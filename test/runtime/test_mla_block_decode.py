@@ -372,9 +372,9 @@ def test_graph_buffers_are_unexpanded_without_block_decode() -> None:
     assert backend.cuda_graph_seq_lens.shape == (4,)
 
 
-def test_mla_config_carries_the_block_decode_flag_defaulting_off() -> None:
-    """MLAConfig must inherit the flag so generate() can set it for the draft."""
-    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+def test_attn_config_carries_the_block_decode_flag_defaulting_off() -> None:
+    """AttnConfig must carry the flag so generate() can set it for the draft."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 
-    field = MLAConfig.__dataclass_fields__["draft_block_decode"]
+    field = AttnConfig.__dataclass_fields__["draft_block_decode"]
     assert field.default is False

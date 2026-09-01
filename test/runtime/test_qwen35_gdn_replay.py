@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -43,7 +42,11 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from test.runtime.test_gdn_state_paging import _CacheMetadata, _ContractPool
+from test.runtime.test_gdn_state_paging import (
+    _CacheMetadata,
+    _ContractPool,
+    _mamba_config_pair,
+)
 
 from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
 
@@ -66,15 +69,13 @@ DEVICE = "cuda"
 
 
 def _config(*, replay: bool):
-    return SimpleNamespace(
-        device=DEVICE,
-        num_attention_heads=NUM_K_HEADS,
-        num_kv_heads=NUM_K_HEADS,
-        attn_tp_size=1,
-        dtype=torch.bfloat16,
+    """(AttnConfig, primary spec) with replay_ssm on the linear component."""
+    return _mamba_config_pair(
+        torch,
+        heads=NUM_K_HEADS,
         head_dim=HEAD_K_DIM,
-        is_draft=False,
-        speculative_num_draft_tokens=DRAFT_TOKENS,
+        spec_tokens=DRAFT_TOKENS,
+        device=DEVICE,
         replay_ssm=replay,
     )
 
@@ -86,7 +87,7 @@ def _make_backend(conv_state, recurrent_state, *, replay: bool):
         4,
         {0: ("linear_attention", conv_state, recurrent_state)},
     )
-    backend = MambaAttnBackend(_config(replay=replay))
+    backend = MambaAttnBackend(*_config(replay=replay))
     backend.set_kv_pool(pool)
     return backend, pool
 
@@ -350,7 +351,7 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
         )
         if replay and not gdn_replay_commit_supported(torch.bfloat16):
             pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-        backend = MambaAttnBackend(_config(replay=replay))
+        backend = MambaAttnBackend(*_config(replay=replay))
         backend.set_kv_pool(pool)
         return backend, pool
 

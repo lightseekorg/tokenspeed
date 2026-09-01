@@ -22,6 +22,7 @@ from .primitives import (
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     block_sum_specialized,
+    finalize_top16_bf16,
     fragment_is_dirty,
     load_global_bf16_as_f32,
     load_global_s32,
@@ -93,7 +94,14 @@ def _select_routed_schedule(
 
 
 class AllReduceRMSNormWithReduceScatterEarlyExit:
-    """One routed role plus one ReduceScatter role per destination group."""
+    """One routed role plus one ReduceScatter role per destination group.
+
+    Routed variants launch only the CTAs needed by runtime M.  After every CTA
+    publishes its first local routed/shared fragment, it admits the PDL
+    successor; that successor may prime input-independent data while its own
+    PDL wait continues to protect collective outputs.  Shared-only variants
+    retain the full-grid completion edge.
+    """
 
     def __init__(
         self,
@@ -135,6 +143,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # BF16); bitwise identity is not guaranteed across compilers.
         self.finalize_input = finalize_top_k is not None
         self.finalize_top_k = finalize_top_k if finalize_top_k is not None else 0
+        self.fast_finalize_top16 = finalize_top_k == 16 and latent_dim == 3584
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -194,6 +203,11 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # rows [total_padded_rows, latent_dim]; ``finalize_weights`` /
         # ``finalize_idx`` are the flat [m * top_k] expert scales and
         # expanded->permuted map. Otherwise the last two are unused dummies.
+        launch_token_ctas = (
+            min(self.token_ctas, m)
+            if cutlass.const_expr(self.include_routed)
+            else self.token_ctas
+        )
         self.kernel(
             latent_source,
             gamma,
@@ -211,7 +225,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             m,
             epsilon,
         ).launch(
-            grid=(self.token_ctas, self.cluster_ctas, self.roles),
+            grid=(launch_token_ctas, self.cluster_ctas, self.roles),
             block=(self.threads, 1, 1),
             cluster=(1, self.cluster_ctas, 1),
             smem=(self.warps + self.cluster_ctas) * 4,
@@ -273,8 +287,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 tidx,
             )
             token = token + self.token_ctas
-        # Trigger dependents only after every CTA stores its final token wave.
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.include_routed):
+            # A shared-only launch keeps the original full-grid edge.
+            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _token_device(
@@ -322,7 +337,37 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
             dirty_elements = Int64(dirty_index) * (Int64(bytes_per_buffer) // Int64(2))
 
-            if cutlass.const_expr(self.finalize_input):
+            if cutlass.const_expr(self.fast_finalize_top16):
+                gemm2_vector = cute.make_ptr(
+                    BFloat16,
+                    (latent_source.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                route_indices = cute.make_ptr(
+                    Int32,
+                    (
+                        finalize_idx.iterator + Int64(token) * self.finalize_top_k
+                    ).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                route_weights = cute.make_ptr(
+                    BFloat16,
+                    (
+                        finalize_weights.iterator + Int64(token) * self.finalize_top_k
+                    ).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                local_packed = sanitize_negative_zero(
+                    finalize_top16_bf16(
+                        gemm2_vector,
+                        route_indices,
+                        route_weights,
+                    )
+                )
+            elif cutlass.const_expr(self.finalize_input):
                 # Inline MoE finalize: gather this fragment from every routed
                 # expert's gemm2 row and combine with the expert scales.
                 # Semantically equivalent to the standalone finalize kernel
@@ -385,6 +430,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 local_packed,
                 volatile=False,
             )
+            if token == token_cta:
+                cute.arch.griddepcontrol_launch_dependents()
 
             cute.arch.cluster_arrive()
             # All CTAs must complete this handshake before the st.shared::cluster exchange: a partial wait skews barrier phases and the pre-DSM wait can match a stale phase, losing the peer-entered guarantee.
@@ -583,6 +630,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 local_packed,
                 volatile=False,
             )
+            if cutlass.const_expr(self.include_routed):
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
 
             # The wait must be unconditional: every per-token-loop barrier use must be arrive/wait-symmetric on every CTA, or the phase counters skew across iterations and the next pre-DSM wait matches a stale phase.
             cute.arch.cluster_arrive()
@@ -969,6 +1019,7 @@ class CollectiveKernel:
         # deferred-finalize triple; the standard materialized-input mode
         # stays available on the same instance.
         self.finalize_top_k = finalize_top_k
+        self.fast_finalize_top16 = finalize_top_k == 16 and latent_dim == 3584
         device = torch.device("cuda", torch.accelerator.current_device_index())
         # Placeholders for the finalize operand slots of the standard-mode
         # kernel signature (never dereferenced when finalize is compiled out).
@@ -1193,6 +1244,15 @@ class CollectiveKernel:
                 or not tensor.is_contiguous()
             ):
                 raise ValueError(f"{name} must be contiguous CUDA {dtype} [{slots}]")
+        if self.fast_finalize_top16 and any(
+            tensor.data_ptr() % 16
+            for tensor in (
+                gemm2_output,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+            )
+        ):
+            raise ValueError("fast top-16 finalize inputs must be 16-byte aligned")
         if (
             shared_source.shape != (m, self.hidden_dim)
             or shared_source.dtype != torch.bfloat16

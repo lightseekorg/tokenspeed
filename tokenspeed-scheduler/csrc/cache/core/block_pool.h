@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -66,19 +67,8 @@ public:
             return {};
         }
 
-        std::vector<CacheBlockLocation> locations;
-        if (cache_blocks_per_lcm_block == 1) {
-            if (NumEmptyLcmBlocks() < num) {
-                return {};
-            }
-            locations.reserve(static_cast<std::size_t>(num));
-            for (std::int32_t i = 0; i < num; ++i) {
-                locations.push_back(
-                    CacheBlockLocation{.lcm_block_id = free_parent_ids_[static_cast<std::size_t>(i)], .slot_index = 0});
-            }
-        } else {
-            locations = planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(num));
-        }
+        std::vector<CacheBlockLocation> locations =
+            planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(num));
         if (locations.size() != static_cast<std::size_t>(num)) {
             return {};
         }
@@ -87,6 +77,113 @@ public:
         out.reserve(locations.size());
         for (CacheBlockLocation location : locations) {
             out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block, location));
+        }
+        return out;
+    }
+
+    std::vector<CacheBlockRef> AcquireUpToBlocks(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block,
+                                                 std::int32_t max_num) {
+        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        if (max_num <= 0) {
+            return {};
+        }
+        std::vector<CacheBlockLocation> locations =
+            planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(max_num));
+        std::vector<CacheBlockRef> out;
+        out.reserve(locations.size());
+        for (CacheBlockLocation location : locations) {
+            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block, location));
+        }
+        return out;
+    }
+
+    std::vector<CacheBlockRef> AcquireAvailableBlocksInOrder(std::span<const std::uint32_t> group_ids,
+                                                             std::span<const std::int32_t> cache_blocks_per_group) {
+        std::vector<bool> requested_groups(cache_blocks_per_group.size(), false);
+        for (std::uint32_t group_id : group_ids) {
+            _assert(group_id < cache_blocks_per_group.size(), "group id has no packing");
+            _assert(cache_blocks_per_group[group_id] > 0, "cache_blocks_per_lcm_block must be > 0");
+            requested_groups[group_id] = true;
+        }
+
+        std::vector<std::vector<std::int32_t>> partial_parent_ids(cache_blocks_per_group.size());
+        for (std::size_t i = 0; i < lcm_blocks_.size(); ++i) {
+            const LcmBlock& parent = lcm_blocks_[i];
+            if (!parent.bound_group || *parent.bound_group >= requested_groups.size() ||
+                !requested_groups[*parent.bound_group]) {
+                continue;
+            }
+            const std::uint32_t group_id = *parent.bound_group;
+            _assert(parent.occupancy.size() == static_cast<std::size_t>(cache_blocks_per_group[group_id]),
+                    "group packing changed while LCM block is occupied");
+            if (parent.occupied_count < parent.occupancy.size()) {
+                partial_parent_ids[group_id].push_back(static_cast<std::int32_t>(i + 1));
+            }
+        }
+
+        std::vector<std::deque<CacheBlockLocation>> available_locations(cache_blocks_per_group.size());
+        for (std::size_t group_id = 0; group_id < partial_parent_ids.size(); ++group_id) {
+            std::vector<std::int32_t>& parent_ids = partial_parent_ids[group_id];
+            std::ranges::sort(parent_ids, [this](std::int32_t lhs_id, std::int32_t rhs_id) {
+                const std::uint32_t lhs_occupied = lcmBlock(lhs_id).occupied_count;
+                const std::uint32_t rhs_occupied = lcmBlock(rhs_id).occupied_count;
+                return lhs_occupied != rhs_occupied ? lhs_occupied > rhs_occupied : lhs_id < rhs_id;
+            });
+            for (std::int32_t parent_id : parent_ids) {
+                const LcmBlock& parent = lcmBlock(parent_id);
+                for (std::size_t slot = 0; slot < parent.occupancy.size(); ++slot) {
+                    if (!parent.occupancy[slot]) {
+                        available_locations[group_id].push_back(CacheBlockLocation{
+                            .lcm_block_id = parent_id,
+                            .slot_index = static_cast<std::int32_t>(slot),
+                        });
+                    }
+                }
+            }
+        }
+
+        std::vector<CacheBlockRef> out(group_ids.size());
+        for (std::size_t i = 0; i < group_ids.size(); ++i) {
+            const std::uint32_t group_id = group_ids[i];
+            const std::int32_t packing = cache_blocks_per_group[group_id];
+            std::deque<CacheBlockLocation>& available = available_locations[group_id];
+            if (available.empty()) {
+                if (free_parent_ids_.empty()) {
+                    continue;
+                }
+                const std::int32_t parent_id = free_parent_ids_.front();
+                out[i] =
+                    createBlockRef(group_id, packing, CacheBlockLocation{.lcm_block_id = parent_id, .slot_index = 0});
+                for (std::int32_t slot = 1; slot < packing; ++slot) {
+                    available.push_back(CacheBlockLocation{.lcm_block_id = parent_id, .slot_index = slot});
+                }
+                continue;
+            }
+            const CacheBlockLocation location = available.front();
+            available.pop_front();
+            out[i] = createBlockRef(group_id, packing, location);
+        }
+        return out;
+    }
+
+    std::vector<CacheBlockRef> AcquireUpToBlocksFromEmptyParent(std::uint32_t group_id,
+                                                                std::int32_t cache_blocks_per_lcm_block,
+                                                                std::int32_t lcm_block_id, std::int32_t max_num) {
+        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        if (max_num <= 0) {
+            return {};
+        }
+        const LcmBlock& parent = lcmBlock(lcm_block_id);
+        _assert(parent.occupied_count == 0 && !parent.bound_group, "directed Host parent must be empty");
+        _assert(!free_parent_ids_.empty() && free_parent_ids_.front() == lcm_block_id,
+                "directed Host parent must be the next free parent");
+
+        const std::int32_t take = std::min(max_num, cache_blocks_per_lcm_block);
+        std::vector<CacheBlockRef> out;
+        out.reserve(static_cast<std::size_t>(take));
+        for (std::int32_t slot = 0; slot < take; ++slot) {
+            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block,
+                                         CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = slot}));
         }
         return out;
     }
@@ -190,6 +287,16 @@ private:
 
     std::vector<CacheBlockLocation> planLocations(std::uint32_t group_id, std::int32_t slots_per_parent,
                                                   std::size_t count) const {
+        if (slots_per_parent == 1) {
+            std::vector<CacheBlockLocation> locations;
+            const std::size_t take = std::min(count, free_parent_ids_.size());
+            locations.reserve(take);
+            for (std::size_t i = 0; i < take; ++i) {
+                locations.push_back(CacheBlockLocation{.lcm_block_id = free_parent_ids_[i], .slot_index = 0});
+            }
+            return locations;
+        }
+
         std::vector<std::int32_t> partially_filled_parent_ids;
         partially_filled_parent_ids.reserve(lcm_blocks_.size());
         for (std::size_t i = 0; i < lcm_blocks_.size(); ++i) {
@@ -243,7 +350,7 @@ private:
                 return locations;
             }
         }
-        return {};
+        return locations;
     }
 
     std::vector<LcmBlock> lcm_blocks_;

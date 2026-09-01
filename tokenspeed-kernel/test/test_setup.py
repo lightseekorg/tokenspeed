@@ -110,7 +110,6 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "nvidia-cutlass-dsl-libs-cu13",
         "nvidia-ml-py",
         "nvtx",
-        "quack-kernels",
         "tokenspeed-deepep",
         "tokenspeed-deepgemm",
         "tokenspeed-fa3",

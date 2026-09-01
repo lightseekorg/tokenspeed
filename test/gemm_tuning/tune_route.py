@@ -18,11 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Measure decode-GEMV backends at Kimi-K3's real serving shapes, cold-cache.
+"""Measure decode-GEMV backends at the served models' real shapes, cold-cache.
 
-The shapes are the exact (N, K) that ``decode_gemv`` receives during TP8
-decode, extracted from an nsys trace of the serving path (rowcta's launch grid
-is ``(N,)``, so gridX identifies each call site). Every measurement cycles
+Run as ``tune_route.py [shape_set] [route.json]``; the set names a key of
+SHAPE_SETS and defaults to K3's TP16 table.
+
+The shapes are the exact (N, K) that the decode path hands the routed GEMV,
+extracted from a trace of the serving path (rowcta's launch grid is ``(N,)``,
+so gridX identifies each call site). Every measurement cycles
 through NUM_COPIES independent weight tensors so the L2 never holds the
 operand between calls -- serving streams a different layer's weight each
 launch, and a single-tensor benchmark distorts the ranking (hot-L2 numbers at
@@ -51,19 +54,53 @@ import torch
 # projection below stays zero rather than quoting a number built on a count
 # carried over from a different parallelism. Labels are the shapes themselves;
 # mapping them to call sites would be a guess until the counts are traced.
-SHAPES = [
-    (3584, 7168, 92, "n3584_k7168"),
-    (2880, 7168, 0, "n2880_k7168"),
-    (1152, 1536, 0, "n1152_k1536"),
-    (7168, 1536, 69, "kda_o_proj_shard"),
-    (1536, 7168, 92, "shared_gate_up_shard"),
-    (7168, 768, 92, "shared_down_shard"),
-]
-MS = [1, 2, 3, 4, 5, 6, 7, 8]  # observed range: the gates admit M <= 8
+SHAPE_SETS = {
+    "k3_tp16": (
+        [
+            (3584, 7168, 92, "n3584_k7168"),
+            (2880, 7168, 0, "n2880_k7168"),
+            (1152, 1536, 0, "n1152_k1536"),
+            (7168, 1536, 69, "kda_o_proj_shard"),
+            (1536, 7168, 92, "shared_gate_up_shard"),
+            (7168, 768, 92, "shared_down_shard"),
+            (1536, 1536, 12, "dspark_q_b_tp8"),
+            (7168, 1024, 12, "dspark_o_proj_tp8"),
+            (7168, 1792, 12, "dspark_down_tp8"),
+            (768, 1536, 0, "qb_tp16"),
+            (1792, 7168, 0, "dspark_gate_up_tp16"),
+            (2112, 14336, 0, "eagle3_fused_qkv_a_tp16"),
+            (2304, 7168, 0, "eagle3_gate_up_tp16"),
+            (7168, 512, 0, "o_proj_tp16"),
+            (7168, 896, 0, "dspark_down_tp16"),
+            (7168, 1152, 0, "eagle3_down_tp16"),
+            (2304, 1536, 0, "mla_q_b"),
+            (6288, 7168, 0, "kda_in_proj"),
+            (3648, 7168, 0, "mla_fused_qkv_a_gate"),
+        ],
+        # Table keys on exact M; sweep the routed range with no holes.
+        list(range(1, 33)),
+    ),
+    "qwen38_next_tp4": (
+        [
+            (512, 2560, 0, "mlp_gate"),
+            (320, 2560, 0, "shared_gate_up"),
+            (2560, 160, 0, "shared_down"),
+            (2560, 1536, 0, "attn_o_proj"),
+            (4120, 2560, 0, "linear_attn_in_proj"),
+            (3584, 2560, 0, "n3584_k2560"),
+            (640, 2560, 0, "n640_k2560"),
+            (2560, 2560, 0, "n2560_k2560"),
+            (12800, 2560, 0, "n12800_k2560"),
+        ],
+        [1, 2, 4, 8],
+    ),
+}
+SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]
 NUM_COPIES = 8
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.
 MARGIN = 1.04
+BACKENDS = ("cublas", "rowcta", "skinny", "tgv", "ll_bf16")
 
 
 def timed(fns, iters: int = 96, rounds: int = 41) -> float:
@@ -148,14 +185,23 @@ def candidates(m: int, n: int, k: int):
     except ImportError:
         pass
 
+    from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_mm, ll_bf16_mm_supported
+
+    if ll_bf16_mm_supported(xs[0], ws[0]):
+
+        def ll(i):
+            return lambda: ll_bf16_mm(xs[i], ws[i], out=o)
+
+        yield "ll_bf16", [ll(i) for i in range(NUM_COPIES)], o, ref
+
 
 route: dict[str, str] = {}
 per_step_gain: dict[int, float] = dict.fromkeys(MS, 0.0)
 print(f"cold-L2 sweep: {NUM_COPIES} weight copies per backend")
 print(f"{'call site':<18}{'NxK':>12} {'M':>2}  ", end="")
-print("  ".join(f"{t:>8}" for t in ("cublas", "rowcta", "skinny", "tgv")), end="")
+print("  ".join(f"{t:>8}" for t in BACKENDS), end="")
 print(f"  {'winner':<8} {'gain':>6}")
-print("-" * 92)
+print("-" * 102)
 for n, k, calls, label in SHAPES:
     for m in MS:
         times: dict[str, float | None] = {}
@@ -174,7 +220,7 @@ for n, k, calls, label in SHAPES:
         best = min(ok, key=ok.get) if ok else None
         cells = "  ".join(
             f"{times.get(t):8.3f}" if isinstance(times.get(t), float) else f"{'-':>8}"
-            for t in ("cublas", "rowcta", "skinny", "tgv")
+            for t in BACKENDS
         )
         # An entry must beat the incumbent selection, not just cuBLAS.
         incumbent = min(
@@ -202,5 +248,5 @@ if any(c for _, _, c, _ in SHAPES):
 else:
     print("per-step projection skipped: calls/step not measured")
 print(json.dumps(route, indent=2))
-if len(sys.argv) > 1:
-    json.dump(route, open(sys.argv[1], "w"), indent=2)
+if len(sys.argv) > 2:
+    json.dump(route, open(sys.argv[2], "w"), indent=2)

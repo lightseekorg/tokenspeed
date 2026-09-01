@@ -18,37 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared result types for registered Kimi Delta Attention kernels."""
+import inspect
 
-from __future__ import annotations
+import pytest
 
-from dataclasses import dataclass
+tile_scheduler = pytest.importorskip("flash_attn.cute.tile_scheduler")
 
-import torch
-
-
-@dataclass(frozen=True)
-class KdaPrefillResult:
-    """Results from a packed KDA prefill.
-
-    Attributes:
-        out: Packed output ``[1, total_tokens, heads, value_dim]``.
-        final_state: One final recurrent state per packed sequence.
-    """
-
-    out: torch.Tensor
-    final_state: torch.Tensor
+from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha import fmha_bias_helper
 
 
-@dataclass(frozen=True)
-class KdaFusedDecodeResult:
-    """Result from an optional pre-convolution KDA decode fusion.
+def test_rel_mha_uses_current_fa4_scheduler_state_api() -> None:
+    assert fmha_bias_helper.SchedulerState is tile_scheduler.SchedulerState
+    assert (
+        fmha_bias_helper.DynamicPersistentVarlenScheduler
+        is tile_scheduler.DynamicPersistentVarlenScheduler
+    )
 
-    Attributes:
-        out: Packed decode output ``[1, batch, heads, value_dim]``.
-        output_norm_applied: Whether the selected kernel applied the output
-            gate and RMSNorm, so the caller must not apply them again.
-    """
-
-    out: torch.Tensor
-    output_norm_applied: bool
+    for scheduler in (
+        tile_scheduler.SingleTileLPTScheduler,
+        tile_scheduler.DynamicPersistentVarlenScheduler,
+    ):
+        parameters = inspect.signature(scheduler.create).parameters
+        assert "ctx" in parameters
+        assert "clc" not in parameters

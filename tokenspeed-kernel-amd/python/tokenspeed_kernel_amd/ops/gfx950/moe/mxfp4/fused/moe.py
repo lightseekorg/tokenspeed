@@ -1009,6 +1009,19 @@ def _maybe_route_owned_mxfp4_mfma_decode(
 _PACKAGE_PREFILL_MIN_M = 9
 
 
+def _select_package_prefill_block_m(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+) -> int:
+    """Use 64 rows when average route density makes 128 over-pad."""
+
+    routed_rows = num_tokens * top_k
+    if 128 * num_experts < routed_rows <= 192 * num_experts:
+        return 64
+    return 128
+
+
 def _maybe_gluon_package_mxfp4_prefill(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -1156,12 +1169,13 @@ def _maybe_gluon_package_mxfp4_prefill(
         gather_package_cdna4_scale,
     )
 
-    sort_block_m = 128
-    # In-house block-aligned sort: runs on the caller's stream with no
-    # device-to-host sync. The worst-case padded route buffers are kept at full
-    # length -- padding blocks carry the ``-1`` expert sentinel (stage1
-    # early-exits) and stage2 skips tiles past ``num_valid_ids[0]`` on-device,
-    # so no host-side trim is needed.
+    sort_block_m = _select_package_prefill_block_m(
+        n_tokens,
+        top_k,
+        n_experts,
+    )
+    # The stable, chunked sort preserves source-token locality for the stage-1
+    # activation gather while keeping all metadata on the current stream.
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out = (
         gluon_moe_sorting(
             topk_ids,
@@ -1184,9 +1198,19 @@ def _maybe_gluon_package_mxfp4_prefill(
         top_k=top_k,
         flatten_topk=False,
     )
-    inter = torch.empty(
-        (n_tokens, top_k, inter_dim),
-        dtype=torch.bfloat16,
+    stage2_k = int(package_w2.shape[2]) * 2
+    stage2_k_scale = stage2_k // MXFP4_BLOCK
+    stage2_scale_rows = triton.cdiv(int(sorted_ids.shape[0]), 32) * 32
+    # Stage 1 writes the activated intermediate directly as sorted MXFP4,
+    # including the zero K-padding required by the physical W2 shard.
+    q_inter = torch.empty(
+        (sorted_ids.shape[0], stage2_k // 2),
+        dtype=torch.uint8,
+        device=hidden_states.device,
+    )
+    stage2_scale = torch.empty(
+        (stage2_scale_rows, stage2_k_scale),
+        dtype=torch.uint8,
         device=hidden_states.device,
     )
     invoke_gluon_mxfp4_moe_stage1(
@@ -1196,49 +1220,31 @@ def _maybe_gluon_package_mxfp4_prefill(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        inter,
+        q_inter,
         top_k,
         w1_scale=package_w13_scale.view(torch.uint8),
         a1_scale=stage1_scale,
-        sorted_weights=None,
+        block_m=sort_block_m,
         b_preshuffled=True,
         b_gdot128=True,
         swiglu_alpha=float(swiglu_alpha),
         swiglu_limit=float(swiglu_limit),
         swiglu_beta=float(swiglu_beta),
         situ_linear_beta=situ_linear_beta,
+        output_sorted=True,
+        output_quantized=True,
+        out_scale=stage2_scale,
+        output_k=stage2_k,
     )
-    inter_flat = inter.view(n_tokens * top_k, inter_dim)
-    stage2_k = int(package_w2.shape[2]) * 2
-    if stage2_k != inter_dim:
-        inter_flat = torch.nn.functional.pad(inter_flat, (0, stage2_k - inter_dim))
 
-    q_inter, q_inter_scale = _quantize_mxfp4_activation(inter_flat)
-
-    # Stage 2 down-projection block size. A smaller block reduces per-expert
-    # 128-row sort padding (top-8 over 384 experts), but on gfx950 the
-    # MFMA-utilization win of the 128-row tile dominates that padding cost.
-    # Sweep-tuned on the Kimi TP4 shard (E=384, D=7168, I=512, topk=8),
-    # BLOCK_M=128 is 10-17% faster than the old 32/64 tiers at M<=1024 and is
-    # fastest at every M; on the gpt-oss shape (E=128, topk=4) it is within ~1%
-    # of the old tiers (no regression). Forcing sort_block_m<128 at large M also
-    # overflows the routed buffers (illegal access), so a flat 128 is both
-    # faster and safer. It also matches ``sort_block_m``, so stage 2 reuses the
-    # stage-1 sort directly (no second moe_sorting pass).
-    stage2_block_m = 128
+    # Both stages consume the same route blocking so the lower-padding choice
+    # does not require a second sort or any metadata conversion.
+    stage2_block_m = sort_block_m
     s2_sorted_ids = sorted_ids
     s2_sorted_weights = sorted_weights
     s2_sorted_expert_ids = sorted_expert_ids
     s2_num_valid_ids = num_valid_ids
 
-    stage2_scale = gather_package_cdna4_scale(
-        q_inter_scale,
-        s2_sorted_ids,
-        source_rows=n_tokens * top_k,
-        cols=stage2_k,
-        top_k=top_k,
-        flatten_topk=True,
-    )
     invoke_gluon_mxfp4_moe_stage2_1x2(
         q_inter,
         None,
@@ -1256,6 +1262,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         block_m=stage2_block_m,
         sort_block_m=stage2_block_m,
         force_reduce=True,
+        input_sorted=True,
     )
     return out
 

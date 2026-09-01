@@ -23,6 +23,7 @@ from tokenspeed.runtime.execution.drafter.dflash import (
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
     resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import (
@@ -329,17 +330,21 @@ def test_block_draft_shares_the_targets_retention() -> None:
     die with the target's pages; a sliding cache group of its own would both
     evict rows the target still owns and collide with the target's planes.
     """
-    config = _draft_attn_config("DSPARK", ("sliding_attention",) * 6)
+    spec = _draft_attn_config("DSPARK", ("sliding_attention",) * 6).component(
+        SoftmaxAttnConfig
+    )
 
-    assert config.layer_types == ()
-    assert config.sliding_window_tokens is None
+    assert spec.layer_types == ()
+    assert spec.sliding_window_tokens is None
 
 
 def test_a_non_block_draft_keeps_its_own_labels() -> None:
-    config = _draft_attn_config("EAGLE3", ("sliding_attention",) * 6)
+    spec = _draft_attn_config("EAGLE3", ("sliding_attention",) * 6).component(
+        SoftmaxAttnConfig
+    )
 
-    assert config.layer_types == ("sliding_attention",) * 6
-    assert config.sliding_window_tokens == 1024
+    assert spec.layer_types == ("sliding_attention",) * 6
+    assert spec.sliding_window_tokens == 1024
 
 
 # --------------------------------------------------------------------------

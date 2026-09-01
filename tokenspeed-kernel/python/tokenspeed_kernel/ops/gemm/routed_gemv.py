@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Measured decode-GEMV routing for Kimi-K3's projection shapes.
+"""Measured decode-GEMV routing for the served models' projection shapes.
 
 Every entry in ``MEASURED_ROUTE`` was measured on GB300 (sm103) at the exact
 (N, K) the TP8 decode path hands ``decode_gemv`` -- extracted from an nsys
@@ -52,7 +52,106 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 # wrappers' per-call view cannot diverge. Measured; see module docstring.
 MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
     {
+        # K3 drafters at TP16; shapes read from the model code, not configs.
+        # both q_b  N=768 K=1536
+        (2, 768, 1536): "skinny",
+        (3, 768, 1536): "skinny",
+        (4, 768, 1536): "skinny",
+        (5, 768, 1536): "skinny",
+        (6, 768, 1536): "skinny",
+        (7, 768, 1536): "skinny",
+        (8, 768, 1536): "skinny",
+        (9, 768, 1536): "skinny",
+        (10, 768, 1536): "skinny",
+        (11, 768, 1536): "skinny",
+        (12, 768, 1536): "skinny",  # re-swept: 1.49x vs cuBLAS; edges tgv by ~1%
+        (13, 768, 1536): "tgv",
+        (14, 768, 1536): "tgv",
+        (15, 768, 1536): "tgv",
+        (16, 768, 1536): "tgv",
+        (17, 768, 1536): "tgv",
+        (18, 768, 1536): "tgv",
+        (19, 768, 1536): "tgv",
+        (20, 768, 1536): "tgv",
+        (21, 768, 1536): "tgv",
+        (22, 768, 1536): "tgv",
+        (23, 768, 1536): "tgv",
+        (24, 768, 1536): "tgv",
+        (25, 768, 1536): "tgv",
+        (26, 768, 1536): "tgv",
+        (27, 768, 1536): "tgv",
+        (28, 768, 1536): "tgv",
+        (17, 2304, 7168): "tgv",
+        (18, 2304, 7168): "tgv",
+        (19, 2304, 7168): "tgv",
+        (21, 2304, 7168): "tgv",
+        (22, 2304, 7168): "tgv",
+        (24, 2304, 7168): "tgv",
+        (32, 2304, 7168): "tgv",
+        (29, 768, 1536): "tgv",
+        (30, 768, 1536): "tgv",
+        (31, 768, 1536): "tgv",
+        (32, 768, 1536): "tgv",
+        # dspark gate_up  N=1792 K=7168
+        (2, 1792, 7168): "skinny",
+        (3, 1792, 7168): "skinny",
+        (4, 1792, 7168): "skinny",
+        # dspark fused_qkv_a (2112x7168): handled by dsv3_fused_a_gemm upstream.
+        # eagle3 fused_qkv_a  N=2112 K=14336
+        (1, 2112, 14336): "skinny",
+        (2, 2112, 14336): "skinny",
+        (3, 2112, 14336): "skinny",
+        # eagle3 gate_up  N=2304 K=7168
+        (2, 2304, 7168): "skinny",
+        (3, 2304, 7168): "skinny",
+        # both o_proj  N=7168 K=512
+        (1, 7168, 512): "tgv",
+        # dspark down  N=7168 K=896
+        (1, 7168, 896): "tgv",
+        (2, 7168, 896): "tgv",
+        (3, 7168, 896): "tgv",
+        (4, 7168, 896): "tgv",
+        (5, 7168, 896): "tgv",
+        (6, 7168, 896): "tgv",
+        (7, 7168, 896): "tgv",
+        (8, 7168, 896): "tgv",
+        # eagle3 down  N=7168 K=1152
+        (1, 7168, 1152): "tgv",
+        (2, 7168, 1152): "tgv",
+        # eagle3 fc: (7168, 21504) was the unsharded width; TP16 shard unmeasured.
+        # M values the 1/2/4/8 sweep skipped; GB200 reproduced 39/40 verdicts.
+        # n1152_k1536  N=1152 K=1536
+        (9, 1152, 1536): "skinny",
+        (10, 1152, 1536): "tgv",
+        (11, 1152, 1536): "tgv",
+        (12, 1152, 1536): "tgv",
+        (13, 1152, 1536): "tgv",
+        (14, 1152, 1536): "tgv",
+        (15, 1152, 1536): "tgv",
+        (16, 1152, 1536): "tgv",
+        # shared gate_up shard  N=1536 K=7168
+        (3, 1536, 7168): "skinny",
+        # MLA q_b  N=2304 K=1536
+        (5, 2304, 1536): "tgv",
+        (6, 2304, 1536): "tgv",
+        (7, 2304, 1536): "tgv",
+        # n2880_k7168  N=2880 K=7168
+        (12, 2880, 7168): "tgv",  # 1.095-1.102x, three runs
+        (13, 2880, 7168): "tgv",
+        (15, 2880, 7168): "tgv",
+        # MLA fused qkv_a + gate  N=3648 K=7168
+        (3, 3648, 7168): "skinny",
+        # KDA in_proj  N=6288 K=7168
+        (3, 6288, 7168): "tgv",  # re-swept: 1.12x vs cuBLAS; edges skinny by ~1%
+        (5, 6288, 7168): "tgv",
+        (6, 6288, 7168): "tgv",
+        # shared down shard  N=7168 K=768
+        (3, 7168, 768): "tgv",
+        (5, 7168, 768): "tgv",
+        (6, 7168, 768): "tgv",
+        (7, 7168, 768): "tgv",
         (1, 3584, 7168): "skinny",  # MoE latent down-proj, 92 calls/step
+        # KDA o_proj shard  N=7168 K=1536
         (1, 7168, 1536): "tgv",
         (2, 7168, 1536): "tgv",
         (4, 7168, 1536): "tgv",
@@ -78,6 +177,28 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         # (1, 2304, 1536) mla_q_b stays on rowcta: 2.48 vs skinny 2.53.
         # M > 1 (small batches, speculative verify) vs the cublas incumbent.
         (2, 3584, 7168): "skinny",  # 9.20 vs 11.67 (1.27x)
+        # TP8 DSpark drafter, shapes observed at the launch point on GB300.
+        # eagle3 drafter TP8 widths; nothing past M=4 clears the margin.
+        (2, 4608, 7168): "tgv",  # 1.10x
+        (1, 7168, 2304): "tgv",  # 1.10x
+        (2, 7168, 2304): "tgv",  # 1.10x
+        (2, 1536, 1536): "skinny",  # 2.18x
+        (3, 1536, 1536): "skinny",  # 1.95x
+        (4, 1536, 1536): "skinny",  # 1.83x
+        (5, 1536, 1536): "skinny",  # 1.68x
+        (6, 1536, 1536): "skinny",  # 1.63x
+        (7, 1536, 1536): "skinny",  # 1.55x
+        (8, 1536, 1536): "tgv",  # 1.54x
+        (1, 7168, 1024): "tgv",  # 1.24x
+        (2, 7168, 1024): "tgv",  # 1.16x
+        (3, 7168, 1024): "tgv",  # 1.15x
+        (4, 7168, 1024): "tgv",  # 1.16x
+        (5, 7168, 1024): "tgv",  # 1.15x
+        (6, 7168, 1024): "tgv",  # 1.16x
+        (7, 7168, 1024): "tgv",  # 1.15x
+        (8, 7168, 1024): "tgv",  # 1.15x
+        (1, 7168, 1792): "tgv",  # 1.13x
+        (2, 7168, 1792): "tgv",  # 1.10x
         (4, 3584, 7168): "skinny",  # 10.38 vs 11.21 (1.08x)
         (2, 6288, 7168): "tgv",  # 15.29 vs 17.07 (1.12x)
         (4, 6288, 7168): "tgv",  # 15.25 vs 17.26 (1.13x)
@@ -92,13 +213,29 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         # dispatch during a live bs=1 run rather than scaled from TP8: only
         # 1152x1536 halves, 3584x7168 is not TP-sharded at all, 2880x7168 has
         # no TP8 analogue, and TP8's largest entry (6288x7168) never reaches
+        (17, 1152, 1536): "tgv",
+        (18, 1152, 1536): "tgv",
+        (19, 1152, 1536): "tgv",
+        (20, 1152, 1536): "tgv",
+        (21, 1152, 1536): "tgv",
+        (22, 1152, 1536): "tgv",
+        (23, 1152, 1536): "tgv",
+        (24, 1152, 1536): "tgv",
+        (25, 1152, 1536): "tgv",
+        (26, 1152, 1536): "tgv",
+        (27, 1152, 1536): "tgv",
+        (28, 1152, 1536): "tgv",
+        (29, 1152, 1536): "tgv",
+        (30, 1152, 1536): "tgv",
+        (31, 1152, 1536): "tgv",
+        (32, 1152, 1536): "tgv",
         # decode_gemv here. Same >= 4% margin, same cold-L2 tuner.
         (3, 3584, 7168): "skinny",  # 9.54 vs 11.23 (1.18x)
         (1, 2880, 7168): "skinny",  # 7.13 vs rowcta 8.61 (1.21x)
         (2, 2880, 7168): "skinny",  # 7.95 vs 9.80 (1.23x)
         (3, 2880, 7168): "skinny",  # 8.24 vs 9.77 (1.19x)
         (4, 2880, 7168): "skinny",  # 9.32 vs 9.78 (1.05x)
-        # 3584 and 2880 stay on the incumbent at M >= 5: skinny inverts there
+        # 3584 and 2880 leave skinny at M >= 5: skinny inverts there
         # (15.85 vs cublas 11.06 at M=8, 3584x7168), so the win is not simply
         # "skinny for small M" and the boundary has to be measured per width.
         (2, 1152, 1536): "skinny",  # 1.99 vs 4.85 (2.44x)
@@ -109,6 +246,49 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (7, 1152, 1536): "skinny",  # 2.59 vs 4.45 (1.72x)
         (8, 1152, 1536): "skinny",  # 2.72 vs 4.46 (1.64x)
         # (1, 1152, 1536) stays on rowcta: 1.907 vs 1.943, inside the margin.
+        # TP4 (B200, sm100), bf16 dense linears: the fp8 checkpoint quantizes
+        # only the routed experts. M is the captured decode bucket -- 5 was
+        # swept but never observed.
+        (1, 512, 2560): "skinny",  # mlp.gate; 1.83 vs 4.37 (2.39x)
+        (2, 512, 2560): "skinny",  # 2.05 vs 4.38 (2.13x)
+        (4, 512, 2560): "ll_bf16",  # 2.28 vs 4.43 (1.95x)
+        (8, 512, 2560): "ll_bf16",  # 2.32 vs 4.64 (2.00x)
+        (1, 320, 2560): "skinny",  # shared_expert gate_up; 1.80 vs 4.36 (2.42x)
+        (2, 320, 2560): "skinny",  # 2.00 vs 5.75 (2.88x)
+        (4, 320, 2560): "ll_bf16",  # 2.22 vs 4.74 (2.13x)
+        (8, 320, 2560): "ll_bf16",  # 2.25 vs 4.73 (2.10x)
+        # shared_expert down-proj. K = 160 is not a multiple of 128, so neither
+        # the skinny GEMM nor ll_bf16 admits it and tgv takes every width.
+        (1, 2560, 160): "tgv",  # 1.61 vs 1.88 (1.17x)
+        (2, 2560, 160): "tgv",  # 1.65 vs 3.09 (1.87x)
+        (4, 2560, 160): "tgv",  # 1.66 vs 3.09 (1.86x)
+        (8, 2560, 160): "tgv",  # 1.65 vs 1.92 (1.16x)
+        (1, 2560, 1536): "ll_bf16",  # attn o_proj; 2.55 vs 3.25 (1.27x)
+        (2, 2560, 1536): "ll_bf16",  # 2.54 vs 4.90 (1.92x)
+        (4, 2560, 1536): "ll_bf16",  # 2.58 vs 4.84 (1.88x)
+        (8, 2560, 1536): "ll_bf16",  # 2.67 vs 4.67 (1.75x)
+        (1, 4120, 2560): "ll_bf16",  # linear_attn in_proj; 4.84 vs 9.26 (1.91x)
+        (2, 4120, 2560): "ll_bf16",  # 4.88 vs 8.55 (1.75x)
+        (4, 4120, 2560): "ll_bf16",  # 4.87 vs 8.41 (1.73x)
+        (8, 4120, 2560): "ll_bf16",  # 4.91 vs 8.38 (1.71x)
+        (1, 3584, 2560): "ll_bf16",  # 4.35 vs 5.50 (1.26x)
+        (2, 3584, 2560): "ll_bf16",  # 4.42 vs 7.50 (1.70x)
+        (4, 3584, 2560): "ll_bf16",  # 4.41 vs 7.63 (1.73x)
+        (8, 3584, 2560): "ll_bf16",  # 4.44 vs 7.28 (1.64x)
+        # 640x2560 crosses over: skinny leads to M == 4, ll_bf16 from M == 8.
+        (1, 640, 2560): "skinny",  # 1.88 vs 4.69 (2.49x)
+        (2, 640, 2560): "skinny",  # 2.10 vs 4.62 (2.20x)
+        (4, 640, 2560): "skinny",  # 2.89 vs 4.77 (1.65x)
+        (8, 640, 2560): "ll_bf16",  # 3.01 vs 4.81 (1.60x)
+        (1, 2560, 2560): "ll_bf16",  # 3.27 vs 5.06 (1.55x)
+        (2, 2560, 2560): "ll_bf16",  # 3.36 vs 6.37 (1.90x)
+        (4, 2560, 2560): "ll_bf16",  # 3.40 vs 6.08 (1.79x)
+        (8, 2560, 2560): "ll_bf16",  # 3.40 vs 6.35 (1.87x)
+        # 12800x2560's margins shrink as M grows and invert at 8 (cublas 13.70
+        # vs ll_bf16 13.43, inside the margin), so M == 8 keeps cublas.
+        (1, 12800, 2560): "skinny",  # 11.07 vs 14.62 (1.32x)
+        (2, 12800, 2560): "skinny",  # 11.81 vs 14.38 (1.22x)
+        (4, 12800, 2560): "ll_bf16",  # 13.31 vs 14.43 (1.08x)
     }
 )
 
@@ -260,6 +440,36 @@ def tgv_gemv(
     return result
 
 
+def ll_bf16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` via the low-latency BF16 GEMM.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous bf16 weight.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_mm, ll_bf16_mm_supported
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    if (
+        MEASURED_ROUTE.get((m, n, k)) != "ll_bf16"
+        or x.dtype != torch.bfloat16
+        or not _usable_in_capture("ll_bf16", dev, m, n, k)
+        or not ll_bf16_mm_supported(x, weight)
+    ):
+        return _torch_decode_gemv(x, weight, out)
+    result = ll_bf16_mm(x.detach(), weight.detach(), out=out)
+    _mark_warmed("ll_bf16", dev, m, n, k)
+    return result
+
+
 # Fused ``a + x @ W.T + c`` (K3 MoE latent up-proj epilogue): (m, n, k) ->
 # (block_size, outputs_per_block, k_unroll). Cold-L2 vs the incumbent: M == 1
 # 8.86us vs rowcta_gemv_add3 9.42, M == 2 10.05 vs composed 12.81. M == 4 was
@@ -400,13 +610,13 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv}
+    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv, "ll_bf16": ll_bf16_gemv}
     for (m, n, k), backend in MEASURED_ROUTE.items():
         register_kernel(
             "gemm",
             "decode_gemv",
             name=f"{backend}_gemv_m{m}_n{n}_k{k}",
-            solution="cute_dsl" if backend == "skinny" else "flashinfer",
+            solution="flashinfer" if backend == "tgv" else "cute_dsl",
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
             traits={

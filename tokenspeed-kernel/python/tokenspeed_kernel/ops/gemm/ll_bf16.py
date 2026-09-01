@@ -23,6 +23,10 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import (
+    flashinfer_cute_dsl_mm_bf16,
+    has_flashinfer_cute_dsl_bf16,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -84,4 +88,99 @@ def ll_bf16_router_supported(
     return ll_bf16_router.supports(hidden_states, weight, m)
 
 
-__all__ = ["MAX_M", "cute_dsl_ll_bf16_router", "ll_bf16_router_supported"]
+# The kernels issue 32-byte vector loads from the base of each operand.
+_PTR_ALIGN = 32
+# Both backends step K in multiples of 128.
+_K_ALIGN = 128
+
+
+def ll_bf16_mm_supported(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> bool:
+    """Whether :func:`ll_bf16_mm` can serve these operands.
+
+    Args:
+        x: ``[..., K]`` BF16 activation; its leading dims flatten to ``M``.
+        weight: ``[N, K]`` BF16 weight.
+        bias: Optional ``[N]`` BF16 bias.
+
+    Returns:
+        True when every guard holds, so the caller can fall back otherwise.
+    """
+    if weight.ndim != 2 or x.ndim < 1:
+        return False
+    n, k = weight.shape
+    # Checked on the originals: a reshape of a non-contiguous x would copy,
+    # voiding the pointer-alignment check below.
+    if x.shape[-1] != k or k % _K_ALIGN:
+        return False
+    if x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
+        return False
+    if not x.is_contiguous() or not weight.is_contiguous():
+        return False
+    if x.device != weight.device:
+        return False
+    if x.data_ptr() % _PTR_ALIGN or weight.data_ptr() % _PTR_ALIGN:
+        return False
+    m = x.numel() // k
+    if not 1 <= m <= MAX_M:
+        return False
+    if bias is not None and (
+        bias.ndim != 1
+        or bias.shape[0] != n
+        or bias.dtype is not torch.bfloat16
+        or not bias.is_contiguous()
+        or bias.device != x.device
+    ):
+        return False
+    # Only the vendored path carries further requirements -- its own toolchain,
+    # and a cluster for the split-K reduce above MAX_M_DOTPROD.
+    return has_flashinfer_cute_dsl_bf16() or ll_bf16_router.supports(
+        x.view(m, k), weight, m
+    )
+
+
+def ll_bf16_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T (+ bias)`` in BF16, the dense-linear form of the router GEMM.
+
+    Args:
+        x: ``[..., K]`` contiguous BF16 activation; leading dims flatten to
+            ``M``, which must not exceed :data:`MAX_M`.
+        weight: ``[N, K]`` contiguous BF16 weight.
+        bias: Optional contiguous ``[N]`` BF16 bias.
+        out: Optional ``[..., N]`` BF16 destination; allocated when omitted.
+
+    Returns:
+        ``[..., N]`` BF16 tensor carrying ``x``'s leading dims, ``out`` when it
+        was given.
+    """
+    k = weight.shape[1]
+    m = x.numel() // k
+    n = weight.shape[0]
+    # view, not reshape: a reshaped non-contiguous out would take the writes.
+    flat_out = None if out is None else out.view(m, n)
+    if has_flashinfer_cute_dsl_bf16():
+        result = flashinfer_cute_dsl_mm_bf16(x.view(m, k), weight, bias, flat_out)
+    else:
+        result = ll_bf16_router(
+            x.view(m, k),
+            weight,
+            flat_out,
+            bias=bias,
+            out_dtype=torch.bfloat16,
+        )
+    return result.view(*x.shape[:-1], n)
+
+
+__all__ = [
+    "MAX_M",
+    "cute_dsl_ll_bf16_router",
+    "ll_bf16_mm",
+    "ll_bf16_mm_supported",
+    "ll_bf16_router_supported",
+]

@@ -33,6 +33,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E4
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
+    fused as gfx1250_fused,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     _resolve_block_m,
 )
@@ -443,6 +446,44 @@ def test_gfx1250_resolve_block_m_defaults(
         )
         == expected_block_m
     )
+
+
+def test_gfx1250_ragged_matmul_forwards_fused_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x = torch.empty((2, 4), dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    activation = gfx1250_fused.FusedActivation(
+        gfx1250_fused.FnSpecs(
+            "situ",
+            None,
+            ("beta", "linear_beta"),
+            reduction_n=2,
+        ),
+        (4.0, 25.0),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_matmul(*args, **kwargs):
+        captured.update(kwargs)
+        return output, None
+
+    monkeypatch.setattr(gfx1250_fused, "matmul", fake_matmul)
+
+    actual = gfx1250_fused.gluon_mxfp_ragged_matmul(
+        x,
+        torch.empty((1, 4, 8), dtype=torch.uint8),
+        None,
+        w_mx_scale=torch.empty(1),
+        fused_activation=activation,
+    )
+
+    assert actual is output
+    assert captured["fused_activation"] is activation
+    assert captured["block_n"] == 256
+    assert captured["block_k"] == 256
+    assert captured["num_warps"] == 4
+    assert captured["num_buffers"] == 3
 
 
 @pytest.mark.parametrize(

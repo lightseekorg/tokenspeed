@@ -41,7 +41,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from kimi3_reference import a16w4_mxfp4_moe_reference
+from kimi3_reference import mxfp4_moe_reference
 from utils import make_mxfp4_moe_weights
 
 deep_ep = pytest.importorskip("deep_ep", reason="deep_ep is an optional dependency")
@@ -103,7 +103,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -111,6 +111,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=beta,
         situ_linear_beta=linear_beta,
     )

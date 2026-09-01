@@ -128,16 +128,19 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         # metadata sees the same geometry a captured graph would, and state
         # groups land in state_group_ids rather than the span map.
         from tokenspeed.runtime.execution import workspace
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
         from tokenspeed.runtime.utils.env import envs
 
-        config = MHAConfig(
-            device="cpu",
+        spec = MHAConfig(
             backend_name="trtllm",
             num_attention_heads=4,
             num_kv_heads=1,
             head_dim=64,
             attn_tp_size=1,
+        )
+        config = AttnConfig(
+            device="cpu",
             dtype=self.torch.bfloat16,
             kv_cache_dtype=self.torch.bfloat16,
             prefix_granularity=64,
@@ -146,12 +149,13 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             max_bs=1,
             max_graph_bs=1,
             kv_cache_quant_method="none",
+            components=(spec,),
         )
         with (
             envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
             mock.patch.object(workspace, "_pools", {}),
         ):
-            backend = self.Backend(config)
+            backend = self.Backend(config, spec)
 
         # Nothing is known before the pool arrives.
         self.assertEqual(backend._geometry.granularities, {})

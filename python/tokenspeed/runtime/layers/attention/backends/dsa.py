@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
@@ -46,11 +47,13 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
-def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:
+def _make_dense_backend(
+    config: AttnConfig, spec: DSAConfig, platform
+) -> AttentionBackend:
     if platform.is_nvidia:
-        return TRTLLMMLABackend(config)
+        return TRTLLMMLABackend(config, spec)
     if platform.is_amd:
-        return MLAAttnBackend(config)
+        return MLAAttnBackend(config, spec)
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 
@@ -72,26 +75,26 @@ class DSABackend(AttentionBackend):
     # frozen at capture-time (dummy) values. Keep prefills eager.
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
-    def __init__(self, config: DSAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: DSAConfig):
+        super().__init__(config, spec)
         platform = current_platform()
-        self._dense_backend = _make_dense_backend(config, platform)
-        self.index_topk = config.index_topk
+        self._dense_backend = _make_dense_backend(config, spec, platform)
+        self.index_topk = spec.index_topk
         self.max_context_len = config.context_len
         self.kernel_page_size = (
             config.kernel_page_size
             if config.kernel_page_size is not None
             else DSA_SPARSE_PAGE_SIZE
         )
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
 
     @property

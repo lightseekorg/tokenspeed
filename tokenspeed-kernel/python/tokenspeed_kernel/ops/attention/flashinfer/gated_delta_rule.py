@@ -43,7 +43,7 @@ Other prefill conventions (verified equal to bf16 on B200):
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.gdn_utils import (
+from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
@@ -273,6 +273,12 @@ if is_available():
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            # WORKAROUND: FlashInfer 0.6.18's CP cache uses the stale
+            # cute.compile[...] syntax, which CUTLASS DSL 4.7.1 no longer
+            # supports. Remove this when custom_compile_cache is fixed
+            # upstream. Disabling CP can slow long-context GDN prefill but
+            # does not change correctness.
+            use_cp=False,
         )
 
         out = out.to(q.dtype)

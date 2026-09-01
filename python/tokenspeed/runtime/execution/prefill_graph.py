@@ -110,9 +110,12 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     The default ladder bounds RELATIVE padding waste: a forward pads its graphed
     compute to the next bucket, so what matters is the gap as a fraction of the
     size -- a flat stride is needlessly coarse for short prompts and needlessly
-    dense at the top. Each bucket's step is the largest power of two <= size/8
-    (padded tail at most ~12.5% anywhere on the ladder), floored at 16 tokens and
-    capped at 512 so the absolute worst case stays bounded at the top end. Dense
+    dense at the top. Each bucket's step is the largest power of two <= size/8,
+    floored at 16 tokens and capped at 512 so the absolute worst case stays
+    bounded at the top end. The ~12.5% tail that step implies holds only where
+    size/8 exceeds the floor: below ~128 tokens the floor dominates and the
+    relative waste grows sharply (17 -> 32 pads 88%, 1 -> 16 pads 1500%),
+    which is where a graphed forward is least likely to pay for itself. Dense
     ladders are cheap: all captures share one stream + mempool, so graph memory
     is ~the largest bucket's peak regardless of bucket count (see
     ``BreakableCapture``); the remaining cost is ~0.5s of startup capture per
@@ -187,10 +190,10 @@ class PrefillGraph:
     A pure graph object -- :meth:`can_run` / :meth:`replay` -- holding no
     reference to any other component. The executor calls :meth:`capture` once
     kernel tuning has run, passing the decode wrapper transiently for its
-    capture stream and dummy cache-group tables; it is not kept. The dispatch
+    capture stream; it is not kept. The dispatch
     checks :meth:`can_run` and calls :meth:`replay`; the eager path stays a
     direct ``model_runner.forward`` call at that call site. Capture failure
-    degrades to eager -- world-agreed, so DP/TP ranks stay in lockstep.
+    fails the boot (see :meth:`capture`).
 
     Args:
         model_runner: The target ModelRunner. Supplies the loaded model
@@ -275,8 +278,8 @@ class PrefillGraph:
     def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
-        ``decode_wrapper`` supplies the shared capture stream and dummy
-        cache-group block tables (used here only, not stored). Buckets share
+        ``decode_wrapper`` supplies the shared capture stream (used here only,
+        not stored). Buckets share
         one PRIVATE mempool (first capture
         allocates it), so graph memory stays ~the largest bucket's peak --
         but never the decode graphs' pool: eager ops cache raw pointers to
@@ -286,16 +289,13 @@ class PrefillGraph:
         call (IMA; A/B-proven on qwen3.5 MTP).
 
         Runs under inference mode like serving forwards (in-place updates on
-        inference-mode model state buffers are only legal there). OOM fails
-        the boot LOUDLY (the graph pool did not fit next to weights + KV
-        cache; the operator decides: free headroom, lower
-        ``--prefill-graph-max-tokens``, or 0 to disable). Any other failure
-        means the dummy-batch machinery doesn't cover this model family yet:
-        degrade to eager prefill instead of crashing the server, and agree on
-        that across the world (a MIN all-reduce over the success flag) --
-        replay force-sets ``global_num_tokens`` on every rank, so one eager
-        rank among replaying peers diverges the token counts and deadlocks
-        the next collective.
+        inference-mode model state buffers are only legal there). There is no
+        handler here: every failure kills the boot, OOM included (the graph
+        pool did not fit next to weights + KV cache -- free headroom, lower
+        ``--prefill-graph-max-tokens``, or set it to 0). A model family that
+        cannot capture has to say so up front in ``ModelExecutor``'s
+        ``disable_prefill_graph`` condition, because degrading here silently
+        served eager prefill to a whole model family while CI stayed green.
         """
         if self.disable:
             return
@@ -306,36 +306,14 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
-        captured_ok = True
-        try:
-            # Seam: backends alloc static buffers or refuse capture; kept
-            # outside inference mode (in-place refresh). Base default: no-op.
-            self.attn_backend.init_prefill_graph_state(
-                max_num_tokens=max(self.capture_buckets),
-                max_bs=int(self.page_table.shape[0]),
-            )
-            with maybe_inference_mode():
-                self._capture_all_buckets(decode_wrapper)
-        except torch.cuda.OutOfMemoryError:
-            logger.error(
-                "Prefill graph capture ran out of GPU memory. Free up "
-                "--gpu-memory-utilization headroom, lower "
-                "--prefill-graph-max-tokens (default %d), or set it to 0 to "
-                "disable the prefill graph.",
-                2048,
-            )
-            raise
-        except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
-            logger.warning(
-                "Prefill graph capture failed (%s: %s); falling back to eager "
-                "prefill. This model family may need dedicated dummy-batch support.",
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            captured_ok = False
-        if not self._capture_unanimous(captured_ok):
-            self.disable = True
+        # Seam: backends alloc static buffers or refuse capture; kept
+        # outside inference mode (in-place refresh). Base default: no-op.
+        self.attn_backend.init_prefill_graph_state(
+            max_num_tokens=max(self.capture_buckets),
+            max_bs=int(self.page_table.shape[0]),
+        )
+        with maybe_inference_mode():
+            self._capture_all_buckets(decode_wrapper)
 
     def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
         rank = self.config.global_rank
@@ -349,7 +327,7 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self.make_dummy_batch(bucket, decode_wrapper)
+            self._ctx = self.make_dummy_batch(bucket)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
             )
@@ -419,69 +397,85 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
-    def _dummy_group_tables(
-        self, req_tokens: int, bs: int
-    ) -> dict[str, "torch.Tensor"]:
-        """Build capture tables that honor each backend's active-page contract."""
-        backend = self.attn_backend
-        # The arena's specs are the source; the backend's state_group_ids is
-        # learned from these same specs, so consulting it as a second opinion
-        # could only ever return the same set.
-        specs = self.token_to_kv_pool.arena.cache_group_specs
-        state_group_ids = {
-            str(spec.group_id) for spec in specs if spec.family == "state"
-        }
-        # Composite wrappers hold the cache-group consumer as a child.
-        if not hasattr(backend, "kernel_page_size") and hasattr(
-            backend, "full_attn_backend"
-        ):
-            backend = backend.full_attn_backend
-        require_real_active_pages = backend.cache_active_pages_must_be_real
-        # Full width: backends that derive the row stride from max_kv_len
-        # (trtllm) index the whole row even when the bucket is small.
-        width = getattr(backend, "max_num_pages", 0) or -(
-            -req_tokens // backend.kernel_page_size
-        )
+    def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
+        """Build the capture batch's group tables: one row per fabricated
+        request, one width per group, row ``i`` holding block ``i + 1``.
+
+        Width is ``ceil(physical_context_len / grain)`` for every group,
+        whatever its retention. The physical extent is the quantity every
+        backend sizes its own per-request tables from
+        (``BaseAttnConfig.context_len`` is the model context plus
+        ``spec_context_pad``), so a row sized from it covers any column a
+        consumer can derive: rows travel in the group's raw scheduler grain,
+        and every consumer expands to kernel pages inside the backend
+        through the one shared ``expand_history_table`` (the unified-path
+        table invariant). The width is a property of the group's published
+        spec, not of the kernel that reads it, which is why no per-backend
+        knob is needed.
+
+        Deliberately NOT ``compute_max_logical_pages_for_capture``: that
+        helper answers the decode question, where a row describes live cache
+        history, so a sliding group is bounded by its window. Capture derives
+        a write column per position of the extend it fabricates
+        (``extend_group_out_cache_locs``, ``(prefix + new - 1) // grain``)
+        with no window bound, so a window-sized row underflows.
+        Trying the helper here made Inkling capture die with "extend write
+        locations out of table bounds" -- its ``sliding_attention_0`` row was
+        6 columns against the 63 the bucket needed.
+
+        Blocks are distinct per row because a state group takes one working
+        block per request; two rows sharing one clobber each other. Note the
+        runtime check for that (``_gather_state_block_indices``) is gated on
+        ``TOKENSPEED_CACHE_DEBUG``, so a regression here would be silent --
+        ``test_each_capture_row_gets_its_own_block`` is the guard.
+
+        An empty dict (a pool publishing no groups: unit fixtures, warmup
+        before binding) skips the cache-metadata kwargs downstream.
+        """
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
         out = {}
-        for spec in specs:
-            group_id = str(spec.group_id)
-            group_width = width
-            if require_real_active_pages:
-                raw_tokens_per_page = int(spec.block_granularity)
-                group_width = max(
-                    1,
-                    (req_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
-                )
-            out[group_id] = torch.full(
-                (bs, group_width),
-                1 if require_real_active_pages or group_id in state_group_ids else 0,
-                dtype=torch.int32,
-                device=self.config.device,
-            )
+        extent = max(1, int(self.config.physical_context_len))
+        # Built on the host: make_dummy_batch's only use of these is
+        # ``.cpu().numpy()`` for the contract packer, so a device tensor here
+        # would be allocated and copied straight back off per group per bucket.
+        first_block = torch.arange(1, bs + 1, dtype=torch.int32)
+        for spec in self.token_to_kv_pool.arena.cache_group_specs:
+            cols = -(-extent // int(spec.block_granularity))
+            # Never the reserved block 0: attention runs eager inside the
+            # break, so capture really does write KV, and block 0 must stay
+            # zero for the padding and table holes that resolve into it.
+            # The upper bound is the group's own block count, enforced by the
+            # contract packer: block_tables_from_forward_op rejects anything
+            # past group_page_counts[gid] - 1, and capture failure is fatal, so
+            # a violation is a loud dead boot rather than a bad table. It is
+            # never reached in practice, but not because bs is bounded by the
+            # pool -- the bucket ladder does not clamp against max_bs, and an
+            # oversized bs dies earlier on the max_bs-sized request buffers
+            # make_dummy_batch writes before it gets here.
+            out[str(spec.group_id)] = first_block[:, None].expand(bs, cols).contiguous()
         return out
 
-    def make_dummy_batch(
-        self, num_tokens: int, decode_wrapper: ForwardStepRunner | None
-    ) -> ForwardContext:
+    def make_dummy_batch(self, num_tokens: int) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy extend
         forward of ``num_tokens`` tokens, and return its ForwardContext.
 
         The tokens are split across ``ceil(num_tokens / context_len)`` dummy
         requests so no single request exceeds the model context length: every
         per-request structure (page-table rows, DSA indexer tables) is sized
-        for ``context_len``, and a longer fabricated request indexes past
-        them. A real forward carries more than ``context_len`` tokens only as
+        for ``physical_context_len``, and a longer fabricated request indexes
+        past them. It does not bound the request-indexed buffers, which are
+        sized ``max_num_seqs // dp``: a bucket above ``context_len * max_bs``
+        overflows them and kills the boot (pre-existing; ``_autotune`` clamps
+        its token count for exactly that reason, the bucket ladder does not). A real forward carries more than ``context_len`` tokens only as
         a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
-        go to the reserved dummy slot. Per-group tables use page 0 when a
-        backend permits the null page for capture and page 1 when active
-        metadata requires a real writable page. Backends with extra cache
-        groups (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every
-        group table, or their extend metadata is incomplete.
+        go to the reserved dummy slot; per-group table widths come from
+        :meth:`_dummy_group_tables`. Backends with extra cache groups
+        (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every group
+        table, or their extend metadata is incomplete.
         """
         ib = self.input_buffers
         # Logical context_len, deliberately NOT physical_context_len: the
@@ -529,21 +523,20 @@ class PrefillGraph:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
-        if (
-            self.attn_backend.cache_active_pages_must_be_real
-            and decode_wrapper is not None
-        ):
-            # Placeholder tables for backends that validate live-page
-            # geometry at metadata init (V4); see _dummy_group_tables for
-            # the honoring of that contract below.
-            tables = decode_wrapper._capture_group_block_tables(
-                bs, self.token_to_kv_pool
-            )
-            if tables is not None:
-                extra_metadata_kwargs["block_tables"] = tables
+        group_tables = self._dummy_group_tables(bs)
+        if self.attn_backend.cache_active_pages_must_be_real:
+            # A backend that validates live-page geometry at metadata init
+            # (V4) refuses null-page placeholder rows, so it must get the
+            # real distinct-block tables built above -- a raise, not an
+            # assert, because assert is stripped under -O.
+            if not group_tables:
+                raise RuntimeError(
+                    f"{type(self.attn_backend).__name__} requires real "
+                    "active pages but the pool publishes no cache groups, "
+                    "so capture has no group tables to give it"
+                )
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        group_tables = self._dummy_group_tables(max(seq_lens), bs)
         if group_tables:
             arrays = {
                 group_id: table.cpu().numpy()
@@ -576,27 +569,6 @@ class PrefillGraph:
             **extra_metadata_kwargs,
         )
         return ctx
-
-    def _capture_unanimous(self, captured_ok: bool) -> bool:
-        """MIN-reduce capture success across the world (see ``capture``)."""
-        if self.config.world_group is None or self.config.world_size <= 1:
-            return captured_ok
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
-
-        cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
-        flag = torch.tensor([1 if captured_ok else 0], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN, group=cpu_group
-        )
-        unanimous = bool(flag.item())
-        if not unanimous and captured_ok:
-            logger.warning(
-                "Prefill graph: a peer rank failed capture; falling back to "
-                "eager prefill on all ranks to keep DP/TP token counts in lockstep."
-            )
-        return unanimous
 
     # ------------------------------------------------------------------
     # Replay dispatch

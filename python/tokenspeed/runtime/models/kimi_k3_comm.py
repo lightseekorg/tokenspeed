@@ -99,6 +99,9 @@ class K3MoETailTier(IntEnum):
 # in-graph (correct, but decode-suboptimal) — a follow-up should add an
 # is_decode axis rather than gate on the graph phase, which prefill graphs
 # legitimately share.
+# Measured profit edge of the fused tail; the kernel's own capacity is larger.
+TAIL_FUSION_MAX_TOKENS = 32
+
 MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
@@ -111,15 +114,25 @@ def select_k3_moe_tail_tier(
     tail_fusion_max_tokens: int,
     fused_moe_ar: bool,
     multimem_ok: bool,
+    is_decode: bool = False,
+    join_moe_reduce: bool = False,
 ) -> K3MoETailTier:
     """Pick the tail tier; every input must be rank-uniform.
 
     Args:
         num_tokens: Tokens in this forward (identical on every rank).
         graph_phase: Whether the forward runs under the CUDA-graph phase.
-        tail_fusion_max_tokens: Fused decode kernel capacity, 0 when absent.
-        fused_moe_ar: Whether the fused-AR execution plan is armed.
+        tail_fusion_max_tokens: Largest token count the fused tail is both
+            able and worth running at, 0 when absent.
+        fused_moe_ar: Whether the fused-AR execution plan is armed (implies a
+            backend-owned lane, so TRT-LLM only).
+        join_moe_reduce: Whether the routed and shared partials can be reduced
+            together without a lane, via a concatenated one-shot or a grouped
+            all-reduce. Portable, so this is what lets non-TRT-LLM backends
+            reach the join tier.
         multimem_ok: Collectively-agreed multimem availability.
+        is_decode: Whether this forward is a decode (spec-verify included);
+            rank-uniform and stable between graph capture and replay.
 
     Returns:
         The best applicable ``K3MoETailTier``.
@@ -129,8 +142,31 @@ def select_k3_moe_tail_tier(
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
+        # No lane, but the join only needs a concatenated or grouped
+        # all-reduce. Taking it halves the tail's collectives -- SEPARATE_REDUCE
+        # reduces the routed and shared partials over the same group one after
+        # the other -- and each collective is a rendezvous whose cost does not
+        # amortize with batch, so the saving is largest at low concurrency.
+        #
+        # SEPARATE_REDUCE stays the fallback for layouts that cannot join,
+        # which includes a sharded up projection: its tail folds the projection
+        # between two sequential all-reduces instead of calling
+        # kimi3_join_reduce_moe, so it would save no collective while still
+        # giving up the routed_in_fork overlap.
+        #
+        # MULTIMEM_AR is deliberately still not reachable here. It already
+        # required fused_moe_ar before this join existed, so promoting
+        # lane-less backends into the multimem window would be a separate
+        # behavioural change rather than part of this one.
+        if join_moe_reduce:
+            return K3MoETailTier.FUSED_LANE_AR
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
+    if (
+        multimem_ok
+        # Decode buckets skip multimem: same bytes, but it leaves the GPU idle there.
+        and not is_decode
+        and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS
+    ):
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -583,7 +619,13 @@ class K3MoeTailComm:
     # ------------------------------------------------------------------
     # Routing
     # ------------------------------------------------------------------
-    def plan(self, num_tokens: int, hidden_states: torch.Tensor) -> TailPlan:
+    def plan(
+        self,
+        num_tokens: int,
+        hidden_states: torch.Tensor,
+        *,
+        is_decode: bool = False,
+    ) -> TailPlan:
         """Pick the tail tier and its forward-side obligations.
 
         Every input must be rank-uniform (token count, graph phase and the
@@ -594,10 +636,14 @@ class K3MoeTailComm:
             num_tokens=num_tokens,
             graph_phase=get_is_cuda_graph_phase(),
             tail_fusion_max_tokens=(
-                self.latent_tail.max_num_tokens if self.latent_tail is not None else 0
+                min(self.latent_tail.max_num_tokens, TAIL_FUSION_MAX_TOKENS)
+                if self.latent_tail is not None
+                else 0
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
+            join_moe_reduce=self.execution_plan.join_moe_reduce,
             multimem_ok=self.state.multimem_ar_ok,
+            is_decode=is_decode,
         )
         if tier is K3MoETailTier.TAIL_FUSION:
             # Full fusion: with the trtllm fused-AR plan armed and a

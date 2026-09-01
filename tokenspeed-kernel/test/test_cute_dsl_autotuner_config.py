@@ -18,36 +18,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+import pytest
 
-from dataclasses import dataclass
-from enum import Enum
-
-import torch
+autotuner = pytest.importorskip("flashinfer.autotuner")
 
 
-class GdnCheckpointLayout(str, Enum):
-    """Backend-native checkpoint layout returned by GDN chunk prefill."""
-
-    NONE = "none"
-    FLA = "fla"
-    FLASHINFER = "flashinfer"
+def _sentinel(*args):
+    return args
 
 
-@dataclass(frozen=True)
-class GdnChunkPrefillResult:
-    """Structured result for GDN chunk prefill.
+def test_nvfp4_tuning_config_uses_indexed_flashinfer_initializers() -> None:
+    packed_initializer = _sentinel
+    dynamic_spec = autotuner.DynamicTensorSpec(
+        (0, 6),
+        (0, 0),
+        _sentinel,
+        _sentinel,
+    )
+    config = autotuner.TuningConfig(
+        dynamic_tensor_specs=(dynamic_spec,),
+        tensor_initializers=(
+            (0, packed_initializer),
+            (6, autotuner.autotuner_initializer_empty),
+        ),
+        use_cold_l2_cache=True,
+    )
 
-    Args:
-        out: GDN output tensor.
-        final_state: Final recurrent state, when requested.
-        h: Optional backend-native intermediate recurrent checkpoints.
-        h_cu_starts: Optional cumulative checkpoint starts for FlashInfer layout.
-        h_layout: Layout of ``h``.
-    """
-
-    out: torch.Tensor
-    final_state: torch.Tensor | None
-    h: torch.Tensor | None = None
-    h_cu_starts: torch.Tensor | None = None
-    h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
+    assert config.dynamic_tensor_specs[0].input_idx == (0, 6)
+    assert config.tensor_initializers[0] == (0, packed_initializer)
+    assert config.tensor_initializers[1] == (
+        6,
+        autotuner.autotuner_initializer_empty,
+    )

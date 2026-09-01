@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
@@ -115,8 +116,8 @@ class MLAAttnBackend(AttentionBackend):
 
     supports_mla_projected_value_decode = True
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         self._cache_groups_bound = False
         self.max_context_len = config.context_len
@@ -127,15 +128,15 @@ class MLAAttnBackend(AttentionBackend):
         )
         self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
 
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # DFLASH/DSpark draft: the drafter proposes a whole block in one decode
         # forward and needs the block to be non-causal. Rather than a mask, each
@@ -145,7 +146,7 @@ class MLAAttnBackend(AttentionBackend):
         # target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        backend_name = config.backend_name or "mla"
+        backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None

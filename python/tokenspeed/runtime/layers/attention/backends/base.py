@@ -49,7 +49,10 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -129,8 +132,8 @@ _SpeculativeStateBackendT = TypeVar(
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
-    # Capture helpers use a real writable page for every active group when
-    # the backend rejects the reserved null page for live sequence metadata.
+    # Decode-capture helpers use a real writable page for every active group
+    # when the backend validates live-page geometry at metadata init (V4).
     cache_active_pages_must_be_real: bool = False
     supports_mla_projected_value_decode: bool = False
     # Cache families this backend consumes from the pool contract; wrappers
@@ -175,12 +178,14 @@ class AttentionBackend(ABC):
     # unit fixtures that never bind a pool.
     _geometry: CacheGroupGeometry = CacheGroupGeometry()
 
-    def __init__(self, config: BaseAttnConfig) -> None:
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        # ``spec`` is the component this backend serves; hybrid sub-backends
+        # built over the softmax component's plumbing receive that spec.
         self.device = config.device
-        self.num_qo_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
+        self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.dtype = config.dtype
-        self.head_dim = config.head_dim
+        self.head_dim = spec.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
         self.cache_pool: CachePool | None = None

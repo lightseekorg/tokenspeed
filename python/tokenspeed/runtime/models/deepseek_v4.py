@@ -38,13 +38,11 @@ from tokenspeed_kernel import (
     NoKernelFoundError,
     dsa_decode_topk,
     dsa_prefill_topk,
+    dsv4_decode_topk,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
     dsv4_indexer_cache_format,
-    dsv4_indexer_decode_metadata_compute,
-    dsv4_indexer_decode_topk,
-    dsv4_indexer_prefill_topk,
 )
 from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
 from tokenspeed_kernel import (
@@ -54,6 +52,7 @@ from tokenspeed_kernel import (
     dsv4_mega_moe_warmup,
     dsv4_padded_heads,
     dsv4_plan,
+    dsv4_prefill_topk,
 )
 from tokenspeed_kernel import dsv4_select_experts as _kernel_dsv4_select_experts
 from tokenspeed_kernel import (
@@ -62,6 +61,9 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_indexer_decode_metadata_compute,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1057,7 +1059,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     raise RuntimeError(
                         "DeepSeek V4 sparse indexer prefill metadata is incomplete"
                     )
-                topk, next_gathered_k = dsv4_indexer_prefill_topk(
+                topk, next_gathered_k = dsv4_prefill_topk(
                     index_q=(
                         packed_q_values[token_start:token_end],
                         packed_q_scales[token_start:token_end],
@@ -1113,7 +1115,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     device=decode_block_table.device,
                     dtype=torch.int32,
                 )[safe_req_indices]
-            dsv4_indexer_decode_topk(
+            dsv4_decode_topk(
                 index_q=(
                     packed_q_values[decode_start:decode_end],
                     packed_q_scales[decode_start:decode_end],

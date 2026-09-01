@@ -12,10 +12,11 @@ from cutlass import const_expr
 class LLBf16Dotprod:
     """BF16 router GEMM kernel based on CTA-local dot products.
 
-    This kernel computes C[M, N] = A[M, K] @ B[N, K]^T for bf16 inputs
-    and fp32 output. It launches one CTA per output column, distributes K
-    across CTA threads with vectorized loads, accumulates one fp32 dot product
-    per token, and reduces through warp shuffles plus shared memory.
+    This kernel computes C[M, N] = A[M, K] @ B[N, K]^T (+ bias[N]) for bf16
+    inputs, accumulating in fp32 and converting to ``out_dtype`` on store. It
+    launches one CTA per output column, distributes K across CTA threads with
+    vectorized loads, accumulates one fp32 dot product per token, and reduces
+    through warp shuffles plus shared memory.
 
     :param k: Compile-time K dimension specialized into the generated kernel.
     :type k: int
@@ -33,14 +34,15 @@ class LLBf16Dotprod:
     :note: Supported accumulator data types:
         - Float32
     :note: Supported C data types:
-        - Float32
+        - Float32/BFloat16
     :note: Constraints:
         - K must preserve 16-byte row alignment for contiguous bf16 inputs.
 
     :note: K is handled as vectorized main/tail loops plus scalar remainder.
 
-    :compile-key: ``(M, K, bs)`` selects the token count, hidden size,
-        and CTA thread/K-stripe width specialization.
+    :compile-key: ``(M, K, bs, out_dtype, has_bias)`` selects the token count,
+        hidden size, CTA thread/K-stripe width, output element type, and
+        whether the epilogue folds in a bias.
     """
 
     def __init__(
@@ -50,12 +52,14 @@ class LLBf16Dotprod:
         main_vec_width: int = 8,
         tail_vec_width: int = 4,
         use_pdl: bool = False,
+        out_dtype=cutlass.Float32,
+        has_bias: bool = False,
     ):
         """Initialize the dot-product kernel configuration.
 
         This configuration fixes the CTA thread count, reduction warp count,
-        bf16 vector widths, and K-loop decomposition used by the generated
-        kernel.
+        bf16 vector widths, K-loop decomposition, and epilogue used by the
+        generated kernel.
 
         :param k: Hidden size K used to specialize the K-loop decomposition.
         :type k: int
@@ -67,11 +71,17 @@ class LLBf16Dotprod:
         :type tail_vec_width: int
         :param use_pdl: Whether to launch with Programmatic Dependent Launch.
         :type use_pdl: bool
+        :param out_dtype: Element type of C; the FP32 accumulator converts to it.
+        :param has_bias: Whether the epilogue adds a ``[N]`` bias before the
+            output conversion.
+        :type has_bias: bool
         """
         self.bs = bs
         self.main_vec_width = main_vec_width
         self.tail_vec_width = tail_vec_width
         self.use_pdl = use_pdl
+        self.out_dtype = out_dtype
+        self.has_bias = has_bias
         self.num_warps = bs // cute.arch.WARP_SIZE
         self._init_k_tiles(k)
 
@@ -158,6 +168,7 @@ class LLBf16Dotprod:
         gA: cute.Tensor,
         gB: cute.Tensor,
         gC: cute.Tensor,
+        gBias: cute.Tensor,
         M: cutlass.Constexpr,
         K_dim: cutlass.Constexpr,
         N_dim: cutlass.Int32,
@@ -169,7 +180,7 @@ class LLBf16Dotprod:
         - Traverse K with vectorized 128-bit, vectorized 64-bit, scalar, and
           ragged-tail loops from the precomputed K decomposition.
         - Reduce each token accumulator first within the warp, then across
-          warps through shared memory, and store ``C[:, n]``.
+          warps through shared memory, add the bias, and store ``C[:, n]``.
 
         :param gA: Input tensor A with shape ``[M, K]``.
         :type gA: cute.Tensor
@@ -177,6 +188,10 @@ class LLBf16Dotprod:
         :type gB: cute.Tensor
         :param gC: Output tensor C with shape ``[M, N]``.
         :type gC: cute.Tensor
+        :param gBias: Bias tensor with shape ``[N]``, read only when the
+            kernel was built with ``has_bias``; otherwise a same-typed
+            placeholder the kernel never touches.
+        :type gBias: cute.Tensor
         :param M: Token count selected by the compile key.
         :type M: cutlass.Constexpr
         :param K_dim: Hidden size selected by the compile key.
@@ -190,6 +205,7 @@ class LLBf16Dotprod:
             gA,
             gB,
             gC,
+            gBias,
             M,
             self.main_vec_width,
             self.tail_vec_width,
@@ -219,6 +235,7 @@ class LLBf16Dotprod:
         gA: cute.Tensor,
         gB: cute.Tensor,
         gC: cute.Tensor,
+        gBias: cute.Tensor,
         M: cutlass.Constexpr,
         main_vec_width: cutlass.Constexpr,
         tail_vec_width: cutlass.Constexpr,
@@ -302,10 +319,15 @@ class LLBf16Dotprod:
         if tidx == 0:
             for m in cutlass.range_constexpr(M):
                 partials = sm[m, None].load()
-                gC[m, n_idx] = partials.reduce(
-                    cute.ReductionOp.ADD,
-                    init_val=cutlass.Float32(0.0),
-                    reduction_profile=0,
+                acc_m = cutlass.Float32(
+                    partials.reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=cutlass.Float32(0.0),
+                        reduction_profile=0,
+                    )
                 )
+                if const_expr(self.has_bias):
+                    acc_m = acc_m + gBias[n_idx].to(cutlass.Float32)
+                gC[m, n_idx] = acc_m.to(self.out_dtype)
         if const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()

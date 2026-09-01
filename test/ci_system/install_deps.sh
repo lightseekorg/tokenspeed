@@ -240,7 +240,7 @@ FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
     case "${FLASHINFER_VERSION}" in
-        0.6.16) FLASHINFER_CUBIN_SHA256="6af91f9fdae7b6fd0282f891cbcae3416afdd2c4c14783649d04d1dd83cddee5" ;;
+        0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,

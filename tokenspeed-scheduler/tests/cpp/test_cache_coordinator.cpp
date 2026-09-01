@@ -2536,7 +2536,7 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     CacheFullBlocksForTest(coordinator, tables, hashes, /*first_slot=*/0);
     std::vector<CacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
 
-    ASSERT_EQ(pending.size(), 4u);  // 2 pages x 2 groups, group-wrapped keys
+    ASSERT_EQ(pending.size(), 2u);  // sliding-window group only; full-attention deferred
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
     for (const BlockTable& table : tables) {
         for (const CacheBlockRef& block_ref : table.Blocks()) {
@@ -2546,10 +2546,9 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     // Typed keys keep the group distinct without changing the content hash.
     std::unordered_set<CacheKey, CacheKeyHash> keys;
     for (const auto& c : pending) keys.insert(c.key);
-    EXPECT_EQ(keys.size(), 4u);
-    // Collection is group-major: 2 pages for group 0, then 2 for group 1.
+    EXPECT_EQ(keys.size(), 2u);
     for (std::size_t i = 0; i < pending.size(); ++i) {
-        EXPECT_EQ(pending[i].key, Key(hashes[i % 2], static_cast<std::uint32_t>(i / 2))) << "candidate " << i;
+        EXPECT_EQ(pending[i].key, Key(hashes[i], /*group_id=*/1)) << "candidate " << i;
     }
 
     // Re-registering the same hashes yields nothing new (IsCached skip).
@@ -2576,6 +2575,135 @@ TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
     CacheFullBlocksForTest(coordinator, tables, hashes, 0);
     EXPECT_TRUE(coordinator.TakePendingStores().empty());
+    coordinator.Free(tables);
+}
+
+TEST(CacheCoordinatorStoreCandidates, PrefillPublicationStreamsFullAndStateDecodePublicationDoesNot) {
+    BlockPool pool(24);
+    BlockPool host_pool(24);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kSlidingWindow,
+            .sliding_window = 8,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kMambaState,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, &host_pool, /*stream_device_cache_to_host=*/true);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+
+    coordinator.CacheCompletedBlocks(tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                     /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
+                                     /*stream_completed_to_host=*/true);
+    std::vector<CacheCoordinator::StoreCandidate> prefill = coordinator.TakePendingStores();
+    ASSERT_EQ(prefill.size(), 5u);
+    EXPECT_EQ(prefill[0].key, Key(hashes[0], /*group_id=*/0));
+    EXPECT_EQ(prefill[1].key, Key(hashes[1], /*group_id=*/0));
+    EXPECT_EQ(prefill[2].key, Key(hashes[0], /*group_id=*/1));
+    EXPECT_EQ(prefill[3].key, Key(hashes[1], /*group_id=*/1));
+    EXPECT_EQ(prefill[4].key, Key(hashes[1], /*group_id=*/2));
+
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+    std::vector<std::string> decode_hashes = hashes;
+    decode_hashes.push_back(ContentHashes({{5, 6}})[0]);
+    coordinator.CacheCompletedBlocks(tables, decode_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                     /*first_new_prefix_page=*/2, /*num_computed_tokens=*/6, CacheBoundaryKind::kChunk,
+                                     /*stream_completed_to_host=*/false);
+    std::vector<CacheCoordinator::StoreCandidate> decode = coordinator.TakePendingStores();
+    ASSERT_EQ(decode.size(), 1u);
+    EXPECT_EQ(decode[0].key, Key(decode_hashes[2], /*group_id=*/1));
+
+    coordinator.QueueCachedBlocksForStore(decode_hashes);
+    coordinator.QueueLatestSnapshotBlocksForStore(decode_hashes);
+    std::vector<CacheCoordinator::StoreCandidate> finish = coordinator.TakePendingStores();
+    ASSERT_EQ(finish.size(), 7u);
+    EXPECT_EQ(finish[0].key, Key(decode_hashes[0], /*group_id=*/0));
+    EXPECT_EQ(finish[1].key, Key(decode_hashes[1], /*group_id=*/0));
+    EXPECT_EQ(finish[2].key, Key(decode_hashes[2], /*group_id=*/0));
+    EXPECT_EQ(finish[3].key, Key(decode_hashes[0], /*group_id=*/1));
+    EXPECT_EQ(finish[4].key, Key(decode_hashes[1], /*group_id=*/1));
+    EXPECT_EQ(finish[5].key, Key(decode_hashes[2], /*group_id=*/1));
+    EXPECT_EQ(finish[6].key, Key(decode_hashes[2], /*group_id=*/2));
+    coordinator.Free(tables);
+}
+
+TEST(CacheCoordinatorStoreCandidates, PrefillStreamsThreeKdaGroupsDecodeFinishWritesLatestOnly) {
+    BlockPool pool(32);
+    BlockPool host_pool(32);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kMambaState,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kMambaState,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kMambaState,
+            .sliding_window = 0,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, &host_pool, /*stream_device_cache_to_host=*/true);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+
+    coordinator.CacheCompletedBlocks(tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                     /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kChunk,
+                                     /*stream_completed_to_host=*/true);
+    std::vector<CacheCoordinator::StoreCandidate> prefill = coordinator.TakePendingStores();
+    ASSERT_EQ(prefill.size(), 5u) << "2 MLA pages plus one snapshot from each of 3 KDA groups";
+    EXPECT_EQ(prefill[0].key, Key(hashes[0], /*group_id=*/0));
+    EXPECT_EQ(prefill[1].key, Key(hashes[1], /*group_id=*/0));
+    EXPECT_EQ(prefill[2].key, Key(hashes[1], /*group_id=*/1));
+    EXPECT_EQ(prefill[3].key, Key(hashes[1], /*group_id=*/2));
+    EXPECT_EQ(prefill[4].key, Key(hashes[1], /*group_id=*/3));
+
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+    std::vector<std::string> decode_hashes = hashes;
+    decode_hashes.push_back(ContentHashes({{5, 6}})[0]);
+    coordinator.CacheCompletedBlocks(tables, decode_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                     /*first_new_prefix_page=*/2, /*num_computed_tokens=*/6, CacheBoundaryKind::kChunk,
+                                     /*stream_completed_to_host=*/false);
+    EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "decode publication must not auto-stream MLA or KDA";
+
+    coordinator.QueueCachedBlocksForStore(decode_hashes);
+    coordinator.QueueLatestSnapshotBlocksForStore(decode_hashes);
+    std::vector<CacheCoordinator::StoreCandidate> finish = coordinator.TakePendingStores();
+    ASSERT_EQ(finish.size(), 6u) << "all MLA pages plus the latest snapshot per KDA group";
+    EXPECT_EQ(finish[0].key, Key(decode_hashes[0], /*group_id=*/0));
+    EXPECT_EQ(finish[1].key, Key(decode_hashes[1], /*group_id=*/0));
+    EXPECT_EQ(finish[2].key, Key(decode_hashes[2], /*group_id=*/0));
+    EXPECT_EQ(finish[3].key, Key(decode_hashes[2], /*group_id=*/1));
+    EXPECT_EQ(finish[4].key, Key(decode_hashes[2], /*group_id=*/2));
+    EXPECT_EQ(finish[5].key, Key(decode_hashes[2], /*group_id=*/3));
     coordinator.Free(tables);
 }
 
@@ -2679,6 +2807,199 @@ std::int32_t HostPut(CacheCoordinator& coordinator, BlockPool& host_pool, const 
         .Register(host_pool, block_ref, key, NextTestAccessEpoch());
     block_ref.reset();
     return id;
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
+    BlockPool device_pool(4);
+    BlockPool host_pool(2);
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 2,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    HostPut(coordinator, host_pool, "old-0", 0);
+    HostPut(coordinator, host_pool, "old-1", 0);
+    HostPut(coordinator, host_pool, "old-2", 0);
+    HostPut(coordinator, host_pool, "old-3", 0);
+
+    const std::array<std::uint32_t, 3> groups{0, 0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.requested, 3u);
+    EXPECT_EQ(batch.stats.allocated, 3u);
+    EXPECT_EQ(batch.stats.unallocated, 0u);
+    EXPECT_EQ(batch.stats.same_group_scans, 1u);
+    EXPECT_EQ(batch.stats.cross_group_scans, 0u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {
+    BlockPool device_pool(2);
+    BlockPool host_pool(2);
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(pinned);
+    coordinator.CacheHostBlock(pinned, Key("pinned", 0));
+
+    const std::array<std::uint32_t, 2> groups{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    EXPECT_TRUE(batch.blocks[0]);
+    EXPECT_FALSE(batch.blocks[1]);
+    EXPECT_EQ(batch.stats.requested, 2u);
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    EXPECT_EQ(batch.stats.unallocated, 1u);
+    EXPECT_EQ(batch.stats.same_group_scans, 1u);
+    EXPECT_EQ(batch.stats.cross_group_scans, 1u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandidateGroup) {
+    BlockPool device_pool(2);
+    BlockPool host_pool(1);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+
+    const std::array<std::uint32_t, 2> groups{1, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    ASSERT_TRUE(batch.blocks[0]);
+    EXPECT_EQ(host_pool.BoundGroup(batch.blocks[0]->Location().lcm_block_id), 1u);
+    EXPECT_FALSE(batch.blocks[1]);
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    EXPECT_EQ(batch.stats.unallocated, 1u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchGivesInterleavedGroupsFreeCapacityInCandidateOrder) {
+    BlockPool device_pool(3);
+    BlockPool host_pool(2);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+
+    const std::array<std::uint32_t, 3> groups{0, 1, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    ASSERT_TRUE(batch.blocks[0]);
+    EXPECT_EQ(host_pool.BoundGroup(batch.blocks[0]->Location().lcm_block_id), 0u);
+    ASSERT_TRUE(batch.blocks[1]);
+    EXPECT_EQ(host_pool.BoundGroup(batch.blocks[1]->Location().lcm_block_id), 1u);
+    EXPECT_FALSE(batch.blocks[2]);
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    EXPECT_EQ(batch.stats.unallocated, 1u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) {
+    BlockPool device_pool(4);
+    BlockPool host_pool(2);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    HostPut(coordinator, host_pool, "old-0", 0);
+    HostPut(coordinator, host_pool, "old-1", 0);
+    HostPut(coordinator, host_pool, "old-2", 0);
+    HostPut(coordinator, host_pool, "old-3", 0);
+
+    const std::array<std::uint32_t, 3> groups{1, 1, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    ASSERT_TRUE(batch.blocks[0]);
+    ASSERT_TRUE(batch.blocks[1]);
+    ASSERT_TRUE(batch.blocks[2]);
+    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, batch.blocks[1]->Location().lcm_block_id);
+    EXPECT_NE(batch.blocks[0]->Location().slot_index, batch.blocks[1]->Location().slot_index);
+    EXPECT_EQ(host_pool.BoundGroup(batch.blocks[0]->Location().lcm_block_id), 1u);
+    EXPECT_EQ(host_pool.BoundGroup(batch.blocks[2]->Location().lcm_block_id), 0u);
+    EXPECT_NE(batch.blocks[0]->Location().lcm_block_id, batch.blocks[2]->Location().lcm_block_id);
+    EXPECT_EQ(batch.stats.same_group_scans, 2u);
+    EXPECT_EQ(batch.stats.cross_group_scans, 1u);
+    EXPECT_EQ(batch.stats.allocated, 3u);
+    EXPECT_EQ(batch.stats.unallocated, 0u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlacementPoolPerVictim) {
+    BlockPool device_pool(4);
+    BlockPool host_pool(2);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    HostPut(coordinator, host_pool, "old-0", 0);
+    HostPut(coordinator, host_pool, "old-1", 0);
+    HostPut(coordinator, host_pool, "old-2", 0);
+    HostPut(coordinator, host_pool, "old-3", 0);
+
+    const std::array<std::uint32_t, 3> groups{1, 1, 1};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.cross_group_scans, 1u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCacheValueParent) {
+    BlockPool device_pool(3);
+    BlockPool host_pool(2);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    const std::int32_t older_parent = HostPut(coordinator, host_pool, "older", 0);
+    const std::int32_t newer_parent = HostPut(coordinator, host_pool, "newer", 1);
+
+    const std::array<std::uint32_t, 1> groups{2};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_TRUE(batch.blocks[0]);
+    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, older_parent);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("older", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("newer", 1)));
+    EXPECT_EQ(host_pool.BoundGroup(newer_parent), 1u);
+}
+
+TEST(CacheCoordinatorHostReplacement, BatchDoesNotRebindPinnedParent) {
+    BlockPool device_pool(2);
+    BlockPool host_pool(1);
+    const std::array specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    HostPut(coordinator, host_pool, "old-0", 0);
+    HostPut(coordinator, host_pool, "old-1", 0);
+    CacheBlockRef pinned = coordinator.GroupPrefixIndex(0).Find(host_pool, Key("old-0", 0));
+    ASSERT_TRUE(pinned);
+
+    const std::array<std::uint32_t, 1> groups{1};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups);
+
+    ASSERT_EQ(batch.blocks.size(), groups.size());
+    EXPECT_FALSE(batch.blocks[0]);
+    EXPECT_EQ(host_pool.BoundGroup(1), 0u);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+    EXPECT_EQ(batch.stats.cross_group_scans, 1u);
+    EXPECT_EQ(batch.stats.allocated, 0u);
+    EXPECT_EQ(batch.stats.unallocated, 1u);
 }
 
 // Cache slots [0, blocks) in the DEVICE pool for every group, so the merged MatchPrefix's

@@ -22,10 +22,43 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
-def _spec(group_id: str, *, family: str = "history", **fields) -> SimpleNamespace:
-    """A published group-spec double. ``family`` decides state vs history, so
-    it is never inferred from the group id."""
-    return SimpleNamespace(group_id=group_id, family=family, **fields)
+def _spec(
+    group_id: str,
+    *,
+    family: str = "history",
+    block_granularity: int = 64,
+    retention: str = "full_history",
+    sliding_window_tokens: int | None = None,
+):
+    """A published group spec.
+
+    The real dataclass, not a namespace: it derives ``block_granularity`` from
+    the geometry the way production does, refuses ``page_size`` on a
+    checkpoint-state group, and carries ``retention`` -- which the width rule
+    deliberately ignores, and which a namespace double cannot express at all,
+    so ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
+    written against one.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        CacheGroupSpec,
+    )
+
+    if family == "state":
+        return CacheGroupSpec(
+            group_id=group_id,
+            retention=retention,
+            family="state",
+            checkpoint_granularity=block_granularity,
+            sliding_window_tokens=sliding_window_tokens,
+        )
+    return CacheGroupSpec(
+        group_id=group_id,
+        retention=retention,
+        family=family,
+        rows_per_page=block_granularity,
+        entry_stride_tokens=1,
+        sliding_window_tokens=sliding_window_tokens,
+    )
 
 
 def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
@@ -33,6 +66,13 @@ def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
     return SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=tuple(specs), **arena_attrs)
     )
+
+
+def _backend(**attrs) -> SimpleNamespace:
+    """An attention-backend double. Interface attributes the production code
+    reads directly (no getattr probes) must be declared explicitly."""
+    attrs.setdefault("cache_active_pages_must_be_real", False)
+    return SimpleNamespace(**attrs)
 
 
 class SliceMhaExtendInputsTest(unittest.TestCase):
@@ -102,8 +142,13 @@ class TrimKvToLocsTest(unittest.TestCase):
         self.assertEqual(self.trim(locs, None, None), (None, None))
 
 
+class _StopAfterSpy(Exception):
+    """Raised by the spy to stop make_dummy_batch at the seam under test."""
+
+
 class DummyGroupTablesTest(unittest.TestCase):
-    """Capture-time dummy tables: null KV pages and writable state pages."""
+    """Capture-time dummy tables: every group gets a real, writable block;
+    none get the reserved null block 0."""
 
     def setUp(self):
         try:
@@ -118,57 +163,92 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.attn_backend = backend
         pg.token_to_kv_pool = pool
-        pg.config = SimpleNamespace(device="cpu")
+        pg.config = SimpleNamespace(
+            device="cpu",
+            physical_context_len=1000,
+            spec_num_tokens=None,
+            overlap_schedule_depth=0,
+        )
         return pg
 
-    def test_backend_gets_writable_state_tables(self):
-        backend = SimpleNamespace(
-            kernel_page_size=32,
-            max_num_pages=0,  # fall back to bucket-derived width
-            state_group_ids=frozenset({"linear_attention"}),
-            cache_active_pages_must_be_real=False,
-        )
+    def test_every_group_gets_a_real_block(self):
+        backend = _backend()
         pool = _fake_pool(
             specs=(
-                _spec("full_attention"),
-                _spec("sliding_attention"),
-                _spec("linear_attention", family="state"),  # state: included
+                _spec("full_attention", block_granularity=64),
+                _spec("sliding_attention", block_granularity=64),
+                # state: included
+                _spec("linear_attention", family="state", block_granularity=128),
             )
         )
-        tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
+        tables = self._bare(backend, pool)._dummy_group_tables(1)
         self.assertEqual(
             set(tables),
             {"full_attention", "sliding_attention", "linear_attention"},
         )
-        for t in tables.values():
-            self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
-        self.assertEqual(int(tables["full_attention"].abs().sum()), 0)
-        self.assertEqual(int(tables["sliding_attention"].abs().sum()), 0)
-        self.assertTrue(
-            bool((tables["linear_attention"] == 1).all()),
-            "state checkpoints need a writable dummy page during graph capture",
-        )
+        # Each group in its own grain, rounded UP: 1000 is a multiple of
+        # neither, so a floor would give 15 and 7 and fail here.
+        self.assertEqual(tables["full_attention"].shape, (1, 16))
+        self.assertEqual(tables["linear_attention"].shape, (1, 8))
+        for group_id, table in tables.items():
+            self.assertGreater(
+                int(table.min()),
+                0,
+                f"{group_id}: capture writes KV, so no group may get the "
+                "reserved null block",
+            )
 
-    def test_full_width_for_stride_deriving_backends(self):
-        # trtllm-style: row stride comes from max_kv_len, so dummy tables
-        # must span the full table width, not just the bucket.
-        backend = SimpleNamespace(
-            kernel_page_size=32,
-            max_num_pages=2500,
-            state_group_ids=frozenset(),
-            cache_active_pages_must_be_real=False,
+    def test_width_spans_the_extent_at_a_realistic_magnitude(self):
+        """Width is ceil(physical extent / grain), at a size where a silent
+        cap would hide -- every other fixture here is a few hundred columns."""
+        bare = self._bare(
+            _backend(),
+            _fake_pool(specs=(_spec("full_attention", block_granularity=64),)),
         )
-        pool = _fake_pool(specs=(_spec("full_attention"),))
-        tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
-        self.assertEqual(tables["full_attention"].shape, (1, 2500))
+        bare.config.physical_context_len = 262144
+        self.assertEqual(bare._dummy_group_tables(1)["full_attention"].shape[1], 4096)
 
-    def test_real_active_page_contract_uses_per_group_geometry(self):
-        backend = SimpleNamespace(
-            cache_active_pages_must_be_real=True,
-            prefix_granularity=256,
-            max_num_pages=257,
-            state_group_ids=frozenset(),
+    def test_sliding_window_group_still_spans_the_whole_extent(self):
+        """A sliding group must NOT be narrowed to its window.
+
+        The decode capture helper bounds a sliding row by the window, because
+        a decode row describes live cache history. Capture fabricates one
+        extend over the whole extent and derives a write column for every
+        position in it, so the window bound underflows the table. Measured on
+        Inkling: a window-sized ``sliding_attention_0`` row got 6 columns and
+        the extend needed 63 -- "extend write locations out of table bounds",
+        boot dead. This asserts the width that survives.
+        """
+        pool = _fake_pool(
+            specs=(
+                _spec("full_attention", block_granularity=128),
+                _spec(
+                    "sliding_attention",
+                    block_granularity=128,
+                    retention="sliding_window",
+                    sliding_window_tokens=128,
+                ),
+            )
         )
+        bare = self._bare(_backend(), pool)
+        bare.config.physical_context_len = 8192
+
+        tables = bare._dummy_group_tables(1)
+        self.assertEqual(tables["full_attention"].shape[1], 64)
+        self.assertEqual(
+            tables["sliding_attention"].shape[1],
+            64,
+            "retention must not narrow a capture row; the window bound is a "
+            "decode-side answer to a different question",
+        )
+        # The bound the runtime actually enforces, restated here so the number
+        # above is tied to it: ceil-1 of the largest position in the extend.
+        self.assertLess((8192 - 1) // 128, tables["sliding_attention"].shape[1])
+
+    def test_width_follows_each_groups_own_geometry(self):
+        # DeepSeek-V4 shape: sibling groups with very different grains. Each
+        # gets ceil(extent / its own granularity) -- one rule, no width flag.
+        backend = _backend()
         pool = _fake_pool(
             specs=(
                 _spec("fine", block_granularity=4),
@@ -176,40 +256,361 @@ class DummyGroupTablesTest(unittest.TestCase):
             )
         )
 
-        tables = self._bare(backend, pool)._dummy_group_tables(65536, 1)
+        # 1000 % 256 != 0, so a floor would give 3 for the coarse group.
+        tables = self._bare(backend, pool)._dummy_group_tables(1)
 
-        self.assertEqual(tables["fine"].shape, (1, 16384))
-        self.assertEqual(tables["coarse"].shape, (1, 256))
-        self.assertTrue(bool((tables["fine"] == 1).all()))
-        self.assertTrue(bool((tables["coarse"] == 1).all()))
+        self.assertEqual(tables["fine"].shape, (1, 250))  # ceil(1000/4)
+        self.assertEqual(tables["coarse"].shape, (1, 4))  # ceil(1000/256)
+        self.assertGreater(int(tables["fine"].min()), 0)
+        self.assertGreater(int(tables["coarse"].min()), 0)
 
-    def test_composite_wrapper_resolves_grouped_cache_child(self):
-        # Hybrid wrappers set the flag but hold the paged KV consumer as
-        # full_attn_backend; the helper must not AttributeError (which would
-        # silently disable the prefill graph via the capture fallback).
-        child = SimpleNamespace(
-            kernel_page_size=32,
-            max_num_pages=0,
-            state_group_ids=frozenset(),
-            cache_active_pages_must_be_real=False,
-        )
-        wrapper = SimpleNamespace(full_attn_backend=child)
+    def test_hybrid_wrapper_needs_no_child_descent(self):
+        # A hybrid wrapper carries no kernel geometry of its own; the one
+        # width rule needs none, so the wrapper alone must produce tables
+        # for every group, state included.
+        wrapper = _backend()
         pool = _fake_pool(
             specs=(
-                _spec("full_attention"),
-                _spec("linear_attention", family="state"),
+                _spec("full_attention", block_granularity=128),
+                _spec("linear_attention", family="state", block_granularity=128),
             )
         )
-        tables = self._bare(wrapper, pool)._dummy_group_tables(64, 1)
+        tables = self._bare(wrapper, pool)._dummy_group_tables(1)
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
-        self.assertEqual(tables["full_attention"].shape, (1, 2))
+        self.assertEqual(tables["full_attention"].shape, (1, 8))  # ceil(1000/128)
+
+    def test_each_capture_row_gets_its_own_block(self):
+        """A state group needs one working block per request: two rows sharing
+        one silently clobber each other. The runtime check is gated on
+        TOKENSPEED_CACHE_DEBUG, so a regression would be silent and this test
+        is the guard. Reachable at bs>1, which ``_autotune`` produces whenever
+        the chunk budget exceeds the model context -- and ``_autotune`` runs
+        even with the prefill graph disabled."""
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+            compute_state_block_indices,
+        )
+
+        pool = _fake_pool(
+            specs=(
+                _spec("full_attention", block_granularity=64),
+                _spec("linear_attention", family="state", block_granularity=128),
+            )
+        )
+        bare = self._bare(_backend(), pool)
+        bare.config.physical_context_len = 1024
+        tables = bare._dummy_group_tables(3)
+        for group_id, table in tables.items():
+            self.assertEqual(table.shape[0], 3, group_id)
+            self.assertGreater(int(table.min()), 0, group_id)
+            # The state path gathers at (seq_len - 1) // grain -- the LAST live
+            # column, never column 0. Asserting only on column 0 admits a table
+            # that aliases everywhere the runtime actually reads.
+            last_column = table[:, -1].tolist()
+            self.assertEqual(
+                len(set(last_column)),
+                3,
+                f"{group_id}: rows alias at the column the state path reads, "
+                f"got {last_column}",
+            )
+        # Strongest form: hand the shipped table to the production helper and
+        # let its own uniqueness rule be the assertion.
+        compute_state_block_indices(
+            tables["linear_attention"],
+            128,
+            torch.zeros(3, dtype=torch.int32),
+            torch.full((3,), 1024, dtype=torch.int32),
+            validate=True,
+        )
+
+    def test_expanded_row_reaches_the_kernels_full_width(self):
+        """The width is stated in block granularity, but a stride-deriving
+        kernel (trtllm) indexes the whole row. The safety step is the mapping
+        point: ``_kernel_page_tables`` re-expands to ``max_num_pages``. Pin
+        that, or the contract the deleted width flag protected has no test."""
+        from tokenspeed.runtime.layers.attention.backends.base import (
+            AttentionBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+            CacheGroupGeometry,
+        )
+
+        spec = _spec("full_attention", block_granularity=128)
+        bare = self._bare(_backend(), _fake_pool(specs=(spec,)))
+        bare.config.physical_context_len = 8192
+        tables = bare._dummy_group_tables(1)
+
+        host = SimpleNamespace(
+            kernel_page_size=64,
+            max_num_pages=-(-8192 // 64),
+            _geometry=CacheGroupGeometry(
+                granularities={"full_attention": 128},
+                history_block_granularity=128,
+            ),
+            _group_block_granularity=lambda gid: 128,
+            _consumer_page_size=lambda gid: 64,
+        )
+        expanded = AttentionBackend._kernel_page_tables(host, dict(tables))
+
+        self.assertEqual(
+            expanded["full_attention"].shape[1],
+            host.max_num_pages,
+            "the expanded row must span the width the kernel derives from "
+            "max_kv_len",
+        )
+        self.assertGreater(int(expanded["full_attention"].min()), 0)
+
+        # Padded max_num_pages: TRTLLM-MLA rounds its width up to a block
+        # constraint, so the expansion tail is zero-filled past the live
+        # range. The contract is "no null block INSIDE the live range"; a
+        # blanket min() > 0 passes above only because 8192/128*2 lands exactly
+        # on 128, an arithmetic accident this case removes.
+        host.max_num_pages = 130
+        padded = AttentionBackend._kernel_page_tables(host, dict(tables))
+        live = -(-8192 // host.kernel_page_size)
+        self.assertEqual(padded["full_attention"].shape[1], 130)
+        self.assertGreater(
+            int(padded["full_attention"][:, :live].min()),
+            0,
+            "the live prefix must never contain the reserved null block",
+        )
+
+    def _dummy_batch_probe(
+        self,
+        *,
+        num_tokens,
+        context_len,
+        physical,
+        specs,
+        cache_active_pages_must_be_real=False,
+        arena_blocks=64,
+    ):
+        """Drive make_dummy_batch to the backend hand-off and record it.
+
+        Stops at ``init_forward_metadata`` -- one statement past everything
+        the capture path builds -- so the real ``CacheBatchMetadata`` and the
+        real ``block_tables_from_forward_op`` run on the way. Those enforce
+        int32, row count against the batch, non-zero width, contract group
+        order, and every entry inside ``group_page_counts - 1``; a capture
+        they refuse kills the boot, so they are the assertion.
+        """
+        from unittest import mock
+
+        import torch
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        # The contract requires group_page_counts == num_lcm_blocks * packing
+        # + 1; the +1 is the reserved null block every table can point at.
+        num_lcm_blocks = arena_blocks
+        contract = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=num_lcm_blocks,
+            token_capacity=num_lcm_blocks * 64,
+            group_specs=tuple(specs),
+            group_page_counts={str(sp.group_id): num_lcm_blocks + 1 for sp in specs},
+            group_packing={str(sp.group_id): 1 for sp in specs},
+        )
+        pg = self.PrefillGraph.__new__(self.PrefillGraph)
+        pg.attn_backend = _backend(
+            cache_active_pages_must_be_real=cache_active_pages_must_be_real,
+        )
+        pg.token_to_kv_pool = _fake_pool(specs=tuple(specs), runtime_contract=contract)
+        pg.config = SimpleNamespace(
+            device="cpu",
+            context_len=context_len,
+            physical_context_len=physical,
+            world_size=1,
+        )
+        pg.dp_size = 1
+        pg.drafter = None
+        buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
+        pg.input_buffers = SimpleNamespace(
+            dummy_kv_slot=0,
+            input_ids_buf=buf(4096, torch.int32),
+            out_cache_loc_buf=buf(4096, torch.int32),
+            positions_buf=buf(4096, torch.int64),
+            req_pool_indices_buf=buf(16, torch.int32),
+            seq_lens_buf=buf(16, torch.int32),
+            extend_seq_lens_buf=buf(16, torch.int32),
+            extend_seq_lens_cpu=buf(16, torch.int32),
+            extend_prefix_lens_buf=buf(16, torch.int32),
+            extend_prefix_lens_cpu=buf(16, torch.int32),
+        )
+        pg.page_table = torch.zeros(16, 64, dtype=torch.int32)
+
+        seen = {}
+
+        def _record(**kwargs):
+            seen.update(kwargs)
+            # The row-constant table is legal only for a prefix-free extend:
+            # with history the state gather resolves in == out and refuses.
+            seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
+            raise _StopAfterSpy
+
+        pg.attn_backend.init_forward_metadata = _record
+        with mock.patch(
+            "tokenspeed.runtime.execution.prefill_graph.ForwardContext",
+            lambda **kw: SimpleNamespace(**kw),
+        ):
+            with self.assertRaises(_StopAfterSpy):
+                pg.make_dummy_batch(num_tokens)
+        return seen
+
+    def test_make_dummy_batch_tables_survive_the_cache_contract(self):
+        """The real validator sees the tables, and rows track the batch."""
+        spec = _spec("full_attention", block_granularity=64)
+        # 2048 tokens over a 960 context is three fabricated requests, so a
+        # rule that collapsed rows to one would be visible here.
+        seen = self._dummy_batch_probe(
+            num_tokens=2048, context_len=960, physical=1024, specs=(spec,)
+        )
+        tables = seen["block_tables"]
+        table = tables["full_attention"]
+        self.assertEqual(table.shape[0], 3, "one row per fabricated request")
+        # physical (1024), not the user-facing context_len (960): 16 vs 15.
+        self.assertEqual(table.shape[1], 16)
+        self.assertGreater(int(table.min()), 0)
+        self.assertIsNotNone(seen.get("cache_metadata"))
+        # The tables are built on the host; the packer's output is what the
+        # backend gets, and it must land on the configured device. Nothing
+        # else re-places them, so this assertion is the whole device contract.
+        self.assertEqual(table.device.type, "cpu")
+        self.assertEqual(seen["max_prefix"], 0, "capture fabricates no prefix")
+
+    def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
+        """A backend that validates live-page geometry (V4) is told how many
+        tokens the batch carries and handed the live positions slice, and it
+        still gets the metadata-derived tables. The decode wrapper is not
+        consulted: capture builds its own distinct-block tables."""
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=128,
+            context_len=960,
+            physical=1024,
+            specs=(spec,),
+            cache_active_pages_must_be_real=True,
+        )
+        self.assertEqual(seen["num_tokens"], 128)
+        self.assertEqual(seen["positions"].shape[0], 128)
+        self.assertIn("full_attention", seen["block_tables"])
+
+    def test_block_ids_are_checked_against_the_groups_real_block_count(self):
+        """The probe's default arena has ~20x slack, so an id error would not
+        reach the packer. Shrink it until the bound is tight and confirm the
+        packer -- not this test -- is what rejects an out-of-range id."""
+        spec = _spec("full_attention", block_granularity=64)
+        # 2 blocks + the reserved null one: bs=2 fits, bs=3 does not.
+        self._dummy_batch_probe(
+            num_tokens=1920,
+            context_len=960,
+            physical=1024,
+            specs=(spec,),
+            arena_blocks=2,
+        )
+        with self.assertRaises(ValueError) as caught:
+            self._dummy_batch_probe(
+                num_tokens=2880,
+                context_len=960,
+                physical=1024,
+                specs=(spec,),
+                arena_blocks=2,
+            )
+        self.assertIn("page ID outside", str(caught.exception))
+
+    def test_ceiling_is_exact_at_the_residue_that_distinguishes_it(self):
+        """Pin the rounding at the only residue where it shows.
+
+        Every other fixture here uses an extent where ceil(N/g) == ceil((N-1)/g),
+        so an off-by-one in the extent is invisible. At physical % grain == 1 the
+        two differ, and one column short is the "extend write locations out of
+        table bounds" dead boot.
+        """
+        spec = _spec("full_attention", block_granularity=64)
+        bare = self._bare(_backend(), _fake_pool(specs=(spec,)))
+        bare.config.physical_context_len = 4097
+
+        cols = bare._dummy_group_tables(1)["full_attention"].shape[1]
+        self.assertEqual(cols, 65)  # ceil(4097/64); extent-1 would give 64
+        # Restate the bound the runtime enforces so the constant is tied to it.
+        self.assertGreater(cols, (4097 - 1) // 64)
+
+    def test_degenerate_extent_still_yields_one_column(self):
+        """A non-positive extent is not reachable through ServerArgs, but the
+        clamp is what keeps a zero-width table -- which the contract packer
+        rejects outright -- from being the failure mode."""
+        spec = _spec("full_attention", block_granularity=64)
+        bare = self._bare(_backend(), _fake_pool(specs=(spec,)))
+        for extent in (0, -8):
+            bare.config.physical_context_len = extent
+            self.assertEqual(
+                bare._dummy_group_tables(1)["full_attention"].shape[1], 1, extent
+            )
+
+    def test_group_tables_are_required_when_the_backend_needs_real_pages(self):
+        """``cache_active_pages_must_be_real`` against a groupless pool must
+        fail loudly. A bare assert would vanish under -O, which is exactly
+        when a silent empty dict would be worst. (A groupless pool cannot even
+        build a runtime contract, so the raise is guarded at the graph level:
+        drive make_dummy_batch directly over a spec-free arena.)"""
+        import torch
+
+        bare = self._bare(
+            _backend(cache_active_pages_must_be_real=True), _fake_pool(specs=())
+        )
+        bare.config.context_len = 960
+        bare.config.world_size = 1
+        bare.dp_size = 1
+        bare.drafter = None
+        buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
+        bare.input_buffers = SimpleNamespace(
+            dummy_kv_slot=0,
+            input_ids_buf=buf(4096, torch.int32),
+            out_cache_loc_buf=buf(4096, torch.int32),
+            positions_buf=buf(4096, torch.int64),
+            req_pool_indices_buf=buf(16, torch.int32),
+            seq_lens_buf=buf(16, torch.int32),
+            extend_seq_lens_buf=buf(16, torch.int32),
+            extend_seq_lens_cpu=buf(16, torch.int32),
+            extend_prefix_lens_buf=buf(16, torch.int32),
+            extend_prefix_lens_cpu=buf(16, torch.int32),
+        )
+        bare.page_table = torch.zeros(16, 64, dtype=torch.int32)
+        from unittest import mock
+
+        with mock.patch(
+            "tokenspeed.runtime.execution.prefill_graph.ForwardContext",
+            lambda **kw: SimpleNamespace(**kw),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                bare.make_dummy_batch(128)
+        self.assertIn("requires real active pages", str(caught.exception))
 
     def test_pool_without_groups_is_empty(self):
-        backend = SimpleNamespace(
-            kernel_page_size=64, cache_active_pages_must_be_real=False
-        )
+        backend = _backend()
         pool = _fake_pool(specs=())
-        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
+        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(1), {})
+
+    def test_mla_target_gets_tables_from_the_pool_alone(self):
+        """No backend gate: the pool's published specs are the only key.
+        Gating capture metadata on a backend flag handed MLA targets a dummy
+        batch with no metadata, which they refuse -- Kimi-K2.5 ran every eval
+        on eager prefill before the gate was removed."""
+        backend = _backend()
+        pool = _fake_pool(specs=(_spec("full_attention", block_granularity=128),))
+        tables = self._bare(backend, pool)._dummy_group_tables(2)
+        self.assertEqual(set(tables), {"full_attention"})
+        # Scheduler-table columns span block_granularity: ceil(1000/128).
+        self.assertEqual(tables["full_attention"].shape, (2, 8))
+        self.assertGreater(
+            int(tables["full_attention"].min()),
+            0,
+            "MLA rejects the null block in live metadata, so capture needs a "
+            "real writable block",
+        )
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
         from unittest import mock
@@ -244,6 +645,65 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         self.assertFalse(graph.disable)
         capture.assert_not_called()
+
+
+class CaptureFailureIsLoudTest(unittest.TestCase):
+    """A capture the dummy-batch machinery cannot serve must stop the boot.
+
+    Degrading here is what let a whole model family run eager prefill with a
+    warning nobody read: the warning was indistinguishable from the families
+    that are deliberately eager.
+    """
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.torch = torch
+        self.PrefillGraph = PrefillGraph
+
+    def _bare(self, raises=None):
+        pg = self.PrefillGraph.__new__(self.PrefillGraph)
+        pg.disable = False
+        pg.capture_buckets = [4]
+        pg.attn_backend = SimpleNamespace(
+            init_prefill_graph_state=lambda **kwargs: None
+        )
+        pg.page_table = self.torch.zeros(4, 4, dtype=self.torch.int32)
+        pg.config = SimpleNamespace(device="cpu", world_group=None, world_size=1)
+        pg._embed_tokens = SimpleNamespace(
+            weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+        )
+
+        def _capture_all_buckets(_decode_wrapper):
+            if raises is not None:
+                raise raises
+
+        pg._capture_all_buckets = _capture_all_buckets
+        return pg
+
+    def test_capture_failure_propagates_untouched(self):
+        """Nothing between the backend and the operator: same exception object,
+        same traceback. ``capture`` has no handler at all, so a partial ladder
+        cannot be left behind -- the boot dies with it."""
+        cause = RuntimeError("backend refused the dummy batch")
+        pg = self._bare(raises=cause)
+        with self.assertRaises(RuntimeError) as caught:
+            pg.capture(None)
+        self.assertIs(caught.exception, cause)
+
+    def test_successful_capture_does_not_raise(self):
+        self._bare().capture(None)
+
+    def test_oom_propagates(self):
+        """OOM keeps its own type and message. The capture pool not fitting is
+        an operator-visible sizing failure, not something to recover from."""
+        pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
+        with self.assertRaises(self.torch.cuda.OutOfMemoryError):
+            pg.capture(None)
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):

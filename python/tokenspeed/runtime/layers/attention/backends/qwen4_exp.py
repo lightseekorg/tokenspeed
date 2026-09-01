@@ -39,7 +39,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
     from tokenspeed.runtime.models.qwen4_exp_ple import Qwen4ExpPLELayer
 
@@ -64,8 +67,8 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
     # advance n-gram, short-conv, or compressed-key state.
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
-    def __init__(self, config: BaseAttnConfig) -> None:
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        super().__init__(config, spec)
         self._ple_layers: tuple[Qwen4ExpPLELayer, ...] = ()
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
 

@@ -49,6 +49,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
     MoEProgramBase,
+    _situ_gfx1250,
     _swiglu_gfx1250,
     composition,
     compute_offsets,
@@ -818,6 +819,9 @@ def _matmul(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     # MoE config
     N_EXPTS_TOT: gl.constexpr,
@@ -1064,7 +1068,17 @@ def _matmul(
     bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
     acc += bias[None, :]
 
-    if DO_SWIGLU:
+    gl.static_assert(
+        not (DO_SWIGLU and DO_SITU),
+        "SwiGLU and SiTU cannot both be enabled",
+    )
+    if DO_SITU:
+        out = _situ_gfx1250(acc, SITU_BETA, SITU_LINEAR_BETA)
+        gl.static_assert(
+            out.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+        )
+    elif DO_SWIGLU:
         out = _swiglu_gfx1250(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
@@ -1181,13 +1195,31 @@ def _mark_scale_preshuffled(scale: Tensor | None, enabled: bool) -> Tensor | Non
 
 def _activation_config(fused_activation: FusedActivation | None):
     if fused_activation is None:
-        return False, 0.0, 0.0, 0.0, 1
+        return False, 0.0, 0.0, 0.0, False, 0.0, 0.0, 1
     specs = fused_activation.specs
     if specs.name == FnSpecs.default().name:
-        return False, 0.0, 0.0, 0.0, 1
+        return False, 0.0, 0.0, 0.0, False, 0.0, 0.0, 1
+    if specs.name == "situ":
+        if len(fused_activation.fn_args) < 2:
+            raise ValueError("SiTU activation requires beta and linear_beta")
+        situ_beta = float(fused_activation.fn_args[0])
+        situ_linear_beta = float(fused_activation.fn_args[1])
+        if situ_beta <= 0.0 or situ_linear_beta <= 0.0:
+            raise ValueError("SiTU beta and linear_beta must be positive")
+        return (
+            False,
+            0.0,
+            0.0,
+            0.0,
+            True,
+            situ_beta,
+            situ_linear_beta,
+            int(specs.reduction_n),
+        )
     if specs.name != "swiglu":
         raise NotImplementedError(
-            f"gfx1250 MoE only supports no activation or SwiGLU, got {specs.name!r}"
+            "gfx1250 MoE only supports no activation, SwiGLU, or SiTU, "
+            f"got {specs.name!r}"
         )
     if len(fused_activation.fn_args) < 2:
         raise ValueError("SwiGLU activation requires at least alpha and limit")
@@ -1198,7 +1230,7 @@ def _activation_config(fused_activation: FusedActivation | None):
         if len(fused_activation.fn_args) >= 3
         else 1.0
     )
-    return True, alpha, limit, beta, int(specs.reduction_n)
+    return True, alpha, limit, beta, False, 0.0, 0.0, int(specs.reduction_n)
 
 
 def _validate_schedule(
@@ -1287,7 +1319,7 @@ def matmul(
         scatter_indx: Optional destination row indices for combine writeback.
         precision_config: MX scale/output dtype configuration.
         x_global_scale: Optional scalar activation dequantization scale.
-        fused_activation: Optional SwiGLU activation descriptor.
+        fused_activation: Optional SwiGLU or SiTU activation descriptor.
         block_m: Concrete row tile resolved by the caller.
         decode: Select the small-M, M-ragged decode kernel.
 
@@ -1313,9 +1345,16 @@ def matmul(
     if precision_config is None:
         precision_config = PrecisionConfig()
     fused_activation = fused_activation or FusedActivation(FnSpecs.default(), tuple())
-    do_swiglu, swiglu_alpha, swiglu_limit, swiglu_beta, activation_reduction_n = (
-        _activation_config(fused_activation)
-    )
+    (
+        do_swiglu,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
+        do_situ,
+        situ_beta,
+        situ_linear_beta,
+        activation_reduction_n,
+    ) = _activation_config(fused_activation)
 
     a_torch = a.storage.data if isinstance(a, Tensor) else a
     b_torch = b.storage.data if isinstance(b, Tensor) else b
@@ -1461,6 +1500,9 @@ def matmul(
         swiglu_alpha,
         swiglu_limit,
         swiglu_beta,
+        do_situ,
+        situ_beta,
+        situ_linear_beta,
         activation_reduction_n,
         n_valid_slices,
         opt_flags.block_m,
@@ -1496,85 +1538,6 @@ def _index_tensor(obj: Any | None, attr: str) -> torch.Tensor | None:
     if obj is None:
         return None
     return getattr(obj, attr) if hasattr(obj, attr) else obj
-
-
-def gluon_mxfp_dispatch_swiglu(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scale: torch.Tensor,
-    *,
-    x_scale: torch.Tensor | None = None,
-    x_format: str = "e2m1",
-    x_global_scale: torch.Tensor | float = 1.0,
-    bias: torch.Tensor | None,
-    a_ragged_metadata,
-    gather_indx,
-    out_dtype: torch.dtype = torch.bfloat16,
-    swiglu_alpha: float = 1.0,
-    swiglu_limit: float = 0.0,
-    swiglu_beta: float = 1.0,
-    block_m: int | None = None,
-    block_n: int = 256,
-    block_k: int = 256,
-    num_warps: int = 4,
-    num_buffers: int = 3,
-    use_warp_pipeline: bool | None = None,
-    use_slice_mn: bool | None = None,
-    use_slice_n: bool | None = None,
-    scale_load_mode: str = "transpose",
-    w_transpose: bool = True,
-    persistent: bool | None = None,
-    num_ctas: int | None = None,
-    out_quant_scale: torch.Tensor | float | None = None,
-    out_quant_format: str | None = None,
-    w_preshuffle: bool = False,
-    x_scale_ragged_padded: bool = False,
-    decode: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch GEMM + fused SwiGLU using the gfx1250 Gluon MoE kernel."""
-    del use_warp_pipeline, use_slice_mn, use_slice_n
-    del persistent, num_ctas, w_preshuffle, x_scale_ragged_padded
-    if out_quant_scale is not None or out_quant_format is not None:
-        raise NotImplementedError(
-            "gfx1250 dispatch wrapper does not support output quantization"
-        )
-    if x_format == "e2m1" and x_scale is None:
-        raise ValueError("x_scale is required for e2m1/MXFP4 activation input")
-    if x_format != "e2m1" and x_scale is not None:
-        raise ValueError("x_scale is only supported for e2m1/MXFP4 activation input")
-    gather_tensor = _index_tensor(gather_indx, "src_indx")
-    m = int(x.shape[-2] if gather_tensor is None else gather_tensor.shape[0])
-    num_experts = None if a_ragged_metadata is None else a_ragged_metadata.n_slices
-    if block_m is None:
-        block_m = _resolve_block_m(decode, m, num_experts, is_combine=False)
-    activation = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
-        (float(swiglu_alpha), float(swiglu_limit), float(swiglu_beta)),
-    )
-    precision = PrecisionConfig(
-        out_dtype=out_dtype,
-        a_mx_scale=x_scale,
-        b_mx_scale=w_scale,
-    )
-    out, _ = matmul(
-        x,
-        w,
-        bias,
-        a_ragged_metadata=a_ragged_metadata,
-        gather_indx=gather_tensor,
-        precision_config=precision,
-        x_global_scale=x_global_scale,
-        fused_activation=activation,
-        scale_preshuffle=(scale_load_mode == "swizzle"),
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_buffers=num_buffers,
-        w_transpose=w_transpose,
-        decode=decode,
-    )
-    return out
 
 
 def gluon_mxfp_combine(
@@ -1759,11 +1722,15 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     w13_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    activation: str = "swiglu",
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     decode: bool = False,
     block_m: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -1779,11 +1746,16 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w13_bias: Optional expert bias for the gate/up projection.
         w2_bias: Optional expert bias for the down projection.
         out_dtype: Final output dtype.
+        activation: Fused gate activation, either ``"swiglu"``/``"silu"`` or
+            ``"situ"``.
         swiglu_alpha: SwiGLU gate scale.
         swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
         swiglu_beta: SwiGLU linear branch offset.
+        situ_beta: SiTU gate clamp.
+        situ_linear_beta: SiTU linear-branch clamp.
         decode: Select the small-M decode kernel for both MoE projections.
         block_m: Optional row-tile override; unset values resolve per projection.
+        out: Optional destination tensor for the finalized expert output.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
@@ -1824,25 +1796,43 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         hidden_states,
         w13_weight.act_scale,
     )
-    intermediate = gluon_mxfp_dispatch_swiglu(
+    if activation == "situ":
+        fused_activation = FusedActivation(
+            FnSpecs("situ", None, ("beta", "linear_beta"), reduction_n=2),
+            (float(situ_beta), float(situ_linear_beta)),
+        )
+    elif activation == "silu":
+        fused_activation = FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
+            (1.0, 0.0, 0.0),
+        )
+    elif activation == "swiglu":
+        fused_activation = FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
+            (float(swiglu_alpha), float(swiglu_limit), float(swiglu_beta)),
+        )
+    else:
+        raise ValueError(
+            "gfx1250 Gluon MXFP4 MoE supports activation 'silu', "
+            f"'swiglu', or 'situ', got {activation!r}"
+        )
+    intermediate = gluon_mxfp_ragged_matmul(
         x_fp8,
         w13_weight,
-        w13_mx_scale,
+        w13_bias,
+        w_mx_scale=w13_mx_scale,
         x_format="e4m3",
         x_global_scale=w13_weight.act_scale,
-        bias=w13_bias,
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
         out_dtype=out_dtype,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_limit=swiglu_limit,
-        swiglu_beta=swiglu_beta,
+        fused_activation=fused_activation,
+        scale_preshuffle=True,
         block_m=block_m,
         block_n=256,
         block_k=256,
         num_warps=4,
         num_buffers=3,
-        scale_load_mode="swizzle",
         decode=decode,
     )
     intermediate_fp8 = _quantize_fp8_activation(
@@ -1868,11 +1858,24 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         decode=decode,
     )
     weighted = flat.float() * topk_weights.reshape(-1, 1)
-    return (
+    result = (
         weighted.view(hidden_states.shape[0], topk_ids.shape[1], flat.shape[-1])
         .sum(dim=1)
         .to(out_dtype)
     )
+    if out is None:
+        return result
+    if (
+        out.shape != result.shape
+        or out.dtype != result.dtype
+        or out.device != result.device
+    ):
+        raise ValueError(
+            "gfx1250 Gluon MXFP4 MoE output buffer must match the result's "
+            "shape, dtype, and device"
+        )
+    out.copy_(result)
+    return out
 
 
 def gluon_mxfp_ragged_matmul(
@@ -1919,7 +1922,7 @@ def gluon_mxfp_ragged_matmul(
         "decode",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
-    wrapper_launch_kwargs = {
+    combine_launch_kwargs = {
         k: v
         for k, v in launch_kwargs.items()
         if k in {"block_m", "block_n", "block_k", "num_buffers", "num_warps", "decode"}
@@ -1945,30 +1948,19 @@ def gluon_mxfp_ragged_matmul(
             out_dtype=out_dtype,
             scale_load_mode=scale_load_mode,
             w_transpose=w_transpose,
-            **wrapper_launch_kwargs,
+            **combine_launch_kwargs,
         )
     if fused_activation is not None:
-        swiglu_args = _activation_config(fused_activation)
-        if not swiglu_args[0]:
-            raise NotImplementedError("only SwiGLU fused activation is supported")
-        return gluon_mxfp_dispatch_swiglu(
-            x,
-            w,
-            w_mx_scale,
-            x_scale=x_mx_scale,
-            x_format=x_format,
-            x_global_scale=x_global_scale,
-            bias=bias,
-            a_ragged_metadata=a_ragged_metadata,
-            gather_indx=gather_indx,
-            out_dtype=out_dtype,
-            swiglu_alpha=swiglu_args[1],
-            swiglu_limit=swiglu_args[2],
-            swiglu_beta=swiglu_args[3],
-            scale_load_mode=scale_load_mode,
-            w_transpose=w_transpose,
-            **wrapper_launch_kwargs,
-        )
+        if x_format == "e2m1" and x_mx_scale is None:
+            raise ValueError("x_mx_scale is required for e2m1/MXFP4 activation input")
+        if x_format != "e2m1" and x_mx_scale is not None:
+            raise ValueError(
+                "x_mx_scale is only supported for e2m1/MXFP4 activation input"
+            )
+        launch_kwargs.setdefault("block_n", 256)
+        launch_kwargs.setdefault("block_k", 256)
+        launch_kwargs.setdefault("num_warps", 4)
+        launch_kwargs.setdefault("num_buffers", 3)
     precision = PrecisionConfig(
         out_dtype=out_dtype, a_mx_scale=x_mx_scale, b_mx_scale=w_mx_scale
     )
@@ -1987,6 +1979,7 @@ def gluon_mxfp_ragged_matmul(
         gather_indx=gather_tensor,
         scatter_indx=_index_tensor(scatter_indx, "dst_indx"),
         precision_config=precision,
+        fused_activation=fused_activation,
         block_m=block_m,
         x_global_scale=x_global_scale,
         scale_preshuffle=scale_preshuffle,
@@ -2000,6 +1993,6 @@ def gluon_mxfp_ragged_matmul(
 __all__ = [
     "PrecisionConfig",
     "gluon_mxfp_combine",
-    "gluon_mxfp_dispatch_swiglu",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",
+    "gluon_mxfp_ragged_matmul",
 ]

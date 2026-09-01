@@ -164,7 +164,8 @@ public:
                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
     void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                               std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind);
+                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
+                              bool stream_completed_to_host = false);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -178,11 +179,27 @@ public:
     struct StoreCandidate {
         CacheKey key;
     };
-    // Retry ordinary D2H Store for already-published Device cache entries.
+    struct HostAllocationStats {
+        std::size_t requested{0};
+        std::size_t allocated{0};
+        std::size_t unallocated{0};
+        std::size_t same_group_scans{0};
+        std::size_t cross_group_scans{0};
+    };
+    struct HostAllocationBatch {
+        std::vector<CacheBlockRef> blocks;
+        HostAllocationStats stats;
+    };
+    // Queue every already-published non-state Device cache entry for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
+    // Queue the newest Device-resident checkpoint from each snapshot-state
+    // group. State checkpoints are intentionally deferred from continuous
+    // Host streaming and persisted at request lifecycle boundaries instead.
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
+    HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
@@ -221,7 +238,7 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host = false);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

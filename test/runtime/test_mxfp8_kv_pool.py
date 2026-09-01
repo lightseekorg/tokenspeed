@@ -260,15 +260,18 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
 
 
 def _make_config(prefix_granularity: int):
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
-    return MHAConfig(
-        device="cuda",
+    spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=16,
         num_kv_heads=HEADS,
         head_dim=HEAD_DIM,
         attn_tp_size=1,
+    )
+    return AttnConfig(
+        device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
@@ -278,6 +281,7 @@ def _make_config(prefix_granularity: int):
         max_bs=8,
         max_graph_bs=8,
         kv_cache_quant_method="none",
+        components=(spec,),
     )
 
 

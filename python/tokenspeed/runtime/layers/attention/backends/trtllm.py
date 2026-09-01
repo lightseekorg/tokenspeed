@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     learn_cache_group_geometry,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MHA_PAGE_SIZE,
@@ -180,8 +181,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             return self.forward_prefill_metadata
         return self.forward_decode_metadata
 
-    def __init__(self, config: MHAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MHAConfig):
+        super().__init__(config, spec)
 
         self.kernel_page_size = (
             config.kernel_page_size

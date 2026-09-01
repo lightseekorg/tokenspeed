@@ -88,33 +88,40 @@ void Scheduler::handleEvent(const forward::Finish& event) {
     }
     if (Request* request = findRequest(event.request_id)) {
         if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
-            publishCompletedPages(*request);
+            if (auto store = publishCompletedPages(*request)) {
+                pending_write_back_operations_.push_back(std::move(*store));
+            }
         }
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
 
-void Scheduler::publishCompletedPages(Request& request) {
+std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     const std::vector<std::span<const std::int32_t>> stable_prefix_pages = request.FullPrefixPages(true);
     fsm::CacheProgress progress = request.CacheProgress();
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(progress.prefix_hashes.size());
     const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
     _assert(first_new_prefix_page <= num_stable_prefix_pages, "cache progress exceeds completed request pages");
-    if (first_new_prefix_page == num_stable_prefix_pages) {
-        return;
+    if (first_new_prefix_page != num_stable_prefix_pages) {
+        const std::string previous_hash =
+            progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
+        std::vector<std::string> new_hashes =
+            AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages);
+        progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
+                                      std::make_move_iterator(new_hashes.end()));
+
+        std::vector<CacheKey> event_keys =
+            registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
+        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
+                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+        discardUncachedKvEventPages(event_keys);
     }
-
-    const std::string previous_hash = progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
-    std::vector<std::string> new_hashes =
-        AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages);
-    progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
-                                  std::make_move_iterator(new_hashes.end()));
-
-    std::vector<CacheKey> event_keys =
-        registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
-    coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
-                                      first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
-    discardUncachedKvEventPages(event_keys);
+    if (!config_.StreamsDeviceCacheToHost()) {
+        return std::nullopt;
+    }
+    coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
+    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    return tier_transfers_.StartPendingStores();
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

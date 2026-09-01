@@ -34,6 +34,8 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
+_HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
+_HOST_CACHE_BLOCK_SIZE = 4096
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -73,54 +75,65 @@ __all__ = [
 def _transfer_cache_ranges_kernel(
     buffer_addresses_ptr,
     ranges_ptr,
+    num_ranges,
+    num_chunks,
     NUM_DEVICE_BUFFERS: tl.constexpr,
     DIRECTION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    range_id = tl.program_id(0)
-    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    range_offset = range_id * 4
-    device_buffer_index = tl.load(ranges_ptr + range_offset)
-    device_offset = tl.load(ranges_ptr + range_offset + 1)
-    host_offset = tl.load(ranges_ptr + range_offset + 2)
-    num_bytes = tl.load(ranges_ptr + range_offset + 3)
+    work_items = num_ranges * num_chunks
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    for work_id in tl.range(pid, work_items, nprogs):
+        range_id = work_id // num_chunks
+        chunk_id = work_id - range_id * num_chunks
+        range_offset = range_id * 4
+        device_buffer_index = tl.load(ranges_ptr + range_offset)
+        device_offset = tl.load(ranges_ptr + range_offset + 1)
+        host_offset = tl.load(ranges_ptr + range_offset + 2)
+        num_bytes = tl.load(ranges_ptr + range_offset + 3)
+        byte_offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
-    device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
-    host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
-    device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
-    host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-    mask = byte_offsets < num_bytes
-    if DIRECTION == 0:
-        values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-        tl.store(
-            host_ptr + byte_offsets,
-            values,
-            mask=mask,
-            cache_modifier=".cs",
-        )
-    else:
-        values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-        tl.store(device_ptr + byte_offsets, values, mask=mask)
+        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
+        host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
+        device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
+        host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
+        mask = byte_offsets < num_bytes
+        if DIRECTION == 0:
+            values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
+            tl.store(
+                host_ptr + byte_offsets,
+                values,
+                mask=mask,
+                cache_modifier=".cs",
+            )
+        else:
+            values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
+            tl.store(device_ptr + byte_offsets, values, mask=mask)
 
 
 def transfer_cache_ranges(
-    device_buffers: list[torch.Tensor],
-    host_buffer: torch.Tensor,
-    ranges: list[tuple[int, int, int, int]],
+    address_table: torch.Tensor,
+    range_table: torch.Tensor,
     direction: int,
+    *,
+    num_ranges: int,
+    max_bytes: int,
+    num_device_buffers: int,
+    grid_cap: int | None = None,
 ) -> None:
-    """Copy byte ranges between device buffers and mapped Host memory.
-
-    The Host tensor is passed indirectly through its GPU-visible UVA address;
-    Triton receives only CUDA tensors containing addresses and descriptors.
-    Argument shape, dtype, and bounds validation belongs to the public
-    transport wrapper.
+    """Copy prepared Host-cache ranges with a capped grid-stride launch.
 
     Args:
-        device_buffers: Contiguous device cache tensors.
-        host_buffer: Contiguous pinned CPU uint8 buffer.
-        ranges: ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
+        address_table: Device ``uint64`` table of device-buffer pointers
+            followed by the mapped Host pointer.
+        range_table: Device ``int64`` rows
+            ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
         direction: ``0`` for device-to-Host and ``1`` for Host-to-device.
+        num_ranges: Valid leading rows in ``range_table``.
+        max_bytes: Largest ``num_bytes`` among those rows.
+        num_device_buffers: Count of device pointers in ``address_table``.
+        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP`` (64).
 
     Returns:
         None; the copy is enqueued on the current device stream.
@@ -128,20 +141,21 @@ def transfer_cache_ranges(
 
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
-    if not ranges:
+    if num_ranges <= 0:
         return
-    device = device_buffers[0].device
-    platform = current_platform()
-    addresses = [buffer.data_ptr() for buffer in device_buffers]
-    addresses.append(platform.device_visible_data_ptr(host_buffer))
-    address_table = torch.tensor(addresses, dtype=torch.uint64, device=device)
-    range_table = torch.tensor(ranges, dtype=torch.int64, device=device)
-    block_size = 4096
-    grid = (len(ranges), triton.cdiv(max(row[3] for row in ranges), block_size))
+    block_size = _HOST_CACHE_BLOCK_SIZE
+    num_chunks = triton.cdiv(max_bytes, block_size)
+    work_items = num_ranges * num_chunks
+    cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
+    if cap <= 0:
+        raise ValueError("grid_cap must be positive")
+    grid = (min(cap, work_items),)
     _transfer_cache_ranges_kernel[grid](
         address_table,
         range_table,
-        NUM_DEVICE_BUFFERS=len(device_buffers),
+        num_ranges,
+        num_chunks,
+        NUM_DEVICE_BUFFERS=num_device_buffers,
         DIRECTION=direction,
         BLOCK_SIZE=block_size,
         num_warps=8,

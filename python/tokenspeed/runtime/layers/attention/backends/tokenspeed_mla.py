@@ -59,6 +59,7 @@ from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TOKENSPEED_MLA_DEFAULT_PAGE_SIZE,
@@ -117,8 +118,8 @@ class CuteDSLMLABackend(AttentionBackend):
     _logged_decode = False
     _logged_prefill = False
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         # Latched the first time cache metadata arrives. Once bound, a
         # forward without cache metadata is a hard error: the cache contract
@@ -136,12 +137,12 @@ class CuteDSLMLABackend(AttentionBackend):
         )
 
         # MLA dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
 
@@ -152,7 +153,7 @@ class CuteDSLMLABackend(AttentionBackend):
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
         # the decode forward with the pool frozen.
-        self._num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
+        self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
         self.cutedsl_workspace = self._cutedsl_workspace(
             max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)

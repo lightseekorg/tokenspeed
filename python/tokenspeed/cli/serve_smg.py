@@ -54,7 +54,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
-from tokenspeed.runtime.utils.launcher import detect_topology
+from tokenspeed.runtime.utils.launcher import _ephemeral_port_range, detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -260,6 +260,41 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
 
 
+_FREE_PORT_MAX_ATTEMPTS = 5
+
+
+def _free_port_avoiding_ephemeral_range() -> int:
+    """Allocate a free TCP port, retrying one that falls in the ephemeral range.
+
+    ``get_free_port()`` samples via ``bind(("", 0))``, which the kernel
+    satisfies from the very same ephemeral range it uses to auto-assign
+    *source* ports to outbound connections (health probes, gRPC dials, HF
+    Hub downloads, ...). The gap between that sample and the freshly spawned
+    smg subprocess actually binding it is real (process spawn + Python/PyO3
+    import + router construction), and on a host running several
+    ``ts serve`` replicas at once — each doing its own outbound networking —
+    an unrelated connection can grab that exact port first. smg's Rust
+    listeners don't set ``SO_REUSEADDR``, so the late bind then fails with
+    ``AddrInUse``, and because a dead listener aborts the whole
+    ``router.start()`` call, this is fatal to the gateway regardless of
+    which listener (main port, Prometheus, ...) lost the race.
+
+    Retrying a handful of times against a *known* ephemeral range keeps the
+    returned port out of it; on hosts where the range can't be read (e.g.
+    non-Linux), this degrades to a plain ``get_free_port()`` call.
+    """
+    ephemeral = _ephemeral_port_range()
+    port = get_free_port()
+    if ephemeral is None:
+        return port
+    low, high = ephemeral
+    for _ in range(_FREE_PORT_MAX_ATTEMPTS - 1):
+        if not (low <= port <= high):
+            return port
+        port = get_free_port()
+    return port
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -277,10 +312,20 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     outbound connection (engine bootstrap, readiness probes) as an ephemeral
     source port, failing the gateway bind. Callers that need a stable scrape
     target can still pass an explicit ``--prometheus-port``.
+
+    The port itself is drawn via ``_free_port_avoiding_ephemeral_range()``
+    rather than a bare ``get_free_port()``: even allocated "right before"
+    spawn, a candidate sampled from the ephemeral range can still be raced
+    away by an unrelated outbound connection during subprocess startup —
+    see that helper's docstring.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(get_free_port())]
+    return [
+        *gateway_args,
+        "--prometheus-port",
+        str(_free_port_avoiding_ephemeral_range()),
+    ]
 
 
 def _load_model_config(model_id: str | None) -> dict:
@@ -482,7 +527,7 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     pinned = _get_from_args(engine_args, "--rl-control-port")
     if pinned is not None:
         return engine_args, f"http://127.0.0.1:{int(pinned)}"
-    port = get_free_port()
+    port = _free_port_avoiding_ephemeral_range()
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
@@ -609,7 +654,7 @@ async def run_smg(
             pass  # Windows: signal handlers via asyncio aren't supported. Out of scope.
 
     try:
-        engine_port = get_free_port()
+        engine_port = _free_port_avoiding_ephemeral_range()
 
         # Wire the in-engine RL control-plane port (always on). Must happen
         # before spawn_engine.

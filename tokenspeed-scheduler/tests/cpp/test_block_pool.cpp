@@ -201,5 +201,37 @@ TEST(BlockPoolLcmPlacementTest, LastReleaseImmediatelyClearsParentBinding) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
 }
 
+TEST(BlockPoolTest, AcquireUpToBlocksReturnsAvailableCompatiblePlacements) {
+    BlockPool pool(2);
+    std::vector<CacheBlockRef> first = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/2, /*num=*/3);
+    ASSERT_EQ(first.size(), 3u);
+
+    std::vector<CacheBlockRef> partial = pool.AcquireUpToBlocks(/*group_id=*/0, /*packing=*/2, /*max_num=*/3);
+
+    ASSERT_EQ(partial.size(), 1u);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 4);
+}
+
+TEST(BlockPoolTest, AcquireUpToBlocksWithPackingOneReturnsPartialCapacity) {
+    BlockPool pool(2);
+    CacheBlockRef occupied = pool.AcquireBlock(/*group_id=*/0, /*packing=*/1);
+    ASSERT_TRUE(occupied);
+
+    std::vector<CacheBlockRef> partial = pool.AcquireUpToBlocks(/*group_id=*/1, /*packing=*/1, /*max_num=*/2);
+
+    ASSERT_EQ(partial.size(), 1u);
+    EXPECT_EQ(pool.BoundGroup(partial.front()->Location().lcm_block_id), 1u);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 2);
+}
+
+TEST(BlockPoolTest, ExactAcquireBlocksRemainsAllOrNothing) {
+    BlockPool pool(2);
+    std::vector<CacheBlockRef> first = pool.AcquireBlocks(/*group_id=*/0, /*packing=*/2, /*num=*/3);
+    ASSERT_EQ(first.size(), 3u);
+
+    EXPECT_TRUE(pool.AcquireBlocks(/*group_id=*/0, /*packing=*/2, /*num=*/2).empty());
+    EXPECT_EQ(pool.NumOccupiedSlots(), 3);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

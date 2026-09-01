@@ -48,6 +48,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     learn_cache_group_geometry,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
 )
@@ -169,8 +170,8 @@ class MSAAttnBackend(AttentionBackend):
     ) -> bool:
         return False
 
-    def __init__(self, config: MSAConfig) -> None:
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MSAConfig) -> None:
+        super().__init__(config, spec)
 
         # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
@@ -180,9 +181,9 @@ class MSAAttnBackend(AttentionBackend):
             else MSA_PAGE_SIZE
         )
         self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
-        self.tp_q_head_num = max(config.num_attention_heads // config.attn_tp_size, 1)
-        self.tp_kv_head_num = max(config.num_kv_heads // config.attn_tp_size, 1)
-        self.head_dim = config.head_dim
+        self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
+        self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
+        self.head_dim = spec.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_fp8 = self.kv_cache_dtype in (
@@ -191,11 +192,11 @@ class MSAAttnBackend(AttentionBackend):
         )
 
         # Sparse attention parameters
-        self.sparse_layer_ids = config.sparse_layer_ids
-        self.index_head_dim = config.index_head_dim
-        self.index_topk_blocks = config.index_topk_blocks
-        self.index_init_blocks = config.index_init_blocks
-        self.index_local_blocks = config.index_local_blocks
+        self.sparse_layer_ids = spec.sparse_layer_ids
+        self.index_head_dim = spec.index_head_dim
+        self.index_topk_blocks = spec.index_topk_blocks
+        self.index_init_blocks = spec.index_init_blocks
+        self.index_local_blocks = spec.index_local_blocks
 
         # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
         # (whole block in one decode forward), with uniform non-causal seq_lens.
@@ -747,26 +748,26 @@ class MSAAttnBackend(AttentionBackend):
 class MSAHybridAttnBackend(AttentionBackend):
     """Minimax hybrid attention backend that dispatches to either a dense or sparse backend per layer."""
 
-    def __init__(self, config: MSAConfig) -> None:
+    def __init__(self, config: AttnConfig, spec: MSAConfig) -> None:
         from tokenspeed.runtime.layers.attention.registry import (
             _create_attn_backend_with_name,
         )
 
-        super().__init__(config)
+        super().__init__(config, spec)
         full_attn_backend = _create_attn_backend_with_name(
-            config.full_attn_backend_name,
+            spec.full_attn_backend_name,
             AttentionArch.MHA,
             config,
         )
-        sparse_attn_backend = MSAAttnBackend(config)
+        sparse_attn_backend = MSAAttnBackend(config, spec)
         self.full_attn_backend = full_attn_backend
         self.sparse_attn_backend = sparse_attn_backend
         self.sparse_layer_ids = sparse_attn_backend.sparse_layer_ids
         logger.info(
             "Created MiniMax hybrid attention backend: %d dense layers, "
             "%d sparse layers (dense=%s, sparse=%s)",
-            len(config.compute_layer_types) - len(config.sparse_layer_ids),
-            len(config.sparse_layer_ids),
+            len(spec.compute_layer_types) - len(spec.sparse_layer_ids),
+            len(spec.sparse_layer_ids),
             type(full_attn_backend).__name__,
             type(sparse_attn_backend).__name__,
         )
