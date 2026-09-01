@@ -22,7 +22,6 @@
 
 Run as ``tune_route.py [shape_set] [route.json]``; the set names a key of
 SHAPE_SETS and defaults to K3's TP16 table.
-
 The shapes are the exact (N, K) that the decode path hands the routed GEMV,
 extracted from a trace of the serving path (rowcta's launch grid is ``(N,)``,
 so gridX identifies each call site). Every measurement cycles
@@ -163,7 +162,11 @@ def candidates(m: int, n: int, k: int):
     )
 
     if skinny.is_available():
-        cfg = skinny.default_config(m, n, k)
+        # Rank the config serving would run, not the bare heuristic, so a
+        # re-sweep cannot demote a shape whose win lives in SKINNY_CONFIG_ROUTE.
+        from tokenspeed_kernel.ops.gemm.routed_gemv import _skinny_config
+
+        cfg = _skinny_config(m, n, k)
         if skinny.supports(cfg, m, n, k):
 
             def sk(i):
