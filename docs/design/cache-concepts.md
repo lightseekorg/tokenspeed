@@ -653,6 +653,11 @@ means touching every backend family at once; do it as its own milestone.
   bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
   packing: the declaring group is positional, and packing is the layout's
   answer, so neither can be stated twice and disagree. ✓
+* The model side names the same ids: every `PagedAttention` layer carries a
+  mandatory `group_id`, checked against the pool's published specs at startup
+  (`validate_cache_group_ids`, single-group pools included), and backends
+  index their learned geometry by it with no fallback
+  (`CacheGroupGeometry.granularity_of` raises on unknown ids). ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

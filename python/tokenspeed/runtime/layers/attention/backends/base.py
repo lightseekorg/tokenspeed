@@ -339,11 +339,11 @@ class AttentionBackend(ABC):
         return kept or None
 
     def _group_block_granularity(self, gid: str) -> int:
-        return self._geometry.granularity_of(gid, self.kernel_page_size)
+        return self._geometry.granularity_of(gid)
 
     def _layer_page_size(self, layer) -> int:
-        """Page size of the layer's cache group (uniform when unknown)."""
-        return self._group_block_granularity(getattr(layer, "group_id", ""))
+        """Page size of the layer's cache group."""
+        return self._group_block_granularity(layer.group_id)
 
     def _kernel_page_tables(self, page_tables):
         """Convert per-group page IDs to the page size consumed by the kernel.
@@ -374,23 +374,21 @@ class AttentionBackend(ABC):
         return self.kernel_page_size
 
     def _compute_decode_group_out_cache_locs(
-        self, page_tables, seq_lens, page_size, num_tokens_per_req=1
+        self, page_tables, seq_lens, num_tokens_per_req=1
     ):
         """Thin binding of :func:`decode_group_out_cache_locs` to this
-        backend's learned granularities (``page_size`` is the base size for
-        group-less keys)."""
+        backend's learned granularities."""
         return decode_group_out_cache_locs(
             page_tables,
             seq_lens,
-            lambda gid: self._group_block_granularity(gid) if gid else page_size,
+            self._group_block_granularity,
             num_tokens_per_req,
         )
 
     def _compute_extend_group_out_cache_locs(
-        self, page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu, page_size
+        self, page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu
     ):
         """Thin binding of :func:`extend_group_out_cache_locs`."""
-        del page_size
         return extend_group_out_cache_locs(
             page_tables,
             extend_prefix_lens_cpu,
@@ -398,11 +396,10 @@ class AttentionBackend(ABC):
             self._group_block_granularity,
         )
 
-    def _maybe_check_group_write_locs(self, page_tables, out_cache_locs, page_size):
+    def _maybe_check_group_write_locs(self, page_tables, out_cache_locs):
         """TOKENSPEED_CACHE_DEBUG=1 gate over
         :func:`check_group_write_locs` (eager only — graph-padded batches
         would trip the non-hole assert on dummy rows)."""
-        del page_size
         if not cache_debug_enabled():
             return
         check_group_write_locs(

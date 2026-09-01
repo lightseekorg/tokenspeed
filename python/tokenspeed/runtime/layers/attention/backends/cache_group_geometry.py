@@ -67,9 +67,22 @@ class CacheGroupGeometry:
     full_history_group_id: str | None = None
     history_block_granularity: int = 0
 
-    def granularity_of(self, group_id: str, default: int) -> int:
-        """This group's block granularity, or ``default`` for unknown ids."""
-        return self.granularities.get(group_id, default)
+    def granularity_of(self, group_id: str) -> int:
+        """This group's block granularity; an unknown id is a contract bug.
+
+        Every id reaching here must name a learned row-geometry group —
+        layer group ids are validated against the pool's published specs at
+        startup (``validate_cache_group_ids``), and table dicts are keyed by
+        contract ids. No fallback: a miss means the geometry was never
+        learned (pool not bound) or the id belongs to a state group.
+        """
+        try:
+            return self.granularities[group_id]
+        except KeyError:
+            raise KeyError(
+                f"cache group {group_id!r} has no learned block granularity "
+                f"(learned row-geometry groups: {sorted(self.granularities)})"
+            ) from None
 
 
 def learn_cache_group_geometry(

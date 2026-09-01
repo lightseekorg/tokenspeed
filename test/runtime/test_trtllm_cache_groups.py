@@ -270,7 +270,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
     def test_decode_group_write_locations(self):
         # Per-group decode write locations (the update_draft_forward_metadata
         # re-anchor and the capture builders share this math).
-        b = self._bare_backend()
+        b = self._bare_backend(groups={"full_attention": 64, "sliding_attention": 64})
         seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
         tables = {
             "full_attention": self.torch.tensor(
@@ -280,9 +280,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
-        locs = b._compute_decode_group_out_cache_locs(
-            tables, seq_lens, b.kernel_page_size
-        )
+        locs = b._compute_decode_group_out_cache_locs(tables, seq_lens)
         # seq_len 65 -> page index 1, offset 0; seq_len 3 -> page 0, offset 2.
         self.assertEqual(
             locs["full_attention"].tolist(),
@@ -294,7 +292,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         )
 
     def test_extend_metadata_grouped_drops_single_table(self):
-        b = self._bare_backend()
+        b = self._bare_backend(groups={"full_attention": 64})
         bs = 1
         seq_lens = self.torch.tensor([66], dtype=self.torch.int32)
         tables = {"full_attention": self.torch.tensor([[5, 6]], dtype=self.torch.int32)}
@@ -302,7 +300,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             tables,
             self.torch.tensor([64], dtype=self.torch.int32),
             self.torch.tensor([2], dtype=self.torch.int32),
-            b.kernel_page_size,
         )
         b._init_extend_metadata(
             bs,

@@ -42,6 +42,9 @@ from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -629,6 +632,7 @@ class MiniMaxM2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=FULL_ATTENTION,
         )
 
         self.q_norm = MiniMaxM2RMSNormTP(

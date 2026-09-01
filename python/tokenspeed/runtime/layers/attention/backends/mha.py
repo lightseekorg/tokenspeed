@@ -158,7 +158,6 @@ class MHAAttnBackend(AttentionBackend):
             fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
                 md.page_tables,
                 frontier,
-                self.kernel_page_size,
                 self.spec_num_tokens,
             )
         self.forward_decode_metadata = replace(md, **fields)
@@ -262,11 +261,8 @@ class MHAAttnBackend(AttentionBackend):
                 group_page_tables,
                 extend_prefix_lens_cpu[:bs],
                 extend_seq_lens_cpu[:bs],
-                self.kernel_page_size,
             )
-            self._maybe_check_group_write_locs(
-                group_page_tables, group_out_cache_locs, self.kernel_page_size
-            )
+            self._maybe_check_group_write_locs(group_page_tables, group_out_cache_locs)
             group_page_tables = self._kernel_page_tables(group_page_tables)
         else:
             page_table = build_page_table(

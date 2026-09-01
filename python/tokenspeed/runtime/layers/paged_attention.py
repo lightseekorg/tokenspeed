@@ -43,7 +43,8 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
-        group_id: str = "",
+        *,
+        group_id: str,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -56,8 +57,15 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
-        # cache group ("" -> single-table fallback in the backend).
-        # make group_id mandatory once flat is the only path.
+        # The layer's cache group; must name a group the model's KV pool
+        # publishes (validate_cache_group_ids checks at startup, backends
+        # index their learned geometry by it — no fallback).
+        if not group_id:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id} requires a nonempty "
+                "group_id naming the layer's cache group (derive it with "
+                "layer_group_ids, or FULL_ATTENTION for uniform models)."
+            )
         self.group_id = group_id
         self.k_scale = None
         self.v_scale = None
@@ -101,25 +109,20 @@ def validate_cache_group_ids(
     model: nn.Module,
     cache_group_specs: Sequence,
 ) -> None:
-    """Fail fast (ValueError) when a pool publishing more than one cache
-    group meets a PagedAttention layer whose group_id is empty or unknown --
-    instead of a KeyError deep in the backend, possibly during graph capture.
+    """Fail fast (ValueError) when a PagedAttention layer's group_id is not
+    among the pool's published cache groups -- instead of a KeyError deep in
+    the backend, possibly during graph capture. Single-group pools are
+    checked too: backends index their learned geometry by the layer's
+    group_id with no fallback.
     """
     group_ids = {str(spec.group_id) for spec in cache_group_specs}
-    if len(group_ids) <= 1:
+    if not group_ids:
+        # No published contract to validate against (pools without specs).
         return
     model_name = type(model).__name__
     for name, module in model.named_modules():
         if not isinstance(module, PagedAttention):
             continue
-        if not module.group_id:
-            raise ValueError(
-                f"{model_name}: attention layer {name!r} (layer_id="
-                f"{module.layer_id}) has empty group_id but the KV pool "
-                f"publishes {len(group_ids)} cache groups "
-                f"{sorted(group_ids)}; pass group_id=<layer_type> to "
-                "PagedAttention (see gpt_oss.py)."
-            )
         if module.group_id not in group_ids:
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="

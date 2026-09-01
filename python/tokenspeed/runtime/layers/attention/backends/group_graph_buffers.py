@@ -115,7 +115,7 @@ class GroupGraphBuffers:
         gids = att_gids + owned_gids  # attention prefix, wrapper-owned tail
         if not gids:
             return
-        granularity = lambda gid: geometry.granularity_of(gid, kernel_page_size)
+        granularity = geometry.granularity_of
         source_widths = {
             gid: ceil_div(max_num_pages * kernel_page_size, granularity(gid))
             for gid in gids
@@ -336,9 +336,7 @@ class GroupGraphBuffers:
                 if ratio != 1:
                     expand_page_table(
                         src[:rows, :source_cols],
-                        block_granularity=self._geometry.granularity_of(
-                            gid, self._kernel_page_size
-                        ),
+                        block_granularity=self._geometry.granularity_of(gid),
                         kernel_page_size=int(self._consumer_page_sizes_tensor[i]),
                         max_kernel_pages=buf.shape[1],
                         out=buf[:rows],

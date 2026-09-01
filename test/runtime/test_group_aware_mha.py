@@ -92,7 +92,7 @@ class SelectPageTableTest(unittest.TestCase):
 
 
 class ValidateCacheGroupIdsTest(unittest.TestCase):
-    """Init-time fail-fast: multi-group pool requires labeled layers."""
+    """Init-time fail-fast: every layer must name a published cache group."""
 
     def setUp(self):
         try:
@@ -140,14 +140,11 @@ class ValidateCacheGroupIdsTest(unittest.TestCase):
             self._specs(["full_attention", "sliding_attention"]),
         )
 
-    def test_multi_group_empty_group_id_raises(self):
-        with self.assertRaisesRegex(
-            ValueError, r"TinyModel.*layer_id=1.*empty group_id"
-        ):
-            self.validate(
-                self._model(["full_attention", ""]),
-                self._specs(["full_attention", "sliding_attention"]),
-            )
+    def test_constructor_rejects_empty_group_id(self):
+        # group_id is mandatory at construction; there is no backend fallback
+        # for an unlabeled layer.
+        with self.assertRaisesRegex(ValueError, r"layer_id=1.*nonempty"):
+            self._model(["full_attention", ""])
 
     def test_multi_group_unknown_group_id_raises(self):
         with self.assertRaisesRegex(ValueError, r"TinyModel.*'nope'"):
@@ -156,12 +153,18 @@ class ValidateCacheGroupIdsTest(unittest.TestCase):
                 self._specs(["full_attention", "sliding_attention"]),
             )
 
-    def test_single_group_empty_group_id_is_fine(self):
-        # Documented fallback: single-group pools serve group-unaware layers.
-        self.validate(self._model(["", ""]), self._specs(["full_attention"]))
+    def test_single_group_unknown_group_id_raises(self):
+        # Single-group pools validate too: backends index their learned
+        # geometry by the layer's group_id with no fallback.
+        with self.assertRaisesRegex(ValueError, r"TinyModel.*'nope'"):
+            self.validate(self._model(["nope"]), self._specs(["full_attention"]))
+        self.validate(self._model(["full_attention"]), self._specs(["full_attention"]))
 
-    def test_no_groups_is_fine(self):
-        self.validate(self._model(["", ""]), self._specs([]))
+    def test_no_published_groups_is_fine(self):
+        # A pool without a published contract has nothing to validate against.
+        self.validate(
+            self._model(["full_attention", "full_attention"]), self._specs([])
+        )
 
 
 class GptOssGroupIdTest(unittest.TestCase):

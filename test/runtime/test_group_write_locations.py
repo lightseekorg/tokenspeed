@@ -28,6 +28,8 @@ PAGE = 2
 MAX_NUM_PAGES = 4
 MAX_BS = 4
 
+_GROUP_IDS = ("sliding_attention", "full_attention")
+
 
 def _decode_forward_mode():
     return SimpleNamespace(
@@ -68,7 +70,11 @@ class _MHACase(_TorchCase):
         self.MHAAttnBackend = MHAAttnBackend
         self.backend = MHAAttnBackend.__new__(MHAAttnBackend)
         self.backend.kernel_page_size = PAGE
-        self.backend._geometry = CacheGroupGeometry()
+        # granularity_of is fail-fast now; the fixture learns the groups the
+        # tests use at the base page size, like a bound single-grain pool.
+        self.backend._geometry = CacheGroupGeometry(
+            granularities={gid: PAGE for gid in _GROUP_IDS}
+        )
 
 
 class ComputeOutCacheLocsTest(_MHACase):
@@ -94,7 +100,7 @@ class ComputeOutCacheLocsTest(_MHACase):
             ),
         }
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        locs = self.backend._compute_decode_group_out_cache_locs(tables, seq_lens, PAGE)
+        locs = self.backend._compute_decode_group_out_cache_locs(tables, seq_lens)
         # sliding: r0 page 7*2+0=14; r1 page 6*2+1=13.
         assert locs["sliding_attention"].tolist() == [14, 13]
         # full: r0 3*2+0=6; r1 8*2+1=17.
@@ -114,7 +120,7 @@ class ComputeOutCacheLocsTest(_MHACase):
         prefix_cpu = torch.tensor([2, 0], dtype=torch.int32)
         extend_cpu = torch.tensor([3, 2], dtype=torch.int32)
         locs = self.backend._compute_extend_group_out_cache_locs(
-            tables, prefix_cpu, extend_cpu, PAGE
+            tables, prefix_cpu, extend_cpu
         )
         # r0: pos 2,3,4 -> page_idx 1,1,2 -> pages 2,2,3 ->
         #     locs 2*2+0=4, 2*2+1=5, 3*2+0=6; r1: pages 4,4 -> locs 8, 9.
@@ -131,7 +137,7 @@ class ComputeOutCacheLocsTest(_MHACase):
             "large": torch.tensor([[6, 7]], dtype=torch.int32),
         }
         locs = self.backend._compute_decode_group_out_cache_locs(
-            tables, torch.tensor([5], dtype=torch.int32), PAGE
+            tables, torch.tensor([5], dtype=torch.int32)
         )
         self.assertEqual(locs["small"].tolist(), [6])
         self.assertEqual(locs["large"].tolist(), [28])
@@ -149,7 +155,6 @@ class ComputeOutCacheLocsTest(_MHACase):
             tables,
             torch.tensor([3], dtype=torch.int32),
             torch.tensor([3], dtype=torch.int32),
-            PAGE,
         )
         self.assertEqual(locs["small"].tolist(), [23, 24, 25])
         self.assertEqual(locs["large"].tolist(), [83, 84, 85])
@@ -172,7 +177,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
         with mock.patch.dict(os.environ):
             os.environ.pop("TOKENSPEED_CACHE_DEBUG", None)
             self.backend._maybe_check_group_write_locs(
-                self._table_with_front_hole(), bad, PAGE
+                self._table_with_front_hole(), bad
             )
 
     def test_debug_rejects_write_into_hole_page(self):
@@ -183,7 +188,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
             os.environ, {"TOKENSPEED_CACHE_DEBUG": "1"}
         ), self.assertRaisesRegex(AssertionError, "null page.*sliding_attention"):
             self.backend._maybe_check_group_write_locs(
-                self._table_with_front_hole(), bad, PAGE
+                self._table_with_front_hole(), bad
             )
 
     def test_debug_rejects_page_outside_table(self):
@@ -194,7 +199,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
             os.environ, {"TOKENSPEED_CACHE_DEBUG": "1"}
         ), self.assertRaisesRegex(AssertionError, "escape.*sliding_attention"):
             self.backend._maybe_check_group_write_locs(
-                self._table_with_front_hole(), bad, PAGE
+                self._table_with_front_hole(), bad
             )
 
     def test_debug_passes_valid_locs(self):
@@ -203,7 +208,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
         good = {"sliding_attention": torch.tensor([4, 5, 6], dtype=torch.int32)}
         with mock.patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "1"}):
             self.backend._maybe_check_group_write_locs(
-                self._table_with_front_hole(), good, PAGE
+                self._table_with_front_hole(), good
             )
 
     def test_debug_honors_group_block_granularity(self):
@@ -212,7 +217,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
         tables = {"wide": torch.tensor([[2, 3]], dtype=torch.int32)}
         locs = {"wide": torch.tensor([11, 15], dtype=torch.int32)}
         with mock.patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "1"}):
-            self.backend._maybe_check_group_write_locs(tables, locs, PAGE)
+            self.backend._maybe_check_group_write_locs(tables, locs)
 
 
 class InitForwardMetadataAssemblyTest(_MHACase):
@@ -224,7 +229,9 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         torch = self.torch
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.kernel_page_size = PAGE
-        backend._geometry = CacheGroupGeometry()
+        backend._geometry = CacheGroupGeometry(
+            granularities={gid: PAGE for gid in _GROUP_IDS}
+        )
         backend.max_context_len = MAX_NUM_PAGES * PAGE
         backend.max_num_pages = MAX_NUM_PAGES
         backend.spec_num_tokens = 1
@@ -424,9 +431,6 @@ class SelectOutCacheLocTest(_MHACase):
         )
 
         assert got is caller_loc
-
-
-_GROUP_IDS = ("sliding_attention", "full_attention")
 
 
 class GraphLocBuffersTest(_MHACase):
