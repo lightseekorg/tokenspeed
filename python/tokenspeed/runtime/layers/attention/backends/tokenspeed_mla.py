@@ -691,12 +691,16 @@ class CuteDSLMLABackend(AttentionBackend):
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # Structural gate: the target takes the cache-group path (every LCM
-        # pool publishes a contract); the MTP draft keeps the batch-ordered
-        # draft page table for its in-graph write-loc math unless the runner
-        # explicitly dispatches groups to it. Latch BEFORE the views are
-        # built — the recorded forward_decode's select_out_cache_loc branch
-        # reads it.
-        if cache_group_ids or not self.is_draft:
+        # pool publishes a contract); the draft NEVER latches — it runs on
+        # its own classic paged pool and reads the staged batch-ordered
+        # draft page table (see init_forward_metadata), and it allocates no
+        # group write-location buffer, so a latched draft would send the
+        # recorded select_out_cache_loc into the missing-locations raise
+        # even when the runner dispatches group ids to it. Latch BEFORE the
+        # views are built — the recorded forward_decode's
+        # select_out_cache_loc branch reads it.
+        del cache_group_ids
+        if not self.is_draft:
             self._cache_groups_bound = True
         self._decode_views(bs)
 

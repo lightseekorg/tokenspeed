@@ -118,13 +118,16 @@ def test_mla_target_verify_width_applies_to_mixed_batches() -> None:
 
 
 def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
-    # The guarantee is structural now: a draft never allocates the group
-    # write-location buffer, and its bind latch stays down unless the runner
-    # explicitly dispatches cache groups to it.
+    # The guarantee is structural: a draft never allocates the group
+    # write-location buffer, so its bind latch must stay down even when the
+    # runner dispatches cache-group ids to it (EAGLE drafts share the
+    # target's page-id space, so the runner does). A latched draft sends
+    # the recorded select_out_cache_loc into the missing-locations raise —
+    # Kimi-K2.5 eagle3 died at capture exactly this way.
     backend = _bare_mla_backend(cache_contract=False, is_draft=True)
     backend.init_cuda_graph_state(max_bs=2)
 
-    backend.bind_decode_views(2)
+    backend.bind_decode_views(2, cache_group_ids=("full_attention",))
 
     assert backend._cache_groups_bound is False
     assert backend.decode_cuda_graph_group_out_cache_loc is None
