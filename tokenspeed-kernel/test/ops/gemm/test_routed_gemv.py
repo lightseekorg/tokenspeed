@@ -268,6 +268,22 @@ def test_unlisted_shapes_keep_the_generic_selection():
     assert "rowcta" in getattr(impl, "__name__", "")
 
 
+def test_qwen38_route_keeps_unstable_shapes_on_fallback():
+    assert MEASURED_ROUTE[(2, 12800, 2560)] == "skinny"
+    assert {
+        m for m, n, k in MEASURED_ROUTE if (n, k) == (12800, 2560)
+    } == {2}
+    for shape in (
+        (2, 512, 2560),
+        (4, 640, 2560),
+        (17, 2560, 320),
+        (21, 2560, 320),
+        (23, 2560, 320),
+        (1, 6656, 2560),
+    ):
+        assert shape not in MEASURED_ROUTE
+
+
 @pytest.mark.parametrize("m", [1, 2, 4])
 def test_shared_projections_route_and_match_torch(m):
     """The K3 shared gate_up/down call sites take the measured route on
