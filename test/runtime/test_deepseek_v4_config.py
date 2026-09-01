@@ -1014,7 +1014,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            block_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         )
@@ -1083,7 +1083,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=1,
             req_pool_indices=torch.zeros(1, dtype=torch.int32),
             seq_lens=torch.ones(1, dtype=torch.int32),
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            block_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             block_tables={"v4.swa_kv": swa_table, "v4.state": state_table},
             cache_metadata=target_cache_metadata,
@@ -2541,7 +2541,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            block_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             block_tables={"v4.swa_kv": compact},
             block_table_base_offsets={"v4.swa_kv": base},
         )
@@ -3029,7 +3029,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            page_table=torch.zeros((3, 1), dtype=torch.int32),
+            block_table=torch.zeros((3, 1), dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -3076,7 +3076,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         [prefill_tokens, 100, 200], dtype=torch.int32
                     ),
                     forward_mode=ForwardMode.MIXED,
-                    page_table=torch.zeros((3, 256), dtype=torch.int32),
+                    block_table=torch.zeros((3, 256), dtype=torch.int32),
                     extend_seq_lens_cpu=torch.tensor(
                         [prefill_tokens], dtype=torch.int32
                     ),
@@ -3136,7 +3136,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([7, 20], dtype=torch.int32),
                 forward_mode=ForwardMode.MIXED,
-                page_table=torch.zeros((2, 64), dtype=torch.int32),
+                block_table=torch.zeros((2, 64), dtype=torch.int32),
                 extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
                 num_extends=1,
             )
@@ -3164,7 +3164,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([17, 65], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
-            page_table=torch.zeros((2, 2), dtype=torch.int32),
+            block_table=torch.zeros((2, 2), dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([12, 56], dtype=torch.int32),
             num_extends=2,
@@ -3206,7 +3206,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([5], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
-                page_table=torch.zeros((1, 1), dtype=torch.int32),
+                block_table=torch.zeros((1, 1), dtype=torch.int32),
                 extend_prefix_lens_cpu=torch.tensor([2], dtype=torch.int32),
                 num_extends=1,
             )
@@ -3221,7 +3221,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([131], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
-                page_table=torch.zeros((1, 3), dtype=torch.int32),
+                block_table=torch.zeros((1, 3), dtype=torch.int32),
                 extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
                 num_extends=1,
             )
@@ -3343,7 +3343,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([4, 7, 9], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
-            page_table=torch.zeros((3, 1), dtype=torch.int32),
+            block_table=torch.zeros((3, 1), dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([2, 1, 3], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 6, 6], dtype=torch.int32),
             num_extends=3,
@@ -3353,7 +3353,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         calls = []
 
         def fake_prefill_chunk(**kwargs):
-            chunk_metadata = backend.forward_metadata
+            # Chunk slices travel as the metadata parameter; the slots are
+            # never touched mid-call.
+            chunk_metadata = kwargs["metadata"]
             calls.append(
                 (
                     kwargs["q"].shape[0],
@@ -3433,7 +3435,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.MIXED,
-            page_table=page_table,
+            block_table=page_table,
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -3448,7 +3450,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices,
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=page_table,
+            block_table=page_table,
         )
         decode_metadata = backend.forward_metadata
         self.assertIs(backend.forward_decode_metadata, decode_metadata)
@@ -3539,7 +3541,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            block_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             block_tables={
                 "v4.swa_kv": swa,
                 "v4.c4a.compressor_state": c4_state,
@@ -3984,7 +3986,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            page_table=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
+            block_table=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 4, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 5, 11], dtype=torch.int32),
             num_extends=3,
@@ -4030,14 +4032,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
         calls = []
 
         def fake_prefill(**kwargs):
-            metadata = backend.forward_metadata
+            # The mixed dispatcher passes its slices as the metadata
+            # parameter; the slots are never touched mid-call.
+            metadata = kwargs["metadata"]
             calls.append(
                 (
                     "prefill",
@@ -4052,7 +4056,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             return kwargs["q"].new_full((3, 2, 4), 1.0)
 
         def fake_decode(**kwargs):
-            metadata = backend.forward_metadata
+            metadata = kwargs["metadata"]
             calls.append(
                 (
                     "decode",
@@ -4134,7 +4138,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
@@ -4145,7 +4149,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         calls = []
 
         def fake_prefill_chunk(**kwargs):
-            metadata = backend.forward_metadata
+            # Slices travel as the metadata parameter (slots untouched).
+            metadata = kwargs["metadata"]
             calls.append(
                 (
                     "prefill",
@@ -4158,7 +4163,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             return q.new_full((q.shape[0], 1, 2), 1.0)
 
         def fake_decode(**kwargs):
-            metadata = backend.forward_metadata
+            metadata = kwargs["metadata"]
             calls.append(
                 (
                     "decode",
@@ -4277,7 +4282,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([70, 3], dtype=torch.int32),
             num_tokens=8,
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertTrue(
             torch.equal(
@@ -4313,7 +4318,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([70, 3], dtype=torch.int32),
             num_tokens=8,
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertEqual(
             draft_backend.forward_metadata.forward_mode, ForwardMode.DECODE
@@ -4349,7 +4354,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([70, 3], dtype=torch.int32),
                 num_tokens=7,
                 forward_mode=ForwardMode.DECODE,
-                page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+                block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
             )
 
     def test_deepseek_v4_decode_metadata_defaults_to_one_token(self):
@@ -4376,7 +4381,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
 
         self.assertTrue(
@@ -4511,7 +4516,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=c4_table,
+            block_table=c4_table,
             block_tables=_v4_compressed_kv_tables(c4=c4_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -4549,7 +4554,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=c128_table,
+            block_table=c128_table,
             block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         hca_positions = seq_lens.to(torch.int64) - 1
@@ -4609,7 +4614,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=c128_table,
+            block_table=c128_table,
             block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -4757,7 +4762,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=compressed_table,
+            block_table=compressed_table,
             block_tables=_v4_compressed_kv_tables(
                 c4=compressed_table,
                 c128=compressed_table,
@@ -4834,7 +4839,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.arange(4, dtype=torch.int32),
             torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor(
+            block_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -5118,7 +5123,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             num_tokens=16,
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor(
+            block_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -5175,7 +5180,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             num_tokens=16,
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor(
+            block_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -5269,7 +5274,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             num_tokens=16,
             forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor(
+            block_table=torch.tensor(
                 [[10, 11], [20, 21], [30, 31], [40, 41]],
                 dtype=torch.int32,
             ),
@@ -5402,7 +5407,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
-            page_table=page_table,
+            block_table=page_table,
             extend_seq_lens_cpu=seq_lens.cpu(),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
         )
@@ -5414,7 +5419,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens,
             num_tokens=1,
             forward_mode=ForwardMode.DECODE,
-            page_table=page_table,
+            block_table=page_table,
         )
         backend.advance_draft_forward_metadata()
 
@@ -5456,7 +5461,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.forward_metadata = decode_metadata
 
         def fake_prefill_chunk(**kwargs):
-            self.assertIs(backend.forward_metadata, prefill_metadata)
+            # The prefill-slot fallback travels as the metadata parameter;
+            # forward_metadata itself is never rewritten by a read path.
+            self.assertIs(kwargs["metadata"], prefill_metadata)
+            self.assertIs(backend.forward_metadata, decode_metadata)
             q = kwargs["q"]
             return q.new_zeros((q.shape[0], 1, 2))
 
@@ -5478,7 +5486,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         self.assertEqual(out.shape, (6, 1, 2))
-        self.assertIs(backend.forward_metadata, prefill_metadata)
+        # The read path leaves the slots exactly as it found them.
+        self.assertIs(backend.forward_metadata, decode_metadata)
+        self.assertIs(backend.forward_prefill_metadata, prefill_metadata)
 
     def test_deepseek_v4_indexer_decode_plan_batches_metadata(self):
         positions = torch.tensor([15, 7, 3], dtype=torch.int64)

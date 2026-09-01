@@ -23,7 +23,7 @@ path nothing exercised routinely.
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
-seq_lens, *, forward_mode, page_table, num_extends, for_graph_replay,
+seq_lens, *, forward_mode, block_table, num_extends, for_graph_replay,
 **cache_kwargs)` is the ONLY way decode metadata is prepared:
 
 * **capture** (`init_forward_metadata_capture_cuda_graph`) is INHERITED: the
@@ -31,7 +31,7 @@ seq_lens, *, forward_mode, page_table, num_extends, for_graph_replay,
   backend over its `_decode_views` builder) and runs the idle-refresh arm
   (`actual_bs=0`,
   `for_graph_replay=True`) against the runner-seeded seq_lens and the
-  address-stable staged page_table — never live tables. Only a genuine
+  address-stable staged block_table — never live tables. Only a genuine
   capture-only asymmetry overrides it (see "Capture is inherited");
 * **replay** = refresh (`for_graph_replay=True`) + `graph.replay()`;
 * **eager decode** = refresh (`for_graph_replay=False`) + the same forward
@@ -111,7 +111,7 @@ latch `_cache_groups_bound` before the views are built. A new backend
 implements `refresh_decode_metadata` + `init_cuda_graph_state` and inherits
 capture; a new override must name its kernel-imposed asymmetry here. Every
 capture signature must accept the runner kwarg set (`cache_group_ids`,
-`page_table`, `**kwargs`) — pinned by
+`block_table`, `**kwargs`) — pinned by
 `test_unified_decode_path.py::CaptureSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
@@ -163,6 +163,17 @@ depths) leaves the refreshed decode slot unread; a block drafter (DFLASH)
 re-runs the same refresh inside each block-decode step, overwriting it. A
 backend that lets one call clobber the other slot's metadata is in breach —
 that, not drafter special-casing, is the invariant to fix.
+
+**V4's packed-draft deviation (documented):** a V4 draft's packed verify
+round legitimately writes BOTH slots at its end — the bs*N packed views ride
+the prefill slot (the step-0 shape carrier; `_select_decode_metadata`
+resolves them there through a DECODE-mode-gated fallback), and the bs-row
+step views own the decode slot. Capture and replay refresh reach that state
+through the SAME publisher (`_publish_draft_round`), so replay reproduces
+capture's slot end state by construction — the pointer guard's capture-end
+snapshot verifies it. Slot writes exist only in the three publishers; the
+`forward_deepseek_v4_*` read paths thread resolved metadata as parameters
+and never write a slot.
 
 ### PD decode nodes
 
@@ -236,20 +247,25 @@ Every backend consumes the wrapper's per-group `block_tables` kwarg — raw
 scheduler tables in block-granularity page ids — and there is no capability
 flag saying so (`uses_cache_groups` was deleted once it was universally
 True). The invariant replacing it: **any table a backend receives — the
-per-group `block_tables`, the staged draft `page_table`, a warmup
+per-group `block_tables`, the staged draft `block_table`, a warmup
 placeholder — carries raw scheduler pages; kernel-page expansion happens
 inside the backend, through the one shared `expand_history_table`
 (`cache_group_geometry.py`; the base `set_cache_pool` learns the
 full-history grain from the pool's specs into one `CacheGroupGeometry`
 value object)**. The routing surface lives on `AttentionBackend` itself:
 the write-location slot math lives in `group_write_locations.py` as pure
-functions, and the stacked per-group CUDA-graph buffers live in
-`group_graph_buffers.GroupGraphBuffers`, composed at graph-state init.
-Inside the stack, page vocabulary stays with paged-KV consumers
+functions, and every persistent decode buffer lives in one composed
+`decode_buffers.DecodeBuffers`, built at graph-state init. It carries two
+tiers: the stacked per-group tables/locations with their shared fill
+machinery, and the single-table slots (`seq_lens` / `page_table` /
+`out_cache_loc`) whose geometry is kernel-shaped — the owning backend
+allocates and fills those (the MLA family constructs the bare, stack-less
+form; folding their fills into the group machinery is the next unification
+milestone). Inside the stack, page vocabulary stays with paged-KV consumers
 (`cache-concepts.md`): attention-consumed groups get consumer-page-grain
-`page_tables` plus write-location views, while wrapper-owned (Inkling conv)
-groups ride the stack tail as block-granularity `owned_block_tables` with
-no location views (the wrapper keeps its own write-loc machinery).
+`group_page_tables` plus write-location views, while wrapper-owned (Inkling
+conv) groups ride the stack tail as block-granularity `owned_block_tables`
+with no location views (the wrapper keeps its own write-loc machinery).
 `CacheBatchMetadata` no longer carries a `kernel_table` expansion;
 `cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
 KDA state paging only. `cache_active_pages_must_be_real` remains a separate
@@ -287,7 +303,7 @@ None carried information not already implied by the pool's published specs.
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
 The group mixins are gone — the routing surface lives on
-`AttentionBackend` (per-group selection, GroupGraphBuffers composition) and
+`AttentionBackend` (per-group selection, DecodeBuffers composition) and
 the two write-location kernels stay two sets of pure functions
 (`group_write_locations.py`); unifying that math with V4's bespoke slot
 mapping is the final block-table-owner milestone (`cache-concepts.md`

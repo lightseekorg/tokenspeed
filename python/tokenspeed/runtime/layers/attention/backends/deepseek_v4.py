@@ -715,6 +715,45 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             return None
         return None
 
+    # ------------------------------------------------------------------
+    # Slot publication — the ONLY writers of the three metadata slots.
+    #
+    # | phase end                        | prefill slot   | decode slot | forward_metadata |
+    # |----------------------------------|----------------|-------------|------------------|
+    # | extend/mixed init                | new dynamic    | (unchanged) | = prefill        |
+    # | idle init / decode refresh /     | (unchanged)    | views(bs,N) | = decode         |
+    # |   target verify refresh / capture|                |             |                  |
+    # | packed-draft refresh == capture  | packed views   | step views  | = decode         |
+    # | advance (draft steps 1+)         | (unchanged)    | step views  | = decode         |
+    #
+    # Capture and replay refresh call the SAME publisher, so "replay must
+    # reproduce capture's end state" is one line of code, not a cross-method
+    # contract (graph_ptr_guard verifies the slots' object graph against the
+    # capture-end snapshot). Forwards are read-only: resolution results
+    # travel as parameters, never through a slot write.
+    # ------------------------------------------------------------------
+
+    def _publish_prefill(self, metadata: DeepseekV4ForwardMetadata) -> None:
+        self.forward_prefill_metadata = metadata
+        self.forward_metadata = metadata
+
+    def _publish_decode(self, metadata: DeepseekV4ForwardMetadata) -> None:
+        self.forward_decode_metadata = metadata
+        self.forward_metadata = metadata
+
+    def _publish_draft_round(
+        self,
+        packed: DeepseekV4ForwardMetadata,
+        step: DeepseekV4ForwardMetadata,
+    ) -> None:
+        """A packed-draft round's end state: the bs*N verify views ride the
+        prefill slot (the step-0 shape carrier — _select_decode_metadata's
+        DECODE-gated fallback resolves them there), the bs-row step views own
+        the decode slot."""
+        self.forward_prefill_metadata = packed
+        self.forward_decode_metadata = step
+        self.forward_metadata = step
+
     def _prepare_draft_round(
         self,
         prefill_metadata: DeepseekV4ForwardMetadata,
@@ -722,8 +761,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> None:
         """Bind the draft's plain-step views for this round and run the
         indexer/slot-mapping refresh hooks over them (DraftRounds owns the
-        copy-only binding; the kernel-facing refresh trio stays here)."""
-        self.forward_prefill_metadata = prefill_metadata
+        copy-only binding; the kernel-facing refresh trio stays here; slot
+        publication belongs to the publishers, never here)."""
         assert self.draft_rounds is not None
         metadata = self.draft_rounds.prepare(prefill_metadata, base_seq_lens)
         metadata.cache.refresh_decode_compressed_slot_mappings(
@@ -767,7 +806,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        block_table: torch.Tensor = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -1032,7 +1071,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
         )
-        self.forward_metadata = DeepseekV4ForwardMetadata(
+        metadata = DeepseekV4ForwardMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             query_lens=query_lens,
@@ -1048,9 +1087,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if metadata_forward_mode is not None and metadata_forward_mode.is_idle():
             # A pure DECODE init raises at the top, so idle is the only
             # decode-shaped mode left here.
-            self.forward_decode_metadata = self.forward_metadata
+            self._publish_decode(metadata)
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
-            self.forward_prefill_metadata = self.forward_metadata
+            self._publish_prefill(metadata)
+        else:
+            self.forward_metadata = metadata
 
     def _update_decode_swa_metadata(
         self,
@@ -1121,10 +1162,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compress_ratio: int,
         block_size: int,
         topk_indices: torch.Tensor | None,
+        metadata: DeepseekV4ForwardMetadata | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if compress_ratio <= 1:
             return None, None
-        metadata = self.forward_metadata
+        if metadata is None:
+            metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
         num_tokens = positions.numel()
@@ -1288,11 +1331,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         softmax_scale: float,
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
+        metadata: DeepseekV4ForwardMetadata | None = None,
     ) -> torch.Tensor:
-        metadata = self._select_decode_metadata(q.shape[0])
+        # Resolution is a READ: the mixed path passes its decode slice, the
+        # model path resolves by token count; neither writes a slot.
+        if metadata is None:
+            metadata = self._select_decode_metadata(q.shape[0])
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
-        self.forward_metadata = metadata
         if metadata.forward_mode is None or not metadata.forward_mode.is_decode():
             raise RuntimeError(
                 "forward_deepseek_v4_decode only supports ForwardMode.DECODE"
@@ -1335,6 +1381,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compress_ratio=compress_ratio,
             block_size=compressed_block_size,
             topk_indices=topk_indices,
+            metadata=metadata,
         )
 
         compressed_cache_2d = None
@@ -1394,71 +1441,71 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_decode_reqs = metadata.decode_req_count()
         num_decode_tokens = metadata.decode_token_count()
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
-        saved_metadata = self.forward_metadata
-        try:
-            if num_prefill_tokens > 0:
-                self.forward_metadata = self._metadata_slice(
-                    metadata,
-                    req_start=0,
-                    req_end=num_prefill_reqs,
-                    token_start=0,
-                    token_end=num_prefill_tokens,
-                    forward_mode=ForwardMode.EXTEND,
-                )
-                prefill_out = self.forward_deepseek_v4_prefill(
-                    q=q[:num_prefill_tokens],
-                    positions=positions[:num_prefill_tokens],
-                    token_to_kv_pool=token_to_kv_pool,
-                    layer_id=layer_id,
-                    kind=kind,
-                    compress_ratio=compress_ratio,
-                    num_local_heads=num_local_heads,
-                    padded_heads=padded_heads,
-                    head_dim=head_dim,
-                    window_size=window_size,
-                    softmax_scale=softmax_scale,
-                    attn_sink=attn_sink,
-                    topk_indices=(
-                        topk_indices[:num_prefill_tokens]
-                        if topk_indices is not None
-                        else None
-                    ),
-                )
-                with nvtx_range(f"attn_{kind}_mixed_prefill_copy"):
-                    out[:num_prefill_tokens].copy_(prefill_out)
-            if num_decode_tokens > 0:
-                decode_end = num_prefill_tokens + num_decode_tokens
-                self.forward_metadata = self._metadata_slice(
-                    metadata,
-                    req_start=num_prefill_reqs,
-                    req_end=num_prefill_reqs + num_decode_reqs,
-                    token_start=num_prefill_tokens,
-                    token_end=decode_end,
-                    forward_mode=ForwardMode.DECODE,
-                )
-                decode_out = self.forward_deepseek_v4_decode(
-                    q=q[num_prefill_tokens:decode_end],
-                    positions=positions[num_prefill_tokens:decode_end],
-                    token_to_kv_pool=token_to_kv_pool,
-                    layer_id=layer_id,
-                    kind=kind,
-                    compress_ratio=compress_ratio,
-                    num_local_heads=num_local_heads,
-                    padded_heads=padded_heads,
-                    head_dim=head_dim,
-                    window_size=window_size,
-                    softmax_scale=softmax_scale,
-                    attn_sink=attn_sink,
-                    topk_indices=(
-                        topk_indices[num_prefill_tokens:decode_end]
-                        if topk_indices is not None
-                        else None
-                    ),
-                )
-                with nvtx_range(f"attn_{kind}_mixed_decode_copy"):
-                    out[num_prefill_tokens:decode_end].copy_(decode_out)
-        finally:
-            self.forward_metadata = saved_metadata
+        # Slices travel as parameters; the slots are never touched mid-call
+        # (the save/restore dance was a mutation on a read path).
+        if num_prefill_tokens > 0:
+            prefill_metadata = self._metadata_slice(
+                metadata,
+                req_start=0,
+                req_end=num_prefill_reqs,
+                token_start=0,
+                token_end=num_prefill_tokens,
+                forward_mode=ForwardMode.EXTEND,
+            )
+            prefill_out = self.forward_deepseek_v4_prefill(
+                q=q[:num_prefill_tokens],
+                positions=positions[:num_prefill_tokens],
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                kind=kind,
+                compress_ratio=compress_ratio,
+                num_local_heads=num_local_heads,
+                padded_heads=padded_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_indices=(
+                    topk_indices[:num_prefill_tokens]
+                    if topk_indices is not None
+                    else None
+                ),
+                metadata=prefill_metadata,
+            )
+            with nvtx_range(f"attn_{kind}_mixed_prefill_copy"):
+                out[:num_prefill_tokens].copy_(prefill_out)
+        if num_decode_tokens > 0:
+            decode_end = num_prefill_tokens + num_decode_tokens
+            decode_metadata = self._metadata_slice(
+                metadata,
+                req_start=num_prefill_reqs,
+                req_end=num_prefill_reqs + num_decode_reqs,
+                token_start=num_prefill_tokens,
+                token_end=decode_end,
+                forward_mode=ForwardMode.DECODE,
+            )
+            decode_out = self.forward_deepseek_v4_decode(
+                q=q[num_prefill_tokens:decode_end],
+                positions=positions[num_prefill_tokens:decode_end],
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                kind=kind,
+                compress_ratio=compress_ratio,
+                num_local_heads=num_local_heads,
+                padded_heads=padded_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_indices=(
+                    topk_indices[num_prefill_tokens:decode_end]
+                    if topk_indices is not None
+                    else None
+                ),
+                metadata=decode_metadata,
+            )
+            with nvtx_range(f"attn_{kind}_mixed_decode_copy"):
+                out[num_prefill_tokens:decode_end].copy_(decode_out)
         return out
 
     def _prefill_workspace(
@@ -1471,8 +1518,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         window_size: int,
         head_dim: int,
         topk_indices: torch.Tensor | None,
+        metadata: DeepseekV4ForwardMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        metadata = self.forward_metadata
+        if metadata is None:
+            metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         cache_metadata = metadata.cache
@@ -1803,8 +1852,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         softmax_scale: float,
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
+        metadata: DeepseekV4ForwardMetadata | None = None,
     ) -> torch.Tensor:
-        metadata = self.forward_metadata
+        if metadata is None:
+            metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
@@ -1819,6 +1870,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 q_padded[:, : q.shape[1]].copy_(q)
         with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
+                metadata=metadata,
                 positions=positions,
                 token_to_kv_pool=token_to_kv_pool,
                 layer_id=layer_id,
@@ -1854,8 +1906,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         softmax_scale: float,
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
+        metadata: DeepseekV4ForwardMetadata | None = None,
     ) -> torch.Tensor:
-        metadata = self.forward_metadata
+        if metadata is None:
+            metadata = self.forward_metadata
         if (
             metadata is None
             or metadata.forward_mode is None
@@ -1864,7 +1918,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata = self.forward_prefill_metadata or metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        self.forward_metadata = metadata
         if (
             metadata.forward_mode is None
             or not metadata.forward_mode.is_extend_or_mixed()
@@ -1895,6 +1948,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 softmax_scale=softmax_scale,
                 attn_sink=attn_sink,
                 topk_indices=topk_indices,
+                metadata=metadata,
             )
 
         query_lens_cpu = metadata.query_lens_cpu
@@ -1915,44 +1969,41 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"count: query_tokens={token_offsets[-1]}, q_tokens={q.shape[0]}"
             )
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
-        saved_metadata = self.forward_metadata
-        try:
-            for req_start in range(0, num_reqs, self.prefill_chunk_size):
-                req_end = min(req_start + self.prefill_chunk_size, num_reqs)
-                token_start = token_offsets[req_start]
-                token_end = token_offsets[req_end]
-                if token_end <= token_start:
-                    continue
-                self.forward_metadata = self._metadata_slice(
-                    saved_metadata,
-                    req_start=req_start,
-                    req_end=req_end,
-                    token_start=token_start,
-                    token_end=token_end,
-                    forward_mode=ForwardMode.EXTEND,
-                )
-                chunk_out = self._forward_deepseek_v4_prefill_chunk(
-                    q=q[token_start:token_end],
-                    positions=positions[token_start:token_end],
-                    token_to_kv_pool=token_to_kv_pool,
-                    layer_id=layer_id,
-                    kind=kind,
-                    compress_ratio=compress_ratio,
-                    num_local_heads=num_local_heads,
-                    padded_heads=padded_heads,
-                    head_dim=head_dim,
-                    window_size=window_size,
-                    softmax_scale=softmax_scale,
-                    attn_sink=attn_sink,
-                    topk_indices=(
-                        topk_indices[token_start:token_end]
-                        if topk_indices is not None
-                        else None
-                    ),
-                )
-                out[token_start:token_end].copy_(chunk_out)
-        finally:
-            self.forward_metadata = saved_metadata
+        for req_start in range(0, num_reqs, self.prefill_chunk_size):
+            req_end = min(req_start + self.prefill_chunk_size, num_reqs)
+            token_start = token_offsets[req_start]
+            token_end = token_offsets[req_end]
+            if token_end <= token_start:
+                continue
+            chunk_metadata = self._metadata_slice(
+                metadata,
+                req_start=req_start,
+                req_end=req_end,
+                token_start=token_start,
+                token_end=token_end,
+                forward_mode=ForwardMode.EXTEND,
+            )
+            chunk_out = self._forward_deepseek_v4_prefill_chunk(
+                q=q[token_start:token_end],
+                positions=positions[token_start:token_end],
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                kind=kind,
+                compress_ratio=compress_ratio,
+                num_local_heads=num_local_heads,
+                padded_heads=padded_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_indices=(
+                    topk_indices[token_start:token_end]
+                    if topk_indices is not None
+                    else None
+                ),
+                metadata=chunk_metadata,
+            )
+            out[token_start:token_end].copy_(chunk_out)
         return out
 
     def init_cuda_graph_state(
@@ -2107,9 +2158,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 metadata,
                 self.graph.seq_lens[:bs],
             )
+            self._publish_draft_round(metadata, self.draft_rounds.current)
+            return
         if is_decode:
-            self.forward_decode_metadata = metadata
-        self.forward_metadata = metadata
+            self._publish_decode(metadata)
+        else:
+            self.forward_metadata = metadata
 
     def refresh_decode_metadata(
         self,
@@ -2119,7 +2173,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         *,
         forward_mode: ForwardMode,
-        page_table: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
         num_extends: int = 0,
         for_graph_replay: bool = False,
         **kwargs,
@@ -2330,23 +2384,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             _refresh_decode_indexer_schedule_metadata(metadata)
         if is_packed_decode and self.is_draft:
-            # A draft's packed round ends with the decode slot (and
-            # forward_metadata) on the bs-row draft-decode object: the
-            # captured graph recorded advance_draft_forward_metadata as its
-            # LAST slot write, so the replay refresh must leave the same
-            # object reachable — graph_ptr_guard verifies the slots' object
-            # graph against the capture-end snapshot. The packed bs*N views
-            # go to the PREFILL slot as the step-0 shape carrier: eager
-            # step 0 resolves its bs*N query through _select_decode_metadata's
-            # prefill-slot fallback (DECODE-mode gated), exactly like the
-            # model-side resolver.
-            self.forward_prefill_metadata = metadata
-            self.forward_decode_metadata = self.draft_rounds.current
-            self.forward_metadata = self.draft_rounds.current
+            self._publish_draft_round(metadata, self.draft_rounds.current)
             return
         if is_decode:
-            self.forward_decode_metadata = metadata
-        self.forward_metadata = metadata
+            self._publish_decode(metadata)
+        else:
+            self.forward_metadata = metadata
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         if self.draft_rounds is None or self.forward_prefill_metadata is None:
@@ -2371,8 +2414,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        self.forward_decode_metadata = metadata
-        self.forward_metadata = metadata
+        self._publish_decode(metadata)
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("DeepSeek V4 uses the model-local attention forward")
