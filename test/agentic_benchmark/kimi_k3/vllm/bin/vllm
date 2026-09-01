@@ -1,0 +1,48 @@
+#!/usr/bin/bash
+
+set -euo pipefail
+
+: "${VLLM_BENCH_CONFIG:?Set VLLM_BENCH_CONFIG}"
+: "${VLLM_MASTER_ADDR:?Set VLLM_MASTER_ADDR}"
+: "${SLURM_PROCID:?SLURM_PROCID is required}"
+: "${MODEL_DIR:?Set MODEL_DIR}"
+: "${DRAFT_DIR:?Set DRAFT_DIR}"
+VLLM_REAL_BIN=${VLLM_REAL_BIN:-/usr/local/bin/vllm}
+
+runtime_args=()
+for arg in "$@"; do
+    arg=${arg//nvidia\/Kimi-K3-NVFP4/$MODEL_DIR}
+    arg=${arg//Inferact\/Kimi-K3-DSpark/$DRAFT_DIR}
+    runtime_args+=("$arg")
+done
+
+node_args=(
+    --distributed-executor-backend mp
+    --nnodes "${SLURM_NNODES:-2}"
+    --node-rank "$SLURM_PROCID"
+    --master-addr "$VLLM_MASTER_ADDR"
+    --master-port "${VLLM_MASTER_PORT:-29500}"
+    --host 0.0.0.0
+    --served-model-name nvidia/Kimi-K3-NVFP4
+)
+
+if [[ "$SLURM_PROCID" -ne 0 ]]; then
+    node_args+=(--headless)
+fi
+
+if [[ "$VLLM_BENCH_CONFIG" == attn_dp8_moe_ep8 ]]; then
+    node_args+=(
+        --data-parallel-size-local "${VLLM_DP_LOCAL_SIZE:-4}"
+        --data-parallel-address "$VLLM_MASTER_ADDR"
+        --data-parallel-rpc-port "${VLLM_DP_RPC_PORT:-29501}"
+    )
+fi
+
+printf 'launch hostname=%s node_rank=%s config=%s\n' \
+    "$(hostname)" "$SLURM_PROCID" "$VLLM_BENCH_CONFIG"
+printf 'cache HF_HOME=%s HF_HUB_CACHE=%s HF_HUB_OFFLINE=%s\n' \
+    "${HF_HOME:-<unset>}" "${HF_HUB_CACHE:-<unset>}" "${HF_HUB_OFFLINE:-<unset>}"
+printf 'command:'
+printf ' %q' "$VLLM_REAL_BIN" "${runtime_args[@]}" "${node_args[@]}"
+printf '\n'
+exec "$VLLM_REAL_BIN" "${runtime_args[@]}" "${node_args[@]}"
