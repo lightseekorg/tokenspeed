@@ -967,8 +967,13 @@ class Qwen4ExpPLELayer(nn.Module):
             embeddings, context_tail = self.ple_embedding.forward_flat(
                 flat_ids, initial_context, req, col, starts, need_tail=verify
             )
-            final_context = self._final_context(
-                flat_ids, initial_context, lengths_t, starts
+            # Only the non-verify branch writes it back, and ``verify`` is fixed
+            # when a graph is captured, so skipping here keeps the gather and
+            # its ten elementwise kernels out of the captured verify graph.
+            final_context = (
+                None
+                if verify
+                else self._final_context(flat_ids, initial_context, lengths_t, starts)
             )
         else:
             contexts, final_context = self._token_contexts(
