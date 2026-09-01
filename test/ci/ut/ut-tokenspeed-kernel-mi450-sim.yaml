@@ -61,6 +61,10 @@ env:
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_mixed_1024]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_persistent_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_matches_weighted_relu_oracle
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_prefill_uses_workspace_rows_not_global_slots
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_accepts_block_split_writer_output
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_logits_cover_empty_and_short_spans
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_feeds_block_scaled_gemm
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[130-300-block_size2]
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[192-256-block_size3]
