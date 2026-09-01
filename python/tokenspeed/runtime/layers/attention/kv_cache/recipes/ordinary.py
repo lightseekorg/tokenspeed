@@ -37,7 +37,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -50,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
+    CacheGroupDeclaration,
     hybrid_slab_group_size,
     layer_group_ids,
 )
@@ -80,17 +80,19 @@ class OrdinaryRecipe(CacheRecipe):
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
-        """Merged labels, or empty when they cannot align per layer.
+        """Merged labels, target then draft, always one per layer.
 
-        A NextN draft inherits the target hf_config's ``layer_types`` (one
-        draft layer against 61 target labels), so misaligned labels degrade to
-        full-history rather than mislabeling a group.
+        A side whose config labels cannot align per layer resolves to
+        full-history rather than mislabeling a group: plain MLA/DSA configs
+        declare no labels at all, and a NextN draft inherits the target
+        hf_config's ``layer_types`` (one draft layer against 61 target
+        labels).
         """
         target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
         if len(target) != self.num_target_layers:
-            target = ()
+            target = (FULL_ATTENTION,) * self.num_target_layers
         if self.draft_attn_config is None:
-            return target if target else ()
+            return target
         draft = tuple(
             getattr(
                 self.draft_attn_config.component(SoftmaxAttnConfig), "layer_types", ()
@@ -98,8 +100,7 @@ class OrdinaryRecipe(CacheRecipe):
         )
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
-        merged = target + draft
-        return merged if len(merged) == len(self.group_ids) else ()
+        return target + draft
 
     # ---- geometry ----
 

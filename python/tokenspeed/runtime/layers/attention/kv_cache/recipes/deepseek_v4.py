@@ -52,7 +52,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -60,6 +59,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )

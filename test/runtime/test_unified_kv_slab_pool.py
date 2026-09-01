@@ -431,7 +431,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             layer_num=1,
             rank=0,
             cache_group_specs=_specs_for_layers(
-                layer_types=(),
+                layer_types=("full_attention",),
                 group_ids=("full_attention",),
                 sliding_window_tokens=None,
                 prefix_granularity=4,

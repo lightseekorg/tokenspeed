@@ -115,6 +115,9 @@ class CacheGroupSpec:
         return self.page_size
 
 
+# One declared cache group: what the scheduler is told, and the bytes it costs.
+CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[plan.CacheFieldSpec, ...]]
+
 _CACHE_GROUP_DUMMY_PAGES = 1
 
 # The scale-tile span lives with the field geometry it defines (plan.py); it is
@@ -542,14 +545,14 @@ def split_recurrent_state_groups(layer_types: Sequence[str]) -> list[str]:
 
 def group(
     *,
-    layer_types: Sequence[str],
-    group_ids: Sequence[str],
+    layer_types: Sequence[str],  # len: num_layers
+    group_ids: Sequence[str],  # len: num_layers
     sliding_window_tokens: SlidingWindowTokens,
     prefix_granularity: int,
     fields_for_layer,
     page_sizes: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
-) -> tuple[tuple[CacheGroupSpec, tuple], ...]:
+) -> tuple[CacheGroupDeclaration, ...]:
     """Walk the layers once, building each group whole.
 
     A cache group has two halves -- the scheduler-facing spec and the bytes
@@ -569,8 +572,8 @@ def group(
         layer_types: Per-layer labels: "full_attention" / "sliding_attention"
             (or sliding sub-group labels "sliding_attention_<k>") /
             "linear_attention" (state-family, e.g. Qwen3.5 GDN). Retention
-            and family always come from these labels. Empty means every layer
-            is full-history.
+            and family always come from these labels; the recipe resolves
+            one label per layer (CacheRecipe.layer_types).
         group_ids: Physical group id per layer. The cache recipe is the
             single source of these ids: derive them with ``layer_group_ids``
             for label-equivalent grouping, or supply a finer split (hybrid
@@ -606,9 +609,7 @@ def group(
             "cache recipe is their single source: derive them with "
             "layer_group_ids(...)"
         )
-    resolved_layer_types = tuple(layer_types) or (FULL_ATTENTION,) * len(
-        resolved_group_ids
-    )
+    resolved_layer_types = tuple(layer_types)
     if len(resolved_group_ids) != len(resolved_layer_types):
         raise ValueError(
             f"group_ids has {len(resolved_group_ids)} entries but layer_types "
@@ -631,8 +632,6 @@ def group(
     for layer_id, ((retention, window), gid) in enumerate(
         zip(layer_policies, resolved_group_ids)
     ):
-        if not gid:
-            raise ValueError(f"group_ids[{layer_id}] must be non-empty")
         family: Family = (
             "state"
             if resolved_layer_types[layer_id] in STATE_LAYER_TYPES
@@ -658,6 +657,7 @@ def group(
                 family=family,
                 block_tokens=sizes.pop(gid, None) or prefix_granularity,
             )
+
         occurrence = occurrences.get(gid, 0)
         declared = tuple(fields_for_layer(layer_id, gid, occurrence))
         if declared:

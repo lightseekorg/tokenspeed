@@ -39,7 +39,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
+    CacheGroupDeclaration,
     CacheGroupSpec,
     compute_cache_group_page_counts,
     group,
@@ -50,9 +50,6 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
-
-# One declared cache group: what the scheduler is told, and the bytes it costs.
-CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]
 
 
 class CacheRecipe(ABC):
@@ -118,8 +115,7 @@ class CacheRecipe(ABC):
             spec=CachePoolSpec(
                 family=self.family,
                 memory_plan=layout.bind(num_lcm_blocks),
-                layer_types=self.layer_types
-                or (FULL_ATTENTION,) * (self.num_target_layers + self.num_draft_layers),
+                layer_types=self.layer_types,
                 # The same declarations the layout was packed from, so plan and
                 # specs cannot name different groups.
                 cache_group_specs=tuple(spec for spec, _ in groups),
@@ -144,7 +140,12 @@ class CacheRecipe(ABC):
     @property
     @abstractmethod
     def layer_types(self) -> tuple[str, ...]:
-        """Per-layer cache-group label, target layers then draft layers."""
+        """Per-layer cache-group label, target layers then draft layers.
+
+        Always one label per merged layer -- consumers size the model from
+        ``len(layer_types)`` -- so a family whose config declares no labels
+        resolves them (full-history) instead of returning fewer.
+        """
 
     @property
     def group_ids(self) -> tuple[str, ...]:

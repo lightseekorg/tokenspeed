@@ -52,6 +52,11 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         kwargs.update(overrides)
         from cache_pool_test_utils import make_layer_group_ids
 
+        # Resolve the labels the way a recipe does: one per layer,
+        # full-history when the test declares none.
+        layer_types = (
+            kwargs.get("layer_types") or ("full_attention",) * kwargs["layer_num"]
+        )
         plan = make_mha_memory_plan(
             size=kwargs["size"],
             prefix_granularity=kwargs["prefix_granularity"],
@@ -59,12 +64,12 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
             dtype=kwargs["dtype"],
-            layer_types=kwargs.get("layer_types", ()),
+            layer_types=layer_types,
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
         group_ids = make_layer_group_ids(
             layer_num=kwargs["layer_num"],
-            layer_types=kwargs.get("layer_types", ()),
+            layer_types=layer_types,
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
         from cache_pool_test_utils import specs_for_layers
@@ -72,7 +77,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         kwargs.setdefault(
             "cache_group_specs",
             specs_for_layers(
-                layer_types=kwargs.get("layer_types", ()),
+                layer_types=layer_types,
                 group_ids=group_ids,
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
                 prefix_granularity=kwargs["prefix_granularity"],

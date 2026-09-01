@@ -192,6 +192,10 @@ def make_mha_memory_plan(
     """An MHA plan the way the recipe builds one: group, pack, bind."""
     if size % prefix_granularity:
         raise ValueError("test pool size must be divisible by prefix_granularity")
+    # Resolve the labels the way a recipe does: one per layer, full-history
+    # when the caller declares none.
+    if not layer_types:
+        layer_types = ("full_attention",) * layer_num
     group_ids = make_layer_group_ids(
         layer_num=layer_num,
         layer_types=layer_types,
