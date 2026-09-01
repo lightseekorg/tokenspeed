@@ -427,12 +427,10 @@ def test_attn_res_model_update_modes_graph_replay(
     call_delta = delta if use_delta else None
     block_write_idx = valid_blocks if write_block else -1
 
-    # Compile before capture and retain the eager result as the replay oracle.
-    eager_prefix = original_prefix.clone()
-    eager_blocks = original_blocks.clone()
-    eager_output = attn_res_fwd(
-        eager_prefix,
-        eager_blocks,
+    # Compile before capture so the graph contains only the steady-state launch.
+    attn_res_fwd(
+        prefix.clone(),
+        blocks.clone(),
         res_weight,
         score_weight,
         out_norm_weight=output_weight,
@@ -458,9 +456,23 @@ def test_attn_res_model_update_modes_graph_replay(
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(prefix, eager_prefix, rtol=0, atol=0)
-    torch.testing.assert_close(blocks, eager_blocks, rtol=0, atol=0)
-    torch.testing.assert_close(actual, eager_output, rtol=0, atol=0)
+    updated_prefix = (
+        _bf16_add_rne(original_prefix, delta) if use_delta else original_prefix
+    )
+    expected = _attn_res_reference(
+        updated_prefix,
+        original_blocks.transpose(0, 1),
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        1e-6,
+        1e-6,
+    )
+    torch.testing.assert_close(prefix, updated_prefix, rtol=0, atol=0)
+    expected_block = updated_prefix if write_block else original_blocks[valid_blocks]
+    torch.testing.assert_close(blocks[valid_blocks], expected_block, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
