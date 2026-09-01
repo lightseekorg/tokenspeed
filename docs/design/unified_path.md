@@ -125,9 +125,9 @@ two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 Current declarations: `DSABackend` and `Qwen4ExpMambaAttnBackend` disable the
 prefill graph (rationale comments live on those classes).
 
-Rules: declarations are static "never works" facts — a runtime capture
-failure keeps its own degrade path (`PrefillGraph._capture_unanimous`'s
-world-agreed eager fallback). Resolution is device-side at startup and
+Rules: declarations are static "never works" facts — a runtime prefill
+capture failure is FATAL (no silent eager degrade: a family that cannot
+capture must declare it, or the boot dies). Resolution is device-side at startup and
 class-attribute-driven, so every DP rank derives the same answer
 (event-loop.md). `disable_prefill_graph` in the config carries user intent
 only. `decode_graph=False` still requires `refresh_decode_metadata` and

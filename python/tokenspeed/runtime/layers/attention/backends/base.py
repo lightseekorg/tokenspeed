@@ -71,8 +71,9 @@ class CudaGraphSupport:
     refresh still serves eager decode, so ``init_cuda_graph_state`` and
     ``refresh_decode_metadata`` stay mandatory. ``prefill_graph=False``
     disables the breakable prefill (extend) graph. Static "never works"
-    declarations only; runtime capture failures keep their own degrade paths
-    (``PrefillGraph._capture_unanimous``).
+    declarations only — and they are the ONLY escape: a prefill capture
+    failure at runtime is fatal, so a family that cannot capture must say
+    so here rather than rely on a degrade path.
     """
 
     decode_graph: bool = True
