@@ -327,7 +327,14 @@ class AttentionBackend(ABC):
                 if gid not in self.engine_owned_group_ids
             }
             return kept or None
-        unknown = sorted(gid for gid in tables if gid not in families)
+        # Wrapper-owned groups (Inkling conv) are the wrapper's to judge:
+        # they ride the same dict but answer to the wrapper's pool, which
+        # this backend's geometry never learned.
+        unknown = sorted(
+            gid
+            for gid in tables
+            if gid not in families and gid not in self.engine_owned_group_ids
+        )
         if unknown:
             raise RuntimeError(
                 f"{type(self).__name__}: delivered tables for groups "
