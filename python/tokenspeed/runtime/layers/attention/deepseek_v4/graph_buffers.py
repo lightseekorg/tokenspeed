@@ -80,20 +80,14 @@ class DeepseekV4GraphBuffers:
         self.page_table = torch.zeros(
             (max_bs, max_num_pages), dtype=torch.int32, device=device
         )
-        self.req_pool_indices = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=device
-        )
+        self.req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32, device=device)
         self.seq_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
         self.query_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
         self.query_start_loc = torch.arange(
             max_bs + 1, dtype=torch.int32, device=device
         )
-        self.token_to_req = torch.arange(
-            max_tokens, dtype=torch.int32, device=device
-        )
-        self.is_valid_token = torch.ones(
-            max_tokens, dtype=torch.bool, device=device
-        )
+        self.token_to_req = torch.arange(max_tokens, dtype=torch.int32, device=device)
+        self.is_valid_token = torch.ones(max_tokens, dtype=torch.bool, device=device)
         query_start_base = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
         token_to_req_base = torch.arange(max_bs, dtype=torch.int32, device=device)
         self.query_start_by_width: dict[int, torch.Tensor] = {}
@@ -206,9 +200,7 @@ class DeepseekV4GraphBuffers:
         self.req_pool_indices[:bs].copy_(req_pool_indices[:bs])
         self.seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
 
-    def fill_packed_rows(
-        self, *, bs: int, actual_bs: int, tokens_per_req: int
-    ) -> int:
+    def fill_packed_rows(self, *, bs: int, actual_bs: int, tokens_per_req: int) -> int:
         """Refresh the packed row machinery (query starts, owner map, padding
         mask) from the precomputed per-width tables. Returns total tokens."""
         total_tokens = bs * tokens_per_req
