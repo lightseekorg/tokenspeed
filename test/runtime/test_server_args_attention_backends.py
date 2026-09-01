@@ -183,51 +183,53 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
         self.assertEqual(MLAAttnBackend(config, spec).kernel_solution, "gluon")
 
-    def test_amd_dsa_backend_uses_mla_for_dense_attention(self):
-        import torch
-
+    def test_dsa_routes_dense_attention_through_registry(self):
         from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-        from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 
-        spec = DSAConfig(
-            backend_name="hybrid_linear_attn",
-            num_attention_heads=64,
-            num_kv_heads=64,
-            head_dim=256,
-            attn_tp_size=4,
-            kv_lora_rank=512,
-            qk_nope_head_dim=256,
-            qk_rope_head_dim=0,
-            v_head_dim=256,
-            kv_cache_dim=512,
-            scaling=256**-0.5,
-            index_topk=2048,
-            index_head_dim=128,
-            index_n_heads=32,
+        config = object()
+        dense_backend = object()
+
+        for platform, name in (
+            (SimpleNamespace(is_nvidia=True, is_amd=False), "trtllm_mla"),
+            (SimpleNamespace(is_nvidia=False, is_amd=True), "mla"),
+        ):
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    registry,
+                    "_create_attn_backend_with_name",
+                    return_value=dense_backend,
+                ) as create,
+            ):
+                self.assertIs(
+                    dsa_backend._make_dense_backend(config, platform), dense_backend
+                )
+                create.assert_called_once_with(name, AttentionArch.MLA, config)
+
+    def test_named_backend_routing_does_not_mutate_source_spec(self):
+        from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+        source = SoftmaxAttnConfig(
+            backend_name="parent",
+            num_attention_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            attn_tp_size=1,
         )
-        config = AttnConfig(
-            device="cpu",
-            dtype=torch.bfloat16,
-            kv_cache_dtype=torch.bfloat16,
-            kv_cache_quant_method="none",
-            prefix_granularity=64,
-            context_len=4096,
-            max_bs=2,
-            max_graph_bs=2,
-            components=(spec,),
-        )
-        platform = SimpleNamespace(is_nvidia=False, is_amd=True)
+        config = SimpleNamespace(component=lambda _: source)
+        routed = {}
 
-        with mock.patch.object(dsa_backend, "current_platform", return_value=platform):
-            backend = registry._create_attn_backend_with_name(
-                "dsa", AttentionArch.DSA, config
-            )
+        class ProbeBackend:
+            def __init__(self, _config, spec):
+                routed["source_name"] = source.backend_name
+                routed["spec"] = spec
 
-        self.assertIsInstance(backend._dense_backend, MLAAttnBackend)
-        self.assertIsNone(backend._dense_backend.kernel_solution)
-        self.assertEqual(spec.backend_name, "hybrid_linear_attn")
+        with mock.patch.object(registry, "_get_backend_cls", return_value=ProbeBackend):
+            registry._create_attn_backend_with_name("child", AttentionArch.MHA, config)
+
+        self.assertEqual(routed["source_name"], "parent")
+        self.assertEqual(routed["spec"].backend_name, "child")
+        self.assertIsNot(routed["spec"], source)
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode,
@@ -36,8 +34,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -48,14 +44,22 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTEN
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
-def _make_dense_backend(
-    config: AttnConfig, spec: DSAConfig, platform
-) -> AttentionBackend:
-    if platform.is_nvidia:
-        return TRTLLMMLABackend(config, spec)
-    if platform.is_amd:
-        return MLAAttnBackend(config, replace(spec, backend_name="mla"))
-    raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
+def _make_dense_backend(config: AttnConfig, platform) -> AttentionBackend:
+    if not (platform.is_nvidia or platform.is_amd):
+        raise RuntimeError(
+            f"DSA backend does not support platform {platform.vendor!r}."
+        )
+    backend_name = "trtllm_mla" if platform.is_nvidia else "mla"
+
+    from tokenspeed.runtime.layers.attention.registry import (
+        _create_attn_backend_with_name,
+    )
+
+    return _create_attn_backend_with_name(
+        backend_name,
+        AttentionArch.MLA,
+        config,
+    )
 
 
 class DSABackend(AttentionBackend):
@@ -72,7 +76,7 @@ class DSABackend(AttentionBackend):
     def __init__(self, config: AttnConfig, spec: DSAConfig):
         super().__init__(config, spec)
         platform = current_platform()
-        self._dense_backend = _make_dense_backend(config, spec, platform)
+        self._dense_backend = _make_dense_backend(config, platform)
         self.index_topk = spec.index_topk
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)

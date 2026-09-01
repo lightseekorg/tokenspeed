@@ -344,13 +344,11 @@ def _create_attn_backend_with_name(
     arch: AttentionArch,
     config: AttnConfig,
 ) -> AttentionBackend:
-    spec = config.component(SoftmaxAttnConfig)
-    original_name = spec.backend_name
-    spec.backend_name = name
-    try:
-        return _get_backend_cls(name, arch)(config, spec)
-    finally:
-        spec.backend_name = original_name
+    spec = dataclasses.replace(
+        config.component(SoftmaxAttnConfig),
+        backend_name=name,
+    )
+    return _get_backend_cls(name, arch)(config, spec)
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
