@@ -23,14 +23,14 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 | File | Role |
 | --- | --- |
 | `__init__.py` | Package exports: the stage invokers, the top-k route entries, the prefill weight aliases, and the scale gather. |
-| `prefill_stage1.py` / `prefill_stage2.py` | A4W4 block-ragged prefill GEMMs (gdot128-preshuffled weights). |
+| `prefill_stage1.py` / `prefill_stage2.py` | Block-ragged MXFP4/MXFP8-activation, MXFP4-weight prefill GEMMs (gdot128-preshuffled weights). |
 | `decode_stage1.py` / `decode_stage2.py` | A4W4 direct-MFMA decode kernels plus their invokers: stage 1 fuses SwiGLU, stage 2 fuses the routed-weight top-k combine. |
 | `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths that read the unshuffled MXFP4 weights directly: route-direct warp decode and a contiguous-EP grouped GEMM. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
-| `quantize_gluon.py` | Leaf Gluon helpers for MXFP4 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
+| `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |
 | `preprocess.py` / `weight_preprocess.py` | Offline weight interleave, scale swizzle, gdot128 preshuffle, package-prefill aliases. |
