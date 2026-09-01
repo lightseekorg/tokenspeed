@@ -106,6 +106,12 @@ def _use_two_stage_producer_direct(
     )
 
 
+# Staging slots the one-shot all-reduce rotates through. Two is enough to keep
+# the reclaim wait off the critical path: a rank may be a whole invocation ahead
+# of its slowest peer before it has to wait for that peer to finish reading.
+_STAGED_SLOTS = 2
+
+
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.is_available():
         with torch.cuda.device(gpu_id):
@@ -373,7 +379,9 @@ class IrisAllReduce(object):
         # bookkeeping such as ring/spinlock flags.
         if heap_size is None:
             buf_bytes = max_numel * dtype.itemsize
-            heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
+            # _input_buf, _attnres_input_buf (2), _producer_direct_scratch_buf,
+            # and the staged path's rotating slots (_STAGED_SLOTS).
+            heap_size = max(1 << 28, (4 + _STAGED_SLOTS) * buf_bytes + (16 << 20))
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -397,6 +405,12 @@ class IrisAllReduce(object):
         self._max_blocks = triton.cdiv(max_numel, self._block_size)
         self._ready_flags = self._ctx.zeros(
             (self._max_blocks, self.world_size), dtype=torch.int32
+        )
+        # The staged one-shot rotates across its own slots rather than sharing
+        # _input_buf: that buffer is handed out by acquire_outputs for
+        # producer-direct reductions, so its layout is not ours to rotate.
+        self._staged_input_buf = self._ctx.zeros(
+            (_STAGED_SLOTS, max_numel), dtype=dtype
         )
         self._producer_direct_block_size = 512
         # Use one program per tile for small payloads, capped to limit contention.
@@ -444,15 +458,9 @@ class IrisAllReduce(object):
             f"tensor numel ({numel}) exceeds iris buffer capacity "
             f"({self.max_numel})"
         )
-        if tensor.dim() >= 2:
-            n_dim = tensor.shape[-1]
-            m_dim = numel // n_dim
-        else:
-            m_dim, n_dim = 1, numel
-        in_view = self._input_buf.narrow(0, 0, numel).view(m_dim, n_dim)
         iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, self._block_size),)](
             tensor.view(-1),
-            in_view.view(-1),
+            self._staged_input_buf.view(-1),
             tensor.view(-1),
             self._ready_flags,
             self._group_heap_bases,
@@ -460,6 +468,8 @@ class IrisAllReduce(object):
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
             BLOCK_SIZE=self._block_size,
+            SLOT_STRIDE=self.max_numel,
+            NUM_SLOTS=_STAGED_SLOTS,
             num_warps=4,
         )
 
@@ -649,20 +659,45 @@ def iris_stage_one_shot_allreduce_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
 ):
+    """One-shot all-reduce over rotating staging slots.
+
+    A single staging slot is not safe across calls. Each rank stages, publishes
+    a ready epoch, waits for its peers, sums their slots and returns -- but the
+    store happens *before* the wait, so a rank called straight back overwrites
+    the slot a slower peer is still summing, and that peer silently sums the
+    next collective's data. No error, no hang, just wrong numbers on whichever
+    ranks lagged.
+
+    Rotating over two slots closes it, and the existing entry barrier is what
+    makes two enough. Writing epoch E+1 lands on the other slot, so it cannot
+    disturb a peer still reading E. Reaching E+2 -- which returns to E's slot --
+    means passing the entry wait at E+1, which blocks until every peer published
+    ready(E+1); a peer publishes that only after it has finished reading at E.
+    So by the time a slot is reused, every peer is provably done with it, and no
+    consumption flag or exit barrier has to be paid for.
+
+    Epochs are per-block, so a grid that shrinks between calls leaves the higher
+    blocks' counters where they were. That is consistent across ranks -- every
+    rank launches the same grid for the same collective -- and blocks never read
+    each other's slots, so they may sit on different slots at once.
+    """
     block_id = tl.program_id(0)
     offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < NUMEL
 
-    local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    tl.store(input_sym_ptr + offsets, local, mask=mask, cache_modifier=".wt")
-    tl.debug_barrier()
-
     flag_offset = block_id * WORLD_SIZE
     local_ready = ready_flags + flag_offset + RANK
     epoch = tl.load(local_ready).to(tl.int32) + 1
-    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+    slot = (epoch % NUM_SLOTS) * SLOT_STRIDE
 
+    local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    tl.store(input_sym_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
+    tl.debug_barrier()
+
+    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
     for peer in tl.static_range(0, WORLD_SIZE):
         if peer != RANK:
             seen = tl.full((), 0, dtype=tl.int32)
@@ -680,7 +715,7 @@ def iris_stage_one_shot_allreduce_kernel(
     for peer in tl.static_range(0, WORLD_SIZE):
         if peer != RANK:
             acc += iris.load(
-                input_sym_ptr + offsets,
+                input_sym_ptr + slot + offsets,
                 RANK,
                 peer,
                 heap_bases,
