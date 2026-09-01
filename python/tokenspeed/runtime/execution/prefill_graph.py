@@ -168,7 +168,7 @@ def _prefill_bucket_step(size: int) -> int:
 
 
 class CapturedForward(NamedTuple):
-    """A bucket's captured inner-forward outputs (stable pool addresses)."""
+    """A bucket's captured inner-forward outputs at stable shared addresses."""
 
     # Final hidden states with shape [bucket, hidden]; padded tail is garbage.
     hidden_states: torch.Tensor
@@ -263,9 +263,11 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
-        # One captured graph + bucket-sized output per padded token bucket.
+        # One captured graph per padded token bucket.
         self._captures: dict[int, BreakableCapture] = {}
         self._outputs: dict[int, CapturedForward] = {}
+        self._hidden_output_buf: torch.Tensor | None = None
+        self._aux_output_bufs: list[torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -275,10 +277,12 @@ class PrefillGraph:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
-        not stored). Buckets share
-        one PRIVATE mempool (first capture
-        allocates it), so graph memory stays ~the largest bucket's peak --
-        but never the decode graphs' pool: eager ops cache raw pointers to
+        not stored). Buckets share one PRIVATE mempool (first capture allocates
+        it), so reclaimable graph intermediates stay ~the largest bucket's
+        peak. Retained hidden and aux outputs instead alias buffers sized for
+        the largest bucket; retaining each graph-private output would make
+        their memory grow with the sum of all buckets. The private pool is
+        never the decode graphs' pool: eager ops cache raw pointers to
         buffers they lazily allocated inside a decode capture (flashinfer's
         trtllm-gen MoE runner), and a prefill capture reusing those freed
         blocks means every replay rewrites them, corrupting the next eager
@@ -348,17 +352,53 @@ class PrefillGraph:
         self, bucket: int, decode_wrapper: CudaGraphWrapper | None
     ) -> None:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
+        sample_outputs = None
         for _ in range(self.num_warmup):
-            self._run_inner(bucket)
+            sample_outputs = self._run_inner(bucket)
+        if self._hidden_output_buf is None:
+            if sample_outputs is None:
+                sample_outputs = self._run_inner(bucket)
+            self._allocate_output_buffers(CapturedForward(*sample_outputs))
+        # Only the first bucket needs it; holding it pins a bucket of rows.
+        sample_outputs = None
         torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:
-            self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
+            outputs = CapturedForward(*self._run_inner(bucket))
+            self._outputs[bucket] = self._store_outputs(bucket, outputs)
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
         cap.replay()  # capture records kernels without executing; smoke-test replay
         self._captures[bucket] = cap
+
+    def _allocate_output_buffers(self, outputs: CapturedForward) -> None:
+        max_bucket = max(self.capture_buckets)
+        self._hidden_output_buf = outputs.hidden_states.new_empty(
+            max_bucket, outputs.hidden_states.shape[1]
+        )
+        if outputs.aux_hidden_states is not None:
+            self._aux_output_bufs = [
+                aux.new_empty(max_bucket, aux.shape[1])
+                for aux in outputs.aux_hidden_states
+            ]
+
+    def _store_outputs(self, bucket: int, outputs: CapturedForward) -> CapturedForward:
+        assert self._hidden_output_buf is not None
+        hidden = self._hidden_output_buf[:bucket]
+        hidden.copy_(outputs.hidden_states)
+        if outputs.aux_hidden_states is None:
+            return CapturedForward(hidden, None)
+        assert self._aux_output_bufs is not None
+        aux_views = []
+        for destination, output in zip(
+            self._aux_output_bufs, outputs.aux_hidden_states, strict=True
+        ):
+            view = destination[:bucket]
+            view.copy_(output)
+            aux_views.append(view)
+        # Safe alias: replays serialize and callers consume outputs immediately.
+        return CapturedForward(hidden, aux_views)
 
     def _run_inner(self, num_tokens: int):
         """Run the inner model over the leading ``num_tokens`` of the static buffers.

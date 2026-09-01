@@ -611,9 +611,22 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
             _resolve_prefill_graph_max_tokens,
         )
 
+        # The literal, not just the constant: the ceiling must cover a chunk.
+        self.assertEqual(PREFILL_GRAPH_DEFAULT_MAX_TOKENS, 8192)
+        self.assertEqual(_resolve_prefill_graph_max_tokens(self._args()), 8192)
+
+    def test_a_smaller_chunk_still_clamps_the_ceiling(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args()),
-            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens(self._args(chunked_prefill_size=2048)),
+            2048,
+        )
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(self._args(max_total_tokens=4096)),
+            4096,
         )
 
     def test_all_to_all_backend_disables_the_graph(self):
