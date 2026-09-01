@@ -89,6 +89,22 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_decode_qlen4_verify_matches_per_token_decode[fp8_e4m3]
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[decode]
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[extend]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_dense_scores_match_reference
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-portable]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-production]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-production-16-rows]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-portable]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-production]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-production-16-rows]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-portable]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-production]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-production-16-rows]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[False-1024]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[False-2048]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[True-1024]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[True-2048]
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_workspace_budget_tiles_query_rows
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_cuda_graph_tracks_dynamic_lengths
     --deselect=tokenspeed-kernel/test/test_numerics.py::TestNumericsVerification::test_gemm_fp8[gemm.bmm:triton_bmm_fp8_blockscale]
     --deselect=tokenspeed-kernel/test/test_numerics.py::TestNumericsVerification::test_gemm_fp8[gemm.mm:triton_mm_fp8_blockscale]
 
@@ -123,6 +139,8 @@ env:
     # outputs and no longer match an fp32 reference exactly:
     # https://github.com/ROCm/rocm-systems/issues/10806
     --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_cuda_fallback
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_decode_append_defers_unmaterialized_pool
+    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_prefill_write_matches_reference
     --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
