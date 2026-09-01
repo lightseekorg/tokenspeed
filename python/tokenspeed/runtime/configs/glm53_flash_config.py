@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -32,16 +31,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 _ATTENTION_LAYER = "attention"
 _LINEAR_ATTENTION_LAYER = LINEAR_ATTENTION
-GLM53_FLASH_MODEL_TYPE = "glm53_flash"
-GLM53_FLASH_TEXT_MODEL_TYPE = "glm53_flash_text"
-GLM53_FLASH_VISION_MODEL_TYPE = "glm53_flash_vision"
-LEGACY_GLM53_FLASH_MODEL_TYPE = "glm5_next"
 
 
 class Glm53FlashVisionConfig(PretrainedConfig):
     """GLM-5.3-Flash vision tower configuration."""
 
-    model_type = GLM53_FLASH_VISION_MODEL_TYPE
+    model_type = "glm53_flash_vision"
 
     def __init__(
         self,
@@ -92,7 +87,7 @@ class Glm53FlashTextConfig(PretrainedConfig):
     TokenSpeed hybrid-layer and cache vocabularies used by Kimi-K3.
     """
 
-    model_type = GLM53_FLASH_TEXT_MODEL_TYPE
+    model_type = "glm53_flash_text"
 
     def __init__(
         self,
@@ -293,39 +288,6 @@ class Glm53FlashTextConfig(PretrainedConfig):
             **kwargs,
         )
 
-    @property
-    def mamba2_cache_params(self):
-        """KDA per-request state spec consumed by the hybrid KV-cache allocator.
-
-        Returns ``(conv_state_shape, temporal_state_shape, conv_dtype,
-        ssm_dtype, mamba_layer_ids)`` — the same contract as Kimi-K3's
-        KDA: three short causal convolutions (q/k/v) per layer and a
-        per-head ``head_dim x head_dim`` delta-rule recurrent state in fp32.
-        """
-        from tokenspeed.runtime.distributed.utils import divide
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        attn_tp_size = global_server_args_dict["mapping"].attn.tp_size
-        conv_state_shape = (
-            divide(
-                3 * self.linear_num_heads * self.linear_head_dim,
-                attn_tp_size,
-            ),
-            self.linear_conv_kernel_dim - 1,
-        )
-        temporal_state_shape = (
-            divide(self.linear_num_heads, attn_tp_size),
-            self.linear_head_dim,
-            self.linear_head_dim,
-        )
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            torch.bfloat16,
-            torch.float32,
-            self.linear_layer_ids,
-        )
-
     def is_kda_layer(self, layer_id: int) -> bool:
         return self.layer_types[layer_id] == _LINEAR_ATTENTION_LAYER
 
@@ -372,7 +334,7 @@ class Glm53FlashTextConfig(PretrainedConfig):
 class Glm53FlashConfig(PretrainedConfig):
     """Top-level multimodal GLM-5.3-Flash configuration."""
 
-    model_type = GLM53_FLASH_MODEL_TYPE
+    model_type = "glm53_flash"
     text_config_cls = Glm53FlashTextConfig
     vision_config_cls = Glm53FlashVisionConfig
 
@@ -399,7 +361,6 @@ class Glm53FlashConfig(PretrainedConfig):
             vision_config = self.vision_config_cls(swiglu_limit=text_swiglu_limit)
         elif isinstance(vision_config, dict):
             vision_values = dict(vision_config)
-            vision_values.setdefault("model_type", self.vision_config_cls.model_type)
             vision_values.setdefault("swiglu_limit", text_swiglu_limit)
             vision_config = self.vision_config_cls(**vision_values)
         if vision_config.swiglu_limit is None:

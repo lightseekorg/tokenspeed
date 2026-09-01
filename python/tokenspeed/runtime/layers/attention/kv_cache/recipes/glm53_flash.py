@@ -165,93 +165,121 @@ def glm53_flash_parents_needed(
     return parents
 
 
+def _require_dsa_config(config: AttnConfig, role: str) -> DSAConfig:
+    spec = config.component(DSAConfig)
+    if spec is None:
+        raise TypeError(f"GLM-5.3-Flash {role} cache requires a DSA component")
+    return spec
+
+
+def _require_linear_config(config: AttnConfig) -> LinearAttnConfig:
+    spec = config.component(LinearAttnConfig)
+    if spec is None:
+        raise TypeError(
+            "GLM-5.3-Flash target cache requires a linear-attention component"
+        )
+    return spec
+
+
+def _target_layer_types(config: AttnConfig, num_layers: int) -> tuple[str, ...]:
+    num_layers = require_positive_int("num_attention_layers", num_layers)
+    linear_layer_ids = _require_linear_config(config).layer_ids
+    if len(linear_layer_ids) != len(set(linear_layer_ids)) or any(
+        layer_id < 0 or layer_id >= num_layers for layer_id in linear_layer_ids
+    ):
+        raise ValueError(
+            "GLM-5.3-Flash linear-attention layer ids must be unique and "
+            f"inside [0, {num_layers})"
+        )
+    linear_layer_id_set = set(linear_layer_ids)
+    return tuple(
+        LINEAR_ATTENTION if layer_id in linear_layer_id_set else FULL_ATTENTION
+        for layer_id in range(num_layers)
+    )
+
+
 def declare_glm53_flash_groups(
-    text_config,
+    num_target_layers: int,
     *,
-    tp_size: int,
-    mla_cache_dtype: torch.dtype,
+    attn_config: AttnConfig,
+    draft_attn_config: AttnConfig | None = None,
     draft_layers: int = 0,
-    pd_disaggregation_enabled: bool = False,
-    fields_for_layer=None,
-    sliding_window_tokens=None,
 ) -> tuple[CacheGroupDeclaration, ...]:
-    """Build the GLM-5.3-Flash group declarations without a live server recipe."""
-    if pd_disaggregation_enabled:
+    """Declare GLM cache groups from its composite attention components."""
+    if attn_config.pd_disaggregation_enabled:
         raise NotImplementedError(
             "GLM-5.3-Flash disaggregated serving requires an explicit transfer "
             "bridge for its request-local KPool tail"
         )
-    layer_types = tuple(text_config.paged_cache_layer_types)
+    if draft_layers and draft_attn_config is None:
+        raise TypeError("GLM-5.3-Flash draft layers require a draft attention config")
+
+    target_dsa = _require_dsa_config(attn_config, "target")
+    target_linear = _require_linear_config(attn_config)
+    target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
-        tuple(split_recurrent_state_groups(layer_types))
+        tuple(split_recurrent_state_groups(target_layer_types))
         + (FULL_ATTENTION,) * draft_layers
     )
-    resolved_layer_types = tuple(
+    layer_types = tuple(
         FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
         for group_id in group_ids
     )
-    kpool = require_positive_int("index_kpool", text_config.index_kpool)
-    index_head_dim = require_positive_int("index_head_dim", text_config.index_head_dim)
-    pooled_rows = GLM53_FLASH_LOGICAL_BLOCK_TOKENS // kpool
+    target_layers = len(target_layer_types)
 
-    if fields_for_layer is None:
-        linear = text_config.linear_attn_config
-        num_heads = require_positive_int(
-            "linear_attn_config.num_heads", linear["num_heads"]
-        )
-        head_dim = require_positive_int(
-            "linear_attn_config.head_dim", linear["head_dim"]
-        )
-        kernel_size = require_positive_int(
-            "linear_attn_config.short_conv_kernel_size",
-            linear["short_conv_kernel_size"],
-        )
-        tp_size = require_positive_int("tp_size", tp_size)
-        if num_heads % tp_size:
-            raise ValueError(
-                f"KDA num_heads={num_heads} must be divisible by tp_size={tp_size}"
-            )
-        conv_shape = (3 * num_heads * head_dim // tp_size, kernel_size - 1)
-        recurrent_shape = (num_heads // tp_size, head_dim, head_dim)
-        latent_width = text_config.kv_lora_rank + text_config.qk_rope_head_dim
-        latent_dtype = scatter_stored_dtype_name(mla_cache_dtype)
-
-        def fields_for_layer(layer_id: int, group_id: str, occurrence: int):
-            plane_id = f"slot.{occurrence}"
-            if group_id == FULL_ATTENTION:
-                return (
-                    CacheFieldSpec(
-                        f"layer.{layer_id}.latent_kv",
-                        plane_id,
-                        (GLM53_FLASH_LOGICAL_BLOCK_TOKENS, 1, latent_width),
-                        latent_dtype,
-                    ),
+    def fields_for_layer(
+        layer_id: int, group_id: str, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        plane_id = f"slot.{occurrence}"
+        if group_id == FULL_ATTENTION:
+            config = attn_config if layer_id < target_layers else draft_attn_config
+            if config is None:
+                raise TypeError(
+                    "GLM-5.3-Flash draft cache field requires a draft attention config"
                 )
+            dsa = _require_dsa_config(
+                config, "target" if layer_id < target_layers else "draft"
+            )
             return (
                 CacheFieldSpec(
-                    f"layer.{layer_id}.conv_state",
+                    f"layer.{layer_id}.latent_kv",
                     plane_id,
-                    conv_shape,
-                    cache_dtype_name(torch.bfloat16),
-                    exact_page_stride=False,
-                ),
-                CacheFieldSpec(
-                    f"layer.{layer_id}.recurrent_state",
-                    plane_id,
-                    recurrent_shape,
-                    cache_dtype_name(torch.float32),
-                    exact_page_stride=False,
+                    (
+                        GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
+                        1,
+                        dsa.kv_lora_rank + dsa.qk_rope_head_dim,
+                    ),
+                    scatter_stored_dtype_name(config.kv_cache_dtype),
                 ),
             )
+        return (
+            CacheFieldSpec(
+                f"layer.{layer_id}.conv_state",
+                plane_id,
+                target_linear.conv_state_shape,
+                cache_dtype_name(torch.bfloat16),
+                exact_page_stride=False,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.recurrent_state",
+                plane_id,
+                target_linear.temporal_state_shape,
+                cache_dtype_name(torch.float32),
+                exact_page_stride=False,
+            ),
+        )
 
     base = group(
-        layer_types=resolved_layer_types,
+        layer_types=layer_types,
         group_ids=group_ids,
-        sliding_window_tokens=sliding_window_tokens,
+        sliding_window_tokens=target_dsa.sliding_window_tokens,
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         fields_for_layer=fields_for_layer,
-        pd_disaggregation_enabled=pd_disaggregation_enabled,
+        pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
     )
+    kpool = require_positive_int("index_kpool", target_dsa.index_kpool)
+    index_head_dim = require_positive_int("index_head_dim", target_dsa.index_head_dim)
+    pooled_rows = GLM53_FLASH_LOGICAL_BLOCK_TOKENS // kpool
     index_fields = []
     index_plane_id = f"slot.{sum(gid == FULL_ATTENTION for gid in group_ids)}"
     for layer_id, group_id in enumerate(group_ids):
@@ -285,21 +313,18 @@ class Glm53FlashRecipe(CacheRecipe):
     family = "glm53_flash"
 
     @cached_property
-    def _text_config(self):
-        hf_config = self.model_config.hf_config
-        return getattr(hf_config, "text_config", hf_config)
+    def _dsa_config(self) -> DSAConfig:
+        return _require_dsa_config(self.attn_config, "target")
+
+    @cached_property
+    def target_layer_types(self) -> tuple[str, ...]:
+        return _target_layer_types(
+            self.attn_config, self.model_config.num_attention_layers
+        )
 
     @cached_property
     def target_group_ids(self) -> tuple[str, ...]:
-        layer_types = tuple(self._text_config.paged_cache_layer_types)
-        if not layer_types:
-            raise ValueError("GLM-5.3-Flash cache requires paged_cache_layer_types")
-        return tuple(split_recurrent_state_groups(layer_types))
-
-    @property
-    @override
-    def num_target_layers(self) -> int:
-        return len(self.target_group_ids)
+        return tuple(split_recurrent_state_groups(self.target_layer_types))
 
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
@@ -331,82 +356,13 @@ class Glm53FlashRecipe(CacheRecipe):
             int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0),
         )
 
-    @staticmethod
-    def _require_dsa_component(config: AttnConfig) -> DSAConfig:
-        component = config.component(DSAConfig)
-        if component is None:
-            raise ValueError("GLM-5.3-Flash cache requires a DSA component")
-        return component
-
-    @cached_property
-    def _target_dsa(self) -> DSAConfig:
-        return self._require_dsa_component(self.attn_config)
-
-    @cached_property
-    def _linear_attn(self) -> LinearAttnConfig:
-        component = self.attn_config.component(LinearAttnConfig)
-        if component is None:
-            raise ValueError(
-                "GLM-5.3-Flash cache requires a linear-attention component"
-            )
-        return component
-
-    @cached_property
-    def _kda_shapes(self):
-        return (
-            self._linear_attn.conv_state_shape,
-            self._linear_attn.temporal_state_shape,
-        )
-
-    @override
-    def fields_for_layer(
-        self, layer_id: int, group_id: str, occurrence: int
-    ) -> tuple[CacheFieldSpec, ...]:
-        plane_id = f"slot.{occurrence}"
-        if group_id == FULL_ATTENTION:
-            config = (
-                self.attn_config
-                if layer_id < self.num_target_layers
-                else self.draft_attn_config
-            )
-            dsa = self._require_dsa_component(config)
-            latent_width = dsa.kv_lora_rank + dsa.qk_rope_head_dim
-            return (
-                CacheFieldSpec(
-                    f"layer.{layer_id}.latent_kv",
-                    plane_id,
-                    (self.prefix_granularity, 1, latent_width),
-                    scatter_stored_dtype_name(config.kv_cache_dtype),
-                ),
-            )
-        conv_shape, recurrent_shape = self._kda_shapes
-        return (
-            CacheFieldSpec(
-                f"layer.{layer_id}.conv_state",
-                plane_id,
-                conv_shape,
-                cache_dtype_name(torch.bfloat16),
-                exact_page_stride=False,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.recurrent_state",
-                plane_id,
-                recurrent_shape,
-                cache_dtype_name(torch.float32),
-                exact_page_stride=False,
-            ),
-        )
-
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         return declare_glm53_flash_groups(
-            self._text_config,
-            tp_size=self._target_dsa.attn_tp_size,
-            mla_cache_dtype=self.attn_config.kv_cache_dtype,
+            self.num_target_layers,
+            attn_config=self.attn_config,
+            draft_attn_config=self.draft_attn_config,
             draft_layers=self.num_draft_layers,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
-            fields_for_layer=self.fields_for_layer,
-            sliding_window_tokens=self._target_dsa.sliding_window_tokens,
         )
 
     @override
@@ -417,7 +373,7 @@ class Glm53FlashRecipe(CacheRecipe):
             if spec.group_id.startswith(LINEAR_ATTENTION)
         ]
         return glm53_flash_packing_counts(
-            tp_size=self._target_dsa.attn_tp_size,
+            tp_size=self._dsa_config.attn_tp_size,
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             state_group_ids=state_group_ids,
         )
@@ -434,11 +390,11 @@ class Glm53FlashRecipe(CacheRecipe):
             max_bs = max(max_bs, self.draft_attn_config.max_bs)
         return Glm53FlashPoolOptions(
             index_kpool=require_positive_int(
-                "index_kpool", self._text_config.index_kpool
+                "index_kpool", self._dsa_config.index_kpool
             ),
             tail_extra_slots=self.tail_extra_slots,
             index_head_dim=require_positive_int(
-                "index_head_dim", self._text_config.index_head_dim
+                "index_head_dim", self._dsa_config.index_head_dim
             ),
             # Scheduler request IDs are 1-based; row 0 and one graph-padding
             # sentinel sit outside the live range.

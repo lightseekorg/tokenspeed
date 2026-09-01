@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.ops.attention import (
@@ -43,10 +43,7 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
-from tokenspeed.runtime.layers.attention.kpool import (
-    KPoolPrefillPlan,
-    KPoolRuntime,
-)
+from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
@@ -59,14 +56,6 @@ def _make_dense_backend(
     if platform.is_amd:
         return MLAAttnBackend(config, replace(spec, backend_name="mla"))
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
-
-
-@dataclass
-class DSAForwardMetadata:
-    """DSA-owned state shared by sparse-attention layers in one forward."""
-
-    kpool_prefill_plan: KPoolPrefillPlan | None = None
-    req_pool_indices: torch.Tensor | None = None
 
 
 class DSABackend(AttentionBackend):
@@ -106,7 +95,6 @@ class DSABackend(AttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
-        self.forward_metadata = DSAForwardMetadata()
 
     def require_kpool_runtime(self) -> KPoolRuntime:
         """Return the configured KPool runtime for sparse pooled indexing."""
@@ -114,17 +102,13 @@ class DSABackend(AttentionBackend):
             raise RuntimeError("DSA backend was created without KPool configuration")
         return self.kpool_runtime
 
-    def _reset_forward_metadata(
+    def _reset_forward_state(
         self, req_pool_indices: torch.Tensor | None = None
     ) -> None:
-        """Start a new per-forward metadata lifetime.
-
-        Mirrors KDA's ``MambaForwardMetadata`` ownership: model-specific DSA
-        planning may be shared by layers in this forward, but never by the next
-        request batch.
-        """
-        self.forward_metadata = DSAForwardMetadata(req_pool_indices=req_pool_indices)
+        """Clear DSA-owned state before initializing the MLA delegate."""
         self._prefill_page_table = None
+        if self.kpool_runtime is not None:
+            self.kpool_runtime.reset_forward(req_pool_indices)
 
     @property
     def forward_decode_metadata(self):
@@ -243,7 +227,7 @@ class DSABackend(AttentionBackend):
         cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
-        self._reset_forward_metadata(req_pool_indices[:bs])
+        self._reset_forward_state(req_pool_indices[:bs])
         # The target's MLA delegate binds the history group.  A chaining MTP
         # draft instead consumes its independently staged batch-ordered table;
         # advertising target cache groups would incorrectly select paged MLA.
@@ -280,7 +264,7 @@ class DSABackend(AttentionBackend):
         page_table: torch.Tensor = None,
         **kwargs,
     ):
-        self._reset_forward_metadata(req_pool_indices[:bs])
+        self._reset_forward_state(req_pool_indices[:bs])
         self._dense_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -324,7 +308,7 @@ class DSABackend(AttentionBackend):
         page_table: torch.Tensor,
         **kwargs,
     ):
-        self._reset_forward_metadata(req_pool_indices[:bs])
+        self._reset_forward_state(req_pool_indices[:bs])
         self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,

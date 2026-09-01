@@ -7,9 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
-
-import torch
 
 from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashConfig,
@@ -20,6 +17,10 @@ from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     configure_glm_attention,
 )
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.registry import _LINEAR_ATTN_CLS
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
 _NUM_LAYERS = 45
@@ -232,10 +233,8 @@ class Glm53FlashConfigTests(unittest.TestCase):
             },
         )
 
-    def test_mamba2_cache_params_shapes(self):
-        import tokenspeed.runtime.utils.env as env_mod
-
-        config = Glm53FlashTextConfig(
+    def test_composite_attention_registry_assigns_kda_only_to_target(self):
+        text_config = Glm53FlashTextConfig(
             num_hidden_layers=4,
             layer_types=[
                 "linear_attention",
@@ -245,17 +244,12 @@ class Glm53FlashConfigTests(unittest.TestCase):
             ],
             linear_attn_config=_linear_attn_config(num_layers=4),
         )
-        mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=8))
-        with mock.patch.dict(env_mod.global_server_args_dict, {"mapping": mapping}):
-            conv_shape, recurrent_shape, conv_dtype, state_dtype, layers = (
-                config.mamba2_cache_params
-            )
-
-        self.assertEqual(conv_shape, (3 * 64 * 128 // 8, 3))
-        self.assertEqual(recurrent_shape, (64 // 8, 128, 128))
-        self.assertEqual(conv_dtype, torch.bfloat16)
-        self.assertEqual(state_dtype, torch.float32)
-        self.assertEqual(layers, config.linear_layer_ids)
+        self.assertIs(
+            _LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"],
+            LinearAttnConfig,
+        )
+        self.assertNotIn("Glm53FlashForConditionalGenerationNextN", _LINEAR_ATTN_CLS)
+        self.assertFalse(hasattr(text_config, "mamba2_cache_params"))
 
     def test_nested_linear_attn_config_remains_serializable(self):
         config = Glm53FlashConfig(

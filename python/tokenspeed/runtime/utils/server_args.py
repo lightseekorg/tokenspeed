@@ -510,15 +510,18 @@ class ServerArgs:
         # AttnInitializer.modify_args where both hardware and model arch are known.
 
         if self.sampling_backend is None:
-            # Choose a backend that honors per-request sampling parameters on
-            # each GPU vendor. ``greedy`` always takes argmax and intentionally
-            # ignores temperature/top-p/top-k, so it remains opt-in for
-            # performance-only or explicitly deterministic workloads.
-            platform = current_platform()
-            if platform.is_nvidia:
+            # ``flashinfer`` is the only built-in backend that respects per-request
+            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
+            # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
+            # for single-step (always argmax)"*) — fast for hand-tuned greedy
+            # decoding but silently wrong for any serving deployment where
+            # requests carry sampling params, since the model collapses into
+            # repetition-mode loops within a few hundred steps. Default to the
+            # sampling-respecting backend on NVIDIA where flashinfer is
+            # available, fall back to greedy elsewhere; users can still opt
+            # into greedy explicitly via ``--sampling-backend greedy``.
+            if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
-            elif platform.is_amd:
-                self.sampling_backend = "triton"
             else:
                 self.sampling_backend = "greedy"
 

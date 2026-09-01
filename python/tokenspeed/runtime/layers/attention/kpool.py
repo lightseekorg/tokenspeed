@@ -334,6 +334,13 @@ class KPoolRuntime:
     def __init__(self, pool_size: int, index_topk: int) -> None:
         self.pool_size = pool_size
         self.index_topk = index_topk
+        self.prefill_plan: KPoolPrefillPlan | None = None
+        self.req_pool_indices: torch.Tensor | None = None
+
+    def reset_forward(self, req_pool_indices: torch.Tensor | None = None) -> None:
+        """Reset KPool state for a new forward."""
+        self.prefill_plan = None
+        self.req_pool_indices = req_pool_indices
 
     def ensure_prefill_plan(
         self,
@@ -343,16 +350,13 @@ class KPoolRuntime:
         token_capacity: int | None = None,
     ) -> None:
         """Build the layer-invariant prefill plan once for the current forward."""
-        if (
-            ctx.num_extends <= 0
-            or backend.forward_metadata.kpool_prefill_plan is not None
-        ):
+        if ctx.num_extends <= 0 or self.prefill_plan is not None:
             return
 
         metadata = backend.chunked_prefill_metadata
         index_table = backend.kpool_prefill_page_table(ctx.num_extends)
         index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
-        backend.forward_metadata.kpool_prefill_plan = build_kpool_prefill_plan(
+        self.prefill_plan = build_kpool_prefill_plan(
             prefix_lens_cpu=metadata.extend_prefix_lens_cpu[: ctx.num_extends],
             extend_lens_cpu=metadata.extend_seq_lens_cpu[: ctx.num_extends],
             index_block_table=index_table,
@@ -375,7 +379,7 @@ class KPoolRuntime:
         """Write completed prefill pools and preserve their incomplete tails."""
         pool = ctx.token_to_kv_pool
         index_cache, tail_k, tail_gate = pool.get_kpool_buffers(layer_id)
-        shared_plan = backend.forward_metadata.kpool_prefill_plan
+        shared_plan = self.prefill_plan
         if shared_plan is None:
             raise RuntimeError("DSA KPool prefill plan was not initialized")
         plan = shared_plan.write
@@ -452,7 +456,7 @@ class KPoolRuntime:
         row_start = int(metadata.num_extends or 0)
         seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs].to(torch.int32)
         index_table = backend.kpool_decode_page_table(row_start, num_reqs)
-        request_slots = backend.forward_metadata.req_pool_indices
+        request_slots = self.req_pool_indices
         if request_slots is None:
             raise RuntimeError("DSA KPool decode requires request-pool indices")
         request_slots = request_slots[row_start : row_start + num_reqs].to(torch.int32)
@@ -542,7 +546,7 @@ class KPoolRuntime:
 
         history_table = backend.kpool_prefill_page_table(ctx.num_extends)
         index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
-        shared_plan = backend.forward_metadata.kpool_prefill_plan
+        shared_plan = self.prefill_plan
         if shared_plan is None:
             raise RuntimeError("DSA KPool prefill plan was not initialized")
         positions = shared_plan.positions

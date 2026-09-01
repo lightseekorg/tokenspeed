@@ -58,7 +58,6 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _get_from_args,
     _is_deepseek_v4_model,
-    _is_glm_dsa_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
@@ -506,16 +505,6 @@ def test_local_deepseek_v4_config_is_detected(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
 
     assert _is_deepseek_v4_model(str(tmp_path))
-
-
-def test_glm53_flash_name_and_legacy_checkpoint_config_are_detected(tmp_path):
-    assert _is_glm_dsa_model("zai-org/GLM-5.3-Flash")
-
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm53_flash"}))
-    assert _is_glm_dsa_model(str(tmp_path))
-
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next"}))
-    assert _is_glm_dsa_model(str(tmp_path))
 
 
 def _make_kimi_k3_model_dir(tmp_path):

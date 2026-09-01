@@ -48,7 +48,10 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_valid_rows,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.dsa import DSABackend
@@ -584,9 +587,9 @@ class Glm53FlashKDA(nn.Module):
         self.conv_size = linear["short_conv_kernel_size"]
         self.lower_bound = linear["gate_lower_bound"]
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
         self.local_num_heads = self.num_heads // tp_size
         projection_size = self.num_heads * self.head_dim
         local_projection_size = self.local_num_heads * self.head_dim
@@ -744,7 +747,7 @@ class Glm53FlashKDA(nn.Module):
             activation="silu",
             key_dim=projection_size,
             value_dim=projection_size,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=self.head_dim,
             head_v_dim=self.head_dim,
             f_a_out=f_a,
@@ -1014,7 +1017,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
 
         logical_num_tokens = q_norm.shape[0]
         if ctx.num_extends > 0:
-            prefill_plan = dsa_backend.forward_metadata.kpool_prefill_plan
+            prefill_plan = kpool_runtime.prefill_plan
             if prefill_plan is None:
                 raise RuntimeError("GLM-5.3-Flash prefill requires a KPool plan")
             num_decode_reqs = self._resolve_decode_req_count(
@@ -1025,14 +1028,11 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
             logical_num_tokens = (
                 prefill_plan.num_prefill_tokens + num_decode_reqs * spec_width
             )
-            real_input_num_tokens = getattr(ctx, "real_input_num_tokens", None)
-            if (
-                real_input_num_tokens is not None
-                and logical_num_tokens != real_input_num_tokens
-            ):
+            valid_rows = current_valid_rows()
+            if valid_rows is not None and logical_num_tokens != valid_rows:
                 raise RuntimeError(
                     "GLM-5.3-Flash live row metadata disagrees with the scheduler: "
-                    f"metadata={logical_num_tokens}, scheduler={real_input_num_tokens}"
+                    f"metadata={logical_num_tokens}, scheduler={valid_rows}"
                 )
             if logical_num_tokens > q_norm.shape[0]:
                 raise RuntimeError(
@@ -1050,7 +1050,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         decode_start = decode_window.start
         decode_end = decode_window.end
         if ctx.num_extends > 0:
-            prefill_plan = dsa_backend.forward_metadata.kpool_prefill_plan
+            prefill_plan = kpool_runtime.prefill_plan
             if num_prefill_tokens != prefill_plan.num_prefill_tokens:
                 raise RuntimeError(
                     "GLM-5.3-Flash live row split disagrees with KPool metadata: "

@@ -237,10 +237,11 @@ def test_kda_checkpoint_input_weights_load_into_one_projection(monkeypatch) -> N
     mapping = Mapping(
         rank=1,
         world_size=2,
-        attn_tp_size=2,
+        attn_tp_size=1,
+        attn_dp_size=2,
+        linear_attn_tp_size=2,
         dense_tp_size=2,
         moe_tp_size=2,
-        vision_tp_size=2,
     )
     attention = Glm53FlashKDA(config, mapping, layer_id=0)
 

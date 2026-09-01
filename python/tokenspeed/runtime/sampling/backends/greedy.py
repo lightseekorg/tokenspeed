@@ -125,8 +125,8 @@ class GreedySamplingBackend(SamplingBackend):
 
     sampling_info is ignored for single-step (always argmax). verify() also
     treats every request as greedy — stochastic verification is not
-    supported. Intended for explicitly greedy workloads and as a fallback on
-    platforms without a parameter-respecting sampling backend."""
+    supported. Intended as the default backend and as a fallback when
+    flashinfer is unavailable."""
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 

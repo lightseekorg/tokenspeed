@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,11 @@ import torch
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashTextConfig
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
+)
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (
@@ -50,10 +56,53 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         },
     )
     num_lcm_blocks = 2
-    groups = declare_glm53_flash_groups(
-        text_config,
+    dsa = DSAConfig(
+        backend_name="dsa",
+        num_attention_heads=text_config.num_attention_heads,
+        num_kv_heads=text_config.num_key_value_heads,
+        head_dim=text_config.qk_head_dim,
+        attn_tp_size=4,
+        layer_types=tuple(text_config.paged_cache_layer_types),
+        kv_lora_rank=text_config.kv_lora_rank,
+        qk_nope_head_dim=text_config.qk_nope_head_dim,
+        qk_rope_head_dim=text_config.qk_rope_head_dim,
+        v_head_dim=text_config.v_head_dim,
+        scaling=text_config.qk_head_dim**-0.5,
+        kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+        index_topk=text_config.index_topk,
+        index_head_dim=text_config.index_head_dim,
+        index_n_heads=text_config.index_n_heads,
+        index_kpool=text_config.index_kpool,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=text_config.linear_num_heads,
+        num_v_heads=text_config.linear_num_heads,
+        head_k_dim=text_config.linear_head_dim,
+        head_v_dim=text_config.linear_head_dim,
+        conv_kernel_size=text_config.linear_conv_kernel_dim,
+        layer_ids=tuple(text_config.linear_layer_ids),
         tp_size=4,
-        mla_cache_dtype=torch.float8_e4m3fn,
+    )
+    attn_config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_quant_method="none",
+        prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
+        context_len=4096,
+        max_bs=8,
+        max_graph_bs=8,
+        components=(dsa, linear),
+    )
+    draft_attn_config = replace(
+        attn_config,
+        is_draft=True,
+        components=(replace(dsa, layer_types=(FULL_ATTENTION,)),),
+    )
+    groups = declare_glm53_flash_groups(
+        text_config.num_hidden_layers,
+        attn_config=attn_config,
+        draft_attn_config=draft_attn_config,
         draft_layers=1,
     )
     state_group_ids = [

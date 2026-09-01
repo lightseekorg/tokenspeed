@@ -63,13 +63,7 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
-from tokenspeed.runtime.configs.glm53_flash_config import (
-    GLM53_FLASH_MODEL_TYPE,
-    GLM53_FLASH_TEXT_MODEL_TYPE,
-    GLM53_FLASH_VISION_MODEL_TYPE,
-    LEGACY_GLM53_FLASH_MODEL_TYPE,
-    Glm53FlashConfig,
-)
+from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -95,7 +89,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
-    LEGACY_GLM53_FLASH_MODEL_TYPE: Glm53FlashConfig,
+    "glm5_next": Glm53FlashConfig,
 }
 
 _GLM53_FLASH_ARCHITECTURE_ALIASES = {
@@ -229,23 +223,19 @@ def _normalize_glm53_flash_metadata(config: PretrainedConfig) -> None:
     """Collapse legacy checkpoint names at the config-loading boundary."""
     architectures = getattr(config, "architectures", None) or []
     if not (
-        getattr(config, "model_type", None)
-        in {GLM53_FLASH_MODEL_TYPE, LEGACY_GLM53_FLASH_MODEL_TYPE}
+        isinstance(config, Glm53FlashConfig)
         or any(arch in _GLM53_FLASH_ARCHITECTURE_ALIASES for arch in architectures)
     ):
         return
 
-    config.model_type = GLM53_FLASH_MODEL_TYPE
+    config.model_type = Glm53FlashConfig.model_type
     config.__dict__["architectures"] = [
         _GLM53_FLASH_ARCHITECTURE_ALIASES.get(arch, arch) for arch in architectures
     ]
-    for nested_name, model_type in (
-        ("text_config", GLM53_FLASH_TEXT_MODEL_TYPE),
-        ("vision_config", GLM53_FLASH_VISION_MODEL_TYPE),
-    ):
+    for nested_name in ("text_config", "vision_config"):
         nested = getattr(config, nested_name, None)
         if nested is not None:
-            nested.model_type = model_type
+            nested.model_type = type(nested).model_type
 
 
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
