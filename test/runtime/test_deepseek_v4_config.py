@@ -5219,7 +5219,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         first_decode_metadata = metadata
         cached_swa = torch.empty((4, 8), dtype=torch.int32)
-        first_decode_metadata.attention.decode_swa_indices = cached_swa
+        first_decode_metadata.attention.swa_indices = cached_swa
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
             num_tokens=16,
@@ -5229,7 +5229,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.advance_draft_forward_metadata()
         self.assertIs(backend.forward_metadata, first_decode_metadata)
-        self.assertIs(backend.forward_metadata.attention.decode_swa_indices, cached_swa)
+        self.assertIs(backend.forward_metadata.attention.swa_indices, cached_swa)
 
     def test_deepseek_v4_packed_draft_replay_reproduces_capture_end_state(self):
         """The bug-2 parity: replay's refresh must leave the slots exactly as

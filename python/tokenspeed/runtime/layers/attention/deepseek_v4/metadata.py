@@ -88,10 +88,10 @@ class DeepseekV4IndexerBatchMetadata:
 
 @dataclass
 class DeepseekV4AttentionMetadata:
-    decode_swa_indices: torch.Tensor | None = None
-    decode_swa_lens: torch.Tensor | None = None
-    decode_swa_window_size: int = 0
-    decode_swa_block_size: int = 0
+    swa_indices: torch.Tensor | None = None
+    swa_lens: torch.Tensor | None = None
+    swa_window_size: int = 0
+    swa_block_size: int = 0
     # Cache for dense compressed decode attention indices/lens. CSA decode uses
     # dynamic top-k indices and does not populate this cache.
     decode_dense_compressed_indices_cache: dict[
@@ -139,7 +139,9 @@ class DeepseekV4ForwardMetadata:
         default_factory=DeepseekV4IndexerMetadata
     )
     forward_mode: ForwardMode | None = None
-    # Padding mask for CUDA graph replay rows; this is not mixed-batch state.
+    # The CUDA-graph padding mask, one mission: True = live token, False =
+    # a padded replay row (never mixed-batch state; prefill rows are always
+    # live).
     is_valid_token: torch.Tensor | None = None
     # CPU lens are retained for sparse prefill/indexer planning without
     # forcing another device-to-host sync in the model path.

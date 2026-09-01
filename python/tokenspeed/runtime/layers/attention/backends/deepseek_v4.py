@@ -291,8 +291,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
-        self._decode_swa_window_size = 0
-        self._decode_swa_block_size = 0
+        self._swa_window_size = 0
+        self._swa_block_size = 0
         self.speculative_num_steps = getattr(config, "speculative_num_steps", 0) or 0
         self.speculative_num_draft_tokens = (
             getattr(config, "speculative_num_draft_tokens", 0) or 0
@@ -1103,15 +1103,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         attention_metadata = metadata.attention
         num_tokens = metadata.token_to_req_indices.shape[0]
         needs_alloc = (
-            attention_metadata.decode_swa_indices is None
-            or attention_metadata.decode_swa_lens is None
-            or attention_metadata.decode_swa_indices.shape
+            attention_metadata.swa_indices is None
+            or attention_metadata.swa_lens is None
+            or attention_metadata.swa_indices.shape
             != (
                 num_tokens,
                 window_size,
             )
-            or attention_metadata.decode_swa_lens.shape != (num_tokens,)
-            or attention_metadata.decode_swa_indices.device != metadata.seq_lens.device
+            or attention_metadata.swa_lens.shape != (num_tokens,)
+            or attention_metadata.swa_indices.device != metadata.seq_lens.device
         )
         if needs_alloc:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -1120,12 +1120,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     "CUDA graph capture"
                 )
             with torch.inference_mode(False):
-                attention_metadata.decode_swa_indices = torch.empty(
+                attention_metadata.swa_indices = torch.empty(
                     (num_tokens, window_size),
                     dtype=torch.int32,
                     device=metadata.seq_lens.device,
                 )
-                attention_metadata.decode_swa_lens = torch.empty(
+                attention_metadata.swa_lens = torch.empty(
                     (num_tokens,),
                     dtype=torch.int32,
                     device=metadata.seq_lens.device,
@@ -1144,15 +1144,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             window_size=window_size,
             block_size=block_size,
             is_valid_token=metadata.is_valid_token,
-            out_indices=attention_metadata.decode_swa_indices,
-            out_lens=attention_metadata.decode_swa_lens,
+            out_indices=attention_metadata.swa_indices,
+            out_lens=attention_metadata.swa_lens,
         )
-        attention_metadata.decode_swa_indices = indices
-        attention_metadata.decode_swa_lens = lens
-        attention_metadata.decode_swa_window_size = window_size
-        attention_metadata.decode_swa_block_size = block_size
-        self._decode_swa_window_size = window_size
-        self._decode_swa_block_size = block_size
+        attention_metadata.swa_indices = indices
+        attention_metadata.swa_lens = lens
+        attention_metadata.swa_window_size = window_size
+        attention_metadata.swa_block_size = block_size
+        self._swa_window_size = window_size
+        self._swa_block_size = block_size
         return indices, lens
 
     def _decode_compressed_attention_indices_and_lens(
@@ -1361,14 +1361,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         swa_block_size = token_to_kv_pool.swa_block_size
         attention_metadata = metadata.attention
         if (
-            attention_metadata.decode_swa_indices is not None
-            and attention_metadata.decode_swa_lens is not None
-            and attention_metadata.decode_swa_window_size == window_size
-            and attention_metadata.decode_swa_block_size == swa_block_size
-            and attention_metadata.decode_swa_indices.shape[0] == positions.numel()
+            attention_metadata.swa_indices is not None
+            and attention_metadata.swa_lens is not None
+            and attention_metadata.swa_window_size == window_size
+            and attention_metadata.swa_block_size == swa_block_size
+            and attention_metadata.swa_indices.shape[0] == positions.numel()
         ):
-            swa_indices = attention_metadata.decode_swa_indices
-            swa_lens = attention_metadata.decode_swa_lens
+            swa_indices = attention_metadata.swa_indices
+            swa_lens = attention_metadata.swa_lens
         else:
             swa_indices, swa_lens = self._update_decode_swa_metadata(
                 metadata,
@@ -2364,13 +2364,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if (
             metadata_forward_mode is not None
             and metadata_forward_mode.is_decode()
-            and self._decode_swa_window_size > 0
-            and self._decode_swa_block_size > 0
+            and self._swa_window_size > 0
+            and self._swa_block_size > 0
         ):
             self._update_decode_swa_metadata(
                 metadata,
-                window_size=self._decode_swa_window_size,
-                block_size=self._decode_swa_block_size,
+                window_size=self._swa_window_size,
+                block_size=self._swa_block_size,
             )
             metadata.cache.refresh_decode_compressed_slot_mappings(
                 token_to_req_indices=metadata.token_to_req_indices,
@@ -2395,11 +2395,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if self.draft_rounds is None or self.forward_prefill_metadata is None:
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
         metadata = self.draft_rounds.advance(seq_lens)
-        if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
+        if self._swa_window_size > 0 and self._swa_block_size > 0:
             self._update_decode_swa_metadata(
                 metadata,
-                window_size=self._decode_swa_window_size,
-                block_size=self._decode_swa_block_size,
+                window_size=self._swa_window_size,
+                block_size=self._swa_block_size,
             )
         # seq_lens just changed, so any previously-refreshed plan tensors are
         # stale. Re-run the same metadata-setup hooks the main path uses.
