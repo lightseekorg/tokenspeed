@@ -115,7 +115,7 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
     # Unified decode path: refresh writes the persistent buffers the wrapper
     # allocates at startup (init_cuda_graph_state runs unconditionally).
-    if not hasattr(backend, "cuda_graph_kv_indices"):
+    if not hasattr(backend, "cuda_graph_page_table"):
         backend.init_cuda_graph_state(max_bs=max(bs, 4))
     backend.refresh_decode_metadata(
         bs,
@@ -241,7 +241,7 @@ def test_flashmla_grouped_target_verify_writes_whole_window() -> None:
     _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=spec)
 
     meta = backend.forward_decode_metadata
-    assert meta.group_q_len_per_req == spec
+    assert meta.q_len_per_req == spec
     locs = backend.select_out_cache_loc(None, None, ForwardMode.DECODE)
     base = 5 * page_size
     assert locs.tolist() == [base + 7, base + 8, base + 9, base + 10], locs.tolist()
@@ -269,7 +269,7 @@ def test_flashmla_classic_path_uses_page_table() -> None:
     )
     assert backend._cache_groups_bound is False
     meta = backend.forward_decode_metadata
-    assert meta.group_out_cache_loc is None
+    assert meta.out_cache_loc is None
     assert meta.page_table[0, :4].tolist() == page_table[0].tolist()
     # Classic path: select_out_cache_loc is identity.
     caller = torch.tensor([1, 2], device="cuda", dtype=torch.int64)

@@ -263,24 +263,6 @@ class ForwardStepRunner:
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
-            # Target and draft resolve the same batch-ordered full-history
-            # table (the target from cache metadata, the draft from the
-            # published draft page table), so both backends would compute
-            # identical block_kv_indices. When the backing buffer shapes/dtypes
-            # also line up, point the draft backend at the target's buffer and
-            # skip its gather+copy in the replay path: the target's metadata
-            # prep runs first and populates the shared buffer (see
-            # refresh_decode_metadata).
-            target_kv = attn_backend.decode_cuda_graph_kv_indices
-            draft_kv = draft_attn_backend.decode_cuda_graph_kv_indices
-            if (
-                target_kv is not None
-                and draft_kv is not None
-                and target_kv.shape == draft_kv.shape
-                and target_kv.dtype == draft_kv.dtype
-            ):
-                draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
-                draft_attn_backend._page_table_aliased = True
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
@@ -889,10 +871,7 @@ class ForwardStepRunner:
 
         Assembles per-group tables once (row padding is a no-op when
         ``padded_bs == actual_bs``, i.e. every eager call), then refreshes the
-        target backend's persistent decode buffers and the draft's. The target
-        must refresh first: a draft whose kv-indices buffer is aliased to the
-        target's (``_page_table_aliased``) reads what the target's refresh
-        populated.
+        target backend's persistent decode buffers and the draft's.
         """
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None)
         block_tables = kwargs.pop("block_tables", None)

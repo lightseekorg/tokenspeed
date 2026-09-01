@@ -282,7 +282,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
-        locs = b._compute_decode_group_out_cache_locs(tables, seq_lens)
+        locs = b._compute_decode_out_cache_locs(tables, seq_lens)
         # seq_len 65 -> page index 1, offset 0; seq_len 3 -> page 0, offset 2.
         self.assertEqual(
             locs["full_attention"].tolist(),
@@ -298,7 +298,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         bs = 1
         seq_lens = self.torch.tensor([66], dtype=self.torch.int32)
         tables = {"full_attention": self.torch.tensor([[5, 6]], dtype=self.torch.int32)}
-        locs = b._compute_extend_group_out_cache_locs(
+        locs = b._compute_extend_out_cache_locs(
             tables,
             self.torch.tensor([64], dtype=self.torch.int32),
             self.torch.tensor([2], dtype=self.torch.int32),
@@ -309,8 +309,8 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             seq_lens=seq_lens,
             page_table=None,
             extend_seq_lens_cpu=self.torch.tensor([2], dtype=self.torch.int32),
-            group_page_tables=tables,
-            group_out_cache_locs=locs,
+            page_tables=tables,
+            out_cache_locs=locs,
         )
         meta = b.forward_prefill_metadata
         self.assertIsNone(meta.page_table)

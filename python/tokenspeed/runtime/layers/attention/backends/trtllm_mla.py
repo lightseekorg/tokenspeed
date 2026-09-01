@@ -123,13 +123,13 @@ class TRTLLMMLAChunkedPrefillMetadata:
 @dataclass
 class TRTLLMMLADecodeMetadata:
     num_extends: int = 0
-    block_kv_indices: torch.Tensor | None = None
+    page_table: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
     # Cache-group path only: absolute latent write locations, request-major, with
-    # ``group_q_len_per_req`` entries per row (1 outside target verify).
-    group_out_cache_loc: torch.Tensor | None = None
-    group_q_len_per_req: int = 1
+    # ``q_len_per_req`` entries per row (1 outside target verify).
+    out_cache_loc: torch.Tensor | None = None
+    q_len_per_req: int = 1
 
 
 class TRTLLMMLABackend(AttentionBackend):
@@ -179,7 +179,7 @@ class TRTLLMMLABackend(AttentionBackend):
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
         self.decode_cuda_graph_metadata: dict[int, TRTLLMMLADecodeMetadata] = {}
-        self.decode_cuda_graph_kv_indices = None
+        self.decode_cuda_graph_page_table = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -190,34 +190,34 @@ class TRTLLMMLABackend(AttentionBackend):
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
 
-    def _create_block_kv_indices(
+    def _create_page_table(
         self,
         batch_size: int,
         max_blocks: int,
-        page_table: torch.Tensor,
-        block_kv_indices: torch.Tensor | None = None,
+        source_table: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Copy a batch-ordered kernel page table into TRTLLM metadata.
 
-        ``page_table`` is batch-ordered (row i == batch position i) and must
+        ``source_table`` is batch-ordered (row i == batch position i) and must
         already be in this backend's kernel-page units — callers expand raw
         scheduler tables through ``_expand_history_table`` first (warmup
         placeholders are empty/dummy and copy as-is).
         """
-        if block_kv_indices is None:
-            block_kv_indices = torch.zeros(
+        if out is None:
+            out = torch.zeros(
                 (batch_size, max_blocks), dtype=torch.int32, device=self.device
             )
         else:
-            block_kv_indices[:batch_size].zero_()
+            out[:batch_size].zero_()
 
-        copy_len = min(max_blocks, page_table.shape[1])
+        copy_len = min(max_blocks, source_table.shape[1])
 
         # Pages beyond actual seq_len are 0 (from the table init); the kernel
         # uses seq_lens to bound access so these padding entries are never read.
-        block_kv_indices[:batch_size, :copy_len] = page_table[:batch_size, :copy_len]
+        out[:batch_size, :copy_len] = source_table[:batch_size, :copy_len]
 
-        return block_kv_indices
+        return out
 
     # ---- Metadata initialization ----
 
@@ -233,20 +233,20 @@ class TRTLLMMLABackend(AttentionBackend):
     ):
         kwargs.pop("cache_metadata", None)
         kwargs.pop("forward_batch", None)
-        group_table = resolve_full_history_table(
+        full_history_table = resolve_full_history_table(
             kwargs.pop("block_tables", None),
             self._geometry,
             bs,
             kernel_page_size=self.kernel_page_size,
             max_kernel_pages=self.max_num_pages,
         )
-        if group_table is not None:
+        if full_history_table is not None:
             self._cache_groups_bound = True
         elif self.is_draft and bs > 0:
             # The drafter drives this backend directly with no group tables;
             # the batch-ordered draft page table (row i is batch position i)
             # carries raw scheduler pages, expanded by the decode refresh
-            # like any group table.
+            # like any full-history table.
             self._cache_groups_bound = True
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
@@ -274,7 +274,7 @@ class TRTLLMMLABackend(AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 page_table,
-                group_table=group_table,
+                full_history_table=full_history_table,
                 q_len_per_req=verify_q_len(
                     self.spec_num_tokens, self.is_draft, forward_mode
                 ),
@@ -297,7 +297,7 @@ class TRTLLMMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
-        group_table: torch.Tensor | None = None,
+        full_history_table: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ):
         # For target_verify, the draft tokens have already been written to the KV
@@ -305,17 +305,15 @@ class TRTLLMMLABackend(AttentionBackend):
         # Use max_context_len to avoid GPU->CPU sync from seq_lens.max().item()
         max_blocks = self._calc_padded_blocks(self.max_context_len)
 
-        group_out_cache_loc = None
-        if group_table is not None:
+        out_cache_loc = None
+        if full_history_table is not None:
             # The table is already in kernel pages; copy into a buffer padded
             # to the fused-kernel block constraint. DSA's sparse top-k slots
             # are mapped through this same table, so it must come from the
-            # group geometry rather than page_table.
-            block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, group_table
-            )
-            group_out_cache_loc = mla_decode_out_cache_loc(
-                group_table,
+            # group geometry rather than the raw ``page_table`` argument.
+            page_table = self._create_page_table(bs, max_blocks, full_history_table)
+            out_cache_loc = mla_decode_out_cache_loc(
+                full_history_table,
                 seq_lens,
                 page_size=self.kernel_page_size,
                 batch_size=bs,
@@ -323,22 +321,22 @@ class TRTLLMMLABackend(AttentionBackend):
                 q_len_per_req=q_len_per_req,
             )
         else:
-            block_kv_indices = self._create_block_kv_indices(bs, max_blocks, page_table)
+            page_table = self._create_page_table(bs, max_blocks, page_table)
 
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
         self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
             num_extends=num_extends,
-            block_kv_indices=block_kv_indices,
+            page_table=page_table,
             max_seq_len_k=self.max_context_len,
             seq_lens_k=seq_lens,
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=q_len_per_req,
+            out_cache_loc=out_cache_loc,
+            q_len_per_req=q_len_per_req,
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Group-derived latent write location on the cache-group path.
+        """Table-derived latent write locations on the cache-group path.
 
         Identity when not cache-group bound or idle. A draft owns its per-step
         locations (it passes ``num_extends == bs`` by its own convention), so it
@@ -354,11 +352,9 @@ class TRTLLMMLABackend(AttentionBackend):
         if not forward_mode.is_decode():
             return out_cache_loc
         metadata = self.forward_decode_metadata
-        if metadata is None or metadata.group_out_cache_loc is None:
+        if metadata is None or metadata.out_cache_loc is None:
             return out_cache_loc
-        locs = metadata.group_out_cache_loc[
-            metadata.num_extends * metadata.group_q_len_per_req :
-        ]
+        locs = metadata.out_cache_loc[metadata.num_extends * metadata.q_len_per_req :]
         if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
             raise RuntimeError(
                 f"trtllm_mla write locations cover {locs.shape[0]} tokens but "
@@ -438,7 +434,7 @@ class TRTLLMMLABackend(AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
         max_blocks = self._calc_padded_blocks(self.max_context_len)
-        self.decode_cuda_graph_kv_indices = torch.zeros(
+        self.decode_cuda_graph_page_table = torch.zeros(
             (max_bs, max_blocks), dtype=torch.int32, device=self.device
         )
         # Persistent write-location buffer whose address the captured graph
@@ -446,13 +442,13 @@ class TRTLLMMLABackend(AttentionBackend):
         # spec_num_tokens locations per request; a draft owns its per-step
         # locations and never reads it (select_out_cache_loc's draft guard).
         if not self.is_draft:
-            self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
+            self.decode_cuda_graph_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
-            self.decode_cuda_graph_group_out_cache_loc = None
+            self.decode_cuda_graph_out_cache_loc = None
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # Pre-build the per-bs views for the base default capture (the MLA
@@ -471,18 +467,16 @@ class TRTLLMMLABackend(AttentionBackend):
             return metadata
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         capture_q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
-        group_out_cache_loc = None
-        if self.decode_cuda_graph_group_out_cache_loc is not None:
-            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
-                : bs * capture_q_len
-            ]
+        out_cache_loc = None
+        if self.decode_cuda_graph_out_cache_loc is not None:
+            out_cache_loc = self.decode_cuda_graph_out_cache_loc[: bs * capture_q_len]
         metadata = TRTLLMMLADecodeMetadata(
             num_extends=0,
-            block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
+            page_table=self.decode_cuda_graph_page_table[:bs, :max_blocks],
             max_seq_len_k=self.max_context_len,
             seq_lens_k=self.cuda_graph_seq_lens[:bs],
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=capture_q_len,
+            out_cache_loc=out_cache_loc,
+            q_len_per_req=capture_q_len,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         return metadata
@@ -513,10 +507,8 @@ class TRTLLMMLABackend(AttentionBackend):
         metadata.num_extends = num_extends
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
-        # views it). Block indices are refreshed separately; when the block
-        # table is aliased to a peer backend, that peer's refresh already
-        # populated it with identical content.
-        q_len = metadata.group_q_len_per_req
+        # views it).
+        q_len = metadata.q_len_per_req
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
@@ -524,50 +516,50 @@ class TRTLLMMLABackend(AttentionBackend):
         # delivered — decode-only PD nodes included (they never run an extend
         # forward, so an extend-latched gate would leave the kernel on a
         # stale/zero block table instead of the transferred KV).
-        group_table = resolve_full_history_table(
+        full_history_table = resolve_full_history_table(
             kwargs.get("block_tables"),
             self._geometry,
             0,
             kernel_page_size=self.kernel_page_size,
             max_kernel_pages=self.max_num_pages,
         )
-        if group_table is not None:
+        if full_history_table is not None:
             self._cache_groups_bound = True
         elif self.is_draft and bs > 0 and page_table is not None:
             # Draft: the staged batch-ordered table carries raw scheduler
             # pages; expand into this backend's kernel pages.
-            group_table = self._expand_history_table(page_table[:bs])
-        if group_table is not None:
+            full_history_table = self._expand_history_table(page_table[:bs])
+        if full_history_table is not None:
             # Live tables carry one row per REAL request; the idle replay's
             # synthesized placeholder rows are all dummies (actual_bs caps).
-            real_bs = min(int(group_table.shape[0]), bs, actual_bs)
-            if real_bs > 0 and not self._page_table_aliased:
-                self._create_block_kv_indices(
+            real_bs = min(int(full_history_table.shape[0]), bs, actual_bs)
+            if real_bs > 0:
+                self._create_page_table(
                     real_bs,
-                    metadata.block_kv_indices.shape[1],
-                    group_table,
-                    metadata.block_kv_indices,
+                    metadata.page_table.shape[1],
+                    full_history_table,
+                    metadata.page_table,
                 )
-            if metadata.group_out_cache_loc is not None and real_bs > 0:
+            if metadata.out_cache_loc is not None and real_bs > 0:
                 mla_decode_out_cache_loc(
-                    group_table,
+                    full_history_table,
                     self.cuda_graph_seq_lens,
                     page_size=self.kernel_page_size,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
-                    out=metadata.group_out_cache_loc,
+                    out=metadata.out_cache_loc,
                     q_len_per_req=q_len,
                 )
             # Padded rows resolve to the null page 0.
-            metadata.block_kv_indices[real_bs:bs].zero_()
-            if metadata.group_out_cache_loc is not None:
-                metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
-        elif page_table is not None and not self._page_table_aliased:
-            self._create_block_kv_indices(
+            metadata.page_table[real_bs:bs].zero_()
+            if metadata.out_cache_loc is not None:
+                metadata.out_cache_loc[real_bs * q_len : bs * q_len].zero_()
+        elif page_table is not None:
+            self._create_page_table(
                 bs,
-                metadata.block_kv_indices.shape[1],
+                metadata.page_table.shape[1],
                 page_table,
-                metadata.block_kv_indices,
+                metadata.page_table,
             )
 
         self.forward_decode_metadata = metadata
@@ -618,7 +610,7 @@ class TRTLLMMLABackend(AttentionBackend):
 
         if q_len_per_req > 1 and self.is_draft:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
-            page_table = metadata.block_kv_indices[num_extends:].repeat_interleave(
+            page_table = metadata.page_table[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
             )
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
@@ -639,7 +631,7 @@ class TRTLLMMLABackend(AttentionBackend):
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            page_table = metadata.block_kv_indices[num_extends:]
+            page_table = metadata.page_table[num_extends:]
             seq_lens = metadata.seq_lens_k[num_extends:]
             max_seq_len = metadata.max_seq_len_k
 

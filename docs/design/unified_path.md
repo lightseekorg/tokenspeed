@@ -133,13 +133,6 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
-### Refresh ordering: target before draft
-
-The wrapper's `_prepare_decode_metadata` refreshes the target backend before
-the draft. A draft whose kv-indices buffer is aliased to the target's
-(`_page_table_aliased`) reads what the target's refresh populated; reordering
-silently reads stale pages.
-
 ### One draft metadata contract
 
 The draft backend's decode metadata comes from `refresh_decode_metadata` and

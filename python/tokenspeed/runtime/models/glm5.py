@@ -432,9 +432,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if seq_lens is not None:
             limits.append(max(0, int(seq_lens.shape[0]) - num_extends))
 
-        block_tables = getattr(metadata, "block_kv_indices", None)
-        if block_tables is not None:
-            limits.append(max(0, int(block_tables.shape[0]) - num_extends))
+        page_table = getattr(metadata, "page_table", None)
+        if page_table is not None:
+            limits.append(max(0, int(page_table.shape[0]) - num_extends))
 
         return min(limits)
 
@@ -501,7 +501,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
     ) -> GlmDsaDecodeTopK | None:
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if metadata is None or metadata.block_kv_indices is None:
+        if metadata is None or metadata.page_table is None:
             return None
         num_tokens = indexer_output.query.shape[0]
         decode_window = self._resolve_decode_window(
@@ -518,7 +518,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if seq_lens.numel() == 0:
             return None
 
-        page_table = metadata.block_kv_indices[
+        page_table = metadata.page_table[
             num_extends : num_extends + decode_window.num_reqs
         ]
         topk = self.index_topk

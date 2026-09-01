@@ -100,7 +100,7 @@ class ComputeOutCacheLocsTest(_MHACase):
             ),
         }
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        locs = self.backend._compute_decode_group_out_cache_locs(tables, seq_lens)
+        locs = self.backend._compute_decode_out_cache_locs(tables, seq_lens)
         # sliding: r0 page 7*2+0=14; r1 page 6*2+1=13.
         assert locs["sliding_attention"].tolist() == [14, 13]
         # full: r0 3*2+0=6; r1 8*2+1=17.
@@ -119,7 +119,7 @@ class ComputeOutCacheLocsTest(_MHACase):
         }
         prefix_cpu = torch.tensor([2, 0], dtype=torch.int32)
         extend_cpu = torch.tensor([3, 2], dtype=torch.int32)
-        locs = self.backend._compute_extend_group_out_cache_locs(
+        locs = self.backend._compute_extend_out_cache_locs(
             tables, prefix_cpu, extend_cpu
         )
         # r0: pos 2,3,4 -> page_idx 1,1,2 -> pages 2,2,3 ->
@@ -136,7 +136,7 @@ class ComputeOutCacheLocsTest(_MHACase):
             "small": torch.tensor([[1, 2, 3]], dtype=torch.int32),
             "large": torch.tensor([[6, 7]], dtype=torch.int32),
         }
-        locs = self.backend._compute_decode_group_out_cache_locs(
+        locs = self.backend._compute_decode_out_cache_locs(
             tables, torch.tensor([5], dtype=torch.int32)
         )
         self.assertEqual(locs["small"].tolist(), [6])
@@ -151,7 +151,7 @@ class ComputeOutCacheLocsTest(_MHACase):
             "small": torch.tensor([[10, 11, 12]], dtype=torch.int32),
             "large": torch.tensor([[20, 21]], dtype=torch.int32),
         }
-        locs = self.backend._compute_extend_group_out_cache_locs(
+        locs = self.backend._compute_extend_out_cache_locs(
             tables,
             torch.tensor([3], dtype=torch.int32),
             torch.tensor([3], dtype=torch.int32),

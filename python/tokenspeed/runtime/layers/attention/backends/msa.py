@@ -153,7 +153,7 @@ class MSAAttnBackend(AttentionBackend):
         md = self.forward_decode_metadata
         fields = {"seq_lens": frontier}
         if md.out_cache_locs is not None:
-            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
+            fields["out_cache_locs"] = self._compute_decode_out_cache_locs(
                 md.page_tables,
                 frontier,
                 self.spec_num_tokens,
@@ -257,19 +257,19 @@ class MSAAttnBackend(AttentionBackend):
 
         seq_lens = seq_lens[:bs]
 
-        group_page_tables = self._consumed_group_tables(block_tables)
-        group_out_cache_locs = None
-        if group_page_tables:
+        page_tables = self._consumed_group_tables(block_tables)
+        out_cache_locs = None
+        if page_tables:
             # The cache path routes every read/write through the per-group
             # tables; a shared single page_table would be dead work.
             page_table = None
-            group_out_cache_locs = self._compute_extend_group_out_cache_locs(
-                group_page_tables,
+            out_cache_locs = self._compute_extend_out_cache_locs(
+                page_tables,
                 extend_prefix_lens_cpu[:bs],
                 extend_seq_lens_cpu[:bs],
             )
-            self._maybe_check_group_write_locs(group_page_tables, group_out_cache_locs)
-            group_page_tables = self._kernel_page_tables(group_page_tables)
+            self._maybe_check_group_write_locs(page_tables, out_cache_locs)
+            page_tables = self._kernel_page_tables(page_tables)
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
@@ -310,8 +310,8 @@ class MSAAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
-            page_tables=group_page_tables,
-            out_cache_locs=group_out_cache_locs,
+            page_tables=page_tables,
+            out_cache_locs=out_cache_locs,
         )
 
     def init_cuda_graph_state(

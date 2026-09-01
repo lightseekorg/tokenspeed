@@ -84,7 +84,7 @@ class MLAPrefillMetadata:
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list[int]
     # Cache-group path only: absolute latent locations for model-owned extend writes.
-    group_out_cache_loc: torch.Tensor | None = None
+    out_cache_loc: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -94,13 +94,9 @@ class MLADecodeMetadata:
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     # Cache-group path only: absolute latent write locations, request-major, with
-    # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
-    group_out_cache_loc: torch.Tensor | None = None
-    group_q_len_per_req: int = 1
-
-    @property
-    def block_kv_indices(self) -> torch.Tensor:
-        return self.page_table
+    # ``q_len_per_req`` entries per batch row (1 outside target verify).
+    out_cache_loc: torch.Tensor | None = None
+    q_len_per_req: int = 1
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
@@ -155,7 +151,7 @@ class MLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata: dict[int, MLADecodeMetadata] = {}
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
-        self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
+        self.decode_cuda_graph_out_cache_loc: torch.Tensor | None = None
 
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
@@ -188,19 +184,19 @@ class MLAAttnBackend(AttentionBackend):
     ):
         kwargs.pop("cache_metadata", None)
         kwargs.pop("forward_batch", None)
-        group_table = resolve_full_history_table(
+        full_history_table = resolve_full_history_table(
             kwargs.pop("block_tables", None),
             self._geometry,
             bs,
             kernel_page_size=self.kernel_page_size,
             max_kernel_pages=self.max_num_pages,
         )
-        if group_table is not None:
+        if full_history_table is not None:
             self._cache_groups_bound = True
         elif self.is_draft and bs > 0:
             # The drafter drives the draft backend directly with no group
             # tables; the staged batch-ordered draft page table (raw
-            # scheduler pages) stands in, expanded like any group table.
+            # scheduler pages) stands in, expanded like any full-history table.
             self._cache_groups_bound = True
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
@@ -222,7 +218,7 @@ class MLAAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
-                group_table=group_table,
+                full_history_table=full_history_table,
             )
 
         # Target mixed/idle batches carry decode rows whose metadata this init
@@ -237,7 +233,7 @@ class MLAAttnBackend(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 page_table=page_table,
-                group_table=group_table,
+                full_history_table=full_history_table,
                 q_len_per_req=self._verify_q_len(forward_mode),
             )
 
@@ -260,7 +256,7 @@ class MLAAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
-        group_table: torch.Tensor | None = None,
+        full_history_table: torch.Tensor | None = None,
     ):
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
@@ -283,25 +279,25 @@ class MLAAttnBackend(AttentionBackend):
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
-        if group_table is not None:
-            group_out_cache_loc = mla_extend_out_cache_loc(
-                group_table[: seq_lens.shape[0]],
+        if full_history_table is not None:
+            out_cache_loc = mla_extend_out_cache_loc(
+                full_history_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
                 page_size=self.kernel_page_size,
                 validate_pages=cache_debug_enabled(),
             )
-            chunk_page_table = group_table[: seq_lens.shape[0]]
+            chunk_page_table = full_history_table[: seq_lens.shape[0]]
             chunk_req_pool_indices = torch.arange(
-                seq_lens.shape[0], dtype=torch.int64, device=group_table.device
+                seq_lens.shape[0], dtype=torch.int64, device=full_history_table.device
             )
             chunk_page_size = self.kernel_page_size
             if use_absorbed_cached_extend:
-                absorbed_page_table = group_table[: seq_lens.shape[0]]
+                absorbed_page_table = full_history_table[: seq_lens.shape[0]]
         else:
             # Idle/warmup placeholder: page_table is batch-ordered (row i ==
             # batch position i), so identity row indices apply.
-            group_out_cache_loc = None
+            out_cache_loc = None
             chunk_page_table = page_table
             chunk_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=page_table.device
@@ -346,7 +342,7 @@ class MLAAttnBackend(AttentionBackend):
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
-            group_out_cache_loc=group_out_cache_loc,
+            out_cache_loc=out_cache_loc,
         )
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
@@ -373,13 +369,13 @@ class MLAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
-        group_table: torch.Tensor | None = None,
+        full_history_table: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ):
-        if group_table is not None:
-            page_table = group_table[:bs]
-            group_out_cache_loc = mla_decode_out_cache_loc(
-                group_table,
+        if full_history_table is not None:
+            page_table = full_history_table[:bs]
+            out_cache_loc = mla_decode_out_cache_loc(
+                full_history_table,
                 seq_lens,
                 page_size=self.kernel_page_size,
                 batch_size=bs,
@@ -391,7 +387,7 @@ class MLAAttnBackend(AttentionBackend):
             # scheduler pages; expand into this backend's kernel pages. Do
             # not index them by request-pool id.
             page_table = self._expand_history_table(page_table[:bs])
-            group_out_cache_loc = None
+            out_cache_loc = None
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
@@ -399,7 +395,7 @@ class MLAAttnBackend(AttentionBackend):
                 self.kernel_page_size,
                 self.max_context_len,
             )
-            group_out_cache_loc = None
+            out_cache_loc = None
         if self._block_decode_active:
             page_table, block_seq_lens = self._expand_block_decode_metadata(
                 page_table, seq_lens[:bs], bs
@@ -415,16 +411,16 @@ class MLAAttnBackend(AttentionBackend):
                 # The drafter owns block write locations: it recomputes them
                 # in-graph from the live draft length, which is not knowable
                 # here. Only the read path takes the group page table.
-                group_out_cache_loc=None,
-                group_q_len_per_req=1,
+                out_cache_loc=None,
+                q_len_per_req=1,
             )
             return
         self.forward_decode_metadata = MLADecodeMetadata(
             num_extends=num_extends,
             page_table=page_table,
             seq_lens=seq_lens[:bs],
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=q_len_per_req,
+            out_cache_loc=out_cache_loc,
+            q_len_per_req=q_len_per_req,
         )
 
     # ------------------------------------------------------------------
@@ -463,7 +459,7 @@ class MLAAttnBackend(AttentionBackend):
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         # A draft owns its per-step write locations (computed from the staged
         # batch-ordered draft page table); only the target routes writes
-        # through the group-derived location buffer.
+        # through the table-derived location buffer in the metadata.
         if (
             not self._cache_groups_bound
             or forward_mode is None
@@ -478,18 +474,18 @@ class MLAAttnBackend(AttentionBackend):
             return out_cache_loc
         if forward_mode.is_decode():
             metadata = self.forward_decode_metadata
-            if metadata is None or metadata.group_out_cache_loc is None:
+            if metadata is None or metadata.out_cache_loc is None:
                 raise RuntimeError("MLA decode write locations are missing")
-            # Locations are request-major with group_q_len_per_req entries per
+            # Locations are request-major with q_len_per_req entries per
             # row, so a mixed batch skips whole windows, not single rows.
-            locs = metadata.group_out_cache_loc[
-                metadata.num_extends * metadata.group_q_len_per_req :
+            locs = metadata.out_cache_loc[
+                metadata.num_extends * metadata.q_len_per_req :
             ]
         else:
             metadata = self.forward_prefill_metadata
-            if metadata is None or metadata.group_out_cache_loc is None:
+            if metadata is None or metadata.out_cache_loc is None:
                 raise RuntimeError("MLA prefill write locations are missing")
-            locs = metadata.group_out_cache_loc
+            locs = metadata.out_cache_loc
         if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
             raise RuntimeError(
                 f"MLA write locations cover {locs.shape[0]} tokens but "
@@ -514,13 +510,13 @@ class MLAAttnBackend(AttentionBackend):
             # request. A draft owns its per-step write locations and never
             # reads this buffer (every LCM pool publishes a cache contract,
             # so there is no separate contract gate).
-            self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
+            self.decode_cuda_graph_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
-            self.decode_cuda_graph_group_out_cache_loc = None
+            self.decode_cuda_graph_out_cache_loc = None
 
     # Capture is inherited (base default: bind_decode_views + idle refresh).
 
@@ -529,7 +525,7 @@ class MLAAttnBackend(AttentionBackend):
         # the grouped path; the latch must be set BEFORE the views are built
         # (it selects the write-location view) and the recorded
         # select_out_cache_loc branch reads it. A draft binds too — its
-        # refresh consumes the wrapper-dispatched group table — but its
+        # refresh consumes the wrapper-dispatched full-history table — but its
         # write locations stay drafter-owned (see _decode_views).
         del cache_group_ids
         self._cache_groups_bound = True
@@ -585,25 +581,25 @@ class MLAAttnBackend(AttentionBackend):
                 num_extends=0,
                 page_table=self.cuda_graph_page_table[:expanded_bs, :],
                 seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-                group_out_cache_loc=None,
+                out_cache_loc=None,
             )
         else:
             capture_q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
             # A draft owns its per-step write locations (it reads the
             # published batch-ordered table); only the target routes writes
             # through the persistent loc buffer (allocated iff not draft).
-            if self.decode_cuda_graph_group_out_cache_loc is not None:
-                group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
+            if self.decode_cuda_graph_out_cache_loc is not None:
+                out_cache_loc = self.decode_cuda_graph_out_cache_loc[
                     : bs * capture_q_len
                 ]
             else:
-                group_out_cache_loc = None
+                out_cache_loc = None
             metadata = MLADecodeMetadata(
                 num_extends=0,
                 page_table=self.cuda_graph_page_table[:bs, :],
                 seq_lens=self.cuda_graph_seq_lens[:bs],
-                group_out_cache_loc=group_out_cache_loc,
-                group_q_len_per_req=capture_q_len,
+                out_cache_loc=out_cache_loc,
+                q_len_per_req=capture_q_len,
             )
         self.decode_cuda_graph_metadata[bs] = metadata
         return metadata
@@ -645,18 +641,18 @@ class MLAAttnBackend(AttentionBackend):
             return
         # Copy the live lengths into our own cache-seqlens buffer
         # (metadata.seq_lens views it); every metadata path reads it.
-        q_len = metadata.group_q_len_per_req
+        q_len = metadata.q_len_per_req
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-        has_group_tables = bool(block_tables) and (
+        has_full_history_table = bool(block_tables) and (
             self._geometry.full_history_group_id in block_tables
         )
-        if metadata.group_out_cache_loc is not None and (
-            has_group_tables or for_graph_replay
+        if metadata.out_cache_loc is not None and (
+            has_full_history_table or for_graph_replay
         ):
-            if has_group_tables:
+            if has_full_history_table:
                 # Latch the group binding so select_out_cache_loc serves the
-                # group-derived write locations (parity with the extend path).
+                # table-derived write locations (parity with the extend path).
                 self._cache_groups_bound = True
             # The idle replay (actual_bs == 0) carries synthesized placeholder
             # tables; every row is a dummy row, so zero the buffers instead of
@@ -685,10 +681,10 @@ class MLAAttnBackend(AttentionBackend):
         metadata: MLADecodeMetadata,
         block_tables,
     ) -> None:
-        if metadata.group_out_cache_loc is None:
+        if metadata.out_cache_loc is None:
             raise RuntimeError("MLA graph metadata has no write-location buffer")
         # Must match the width baked into the captured buffer view.
-        q_len = metadata.group_q_len_per_req
+        q_len = metadata.q_len_per_req
         real_bs = 0
         table = resolve_full_history_table(
             block_tables,
@@ -710,12 +706,12 @@ class MLAAttnBackend(AttentionBackend):
                     page_size=self.kernel_page_size,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
-                    out=metadata.group_out_cache_loc,
+                    out=metadata.out_cache_loc,
                     q_len_per_req=q_len,
                 )
         # Padded rows resolve to the null page 0 so they never touch a live page.
         metadata.page_table[real_bs:bs].zero_()
-        metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
+        metadata.out_cache_loc[real_bs * q_len : bs * q_len].zero_()
 
     def forward_decode(
         self,

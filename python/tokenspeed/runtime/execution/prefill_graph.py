@@ -417,7 +417,7 @@ class PrefillGraph:
         helper answers the decode question, where a row describes live cache
         history, so a sliding group is bounded by its window. Capture derives
         a write column per position of the extend it fabricates
-        (``extend_group_out_cache_locs``, ``(prefix + new - 1) // grain``)
+        (``extend_out_cache_locs``, ``(prefix + new - 1) // grain``)
         with no window bound, so a window-sized row underflows.
         Trying the helper here made Inkling capture die with "extend write
         locations out of table bounds" -- its ``sliding_attention_0`` row was

@@ -205,8 +205,8 @@ def test_a_block_decode_draft_keeps_its_own_write_locations() -> None:
         num_extends=0,
         page_table=torch.zeros((16, 8), dtype=torch.int32),
         seq_lens=torch.zeros(16, dtype=torch.int32),
-        group_out_cache_loc=None,
-        group_q_len_per_req=1,
+        out_cache_loc=None,
+        q_len_per_req=1,
     )
     selected = backend.select_out_cache_loc(
         layer=None, out_cache_loc=caller_locs, forward_mode=ForwardMode.DECODE
@@ -233,8 +233,8 @@ def test_mixed_batch_skips_whole_windows_not_rows() -> None:
         num_extends=1,
         page_table=torch.zeros((3, 8), dtype=torch.int32),
         seq_lens=torch.zeros(3, dtype=torch.int32),
-        group_out_cache_loc=locs,
-        group_q_len_per_req=4,
+        out_cache_loc=locs,
+        q_len_per_req=4,
     )
 
     selected = backend.select_out_cache_loc(
@@ -251,8 +251,8 @@ def test_non_spec_mixed_batch_still_skips_single_rows() -> None:
         num_extends=1,
         page_table=torch.zeros((3, 8), dtype=torch.int32),
         seq_lens=torch.zeros(3, dtype=torch.int32),
-        group_out_cache_loc=locs,
-        group_q_len_per_req=1,
+        out_cache_loc=locs,
+        q_len_per_req=1,
     )
     selected = backend.select_out_cache_loc(
         layer=None, out_cache_loc=torch.zeros(2), forward_mode=ForwardMode.DECODE
@@ -266,8 +266,8 @@ def test_count_mismatch_is_still_caught() -> None:
         num_extends=0,
         page_table=torch.zeros((2, 8), dtype=torch.int32),
         seq_lens=torch.zeros(2, dtype=torch.int32),
-        group_out_cache_loc=torch.arange(8, dtype=torch.int64),
-        group_q_len_per_req=4,
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+        q_len_per_req=4,
     )
     with pytest.raises(RuntimeError, match="write locations cover"):
         backend.select_out_cache_loc(
@@ -298,13 +298,13 @@ def test_staged_mla_draft_keeps_drafter_write_locations() -> None:
 def test_graph_loc_buffer_is_sized_for_the_window() -> None:
     backend = _backend(spec_num_tokens=8)
     backend.init_cuda_graph_state(max_bs=4)
-    assert backend.decode_cuda_graph_group_out_cache_loc.shape == (32,)
+    assert backend.decode_cuda_graph_out_cache_loc.shape == (32,)
 
 
 def test_graph_loc_buffer_is_unexpanded_without_spec() -> None:
     backend = _backend(spec_num_tokens=1)
     backend.init_cuda_graph_state(max_bs=4)
-    assert backend.decode_cuda_graph_group_out_cache_loc.shape == (4,)
+    assert backend.decode_cuda_graph_out_cache_loc.shape == (4,)
 
 
 def test_capture_records_the_window_width_on_the_metadata() -> None:
@@ -317,8 +317,8 @@ def test_capture_records_the_window_width_on_the_metadata() -> None:
         forward_mode=ForwardMode.DECODE,
     )
     metadata = backend.decode_cuda_graph_metadata[2]
-    assert metadata.group_q_len_per_req == 8
-    assert metadata.group_out_cache_loc.shape == (16,)
+    assert metadata.q_len_per_req == 8
+    assert metadata.out_cache_loc.shape == (16,)
 
 
 def test_capture_clamps_seq_lens_to_the_window() -> None:
@@ -347,7 +347,7 @@ def test_contract_bound_draft_captures_staged_page_table_path() -> None:
         page_table=torch.zeros((2, 4), dtype=torch.int32),
     )
     metadata = backend.decode_cuda_graph_metadata[2]
-    assert metadata.group_out_cache_loc is None
+    assert metadata.out_cache_loc is None
 
 
 def test_a_contract_bound_block_draft_is_admitted_on_the_group_graph_path() -> None:

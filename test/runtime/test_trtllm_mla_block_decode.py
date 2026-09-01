@@ -31,10 +31,9 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.trtllm_workspace = torch.empty(1, dtype=torch.uint8)
     backend.device = torch.device("cpu")
     backend.max_num_pages = backend._calc_padded_blocks(backend.max_context_len)
-    backend._page_table_aliased = False
     backend._cache_groups_bound = False
     backend.decode_cuda_graph_metadata = {}
-    backend.decode_cuda_graph_group_out_cache_loc = None
+    backend.decode_cuda_graph_out_cache_loc = None
     backend.forward_decode_metadata = None
     return backend
 
@@ -53,7 +52,7 @@ def test_eager_draft_page_table_is_not_expanded_twice() -> None:
         page_table=kernel_page_table,
     )
 
-    block_table = backend.forward_decode_metadata.block_kv_indices
+    block_table = backend.forward_decode_metadata.page_table
     assert block_table[0, :6].tolist() == [6, 7, 10, 11, 14, 15]
     assert block_table[0, 6:].eq(0).all()
 
@@ -83,7 +82,7 @@ def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
         for_graph_replay=True,
     )
 
-    block_table = backend.forward_decode_metadata.block_kv_indices
+    block_table = backend.forward_decode_metadata.page_table
     assert block_table[:, :4].tolist() == kernel_page_table.tolist()
     assert block_table[:, 4:].eq(0).all()
 
@@ -113,7 +112,7 @@ def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> Non
         # Reproduce the old DFlash convention from the failing startup log.
         # Block decode must ignore this discriminator and retain both rows.
         num_extends=2,
-        block_kv_indices=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+        page_table=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
         max_seq_len_k=64,
         seq_lens_k=torch.tensor([11, 23], dtype=torch.int32),
     )
@@ -161,7 +160,7 @@ def test_non_block_draft_keeps_causal_catch_up_offsets() -> None:
     backend = _backend(draft_block_decode=False)
     backend.forward_decode_metadata = TRTLLMMLADecodeMetadata(
         num_extends=0,
-        block_kv_indices=torch.tensor([[1, 2]], dtype=torch.int32),
+        page_table=torch.tensor([[1, 2]], dtype=torch.int32),
         max_seq_len_k=60,
         seq_lens_k=torch.tensor([11], dtype=torch.int32),
     )

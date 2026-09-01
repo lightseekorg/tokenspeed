@@ -8,7 +8,7 @@ separately.
 Coverage:
 
 - the MLA full-attention decode graph: capture binds stable
-  ``block_kv_indices`` + ``group_out_cache_loc`` buffers, replay refreshes them
+  ``page_table`` + ``out_cache_loc`` buffers, replay refreshes them
   IN PLACE (same ``data_ptr``) from a fresh forward op;
 - padded batch rows resolve to the null page 0 (dummy-page protection);
 - the draft/target structural gate on the MLA
@@ -78,16 +78,15 @@ def _bare_mla_backend(
     backend.kv_cache_dim = _KV_LORA + _ROPE
     backend.data_type = torch.bfloat16
     backend.cutedsl_workspace = None
-    backend._block_table_aliased = False
     backend._cache_groups_bound = False
     backend.decode_cuda_graph_metadata = {}
-    backend.decode_cuda_graph_kv_indices = None
+    backend.decode_cuda_graph_page_table = None
     backend._geometry = CacheGroupGeometry(
         granularities={"full_attention": _LOGICAL_P},
         full_history_group_id="full_attention",
         history_block_granularity=_LOGICAL_P,
     )
-    backend.decode_cuda_graph_group_out_cache_loc = None
+    backend.decode_cuda_graph_out_cache_loc = None
     backend.forward_decode_metadata = None
     del cache_contract
     return backend
@@ -99,8 +98,8 @@ def test_target_verify_mixed_batch_skips_complete_prefill_windows() -> None:
     locations = torch.arange(16, dtype=torch.int64)
     backend.forward_decode_metadata = CuteDSLMLADecodeMetadata(
         num_extends=1,
-        group_out_cache_loc=locations,
-        group_q_len_per_req=8,
+        out_cache_loc=locations,
+        q_len_per_req=8,
     )
 
     selected = backend.select_out_cache_loc(
@@ -130,7 +129,7 @@ def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
     backend.bind_decode_views(2, cache_group_ids=("full_attention",))
 
     assert backend._cache_groups_bound is False
-    assert backend.decode_cuda_graph_group_out_cache_loc is None
+    assert backend.decode_cuda_graph_out_cache_loc is None
 
 
 def _bare_amd_mla_backend(
@@ -148,7 +147,7 @@ def _bare_amd_mla_backend(
     backend.decode_cuda_graph_metadata = {}
     backend.cuda_graph_page_table = None
     backend.cuda_graph_seq_lens = None
-    backend.decode_cuda_graph_group_out_cache_loc = None
+    backend.decode_cuda_graph_out_cache_loc = None
     backend.forward_decode_metadata = None
     backend._should_use_absorbed_cached_extend = lambda **_: False
     backend._geometry = CacheGroupGeometry(
@@ -171,8 +170,8 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
         cache_group_ids=("full_attention",),
     )
     md = backend.decode_cuda_graph_metadata[2]
-    captured_kv_ptr = md.block_kv_indices.data_ptr()
-    captured_loc_ptr = md.group_out_cache_loc.data_ptr()
+    captured_kv_ptr = md.page_table.data_ptr()
+    captured_loc_ptr = md.out_cache_loc.data_ptr()
 
     # One REAL request (row 0), one padded dummy row (row 1). The op-bound
     # table carries only the real row; padded rows must land on page 0.
@@ -191,19 +190,19 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
     )
     md2 = backend.forward_decode_metadata
     # SAME buffers refreshed in place (no realloc): pointer-stable replay.
-    assert md2.block_kv_indices.data_ptr() == captured_kv_ptr
-    assert md2.group_out_cache_loc.data_ptr() == captured_loc_ptr
+    assert md2.page_table.data_ptr() == captured_kv_ptr
+    assert md2.out_cache_loc.data_ptr() == captured_loc_ptr
 
     # Real row 0: logical page 3 -> kernel pages [6, 7] (ratio 2), page 5 ->
     # [10, 11]. Expansion: page * ratio + k.
-    assert md2.block_kv_indices[0].tolist() == [6, 7, 10, 11]
+    assert md2.page_table[0].tolist() == [6, 7, 10, 11]
     # Write loc for seq_len 70: pos 69, logical page idx 0 -> page 3, offset 69:
     # 3 * 128 + 69 = 453.
-    assert md2.group_out_cache_loc[0].item() == 3 * _LOGICAL_P + 69
+    assert md2.out_cache_loc[0].item() == 3 * _LOGICAL_P + 69
 
     # Padded row 1: null page 0 everywhere.
-    assert torch.all(md2.block_kv_indices[1] == 0)
-    assert md2.group_out_cache_loc[1].item() == 0
+    assert torch.all(md2.page_table[1] == 0)
+    assert md2.out_cache_loc[1].item() == 0
 
 
 def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> None:
@@ -219,7 +218,7 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
     )
     captured = backend.decode_cuda_graph_metadata[2]
     page_ptr = captured.page_table.data_ptr()
-    loc_ptr = captured.group_out_cache_loc.data_ptr()
+    loc_ptr = captured.out_cache_loc.data_ptr()
 
     table = torch.tensor([[3, 5]], dtype=torch.int32)
     backend.refresh_decode_metadata(
@@ -234,11 +233,11 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
     )
     replayed = backend.forward_decode_metadata
     assert replayed.page_table.data_ptr() == page_ptr
-    assert replayed.group_out_cache_loc.data_ptr() == loc_ptr
+    assert replayed.out_cache_loc.data_ptr() == loc_ptr
     assert replayed.page_table[0].tolist() == [6, 7, 10, 11]
-    assert replayed.group_out_cache_loc[0].item() == 3 * _LOGICAL_P + 69
+    assert replayed.out_cache_loc[0].item() == 3 * _LOGICAL_P + 69
     assert torch.all(replayed.page_table[1] == 0)
-    assert replayed.group_out_cache_loc[1].item() == 0
+    assert replayed.out_cache_loc[1].item() == 0
 
 
 def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
@@ -253,9 +252,9 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
     )
     captured = backend.decode_cuda_graph_metadata[2]
     page_ptr = captured.page_table.data_ptr()
-    loc_ptr = captured.group_out_cache_loc.data_ptr()
-    assert captured.group_q_len_per_req == 2
-    assert captured.group_out_cache_loc.shape == (4,)
+    loc_ptr = captured.out_cache_loc.data_ptr()
+    assert captured.q_len_per_req == 2
+    assert captured.out_cache_loc.shape == (4,)
 
     table = torch.tensor([[3, 5]], dtype=torch.int32)
     backend.refresh_decode_metadata(
@@ -270,8 +269,8 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
     )
     replayed = backend.forward_decode_metadata
     assert replayed.page_table.data_ptr() == page_ptr
-    assert replayed.group_out_cache_loc.data_ptr() == loc_ptr
-    assert replayed.group_out_cache_loc.tolist() == [
+    assert replayed.out_cache_loc.data_ptr() == loc_ptr
+    assert replayed.out_cache_loc.tolist() == [
         3 * _LOGICAL_P + 68,
         3 * _LOGICAL_P + 69,
         0,
@@ -297,7 +296,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     decode = backend.forward_decode_metadata
     assert decode.page_table[0].tolist() == [6, 7, 10, 11]
     assert decode.page_table[1].tolist() == [8, 9, 0, 1]
-    assert decode.group_out_cache_loc.tolist() == [
+    assert decode.out_cache_loc.tolist() == [
         3 * _LOGICAL_P + 69,
         4 * _LOGICAL_P + 39,
     ]
@@ -306,7 +305,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
         torch.tensor([-1, -1], dtype=torch.int64),
         ForwardMode.DECODE,
     )
-    assert torch.equal(selected, decode.group_out_cache_loc)
+    assert torch.equal(selected, decode.out_cache_loc)
 
 
 def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
@@ -324,8 +323,8 @@ def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
     )
 
     decode = backend.forward_decode_metadata
-    assert decode.group_q_len_per_req == 2
-    assert decode.group_out_cache_loc.tolist() == [
+    assert decode.q_len_per_req == 2
+    assert decode.out_cache_loc.tolist() == [
         3 * _LOGICAL_P + 68,
         3 * _LOGICAL_P + 69,
         6 * _LOGICAL_P,
@@ -336,7 +335,7 @@ def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
         torch.full((4,), -1, dtype=torch.int64),
         ForwardMode.DECODE,
     )
-    assert torch.equal(selected, decode.group_out_cache_loc)
+    assert torch.equal(selected, decode.out_cache_loc)
 
 
 def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> None:
@@ -379,7 +378,7 @@ def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> Non
         )
     )
     prefill = backend.forward_prefill_metadata
-    assert torch.equal(prefill.group_out_cache_loc, expected)
+    assert torch.equal(prefill.out_cache_loc, expected)
     assert prefill.chunked_loop_num > 0
     assert (
         backend.select_out_cache_loc(
@@ -440,7 +439,7 @@ def test_block_decode_graph_buffers_hold_every_block_row() -> None:
     )
     backend.init_cuda_graph_state(max_bs)
     assert backend.cuda_graph_seq_lens.shape[0] == max_bs * spec
-    assert backend.decode_cuda_graph_kv_indices.shape[0] == max_bs * spec
+    assert backend.decode_cuda_graph_page_table.shape[0] == max_bs * spec
 
 
 def test_block_decode_replay_broadcasts_pages_and_scrubs_padding() -> None:
@@ -453,14 +452,14 @@ def test_block_decode_replay_broadcasts_pages_and_scrubs_padding() -> None:
         draft_block_decode=True,
     )
     backend.init_cuda_graph_state(max_bs)
-    backend.decode_cuda_graph_kv_indices.fill_(-9)
+    backend.decode_cuda_graph_page_table.fill_(-9)
     # Raw scheduler pages (logical P); the backend expands to kernel pages
     # (ratio 2: page L -> [2L, 2L+1]).
     page_table = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
 
     backend._replay_block_decode_page_table(bs, page_table)
 
-    rows = backend.decode_cuda_graph_kv_indices[: bs * spec]
+    rows = backend.decode_cuda_graph_page_table[: bs * spec]
     assert rows[:spec, :4].tolist() == [[10, 11, 12, 13]] * spec
     assert rows[spec : 2 * spec, :4].tolist() == [[14, 15, 16, 17]] * spec
     assert rows[2 * spec :].eq(0).all(), "padded request kept live pages"
@@ -516,12 +515,12 @@ def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
         bs,
     )
     backend.forward_decode_metadata = CuteDSLMLADecodeMetadata(
-        block_kv_indices=rows,
+        page_table=rows,
         max_seq_len_k=_MAX_CTX,
         seq_lens_k=block_lens,
         num_extends=0,
-        group_out_cache_loc=None,
-        group_q_len_per_req=1,
+        out_cache_loc=None,
+        q_len_per_req=1,
     )
     layer = SimpleNamespace(
         tp_q_head_num=heads,

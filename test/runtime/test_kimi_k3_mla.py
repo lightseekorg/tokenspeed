@@ -315,7 +315,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     grouped_md = grouped_backend.forward_decode_metadata
 
     # Write-location oracle: page_id * P + offset at position seq_len - 1.
-    assert grouped_md.group_out_cache_loc.tolist() == [
+    assert grouped_md.out_cache_loc.tolist() == [
         4 * page_size + 42 - 1,
         1 * page_size + page_size - 1,
     ]
@@ -344,10 +344,10 @@ def test_decode_grouped_matches_single_table_and_reference(
     single_table_md = single_table_backend.forward_decode_metadata
     width = page_table.shape[1]
     assert torch.equal(
-        grouped_md.block_kv_indices[:, :width],
-        single_table_md.block_kv_indices[:, :width],
+        grouped_md.page_table[:, :width],
+        single_table_md.page_table[:, :width],
     )
-    assert single_table_md.group_out_cache_loc is None
+    assert single_table_md.out_cache_loc is None
     out_single_table = single_table_backend.forward_decode(
         q, None, None, layer, None, pool, bs, save_kv_cache=False
     )
@@ -461,7 +461,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     )
 
     # Write-location oracle: positions [prefix, seq) at page_id*P+offset.
-    locs = grouped_backend.forward_prefill_metadata.group_out_cache_loc
+    locs = grouped_backend.forward_prefill_metadata.out_cache_loc
     expected = []
     for pages, prefix_len, extend_len in zip(logical_rows, prefix, extend):
         for pos in range(prefix_len, prefix_len + extend_len):
@@ -601,7 +601,7 @@ def test_path_never_reads_page_table(backend_factory, gpu_pool) -> None:
             forward_batch=forward_op,
         )
         md = backend.forward_decode_metadata
-        results.append((md.block_kv_indices.clone(), md.group_out_cache_loc.clone()))
+        results.append((md.page_table.clone(), md.out_cache_loc.clone()))
     for block_kv, locs in results[1:]:
         assert torch.equal(block_kv, results[0][0])
         assert torch.equal(locs, results[0][1])

@@ -41,7 +41,7 @@ from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
 # ---------------------------------------------------------------------------
 
 
-def decode_group_out_cache_locs(
+def decode_out_cache_locs(
     page_tables: dict[str, torch.Tensor],
     seq_lens: torch.Tensor,
     granularity_of,
@@ -87,7 +87,7 @@ def decode_group_out_cache_locs(
     return out
 
 
-def extend_group_out_cache_locs(
+def extend_out_cache_locs(
     page_tables: dict[str, torch.Tensor],
     extend_prefix_lens_cpu: torch.Tensor,
     extend_seq_lens_cpu: torch.Tensor,

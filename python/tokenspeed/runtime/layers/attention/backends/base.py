@@ -38,8 +38,8 @@ from tokenspeed.runtime.layers.attention.backends.group_graph_buffers import (
 )
 from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
     check_group_write_locs,
-    decode_group_out_cache_locs,
-    extend_group_out_cache_locs,
+    decode_out_cache_locs,
+    extend_out_cache_locs,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
@@ -162,10 +162,6 @@ class AttentionBackend(ABC):
     # _init_group_graph_buffers runs (grouped backends call it from
     # init_cuda_graph_state).
     group_graph: GroupGraphBuffers | None = None
-    # The shared kv-indices graph buffer some MLA-family backends allocate;
-    # the runner aliases a draft's to the target's when shapes match, so the
-    # name is a cross-backend protocol. None = no such buffer.
-    decode_cuda_graph_kv_indices: torch.Tensor | None = None
     # Metadata attribute names exempt from the capture-time pointer-identity
     # snapshot (graph_ptr_guard): sanctioned per-step-mutable objects the
     # replayed kernels do not read through Python (e.g. FlashMLA's eager tile
@@ -191,10 +187,6 @@ class AttentionBackend(ABC):
         self.spec_num_tokens = config.speculative_num_draft_tokens
         self.cache_pool: CachePool | None = None
         self._speculative_state_backends: list[SpeculativeStateBackend] = []
-        # True when this backend's CUDA-graph block-table (kv_indices) buffer is
-        # aliased to a peer backend's (e.g. a drafter sharing the target's), so
-        # the replay path skips rebuilding it — the peer already populates it.
-        self._page_table_aliased = False
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         """Bind the pool and learn its group geometry in one step.
@@ -380,23 +372,23 @@ class AttentionBackend(ABC):
         """Page size used to view a group's cache tensor in this backend."""
         return self.kernel_page_size
 
-    def _compute_decode_group_out_cache_locs(
+    def _compute_decode_out_cache_locs(
         self, page_tables, seq_lens, num_tokens_per_req=1
     ):
-        """Thin binding of :func:`decode_group_out_cache_locs` to this
+        """Thin binding of :func:`decode_out_cache_locs` to this
         backend's learned granularities."""
-        return decode_group_out_cache_locs(
+        return decode_out_cache_locs(
             page_tables,
             seq_lens,
             self._group_block_granularity,
             num_tokens_per_req,
         )
 
-    def _compute_extend_group_out_cache_locs(
+    def _compute_extend_out_cache_locs(
         self, page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu
     ):
-        """Thin binding of :func:`extend_group_out_cache_locs`."""
-        return extend_group_out_cache_locs(
+        """Thin binding of :func:`extend_out_cache_locs`."""
+        return extend_out_cache_locs(
             page_tables,
             extend_prefix_lens_cpu,
             extend_seq_lens_cpu,

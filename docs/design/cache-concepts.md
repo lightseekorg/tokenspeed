@@ -548,9 +548,9 @@ and never touches packing. No refactor needed here.
   `page_table` concept exists only where paged-KV kernel tables exist, i.e.
   in Python.
 * The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
-  TRT-LLM MLA chunked-prefill metadata's `page_table`,
-  `_page_table_aliased`, inkling's `col_block_table` (conv state), and the
-  base-class group routing docstrings. Third-party kernel keyword names
+  TRT-LLM MLA chunked-prefill metadata's `page_table`, inkling's
+  `col_block_table` (conv state), and the base-class group routing
+  docstrings. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state

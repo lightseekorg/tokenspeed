@@ -65,7 +65,7 @@ class DSABackend(AttentionBackend):
 
     # DSA reads the history (full-attention) family: the dense sub-backend holds
     # the group tables, and the sparse path maps its top-k slots through the same
-    # block_kv_indices. Declared here because the scheduler validates the
+    # page table. Declared here because the scheduler validates the
     # outermost backend, not the delegate.
     cache_consumer_families = frozenset({"history"})
 
@@ -114,29 +114,8 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.decode_cuda_graph_metadata
 
     @property
-    def decode_cuda_graph_kv_indices(self):
-        return self._dense_backend.decode_cuda_graph_kv_indices
-
-    @decode_cuda_graph_kv_indices.setter
-    def decode_cuda_graph_kv_indices(self, value):
-        if not hasattr(self._dense_backend, "decode_cuda_graph_kv_indices"):
-            raise RuntimeError(
-                "DSA dense backend does not expose decode CUDA graph KV indices."
-            )
-        self._dense_backend.decode_cuda_graph_kv_indices = value
-
-    @property
     def trtllm_workspace(self):
         return self._dense_backend.trtllm_workspace
-
-    @property
-    def _page_table_aliased(self):
-        return self._dense_backend._page_table_aliased
-
-    @_page_table_aliased.setter
-    def _page_table_aliased(self, value):
-        if hasattr(self, "_dense_backend"):
-            self._dense_backend._page_table_aliased = value
 
     def register_step_counter(self, step_counter):
         super().register_step_counter(step_counter)

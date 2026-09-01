@@ -146,7 +146,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         md = self.forward_decode_metadata
         fields = {"seq_lens": frontier}
         if md.out_cache_locs is not None:
-            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
+            fields["out_cache_locs"] = self._compute_decode_out_cache_locs(
                 md.page_tables,
                 frontier,
                 self.spec_num_tokens,
@@ -470,22 +470,22 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 "trtllm decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
-        group_page_tables = self._consumed_group_tables(block_tables)
-        group_out_cache_locs = None
-        if group_page_tables:
+        page_tables = self._consumed_group_tables(block_tables)
+        out_cache_locs = None
+        if page_tables:
             # Verify keeps [bs]-row tables; only DFLASH expands rows.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "cache groups are unsupported with DFLASH block decode"
             assert extend_prefix_lens_cpu is not None
             assert extend_seq_lens_cpu is not None
-            group_out_cache_locs = self._compute_extend_group_out_cache_locs(
-                group_page_tables,
+            out_cache_locs = self._compute_extend_out_cache_locs(
+                page_tables,
                 extend_prefix_lens_cpu[:bs],
                 extend_seq_lens_cpu[:bs],
             )
-            self._maybe_check_group_write_locs(group_page_tables, group_out_cache_locs)
-            group_page_tables = self._kernel_page_tables(group_page_tables)
+            self._maybe_check_group_write_locs(page_tables, out_cache_locs)
+            page_tables = self._kernel_page_tables(page_tables)
 
         self._init_extend_metadata(
             bs,
@@ -496,8 +496,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            group_page_tables=group_page_tables,
-            group_out_cache_locs=group_out_cache_locs,
+            page_tables=page_tables,
+            out_cache_locs=out_cache_locs,
         )
 
     def _replicate_block_page_table(
@@ -543,8 +543,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
-        group_page_tables: dict[str, torch.Tensor] | None = None,
-        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        page_tables: dict[str, torch.Tensor] | None = None,
+        out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Prefill-slot metadata for multi-token decode (uniform q_len per
         request). Routes through the decode kernel via q_len_per_req; the
@@ -568,11 +568,11 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             ),
             page_table=(
                 None
-                if group_page_tables
+                if page_tables
                 else self._build_page_table(bs, page_table, self.page_table_buf)
             ),
-            page_tables=group_page_tables,
-            out_cache_locs=group_out_cache_locs,
+            page_tables=page_tables,
+            out_cache_locs=out_cache_locs,
         )
 
     def _init_extend_metadata(
@@ -585,8 +585,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu=None,
         extend_seq_lens_cpu=None,
-        group_page_tables: dict[str, torch.Tensor] | None = None,
-        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        page_tables: dict[str, torch.Tensor] | None = None,
+        out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Populate prefill slot for regular EXTEND (ragged query)."""
         assert (
@@ -603,7 +603,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         # page_table would be dead work.
         page_table = (
             None
-            if group_page_tables
+            if page_tables
             else self._build_page_table(bs, page_table, self.page_table_buf)
         )
 
@@ -638,8 +638,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table,
-            page_tables=group_page_tables,
-            out_cache_locs=group_out_cache_locs,
+            page_tables=page_tables,
+            out_cache_locs=out_cache_locs,
         )
 
     # ------------------------------------------------------------------
