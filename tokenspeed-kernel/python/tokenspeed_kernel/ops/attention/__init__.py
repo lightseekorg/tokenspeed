@@ -1656,6 +1656,8 @@ def mla_decode_with_kvcache(
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -1693,6 +1695,12 @@ def mla_decode_with_kvcache(
         qk_rope_head_dim: RoPE q/k head dim.
         softmax_scale: Scale applied to QK logits before softmax.
         logit_cap: Optional soft cap applied to attention logits.
+        window_left: Number of historical positions visible to the first query
+            in a proposal block, or -1 for full attention. A non-causal row
+            also sees the whole proposal block. DFlash2 passes the model's
+            ``sliding_window - 1`` value here.
+        noncausal_block_size: Number of flattened proposal rows per request.
+            Use one for ordinary causal decode.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
             kv_lora_rank]. When ``value_weight`` is provided, this is required
@@ -1712,6 +1720,17 @@ def mla_decode_with_kvcache(
     """
     if gate is not None and value_weight is None:
         raise ValueError("gate requires value_weight")
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if noncausal_block_size <= 0:
+        raise ValueError(
+            f"noncausal_block_size must be positive, got {noncausal_block_size}"
+        )
+    if 0 <= window_left < noncausal_block_size - 1:
+        raise ValueError(
+            "window_left must cover the complete non-causal block; got "
+            f"window_left={window_left}, block_size={noncausal_block_size}"
+        )
 
     projected_value = value_weight is not None
     if projected_value:
@@ -1744,6 +1763,43 @@ def mla_decode_with_kvcache(
         if return_lse:
             raise ValueError("projected MLA decode does not support return_lse")
 
+    # The portable Triton MLA kernel is currently the exact implementation of
+    # DFlash2's non-causal sliding mask. Keep full-attention dispatch unchanged;
+    # optimized projected-value kernels can add this trait independently.
+    if window_left >= 0:
+        if override not in (None, "triton_mla_decode_with_kvcache"):
+            raise ValueError(
+                "sliding MLA decode currently requires "
+                "triton_mla_decode_with_kvcache"
+            )
+        if solution not in (None, "triton"):
+            raise ValueError("sliding MLA decode currently requires solution='triton'")
+        override = "triton_mla_decode_with_kvcache"
+        solution = "triton"
+        if projected_value:
+            attention = mla_decode_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=logit_cap,
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
+                override=override,
+                solution=solution,
+            )
+            return mla_project_value(
+                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                value_weight,
+                gate=gate,
+                out=out,
+            )
+
     traits = {
         "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
@@ -1755,6 +1811,7 @@ def mla_decode_with_kvcache(
         "qk_rope_head_dim": qk_rope_head_dim,
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     if projected_value:
         traits.update(
@@ -1829,6 +1886,8 @@ def mla_decode_with_kvcache(
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
         "max_seqlen_k": max_seqlen_k,
+        "window_left": window_left,
+        "noncausal_block_size": noncausal_block_size,
     }
     if projected_value:
         shape_params["value_head_dim"] = value_weight.shape[2]
@@ -1863,7 +1922,7 @@ def mla_decode_with_kvcache(
                 out=out,
                 logit_cap=logit_cap,
             )
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             kv_cache=kv_cache,
             page_table=page_table,
@@ -1877,6 +1936,12 @@ def mla_decode_with_kvcache(
             return_lse=return_lse,
             out=out,
         )
+        if window_left >= 0:
+            kernel_kwargs.update(
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
+            )
+        return kernel(**kernel_kwargs)
 
 
 # ===-----------------------------------------------------------------------===#

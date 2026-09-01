@@ -66,6 +66,8 @@ def _mla_decode_kernel(
     BLOCK_ROPE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_LSE: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    NONCAUSAL_BLOCK_SIZE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_q = tl.program_id(1)
@@ -85,15 +87,30 @@ def _mla_decode_kernel(
     )
 
     cache_len = tl.load(cache_seqlens + cur_batch)
+    if WINDOW_LEFT >= 0:
+        # DFlash2 flattens each non-causal proposal block into one decode row
+        # per position. Every row sees the whole proposal block, while its
+        # historical context follows the reference mask
+        #     query_position - key_position <= window_left.
+        block_position = cur_batch % NONCAUSAL_BLOCK_SIZE
+        context_len = cache_len - NONCAUSAL_BLOCK_SIZE
+        window_start = tl.maximum(
+            0,
+            context_len - WINDOW_LEFT + block_position,
+        )
+        loop_start = (window_start // BLOCK_N) * BLOCK_N
+    else:
+        window_start = 0
+        loop_start = 0
     offs_n = tl.arange(0, BLOCK_N)
     acc = tl.zeros([BLOCK_R], dtype=tl.float32)
     e_sum = 0.0
     e_max = -float("inf")
 
-    for start_n in tl.range(0, cache_len, BLOCK_N, num_stages=2):
+    for start_n in tl.range(loop_start, cache_len, BLOCK_N, num_stages=2):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         token_offsets = start_n + offs_n
-        mask_n = token_offsets < cache_len
+        mask_n = (token_offsets >= window_start) & (token_offsets < cache_len)
         page_indices = token_offsets // PAGE_SIZE
         page_offsets = token_offsets - page_indices * PAGE_SIZE
         physical_pages = tl.load(
@@ -176,6 +193,8 @@ def mla_decode_fwd(
     *,
     logit_cap: float = 0.0,
     lse: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
 ) -> None:
     if q.dim() != 4:
         raise ValueError(
@@ -197,6 +216,22 @@ def mla_decode_fwd(
         raise ValueError("q and out must have contiguous last dimension")
     if lse is not None and lse.shape != q.shape[:-1]:
         raise ValueError(f"lse shape must be {q.shape[:-1]}, got {tuple(lse.shape)}")
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if noncausal_block_size <= 0:
+        raise ValueError(
+            f"noncausal_block_size must be positive, got {noncausal_block_size}"
+        )
+    if 0 <= window_left < noncausal_block_size - 1:
+        raise ValueError(
+            "window_left must cover the complete non-causal block; got "
+            f"window_left={window_left}, block_size={noncausal_block_size}"
+        )
+    if window_left >= 0 and q.shape[0] % noncausal_block_size:
+        raise ValueError(
+            "sliding MLA decode rows must contain complete non-causal blocks: "
+            f"batch={q.shape[0]}, block_size={noncausal_block_size}"
+        )
 
     kv_cache = _normalize_kv_cache(kv_cache)
     if kv_cache.shape[2] != 1:
@@ -245,6 +280,8 @@ def mla_decode_fwd(
         BLOCK_ROPE=block_rope,
         BLOCK_N=block_n,
         HAS_LSE=lse is not None,
+        WINDOW_LEFT=window_left,
+        NONCAUSAL_BLOCK_SIZE=noncausal_block_size,
         num_warps=8,
         num_stages=2,
     )
@@ -260,6 +297,7 @@ def mla_decode_fwd(
     priority=Priority.PORTABLE,
     traits={
         "q_len": frozenset({1}),
+        "sliding_window": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
     },
@@ -279,6 +317,8 @@ def triton_mla_decode_with_kvcache(
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
@@ -304,6 +344,8 @@ def triton_mla_decode_with_kvcache(
         softmax_scale,
         logit_cap=logit_cap,
         lse=lse,
+        window_left=window_left,
+        noncausal_block_size=noncausal_block_size,
     )
     if return_lse:
         return out, lse

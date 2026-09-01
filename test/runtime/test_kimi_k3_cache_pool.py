@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import os
+import sys
 from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
 
 import pytest
 import torch
 from cache_pool_test_utils import make_arena
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -14,6 +21,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
+
+
+def test_kimi_k3_draft_mla_cache_retains_full_history() -> None:
+    """DFlash2 SWA changes compute visibility, never draft KV retention."""
+    num_draft_layers = 6
+    recipe = kimi_recipe(draft_layers=num_draft_layers)
+
+    assert recipe.group_ids[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    assert (
+        recipe.layer_types[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
