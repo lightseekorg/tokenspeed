@@ -92,6 +92,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def should_run_amd_gpu_cleanup(runner: str) -> bool:
+    return is_amd_runner(runner) and runner != "amd-mi450-sim"
+
+
 def is_nvidia_arm_runner(runner: str) -> bool:
     return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
 
@@ -829,19 +833,20 @@ def setup_runner(
         )
 
     if is_amd_runner(runner):
-        # Best-effort: kill any GPU-holding processes left over by a
-        # previous pod scheduled on the same node. Cluster admins flagged
-        # a known race where the device plugin releases a GPU back to the
-        # pool before the previous pod's processes have actually
-        # relinquished VRAM, so we can land in a pod with ~0 GiB free
-        # VRAM. Cleanup script never fails the task.
-        shell_run(
-            "bash test/ci_system/cleanup_amd_gpu_state.sh",
-            env=local_env,
-            cwd=cwd,
-            dry_run=dry_run,
-            check=False,
-        )
+        if should_run_amd_gpu_cleanup(runner):
+            # Best-effort: kill any GPU-holding processes left over by a
+            # previous pod scheduled on the same node. Cluster admins flagged
+            # a known race where the device plugin releases a GPU back to the
+            # pool before the previous pod's processes have actually
+            # relinquished VRAM, so we can land in a pod with ~0 GiB free
+            # VRAM. Cleanup script never fails the task.
+            shell_run(
+                "bash test/ci_system/cleanup_amd_gpu_state.sh",
+                env=local_env,
+                cwd=cwd,
+                dry_run=dry_run,
+                check=False,
+            )
         return local_env, pgm
     if dry_run:
         return local_env, pgm
