@@ -594,56 +594,63 @@ class TestPrefillTokenBuckets(unittest.TestCase):
 class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
     """Which server args switch the prefill graph off entirely."""
 
-    @staticmethod
-    def _args(**overrides):
+    CONTEXT_LEN = 65536
+
+    @classmethod
+    def _args(cls, **overrides):
         base = dict(
             prefill_graph_max_tokens=None,
             chunked_prefill_size=8192,
             max_total_tokens=None,
             all2all_backend="none",
+            max_num_seqs=64,
+            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
         )
         base.update(overrides)
         return SimpleNamespace(**base)
 
+    @classmethod
+    def _resolve(cls, **overrides):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        context_len = overrides.pop("context_len", cls.CONTEXT_LEN)
+        return _resolve_prefill_graph_max_tokens(cls._args(**overrides), context_len)
+
     def test_default_ceiling(self):
         from tokenspeed.runtime.execution.model_executor import (
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
-            _resolve_prefill_graph_max_tokens,
         )
 
         # The literal, not just the constant: the ceiling must cover a chunk.
         self.assertEqual(PREFILL_GRAPH_DEFAULT_MAX_TOKENS, 8192)
-        self.assertEqual(_resolve_prefill_graph_max_tokens(self._args()), 8192)
+        self.assertEqual(self._resolve(), 8192)
 
     def test_a_smaller_chunk_still_clamps_the_ceiling(self):
-        from tokenspeed.runtime.execution.model_executor import (
-            _resolve_prefill_graph_max_tokens,
-        )
+        self.assertEqual(self._resolve(chunked_prefill_size=2048), 2048)
+        self.assertEqual(self._resolve(max_total_tokens=4096), 4096)
 
+    def test_the_request_buffers_bound_the_ceiling(self):
+        # make_dummy_batch splits a bucket across ceil(bucket / context_len)
+        # dummy requests, but the request-indexed buffers hold max_num_seqs//dp.
+        self.assertEqual(self._resolve(context_len=4096, max_num_seqs=1), 4096)
+        self.assertEqual(self._resolve(context_len=4096, max_num_seqs=2), 8192)
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args(chunked_prefill_size=2048)),
-            2048,
-        )
-        self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args(max_total_tokens=4096)),
+            self._resolve(
+                context_len=4096,
+                max_num_seqs=2,
+                mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)),
+            ),
             4096,
         )
 
     def test_all_to_all_backend_disables_the_graph(self):
-        from tokenspeed.runtime.execution.model_executor import (
-            _resolve_prefill_graph_max_tokens,
-        )
-
         # DeepEP's normal dispatch reports per-expert receive counts to the host,
         # and a host sync cannot be captured -- even when asked for explicitly.
+        self.assertEqual(self._resolve(all2all_backend="deepep"), 0)
         self.assertEqual(
-            _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
-        )
-        self.assertEqual(
-            _resolve_prefill_graph_max_tokens(
-                self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
-            ),
-            0,
+            self._resolve(all2all_backend="deepep", prefill_graph_max_tokens=2048), 0
         )
 
 
