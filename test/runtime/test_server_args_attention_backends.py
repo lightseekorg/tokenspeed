@@ -19,6 +19,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -181,6 +182,52 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
 
         self.assertEqual(MLAAttnBackend(config, spec).kernel_solution, "gluon")
+
+    def test_amd_dsa_backend_uses_mla_for_dense_attention(self):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+        from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+        spec = DSAConfig(
+            backend_name="hybrid_linear_attn",
+            num_attention_heads=64,
+            num_kv_heads=64,
+            head_dim=256,
+            attn_tp_size=4,
+            kv_lora_rank=512,
+            qk_nope_head_dim=256,
+            qk_rope_head_dim=0,
+            v_head_dim=256,
+            kv_cache_dim=512,
+            scaling=256**-0.5,
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=32,
+        )
+        config = AttnConfig(
+            device="cpu",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            prefix_granularity=64,
+            context_len=4096,
+            max_bs=2,
+            max_graph_bs=2,
+            components=(spec,),
+        )
+        platform = SimpleNamespace(is_nvidia=False, is_amd=True)
+
+        with mock.patch.object(dsa_backend, "current_platform", return_value=platform):
+            backend = registry._create_attn_backend_with_name(
+                "dsa", AttentionArch.DSA, config
+            )
+
+        self.assertIsInstance(backend._dense_backend, MLAAttnBackend)
+        self.assertIsNone(backend._dense_backend.kernel_solution)
+        self.assertEqual(spec.backend_name, "hybrid_linear_attn")
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

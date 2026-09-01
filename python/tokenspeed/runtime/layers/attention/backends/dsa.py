@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from tokenspeed_kernel.ops.attention import (
@@ -57,7 +57,7 @@ def _make_dense_backend(
     if platform.is_nvidia:
         return TRTLLMMLABackend(config, spec)
     if platform.is_amd:
-        return MLAAttnBackend(config, spec)
+        return MLAAttnBackend(config, replace(spec, backend_name="mla"))
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 
