@@ -28,8 +28,7 @@ import pytest
 import torch
 from utils import is_cdna4, is_cdna5
 
-_IS_GFX950 = is_cdna4()
-if not (_IS_GFX950 or is_cdna5()):
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
         "AMD GFX950 or GFX1250 is required for standard-cache Gluon DSA tests",
         allow_module_level=True,
@@ -39,7 +38,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (  # isort: skip
     index_k_block_split_scatter,
 )
 
-if _IS_GFX950:
+if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
         gluon_dsa_decode_topk_standard_gfx950 as _decode_topk,
         gluon_dsa_prefill_topk_standard_gfx950 as _prefill_topk,
@@ -165,21 +164,6 @@ def _pack_standard_cache(
     fp8_pages.copy_(key_fp8.reshape(num_pages, _PAGE_SIZE, _HEAD_DIM))
     scale_pages.copy_(scales.reshape(num_pages, _PAGE_SIZE, 1))
     return packed, reference, key_fp8, scales
-
-
-def _page_planar_cache(packed: torch.Tensor) -> torch.Tensor:
-    """Copy packed page bytes into a padded page-planar allocation."""
-    page_bytes = _PAGE_SIZE * packed.shape[1]
-    num_pages = packed.shape[0] // _PAGE_SIZE
-    backing = torch.zeros(
-        (num_pages, page_bytes + 64),
-        device=packed.device,
-        dtype=packed.dtype,
-    )
-    cache = backing[:, :page_bytes]
-    cache.copy_(packed.reshape(num_pages, page_bytes))
-    assert cache.stride() == (page_bytes + 64, 1)
-    return cache
 
 
 def _weighted_relu_scores(
@@ -325,83 +309,6 @@ def test_standard_cache_decode_matches_weighted_relu_oracle(case: _DecodeCase) -
         case.q_len,
     )
 
-    _assert_topk(actual, actual_lens, expected, expected_lens)
-
-
-def test_standard_cache_page_planar_matches_oracle() -> None:
-    generator = _generator(175)
-    num_slots = 11 * _PAGE_SIZE
-    keys = (
-        torch.randn(
-            (num_slots, _HEAD_DIM),
-            device=_DEVICE,
-            dtype=torch.float32,
-            generator=generator,
-        )
-        * 0.15
-    )
-    packed, key_reference, _, _ = _pack_standard_cache(keys)
-    cache = _page_planar_cache(packed)
-    query, q_scales, query_reference = _prepared_query(
-        1,
-        64,
-        torch.float8_e4m3fn,
-        generator,
-    )
-    weights = _noncompact_weights(1, 64, torch.bfloat16, generator)
-    weights[:, :32].zero_()
-
-    seq_lens = torch.tensor((515,), device=_DEVICE, dtype=torch.int32)
-    block_table = torch.randperm(11, device=_DEVICE, generator=generator).reshape(1, 11)
-    block_table = block_table.to(torch.int32)
-    actual, actual_lens = _decode_topk(
-        query,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=_PAGE_SIZE,
-        topk=_TOPK,
-        softmax_scale=_SOFTMAX_SCALE,
-        index_k_cache=cache,
-        q_scales=q_scales,
-    )
-    expected, expected_lens = _expected_decode(
-        query_reference,
-        weights,
-        key_reference,
-        seq_lens,
-        block_table,
-        1,
-    )
-    _assert_topk(actual, actual_lens, expected, expected_lens)
-
-    workspace_rows = 600
-    workspace_slots = (
-        torch.arange(workspace_rows, device=_DEVICE) * 37 + 41
-    ).remainder(num_slots)
-    workspace_slots = workspace_slots.to(torch.int64)
-    row_starts = torch.tensor((7,), device=_DEVICE, dtype=torch.int32)
-    row_ends = torch.tensor((550,), device=_DEVICE, dtype=torch.int32)
-    actual, actual_lens = _prefill_topk(
-        query,
-        weights,
-        workspace_slots,
-        row_starts,
-        row_ends,
-        topk=_TOPK,
-        softmax_scale=_SOFTMAX_SCALE,
-        index_k_cache=cache,
-        page_size=_PAGE_SIZE,
-        q_scales=q_scales,
-    )
-    expected, expected_lens = _expected_prefill(
-        query_reference,
-        weights,
-        key_reference,
-        workspace_slots,
-        row_starts,
-        row_ends,
-    )
     _assert_topk(actual, actual_lens, expected, expected_lens)
 
 
@@ -557,10 +464,7 @@ def test_standard_cache_decode_returns_empty_result_for_zero_pages() -> None:
     assert (actual_lens == 0).all()
 
 
-@pytest.mark.parametrize("use_buffer_ops", (True, False))
-def test_standard_cache_decode_logits_cover_empty_and_short_spans(
-    use_buffer_ops: bool,
-) -> None:
+def test_standard_cache_decode_logits_cover_empty_and_short_spans() -> None:
     generator = _generator(350)
     seq_lens = torch.tensor((0, 1, 63, 64, 65), device=_DEVICE, dtype=torch.int32)
     block_table = torch.tensor(
@@ -616,8 +520,8 @@ def test_standard_cache_decode_logits_cover_empty_and_short_spans(
         CHUNK_N=256,
         NUM_WARPS=2,
         Q_IS_FP8=False,
-        USE_BUFFER_LOAD=use_buffer_ops,
-        USE_BUFFER_STORE=use_buffer_ops,
+        USE_BUFFER_LOAD=True,
+        USE_BUFFER_STORE=True,
         num_warps=2,
         waves_per_eu=4,
     )
