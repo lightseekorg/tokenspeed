@@ -92,10 +92,6 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
-def should_run_amd_gpu_cleanup(runner: str) -> bool:
-    return is_amd_runner(runner) and runner != "amd-mi450-sim"
-
-
 def is_nvidia_arm_runner(runner: str) -> bool:
     return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
 
@@ -833,7 +829,7 @@ def setup_runner(
         )
 
     if is_amd_runner(runner):
-        if should_run_amd_gpu_cleanup(runner):
+        if runner != "amd-mi450-sim":
             # Best-effort: kill any GPU-holding processes left over by a
             # previous pod scheduled on the same node. Cluster admins flagged
             # a known race where the device plugin releases a GPU back to the

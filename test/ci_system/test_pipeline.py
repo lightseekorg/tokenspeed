@@ -31,7 +31,6 @@ from pipeline import (
     resolve_score_threshold_for_runner,
     runner_matches_group,
     setup_runner,
-    should_run_amd_gpu_cleanup,
     should_run_nvidia_gpu_cleanup,
     validate_task,
     wrap_command_with_log,
@@ -168,7 +167,7 @@ def test_nvidia_runner_groups_split_arm_from_x86():
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-x86")
 
 
-def test_gpu_cleanup_runner_prefixes():
+def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
     assert is_gb200_runner("slurm-gb200-4node-4gpu")
@@ -184,11 +183,6 @@ def test_gpu_cleanup_runner_prefixes():
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
-
-    assert should_run_amd_gpu_cleanup("amd-mi35x-2gpu-test")
-    assert should_run_amd_gpu_cleanup("amd-mi355-1gpu-bench")
-    assert not should_run_amd_gpu_cleanup("amd-mi450-sim")
-    assert not should_run_amd_gpu_cleanup("b200-4gpu")
 
 
 def test_b200v2_setup_forces_all_apt_invocations_to_ipv4(tmp_path, capsys):
