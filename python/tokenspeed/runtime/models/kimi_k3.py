@@ -1873,10 +1873,6 @@ class KimiLinearMoE(nn.Module):
         if num_tokens == 0:
             return prefix_sum
 
-        # Router runs uncontended on main (3us; on aux it starves to 14us
-        # under concurrent GEMMs). When the selected experts need precomputed
-        # TopK runs on the fork branch beside down_proj; routing bypasses it.
-        router_logits = self.gate(hidden_states)
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
         plan = self.comm.plan(
@@ -1903,6 +1899,24 @@ class KimiLinearMoE(nn.Module):
         else:
             routed_out_buf = shared_out_buf = None
         self.experts._situ_output_buffer = routed_out_buf
+
+        # The router, routed latent and shared gate/up read the same activation
+        # and reduce over the same width, so one GEMM replaces three. Returns
+        # None when the packed weight is unavailable or the shapes are outside
+        # the fused kernel, which leaves the separate projections below.
+        fused_inputs = self._latent_input_projections(
+            hidden_states, shared_out=shared_out_buf
+        )
+        if fused_inputs is not None:
+            router_logits, routed_in, shared_partial = fused_inputs
+        else:
+            # Router runs uncontended on main (3us; on aux it starves to 14us
+            # under concurrent GEMMs). When the selected experts need
+            # precomputed TopK runs on the fork branch beside down_proj;
+            # routing bypasses it.
+            router_logits = self.gate(hidden_states)
+            routed_in = shared_partial = None
+
         prepared_shared_shard = None
         # Enable the fork for the whole graph phase, but only overlap during
         # capture. The pre-capture warmup runs with capture mode off, so gating
@@ -1927,15 +1941,17 @@ class KimiLinearMoE(nn.Module):
                 )
                 if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
-                shared_partial = self.shared_experts(
-                    hidden_states,
-                    down_out=shared_out_buf,
-                )
+                if shared_partial is None:
+                    shared_partial = self.shared_experts(
+                        hidden_states,
+                        down_out=shared_out_buf,
+                    )
                 if plan.split_shared_rs and fork._active:
                     prepared_shared_shard = self.comm.reduce_scatter_shared(
                         shared_partial
                     )
-            routed_in, _ = self.routed_expert_down_proj(hidden_states)
+            if routed_in is None:
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
