@@ -18,7 +18,7 @@ outputs/<sweep_ts>/<config>/parallel_<P>_number_<N>/  # per-run evalscope artifa
 ## Run a sweep
 
 ```bash
-cd test/agentic_benchmark/tokenspeed
+cd test/agentic_benchmark/kimi_k2.5/tokenspeed
 ./agentic_bench.sh
 ```
 
