@@ -1622,12 +1622,18 @@ def _attention_dsa_prefill_topk_bf16_weights() -> object:
 def _attention_dsa_decode_topk_standard(
     index_heads: int,
     q_dtype: torch.dtype = torch.bfloat16,
+    index_k_layout: str = "packed",
 ) -> object:
     q = torch.empty((2, index_heads, 128), dtype=q_dtype)
     q_scales = (
         torch.ones((2, index_heads), dtype=torch.float32)
         if q_dtype == torch.float8_e4m3fn
         else None
+    )
+    index_k_cache = (
+        torch.zeros((128, 132), dtype=torch.uint8)
+        if index_k_layout == "packed"
+        else torch.zeros((2, 64 * 132), dtype=torch.uint8)
     )
     return tokenspeed_kernel.dsa_decode_topk(
         q,
@@ -1637,7 +1643,7 @@ def _attention_dsa_decode_topk_standard(
         page_size=64,
         topk=512,
         softmax_scale=1.0,
-        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        index_k_cache=index_k_cache,
         q_scales=q_scales,
     )
 
@@ -1645,12 +1651,18 @@ def _attention_dsa_decode_topk_standard(
 def _attention_dsa_prefill_topk_standard(
     index_heads: int,
     q_dtype: torch.dtype = torch.bfloat16,
+    index_k_layout: str = "packed",
 ) -> object:
     q = torch.empty((2, index_heads, 128), dtype=q_dtype)
     q_scales = (
         torch.ones((2, index_heads), dtype=torch.float32)
         if q_dtype == torch.float8_e4m3fn
         else None
+    )
+    index_k_cache = (
+        torch.zeros((128, 132), dtype=torch.uint8)
+        if index_k_layout == "packed"
+        else torch.zeros((2, 64 * 132), dtype=torch.uint8)
     )
     return tokenspeed_kernel.dsa_prefill_topk(
         q,
@@ -1660,7 +1672,7 @@ def _attention_dsa_prefill_topk_standard(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=512,
         softmax_scale=1.0,
-        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
     )
@@ -3520,8 +3532,10 @@ _CASES = [
             "attention",
             operation,
             expected,
-            lambda heads=heads, dtype=dtype, invoke=invoke: invoke(heads, dtype),
-            id_suffix=f"h{heads}-{str(dtype).removeprefix('torch.')}",
+            lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(
+                heads, dtype, layout
+            ),
+            id_suffix=(f"h{heads}-{str(dtype).removeprefix('torch.')}-{layout}"),
         )
         for operation, expected, invoke in (
             (
@@ -3537,6 +3551,7 @@ _CASES = [
         )
         for heads in (32, 64)
         for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        for layout in ("packed", "page_planar")
     ),
     _case(
         _is_cdna4,
@@ -3649,6 +3664,34 @@ _CASES = [
         "dsa_prefill_fp8_packed_rank512",
         "triton_dsa_prefill",
         _attention_dsa_prefill_fp8_packed_rank512,
+    ),
+    *(
+        _case(
+            _is_cdna5,
+            "cdna5",
+            "attention",
+            operation,
+            expected,
+            lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(
+                heads, dtype, layout
+            ),
+            id_suffix=(f"h{heads}-{str(dtype).removeprefix('torch.')}-{layout}"),
+        )
+        for operation, expected, invoke in (
+            (
+                "dsa_decode_topk",
+                "gluon_dsa_decode_topk_standard_gfx1250",
+                _attention_dsa_decode_topk_standard,
+            ),
+            (
+                "dsa_prefill_topk",
+                "gluon_dsa_prefill_topk_standard_gfx1250",
+                _attention_dsa_prefill_topk_standard,
+            ),
+        )
+        for heads in (32, 64)
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        for layout in ("packed", "page_planar")
     ),
     _case(
         _is_cdna5,

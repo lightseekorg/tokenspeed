@@ -1132,7 +1132,7 @@ def _run_dense(
             num_kv_splits,
             kv_lora_rank,
             OUTPUT_WITHIN_2GB=_output_within_2gb(out),
-            num_warps=4,
+            num_warps=8,
         )
     return out
 
@@ -1352,7 +1352,7 @@ def gluon_dsa_decode_gfx1250(
             softmax_scale=scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
-            block_h=16,
+            block_h=8,
             max_seqlen_k=max_seqlen_k,
             split_kv=True,
             out=out_view,
@@ -1407,8 +1407,8 @@ def gluon_dsa_prefill_gfx1250(
             qk_rope_head_dim=qk_rope_head_dim,
         )
     elif kv_cache is not None:
-        # Prefill exposes more token-level parallelism and uses a wider head
-        # tile than decode to amortize the selected-row gather.
+        # GLM-5-class prefill uses eight attention heads. A 16-head WMMA tile
+        # avoids the extra inactive rows of the wider decode-independent tile.
         result = _run_dense(
             q,
             kv_cache,
@@ -1417,7 +1417,7 @@ def gluon_dsa_prefill_gfx1250(
             softmax_scale=scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
-            block_h=32,
+            block_h=16,
             max_seqlen_k=max_seqlen_k,
             split_kv=False,
         )
