@@ -37,6 +37,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.deepseek_v4.draft_rounds import (
+    DeepseekV4DraftRounds,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4.graph_buffers import (
     DeepseekV4GraphBuffers,
 )
@@ -294,10 +297,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             getattr(config, "speculative_num_draft_tokens", 0) or 0
         )
-        self._draft_decode_step = 0
-        self._draft_decode_base_seq_lens: torch.Tensor | None = None
-        self._draft_decode_metadata: DeepseekV4ForwardMetadata | None = None
-        self._cuda_graph_draft_decode_metadata = {}
+        # Plain-step draft metadata views; built by init_cuda_graph_state
+        # for draft instances only (see DeepseekV4DraftRounds).
+        self.draft_rounds: DeepseekV4DraftRounds | None = None
 
     def record_layer_cache_ready(
         self,
@@ -713,116 +715,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             return None
         return None
 
-    def _draft_decode_is_valid_token(
-        self,
-        prefill_metadata: DeepseekV4ForwardMetadata,
-    ) -> torch.Tensor | None:
-        if prefill_metadata.is_valid_token is None:
-            return None
-        bs = prefill_metadata.req_pool_indices.numel()
-        return prefill_metadata.is_valid_token[
-            prefill_metadata.query_start_loc[:bs].to(torch.int64)
-        ]
-
-    def _is_cuda_graph_prefill_metadata(
-        self,
-        metadata: DeepseekV4ForwardMetadata,
-    ) -> bool:
-        return self.graph is not None and self.graph.owns_view(metadata)
-
-    def _prepare_draft_decode_metadata(
+    def _prepare_draft_round(
         self,
         prefill_metadata: DeepseekV4ForwardMetadata,
         base_seq_lens: torch.Tensor,
     ) -> None:
+        """Bind the draft's plain-step views for this round and run the
+        indexer/slot-mapping refresh hooks over them (DraftRounds owns the
+        copy-only binding; the kernel-facing refresh trio stays here)."""
         self.forward_prefill_metadata = prefill_metadata
-        self._draft_decode_step = 0
-        self._draft_decode_base_seq_lens = base_seq_lens
-
-        bs = prefill_metadata.req_pool_indices.numel()
-        device = prefill_metadata.req_pool_indices.device
-        is_cuda_graph_metadata = self._is_cuda_graph_prefill_metadata(prefill_metadata)
-        metadata = (
-            self._cuda_graph_draft_decode_metadata.get(bs)
-            if is_cuda_graph_metadata
-            else self._draft_decode_metadata
-        )
-        if (
-            not is_cuda_graph_metadata
-            and metadata is not None
-            # Identity scan, not `in`: dataclass __eq__ would compare tensors.
-            and any(
-                metadata is cached
-                for cached in self._cuda_graph_draft_decode_metadata.values()
-            )
-        ):
-            # The eager/extend-round prep must NEVER mutate a graph-cached
-            # object: the recorded draft kernels hold its capture-time tensor
-            # addresses, and the reuse arm below rebinds req_pool_indices and
-            # cache to this round's dynamic tensors. A capture stores its
-            # object in BOTH _cuda_graph_draft_decode_metadata and
-            # _draft_decode_metadata, so the eager path may find the graph
-            # object here — allocate its own instead (first mixed round after
-            # capture broke the replayed gather on exactly this).
-            metadata = None
-        is_valid_token = self._draft_decode_is_valid_token(prefill_metadata)
-        if (
-            metadata is None
-            or metadata.req_pool_indices.numel() != bs
-            or metadata.seq_lens.numel() != bs
-            or metadata.query_lens.numel() != bs
-            or metadata.token_to_req_indices.numel() != bs
-            or metadata.req_pool_indices.device != device
-        ):
-            query_lens = torch.ones(bs, dtype=torch.int32, device=device)
-            token_to_req = torch.arange(bs, dtype=torch.int32, device=device)
-            decode_seq_lens = torch.empty_like(base_seq_lens)
-            decode_seq_lens.copy_(base_seq_lens)
-            decode_is_valid_token = None
-            if is_valid_token is not None:
-                decode_is_valid_token = torch.empty_like(is_valid_token)
-                decode_is_valid_token.copy_(is_valid_token)
-            metadata = DeepseekV4ForwardMetadata(
-                req_pool_indices=prefill_metadata.req_pool_indices,
-                seq_lens=decode_seq_lens,
-                query_lens=query_lens,
-                query_start_loc=torch.nn.functional.pad(
-                    torch.cumsum(
-                        query_lens.to(torch.int32),
-                        dim=0,
-                        dtype=torch.int32,
-                    ),
-                    (1, 0),
-                ),
-                token_to_req_indices=token_to_req,
-                cache=prefill_metadata.cache,
-                is_valid_token=decode_is_valid_token,
-                forward_mode=ForwardMode.DECODE,
-            )
-            if is_cuda_graph_metadata:
-                self._cuda_graph_draft_decode_metadata[bs] = metadata
-            self._draft_decode_metadata = metadata
-            return
-
-        metadata.req_pool_indices = prefill_metadata.req_pool_indices
-        metadata.cache = prefill_metadata.cache
-        metadata.seq_lens.copy_(base_seq_lens)
-        if is_valid_token is None:
-            metadata.is_valid_token = None
-        else:
-            if (
-                metadata.is_valid_token is None
-                or metadata.is_valid_token.shape != is_valid_token.shape
-                or metadata.is_valid_token.device != is_valid_token.device
-            ):
-                metadata.is_valid_token = torch.empty_like(is_valid_token)
-            metadata.is_valid_token.copy_(is_valid_token)
-        metadata.num_prefill_reqs = 0
-        metadata.num_prefill_tokens = 0
-        metadata.forward_mode = ForwardMode.DECODE
-        # Reuse path: cached decode-indexer plans still describe the previous
-        # prefill. Refresh after updating seq_lens so draft step 0 does not
-        # reuse stale context_lens / page_table tensors.
+        assert self.draft_rounds is not None
+        metadata = self.draft_rounds.prepare(prefill_metadata, base_seq_lens)
         metadata.cache.refresh_decode_compressed_slot_mappings(
             token_to_req_indices=metadata.token_to_req_indices,
             query_start_loc=metadata.query_start_loc,
@@ -834,7 +737,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        self._draft_decode_metadata = metadata
 
     def _select_decode_metadata(
         self,
@@ -2075,6 +1977,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             device=self.device,
         )
+        self.draft_rounds = DeepseekV4DraftRounds(self.graph) if self.is_draft else None
         specs, _ = self._configure_cache_group_contract(
             cache_group_specs,
             cache_group_page_counts,
@@ -2200,7 +2103,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.seq_lens_cpu = None
         metadata.query_lens_cpu = None
         if is_packed_decode and self.is_draft:
-            self._prepare_draft_decode_metadata(
+            self._prepare_draft_round(
                 metadata,
                 self.graph.seq_lens[:bs],
             )
@@ -2384,7 +2287,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
         if is_packed_decode and self.is_draft:
-            self._prepare_draft_decode_metadata(
+            self._prepare_draft_round(
                 metadata,
                 self.graph.seq_lens[:bs],
             )
@@ -2400,7 +2303,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             # from the prefill state the init just published. Draft only — a
             # non-spec target's post-extend decode would otherwise build a
             # draft-decode object nothing ever reads.
-            self._prepare_draft_decode_metadata(
+            self._prepare_draft_round(
                 self.forward_prefill_metadata,
                 seq_lens[:bs].clone(),
             )
@@ -2438,27 +2341,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             # prefill-slot fallback (DECODE-mode gated), exactly like the
             # model-side resolver.
             self.forward_prefill_metadata = metadata
-            self.forward_decode_metadata = self._draft_decode_metadata
-            self.forward_metadata = self._draft_decode_metadata
+            self.forward_decode_metadata = self.draft_rounds.current
+            self.forward_metadata = self.draft_rounds.current
             return
         if is_decode:
             self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
-        if (
-            self._draft_decode_base_seq_lens is None
-            or self.forward_prefill_metadata is None
-            or self._draft_decode_metadata is None
-        ):
+        if self.draft_rounds is None or self.forward_prefill_metadata is None:
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
-        self._draft_decode_step += 1
-        metadata = self._draft_decode_metadata
-        if seq_lens is None:
-            metadata.seq_lens.add_(1)
-        else:
-            metadata.seq_lens.copy_(seq_lens[: metadata.seq_lens.numel()])
-        metadata.forward_mode = ForwardMode.DECODE
+        metadata = self.draft_rounds.advance(seq_lens)
         if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
             self._update_decode_swa_metadata(
                 metadata,

@@ -5286,11 +5286,10 @@ class TestDeepseekV4Config(unittest.TestCase):
             self.assertIs(rep, cap, f"{slot} slot diverged from capture end state")
 
     def test_deepseek_v4_eager_prep_never_mutates_graph_cached_draft_metadata(self):
-        """The bug-1 parity: an eager/extend-round prepare must not rebind
-        fields on the object a captured graph recorded. Capture stores its
-        draft-decode object in both the per-bs cache and _draft_decode_metadata,
-        so the eager prep's reuse lookup can find it — it must allocate its
-        own instead."""
+        """The bug-1 parity, structural form: ONE per-bs step-views object
+        serves graph and eager rounds alike, and prepare never rebinds its
+        tensor fields — an eager round can no longer invalidate what a
+        captured graph recorded, because there is nothing to rebind."""
         backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
@@ -5314,15 +5313,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
-        graph_draft = backend._draft_decode_metadata
-        self.assertIn(
-            graph_draft,
-            list(backend._cuda_graph_draft_decode_metadata.values()),
-        )
+        graph_draft = backend.draft_rounds.current
+        self.assertIs(graph_draft, backend.draft_rounds.step_views(4))
         recorded = (
             graph_draft.req_pool_indices,
             graph_draft.seq_lens,
-            graph_draft.cache,
+            graph_draft.query_start_loc,
+            graph_draft.token_to_req_indices,
+            graph_draft.is_valid_token,
         )
 
         # A NON-graph prefill metadata (dynamic extend round) drives prepare.
@@ -5336,14 +5334,20 @@ class TestDeepseekV4Config(unittest.TestCase):
             token_to_req_indices=torch.arange(4, dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
         )
-        backend._prepare_draft_decode_metadata(
+        backend._prepare_draft_round(
             eager_prefill, torch.tensor([70, 3, 1, 1], dtype=torch.int32)
         )
 
-        self.assertIsNot(backend._draft_decode_metadata, graph_draft)
+        # Same object, same tensors: the eager round copies INTO the views the
+        # graph recorded (cache is the sanctioned per-round swap).
+        self.assertIs(backend.draft_rounds.current, graph_draft)
         self.assertIs(graph_draft.req_pool_indices, recorded[0])
         self.assertIs(graph_draft.seq_lens, recorded[1])
-        self.assertIs(graph_draft.cache, recorded[2])
+        self.assertIs(graph_draft.query_start_loc, recorded[2])
+        self.assertIs(graph_draft.token_to_req_indices, recorded[3])
+        self.assertIs(graph_draft.is_valid_token, recorded[4])
+        self.assertEqual(graph_draft.seq_lens.tolist(), [70, 3, 1, 1])
+        self.assertIs(graph_draft.cache, eager_prefill.cache)
 
     def test_deepseek_v4_draft_metadata_fallback_prefers_current_shape(self):
         prefill_metadata = SimpleNamespace(
@@ -5387,7 +5391,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
-        self.assertEqual(backend._draft_decode_metadata.token_to_req_indices.numel(), 4)
+        self.assertEqual(backend.draft_rounds.current.token_to_req_indices.numel(), 4)
 
         req_pool_indices = torch.tensor([0], dtype=torch.int32)
         seq_lens = torch.tensor([6], dtype=torch.int32)
