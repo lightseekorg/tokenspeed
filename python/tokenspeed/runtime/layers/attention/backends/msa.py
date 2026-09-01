@@ -258,7 +258,7 @@ class MSAAttnBackend(AttentionBackend):
 
         seq_lens = seq_lens[:bs]
 
-        group_page_tables = self._shed_state_groups(block_tables)
+        group_page_tables = self._consumed_group_tables(block_tables)
         group_out_cache_locs = None
         if group_page_tables:
             # The cache path routes every read/write through the per-group

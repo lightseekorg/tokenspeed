@@ -471,7 +471,7 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 "trtllm decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
-        group_page_tables = self._shed_state_groups(block_tables)
+        group_page_tables = self._consumed_group_tables(block_tables)
         group_out_cache_locs = None
         if group_page_tables:
             # Verify keeps [bs]-row tables; only DFLASH expands rows.

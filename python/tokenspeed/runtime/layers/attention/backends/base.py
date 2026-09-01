@@ -285,18 +285,58 @@ class AttentionBackend(ABC):
         """
         return self.forward_decode_metadata
 
-    def _shed_state_groups(self, tables):
-        """Drop family="state" groups (GDN/mamba state blocks, consumed by
-        the mamba backend): computing write locs / capture buffers over the
-        hole-heavy state table writes the dummy page and trips
-        TOKENSPEED_CACHE_DEBUG. Returns None when nothing is left.
+    def _consumed_group_ids(self) -> frozenset[str]:
+        """Cache groups this backend consumes, claimed positively: the
+        group's pool-learned family is one this backend declared in
+        ``cache_consumer_families``, and no wrapper owns the group.
+        Computed live — a wrapper may register owned groups after
+        construction. Pools that never published families (unit fixtures,
+        pre-contract draft pools) fall back to every row-geometry group.
+        """
+        families = self._geometry.families
+        if not families:
+            return frozenset(self._geometry.granularities) - self.engine_owned_group_ids
+        return frozenset(
+            gid
+            for gid, family in families.items()
+            if family in self.cache_consumer_families
+            and gid not in self.engine_owned_group_ids
+        )
+
+    def _consumed_group_tables(self, tables):
+        """Keep the delivered per-group tables this backend consumes
+        (:meth:`_consumed_group_ids`); the rest of the dict rides to its own
+        consumers (state pages to the mamba backend, wrapper-owned conv
+        groups to the wrapper) — computing write locs / capture buffers over
+        a foreign hole-heavy table writes the dummy page and trips
+        TOKENSPEED_CACHE_DEBUG. A table for a group the bound pool never
+        published is a delivery bug and raises. Pools that published no
+        families pass through unfiltered minus wrapper-owned groups (the
+        pre-contract draft path selects target-pool tables the draft's own
+        geometry never learned). Returns None when nothing is left.
         """
         if not tables:
             return None
-        skip = self._geometry.state_group_ids | self.engine_owned_group_ids
-        if skip:
-            tables = {gid: table for gid, table in tables.items() if gid not in skip}
-        return tables or None
+        families = self._geometry.families
+        if not families:
+            if not self.engine_owned_group_ids:
+                return tables
+            kept = {
+                gid: table
+                for gid, table in tables.items()
+                if gid not in self.engine_owned_group_ids
+            }
+            return kept or None
+        unknown = sorted(gid for gid in tables if gid not in families)
+        if unknown:
+            raise RuntimeError(
+                f"{type(self).__name__}: delivered tables for groups "
+                f"{unknown} the bound pool never published "
+                f"(published: {sorted(families)})"
+            )
+        consumed = self._consumed_group_ids()
+        kept = {gid: table for gid, table in tables.items() if gid in consumed}
+        return kept or None
 
     def _group_block_granularity(self, gid: str) -> int:
         return self._geometry.granularity_of(gid, self.kernel_page_size)

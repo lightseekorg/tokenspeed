@@ -433,8 +433,8 @@ class PrefillGraph:
         before binding) skips the cache-metadata kwargs downstream.
         """
         # ALL groups, state included: hybrid wrappers forward the dict to the
-        # mamba child, which requires its state group; KV children shed state
-        # groups themselves (_shed_state_groups).
+        # mamba child, which requires its state group; KV children keep only
+        # the families they declared (_consumed_group_tables).
         out = {}
         extent = max(1, int(self.config.physical_context_len))
         # Built on the host: make_dummy_batch's only use of these is

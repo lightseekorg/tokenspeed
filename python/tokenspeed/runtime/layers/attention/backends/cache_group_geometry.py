@@ -45,6 +45,11 @@ class CacheGroupGeometry:
         granularities: ``group_id -> block_granularity`` for every non-state
             group (rows-per-page span; equals the group's page size for the
             row-geometry groups kept here).
+        families: ``group_id -> family`` for every published group. The
+            positive-claim vocabulary: a backend keeps exactly the delivered
+            groups whose family it declared in ``cache_consumer_families``;
+            the rest ride the same dict to their own consumers. Empty when
+            no pool is bound (unit fixtures, pre-contract draft pools).
         state_group_ids: ``family="state"`` group ids (GDN/mamba state
             blocks, consumed by the mamba backend and shed from every
             attention table).
@@ -57,6 +62,7 @@ class CacheGroupGeometry:
     """
 
     granularities: dict[str, int] = field(default_factory=dict)
+    families: dict[str, str] = field(default_factory=dict)
     state_group_ids: frozenset[str] = frozenset()
     full_history_group_id: str | None = None
     history_block_granularity: int = 0
@@ -94,6 +100,7 @@ def learn_cache_group_geometry(
             for spec in cache_group_specs
             if spec.family != "state"
         },
+        families={str(spec.group_id): str(spec.family) for spec in cache_group_specs},
         state_group_ids=frozenset(
             str(spec.group_id) for spec in cache_group_specs if spec.family == "state"
         ),

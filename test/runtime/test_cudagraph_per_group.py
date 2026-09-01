@@ -699,19 +699,69 @@ class BackendCaptureGroupTest(_BackendCase):
             self._capture(2, _GROUP_IDS)
 
 
-class BackendStateGroupShedTest(_BackendCase):
-    """family="state" groups (GDN/mamba pages) must never reach MHA's flat
-    buffers, table copies, or write-loc math; the hybrid router still hands
-    the FULL dict to the mamba backend (see test_gdn_state_paging)."""
+class BackendConsumedGroupTablesTest(_BackendCase):
+    """Positive claim: a backend keeps exactly the delivered groups whose
+    family it declared in ``cache_consumer_families``. family="state" groups
+    (GDN/mamba pages) must never reach MHA's flat buffers, table copies, or
+    write-loc math; the hybrid router still hands the FULL dict to the mamba
+    backend (see test_gdn_state_paging)."""
 
     _HYBRID_IDS = ("full_attention", "linear_attention")
+    _FAMILIES = {"full_attention": "history", "linear_attention": "state"}
 
     def setUp(self):
         super().setUp()
         self.backend._geometry = CacheGroupGeometry(
             granularities=dict(self.backend._geometry.granularities),
+            families=dict(self._FAMILIES),
             state_group_ids=frozenset({"linear_attention"}),
         )
+
+    def test_filter_keeps_declared_families_only(self):
+        torch = self.torch
+        tables = {
+            "full_attention": torch.ones((1, 1), dtype=torch.int32),
+            "linear_attention": torch.ones((1, 1), dtype=torch.int32),
+        }
+        kept = self.backend._consumed_group_tables(tables)
+        self.assertEqual(set(kept), {"full_attention"})
+        self.assertEqual(
+            self.backend._consumed_group_ids(), frozenset({"full_attention"})
+        )
+
+    def test_filter_unpublished_group_raises(self):
+        torch = self.torch
+        with self.assertRaisesRegex(RuntimeError, "never published"):
+            self.backend._consumed_group_tables(
+                {"mystery": torch.ones((1, 1), dtype=torch.int32)}
+            )
+
+    def test_filter_all_foreign_or_empty_returns_none(self):
+        torch = self.torch
+        self.assertIsNone(
+            self.backend._consumed_group_tables(
+                {"linear_attention": torch.ones((1, 1), dtype=torch.int32)}
+            )
+        )
+        self.assertIsNone(self.backend._consumed_group_tables(None))
+        self.assertIsNone(self.backend._consumed_group_tables({}))
+
+    def test_filter_owned_groups_ride_to_the_wrapper(self):
+        torch = self.torch
+        self.backend.engine_owned_group_ids = frozenset({"full_attention"})
+        self.assertIsNone(
+            self.backend._consumed_group_tables(
+                {"full_attention": torch.ones((1, 1), dtype=torch.int32)}
+            )
+        )
+
+    def test_filter_without_learned_families_passes_through(self):
+        # Pre-contract pools (older draft paths) deliver tables the draft's
+        # own geometry never learned; they pass through unfiltered.
+        torch = self.torch
+        self.backend._geometry = CacheGroupGeometry()
+        tables = {"anything": torch.ones((1, 1), dtype=torch.int32)}
+        self.assertEqual(set(self.backend._consumed_group_tables(tables)), {"anything"})
 
     def test_capture_state_only_yields_no_attention_metadata(self):
         metadata = self._capture(2, ("linear_attention",))
@@ -730,6 +780,7 @@ class BackendStateGroupShedTest(_BackendCase):
         # fills the same persistent buffers replay does.
         self.backend._geometry = CacheGroupGeometry(
             granularities={"full_attention": 2},
+            families=dict(self._FAMILIES),
             state_group_ids=frozenset({"linear_attention"}),
         )
         self.backend._init_group_graph_buffers(MAX_BS)
