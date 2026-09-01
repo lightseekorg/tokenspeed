@@ -42,6 +42,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
 _LOWRANK_ALIGNMENT = 128
 _MAX_ROWS = 32
+_PRODUCTION_UP_SHAPE = (4 * 2560, 320)
 _CUTEDSL_AVAILABLE = ll_bf16_router.is_available()
 
 
@@ -52,7 +53,6 @@ def _round_up(value: int, alignment: int) -> int:
 @dataclasses.dataclass
 class _CachedPaddedWeight:
     source: weakref.ReferenceType[torch.Tensor]
-    version: int
     padded: torch.Tensor
 
 
@@ -68,34 +68,56 @@ def _copy_padded_up_weight(
         padded[:, :lowrank].copy_(up_weight)
 
 
-def _refresh_padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> bool:
-    """Refresh an existing graph-stable padded weight in place.
+def _prepare_padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> bool:
+    """Create or refresh a graph-stable padded weight outside forward.
 
     Args:
         up_weight: Source mix-up weight shaped ``[wide, lowrank]``.
         lowrank: Unpadded rank of the source weight.
 
     Returns:
-        Whether a cached padded allocation existed and was refreshed.
+        Whether the CuTeDSL backend uses a padded allocation for this weight.
     """
     padded_lowrank = _round_up(lowrank, _LOWRANK_ALIGNMENT)
-    if not up_weight.is_cuda or padded_lowrank == lowrank:
+    if (
+        not up_weight.is_cuda
+        or padded_lowrank == lowrank
+        or tuple(up_weight.shape) != _PRODUCTION_UP_SHAPE
+        or up_weight.dtype is not torch.bfloat16
+        or not up_weight.is_contiguous()
+        or not _CUTEDSL_AVAILABLE
+        or not current_platform().is_blackwell
+    ):
         return False
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "gated-residual weight preparation must run outside CUDA Graph capture"
+        )
     device_index = up_weight.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     key = (device_index, up_weight.data_ptr())
     with _PADDED_WEIGHT_LOCK:
         cached = _PADDED_UP_WEIGHTS.get(key)
-        if cached is None or cached.source() is not up_weight:
-            return False
-        _copy_padded_up_weight(cached.padded, up_weight, lowrank)
-        cached.version = int(up_weight._version)
+        if cached is not None and cached.source() is up_weight:
+            _copy_padded_up_weight(cached.padded, up_weight, lowrank)
+            return True
+        padded = torch.empty(
+            (up_weight.shape[0], padded_lowrank),
+            dtype=up_weight.dtype,
+            device=up_weight.device,
+        )
+        _copy_padded_up_weight(padded, up_weight, lowrank)
+        _PADDED_UP_WEIGHTS[key] = _CachedPaddedWeight(
+            source=weakref.ref(up_weight), padded=padded
+        )
         return True
 
 
-def _padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> torch.Tensor:
-    """Return a graph-stable, zero-padded CuTe input weight."""
+def _get_prepared_padded_up_weight(
+    up_weight: torch.Tensor, lowrank: int
+) -> torch.Tensor:
+    """Return the prepared CuTe input weight without mutating cache state."""
     padded_lowrank = _round_up(lowrank, _LOWRANK_ALIGNMENT)
     if padded_lowrank == lowrank:
         return up_weight
@@ -103,31 +125,14 @@ def _padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> torch.Tensor:
     if device_index is None:
         device_index = torch.cuda.current_device()
     key = (device_index, up_weight.data_ptr())
-    version = int(up_weight._version)
     cached = _PADDED_UP_WEIGHTS.get(key)
-    if (
-        cached is not None
-        and cached.source() is up_weight
-        and cached.version == version
-    ):
+    if cached is not None and cached.source() is up_weight:
         return cached.padded
-    with _PADDED_WEIGHT_LOCK:
-        cached = _PADDED_UP_WEIGHTS.get(key)
-        if cached is not None and cached.source() is up_weight:
-            if cached.version != version:
-                _copy_padded_up_weight(cached.padded, up_weight, lowrank)
-                cached.version = version
-            return cached.padded
-        padded = torch.zeros(
-            (up_weight.shape[0], padded_lowrank),
-            dtype=up_weight.dtype,
-            device=up_weight.device,
-        )
-        _copy_padded_up_weight(padded, up_weight, lowrank)
-        _PADDED_UP_WEIGHTS[key] = _CachedPaddedWeight(
-            source=weakref.ref(up_weight), version=version, padded=padded
-        )
-        return padded
+    raise RuntimeError(
+        "CuTeDSL gated-residual weight was not prepared; call "
+        "prepare_gated_residual_weight_cache after loading weights and before "
+        "forward or CUDA Graph capture"
+    )
 
 
 if _CUTEDSL_AVAILABLE:
@@ -199,7 +204,7 @@ if _CUTEDSL_AVAILABLE:
                 "lowrank=320"
             )
         padded_lowrank = _round_up(lowrank, _LOWRANK_ALIGNMENT)
-        padded_up = _padded_up_weight(up_weight, lowrank)
+        padded_up = _get_prepared_padded_up_weight(up_weight, lowrank)
         if not ll_bf16_router.supports(normalized, projection_weight, rows):
             raise ValueError(
                 "CuTeDSL down/inject projection does not support these operands"

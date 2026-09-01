@@ -32,7 +32,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
-    "refresh_gated_residual_weight_cache",
+    "prepare_gated_residual_weight_cache",
 ]
 
 
@@ -57,19 +57,20 @@ def _same_tensor_contract(
         )
 
 
-def refresh_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) -> bool:
-    """Refresh cached derived mix-up weights after an in-place weight load.
+def prepare_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) -> bool:
+    """Prepare derived mix-up weights after an initial or online weight load.
 
-    CUDA graphs retain the address of backend-specific derived weights. This
-    function updates any existing derived allocation without changing that
-    address. It is a no-op when no backend has cached the weight.
+    CUDA graphs retain the address of backend-specific derived weights. The
+    first call creates that fixed-address allocation outside forward; later
+    calls update it in place after online weight synchronization. It is a no-op
+    when the selected platform does not need a derived weight.
 
     Args:
         up_weight: Source mix-up weight shaped ``[wide, lowrank]``.
         lowrank: Rank of the mix gate bottleneck.
 
     Returns:
-        Whether a cached derived allocation existed and was refreshed.
+        Whether a backend-specific derived allocation was prepared.
     """
     if lowrank <= 0:
         raise ValueError("lowrank must be positive")
@@ -79,10 +80,10 @@ def refresh_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) 
             f"{tuple(up_weight.shape)}"
         )
     from tokenspeed_kernel.ops.hyperconnection.cute_dsl import (
-        _refresh_padded_up_weight,
+        _prepare_padded_up_weight,
     )
 
-    return _refresh_padded_up_weight(up_weight, lowrank)
+    return _prepare_padded_up_weight(up_weight, lowrank)
 
 
 def gated_residual_mix(

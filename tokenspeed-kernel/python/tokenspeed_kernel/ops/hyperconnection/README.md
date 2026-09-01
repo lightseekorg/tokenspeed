@@ -41,8 +41,11 @@ broadcast tensor.
   for explicit tuning. Current production measurements favor the one-launch
   persistent path through `T=16` and the general path above it, so CuTeDSL has a
   lower heuristic priority rather than silently regressing the default. Its
-  rank-padded up-projection cache keeps a stable address for CUDA Graphs and is
-  refreshed in place by the runtime weight loader after model updates.
+  rank-padded up-projection is prepared once by the runtime weight loader before
+  forward/CUDA Graph capture. Online weight synchronization refreshes that same
+  fixed-address allocation in place; its shape and address cannot change without
+  rebuilding the model and recapturing graphs. Forward only performs a read-only
+  lookup.
 - Grouped Gemma RMSNorm is implemented in `ops/layernorm/triton.py`. One program
   owns each `(token, branch)` group and emits no unused inverse-RMS tensor.
 

@@ -57,10 +57,10 @@ def test_kernel_boundary_is_gpu_only() -> None:
         grouped_gemma_rmsnorm(normalized, torch.empty(8), 4, 1e-6)
 
 
-def test_up_weight_loader_refreshes_kernel_cache(monkeypatch) -> None:
-    refresh = mock.Mock(return_value=True)
+def test_up_weight_loader_prepares_kernel_cache(monkeypatch) -> None:
+    prepare = mock.Mock(return_value=True)
     monkeypatch.setattr(
-        hyperconnection_module, "refresh_gated_residual_weight_cache", refresh
+        hyperconnection_module, "prepare_gated_residual_weight_cache", prepare
     )
     lowrank = 3
     mixer = GatedResidualSimple(
@@ -72,7 +72,23 @@ def test_up_weight_loader_refreshes_kernel_cache(monkeypatch) -> None:
     param.weight_loader(param, loaded)
 
     torch.testing.assert_close(param, loaded)
-    refresh.assert_called_once_with(param, lowrank)
+    prepare.assert_called_once_with(param, lowrank)
+
+
+def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
+    prepare = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        hyperconnection_module, "prepare_gated_residual_weight_cache", prepare
+    )
+    mixer = GatedResidualSimple(
+        HyperConnectionConfig(hc_count=2, hidden_size=4, hc_lowrank=3)
+    )
+    param = mixer.input_mix_weight_up.weight
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        param.weight_loader(param, torch.empty(8, 4))
+
+    prepare.assert_not_called()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

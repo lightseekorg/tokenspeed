@@ -26,7 +26,7 @@ from tokenspeed_kernel import (
     gated_residual_combine,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
-    refresh_gated_residual_weight_cache,
+    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
@@ -141,6 +141,7 @@ def test_cute_dsl_mix_matches_fp64_reference(rows: int) -> None:
     if KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix") is None:
         pytest.skip("CuTeDSL dependencies are unavailable")
     normalized, projection, up = _inputs(rows, torch.bfloat16)
+    assert prepare_gated_residual_weight_cache(up, LOWRANK)
     actual, actual_inject = gated_residual_mix(
         normalized,
         projection,
@@ -162,6 +163,7 @@ def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
         pytest.skip("CuTeDSL dependencies are unavailable")
     normalized, projection, up = _inputs(1, torch.bfloat16, seed=23)
     up.zero_()
+    assert prepare_gated_residual_weight_cache(up, LOWRANK)
 
     def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
         return gated_residual_mix(
@@ -185,7 +187,11 @@ def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
         torch.randn(up.shape, dtype=up.dtype, device=up.device, generator=generator)
         * 0.1
     )
-    assert refresh_gated_residual_weight_cache(up, LOWRANK)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, before, rtol=3e-2, atol=3e-2)
+
+    assert prepare_gated_residual_weight_cache(up, LOWRANK)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -193,6 +199,37 @@ def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
     assert not torch.allclose(actual, before, rtol=3e-2, atol=3e-2)
+
+
+def test_cute_dsl_mix_rejects_unprepared_up_weight() -> None:
+    if not current_platform().is_blackwell:
+        pytest.skip("the CuTeDSL HC specialization is Blackwell-only")
+    if KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix") is None:
+        pytest.skip("CuTeDSL dependencies are unavailable")
+    normalized, projection, up = _inputs(1, torch.bfloat16, seed=31)
+
+    with pytest.raises(RuntimeError, match="was not prepared"):
+        gated_residual_mix(
+            normalized,
+            projection,
+            up,
+            HC_COUNT,
+            HIDDEN_SIZE,
+            LOWRANK,
+            override="cute_dsl_hyperconnection_mix",
+        )
+
+
+def test_cute_dsl_weight_preparation_rejects_capture(monkeypatch) -> None:
+    if not current_platform().is_blackwell:
+        pytest.skip("the CuTeDSL HC specialization is Blackwell-only")
+    if KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix") is None:
+        pytest.skip("CuTeDSL dependencies are unavailable")
+    _, _, up = _inputs(1, torch.bfloat16, seed=37)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="outside CUDA Graph capture"):
+        prepare_gated_residual_weight_cache(up, LOWRANK)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

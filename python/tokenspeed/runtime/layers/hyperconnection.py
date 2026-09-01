@@ -30,7 +30,7 @@ from tokenspeed_kernel import (
     gated_residual_combine,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
-    refresh_gated_residual_weight_cache,
+    prepare_gated_residual_weight_cache,
 )
 from torch import nn
 
@@ -158,14 +158,14 @@ class GatedResidualSimple(nn.Module):
             self.input_mix_weight_up.weight.weight_loader = self._load_up_weight
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        """Load the mix-up projection and refresh graph-stable derived weights."""
+        """Load the fixed-shape projection and prepare its derived GPU weight."""
         if param.shape != loaded_weight.shape:
             raise ValueError(
                 f"hyper-connection up weight shape mismatch: param "
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
             )
         param.data.copy_(loaded_weight)
-        refresh_gated_residual_weight_cache(param, self.hc_lowrank)
+        prepare_gated_residual_weight_cache(param, self.hc_lowrank)
 
     def _load_projection_shard(
         self,
