@@ -56,6 +56,29 @@ class CommBackend(ABC):
 
         return False
 
+    def can_acquire_all_reduce_outputs(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> bool:
+        """Whether ``acquire_all_reduce_outputs`` returns producer-direct memory.
+
+        The base implementation of ``acquire_all_reduce_outputs`` always
+        succeeds, but by allocating ordinary tensors that the collective must
+        then stage. Callers that only want the buffers when the reduction can
+        consume them in place -- and would otherwise keep a persistent buffer of
+        their own -- ask here first.
+
+        Must be answerable without side effects beyond the backend's own lazy
+        setup, and must return the same answer on every rank of ``group``: a
+        caller that acquires on some ranks and not others would leave the group
+        disagreeing on which collective runs.
+        """
+
+        return False
+
     def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

@@ -1892,10 +1892,17 @@ class KimiLinearMoE(nn.Module):
                 )
             ),
         )
-        if plan.lane is not None:
-            self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
+        # Producer-direct destinations for the routed and shared partials. The
+        # symmetric pair is preferred (the tail reduces it in place); the packed
+        # lane is the fallback, and its two halves are slices of one buffer.
+        if plan.symm_outputs is not None:
+            routed_out_buf, shared_out_buf = plan.symm_outputs
+        elif plan.lane is not None:
+            routed_out_buf = plan.lane[:, : self.routed_hidden]
+            shared_out_buf = plan.lane[:, self.routed_hidden :]
         else:
-            self.experts._situ_output_buffer = None
+            routed_out_buf = shared_out_buf = None
+        self.experts._situ_output_buffer = routed_out_buf
         prepared_shared_shard = None
         # Enable the fork for the whole graph phase, but only overlap during
         # capture. The pre-capture warmup runs with capture mode off, so gating
@@ -1922,11 +1929,7 @@ class KimiLinearMoE(nn.Module):
                     self._topk_ready.record(torch.cuda.current_stream())
                 shared_partial = self.shared_experts(
                     hidden_states,
-                    down_out=(
-                        plan.lane[:, self.routed_hidden :]
-                        if plan.lane is not None
-                        else None
-                    ),
+                    down_out=shared_out_buf,
                 )
                 if plan.split_shared_rs and fork._active:
                     prepared_shared_shard = self.comm.reduce_scatter_shared(

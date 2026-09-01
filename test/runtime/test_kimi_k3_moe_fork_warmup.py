@@ -96,6 +96,7 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
 
     plan = SimpleNamespace(
         lane=None,
+        symm_outputs=None,
         split_shared_rs=False,
         routed_in_fork=False,
         defer_finalize=False,
