@@ -1132,7 +1132,7 @@ def _run_dense(
             num_kv_splits,
             kv_lora_rank,
             OUTPUT_WITHIN_2GB=_output_within_2gb(out),
-            num_warps=8,
+            num_warps=4 if kv_lora_rank == 128 else 8,
         )
     return out
 
