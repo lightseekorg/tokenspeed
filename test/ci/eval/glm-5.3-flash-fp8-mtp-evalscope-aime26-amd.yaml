@@ -1,9 +1,9 @@
-# GLM-5.3-Flash BF16 MTP AIME26 validation on AMD.
 api_version: ci.tokenspeed.io/v1
-name: eval-glm-5.3-flash-bf16-mtp-tp4ep1-aime26-amd
+name: eval-glm-5.3-flash-fp8-mtp-aime26-amd
 type: eval
 workflow_stage: model-test
 triggers:
+  - per-commit
   - manual
 runner:
   labels:
@@ -13,14 +13,10 @@ env:
 install:
   - bash test/ci_system/install_deps_rocm.sh
 server:
-  # ROCm 7.2 hipBLASLt attempts a forbidden operation when the first decode
-  # graph is captured on this runner. Prefer graph-safe hipBLAS/rocBLAS while
-  # retaining the optimized Iris collective path.
   command: >-
-    TORCH_BLAS_PREFER_HIPBLASLT=0
     ts serve
-    --model zai-org/GLM-5.3-Flash-BF16
-    --served-model-name glm-5.3-flash
+    --model zai-org/GLM-5.3-Flash
+    --served-model-name glm-5.3-flash-fp8-mtp
     --attn-tp-size 4
     --ep-size 1
     --language-model-only
@@ -41,12 +37,13 @@ server:
     --host 127.0.0.1
     --port 8000
     --policy round_robin
+    --disable-health-check
     --engine-startup-timeout 900
     --gateway-startup-timeout 600
     --speculative-algorithm MTP
-    --speculative-num-steps 1
+    --speculative-num-steps 3
     --speculative-eagle-topk 1
-    --speculative-num-draft-tokens 2
+    --speculative-num-draft-tokens 4
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1200
@@ -57,7 +54,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model glm-5.3-flash
+    --model glm-5.3-flash-fp8-mtp
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime26
@@ -65,9 +62,7 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":65000,"extra_body":{"reasoning_effort":"max"}}'
 report:
   github_step_summary: true
-# Request-seeded graph-compiled TP4/EP1 MI350X validation scored 0.833. Pin the
-# evaluator and request seed so the one-run gate is reproducible across jobs.
-score_threshold: 0.70
+score_threshold: 0.75

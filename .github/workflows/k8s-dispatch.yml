@@ -19,10 +19,9 @@ on:
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/deepseek-v4-pro-evalscope-gsm8k-amd.yaml
-          - test/ci/eval/glm-5.3-flash-bf16-tp4ep1-evalscope-aime26-amd.yaml
-          - test/ci/eval/glm-5.3-flash-fp8-tp4ep4-evalscope-aime26-nvidia.yaml
-          - test/ci/eval/glm-5.3-flash-fp8-mtp-tp4ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
+          - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
+          - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26-amd.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
           - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
           - test/ci/eval/inkling-mxfp4-mtp-evalscope-aime25.yaml
@@ -33,7 +32,6 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml
-          - test/ci/eval/kimi-k3-dspark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
@@ -46,10 +44,8 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-mxfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
-          - test/ci/perf/glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia.yaml
           - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
-          - test/ci/perf/kimi-k3-dspark-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep1-evalscope-random-4k-1k-mi35x.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml

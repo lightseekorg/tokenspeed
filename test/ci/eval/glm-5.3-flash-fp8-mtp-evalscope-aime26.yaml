@@ -1,6 +1,5 @@
-# GLM-5.3-Flash FP8 MTP AIME26 validation on AMD.
 api_version: ci.tokenspeed.io/v1
-name: eval-glm-5.3-flash-fp8-mtp-tp4ep1-aime26-amd
+name: eval-glm-5.3-flash-fp8-mtp-aime26
 type: eval
 workflow_stage: model-test
 triggers:
@@ -8,31 +7,30 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-4gpu-test
+    - b200-4gpu
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps_rocm.sh
+  - bash test/ci_system/install_deps.sh
 server:
-  # MoE keeps compact experts for gfx950 decode and creates BF16 expert copies
-  # for the faster large-M prefill kernel.
   command: >-
     ts serve
     --model zai-org/GLM-5.3-Flash
-    --served-model-name glm-5.3-flash-fp8-mtp
+    --served-model-name glm-5.3-flash
     --attn-tp-size 4
-    --ep-size 1
+    --enable-expert-parallel
     --language-model-only
+    --moe-backend flashinfer_trtllm
     --max-model-len 65536
     --max-num-seqs 16
     --max-total-tokens 131072
     --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
+    --chunked-prefill-size 4096
     --max-cudagraph-capture-size 16
     --cudagraph-capture-sizes 1 2 4 8 16
-    --gpu-memory-utilization 0.95
+    --gpu-memory-utilization 0.90
     --trust-remote-code
-    --sampling-backend triton
+    --sampling-backend flashinfer
     --disable-kvstore
     --kvstore-ratio 0.0
     --no-enable-prefix-caching
@@ -49,7 +47,7 @@ server:
     --speculative-num-draft-tokens 4
   ready:
     url: http://127.0.0.1:8000/readiness
-    timeout: 1200
+    timeout: 1800
     interval: 10
 eval:
   install:
@@ -57,7 +55,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model glm-5.3-flash-fp8-mtp
+    --model glm-5.3-flash
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime26
@@ -65,7 +63,7 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":65000,"extra_body":{"reasoning_effort":"max"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"top_k":2,"seed":42,"max_tokens":65000,"extra_body":{"reasoning_effort":"max"}}'
 report:
   github_step_summary: true
-score_threshold: 0.75
+score_threshold: 0.70

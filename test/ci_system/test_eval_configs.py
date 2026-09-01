@@ -7,23 +7,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "eval"
-PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
 STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-pr-test-stage.yml"
-GLM53_FLASH_AMD_CONFIG_PATH = (
-    EVAL_CONFIG_DIR / "glm-5.3-flash-fp8-mtp-tp4ep1-evalscope-aime26-amd.yaml"
-)
-GLM53_FLASH_NVIDIA_CONFIG_PATH = (
-    EVAL_CONFIG_DIR / "glm-5.3-flash-fp8-tp4ep4-evalscope-aime26-nvidia.yaml"
-)
-GLM53_FLASH_NVIDIA_SHAREGPT_CONFIG_PATH = (
-    PERF_CONFIG_DIR / "glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia.yaml"
-)
-GLM53_FLASH_BF16_AMD_CONFIG_PATH = (
-    EVAL_CONFIG_DIR / "glm-5.3-flash-bf16-tp4ep1-evalscope-aime26-amd.yaml"
-)
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
-GLM53_FLASH_FP8_MODEL_ID = "zai-org/GLM-5.3-Flash"
-GLM53_FLASH_BF16_MODEL_ID = "zai-org/GLM-5.3-Flash-BF16"
 FORK_PR_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name != github.repository }}"
@@ -49,7 +34,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 12,
+        "count": 11,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -94,154 +79,6 @@ def test_fork_pr_context_is_exposed_to_ci_tasks():
     assert (
         workflow["jobs"]["test"]["env"]["TOKENSPEED_CI_FORK_PR"] == FORK_PR_EXPRESSION
     )
-
-
-def test_glm53_flash_amd_aime26_uses_validated_fp8_mtp_tp4_ep1_configuration():
-    task = yaml.safe_load(GLM53_FLASH_AMD_CONFIG_PATH.read_text(encoding="utf-8"))
-    server_command = task["server"]["command"]
-    eval_install = task["eval"]["install"][0]
-    generation_config = json.loads(
-        flag_value(shlex.split(task["eval"]["command"]), "--generation-config")
-    )
-
-    assert task["runner"]["labels"] == ["amd-mi35x-4gpu-test"]
-    assert task["triggers"] == ["per-commit", "manual"]
-    assert "HF_HOME" not in task["env"]
-    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
-    assert server_command.startswith("ts serve")
-    assert f"--model {GLM53_FLASH_FP8_MODEL_ID}" in server_command
-    assert "--attn-tp-size 4" in server_command
-    assert "--ep-size 1" in server_command
-    assert "--sampling-backend triton" in server_command
-    assert "--force-deterministic-rsag" not in server_command
-    assert "--engine-startup-timeout 900" in server_command
-    assert task["server"]["ready"]["timeout"] == 1200
-    assert "--max-model-len 65536" in server_command
-    assert "--max-cudagraph-capture-size 16" in server_command
-    assert "--disable-health-check" in server_command
-    assert "--speculative-algorithm MTP" in server_command
-    assert "--speculative-num-steps 3" in server_command
-    assert "--speculative-eagle-topk 1" in server_command
-    assert "--speculative-num-draft-tokens 4" in server_command
-    assert "'evalscope[perf]==1.10.0'" in eval_install
-    assert generation_config["seed"] == 42
-    assert generation_config["max_tokens"] == 65000
-    assert generation_config["extra_body"]["reasoning_effort"] == "max"
-    assert task["score_threshold"] == 0.75
-
-
-def test_glm53_flash_nvidia_aime26_uses_validated_tp4_ep4_configuration():
-    task = yaml.safe_load(GLM53_FLASH_NVIDIA_CONFIG_PATH.read_text(encoding="utf-8"))
-    server_command = task["server"]["command"]
-    server_tokens = shlex.split(server_command)
-    eval_tokens = shlex.split(task["eval"]["command"])
-    generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
-
-    assert task["runner"]["labels"] == ["b200-4gpu"]
-    assert "HF_HOME" not in task["env"]
-    assert task["install"] == ["bash test/ci_system/install_deps.sh"]
-    assert server_tokens[0] == "ts"
-    assert flag_value(server_tokens, "--model") == GLM53_FLASH_FP8_MODEL_ID
-    assert "--chat-template" not in server_tokens
-    assert flag_value(server_tokens, "--attn-tp-size") == "4"
-    assert "--enable-expert-parallel" in server_tokens
-    assert "--language-model-only" in server_tokens
-    assert flag_value(server_tokens, "--moe-backend") == "flashinfer_trtllm"
-    assert "--all2all-backend" not in server_tokens
-    assert "--deepep-mode" not in server_tokens
-    assert flag_value(server_tokens, "--max-model-len") == "65536"
-    assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "16"
-    assert flag_value(server_tokens, "--sampling-backend") == "flashinfer"
-    assert "--disable-health-check" in server_tokens
-    assert not any(token.startswith("--speculative-") for token in server_tokens)
-    assert "--draft-model-path-use-base" not in server_tokens
-    assert task["server"]["ready"]["timeout"] == 1800
-    assert flag_value(eval_tokens, "--model") == "glm-5.3-flash"
-    assert "'evalscope[perf]==1.10.0'" in task["eval"]["install"][0]
-    assert generation_config["max_tokens"] == 65000
-    assert generation_config["top_k"] == 2
-    assert generation_config["seed"] == 42
-    assert generation_config["extra_body"]["reasoning_effort"] == "max"
-
-
-def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
-    task = yaml.safe_load(
-        GLM53_FLASH_NVIDIA_SHAREGPT_CONFIG_PATH.read_text(encoding="utf-8")
-    )
-    server_tokens = shlex.split(task["server"]["command"])
-    perf_tokens = shlex.split(task["perf"]["command"])
-    tokenizer_path = flag_value(perf_tokens, "--tokenizer-path")
-
-    assert flag_value(server_tokens, "--model") == GLM53_FLASH_FP8_MODEL_ID
-    assert (
-        flag_value(server_tokens, "--speculative-draft-model-path")
-        == GLM53_FLASH_FP8_MODEL_ID
-    )
-    assert tokenizer_path == "/tmp/glm-5.3-flash-tokenizer"
-    assert flag_value(perf_tokens, "--url").endswith("/v1/chat/completions")
-    tokenizer_install = task["perf"]["install"][1]
-    assert GLM53_FLASH_FP8_MODEL_ID in tokenizer_install
-    assert f"--local-dir {tokenizer_path}" in tokenizer_install
-    assert [
-        flag_value(server_tokens, flag)
-        for flag in (
-            "--attn-tp-size",
-            "--speculative-num-steps",
-            "--speculative-num-draft-tokens",
-        )
-    ] == ["4", "3", "4"]
-    assert "--draft-model-path-use-base" in server_tokens
-    assert flag_value(server_tokens, "--moe-backend") == "flashinfer_trtllm"
-    assert "--all2all-backend" not in server_tokens
-    assert "--disable-health-check" in server_tokens
-    assert [
-        flag_value(perf_tokens, flag)
-        for flag in (
-            "--dataset",
-            "--number",
-            "--min-tokens",
-            "--max-tokens",
-            "--parallel",
-            "--warmup-num",
-            "--seed",
-            "--extra-args",
-        )
-    ] == ["share_gpt_en", "16", "512", "512", "16", "16", "45", '{"ignore_eos":true}']
-    assert "--tokenize-prompt" not in perf_tokens
-    assert "'evalscope[perf]==1.10.0'" in task["perf"]["install"][0]
-    assert "for run_id in 1 2 3" in task["perf"]["command"]
-    assert "statistics.median" in task["perf"]["command"]
-    assert task["perf_threshold"] == 0.9
-    assert task["perf_reference"] == {16: [112.2, 280.4]}
-
-
-def test_glm53_flash_bf16_mtp_manual_task_uses_validated_configuration():
-    task = yaml.safe_load(GLM53_FLASH_BF16_AMD_CONFIG_PATH.read_text(encoding="utf-8"))
-    server_command = task["server"]["command"]
-    eval_install = task["eval"]["install"][0]
-    generation_config = json.loads(
-        flag_value(shlex.split(task["eval"]["command"]), "--generation-config")
-    )
-
-    assert task["triggers"] == ["manual"]
-    assert task["runner"]["labels"] == ["amd-mi35x-4gpu-test"]
-    assert "HF_HOME" not in task["env"]
-    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
-    assert server_command.startswith("TORCH_BLAS_PREFER_HIPBLASLT=0 ts serve")
-    assert f"--model {GLM53_FLASH_BF16_MODEL_ID}" in server_command
-    assert "--attn-tp-size 4" in server_command
-    assert "--ep-size 1" in server_command
-    assert "--sampling-backend triton" in server_command
-    assert "--max-model-len 65536" in server_command
-    assert "--max-cudagraph-capture-size 16" in server_command
-    assert "--speculative-algorithm MTP" in server_command
-    assert "--speculative-num-steps 1" in server_command
-    assert "--speculative-eagle-topk 1" in server_command
-    assert "--speculative-num-draft-tokens 2" in server_command
-    assert "'evalscope[perf]==1.10.0'" in eval_install
-    assert generation_config["seed"] == 42
-    assert generation_config["max_tokens"] == 32768
-    assert task["score_threshold"] == 0.70
 
 
 def test_evalscope_configs_use_expected_dataset_sources():

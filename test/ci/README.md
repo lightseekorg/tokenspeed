@@ -50,11 +50,6 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.90.
 
-GLM-5.3-Flash CI tasks cover AIME26 accuracy and ShareGPT serving performance.
-They reference the public `zai-org/GLM-5.3-Flash` and
-`zai-org/GLM-5.3-Flash-BF16` Hugging Face repositories; launch and evaluation
-parameters live in the corresponding task YAML files.
-
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

@@ -710,15 +710,6 @@ def test_extract_evalscope_score_ignores_non_numeric_cells():
     assert extract_evalscope_score(report_table) is None
 
 
-def test_extract_evalscope_score_from_zero_percentage_table():
-    report_table = """
-│ Model         │ Dataset   │ Metric     │ Subset  │ Num │ Score │
-│ glm-5.3-flash │ AIME-2026 │ Accuracy ↑ │ default │  30 │ 0%    │
-"""
-
-    assert extract_evalscope_score(report_table) == 0.0
-
-
 def test_extract_inspect_score_from_accuracy_summary():
     output = """
 ocrbench_scorer
