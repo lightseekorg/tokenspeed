@@ -46,7 +46,6 @@ def compute_out_cache_loc_kernel(
     uniform_input_length,  # used when input_lengths_ptr is None
     page_size: tl.constexpr,
     max_pages,  # runtime: constexpr here recompiles per page-table width
-    window_pages: tl.constexpr,  # 0 = full history; >0 = sliding ring width
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -71,19 +70,10 @@ def compute_out_cache_loc_kernel(
     specializes the kernel on the None-ness of the pointers at JIT time and
     dead-code-eliminates the corresponding GMEM reads.
 
-    ``window_pages`` selects the column mapping at JIT time. Full history
-    (0) is the degenerate ring: columns grow with position and overflow
-    clamps to the reserved slot 0. A sliding group (>0) retains only the
-    last ``window_pages`` pages per request, so absolute position ``p``
-    lives in ring column ``(p // page_size) % window_pages`` — the modulo
-    IS the construction that makes addressing a slid-out column
-    impossible. Columns the scheduler punched to the null page read as
-    page 0 and route to slot 0 either way.
-
-    ``max_pages``, by contrast, is a runtime scalar: the page table's width
-    grows with context, so specializing on it recompiles the kernel once per
-    distinct width. It only feeds the overflow test, the clamp and the row
-    stride, none of which need a compile-time constant.
+    ``max_pages`` is a runtime scalar: the page table's width grows with
+    context, so specializing on it recompiles the kernel once per distinct
+    width. It only feeds the overflow test, the clamp and the row stride,
+    none of which need a compile-time constant.
     """
     # Program ID represents which request we're processing
     req_idx = tl.program_id(0)
@@ -115,14 +105,9 @@ def compute_out_cache_loc_kernel(
 
         # Compute page indices and offsets
         page_indices = positions // page_size
-        if window_pages > 0:
-            # Ring mapping: overflow is impossible by construction.
-            page_indices = page_indices % window_pages
-            overflow = page_indices < 0  # constant-false, same dtype as below
-        else:
-            overflow = page_indices >= max_pages
-            # Clamp to last valid page to avoid OOB GMEM read.
-            page_indices = tl.minimum(page_indices, max_pages - 1)
+        overflow = page_indices >= max_pages
+        # Clamp to last valid page to avoid OOB GMEM read.
+        page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
         # Load page IDs from the batch-ordered page table.
@@ -167,7 +152,6 @@ def compute_out_cache_loc(
         0,  # uniform_input_length unused when input_lengths_ptr is not None
         page_size=page_size,
         max_pages=max_pages,
-        window_pages=0,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -398,48 +382,5 @@ def compute_out_cache_loc_uniform(
         uniform_input_length,
         page_size=page_size,
         max_pages=max_pages,
-        window_pages=0,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-
-def compute_out_cache_loc_sliding(
-    out_cache_loc_ptr,
-    uniform_input_length: int,
-    cache_start: torch.Tensor,  # [batch_size]
-    page_table: torch.Tensor,  # [batch_size, window_pages], batch-ordered ring
-    page_size: int,
-) -> None:
-    """Sliding-window write locations over a ring-mapped page table.
-
-    Same unified kernel, ring column mapping: the table holds exactly the
-    window's pages (``window_pages == table width``) and old columns are
-    reused in place as the window slides, so the staged table stays
-    capture-stable at a fixed width instead of growing with context.
-
-    Args:
-        out_cache_loc_ptr: [batch_size * uniform_input_length] output slots.
-        uniform_input_length: Tokens per request (uniform across the batch).
-        cache_start: [batch_size] absolute first write position per request.
-        page_table: [batch_size, window_pages] ring table; entries are kernel
-            page ids, 0 for null/reclaimed columns.
-        page_size: Kernel page size in tokens.
-    """
-    batch_size = cache_start.shape[0]
-    window_pages = page_table.shape[1]
-
-    BLOCK_SIZE = 128
-    grid = (batch_size,)
-
-    compute_out_cache_loc_kernel[grid](
-        None,
-        cache_start,
-        page_table,
-        None,
-        out_cache_loc_ptr,
-        uniform_input_length,
-        page_size=page_size,
-        max_pages=window_pages,
-        window_pages=window_pages,
         BLOCK_SIZE=BLOCK_SIZE,
     )

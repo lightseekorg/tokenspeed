@@ -124,7 +124,7 @@ class DFlash(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner | None = None,
-        cache_view=None,
+        page_staging=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -137,7 +137,7 @@ class DFlash(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
+            page_staging=page_staging,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -190,8 +190,8 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.cache_view is None:
-            raise ValueError("Native DFLASH requires a staged cache view.")
+        if self.page_staging is None:
+            raise ValueError("Native DFLASH requires the staged draft page table.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
@@ -983,7 +983,7 @@ class DFlash(BaseDrafter):
                 out=block_positions,
             )
 
-            self.cache_view.out_cache_loc_uniform(
+            self.page_staging.out_cache_loc_uniform(
                 out=cache_locs,
                 cache_start=prefix_lens,
                 num_tokens=self.draft_query_width,
@@ -1004,7 +1004,7 @@ class DFlash(BaseDrafter):
                 req_pool_indices,
                 seq_lens_after,
                 forward_mode=ForwardMode.DECODE,
-                page_table=self.cache_view.table,
+                page_table=self.page_staging.table,
                 num_extends=metadata_num_extends,
             )
         else:
@@ -1097,20 +1097,20 @@ class DFlash(BaseDrafter):
             draft_cache_locs = self.draft_out_cache_loc_buf[
                 : bs * self.draft_query_width
             ]
-            max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
+            max_draft_prefix = self.page_staging.max_tokens - self.draft_query_width
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                page_table=self.cache_view.table,
+                page_table=self.page_staging.table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
                 out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.cache_view.page_size,
+                page_size=self.page_staging.block_granularity,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1141,7 +1141,7 @@ class DFlash(BaseDrafter):
 
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
+        max_draft_prefix = self.page_staging.max_tokens - self.draft_query_width
 
         current_tokens = self.block_ids_buf[:bs, 0]
         draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
@@ -1150,14 +1150,14 @@ class DFlash(BaseDrafter):
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            page_table=self.cache_view.table,
+            page_table=self.page_staging.table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
             out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.cache_view.page_size,
+            page_size=self.page_staging.block_granularity,
             max_draft_prefix=max_draft_prefix,
         )
 

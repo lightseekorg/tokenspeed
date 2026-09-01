@@ -12,7 +12,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.draft_page_staging import CacheView, DraftPageStaging
+from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
 
 
 def _staging(page_size: int = 128, columns: int = 4, rows: int = 8):
@@ -35,8 +35,8 @@ class DraftPageTableUnitsTest(unittest.TestCase):
     Kernel-page expansion happens inside each backend (the same
     ``_expand_history_table`` a wrapper-delivered group table goes through).
     The write-location math is page-size invariant — ``table[i, pos // P] * P
-    + pos % P`` addresses the same token for any page size — so the drafter's
-    ``CacheView`` resolves absolute slots directly over the raw table.
+    + pos % P`` addresses the same token for any page size — so the staging
+    resolves absolute slots directly over the raw table.
     """
 
     def test_publish_copies_raw_ids(self):
@@ -47,9 +47,9 @@ class DraftPageTableUnitsTest(unittest.TestCase):
         self.assertTrue(torch.equal(st.table[0], expected))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-    def test_view_slots_match_the_logical_span(self):
+    def test_staged_slots_match_the_logical_span(self):
         # Absolute slot of position p in logical page L is L*P + p%P; the
-        # view's uniform resolver must produce exactly that.
+        # staging's uniform resolver must produce exactly that.
         st = DraftPageStaging(
             max_bs=8,
             max_pages_per_req=4,
@@ -59,7 +59,7 @@ class DraftPageTableUnitsTest(unittest.TestCase):
         )
         _publish(st, 1, torch.tensor([[3]], dtype=torch.int32, device="cuda"))
         out = torch.zeros(1, dtype=torch.int64, device="cuda")
-        st.view.out_cache_loc_uniform(
+        st.out_cache_loc_uniform(
             out=out,
             cache_start=torch.tensor([5], dtype=torch.int32, device="cuda"),
             num_tokens=1,
@@ -92,14 +92,10 @@ class DraftPageTableUnitsTest(unittest.TestCase):
             torch.equal(st.table[1:], torch.zeros((3, 4), dtype=torch.int32))
         )
 
-    def test_view_reports_raw_page_capacity(self):
+    def test_staging_reports_raw_page_capacity(self):
         st = _staging(page_size=128, columns=4)
-        self.assertEqual(st.view.max_tokens, 4 * 128)
-        self.assertEqual(st.view.page_size, 128)
-
-    def test_view_rejects_unknown_retention(self):
-        with self.assertRaises(ValueError):
-            CacheView(torch.zeros((1, 1), dtype=torch.int32), 128, retention="ring")
+        self.assertEqual(st.max_tokens, 4 * 128)
+        self.assertEqual(st.block_granularity, 128)
 
 
 if __name__ == "__main__":

@@ -751,8 +751,8 @@ class ForwardStepRunner:
                 draft_kwargs["cache_group_ids"] = draft_group_ids
             if self.drafter is not None:
                 # Same staged table the draft's live refresh reads
-                # (_prepare_decode_metadata passes drafter.cache_view.table).
-                draft_kwargs["page_table"] = self.drafter.cache_view.table
+                # (_prepare_decode_metadata passes drafter.page_staging.table).
+                draft_kwargs["page_table"] = self.drafter.page_staging.table
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -1014,7 +1014,7 @@ class ForwardStepRunner:
                 req_pool_indices,
                 draft_seq_lens,
                 forward_mode=ForwardMode.DECODE,
-                page_table=self.drafter.cache_view.table,
+                page_table=self.drafter.page_staging.table,
                 for_graph_replay=use_graph,
                 **draft_attn_kwargs,
             )
@@ -1072,7 +1072,7 @@ class ForwardStepRunner:
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                page_table=self.drafter.cache_view.table,
+                page_table=self.drafter.page_staging.table,
                 forward_mode=forward_mode,
                 **draft_extend_kwargs,
             )
@@ -1098,7 +1098,7 @@ class ForwardStepRunner:
                 draft_seq_lens,
                 forward_mode=ForwardMode.DECODE,
                 num_extends=num_extends,
-                page_table=self.drafter.cache_view.table,
+                page_table=self.drafter.page_staging.table,
                 **draft_refresh_kwargs,
             )
 

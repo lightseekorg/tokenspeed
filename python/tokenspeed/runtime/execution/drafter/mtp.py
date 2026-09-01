@@ -238,7 +238,7 @@ class Mtp(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner,
-        cache_view=None,
+        page_staging=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -252,7 +252,7 @@ class Mtp(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
+            page_staging=page_staging,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -363,7 +363,7 @@ class Mtp(BaseDrafter):
         )
 
         out_cache_loc = self.draft_out_cache_loc_buf[: bs * k]
-        self.cache_view.out_cache_loc_uniform(
+        self.page_staging.out_cache_loc_uniform(
             out=out_cache_loc,
             cache_start=(frontier - k).clamp_min(0),
             num_tokens=k,

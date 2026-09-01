@@ -24,7 +24,10 @@ The multi-step drafters derive their KV write locations inside the captured
 graph (the inputs depend on verify's in-graph ``accept_lengths``), so the
 kernels record a fixed table address at capture time. Per-forward group
 tables are fresh tensors; this component owns the one address-stable buffer
-they are staged into, and the single publish path that fills it.
+they are staged into, the single publish path that fills it, and the
+write-location math over it — drafters express intent ("slots for the next
+k positions of this batch") without touching page ids or page-size
+arithmetic.
 
 Invariants:
 
@@ -44,84 +47,18 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
-    compute_out_cache_loc_sliding,
     compute_out_cache_loc_uniform,
 )
 
 
-class CacheView:
-    """The drafter's window onto the staged page table.
-
-    Wraps the address-stable staged table with the write-location math so
-    drafters express intent ("slots for the next k positions of this batch")
-    without touching page ids or page-size arithmetic. The kernel is picked
-    by the group's retention: ``full_history`` walks columns monotonically,
-    ``sliding_window`` maps positions onto the table's ring; ``state``
-    groups have no page table and no view.
-
-    ``table`` and ``page_size`` remain readable for consumers that hand the
-    staged table to attention-metadata inits (the table's unit is the raw
-    scheduler page, ``page_size == block_granularity``).
-    """
-
-    def __init__(
-        self,
-        table: torch.Tensor,
-        page_size: int,
-        retention: str = "full_history",
-    ) -> None:
-        if retention not in ("full_history", "sliding_window"):
-            raise ValueError(f"unsupported cache view retention {retention!r}")
-        self.table = table
-        self.page_size = int(page_size)
-        self.retention = retention
-
-    @property
-    def max_tokens(self) -> int:
-        """Token capacity of one table row (width × page size)."""
-        return self.table.shape[1] * self.page_size
-
-    def out_cache_loc_uniform(
-        self,
-        out: torch.Tensor,
-        cache_start: torch.Tensor,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        """Resolve KV write slots for ``num_tokens`` positions per request.
-
-        Captured-graph friendly (fixed table address, no host sync). Row
-        ``i`` of ``cache_start`` is batch position ``i``'s first write
-        position; slots land in ``out`` request-major.
-
-        Args:
-            out: Flat int64 output, at least ``bs * num_tokens`` long.
-            cache_start: ``[bs]`` int32 first write position per request.
-            num_tokens: Positions per request (uniform across the batch).
-
-        Returns:
-            ``out`` for chaining.
-        """
-        if self.retention == "sliding_window":
-            compute_out_cache_loc_sliding(
-                out_cache_loc_ptr=out,
-                uniform_input_length=num_tokens,
-                cache_start=cache_start,
-                page_table=self.table,
-                page_size=self.page_size,
-            )
-            return out
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=out,
-            uniform_input_length=num_tokens,
-            cache_start=cache_start,
-            page_table=self.table,
-            page_size=self.page_size,
-        )
-        return out
-
-
 class DraftPageStaging:
-    """Owns the batch-ordered draft page table and its only publish path."""
+    """Owns the batch-ordered draft page table, its only publish path, and
+    the write-location math the drafters run over it.
+
+    ``table`` and ``block_granularity`` remain readable for consumers that
+    hand the staged table to attention-metadata inits (the table's unit is
+    the raw scheduler page).
+    """
 
     def __init__(
         self,
@@ -148,7 +85,40 @@ class DraftPageStaging:
         self.table = torch.zeros(
             (max_bs, max_pages_per_req), dtype=torch.int32, device=device
         )
-        self.view = CacheView(self.table, self.block_granularity)
+
+    @property
+    def max_tokens(self) -> int:
+        """Token capacity of one table row (width × page size)."""
+        return self.table.shape[1] * self.block_granularity
+
+    def out_cache_loc_uniform(
+        self,
+        out: torch.Tensor,
+        cache_start: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Resolve KV write slots for ``num_tokens`` positions per request.
+
+        Captured-graph friendly (fixed table address, no host sync). Row
+        ``i`` of ``cache_start`` is batch position ``i``'s first write
+        position; slots land in ``out`` request-major.
+
+        Args:
+            out: Flat int64 output, at least ``bs * num_tokens`` long.
+            cache_start: ``[bs]`` int32 first write position per request.
+            num_tokens: Positions per request (uniform across the batch).
+
+        Returns:
+            ``out`` for chaining.
+        """
+        compute_out_cache_loc_uniform(
+            out_cache_loc_ptr=out,
+            uniform_input_length=num_tokens,
+            cache_start=cache_start,
+            page_table=self.table,
+            page_size=self.block_granularity,
+        )
+        return out
 
     def publish(self, block_tables, bs: int, padded_bs: int) -> None:
         """Stage this forward's full-history table for the draft's kernels.

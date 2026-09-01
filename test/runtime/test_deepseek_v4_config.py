@@ -940,7 +940,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
+            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
@@ -1001,7 +1001,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
+            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool()
@@ -1066,7 +1066,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
+            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool(
@@ -1120,7 +1120,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
+            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
             owns_eager_decode_metadata=False,
         )

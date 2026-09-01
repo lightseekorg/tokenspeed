@@ -269,12 +269,15 @@ fallback is legal there). The per-backend `_replay_stale_guard` is gone.
 `DraftPageStaging` survives but is no longer a mapping owner: its publish is
 a pure copy + padded-row scrub into the one address-stable buffer the
 drafters' in-graph write-location kernels record at capture
-(`CacheView.out_cache_loc_uniform`; per-forward group tables are fresh
-tensors, so an address-stable shadow is physically required). The
+(`DraftPageStaging.out_cache_loc_uniform`; per-forward group tables are
+fresh tensors, so an address-stable shadow is physically required). The
 write-location math is page-size invariant — `table[i, pos // P] * P +
-pos % P` addresses the same token at any page size — so `CacheView` resolves
+pos % P` addresses the same token at any page size — so the staging resolves
 absolute slots directly over the raw table, exactly like
-`fill_input_buffers`' out_cache_loc path.
+`fill_input_buffers`' out_cache_loc path. (`CacheView`, the former wrapper
+that carried this math, is gone — its only production retention was
+`full_history`, so the class and the never-reached sliding-ring kernel
+branch were folded away.)
 
 Deleted flags, for the record: `needs_group_block_tables`,
 `cache_group_tables_replace_draft_page_table`,

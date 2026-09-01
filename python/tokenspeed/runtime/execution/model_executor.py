@@ -418,7 +418,7 @@ class ModelExecutor:
                 draft_model_runner=draft_model_runner,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
-                cache_view=self._draft_staging.view,
+                page_staging=self._draft_staging,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,

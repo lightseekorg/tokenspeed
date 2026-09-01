@@ -79,7 +79,7 @@ class Eagle(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner,
-        cache_view=None,
+        page_staging=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -93,7 +93,7 @@ class Eagle(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
+            page_staging=page_staging,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -311,7 +311,7 @@ class Eagle(BaseDrafter):
 
         # Write cache slots for steps 1..N-1.
         cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
-        self.cache_view.out_cache_loc_uniform(
+        self.page_staging.out_cache_loc_uniform(
             out=cache_locs,
             cache_start=cache_start,
             num_tokens=self.spec_num_steps - 1,

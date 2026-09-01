@@ -55,7 +55,7 @@ class BaseDrafter:
         draft_model_runner: ModelRunner | None = None,
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
-        cache_view=None,
+        page_staging=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
@@ -65,11 +65,11 @@ class BaseDrafter:
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
-        # Window onto the staged batch-ordered page table (row i == batch
-        # position i, raw scheduler pages, refreshed each forward by
-        # DraftPageStaging.publish). Write-location math goes through the
-        # view so page ids and page-size arithmetic stay out of drafters.
-        self.cache_view = cache_view
+        # The staged batch-ordered page table (row i == batch position i,
+        # raw scheduler pages, refreshed each forward by
+        # DraftPageStaging.publish). Write-location math goes through it so
+        # page ids and page-size arithmetic stay out of drafters.
+        self.page_staging = page_staging
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size

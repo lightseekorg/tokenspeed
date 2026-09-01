@@ -287,7 +287,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
-                cache_view=SimpleNamespace(
+                page_staging=SimpleNamespace(
                     table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
@@ -345,7 +345,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
-                cache_view=SimpleNamespace(
+                page_staging=SimpleNamespace(
                     table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
