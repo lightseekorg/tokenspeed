@@ -91,7 +91,11 @@ SHAPE_SETS = {
             (2560, 2560, 0, "n2560_k2560"),
             (12800, 2560, 0, "n12800_k2560"),
         ],
-        [1, 2, 4, 8],
+        # Table keys on exact M; sweep the routed range with no holes. The
+        # earlier {1, 2, 4, 8} pass left holes that serving does hit --
+        # speculative-verify widths reached 12800x2560 at an unswept M and fell
+        # back to cublas.
+        list(range(1, 33)),
     ),
 }
 SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]

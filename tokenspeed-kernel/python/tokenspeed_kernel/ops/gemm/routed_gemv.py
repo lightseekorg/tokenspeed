@@ -34,6 +34,11 @@ maintenance obligation. Shapes not listed keep the selection they had
 (rowcta at M == 1, torch.mm otherwise). The table is data, not policy:
 re-run the sweep on new hardware or after a kernel change and replace the
 literals wholesale.
+
+One group of entries is interpolated rather than measured, and says so inline:
+12800x2560 at M == 3, 5, 6, 7. The ``qwen38_next_tp4`` sweep only covered M in
+{1, 2, 4, 8}, so those widths were never timed. They carry no 4% guarantee and
+are the first thing a re-sweep should overwrite.
 """
 
 from __future__ import annotations
@@ -284,11 +289,29 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (2, 2560, 2560): "ll_bf16",  # 3.36 vs 6.37 (1.90x)
         (4, 2560, 2560): "ll_bf16",  # 3.40 vs 6.08 (1.79x)
         (8, 2560, 2560): "ll_bf16",  # 3.40 vs 6.35 (1.87x)
-        # 12800x2560's margins shrink as M grows and invert at 8 (cublas 13.70
-        # vs ll_bf16 13.43, inside the margin), so M == 8 keeps cublas.
+        # 12800x2560 is the PLE kv_proj (hc_hidden + hidden = 2560 * 5). Its
+        # margins shrink as M grows and invert at 8 (cublas 13.70 vs ll_bf16
+        # 13.43, inside the margin), so M == 8 keeps cublas.
         (1, 12800, 2560): "skinny",  # 11.07 vs 14.62 (1.32x)
         (2, 12800, 2560): "skinny",  # 11.81 vs 14.38 (1.22x)
         (4, 12800, 2560): "ll_bf16",  # 13.31 vs 14.43 (1.08x)
+        # INTERPOLATED, not measured -- see the module docstring. The sweep ran
+        # M in {1, 2, 4, 8}, so speculative-verify widths landed in a hole and
+        # took the cublas fallback: 20.9us in an nsys trace of serving, against
+        # 14.43 for measured M == 4. These four ride the M == 4 win alone, and
+        # the split-K tactic they pick up ((4, 4) at M >= 5) was tuned on
+        # 7168x896, not here.
+        (3, 12800, 2560): "ll_bf16",
+        (5, 12800, 2560): "ll_bf16",
+        (6, 12800, 2560): "ll_bf16",
+        (7, 12800, 2560): "ll_bf16",
+        # M >= 9 stays unlisted deliberately, not for lack of a guess. Nothing
+        # anchors it: the measured trend here already favours cublas by M == 8,
+        # N = 12800 is the widest shape in the table (65MB of weight, so it
+        # leaves the memory-bound regime the specialized kernels win in), and
+        # the only shapes holding a specialized backend past M == 8 are the
+        # narrow 768/1152x1536 pair. 2880x7168 shows what extrapolating costs:
+        # skinny inverts there to 15.85 against cublas 11.06.
     }
 )
 
