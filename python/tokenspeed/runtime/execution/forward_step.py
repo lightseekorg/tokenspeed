@@ -263,15 +263,6 @@ class ForwardStepRunner:
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
-            # Drafter reads the TARGET's group tables (_draft_group_tables):
-            # its page-size view must match the target's hetero geometry.
-            target_ps = getattr(attn_backend, "group_block_granularities", None)
-            draft_ps = getattr(draft_attn_backend, "group_block_granularities", None)
-            if target_ps and draft_ps is not None:
-                for gid in self._draft_cache_group_ids():
-                    if gid in target_ps:
-                        draft_ps[gid] = target_ps[gid]
-
             # Target and draft resolve the same batch-ordered full-history
             # table (the target from cache metadata, the draft from the
             # published draft page table), so both backends would compute

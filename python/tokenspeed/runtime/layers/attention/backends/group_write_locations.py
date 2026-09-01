@@ -26,7 +26,7 @@ dict of locations over per-group tables with heterogeneous granularities,
 the MLA family computes one location tensor over the single full-history
 table. Everything here is stateless — callers pass the geometry explicitly,
 so the math is testable without a backend instance and can never read stale
-mixin state.
+backend state.
 """
 
 from __future__ import annotations

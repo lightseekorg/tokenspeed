@@ -323,8 +323,8 @@ class MHAAttnBackend(AttentionBackend):
 
         self.cuda_graph_decode_metadata = {}
         # Per-group persistent buffers, parallels cuda_graph_page_table.
-        # Initialized before the DFLASH early return: the mixin's view
-        # builder and the LCM published-groups contract check read the dict.
+        # Initialized before the DFLASH early return: the base view builder
+        # and the LCM published-groups contract check read the dict.
         self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: expand to spec_num_tokens decode rows per

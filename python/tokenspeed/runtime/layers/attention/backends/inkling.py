@@ -181,8 +181,8 @@ class InklingAttnBackend(AttentionBackend):
         # Paged conv geometry (see _inkling_conv_columns). Mandatory: the
         # sconv state always has its paged bridges; there is no rolling mode.
         self.conv_columns = conv_columns
-        # The conv groups are wrapper-owned: the inner mixin must skip their
-        # write-loc math and capture buffers (see AttentionBackend's
+        # The conv groups are wrapper-owned: the inner backend must skip
+        # their write-loc math and capture buffers (see AttentionBackend's
         # engine_owned_group_ids).
         inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
         # Two slots, like forward_prefill_metadata / forward_decode_metadata
@@ -891,7 +891,8 @@ class InklingAttnBackend(AttentionBackend):
         # seq_lens_buf; replay copies the live lengths in, so graph state does
         # not depend on the controller mutating a shared tensor in place.
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
+        # Adopted stacked views are filled by the inner backend's packed
+        # unpack (GroupGraphBuffers.fill); pad rows hit dummy slot 0.
         inner_tabs = getattr(self.inner, "cuda_graph_page_tables", {})
         groups = self.conv_columns["group_block_tokens"]
         self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
@@ -992,7 +993,7 @@ class InklingAttnBackend(AttentionBackend):
                     f"paged sconv decode: no {g!r} table in block_tables"
                 )
             if adopted_filled:
-                # The inner mixin's packed unpack already filled the shared stack rows this step.
+                # The inner backend's packed unpack already filled the shared stack rows this step.
                 continue
             cols = min(src.shape[1], buf.shape[1])
             rows = min(src.shape[0], bs)

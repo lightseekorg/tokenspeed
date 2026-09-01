@@ -210,13 +210,10 @@ class AttentionBackend(ABC):
         """Expand a batch-ordered raw table (scheduler pages of the
         full-history grain) into this backend's kernel pages,
         ``self.max_num_pages`` wide (see cache_group_geometry)."""
-        geometry = getattr(self, "_geometry", None)
         return expand_history_table(
             raw,
             history_block_granularity=(
-                geometry.history_block_granularity
-                if geometry is not None and geometry.history_block_granularity
-                else self.kernel_page_size
+                self._geometry.history_block_granularity or self.kernel_page_size
             ),
             kernel_page_size=self.kernel_page_size,
             max_kernel_pages=self.max_num_pages,
@@ -503,7 +500,7 @@ class AttentionBackend(ABC):
         at replay and pins the capture-time group set (a draft may consume a
         family subset of its buffers); empty for single-table backends. The
         base default is a no-op — refresh builds views lazily — and the
-        cache-group mixins override it so capture records the exact
+        group-routing backends override it so capture records the exact
         per-group views replay refreshes.
         """
 

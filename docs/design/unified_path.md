@@ -231,8 +231,9 @@ captured graph never recorded — are assertable: capture snapshots the tensor
 identities reachable from the decode-metadata slots (`graph_ptr_guard`), and
 `TOKENSPEED_GRAPH_DEBUG=1` re-verifies them before every replay (production
 replays pay one bool check). Per-step-mutable objects a replay never reads
-through Python are exempted via `graph_unstable_metadata_fields` (FlashMLA's
-eager tile schedule is the one occupant). What unification still can NOT
+through Python are exempted via `graph_unstable_metadata_fields` (two
+occupants: FlashMLA's eager tile schedule, and V4's `cache` slot, which
+refresh replaces wholesale each step). What unification still can NOT
 test: mempool reuse and hostfunc semantics — the e2e regression matrix keeps
 graph-on and graph-off configurations for this reason.
 
@@ -245,11 +246,11 @@ True). The invariant replacing it: **any table a backend receives — the
 per-group `block_tables`, the staged draft `page_table`, a warmup
 placeholder — carries raw scheduler pages; kernel-page expansion happens
 inside the backend, through the one shared `expand_history_table`
-(`cache_group_geometry.py`; both mixins learn the full-history grain from
-the pool's specs at `set_cache_pool` into one `CacheGroupGeometry` value
-object)**. The mixins themselves are routing layers: the write-location
-slot math lives in `group_write_locations.py` as pure functions, and the
-stacked per-group CUDA-graph buffers live in
+(`cache_group_geometry.py`; the base `set_cache_pool` learns the
+full-history grain from the pool's specs into one `CacheGroupGeometry`
+value object)**. The routing surface lives on `AttentionBackend` itself:
+the write-location slot math lives in `group_write_locations.py` as pure
+functions, and the stacked per-group CUDA-graph buffers live in
 `group_graph_buffers.GroupGraphBuffers`, composed at graph-state init.
 `CacheBatchMetadata` no longer carries a `kernel_table` expansion;
 `cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
