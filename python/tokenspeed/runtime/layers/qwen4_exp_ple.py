@@ -60,6 +60,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.utils import add_prefix
 
+_IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+# Uniform-batch index bundles, keyed by the shape that fully determines them, so
+# a captured graph holds no kernels for them at all. Entries are never evicted:
+# a replay reads the addresses its capture recorded, so freeing one would let
+# the allocator hand that memory to someone else and feed a replay another
+# tensor's bytes. The key set is bounded by the capture buckets and each bundle
+# is a few index rows, so holding them costs little.
+_UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
+
 
 def _is_prime(value: int) -> bool:
     if value < 2:
@@ -565,6 +574,11 @@ class Qwen4ExpPLELayer(nn.Module):
         is why :meth:`Qwen4ExpPLELayer.forward` has to run as an eager break
         rather than being captured.
 
+        The uniform bundle is memoized, since ``(bs, max_len)`` is fixed for a
+        capture bucket and recomputing it cost seven elementwise kernels per
+        replay. The cached tensors are shared between calls, so consumers must
+        treat them as read-only.
+
         ``starts`` is each request's first flat token index. It belongs to the
         bundle because every consumer of ``req`` needs it to reach the tokens
         themselves, and the ragged path has to compute it for ``col`` anyway.
@@ -573,13 +587,20 @@ class Qwen4ExpPLELayer(nn.Module):
         bs = len(lengths)
         total = int(sum(lengths))
         max_len = max(lengths) if lengths else 0
-        positions = torch.arange(total, device=device, dtype=torch.long)
         if bs and max_len > 0 and max_len * bs == total:
-            req = positions // max_len
-            col = positions - req * max_len
-            lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
-            starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
+            key = (bs, max_len, device)
+            bundle = _UNIFORM_INDEX_CACHE.get(key)
+            if bundle is None:
+                positions = torch.arange(total, device=device, dtype=torch.long)
+                req = positions // max_len
+                col = positions - req * max_len
+                lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
+                starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
+                bundle = (req, col, lengths_t, starts)
+                _UNIFORM_INDEX_CACHE[key] = bundle
+            req, col, lengths_t, starts = bundle
         else:
+            positions = torch.arange(total, device=device, dtype=torch.long)
             lengths_t = torch.tensor(lengths, device=device, dtype=torch.long)
             ends = torch.cumsum(lengths_t, dim=0)
             starts = ends - lengths_t
