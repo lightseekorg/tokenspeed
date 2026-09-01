@@ -36,7 +36,7 @@ ts serve \
     --moe-backend flashinfer_trtllm \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --enable-cache-report \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
@@ -57,7 +57,7 @@ ts serve \
     --trust-remote-code \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --enable-cache-report \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
@@ -91,7 +91,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -121,7 +121,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -134,7 +134,7 @@ Notes:
   draft queries, and the step count is always the verify width minus one. The
   width is checked against the checkpoint's `block_size` at startup, so a
   mismatched launch fails fast instead of drafting a wrong-width block.
-- `--block-size 128` is the target's MSA page size. The draft writes its KV at
+- `--prefix-granularity 128` is the target's MSA page size. The draft writes its KV at
   the target's cache locations and shares the target's page table, so it
   inherits that page size; do not set a separate draft block size.
 - The draft's 1024-token sliding window is an attention mask its own layers
@@ -745,8 +745,8 @@ tokenspeed serve openai/gpt-oss-120b \
 
 DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
 indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override). Requires
+and `--tool-call-parser deepseek_v4`, and auto-sets `prefix_granularity=256` (pass
+`--prefix-granularity N` with `N != 64` to override). Requires
 `tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:

@@ -103,7 +103,7 @@ distributed update mode until that implementation is added.
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--block-size` | KV cache block size. |
+| `--prefix-granularity` | Scheduler prefix granularity in tokens: the identity boundary of cache reuse. `--block-size` is a deprecated alias. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -196,7 +196,7 @@ startup rather than silently drafting a wrong-width block. A checkpoint with
 --speculative-num-steps 7`.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
-target's page table: `--block-size` is a target-side choice and the draft
+target's page table: `--prefix-granularity` is a target-side choice and the draft
 follows it. Any sliding window the draft checkpoint declares is an attention
 mask applied by the draft's own layers, never a cache-retention policy of its
 own.
