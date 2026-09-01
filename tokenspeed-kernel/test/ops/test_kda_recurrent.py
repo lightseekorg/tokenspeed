@@ -948,6 +948,50 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
     assert captured_kwargs["norm_eps"] is None
 
 
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_kda_fused_decode_reports_backend_requirements_to_dispatch(
+    monkeypatch, staged: bool, prepared: bool
+) -> None:
+    captured_traits = []
+    kernel_name = "triton_nvidia_kda_fused_paged_verify_no_store"
+
+    class FakeKernel:
+        name = kernel_name
+
+        def __call__(self, **kwargs):
+            return kwargs["mixed_qkv"]
+
+    def fake_select(*_args, **kwargs):
+        captured_traits.append(kwargs["traits"])
+        return FakeKernel()
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    write_indices = tensor if staged else torch.empty_like(tensor)
+    result = kda_fused_paged_decode(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        read_indices=tensor,
+        write_indices=write_indices,
+        num_heads=12,
+        head_dim=128,
+        cu_seqlens=tensor,
+        prepared_weights=object() if prepared else None,
+    )
+
+    assert result is not None
+    assert captured_traits[0]["staged_state"] is staged
+    assert captured_traits[0]["prepared_weights"] is prepared
+
+
 def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
     """Unsupported convolution widths must fall back before kernel execution."""
     if not (current_platform().is_cdna4 or current_platform().is_cdna5):
@@ -1033,6 +1077,11 @@ def _megafuse_inputs(batch: int, seed: int = 17):
     }
 
 
+def _sequence_major_conv_state(conv_state: torch.Tensor) -> torch.Tensor:
+    """Copy logical [page, feature, tap] values into persistent SD layout."""
+    return conv_state.transpose(1, 2).contiguous().transpose(1, 2)
+
+
 def _run_megafuse(inp, *, fused: bool):
     """One megafuse decode, with the norm epilogue fused in or applied after."""
     from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
@@ -1095,6 +1144,30 @@ def test_kda_megafuse_fused_norm_matches_separate_norm(batch: int) -> None:
     # The epilogue must not disturb the state it writes back.
     torch.testing.assert_close(inp["conv_states"], conv_ref)
     torch.testing.assert_close(inp["state_pool"], state_ref)
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_kda_megafuse_sequence_major_conv_matches_feature_major(batch: int) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA triton KDA megafusion test")
+
+    source = _megafuse_inputs(batch, seed=20260829)
+    feature = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in source.items()}
+    sequence = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in source.items()}
+    sequence["conv_states"] = _sequence_major_conv_state(source["conv_states"])
+    channels = sequence["conv_states"].shape[1]
+    assert sequence["conv_states"].stride()[1:] == (1, channels)
+
+    feature_out = _run_megafuse(feature, fused=True)
+    sequence_out = _run_megafuse(sequence, fused=True)
+
+    torch.testing.assert_close(sequence_out, feature_out, atol=0, rtol=0)
+    torch.testing.assert_close(
+        sequence["conv_states"], feature["conv_states"], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        sequence["state_pool"], feature["state_pool"], atol=0, rtol=0
+    )
 
 
 def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:

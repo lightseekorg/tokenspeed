@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -46,6 +48,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "compute_group_decode_locs",
+    "KdaGroupedStateCopyDescriptor",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -339,6 +342,257 @@ def copy_state_rows(
     )
 
 
+@triton.jit
+def _copy_kda_state_row(
+    pointer,
+    row_stride,
+    src_row,
+    dst_row,
+    tile_index,
+    ROW_U64: tl.constexpr,
+    BLOCK_U64: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+):
+    if NUM_TILES == 1:
+        tile_start = 0
+        tile_end = ROW_U64
+    else:
+        per_tile = tl.cdiv(tl.cdiv(ROW_U64, NUM_TILES), BLOCK_U64) * BLOCK_U64
+        tile_start = tile_index.to(tl.int64) * per_tile
+        tile_end = tl.minimum(tile_start + per_tile, ROW_U64)
+    for start in range(tile_start, tile_end, BLOCK_U64):
+        offsets = start + tl.arange(0, BLOCK_U64)
+        mask = offsets < tile_end
+        values = tl.load(
+            pointer + src_row * row_stride + offsets.to(tl.int64),
+            mask=mask & (src_row >= 0),
+            other=0,
+        )
+        tl.store(
+            pointer + dst_row * row_stride + offsets.to(tl.int64),
+            values,
+            mask=mask,
+        )
+
+
+@triton.jit
+def _copy_kda_grouped_state_rows_kernel(
+    conv_addresses_ptr,
+    conv_row_strides_ptr,
+    recurrent_addresses_ptr,
+    recurrent_row_strides_ptr,
+    group_sel_ptr,
+    read_group_0,
+    read_group_1,
+    read_group_2,
+    write_group_0,
+    write_group_1,
+    write_group_2,
+    batch_size,
+    CONV_ROW_U64: tl.constexpr,
+    RECURRENT_ROW_U64: tl.constexpr,
+    BLOCK_U64: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+):
+    """Copy KDA conv and recurrent COW rows in one launch."""
+    program_index = tl.program_id(0)
+    work_index = program_index // NUM_TILES
+    tile_index = program_index - work_index * NUM_TILES
+    layer_index = work_index // batch_size
+    request_index = work_index - layer_index * batch_size
+    group = tl.load(group_sel_ptr + layer_index)
+
+    src_0 = tl.load(read_group_0 + request_index).to(tl.int64)
+    src_1 = tl.load(read_group_1 + request_index).to(tl.int64)
+    src_2 = tl.load(read_group_2 + request_index).to(tl.int64)
+    dst_0 = tl.load(write_group_0 + request_index).to(tl.int64)
+    dst_1 = tl.load(write_group_1 + request_index).to(tl.int64)
+    dst_2 = tl.load(write_group_2 + request_index).to(tl.int64)
+    src_row = tl.where(group == 0, src_0, tl.where(group == 1, src_1, src_2))
+    dst_row = tl.where(group == 0, dst_0, tl.where(group == 1, dst_1, dst_2))
+
+    # The common path is in-place. A negative destination is graph padding;
+    # a negative source paired with a live destination zero-initializes it.
+    if (src_row == dst_row) | (dst_row < 0):
+        return
+
+    if tile_index == 0:
+        conv_pointer = tl.cast(
+            tl.load(conv_addresses_ptr + layer_index),
+            tl.pointer_type(tl.uint64),
+        )
+        _copy_kda_state_row(
+            conv_pointer,
+            tl.load(conv_row_strides_ptr + layer_index),
+            src_row,
+            dst_row,
+            0,
+            ROW_U64=CONV_ROW_U64,
+            BLOCK_U64=BLOCK_U64,
+            NUM_TILES=1,
+        )
+    recurrent_pointer = tl.cast(
+        tl.load(recurrent_addresses_ptr + layer_index),
+        tl.pointer_type(tl.uint64),
+    )
+    _copy_kda_state_row(
+        recurrent_pointer,
+        tl.load(recurrent_row_strides_ptr + layer_index),
+        src_row,
+        dst_row,
+        tile_index,
+        ROW_U64=RECURRENT_ROW_U64,
+        BLOCK_U64=BLOCK_U64,
+        NUM_TILES=NUM_TILES,
+    )
+
+
+@dataclass(frozen=True)
+class _KdaStateCopyTable:
+    components: tuple[torch.Tensor, ...]
+    addresses: torch.Tensor
+    row_strides: torch.Tensor
+    row_bytes: int
+
+    @classmethod
+    def build(cls, components: Sequence[torch.Tensor]) -> "_KdaStateCopyTable":
+        components = tuple(components)
+        if not components:
+            raise ValueError("components must not be empty")
+        device = components[0].device
+        if device.type != "cuda" or any(value.device != device for value in components):
+            raise ValueError("all components must be CUDA tensors on one device")
+        if components[0].ndim < 2:
+            raise ValueError("components must include a page dimension")
+        pages = components[0].shape[0]
+        itemsize = components[0].element_size()
+        row_elements = components[0].numel() // pages
+        row_bytes = row_elements * itemsize
+        if row_bytes % 8:
+            raise ValueError("KDA state rows must be uint64 aligned")
+        for value in components:
+            if value.ndim < 2 or value.shape[0] != pages:
+                raise ValueError("components must have a common page dimension")
+            if (
+                value.element_size() != itemsize
+                or value.numel() // pages != row_elements
+            ):
+                raise ValueError("components must have a uniform row payload")
+            # Dense inner permutations are legal (notably sequence-major conv),
+            # but padding/overlap inside a page would make a raw row copy unsafe.
+            inner_span = 1 + sum(
+                (value.shape[axis] - 1) * value.stride(axis)
+                for axis in range(1, value.ndim)
+            )
+            if inner_span != row_elements or value.stride(0) < inner_span:
+                raise ValueError(
+                    "each component page must be physically dense and disjoint"
+                )
+            if value.data_ptr() % 8 or value.stride(0) * itemsize % 8:
+                raise ValueError("KDA state rows must be uint64 aligned")
+        addresses = torch.tensor(
+            [value.data_ptr() for value in components],
+            dtype=torch.uint64,
+            device=device,
+        )
+        row_strides = torch.tensor(
+            [value.stride(0) * itemsize // 8 for value in components],
+            dtype=torch.int64,
+            device=device,
+        )
+        return cls(components, addresses, row_strides, row_bytes)
+
+
+def _kda_recurrent_copy_tiles(batch_size: int) -> int:
+    # Cap low-concurrency row parallelism at 16 CTAs; above C16, keep
+    # batch_size * tiles near 256 so the graph's usual no-op grid stays cheap.
+    if batch_size <= 16:
+        return 16
+    if batch_size <= 32:
+        return 8
+    if batch_size <= 64:
+        return 4
+    if batch_size <= 128:
+        return 2
+    return 1
+
+
+@dataclass(frozen=True)
+class KdaGroupedStateCopyDescriptor:
+    """Capture-stable fused COW plan for Kimi-K3's three state groups."""
+
+    conv: _KdaStateCopyTable
+    recurrent: _KdaStateCopyTable
+    group_sel: torch.Tensor
+
+    @classmethod
+    def build(
+        cls,
+        conv_components: Sequence[torch.Tensor],
+        recurrent_components: Sequence[torch.Tensor],
+        group_sel: Sequence[int],
+    ) -> "KdaGroupedStateCopyDescriptor":
+        """Build the fused descriptor before graph capture."""
+        conv = _KdaStateCopyTable.build(conv_components)
+        recurrent = _KdaStateCopyTable.build(recurrent_components)
+        if len(conv.components) != len(recurrent.components):
+            raise ValueError("conv and recurrent components must have equal length")
+        if len(group_sel) != len(conv.components) or any(
+            group not in (0, 1, 2) for group in group_sel
+        ):
+            raise ValueError("group_sel must contain one group id in [0, 2] per layer")
+        if conv.addresses.device != recurrent.addresses.device:
+            raise ValueError("conv and recurrent components must share one device")
+        if conv.components[0].shape[0] != recurrent.components[0].shape[0]:
+            raise ValueError("conv and recurrent components must share page geometry")
+        groups = torch.tensor(
+            group_sel, dtype=torch.int32, device=conv.addresses.device
+        )
+        return cls(conv, recurrent, groups)
+
+    def copy(
+        self,
+        read_groups: Sequence[torch.Tensor],
+        write_groups: Sequence[torch.Tensor],
+        *,
+        batch_size: int,
+    ) -> None:
+        """Copy live COW rows selected by the current graph metadata."""
+        if batch_size == 0:
+            return
+        if len(read_groups) != 3 or len(write_groups) != 3:
+            raise ValueError("exactly three read and three write groups are required")
+        for indices in (*read_groups, *write_groups):
+            if (
+                indices.device != self.conv.addresses.device
+                or indices.dtype not in (torch.int32, torch.int64)
+                or indices.ndim != 1
+                or indices.numel() < batch_size
+            ):
+                raise ValueError(
+                    "group indices must be 1D CUDA int32/int64 buffers "
+                    "with batch capacity"
+                )
+        num_tiles = _kda_recurrent_copy_tiles(batch_size)
+        block_u64 = 1024
+        _copy_kda_grouped_state_rows_kernel[
+            (len(self.conv.components) * batch_size * num_tiles,)
+        ](
+            self.conv.addresses,
+            self.conv.row_strides,
+            self.recurrent.addresses,
+            self.recurrent.row_strides,
+            self.group_sel,
+            *read_groups,
+            *write_groups,
+            batch_size,
+            CONV_ROW_U64=self.conv.row_bytes // 8,
+            RECURRENT_ROW_U64=self.recurrent.row_bytes // 8,
+            BLOCK_U64=block_u64,
+            NUM_TILES=num_tiles,
+        )
+
+
 # -----------------------------------------------------------------------------
 # Flat hybrid cache page sanitization
 # -----------------------------------------------------------------------------
@@ -459,9 +713,7 @@ def store_sf_interleaved(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
     """
-    assert (
-        page_size % 128 == 0
-    ), f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
+    assert page_size % 128 == 0, f"page_size must be a multiple of 128: {page_size}"
     num_tokens, nheads, sf_dim = sf_in.shape
     assert sf_dim == 4, f"expected sf_dim=4 (head_dim 128 / 32), got {sf_dim}"
     if num_tokens == 0:
@@ -948,9 +1200,7 @@ def store_kv_cache(
         return
     n_kv_k = k_src.numel() // n_tokens
     n_kv_v = v_src.numel() // n_tokens
-    assert (
-        n_kv_k == n_kv_v
-    ), f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
+    assert n_kv_k == n_kv_v, f"k/v row sizes differ: {n_kv_k} vs {n_kv_v}"
     assert k_src.stride(-1) == 1 and v_src.stride(-1) == 1
     assert k_dst.stride(-1) == 1 and v_dst.stride(-1) == 1
 
@@ -1178,34 +1428,23 @@ def fused_fp8_set_kv_buffer(
 
     if k_cache.ndim == 3:
         total_slots, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            total_slots % page_size == 0
-        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+        assert total_slots % page_size == 0, f"invalid slots: {total_slots}"
     elif k_cache.ndim == 4:
         _, ps, num_kv_heads, head_dim = k_cache.shape
-        assert (
-            ps == page_size
-        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
+        assert ps == page_size, f"cache page_size={ps}, expected {page_size}"
     else:
         raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
 
     if k.ndim == 3:
-        assert (
-            k.shape[1] == num_kv_heads
-        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
-        assert (
-            k.shape[2] == head_dim
-        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+        assert k.shape[1] == num_kv_heads, f"invalid k heads: {k.shape[1]}"
+        assert k.shape[2] == head_dim, f"k dim={k.shape[2]}, expected {head_dim}"
         assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
         k_3d = k
         v_3d = v
     elif k.ndim == 2:
-        assert (
-            k.shape[1] == num_kv_heads * head_dim
-        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
-        assert (
-            v.shape[1] == num_kv_heads * head_dim
-        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+        expected_width = num_kv_heads * head_dim
+        assert k.shape[1] == expected_width, f"invalid k width: {k.shape[1]}"
+        assert v.shape[1] == expected_width, f"invalid v width: {v.shape[1]}"
         k_3d = k.view(num_tokens, num_kv_heads, head_dim)
         v_3d = v.view(num_tokens, num_kv_heads, head_dim)
     else:

@@ -41,7 +41,7 @@ class _Stream:
         self.waited_events.append(event)
 
 
-def test_layerwise_load_waits_for_the_selected_event_set(monkeypatch):
+def _load_tracker_module(monkeypatch):
     module_name = "tokenspeed.runtime.cache.l2.layerwise_load"
     package = importlib.import_module("tokenspeed.runtime.cache.l2")
     monkeypatch.delitem(sys.modules, module_name, raising=False)
@@ -55,8 +55,12 @@ def test_layerwise_load_waits_for_the_selected_event_set(monkeypatch):
             get_device_module=lambda: device_module,
         ),
     )
+    return importlib.import_module(module_name), stream
 
-    module = importlib.import_module(module_name)
+
+def test_layerwise_load_waits_for_the_selected_event_set(monkeypatch):
+    module, stream = _load_tracker_module(monkeypatch)
+
     tracker = module.LayerwiseLoadTracker(num_layers=2)
     load_index = tracker.begin_load()
     tracker.set_consumers(load_index)
@@ -64,3 +68,23 @@ def test_layerwise_load_waits_for_the_selected_event_set(monkeypatch):
     tracker.wait_for_layer(1)
 
     assert stream.waited_events == [tracker.event_sets[load_index].layer_done_events[1]]
+
+
+def test_cross_layer_wait_uses_the_restore_finish_event(monkeypatch):
+    module, stream = _load_tracker_module(monkeypatch)
+
+    tracker = module.LayerwiseLoadTracker(num_layers=2)
+    load_index = tracker.begin_load()
+    tracker.set_consumers(load_index)
+    finish = tracker.event_sets[load_index].last_layer_done_event
+    finish.query = lambda: False
+
+    tracker.wait_for_all_layers()
+
+    assert stream.waited_events == [finish]
+
+    finish.query = lambda: True
+    tracker.wait_for_all_layers()
+
+    assert tracker.consumer_indices == ()
+    assert stream.waited_events == [finish]

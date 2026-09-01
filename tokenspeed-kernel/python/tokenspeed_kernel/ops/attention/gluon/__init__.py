@@ -595,6 +595,8 @@ if current_platform().is_amd:
         f_a_dim: int,
         qkv_stride: int,
         conv_stride: int,
+        conv_feature_stride: int,
+        conv_history_stride: int,
         f_a_stride: int,
         beta_stride: int,
         state_stride: int,
@@ -604,6 +606,8 @@ if current_platform().is_amd:
         lower_bound: float,
     ) -> None:
         """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
+        if (conv_feature_stride, conv_history_stride) != (3, 1):
+            raise ValueError("gfx950 KDA replay requires feature-major conv state")
         _kda_fused_replay_impl(
             descriptors,
             read_indices,
@@ -844,6 +848,8 @@ if current_platform().is_amd:
         f_a_dim: int,
         qkv_stride: int,
         conv_stride: int,
+        conv_feature_stride: int,
+        conv_history_stride: int,
         f_a_stride: int,
         beta_stride: int,
         state_stride: int,
@@ -853,6 +859,8 @@ if current_platform().is_amd:
         lower_bound: float,
     ) -> None:
         """Replay all gfx1250 layers from persistent BF16 raw-g descriptors."""
+        if (conv_feature_stride, conv_history_stride) != (3, 1):
+            raise ValueError("gfx1250 KDA replay requires feature-major conv state")
         _kda_fused_replay_gfx1250_impl(
             descriptors,
             read_indices,

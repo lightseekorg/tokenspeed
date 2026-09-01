@@ -27,6 +27,9 @@ from typing import ClassVar
 
 import torch
 
+from tokenspeed.runtime.layers.attention.kda_geometry import (
+    kda_conv_state_channel_axis,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
     derive_state_groups_by_layer,
 )
@@ -62,8 +65,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     # A KDA layer has conv/recurrent planes planned and an MLA layer has a
     # latent plane; the plan's field list decides per layer. Latent-page
     # contiguity is a plan invariant (exact_page_stride).
-    # State planes keep their planned shape: the KDA decode ABI reads them
-    # as the plan lays them out.
+    # Recurrent planes keep their planned shape. A history-major convolution
+    # plane is exposed as a zero-copy sequence-major compute view below.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
@@ -77,11 +80,35 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         # A state layer with no planned planes belongs to another pipeline
         # stage (the PP-narrowed plan drops its fields); this view never
         # executes it, so it gets no entry.
-        self._state_buffers_by_layer = {
-            layer_id: (self._conv_state[layer_id], self._recurrent_state[layer_id])
-            for layer_id, label in enumerate(self._layer_types)
-            if label in STATE_LAYER_TYPES and self._conv_state[layer_id] is not None
-        }
+        self._state_buffers_by_layer = {}
+        for layer_id, label in enumerate(self._layer_types):
+            physical_conv = self._conv_state[layer_id]
+            if label not in STATE_LAYER_TYPES or physical_conv is None:
+                continue
+            if physical_conv.ndim != 3:
+                raise RuntimeError(
+                    "KDA convolution state must have three dimensions, "
+                    f"got {tuple(physical_conv.shape)}"
+                )
+            recurrent = self._recurrent_state[layer_id]
+            if recurrent is None:
+                raise RuntimeError("KDA convolution state has no recurrent peer")
+            channels = 3 * recurrent.shape[1] * recurrent.shape[-1]
+            channel_axis = kda_conv_state_channel_axis(
+                tuple(physical_conv.shape[1:]), channels=channels
+            )
+            conv = physical_conv if channel_axis == 0 else physical_conv.transpose(1, 2)
+            channels, history = conv.shape[1:]
+            supported_strides = {(history, 1), (1, channels)}
+            if conv.stride()[1:] not in supported_strides:
+                raise RuntimeError(
+                    "KDA convolution state must use a dense supported layout, "
+                    f"got {tuple(conv.stride())}"
+                )
+            self._state_buffers_by_layer[layer_id] = (
+                conv,
+                recurrent,
+            )
 
     @property
     def num_lcm_blocks(self) -> int:

@@ -26,6 +26,28 @@ import triton
 import triton.language as tl
 
 
+def _conv_state_inner_strides(
+    conv_pool: torch.Tensor,
+    channels: int,
+    *,
+    name: str = "conv_pool",
+) -> tuple[int, int]:
+    """Validate a dense convolution row and return its inner strides."""
+    if conv_pool.ndim != 3 or conv_pool.shape[1] < channels or conv_pool.shape[2] != 3:
+        raise ValueError(
+            f"{name} must have shape [blocks, >= {channels}, 3], got "
+            f"{tuple(conv_pool.shape)}"
+        )
+    physical_channels = conv_pool.shape[1]
+    feature_stride, history_stride = conv_pool.stride()[1:]
+    if (feature_stride, history_stride) not in {(3, 1), (1, physical_channels)}:
+        raise ValueError(
+            f"{name} must use a dense feature-major or sequence-major layout, "
+            f"got stride={tuple(conv_pool.stride())}"
+        )
+    return feature_stride, history_stride
+
+
 @triton.jit
 def _softplus(x):
     return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)
@@ -531,6 +553,8 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     BV: tl.constexpr,
     stride_state_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    stride_conv_feature: tl.constexpr,
+    stride_conv_history: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
@@ -589,15 +613,51 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     s_v2 = tl.zeros([BV], dtype=tl.float32)
     if read_ok:
         cp = conv_pool + b_read * stride_conv_page
-        s_q0 = tl.load(cp + qf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_q1 = tl.load(cp + qf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_q2 = tl.load(cp + qf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_k0 = tl.load(cp + kf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_k1 = tl.load(cp + kf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_k2 = tl.load(cp + kf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_v0 = tl.load(cp + vf * 3 + 0, mask=mask_v, other=0.0).to(tl.float32)
-        s_v1 = tl.load(cp + vf * 3 + 1, mask=mask_v, other=0.0).to(tl.float32)
-        s_v2 = tl.load(cp + vf * 3 + 2, mask=mask_v, other=0.0).to(tl.float32)
+        s_q0 = tl.load(
+            cp + qf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_q1 = tl.load(
+            cp + qf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_q2 = tl.load(
+            cp + qf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k0 = tl.load(
+            cp + kf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k1 = tl.load(
+            cp + kf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k2 = tl.load(
+            cp + kf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_v0 = tl.load(
+            cp + vf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        s_v1 = tl.load(
+            cp + vf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        s_v2 = tl.load(
+            cp + vf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
     acc_q += (
         s_q0 * tl.load(conv_w + qf * 4 + 0, mask=mask_k, other=0.0).to(tl.float32)
         + s_q1 * tl.load(conv_w + qf * 4 + 1, mask=mask_k, other=0.0).to(tl.float32)
@@ -620,15 +680,36 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     # conv state update (shift window); q/k dupes across NV write same values.
     if b_write >= 0:
         cw = conv_pool + b_write * stride_conv_page
-        tl.store(cw + qf * 3 + 0, s_q1.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + qf * 3 + 1, s_q2.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + qf * 3 + 2, x_q.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + kf * 3 + 0, s_k1.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + kf * 3 + 1, s_k2.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + kf * 3 + 2, x_k.to(cw.dtype.element_ty), mask=mask_k)
-        tl.store(cw + vf * 3 + 0, s_v1.to(cw.dtype.element_ty), mask=mask_v)
-        tl.store(cw + vf * 3 + 1, s_v2.to(cw.dtype.element_ty), mask=mask_v)
-        tl.store(cw + vf * 3 + 2, x_v.to(cw.dtype.element_ty), mask=mask_v)
+        q_dst = cw + qf * stride_conv_feature
+        k_dst = cw + kf * stride_conv_feature
+        v_dst = cw + vf * stride_conv_feature
+        tl.store(
+            q_dst + 0 * stride_conv_history, s_q1.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            q_dst + 1 * stride_conv_history, s_q2.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            q_dst + 2 * stride_conv_history, x_q.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            k_dst + 0 * stride_conv_history, s_k1.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            k_dst + 1 * stride_conv_history, s_k2.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            k_dst + 2 * stride_conv_history, x_k.to(cw.dtype.element_ty), mask=mask_k
+        )
+        tl.store(
+            v_dst + 0 * stride_conv_history, s_v1.to(cw.dtype.element_ty), mask=mask_v
+        )
+        tl.store(
+            v_dst + 1 * stride_conv_history, s_v2.to(cw.dtype.element_ty), mask=mask_v
+        )
+        tl.store(
+            v_dst + 2 * stride_conv_history, x_v.to(cw.dtype.element_ty), mask=mask_v
+        )
 
     # --- fused f_b: g_raw[c] = w_fb[c, :] . f_a for this head's K features ---
     o_fa = tl.arange(0, D_FA)
@@ -727,7 +808,11 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     stride_state_page: tl.constexpr,
     stride_state_out_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    stride_conv_feature: tl.constexpr,
+    stride_conv_history: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
+    stride_conv_out_feature: tl.constexpr,
+    stride_conv_out_history: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     HAS_PRECOMPUTED_GATE: tl.constexpr,
     HAS_PRECOMPUTED_CONV: tl.constexpr,
@@ -779,15 +864,51 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         s_v2 = tl.zeros([BV], dtype=tl.float32)
         if read_ok:
             cp = conv_pool + b_read * stride_conv_page
-            s_q0 = tl.load(cp + qf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-            s_q1 = tl.load(cp + qf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-            s_q2 = tl.load(cp + qf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-            s_k0 = tl.load(cp + kf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-            s_k1 = tl.load(cp + kf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-            s_k2 = tl.load(cp + kf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-            s_v0 = tl.load(cp + vf * 3 + 0, mask=mask_v, other=0.0).to(tl.float32)
-            s_v1 = tl.load(cp + vf * 3 + 1, mask=mask_v, other=0.0).to(tl.float32)
-            s_v2 = tl.load(cp + vf * 3 + 2, mask=mask_v, other=0.0).to(tl.float32)
+            s_q0 = tl.load(
+                cp + qf * stride_conv_feature + 0 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_q1 = tl.load(
+                cp + qf * stride_conv_feature + 1 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_q2 = tl.load(
+                cp + qf * stride_conv_feature + 2 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_k0 = tl.load(
+                cp + kf * stride_conv_feature + 0 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_k1 = tl.load(
+                cp + kf * stride_conv_feature + 1 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_k2 = tl.load(
+                cp + kf * stride_conv_feature + 2 * stride_conv_history,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            s_v0 = tl.load(
+                cp + vf * stride_conv_feature + 0 * stride_conv_history,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            s_v1 = tl.load(
+                cp + vf * stride_conv_feature + 1 * stride_conv_history,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            s_v2 = tl.load(
+                cp + vf * stride_conv_feature + 2 * stride_conv_history,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
 
     # initial recurrent state from the committed page
     p_h0 = h_pool + b_read * stride_state_page + i_hv * K * V
@@ -836,32 +957,53 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
             write_ok = b_write >= 0
             # per-position conv window (q/k dupes across NV write same values)
             cw = conv_out + b_write * stride_conv_out_page
+            q_dst = cw + qf * stride_conv_out_feature
+            k_dst = cw + kf * stride_conv_out_feature
+            v_dst = cw + vf * stride_conv_out_feature
             tl.store(
-                cw + qf * 3 + 0, s_q0.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                q_dst + 0 * stride_conv_out_history,
+                s_q0.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + qf * 3 + 1, s_q1.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                q_dst + 1 * stride_conv_out_history,
+                s_q1.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + qf * 3 + 2, s_q2.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                q_dst + 2 * stride_conv_out_history,
+                s_q2.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + kf * 3 + 0, s_k0.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                k_dst + 0 * stride_conv_out_history,
+                s_k0.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + kf * 3 + 1, s_k1.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                k_dst + 1 * stride_conv_out_history,
+                s_k1.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + kf * 3 + 2, s_k2.to(cw.dtype.element_ty), mask=mask_k & write_ok
+                k_dst + 2 * stride_conv_out_history,
+                s_k2.to(cw.dtype.element_ty),
+                mask=mask_k & write_ok,
             )
             tl.store(
-                cw + vf * 3 + 0, s_v0.to(cw.dtype.element_ty), mask=mask_v & write_ok
+                v_dst + 0 * stride_conv_out_history,
+                s_v0.to(cw.dtype.element_ty),
+                mask=mask_v & write_ok,
             )
             tl.store(
-                cw + vf * 3 + 1, s_v1.to(cw.dtype.element_ty), mask=mask_v & write_ok
+                v_dst + 1 * stride_conv_out_history,
+                s_v1.to(cw.dtype.element_ty),
+                mask=mask_v & write_ok,
             )
             tl.store(
-                cw + vf * 3 + 2, s_v2.to(cw.dtype.element_ty), mask=mask_v & write_ok
+                v_dst + 2 * stride_conv_out_history,
+                s_v2.to(cw.dtype.element_ty),
+                mask=mask_v & write_ok,
             )
 
         if HAS_PRECOMPUTED_GATE:
@@ -954,6 +1096,8 @@ def fused_kda_verify_conv_update_kernel(
     stride_raw_tok: tl.constexpr,
     stride_out_tok: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    stride_conv_feature: tl.constexpr,
+    stride_conv_history: tl.constexpr,
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -972,7 +1116,10 @@ def fused_kda_verify_conv_update_kernel(
         from_raw = i_window >= 3
         i_raw = i_window - 3
         b_state = tl.load(
-            conv_pool + safe_read * stride_conv_page + o_c * 3 + i_window,
+            conv_pool
+            + safe_read * stride_conv_page
+            + o_c * stride_conv_feature
+            + i_window * stride_conv_history,
             mask=mask_c & ~from_raw & (b_read >= 0),
             other=0.0,
         ).to(tl.float32)
@@ -1035,14 +1182,7 @@ def fused_kda_verify_conv_update(
         raise ValueError(f"conv_w must be contiguous with shape [{C}, 4]")
     if conv_w.dtype != qkv_raw.dtype:
         raise ValueError(f"conv_w must have dtype {qkv_raw.dtype}, got {conv_w.dtype}")
-    # A page may carry more channels; the kernel reads the leading C.
-    if conv_pool.ndim != 3 or conv_pool.shape[1] < C or conv_pool.shape[2] != 3:
-        raise ValueError(
-            f"conv_pool must have shape [pages, >= {C}, 3], got "
-            f"{tuple(conv_pool.shape)}"
-        )
-    if conv_pool.stride(-1) != 1 or conv_pool.stride(-2) != 3:
-        raise ValueError("conv_pool feature and tap dimensions must be contiguous")
+    conv_feature_stride, conv_history_stride = _conv_state_inner_strides(conv_pool, C)
     if conv_pool.dtype != qkv_raw.dtype:
         raise ValueError(
             f"conv_pool must have dtype {qkv_raw.dtype}, got {conv_pool.dtype}"
@@ -1069,6 +1209,8 @@ def fused_kda_verify_conv_update(
         stride_raw_tok=qkv_raw.stride(0),
         stride_out_tok=out.stride(0),
         stride_conv_page=conv_pool.stride(0),
+        stride_conv_feature=conv_feature_stride,
+        stride_conv_history=conv_history_stride,
         T=T,
         C=C,
         BLOCK_C=block_c,
@@ -1138,6 +1280,12 @@ def fused_recurrent_kda_verify_megafuse(
         scale = K**-0.5
     assert total == N * T
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    conv_feature_stride, conv_history_stride = _conv_state_inner_strides(
+        conv_pool, 3 * P
+    )
+    conv_out_feature_stride, conv_out_history_stride = _conv_state_inner_strides(
+        conv_out, 3 * P, name="conv_out"
+    )
     assert not store_states or write_indices.numel() == N * T
     if g_raw is not None:
         if g_raw.shape != (N * T, P):
@@ -1209,7 +1357,11 @@ def fused_recurrent_kda_verify_megafuse(
         stride_state_page=h_pool.stride(0),
         stride_state_out_page=h_pool_out.stride(0),
         stride_conv_page=conv_pool.stride(0),
+        stride_conv_feature=conv_feature_stride,
+        stride_conv_history=conv_history_stride,
         stride_conv_out_page=conv_out.stride(0),
+        stride_conv_out_feature=conv_out_feature_stride,
+        stride_conv_out_history=conv_out_history_stride,
         HAS_DT_BIAS=dt_bias is not None,
         HAS_PRECOMPUTED_GATE=g_raw is not None,
         HAS_PRECOMPUTED_CONV=conv_qkv is not None,
@@ -1272,6 +1424,9 @@ def fused_recurrent_kda_megafuse(
     if scale is None:
         scale = K**-0.5
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    conv_feature_stride, conv_history_stride = _conv_state_inner_strides(
+        conv_pool, 3 * P
+    )
     if (output_gate is None) != (norm_weight is None):
         raise ValueError("output_gate and norm_weight must be given together")
     if output_gate is not None:
@@ -1329,6 +1484,8 @@ def fused_recurrent_kda_megafuse(
         BV=BV,
         stride_state_page=h_pool.stride(0),
         stride_conv_page=conv_pool.stride(0),
+        stride_conv_feature=conv_feature_stride,
+        stride_conv_history=conv_history_stride,
         num_warps=4,
         num_stages=2,
     )
@@ -1455,6 +1612,8 @@ def fused_recurrent_kda_window_fwd_kernel(
     stride_state_page: tl.constexpr,
     stride_state_out_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    stride_conv_feature: tl.constexpr,
+    stride_conv_history: tl.constexpr,
     WRITE_OUTPUT: tl.constexpr,
     STORE_FINAL: tl.constexpr,
     HAS_N_STEPS: tl.constexpr,
@@ -1534,15 +1693,51 @@ def fused_recurrent_kda_window_fwd_kernel(
     s_v2 = tl.zeros([BV], dtype=tl.float32)
     if read_ok:
         cp = conv_pool + b_read * stride_conv_page
-        s_q0 = tl.load(cp + qf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_q1 = tl.load(cp + qf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_q2 = tl.load(cp + qf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_k0 = tl.load(cp + kf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_k1 = tl.load(cp + kf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_k2 = tl.load(cp + kf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_v0 = tl.load(cp + vf * 3 + 0, mask=mask_v, other=0.0).to(tl.float32)
-        s_v1 = tl.load(cp + vf * 3 + 1, mask=mask_v, other=0.0).to(tl.float32)
-        s_v2 = tl.load(cp + vf * 3 + 2, mask=mask_v, other=0.0).to(tl.float32)
+        s_q0 = tl.load(
+            cp + qf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_q1 = tl.load(
+            cp + qf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_q2 = tl.load(
+            cp + qf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k0 = tl.load(
+            cp + kf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k1 = tl.load(
+            cp + kf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_k2 = tl.load(
+            cp + kf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        s_v0 = tl.load(
+            cp + vf * stride_conv_feature + 0 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        s_v1 = tl.load(
+            cp + vf * stride_conv_feature + 1 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        s_v2 = tl.load(
+            cp + vf * stride_conv_feature + 2 * stride_conv_history,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
 
     # initial recurrent state from the committed page
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
@@ -1930,6 +2125,9 @@ def _launch_kda_window(
         scale = K**-0.5
     assert total == N * T
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    conv_feature_stride, conv_history_stride = _conv_state_inner_strides(
+        conv_pool, 3 * HV * K
+    )
     store_final = h_pool_out is not None
     assert store_final == (write_indices is not None)
     if store_final:
@@ -1985,6 +2183,8 @@ def _launch_kda_window(
         stride_state_page=h_pool.stride(0),
         stride_state_out_page=h_pool_out.stride(0) if h_pool_out is not None else 0,
         stride_conv_page=conv_pool.stride(0),
+        stride_conv_feature=conv_feature_stride,
+        stride_conv_history=conv_history_stride,
         WRITE_OUTPUT=out is not None,
         STORE_FINAL=store_final,
         HAS_N_STEPS=n_steps is not None,
@@ -2198,6 +2398,8 @@ def batched_recurrent_kda_replay_commit_kernel(
     T: tl.constexpr,
     STRIDE_QKV: tl.constexpr,
     STRIDE_CONV: tl.constexpr,
+    STRIDE_CONV_FEATURE: tl.constexpr,
+    STRIDE_CONV_HISTORY: tl.constexpr,
     STRIDE_BETA: tl.constexpr,
     STRIDE_STATE: tl.constexpr,
     STRIDE_GATE: tl.constexpr,
@@ -2242,24 +2444,36 @@ def batched_recurrent_kda_replay_commit_kernel(
     w_k2 = tl.load(conv_w + kf * CONV_WIDTH + 2, mask=mask_k, other=0.0).to(tl.float32)
     w_k3 = tl.load(conv_w + kf * CONV_WIDTH + 3, mask=mask_k, other=0.0).to(tl.float32)
     cp = conv_pool + read_page * STRIDE_CONV
-    s_q0 = tl.load(cp + qf * (CONV_WIDTH - 1) + 0, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
-    s_q1 = tl.load(cp + qf * (CONV_WIDTH - 1) + 1, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
-    s_q2 = tl.load(cp + qf * (CONV_WIDTH - 1) + 2, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
-    s_k0 = tl.load(cp + kf * (CONV_WIDTH - 1) + 0, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
-    s_k1 = tl.load(cp + kf * (CONV_WIDTH - 1) + 1, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
-    s_k2 = tl.load(cp + kf * (CONV_WIDTH - 1) + 2, mask=mask_k & read_ok, other=0.0).to(
-        tl.float32
-    )
+    s_q0 = tl.load(
+        cp + qf * STRIDE_CONV_FEATURE + 0 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
+    s_q1 = tl.load(
+        cp + qf * STRIDE_CONV_FEATURE + 1 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
+    s_q2 = tl.load(
+        cp + qf * STRIDE_CONV_FEATURE + 2 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
+    s_k0 = tl.load(
+        cp + kf * STRIDE_CONV_FEATURE + 0 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
+    s_k1 = tl.load(
+        cp + kf * STRIDE_CONV_FEATURE + 1 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
+    s_k2 = tl.load(
+        cp + kf * STRIDE_CONV_FEATURE + 2 * STRIDE_CONV_HISTORY,
+        mask=mask_k & read_ok,
+        other=0.0,
+    ).to(tl.float32)
 
     # Each program walks every V tile; conv publication is a later launch.
     for i_v in tl.range(0, K, BV, loop_unroll_factor=1):
@@ -2280,13 +2494,19 @@ def batched_recurrent_kda_replay_commit_kernel(
             tl.float32
         )
         s_v0 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 0, mask=mask_v & read_ok, other=0.0
+            cp + vf * STRIDE_CONV_FEATURE + 0 * STRIDE_CONV_HISTORY,
+            mask=mask_v & read_ok,
+            other=0.0,
         ).to(tl.float32)
         s_v1 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 1, mask=mask_v & read_ok, other=0.0
+            cp + vf * STRIDE_CONV_FEATURE + 1 * STRIDE_CONV_HISTORY,
+            mask=mask_v & read_ok,
+            other=0.0,
         ).to(tl.float32)
         s_v2 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 2, mask=mask_v & read_ok, other=0.0
+            cp + vf * STRIDE_CONV_FEATURE + 2 * STRIDE_CONV_HISTORY,
+            mask=mask_v & read_ok,
+            other=0.0,
         ).to(tl.float32)
         state_off = o_v[:, None] * K + o_k[None, :]
         ph = state + read_page * STRIDE_STATE + i_hv * K * K + state_off
@@ -2352,6 +2572,8 @@ def batched_kda_commit_conv_window_kernel(
     T: tl.constexpr,
     STRIDE_QKV: tl.constexpr,
     STRIDE_CONV: tl.constexpr,
+    STRIDE_CONV_FEATURE: tl.constexpr,
+    STRIDE_CONV_HISTORY: tl.constexpr,
     CONV_DIM: tl.constexpr,
     LAYERS_PER_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -2368,10 +2590,22 @@ def batched_kda_commit_conv_window_kernel(
     steps = tl.minimum(tl.maximum(steps, 0), T)
     offsets = i_cb * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < CONV_DIM
-    src = conv_pool + read_page * STRIDE_CONV + offsets * 3
-    s0 = tl.load(src, mask=mask & (read_page >= 0), other=0.0)
-    s1 = tl.load(src + 1, mask=mask & (read_page >= 0), other=0.0)
-    s2 = tl.load(src + 2, mask=mask & (read_page >= 0), other=0.0)
+    src = conv_pool + read_page * STRIDE_CONV + offsets * STRIDE_CONV_FEATURE
+    s0 = tl.load(
+        src + 0 * STRIDE_CONV_HISTORY,
+        mask=mask & (read_page >= 0),
+        other=0.0,
+    )
+    s1 = tl.load(
+        src + 1 * STRIDE_CONV_HISTORY,
+        mask=mask & (read_page >= 0),
+        other=0.0,
+    )
+    s2 = tl.load(
+        src + 2 * STRIDE_CONV_HISTORY,
+        mask=mask & (read_page >= 0),
+        other=0.0,
+    )
     for i_t in range(steps):
         x = tl.load(
             qkv + (i_n * T + i_t) * STRIDE_QKV + offsets,
@@ -2379,10 +2613,10 @@ def batched_kda_commit_conv_window_kernel(
             other=0.0,
         )
         s0, s1, s2 = s1, s2, x
-    dst = conv_pool + write_page * STRIDE_CONV + offsets * 3
-    tl.store(dst, s0, mask=mask & (write_page >= 0))
-    tl.store(dst + 1, s1, mask=mask & (write_page >= 0))
-    tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
+    dst = conv_pool + write_page * STRIDE_CONV + offsets * STRIDE_CONV_FEATURE
+    tl.store(dst + 0 * STRIDE_CONV_HISTORY, s0, mask=mask & (write_page >= 0))
+    tl.store(dst + 1 * STRIDE_CONV_HISTORY, s1, mask=mask & (write_page >= 0))
+    tl.store(dst + 2 * STRIDE_CONV_HISTORY, s2, mask=mask & (write_page >= 0))
 
 
 def batched_recurrent_kda_replay_commit(
@@ -2397,6 +2631,8 @@ def batched_recurrent_kda_replay_commit(
     f_a_dim: int,
     qkv_stride: int,
     conv_stride: int,
+    conv_feature_stride: int,
+    conv_history_stride: int,
     f_a_stride: int,
     beta_stride: int,
     state_stride: int,
@@ -2450,6 +2686,8 @@ def batched_recurrent_kda_replay_commit(
         T=draft_token_num,
         STRIDE_QKV=qkv_stride,
         STRIDE_CONV=conv_stride,
+        STRIDE_CONV_FEATURE=conv_feature_stride,
+        STRIDE_CONV_HISTORY=conv_history_stride,
         STRIDE_BETA=beta_stride,
         STRIDE_STATE=state_stride,
         STRIDE_GATE=gate_stride,
@@ -2481,6 +2719,8 @@ def batched_recurrent_kda_replay_commit(
         T=draft_token_num,
         STRIDE_QKV=qkv_stride,
         STRIDE_CONV=conv_stride,
+        STRIDE_CONV_FEATURE=conv_feature_stride,
+        STRIDE_CONV_HISTORY=conv_history_stride,
         CONV_DIM=conv_dim,
         LAYERS_PER_GROUP=layers_per_group,
         BLOCK=conv_block,
@@ -2499,7 +2739,11 @@ def kda_commit_conv_window_kernel(
     row_base,  # [N] first payload row per request (-1 skips)
     stride_raw_tok: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    stride_conv_feature: tl.constexpr,
+    stride_conv_history: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
+    stride_conv_out_feature: tl.constexpr,
+    stride_conv_out_history: tl.constexpr,
     T: tl.constexpr,
     CONV_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -2531,10 +2775,10 @@ def kda_commit_conv_window_kernel(
     offsets = i_c * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < CONV_DIM
 
-    src = conv_pool + b_read * stride_conv_page + offsets * 3
-    s0 = tl.load(src + 0, mask=mask & (b_read >= 0), other=0.0)
-    s1 = tl.load(src + 1, mask=mask & (b_read >= 0), other=0.0)
-    s2 = tl.load(src + 2, mask=mask & (b_read >= 0), other=0.0)
+    src = conv_pool + b_read * stride_conv_page + offsets * stride_conv_feature
+    s0 = tl.load(src + 0 * stride_conv_history, mask=mask & (b_read >= 0), other=0.0)
+    s1 = tl.load(src + 1 * stride_conv_history, mask=mask & (b_read >= 0), other=0.0)
+    s2 = tl.load(src + 2 * stride_conv_history, mask=mask & (b_read >= 0), other=0.0)
 
     for i_t in range(steps):
         x = tl.load(
@@ -2542,10 +2786,10 @@ def kda_commit_conv_window_kernel(
         )
         s0, s1, s2 = s1, s2, x
 
-    dst = conv_out + b_write * stride_conv_out_page + offsets * 3
-    tl.store(dst + 0, s0, mask=mask)
-    tl.store(dst + 1, s1, mask=mask)
-    tl.store(dst + 2, s2, mask=mask)
+    dst = conv_out + b_write * stride_conv_out_page + offsets * stride_conv_out_feature
+    tl.store(dst + 0 * stride_conv_out_history, s0, mask=mask)
+    tl.store(dst + 1 * stride_conv_out_history, s1, mask=mask)
+    tl.store(dst + 2 * stride_conv_out_history, s2, mask=mask)
 
 
 def kda_commit_conv_window(
@@ -2575,6 +2819,12 @@ def kda_commit_conv_window(
         None. The destination windows are written in place.
     """
     n = write_indices.numel()
+    conv_feature_stride, conv_history_stride = _conv_state_inner_strides(
+        conv_pool, conv_dim
+    )
+    conv_out_feature_stride, conv_out_history_stride = _conv_state_inner_strides(
+        conv_out, conv_dim, name="conv_out"
+    )
     row_base = (
         torch.arange(n, device=write_indices.device, dtype=torch.int32)
         * draft_token_num
@@ -2597,7 +2847,11 @@ def kda_commit_conv_window(
         row_base=row_base,
         stride_raw_tok=qkv_raw.stride(0),
         stride_conv_page=conv_pool.stride(0),
+        stride_conv_feature=conv_feature_stride,
+        stride_conv_history=conv_history_stride,
         stride_conv_out_page=conv_out.stride(0),
+        stride_conv_out_feature=conv_out_feature_stride,
+        stride_conv_out_history=conv_out_history_stride,
         T=draft_token_num,
         CONV_DIM=conv_dim,
         BLOCK=block,

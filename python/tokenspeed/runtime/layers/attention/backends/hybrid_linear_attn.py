@@ -108,6 +108,31 @@ def _mask_fresh_initial_state(
     return torch.where(mask, recurrent_state, torch.zeros_like(recurrent_state))
 
 
+def allocate_conv_state_rows_like(
+    conv_state: torch.Tensor,
+    rows: int,
+    *,
+    zero: bool,
+) -> torch.Tensor:
+    """Allocate dense rows while preserving the convolution cache layout."""
+    if conv_state.ndim != 3:
+        raise ValueError("convolution state must be [rows, channels, history]")
+    channels, history = conv_state.shape[1:]
+    feature_stride, history_stride = conv_state.stride()[1:]
+    if (feature_stride, history_stride) not in {(history, 1), (1, channels)}:
+        raise ValueError(
+            "convolution state must use a dense feature-major or "
+            f"sequence-major layout, got stride={tuple(conv_state.stride())}"
+        )
+    result = torch.empty_strided(
+        (rows, channels, history),
+        (channels * history, feature_stride, history_stride),
+        dtype=conv_state.dtype,
+        device=conv_state.device,
+    )
+    return result.zero_() if zero else result
+
+
 @dataclass(frozen=True)
 class _StateBlockIndexPlan:
     checkpoint_granularity: int
@@ -535,11 +560,7 @@ class MambaAttnBackend(AttentionBackend):
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
             self._verify_scratch[layer_id] = (
-                torch.zeros(
-                    (rows_needed, *conv.shape[1:]),
-                    dtype=conv.dtype,
-                    device=conv.device,
-                ),
+                allocate_conv_state_rows_like(conv, rows_needed, zero=True),
                 (
                     None
                     if self.replay_ssm
@@ -624,10 +645,14 @@ class MambaAttnBackend(AttentionBackend):
 
         def _row_stride_i32(t: torch.Tensor) -> int:
             # Slab components are page-interleaved as_strided views: row
-            # payload contiguous, row-to-row stride the physical page.
-            if t[0].numel() and not t[0].is_contiguous():
+            # payload dense, row-to-row stride the physical block.
+            row = t[0]
+            row_is_dense = row.is_contiguous() or (
+                row.ndim == 2 and row.transpose(0, 1).is_contiguous()
+            )
+            if row.numel() and not row_is_dense:
                 raise RuntimeError(
-                    "batched verify state copy requires contiguous row payloads"
+                    "batched verify state copy requires dense row payloads"
                 )
             stride_bytes = t.stride(0) * t.element_size()
             if stride_bytes % 4:
@@ -1448,6 +1473,7 @@ class MambaAttnBackend(AttentionBackend):
         output_gate = kwargs.get("output_gate")
         norm_weight = kwargs.get("norm_weight")
         norm_eps = kwargs.get("norm_eps")
+        prepared_weights = kwargs.get("flashinfer_kda_decode_weights")
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1479,6 +1505,8 @@ class MambaAttnBackend(AttentionBackend):
             output_gate=output_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            prepared_weights=prepared_weights,
+            layer_id=layer_id,
         )
         if fused_out is not None:
             return fused_out
@@ -1556,6 +1584,8 @@ class MambaAttnBackend(AttentionBackend):
         output_gate: torch.Tensor | None,
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
+        prepared_weights: object | None = None,
+        layer_id: int | None = None,
     ) -> torch.Tensor | None:
         """Whole-step decode attempt; ``None`` falls through to the shared flow.
 
@@ -1586,6 +1616,8 @@ class MambaAttnBackend(AttentionBackend):
             output_gate: Optional KDA gated-norm logits.
             norm_weight: Optional KDA output RMSNorm weight.
             norm_eps: Optional KDA output RMSNorm epsilon.
+            prepared_weights: Opaque backend plan retained by the model.
+            layer_id: Layer owning the state components, when applicable.
 
         Returns:
             The layer output when a fused kernel ran, else None.

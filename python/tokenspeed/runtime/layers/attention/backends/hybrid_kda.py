@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_batched_replay_uses_raw_gate,
+    kda_conv_state_layout,
     kda_fused_paged_decode,
     kda_fused_paged_verify,
     kda_paged_decode,
@@ -48,11 +49,13 @@ from tokenspeed_kernel.ops.attention.triton.capture_payload import (
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
+from tokenspeed_kernel.ops.kvcache.triton import KdaGroupedStateCopyDescriptor
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     HybridLinearAttnBackend,
     MambaAttnBackend,
+    allocate_conv_state_rows_like,
     logger,
 )
 
@@ -121,6 +124,9 @@ class KdaAttnBackend(MambaAttnBackend):
         self._batched_replay_launch = None
         self._batched_replay_ready = False
         self._replay_descriptor_bound: set[int] = set()
+        self._decode_cow_descriptor: KdaGroupedStateCopyDescriptor | None = None
+        self._decode_cow_first_layer: int | None = None
+        self._sequence_major_conv = kda_conv_state_layout() == "sequence_major"
         self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
             raise ValueError(
@@ -136,6 +142,30 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def set_kv_pool(self, kv_pool) -> None:
         super().set_kv_pool(kv_pool)
+        self._decode_cow_descriptor = None
+        self._decode_cow_first_layer = None
+        if self._sequence_major_conv:
+            layer_ids = tuple(self._state_layer_ids())
+            group_ids = tuple(self._state_groups())
+            # Kimi-K3 currently publishes three state groups. Keep a fail-closed
+            # fallback if a future recipe changes that contract: prepared FI
+            # decode weights will be ignored rather than running without COW.
+            if layer_ids and len(group_ids) == 3:
+                group_rows = {group_id: row for row, group_id in enumerate(group_ids)}
+                group_sel = tuple(
+                    group_rows[self._state_group_for(layer_id)]
+                    for layer_id in layer_ids
+                )
+                components = tuple(
+                    self._state_components(layer_id) for layer_id in layer_ids
+                )
+                if components and components[0][0].is_cuda:
+                    self._decode_cow_descriptor = KdaGroupedStateCopyDescriptor.build(
+                        tuple(component[0] for component in components),
+                        tuple(component[1] for component in components),
+                        group_sel,
+                    )
+                    self._decode_cow_first_layer = layer_ids[0]
         if self._replay_active and self.speculative_num_draft_tokens > 1:
             rows = self.max_bs * self.speculative_num_draft_tokens
             layer_ids = tuple(self._state_layer_ids())
@@ -244,6 +274,8 @@ class KdaAttnBackend(MambaAttnBackend):
             strides = (
                 first_qkv.stride(0),
                 first_conv.stride(0),
+                first_conv.stride(1),
+                first_conv.stride(2),
                 first_fa.stride(0),
                 first_beta.stride(0),
                 first_state.stride(0),
@@ -266,6 +298,8 @@ class KdaAttnBackend(MambaAttnBackend):
                 if (
                     layer_qkv.stride(0),
                     layer_conv.stride(0),
+                    layer_conv.stride(1),
+                    layer_conv.stride(2),
                     layer_fa.stride(0),
                     layer_beta.stride(0),
                     layer_state.stride(0),
@@ -308,10 +342,12 @@ class KdaAttnBackend(MambaAttnBackend):
                         f_a_dim=geometry[2],
                         qkv_stride=strides[0],
                         conv_stride=strides[1],
-                        f_a_stride=strides[2],
-                        beta_stride=strides[3],
-                        state_stride=strides[4],
-                        gate_stride=strides[5],
+                        conv_feature_stride=strides[2],
+                        conv_history_stride=strides[3],
+                        f_a_stride=strides[4],
+                        beta_stride=strides[5],
+                        state_stride=strides[6],
+                        gate_stride=strides[7],
                         conv_width=conv_width,
                         layers_per_group=layers_per_group,
                         lower_bound=next(iter(lower_bounds)),
@@ -343,9 +379,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 (
                     conv
                     if self._replay_uses_raw_gate
-                    else torch.empty(
-                        (rows, *conv.shape[1:]), dtype=conv.dtype, device=conv.device
-                    )
+                    else allocate_conv_state_rows_like(conv, rows, zero=False)
                 ),
                 None,
             )
@@ -387,6 +421,35 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             return g_raw
 
+    def _stage_flashinfer_decode_cow(self, layer_id: int, batch_size: int) -> bool:
+        """Prepare single-index FlashInfer state once at the first KDA layer.
+
+        A cross-layer copy cannot jump an active layerwise L2 restore. Fence its
+        final event once before staging; ordinary decode still uses FlashInfer.
+        """
+        descriptor = self._decode_cow_descriptor
+        if descriptor is None or self._decode_cow_first_layer is None:
+            return False
+        metadata = self.forward_metadata
+        if (
+            metadata.state_in_blocks_by_group is None
+            or metadata.state_out_blocks_by_group is None
+        ):
+            return False
+        if layer_id == self._decode_cow_first_layer:
+            load_tracker = getattr(self.kv_pool, "layerwise_load_tracker", None)
+            if load_tracker is not None:
+                load_tracker.wait_for_all_layers()
+            group_ids = self._state_groups()
+            read_groups = tuple(
+                metadata.state_in_blocks_by_group[group_id] for group_id in group_ids
+            )
+            write_groups = tuple(
+                metadata.state_out_blocks_by_group[group_id] for group_id in group_ids
+            )
+            descriptor.copy(read_groups, write_groups, batch_size=batch_size)
+        return True
+
     @override
     def _decode(
         self,
@@ -409,6 +472,8 @@ class KdaAttnBackend(MambaAttnBackend):
         output_gate: torch.Tensor | None,
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
+        prepared_weights: object | None = None,
+        layer_id: int | None = None,
     ) -> torch.Tensor | None:
         if output_gate is not None and (norm_weight is None or norm_eps is None):
             raise ValueError(
@@ -416,6 +481,14 @@ class KdaAttnBackend(MambaAttnBackend):
             )
         if f_a_out is None:
             return None
+        use_prepared_decode = prepared_weights is not None
+        if use_prepared_decode and (
+            layer_id is None
+            or not self._stage_flashinfer_decode_cow(layer_id, mixed_qkv.shape[0])
+        ):
+            use_prepared_decode = False
+        active_prepared_weights = prepared_weights if use_prepared_decode else None
+        dispatch_read_indices = write_indices if use_prepared_decode else read_indices
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
         result = kda_fused_paged_decode(
@@ -428,7 +501,7 @@ class KdaAttnBackend(MambaAttnBackend):
             A_log,
             dt_bias,
             state_pool=ssm_states,
-            read_indices=read_indices,
+            read_indices=dispatch_read_indices,
             write_indices=write_indices,
             num_heads=num_value_heads,
             head_dim=head_v_dim,
@@ -437,6 +510,7 @@ class KdaAttnBackend(MambaAttnBackend):
             output_gate=output_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            prepared_weights=active_prepared_weights,
             recurrent_layout=self.kda_recurrent_layout,
         )
         if result is None:

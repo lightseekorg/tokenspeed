@@ -230,11 +230,18 @@ class KimiK3Recipe(CacheRecipe):
                 ),
             )
         conv_shape, recurrent_shape = self._kda_shapes
+        from tokenspeed_kernel.ops.attention import kda_conv_state_layout
+
+        physical_conv_shape = (
+            (conv_shape[1], conv_shape[0])
+            if kda_conv_state_layout() == "sequence_major"
+            else conv_shape
+        )
         return (
             CacheFieldSpec(
                 f"layer.{layer_id}.conv_state",
                 plane_id,
-                conv_shape,
+                physical_conv_shape,
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
             ),

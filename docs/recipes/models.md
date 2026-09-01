@@ -214,8 +214,9 @@ bounded draft attention for long-context deployments.
 
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a
-DeepSeek-V3-style latent MoE. The KDA layers currently use
-flash-linear-attention kernels on NVIDIA, so install it first:
+DeepSeek-V3-style latent MoE. KDA prefill can use the optional
+flash-linear-attention kernels on NVIDIA, so install it when selecting that
+backend:
 
 ```bash
 pip install flash-linear-attention
@@ -226,8 +227,16 @@ Notes:
 - K3 uses the cache-group scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
-  implementation, including each backend's preferred recurrent-state layout.
-  The runtime does not transpose or reinterpret that state.
+  implementation for prefill and speculative verify. On B200/B300, ordinary
+  single-token decode uses FlashInfer's fused KDA operator when its backend is
+  available; TokenSpeed bulk-copies prefix-cache COW rows before invoking the
+  public single-index API. DSpark T=8 verify remains on the FP32-state
+  ReplaySSM path. A pending layerwise L2 restore is fenced once before the
+  cross-layer decode COW, after which ordinary decode still uses FlashInfer.
+- The persistent KDA convolution layout is sequence-major on Blackwell and
+  feature-major elsewhere. Cache-transfer P/D peers must therefore use the
+  same GPU-generation layout; mixed H100/B200-or-B300 K3 PD is rejected by the
+  cache contract.
 - NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call

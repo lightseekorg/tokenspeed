@@ -76,6 +76,23 @@ class LayerwiseLoadTracker:
         for consumer_index in self.consumer_indices:
             self.event_sets[consumer_index].wait_for_layer(layer_index)
 
+    def wait_for_all_layers(self) -> None:
+        """Fence every active restore before a cross-layer cache operation."""
+        if not self.consumer_indices:
+            return
+        # Each restore copies layers in order on one load stream, so its final
+        # event covers every earlier layer event.
+        events = tuple(
+            self.event_sets[index].last_layer_done_event
+            for index in self.consumer_indices
+        )
+        if all(event.query() for event in events):
+            self.consumer_indices = ()
+            return
+        stream = device_module.current_stream()
+        for event in events:
+            stream.wait_event(event)
+
     def reset(self) -> None:
         self.current_load_index = -1
         self.consumer_indices = ()
