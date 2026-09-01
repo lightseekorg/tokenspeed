@@ -27,7 +27,6 @@ optional sliding window, optional sinks, and optional natural-log LSE output.
 
 from __future__ import annotations
 
-import functools
 import math
 from typing import NamedTuple
 
@@ -43,6 +42,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
 )
 
 gfx1250 = gl.amd.gfx1250
+
+_GFX1250_NUM_CUS = 256
 
 
 @gluon.aggregate
@@ -703,15 +704,8 @@ class LaunchConfig(NamedTuple):
     grid: tuple[int, ...]
 
 
-@functools.lru_cache(maxsize=None)
-def _num_cus(device_index: int) -> int:
-    """Cached: querying it per launch costs ~2us, which is over 10% of a short
-    prefill, and a device's CU count cannot change within a process."""
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def _select_m_tile(
-    *, batch_size: int, n_heads: int, max_seqlen: int, num_cus: int
+    *, batch_size: int, n_heads: int, max_seqlen: int
 ) -> tuple[int, int]:
     """Pick (BLOCK_M, num_warps) for prefill, measured on gfx1250.
 
@@ -728,17 +722,13 @@ def _select_m_tile(
         sequences pay a larger fraction of it.
 
     Below either bound the narrow tile wins by up to 1.2x, so keep it there.
-
-    num_cus comes from the running device rather than a constant, so a compute
-    partition exposing a fraction of the CUs compares its grid against the CUs
-    it actually has. The measured thresholds below come from a full 256-CU part.
     """
     wide_m, wide_warps = 256, 8
     narrow_m, narrow_warps = 128, 4
     if max_seqlen < 1024:
         return narrow_m, narrow_warps
     workgroups = batch_size * n_heads * triton_cdiv(max_seqlen, wide_m)
-    if workgroups < num_cus:
+    if workgroups < _GFX1250_NUM_CUS:
         return narrow_m, narrow_warps
     return wide_m, wide_warps
 
@@ -760,14 +750,7 @@ def get_config(
     num_buffers = 2
     waves_per_eu = 1
     block_m, num_warps = _select_m_tile(
-        batch_size=batch_size,
-        n_heads=n_heads,
-        max_seqlen=max_seqlen,
-        num_cus=_num_cus(
-            q.device.index
-            if q.device.index is not None
-            else torch.cuda.current_device()
-        ),
+        batch_size=batch_size, n_heads=n_heads, max_seqlen=max_seqlen
     )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)

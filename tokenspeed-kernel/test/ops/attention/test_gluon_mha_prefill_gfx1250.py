@@ -122,29 +122,21 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
-def test_select_m_tile_scales_with_device_cus():
-    """The wide tile needs both a long sequence and a grid that fills the device,
-    so the cutoff has to follow the CU count actually reported."""
+def test_select_m_tile_gates():
+    """Both gates on the wide tile are load-bearing.
+
+    Measured on gfx1250, taking the 256-row tile when either gate fails costs up
+    to 1.2x, so pin the behaviour at each boundary.
+    """
     wide = (256, 8)
     narrow = (128, 4)
 
-    # Short sequences pay too much of the causally-masked diagonal block.
-    assert (
-        prefill._select_m_tile(batch_size=8, n_heads=32, max_seqlen=512, num_cus=256)
-        == narrow
-    )
+    # Sequence too short: the causally-masked half of the diagonal block is a
+    # large fraction of the work, even though this grid fills the device.
+    assert prefill._select_m_tile(batch_size=8, n_heads=32, max_seqlen=512) == narrow
 
-    # 128 workgroups underfills 256 CUs but fills a 128-CU partition.
-    assert (
-        prefill._select_m_tile(batch_size=1, n_heads=8, max_seqlen=4096, num_cus=256)
-        == narrow
-    )
-    assert (
-        prefill._select_m_tile(batch_size=1, n_heads=8, max_seqlen=4096, num_cus=128)
-        == wide
-    )
+    # Long enough, but 128 workgroups underfills the 256 CUs.
+    assert prefill._select_m_tile(batch_size=1, n_heads=8, max_seqlen=4096) == narrow
 
-    assert (
-        prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096, num_cus=256)
-        == wide
-    )
+    # Both satisfied.
+    assert prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096) == wide
