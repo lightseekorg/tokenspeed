@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 gfx1250 = gl.amd.gfx1250
 _BLOCK_H = gl.constexpr(8192)
@@ -38,14 +38,14 @@ def _load_candidate(
     hidden,
     hidden_mask,
     stride_block_t: gl.constexpr,
-    stride_block_n: gl.constexpr,
+    stride_block_n: tl.int64,
     candidate: gl.constexpr,
     N: gl.constexpr,
 ):
     if candidate == N - 1:
         return prefix
-    # Candidate offsets can exceed int32; fold the block stride into the pointer.
-    ptr = block_residual + candidate * stride_block_n
+    # The stride fits int32, but candidate * stride can exceed it at large T.
+    ptr = block_residual + candidate * stride_block_n.to(gl.int64)
     return gfx1250.buffer_load(
         ptr,
         (token * stride_block_t + hidden).to(gl.int32),
@@ -66,7 +66,7 @@ def _attn_res_rmsnorm_kernel(
     stride_layer_t: gl.constexpr,
     stride_delta_t: gl.constexpr,
     stride_block_t: gl.constexpr,
-    stride_block_n: gl.constexpr,
+    stride_block_n: tl.int64,
     stride_output_t: gl.constexpr,
     H: gl.constexpr,
     N: gl.constexpr,
@@ -105,7 +105,7 @@ def _attn_res_rmsnorm_kernel(
             mask=hidden_mask,
         )
     if WRITE_BLOCK:
-        block_write_ptr = block_residual + BLOCK_WRITE_IDX * stride_block_n
+        block_write_ptr = block_residual + BLOCK_WRITE_IDX * stride_block_n.to(gl.int64)
         gfx1250.buffer_store(
             prefix.to(block_residual.dtype.element_ty),
             block_write_ptr,
