@@ -268,7 +268,12 @@ def compute_max_logical_pages_for_capture(
     max_tokens_per_req: int = 1,
     overlap_schedule_depth: int = 0,
 ) -> int:
-    """Return CUDA Graph block-table width for one cache group.
+    """Return the decode CUDA Graph block-table width for one cache group.
+
+    Decode only: a decode row describes live cache history, so a sliding group
+    is bounded by its window. Prefill capture fabricates one extend across the
+    whole extent and derives a write column per position in it, so it sizes
+    its own tables -- see ``PrefillGraph._dummy_group_tables``.
 
     Decode admission reserves the current verify span plus one span for each
     overlapped schedule.  Include that complete reservation horizon here: a

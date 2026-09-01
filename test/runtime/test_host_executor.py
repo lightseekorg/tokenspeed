@@ -6,8 +6,9 @@ import os
 import sys
 import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -181,6 +182,50 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(op_ids, [7])
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
+    def test_fill_workspace_ranges_uses_one_batched_load(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        field = SimpleNamespace(
+            field_id="k",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=8,
+            block_stride_bytes=8,
+            payload_bytes=4,
+        )
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=(field,)),))
+        executor.host_storage = SimpleNamespace(
+            host_field_offset=lambda group, block, index: 100 + block * 10 + index
+        )
+        workspace = Mock()
+        workspace.load_ranges.return_value = (1, 4)
+        transfers = [(0, 1, 2)]
+
+        count, max_bytes = executor._fill_workspace_ranges(workspace, transfers)
+
+        workspace.load_ranges.assert_called_once_with(
+            executor._transfer_ranges(transfers)
+        )
+        self.assertEqual((count, max_bytes), (1, 4))
+
+    def test_fill_workspace_ranges_skips_empty_batch(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.layout = SimpleNamespace(groups=(SimpleNamespace(fields=()),))
+        workspace = Mock()
+
+        count, max_bytes = executor._fill_workspace_ranges(workspace, [])
+
+        workspace.load_ranges.assert_not_called()
+        self.assertEqual((count, max_bytes), (0, 0))
+
     def test_writeback_calls_transfer_with_compact_layout(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
@@ -191,13 +236,14 @@ class GroupAwareWireTest(unittest.TestCase):
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
         executor._ready_write_op_ids = []
         executor.layout = SimpleNamespace(buffers=("device",))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.transfer_backend = "dma"
         executor._write_acks = []
-        ranges = [(0, 64, 128, 32)]
-        executor._transfer_ranges = Mock(return_value=ranges)
+        executor._write_workspace = object()
+        executor._fill_workspace_ranges = Mock(return_value=(3, 32))
         stream = object()
         finish = Mock()
 
@@ -217,9 +263,12 @@ class GroupAwareWireTest(unittest.TestCase):
             "d2h",
             executor.layout.buffers,
             executor.host_storage.host_buffer,
-            ranges,
+            (),
             stream,
             backend="dma",
+            workspace=executor._write_workspace,
+            num_ranges=3,
+            max_bytes=32,
         )
         finish.record.assert_called_once_with(stream)
 
@@ -233,6 +282,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
         executor._ready_load_op_ids = []
         executor._load_acks = []
         executor.load_stream = object()
@@ -240,6 +290,8 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
+        executor._load_workspace = object()
+        executor._fill_workspace_ranges = Mock(return_value=(2, 32))
         load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
         tracker = Mock()
         tracker.begin_load.return_value = 0
@@ -258,6 +310,96 @@ class GroupAwareWireTest(unittest.TestCase):
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
+
+    def test_loadback_commits_one_immutable_table_and_launches_layer_slices(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._verifier = None
+        executor.attn_tp_rank = 0
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = object()
+        executor.transfer_backend = "auto"
+        device = SimpleNamespace(type="cuda")
+        device_buffer = SimpleNamespace(device=device)
+        executor.layout = SimpleNamespace(
+            buffers=(device_buffer,),
+            consumers=(("layer.0",), ("layer.1",)),
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        layer_ranges = [
+            [(0, 64, 128, 32), (1, 96, 160, 16)],
+            [(0, 192, 256, 48)],
+        ]
+        executor._transfer_ranges = Mock(side_effect=layer_ranges)
+        workspace = Mock()
+        workspace.load_range_batches.return_value = ((0, 2, 32), (2, 1, 48))
+        executor._load_workspaces = (workspace,)
+        load_events = SimpleNamespace(
+            start_event=Mock(), layer_done_events=[None, None]
+        )
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 2)]
+        finishes = [Mock(), Mock()]
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(executor_module.device_module, "Event", side_effect=finishes),
+            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+        ):
+            executor._start_loading([9], [(0, 2, 1)])
+
+        workspace.load_range_batches.assert_called_once_with(layer_ranges)
+        workspace.commit_ranges.assert_called_once_with(3, device, non_blocking=True)
+        self.assertEqual(
+            transfer.call_args_list,
+            [
+                call(
+                    "h2d",
+                    executor.layout.buffers,
+                    executor.host_storage.host_buffer,
+                    (),
+                    executor.load_stream,
+                    backend="auto",
+                    workspace=workspace,
+                    num_ranges=2,
+                    max_bytes=32,
+                    range_offset=0,
+                    ranges_committed=True,
+                ),
+                call(
+                    "h2d",
+                    executor.layout.buffers,
+                    executor.host_storage.host_buffer,
+                    (),
+                    executor.load_stream,
+                    backend="auto",
+                    workspace=workspace,
+                    num_ranges=1,
+                    max_bytes=48,
+                    range_offset=2,
+                    ranges_committed=True,
+                ),
+            ],
+        )
+        finishes[0].record.assert_called_once_with(executor.load_stream)
+        finishes[1].record.assert_called_once_with(executor.load_stream)
+        self.assertIs(load_events.layer_done_events[0], finishes[0])
+        self.assertIs(load_events.layer_done_events[1], finishes[1])
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):

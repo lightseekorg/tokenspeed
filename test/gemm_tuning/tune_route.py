@@ -63,8 +63,22 @@ SHAPE_SETS = {
             (7168, 1536, 69, "kda_o_proj_shard"),
             (1536, 7168, 92, "shared_gate_up_shard"),
             (7168, 768, 92, "shared_down_shard"),
+            (1536, 1536, 12, "dspark_q_b_tp8"),
+            (7168, 1024, 12, "dspark_o_proj_tp8"),
+            (7168, 1792, 12, "dspark_down_tp8"),
+            (768, 1536, 0, "qb_tp16"),
+            (1792, 7168, 0, "dspark_gate_up_tp16"),
+            (2112, 14336, 0, "eagle3_fused_qkv_a_tp16"),
+            (2304, 7168, 0, "eagle3_gate_up_tp16"),
+            (7168, 512, 0, "o_proj_tp16"),
+            (7168, 896, 0, "dspark_down_tp16"),
+            (7168, 1152, 0, "eagle3_down_tp16"),
+            (2304, 1536, 0, "mla_q_b"),
+            (6288, 7168, 0, "kda_in_proj"),
+            (3648, 7168, 0, "mla_fused_qkv_a_gate"),
         ],
-        [1, 2, 3, 4, 5, 6, 7, 8],  # observed range: the gates admit M <= 8
+        # Table keys on exact M; sweep the routed range with no holes.
+        list(range(1, 33)),
     ),
     "qwen38_next_tp4": (
         [

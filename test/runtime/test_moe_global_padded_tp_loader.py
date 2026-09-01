@@ -24,6 +24,7 @@ import torch
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.loaders import make_weight_loader
+from tokenspeed.runtime.layers.moe.weights.nvfp4 import create_nvfp4_weight_pair
 
 _TP_SIZE = 4
 _BLOCK_SIZE = 128
@@ -141,3 +142,51 @@ def test_global_padding_precedes_w2_weight_and_scale_tp_sharding() -> None:
         torch.testing.assert_close(
             scale[0], _expected_scale_shard(down_scale, rank, dim=1)
         )
+
+
+def test_nvfp4_packed_weight_and_scale_use_the_same_padded_tp_shard() -> None:
+    group_size = 16
+    hidden_size = 16
+    padded_intermediate_size = 768
+    local_intermediate_size = padded_intermediate_size // _TP_SIZE
+    spec = MoELayerSpec(
+        top_k=2,
+        num_experts=1,
+        num_local_experts=1,
+        hidden_size=hidden_size,
+        intermediate_size=padded_intermediate_size,
+        activation="silu",
+        tp_rank=3,
+        tp_size=_TP_SIZE,
+        ep_rank=0,
+        ep_size=1,
+    )
+    layer = torch.nn.Module()
+    create_nvfp4_weight_pair(spec, layer, group_size=group_size)
+    layer.w2_weight.weight_loader(
+        layer.w2_weight,
+        torch.ones(hidden_size, _INTERMEDIATE_SIZE // 2, dtype=torch.uint8),
+        "w2",
+        local_expert_id=0,
+    )
+    layer.w2_weight_scale.weight_loader(
+        layer.w2_weight_scale,
+        torch.full(
+            (hidden_size, _INTERMEDIATE_SIZE // group_size),
+            2,
+            dtype=torch.float8_e4m3fn,
+        ),
+        shard_id="w2",
+        local_expert_id=0,
+    )
+
+    real_values = _INTERMEDIATE_SIZE - 3 * local_intermediate_size
+    assert torch.all(layer.w2_weight[..., : real_values // 2] == 1)
+    assert torch.count_nonzero(layer.w2_weight[..., real_values // 2 :]) == 0
+    assert torch.all(layer.w2_weight_scale[..., : real_values // group_size] == 2)
+    assert (
+        torch.count_nonzero(
+            layer.w2_weight_scale[..., real_values // group_size :].float()
+        )
+        == 0
+    )

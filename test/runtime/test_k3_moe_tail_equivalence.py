@@ -142,6 +142,7 @@ def _build_comm(device: torch.device, *, latent_tail=None):
     )
     comm.execution_plan = SimpleNamespace(
         fused_moe_ar=True,
+        join_moe_reduce=True,
         lane_latent_norm_ar=False,
         comm_fusion_max_num_tokens=8192,
     )
@@ -374,7 +375,7 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
         supports_split_collective=True,
         split_collective_min_tokens=9,
     )
-    comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
+    comm.execution_plan = SimpleNamespace(fused_moe_ar=True, join_moe_reduce=True)
     comm.state = SimpleNamespace(multimem_ar_ok=False)
     comm._shard_up_projection = False
     comm.routed_hidden, comm.hidden_size = L, H
@@ -406,7 +407,9 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
             supports_split_collective=True,
             split_collective_min_tokens=9,
         )
-        comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
+        comm.execution_plan = SimpleNamespace(
+            fused_moe_ar=fused_ar, join_moe_reduce=fused_ar
+        )
         comm.state = SimpleNamespace(multimem_ar_ok=False)
         comm._shard_up_projection = False
         comm.routed_hidden, comm.hidden_size = L, H

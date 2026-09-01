@@ -174,6 +174,48 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
 }
 
+TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
+    BlockPool device_pool{2};
+    BlockPool host_pool{1};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+    const auto cache_device = [&](const CacheKey& key) {
+        CacheBlockRef block = device_pool.AcquireBlock(key.group_id, /*packing=*/1);
+        ASSERT_TRUE(block);
+        coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+            .Register(device_pool, block, key, /*access_epoch=*/1);
+    };
+
+    const CacheKey first_key{.group_id = 0, .content_hash = "first"};
+    cache_device(first_key);
+    const std::array first_hashes{first_key.content_hash};
+    coordinator.QueueCachedBlocksForStore(first_hashes);
+    auto first = transfers.StartPendingStores();
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->transfers.size(), 1u);
+    const std::int32_t destination = first->transfers.front().destination_page;
+
+    const CacheKey second_key{.group_id = 0, .content_hash = "second"};
+    cache_device(second_key);
+    const std::array second_hashes{second_key.content_hash};
+    coordinator.QueueCachedBlocksForStore(second_hashes);
+    EXPECT_FALSE(transfers.StartPendingStores());
+
+    transfers.CompleteWriteBack(first->op_id);
+    coordinator.QueueCachedBlocksForStore(second_hashes);
+    auto second = transfers.StartPendingStores();
+    ASSERT_TRUE(second);
+    ASSERT_EQ(second->transfers.size(), 1u);
+    EXPECT_EQ(second->transfers.front().destination_page, destination);
+    transfers.CompleteWriteBack(second->op_id);
+}
+
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     BlockPool device_pool{2};
     BlockPool host_pool{1};
@@ -199,6 +241,66 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     EXPECT_FALSE(transfers.StartPendingStores());
     coordinator.Free(tables);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
+}
+
+TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
+    BlockPool device_pool{3};
+    BlockPool host_pool{1};
+    const std::array specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 2,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+
+    const auto cache_block = [&](BlockPool& pool, const CacheKey& key) {
+        GroupAllocator& allocator = coordinator.Allocator(static_cast<std::int32_t>(key.group_id));
+        CacheBlockRef block = pool.AcquireBlock(key.group_id, allocator.CacheBlocksPerLcmBlock());
+        EXPECT_TRUE(block);
+        const std::int32_t page = allocator.ResolveCacheBlockId(block->Location());
+        coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+            .Register(pool, block, key, /*access_epoch=*/1);
+        block.reset();
+        return page;
+    };
+
+    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-0"});
+    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-1"});
+
+    const CacheKey group_one{.group_id = 1, .content_hash = "new-1"};
+    cache_block(device_pool, group_one);
+    const std::array group_one_hashes{group_one.content_hash};
+    coordinator.QueueCachedBlocksForStore(group_one_hashes);
+
+    const CacheKey group_zero_first{.group_id = 0, .content_hash = "new-0"};
+    const CacheKey group_zero_second{.group_id = 0, .content_hash = "new-2"};
+    const std::int32_t first_source = cache_block(device_pool, group_zero_first);
+    const std::int32_t second_source = cache_block(device_pool, group_zero_second);
+    const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
+    coordinator.QueueCachedBlocksForStore(group_zero_hashes);
+
+    auto write_back = transfers.StartPendingStores();
+
+    ASSERT_TRUE(write_back);
+    ASSERT_EQ(write_back->transfers.size(), 2u);
+    EXPECT_EQ(write_back->transfers[0].group_id, 0u);
+    EXPECT_EQ(write_back->transfers[0].source_page, first_source);
+    EXPECT_EQ(write_back->transfers[1].group_id, 0u);
+    EXPECT_EQ(write_back->transfers[1].source_page, second_source);
+
+    transfers.CompleteWriteBack(write_back->op_id);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_one));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_first));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_second));
 }
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {

@@ -241,8 +241,8 @@ def test_attn_res_first_layer_snapshot_write() -> None:
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 
 
-@pytest.mark.parametrize("tokens", [2, 4, 8, 16, 32, 64, 128, 256, 512])
-def test_attn_res_delta_and_block_write_power_of_two_batches(tokens: int) -> None:
+@pytest.mark.parametrize("tokens", [2, 4, 8, 16, 32, 64, 65, 128, 256, 512])
+def test_attn_res_delta_and_block_write_batches(tokens: int) -> None:
     valid_blocks = 3
     score_eps, output_eps = 1e-6, 2e-6
     generator = torch.Generator(device="cuda").manual_seed(100 + tokens)

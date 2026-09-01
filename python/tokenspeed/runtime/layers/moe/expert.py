@@ -25,6 +25,9 @@ from dataclasses import replace
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    TRTLLM_NVFP4_ISPP_ALIGNMENT,
+)
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -205,6 +208,11 @@ class MoELayer(torch.nn.Module):
             # nothing to the MoE output.
             self._apply_trtllm_ispp_padding(
                 128, "the flashinfer_trtllm unquant kernel accepts it"
+            )
+        if self._quant_kind == "nvfp4":
+            self._apply_trtllm_ispp_padding(
+                TRTLLM_NVFP4_ISPP_ALIGNMENT,
+                "the flashinfer_trtllm NVFP4 weight layout accepts it",
             )
         if self._quant_kind == "mxfp4":
             if self.quant_config.is_w4a8_fp8:

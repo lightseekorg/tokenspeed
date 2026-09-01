@@ -115,6 +115,14 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void AckWriteBacks(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            for (std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
+                SendWriteBackDone(id);
+            }
+        }
+    }
+
     void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
         event.With(cache::LoadBackDone{
@@ -135,8 +143,8 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    // Send Finish (generation complete) to the scheduler.
-    // This triggers FinishEvent: Decoding → Draining (or Finished if no writeback needed).
+    // Send Finish (generation complete) to the scheduler. Finish-created
+    // transfer tickets retain writeback sources after the request reaches Finished.
     void SendFinish(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Finish{

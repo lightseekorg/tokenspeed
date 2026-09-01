@@ -1541,6 +1541,7 @@ class KimiLinearMoE(nn.Module):
                 int(global_server_args_dict["comm_fusion_max_num_tokens"]),
                 1,
             ),
+            shard_up_projection=self._shard_up_projection,
         )
 
         self._topk_ready = (
@@ -1874,12 +1875,23 @@ class KimiLinearMoE(nn.Module):
 
         # Router runs uncontended on main (3us; on aux it starves to 14us
         # under concurrent GEMMs). When the selected experts need precomputed
-        # TopK, its single small CTA overlaps down_proj from the aux stream,
-        # followed by the shared chain. Kernel routing bypasses that CTA.
+        # TopK runs on the fork branch beside down_proj; routing bypasses it.
         router_logits = self.gate(hidden_states)
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        plan = self.comm.plan(num_tokens, hidden_states)
+        plan = self.comm.plan(
+            num_tokens,
+            hidden_states,
+            # Rank-uniform by construction: DP-EP gather replicates the phase.
+            is_decode=(
+                ctx is not None
+                and (
+                    ctx.all_decode_or_idle
+                    if self._gather_dp_tokens_for_moe
+                    else ctx.forward_mode.is_decode()
+                )
+            ),
+        )
         if plan.lane is not None:
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
         else:

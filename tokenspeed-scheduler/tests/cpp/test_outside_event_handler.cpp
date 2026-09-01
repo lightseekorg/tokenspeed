@@ -51,6 +51,123 @@ inline std::int32_t FindRequestIndex(const ForwardBatch* fwd, const std::string&
     return -1;
 }
 
+class FinishOnlyWriteBackTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.host_allocator.total_pages = 8;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        return cfg;
+    }
+};
+
+TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFinish) {
+    Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
+    const ExecutionPlan prefill = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty())
+        << "the first prefill admit has no completed pages yet";
+    SendForwardDone("r0", {42});
+
+    const ExecutionPlan after_prefill = PlanOnce();
+    std::vector<CacheOperation> prefill_stores = ExtractCacheOpsOfKind<WriteBackBatch>(after_prefill);
+    ASSERT_EQ(prefill_stores.size(), 1u) << "completed prompt pages stream when leaving prefill";
+    const auto& prefill_write_back = std::get<WriteBackBatch>(prefill_stores.front());
+    ASSERT_EQ(prefill_write_back.op_ids.size(), 1u);
+    ASSERT_EQ(prefill_write_back.group_ids.size(), 1u);
+    EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0}));
+    SendWriteBackDone(prefill_write_back.op_ids.front());
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 2);
+
+    SendForwardDone("r0", {43});
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+    SendForwardDone("r0", {44});
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty())
+        << "ordinary decode must not stream a newly completed MLA page";
+    SendForwardDone("r0", {45});
+    SendFinish("r0");
+
+    const ExecutionPlan finish_plan = PlanOnce();
+    const std::vector<CacheOperation> finish_stores = ExtractCacheOpsOfKind<WriteBackBatch>(finish_plan);
+    ASSERT_EQ(finish_stores.size(), 1u);
+    const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
+    ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
+        << "finish writes only the new decode MLA page";
+    SendWriteBackDone(finish_write_back.op_ids.front());
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+}
+
+TEST_F(FinishOnlyWriteBackTestSuite, FinishWithoutEligiblePageEmitsNoStore) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1}});
+    PlanOnce();
+    SendForwardDone("r0", {42});
+    SendFinish("r0");
+
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+}
+
+TEST_F(FinishOnlyWriteBackTestSuite, AbortEmitsNoStore) {
+    Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
+    PlanOnce();
+    SendForwardDone("r0", {42});
+    PlanOnce();
+    SendForwardDone("r0", {43});
+    SendAbortEvent("r0");
+
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+}
+
+class FinishOnlyHybridWriteBackTestSuite : public FinishOnlyWriteBackTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FinishOnlyWriteBackTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 16;
+        cfg.host_allocator.total_pages = 16;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        for (std::int32_t i = 0; i < 3; ++i) {
+            CacheGroupConfig state = cfg.cache_groups.front();
+            state.group_id = "state_" + std::to_string(i);
+            state.family = CacheGroupFamily::State;
+            cfg.cache_groups.push_back(std::move(state));
+        }
+        return cfg;
+    }
+};
+
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresAllMlaPagesAndLatestKdaSnapshot) {
+    Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
+    const ExecutionPlan prefill = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
+    SendForwardDone("r0", {42});
+
+    const ExecutionPlan after_prefill = PlanOnce();
+    std::vector<CacheOperation> prefill_stores = ExtractCacheOpsOfKind<WriteBackBatch>(after_prefill);
+    ASSERT_EQ(prefill_stores.size(), 1u);
+    const auto& prefill_write_back = std::get<WriteBackBatch>(prefill_stores.front());
+    ASSERT_EQ(prefill_write_back.group_ids.size(), 1u);
+    EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0, 1, 2, 3}))
+        << "prefill publication streams every MLA page plus one snapshot for each of three KDA groups";
+    SendWriteBackDone(prefill_write_back.op_ids.front());
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 5);
+
+    SendForwardDone("r0", {43});
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+    SendForwardDone("r0", {44});
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty())
+        << "ordinary decode must not stream the new MLA page or KDA snapshots";
+    SendForwardDone("r0", {45});
+    SendFinish("r0");
+    const std::vector<CacheOperation> finish_stores = ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce());
+    ASSERT_EQ(finish_stores.size(), 1u);
+    const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
+    ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 1, 2, 3}))
+        << "finish writes one decode MLA page and only the latest snapshot from each KDA group";
+    SendWriteBackDone(finish_write_back.op_ids.front());
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
+}
+
 class LoadBackDoneTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -66,35 +183,20 @@ protected:
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r1", {42});
-        auto plan_wb = PlanOnce();
+        const ExecutionPlan seed_stream = PlanOnce();
+        ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty())
+            << "SetupHostCache: expected WriteBack op for r1";
+        AckWriteBacks(seed_stream);
         SendFinish("r1");
-        const WriteBackBatch* wb = nullptr;
-        for (const auto& op : plan_wb.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    wb = w;
-                    break;
-                }
-            }
-        }
-        ASSERT_NE(wb, nullptr) << "SetupHostCache: expected WriteBack op for r1";
-        ASSERT_FALSE(wb->op_ids.empty());
-        SendWriteBackDone(wb->op_ids[0]);
+        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        auto plan_wb2 = PlanOnce();
+        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
-        for (const auto& op : plan_wb2.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    if (!w->op_ids.empty()) SendWriteBackDone(w->op_ids[0]);
-                    break;
-                }
-            }
-        }
+        AckWriteBacks(PlanOnce());
         PlanOnce();
     }
 };

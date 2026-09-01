@@ -27,8 +27,9 @@
 namespace tokenspeed {
 
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
-    std::vector<CacheTransfer> transfers;
-    std::vector<StoreTicket> tickets;
+    std::vector<CacheKey> keys;
+    std::vector<CacheBlockRef> device_block_refs;
+    std::vector<std::uint32_t> group_ids;
     std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
     for (auto& candidate : coordinator_.TakePendingStores()) {
         if (coordinator_.ContainsHostCachedBlock(candidate.key) || store_keys_.contains(candidate.key) ||
@@ -40,20 +41,38 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!device_block_ref) {
             continue;
         }
-        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id));
-        CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
+
+        group_ids.push_back(candidate.key.group_id);
+        keys.push_back(std::move(candidate.key));
+        device_block_refs.push_back(std::move(device_block_ref));
+    }
+
+    if (keys.empty()) {
+        return std::nullopt;
+    }
+
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
+    _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
+
+    std::vector<CacheTransfer> transfers;
+    std::vector<StoreTicket> tickets;
+    transfers.reserve(host_allocation.stats.allocated);
+    tickets.reserve(host_allocation.stats.allocated);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        CacheBlockRef& host_block_ref = host_allocation.blocks[i];
         if (!host_block_ref) {
             continue;
         }
         // The source page id is resolved here and not pinned: the forward
         // thread's stream orders the copy ahead of any later reuse.
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
         transfers.push_back(CacheTransfer{
-            .group_id = candidate.key.group_id,
-            .source_page = manager.ResolveCacheBlockId(device_block_ref->Location()),
+            .group_id = group_ids[i],
+            .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
         });
         tickets.push_back(StoreTicket{
-            std::move(candidate.key),
+            std::move(keys[i]),
             std::move(host_block_ref),
         });
     }
