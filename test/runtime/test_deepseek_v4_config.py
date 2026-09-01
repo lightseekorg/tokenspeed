@@ -2905,11 +2905,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         }
         target_capture = {
             group_id: torch.zeros_like(table)
-            for group_id, table in target._cuda_graph_block_tables.items()
+            for group_id, table in target.graph.block_tables.items()
         }
         draft_capture = {
             group_id: torch.zeros_like(table)
-            for group_id, table in draft._cuda_graph_block_tables.items()
+            for group_id, table in draft.graph.block_tables.items()
         }
         target.init_forward_metadata_capture_cuda_graph(
             **common,
@@ -3498,7 +3498,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_tokens_per_req=1,
         )
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
-        refreshed = backend._refresh_cuda_graph_block_tables(
+        refreshed = backend.graph.refresh_block_tables(
             2,
             {"v4.swa_kv": compact},
             pad_value=-1,
