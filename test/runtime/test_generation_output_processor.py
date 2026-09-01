@@ -117,7 +117,8 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
 
 
 def test_mark_abort_notify_client_flag():
-    """Pause and client aborts retain their origin flag."""
+    """Pause-initiated aborts must flag the request to stream a terminating
+    finish to the (passive) client; client-initiated aborts must not."""
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
 
@@ -130,54 +131,9 @@ def test_mark_abort_notify_client_flag():
 
     client_state = _state([1, 2, 3])
     processor.rid_to_state["client"] = client_state
-    processor.mark_abort("client")
+    processor.mark_abort("client")  # default: client tore down its own state
     assert client_state.to_abort
     assert not client_state.abort_notify_client
-
-
-def test_client_abort_orphan_sends_terminal_ack():
-    sender = _Sender()
-    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
-    state = _state([1, 2, 3])
-    processor.rid_to_state["client"] = state
-    processor.mark_abort("client")
-
-    processor.reap_finished_orphan("client", state)
-
-    assert "client" not in processor.rid_to_state
-    assert len(sender.items) == 1
-    assert sender.items[0].rids == ["client"]
-    assert sender.items[0].finished_reasons[0]["type"] == "abort"
-
-
-def test_inflight_client_abort_sends_terminal_ack():
-    sender = _Sender()
-    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
-    state = _state([1, 2, 3], computed_length=3)
-    processor.rid_to_state["client"] = state
-    processor.mark_abort("client")
-
-    class _DecodeOp:
-        request_ids = ["client"]
-        request_pool_indices = [0]
-        input_lengths = [1]
-        prefill_lengths = []
-        extend_prefix_lens = []
-
-        def num_extends(self):
-            return 0
-
-    result = _ExecutionResult()
-    result.output_tokens = torch.tensor([11], dtype=torch.int32)
-    result.output_lengths = torch.tensor([1], dtype=torch.int32)
-    events = processor.post_process_forward_op(
-        _DecodeOp(), result, is_prefill_instance=False
-    )
-
-    assert "client" not in processor.rid_to_state
-    assert [type(event).__name__ for event in events] == ["ExtendResult", "Finish"]
-    assert len(sender.items) == 1
-    assert sender.items[0].finished_reasons[0]["type"] == "abort"
 
 
 def test_nan_flag_finishes_request_with_numerical_error():
@@ -696,8 +652,7 @@ def test_aborted_prefill_waits_for_pd_transfer_completion(notify_client):
 
     assert processor.finish_prefill_request("prefill") == []
     assert "prefill" not in processor.rid_to_state
-    assert len(sender.items) == 1
-    assert sender.items[0].finished_reasons[0]["type"] == "abort"
+    assert len(sender.items) == int(notify_client)
 
 
 def test_pd_one_token_request_finishes_at_remote_prefill_done():
