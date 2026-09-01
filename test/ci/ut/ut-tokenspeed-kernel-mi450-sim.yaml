@@ -13,6 +13,7 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
+  MI450_SIM_RUN_TIMEOUT: "3600"
   MI450_SIM_WORKERS: "6"
   TEST_DESELECTS: |
     # Iris symmetric heaps require physical KFD/ARSMI peer topology. rocJITsu

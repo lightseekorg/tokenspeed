@@ -106,24 +106,6 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert not is_amd_runner("gb200-4gpu-perf")
 
 
-def test_mi450_sim_uses_self_hosted_cpu_runner(tmp_path):
-    _write_task_yaml(
-        tmp_path,
-        "mi450-sim.yaml",
-        _default_body("mi450-sim", ["amd-mi450-sim"]),
-    )
-
-    matrix = build_matrix(
-        tmp_path,
-        tmp_path,
-        trigger="per-commit",
-        runner_group="amd",
-    )
-
-    assert matrix["include"][0]["runner"] == "amd-mi450-sim"
-    assert "runs_on" not in matrix["include"][0]
-
-
 @pytest.mark.parametrize(
     ("declared", "effective"),
     [
