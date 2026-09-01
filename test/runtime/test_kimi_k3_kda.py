@@ -81,7 +81,6 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
     backend = object.__new__(KdaAttnBackend)
     backend._decode_cow_descriptors = (Descriptor(), Descriptor())
     backend._decode_cow_first_layer = 2
-    backend._decode_cow_l2_notice_emitted = False
     backend._state_groups = lambda: ("g0", "g1", "g2")
     backend.kv_pool = SimpleNamespace(layerwise_load_tracker=None)
     reads = {group: torch.tensor([1, 2]) for group in backend._state_groups()}
@@ -97,9 +96,13 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
     assert backend._stage_flashinfer_decode_cow(3, 2)
     assert len(calls) == 2
 
-    backend.kv_pool.layerwise_load_tracker = SimpleNamespace(consumer_indices=())
-    assert not backend._stage_flashinfer_decode_cow(2, 2)
-    assert len(calls) == 2
+    waits = []
+    backend.kv_pool.layerwise_load_tracker = SimpleNamespace(
+        wait_for_all_layers=lambda: waits.append(True)
+    )
+    assert backend._stage_flashinfer_decode_cow(2, 2)
+    assert waits == [True]
+    assert len(calls) == 4
 
     backend.kv_pool.layerwise_load_tracker = None
     backend.forward_metadata = SimpleNamespace(
@@ -107,7 +110,7 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
         state_out_blocks_by_group=None,
     )
     assert not backend._stage_flashinfer_decode_cow(3, 2)
-    assert len(calls) == 2
+    assert len(calls) == 4
 
 
 def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
@@ -647,9 +650,8 @@ def _to_slab_layout(state: torch.Tensor) -> torch.Tensor:
 def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
     diff = (actual.float() - expected.float()).abs()
     assert diff.mean().item() < mean_tol, f"{what}: mean diff {diff.mean().item()}"
-    assert torch.allclose(
-        actual.float(), expected.float(), atol=atol, rtol=rtol
-    ), f"{what}: max diff {diff.max().item()}"
+    close = torch.allclose(actual.float(), expected.float(), atol=atol, rtol=rtol)
+    assert close, f"{what}: max diff {diff.max().item()}"
 
 
 @requires_cuda

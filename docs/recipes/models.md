@@ -231,8 +231,8 @@ Notes:
   single-token decode uses FlashInfer's fused KDA operator when its backend is
   available; TokenSpeed bulk-copies prefix-cache COW rows before invoking the
   public single-index API. DSpark T=8 verify remains on the FP32-state
-  ReplaySSM path. Layerwise L2 restore also retains the native per-layer path
-  so its load fences are not bypassed.
+  ReplaySSM path. A pending layerwise L2 restore is fenced once before the
+  cross-layer decode COW, after which ordinary decode still uses FlashInfer.
 - The persistent KDA convolution layout is sequence-major on Blackwell and
   feature-major elsewhere. Cache-transfer P/D peers must therefore use the
   same GPU-generation layout; mixed H100/B200-or-B300 K3 PD is rejected by the

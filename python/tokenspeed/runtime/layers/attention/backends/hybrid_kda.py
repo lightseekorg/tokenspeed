@@ -126,7 +126,6 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_descriptor_bound: set[int] = set()
         self._decode_cow_descriptors: tuple[KdaGroupedStateCopyDescriptor, ...] = ()
         self._decode_cow_first_layer: int | None = None
-        self._decode_cow_l2_notice_emitted = False
         self._sequence_major_conv = kda_conv_state_layout() == "sequence_major"
         self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
@@ -428,25 +427,11 @@ class KdaAttnBackend(MambaAttnBackend):
     def _stage_flashinfer_decode_cow(self, layer_id: int, batch_size: int) -> bool:
         """Prepare single-index FlashInfer state once at the first KDA layer.
 
-        Layerwise L2 restore owns the first access to each layer's cache fields.
-        A cross-layer bulk copy cannot safely jump those fences, so such batches
-        stay on the native dual-index Triton path.
+        A cross-layer copy cannot jump an active layerwise L2 restore. Fence its
+        final event once before staging; ordinary decode still uses FlashInfer.
         """
         descriptors = self._decode_cow_descriptors
         if not descriptors or self._decode_cow_first_layer is None:
-            return False
-        load_tracker = getattr(self.kv_pool, "layerwise_load_tracker", None)
-        # This branch is fixed while a CUDA graph is captured. Merely checking
-        # the current consumer set would bake cross-layer copies into a graph
-        # that a later L2-restored batch replays. Disable this backend whenever
-        # the pool participates in layerwise restore, preserving its fences.
-        if load_tracker is not None:
-            if not self._decode_cow_l2_notice_emitted:
-                logger.info(
-                    "FlashInfer KDA decode uses the Triton fallback while "
-                    "layerwise cache restore is active"
-                )
-                self._decode_cow_l2_notice_emitted = True
             return False
         metadata = self.forward_metadata
         if (
@@ -455,6 +440,9 @@ class KdaAttnBackend(MambaAttnBackend):
         ):
             return False
         if layer_id == self._decode_cow_first_layer:
+            load_tracker = getattr(self.kv_pool, "layerwise_load_tracker", None)
+            if load_tracker is not None:
+                load_tracker.wait_for_all_layers()
             group_ids = self._state_groups()
             read_groups = tuple(
                 metadata.state_in_blocks_by_group[group_id] for group_id in group_ids
