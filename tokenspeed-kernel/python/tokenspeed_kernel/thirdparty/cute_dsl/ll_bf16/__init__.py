@@ -79,8 +79,8 @@ class LLBf16Router:
 
     def __init__(self) -> None:
         # Device-keyed: a callable compiled on one GPU must not run on another.
-        # PDL is part of the compiled kernel, so the server switch belongs in
-        # the cache key as well.
+        # PDL is part of the compiled kernel, so the process-wide policy belongs
+        # in the cache key as well.
         self._dotprod: dict[_DotprodCacheKey, Any] = {}
         self._splitk: dict[_SplitKCacheKey, Any] = {}
         self._compile_lock = threading.Lock()

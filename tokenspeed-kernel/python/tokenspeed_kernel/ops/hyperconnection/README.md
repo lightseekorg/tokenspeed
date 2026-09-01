@@ -44,21 +44,15 @@ broadcast tensor.
 - Grouped Gemma RMSNorm is implemented in `ops/layernorm/triton.py`. One program
   owns each `(token, branch)` group and emits no unused inverse-RMS tensor.
 
-## Full-chain PDL
-
-TokenSpeed serving has one PDL switch: `ServerArgs.disable_pdl`, exposed as
-`--disable-pdl`. It defaults to false, so PDL is enabled on NVIDIA Hopper and
-newer GPUs. `ServerArgs` applies the effective hardware-gated value to
-`tokenspeed-kernel`, TorchInductor, and TRT-LLM in the parent and reapplies it in
-every spawned worker before kernel compilation. Disabling the flag explicitly
-sets every backend to zero instead of retaining an earlier process setting.
+## PDL
 
 Grouped RMSNorm, the Triton projection epilogue, persistent mix, mix epilogue,
-and combine all carry matching PDL wait/launch-dependents hooks. CuTeDSL GEMMs
-compile PDL and non-PDL variants under separate cache keys, so the server switch
-cannot reuse a kernel compiled with the opposite policy. Vendor GEMMs in the
-general prefill path retain ordinary stream dependency semantics; all custom
-stages surrounding them remain PDL-aware.
+and combine honor the existing process-wide `pdl_enabled` policy and carry
+matching PDL wait/launch-dependents hooks. CuTeDSL GEMMs compile PDL and non-PDL
+variants under separate cache keys, so changing that policy cannot reuse a
+kernel compiled with the opposite setting. Vendor GEMMs in the general prefill
+path retain ordinary stream dependency semantics; all custom stages surrounding
+them remain PDL-aware.
 
 The persistent path is intentionally not copied from implementations that use
 one process-global barrier tensor. A process-global tensor can race when CUDA

@@ -27,11 +27,7 @@ from tokenspeed_kernel import (
     gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel.platform import (
-    current_platform,
-    pdl_enabled,
-    set_pdl_enabled,
-)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -230,7 +226,7 @@ def test_persistent_mix_full_chain_cuda_graph_replays(enable_pdl: bool) -> None:
 
     previous_pdl = pdl_enabled()
     try:
-        assert set_pdl_enabled(enable_pdl) is enable_pdl
+        assert pdl_enabled(enable_pdl) is enable_pdl
         # Compile every PDL variant and populate the stream-private workspace.
         chain()
         torch.cuda.synchronize()
@@ -262,7 +258,7 @@ def test_persistent_mix_full_chain_cuda_graph_replays(enable_pdl: bool) -> None:
         torch.testing.assert_close(inject, expected_inject, rtol=4e-2, atol=4e-2)
         torch.testing.assert_close(combined, expected_combined, rtol=4e-2, atol=4e-2)
     finally:
-        set_pdl_enabled(previous_pdl)
+        pdl_enabled(previous_pdl)
 
 
 def test_persistent_mix_uses_stream_private_barriers() -> None:

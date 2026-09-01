@@ -31,7 +31,7 @@ from typing import Literal
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
-from tokenspeed_kernel.platform import current_platform, set_pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.utils import (
@@ -942,23 +942,14 @@ class ServerArgs:
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
 
-        self.configure_pdl()
-
         from tokenspeed.runtime.utils.env import envs
 
         envs.TOKENSPEED_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        if not self.disable_pdl:
+            os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
+            # Enable PDL for fused attention kernels.
+            os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-
-    def configure_pdl(self) -> bool:
-        """Apply this server's PDL policy to every in-process kernel backend."""
-        enabled = set_pdl_enabled(not self.disable_pdl and self.device == "cuda")
-        value = "1" if enabled else "0"
-        # These libraries read process environment rather than the
-        # tokenspeed-kernel policy object. Assign, rather than setdefault, so a
-        # later --disable-pdl cannot leave an earlier enabled process state.
-        os.environ["TORCHINDUCTOR_ENABLE_PDL"] = value
-        os.environ["TRTLLM_ENABLE_PDL"] = value
-        return enabled
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1836,10 +1827,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-pdl",
             action="store_true",
-            help=(
-                "Disable full-chain Programmatic Dependent Launch. PDL is "
-                "enabled by default on NVIDIA Hopper and newer GPUs."
-            ),
+            help="Disable PDL launch.",
         )
         prefix_cache_group = parser.add_mutually_exclusive_group()
         prefix_cache_group.add_argument(

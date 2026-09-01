@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 
 import pytest
 import torch
@@ -30,18 +29,12 @@ from tokenspeed_kernel import (
     gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel.platform import (
-    current_platform,
-    pdl_enabled,
-    set_pdl_enabled,
-)
 
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
     HyperConnectionConfig,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def test_runtime_uses_tokenspeed_kernel_boundary() -> None:
@@ -61,30 +54,6 @@ def test_kernel_boundary_is_gpu_only() -> None:
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
     with pytest.raises(ValueError, match="requires GPU tensors"):
         grouped_gemma_rmsnorm(normalized, torch.empty(8), 4, 1e-6)
-
-
-def test_server_args_is_the_authoritative_pdl_switch(monkeypatch) -> None:
-    for name in ("TORCHINDUCTOR_ENABLE_PDL", "TRTLLM_ENABLE_PDL"):
-        monkeypatch.setenv(name, os.environ.get(name, "0"))
-    previous = pdl_enabled()
-    args = object.__new__(ServerArgs)
-    args.device = "cuda"
-    try:
-        args.disable_pdl = True
-        assert not args.configure_pdl()
-        assert not pdl_enabled()
-        assert os.environ["TORCHINDUCTOR_ENABLE_PDL"] == "0"
-        assert os.environ["TRTLLM_ENABLE_PDL"] == "0"
-
-        args.disable_pdl = False
-        expected = current_platform().is_hopper_plus
-        assert args.configure_pdl() is expected
-        assert pdl_enabled() is expected
-        expected_value = "1" if expected else "0"
-        assert os.environ["TORCHINDUCTOR_ENABLE_PDL"] == expected_value
-        assert os.environ["TRTLLM_ENABLE_PDL"] == expected_value
-    finally:
-        set_pdl_enabled(previous)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
