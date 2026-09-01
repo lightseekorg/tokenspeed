@@ -228,6 +228,7 @@ class _AttnSideProfile:
     derivation instead of two interleaved copies.
     """
 
+    architectures: tuple[str, ...]
     requested_backend: str | None
     is_hybrid_gdn: bool
     is_kda: bool
@@ -250,6 +251,7 @@ def _resolve_attn_side(
     architectures = getattr(hf_config, "architectures", None) or []
     is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
     return _AttnSideProfile(
+        architectures=tuple(architectures),
         requested_backend=requested_backend,
         is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
         is_kda=any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
@@ -284,6 +286,58 @@ def _check_pd_support(
             "Inkling PD supports target-only decoding; speculative/draft "
             "ShortConv checkpoint transfer is not implemented"
         )
+
+
+def _apply_backend_overrides(
+    server_args: ServerArgs,
+    target: _AttnSideProfile,
+    draft: _AttnSideProfile | None,
+) -> None:
+    """The one place family resolution writes back into ``server_args``.
+
+    The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
+    the backend choice through the generate() protocol, and the
+    ``global_server_args_dict`` snapshot serves models that pick kernel paths
+    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
+    any ``_create_attn_config`` call. The user's pre-override choice survives
+    as ``profile.requested_backend``.
+    """
+    if target.is_deepseek_v4:
+        server_args.attention_backend = "deepseek_v4"
+    if draft is not None and draft.is_deepseek_v4:
+        server_args.drafter_attention_backend = "deepseek_v4"
+
+    if target.is_hybrid_linear:
+        # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
+        # hybrid_linear_attn. The user's original choice stays in the profile
+        # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
+        server_args.attention_backend = "hybrid_linear_attn"
+    elif server_args.attention_backend == "hybrid_linear_attn":
+        logger.warning(
+            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
+            target.architectures,
+        )
+        server_args.attention_backend = None
+        if server_args.drafter_attention_backend == "hybrid_linear_attn":
+            logger.warning(
+                "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
+                draft.architectures if draft is not None else (),
+            )
+            server_args.drafter_attention_backend = None
+
+
+def _resolve_full_attn_backend_name(
+    profile: _AttnSideProfile, softmax_attn, hybrid_request: str | None
+) -> str:
+    """The name the full-attention layers run on (the hybrid sub-backend,
+    or the config's own resolution)."""
+    if profile.is_hybrid_linear:
+        return _resolve_hybrid_full_backend_name(
+            hybrid_request,
+            is_kda=profile.is_kda,
+            has_cache_plan=True,
+        )
+    return softmax_attn.backend_name
 
 
 def _has_state_layers(config: AttnConfig) -> bool:
@@ -844,6 +898,24 @@ def _prepare_verify_workspace(
 
 
 # ---------- public API ----------
+def _narrow_spec_for_pp(spec: CachePoolSpec, mapping) -> tuple[CachePoolSpec, object]:
+    """Chunk-pipeline stage: physically allocate only this stage's layers'
+    planes. The logical geometry (parents, packing, page math) stays the
+    full model's so every rank's scheduler plans identically; the returned
+    full plan serves the PD wire contract (every stage registers the same
+    logical layout, Decode plans stage windows against it).
+    """
+    from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
+
+    stage_start, stage_end = pp_layer_window(len(spec.layer_types), mapping)
+    pp_logical_plan = spec.memory_plan
+    spec = dataclasses.replace(
+        spec,
+        memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+    )
+    return spec, pp_logical_plan
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -870,42 +942,15 @@ def create_attn_components(
     _check_pd_support(
         server_args, target, draft, has_draft_model=draft_model_config is not None
     )
-
-    if target.is_deepseek_v4:
-        server_args.attention_backend = "deepseek_v4"
-    if draft is not None and draft.is_deepseek_v4:
-        server_args.drafter_attention_backend = "deepseek_v4"
-
-    if target.is_hybrid_linear:
-        # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
-        # hybrid_linear_attn. The user's original choice stays in the profile
-        # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
-        server_args.attention_backend = "hybrid_linear_attn"
-    elif server_args.attention_backend == "hybrid_linear_attn":
-        logger.warning(
-            "Ignoring hybrid_linear_attn backend for non-hybrid model architectures=%s",
-            getattr(model_config.hf_config, "architectures", None) or [],
-        )
-        server_args.attention_backend = None
-        if server_args.drafter_attention_backend == "hybrid_linear_attn":
-            logger.warning(
-                "Ignoring hybrid_linear_attn drafter backend for non-hybrid model"
-            )
-            server_args.drafter_attention_backend = None
+    _apply_backend_overrides(server_args, target, draft)
 
     config = _create_attn_config(server_args, model_config)
     softmax_attn = config.component(SoftmaxAttnConfig)
     if target.is_deepseek_v4:
         softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     cache_family = _resolve_cache_family(target, model_config, config)
-    target_full_attn_backend_name = (
-        _resolve_hybrid_full_backend_name(
-            target.requested_backend,
-            is_kda=target.is_kda,
-            has_cache_plan=True,
-        )
-        if target.is_hybrid_linear
-        else softmax_attn.backend_name
+    target_full_attn_backend_name = _resolve_full_attn_backend_name(
+        target, softmax_attn, hybrid_request=target.requested_backend
     )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
@@ -921,16 +966,15 @@ def create_attn_components(
         draft_softmax_attn.sliding_window_tokens = int(
             draft_model_config.hf_config.sliding_window
         )
-    draft_full_attn_backend_name = None
-    if draft_attn_config is not None:
-        if draft.is_hybrid_linear:
-            draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
-                draft_softmax_attn.backend_name,
-                is_kda=draft.is_kda,
-                has_cache_plan=True,
-            )
-        else:
-            draft_full_attn_backend_name = draft_softmax_attn.backend_name
+    draft_full_attn_backend_name = (
+        # The draft's hybrid sub-backend request is its config's own
+        # resolution, not the user's target choice.
+        _resolve_full_attn_backend_name(
+            draft, draft_softmax_attn, hybrid_request=draft_softmax_attn.backend_name
+        )
+        if draft_attn_config is not None
+        else None
+    )
     draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
@@ -1001,23 +1045,7 @@ def create_attn_components(
     # compute view below (target, draft) is a layer window onto.
     pp_logical_plan = None
     if server_args.mapping.has_pp:
-        # Chunk-pipeline stage: physically allocate only this stage's layers'
-        # planes. The logical geometry (parents, packing, page math) stays
-        # the full model's so every rank's scheduler plans identically; keep
-        # the full plan for the PD wire contract (every stage registers the
-        # same logical layout, Decode plans stage windows against it).
-        from dataclasses import replace as _dc_replace
-
-        from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
-
-        stage_start, stage_end = pp_layer_window(
-            len(spec.layer_types), server_args.mapping
-        )
-        pp_logical_plan = spec.memory_plan
-        spec = _dc_replace(
-            spec,
-            memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
-        )
+        spec, pp_logical_plan = _narrow_spec_for_pp(spec, server_args.mapping)
         target_spec = spec
     arena = create_cache_arena(
         spec,
