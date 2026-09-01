@@ -26,6 +26,7 @@ from tokenspeed_kernel import (
     gated_residual_combine,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
+    refresh_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
@@ -154,6 +155,46 @@ def test_cute_dsl_mix_matches_fp64_reference(rows: int) -> None:
     torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
 
 
+def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
+    if not current_platform().is_blackwell:
+        pytest.skip("the CuTeDSL HC specialization is Blackwell-only")
+    if KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix") is None:
+        pytest.skip("CuTeDSL dependencies are unavailable")
+    normalized, projection, up = _inputs(1, torch.bfloat16, seed=23)
+    up.zero_()
+
+    def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
+        return gated_residual_mix(
+            normalized,
+            projection,
+            up,
+            HC_COUNT,
+            HIDDEN_SIZE,
+            LOWRANK,
+            override="cute_dsl_hyperconnection_mix",
+        )
+
+    before, _ = mix()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, actual_inject = mix()
+
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    up.data.copy_(
+        torch.randn(up.shape, dtype=up.dtype, device=up.device, generator=generator)
+        * 0.1
+    )
+    assert refresh_gated_residual_weight_cache(up, LOWRANK)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected, expected_inject = _mix_reference(normalized, projection, up)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
+    assert not torch.allclose(actual, before, rtol=3e-2, atol=3e-2)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_combine_accepts_reduce_scatter_row_slices(dtype: torch.dtype) -> None:
     generator = torch.Generator(device="cuda").manual_seed(29)
@@ -193,6 +234,22 @@ def test_grouped_gemma_rmsnorm_production_shape(rows: int, dtype: torch.dtype) -
     torch.testing.assert_close(
         actual, expected.to(dtype), rtol=tolerance, atol=tolerance
     )
+
+
+def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
+    x = torch.empty(0, WIDE, dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty(WIDE, dtype=x.dtype, device=x.device)
+    invalid_outputs = (
+        torch.empty(1, WIDE, dtype=x.dtype, device=x.device),
+        torch.empty(x.shape, dtype=torch.float16, device=x.device),
+        torch.empty(x.shape, dtype=x.dtype, device="cpu"),
+    )
+    for out in invalid_outputs:
+        with pytest.raises(ValueError, match="out must match"):
+            grouped_gemma_rmsnorm(x, weight, HIDDEN_SIZE, 1e-6, out=out)
+
+    out = torch.empty_like(x)
+    assert grouped_gemma_rmsnorm(x, weight, HIDDEN_SIZE, 1e-6, out=out) is out
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])

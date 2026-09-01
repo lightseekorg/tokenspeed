@@ -192,18 +192,18 @@ def grouped_gemma_rmsnorm(
         )
     if weight.dtype != x.dtype or weight.device != x.device:
         raise ValueError("weight must match x dtype and device")
-    if x.numel() == 0:
-        return torch.empty_like(x) if out is None else out
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not weight.is_contiguous():
-        weight = weight.contiguous()
     if out is None:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
         raise ValueError("out must match x shape, dtype, and device")
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
+    if x.numel() == 0:
+        return out
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
 
     rows = x.numel() // width
     groups = width // group_size

@@ -40,7 +40,9 @@ broadcast tensor.
   GEMMs with the same fused Triton epilogues on Blackwell. It remains selectable
   for explicit tuning. Current production measurements favor the one-launch
   persistent path through `T=16` and the general path above it, so CuTeDSL has a
-  lower heuristic priority rather than silently regressing the default.
+  lower heuristic priority rather than silently regressing the default. Its
+  rank-padded up-projection cache keeps a stable address for CUDA Graphs and is
+  refreshed in place by the runtime weight loader after model updates.
 - Grouped Gemma RMSNorm is implemented in `ops/layernorm/triton.py`. One program
   owns each `(token, branch)` group and emits no unused inverse-RMS tensor.
 

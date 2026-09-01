@@ -89,6 +89,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.hyperconnection import (
     gated_residual_combine,
     gated_residual_mix,
+    refresh_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
@@ -142,6 +143,7 @@ __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
     "grouped_gemma_rmsnorm",
+    "refresh_gated_residual_weight_cache",
     # attention
     "mha_plan",
     "mha_prefill",

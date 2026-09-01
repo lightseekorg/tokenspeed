@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import inspect
+from unittest import mock
 
 import pytest
 import torch
@@ -54,6 +55,24 @@ def test_kernel_boundary_is_gpu_only() -> None:
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
     with pytest.raises(ValueError, match="requires GPU tensors"):
         grouped_gemma_rmsnorm(normalized, torch.empty(8), 4, 1e-6)
+
+
+def test_up_weight_loader_refreshes_kernel_cache(monkeypatch) -> None:
+    refresh = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        hyperconnection_module, "refresh_gated_residual_weight_cache", refresh
+    )
+    lowrank = 3
+    mixer = GatedResidualSimple(
+        HyperConnectionConfig(hc_count=2, hidden_size=4, hc_lowrank=lowrank)
+    )
+    param = mixer.input_mix_weight_up.weight
+    loaded = torch.randn_like(param)
+
+    param.weight_loader(param, loaded)
+
+    torch.testing.assert_close(param, loaded)
+    refresh.assert_called_once_with(param, lowrank)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

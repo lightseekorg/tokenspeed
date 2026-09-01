@@ -60,6 +60,40 @@ _PADDED_WEIGHT_LOCK = threading.Lock()
 _PADDED_UP_WEIGHTS: dict[tuple[int, int], _CachedPaddedWeight] = {}
 
 
+def _copy_padded_up_weight(
+    padded: torch.Tensor, up_weight: torch.Tensor, lowrank: int
+) -> None:
+    with torch.no_grad():
+        padded.zero_()
+        padded[:, :lowrank].copy_(up_weight)
+
+
+def _refresh_padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> bool:
+    """Refresh an existing graph-stable padded weight in place.
+
+    Args:
+        up_weight: Source mix-up weight shaped ``[wide, lowrank]``.
+        lowrank: Unpadded rank of the source weight.
+
+    Returns:
+        Whether a cached padded allocation existed and was refreshed.
+    """
+    padded_lowrank = _round_up(lowrank, _LOWRANK_ALIGNMENT)
+    if not up_weight.is_cuda or padded_lowrank == lowrank:
+        return False
+    device_index = up_weight.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, up_weight.data_ptr())
+    with _PADDED_WEIGHT_LOCK:
+        cached = _PADDED_UP_WEIGHTS.get(key)
+        if cached is None or cached.source() is not up_weight:
+            return False
+        _copy_padded_up_weight(cached.padded, up_weight, lowrank)
+        cached.version = int(up_weight._version)
+        return True
+
+
 def _padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> torch.Tensor:
     """Return a graph-stable, zero-padded CuTe input weight."""
     padded_lowrank = _round_up(lowrank, _LOWRANK_ALIGNMENT)
@@ -79,18 +113,17 @@ def _padded_up_weight(up_weight: torch.Tensor, lowrank: int) -> torch.Tensor:
         return cached.padded
     with _PADDED_WEIGHT_LOCK:
         cached = _PADDED_UP_WEIGHTS.get(key)
-        if (
-            cached is not None
-            and cached.source() is up_weight
-            and cached.version == version
-        ):
+        if cached is not None and cached.source() is up_weight:
+            if cached.version != version:
+                _copy_padded_up_weight(cached.padded, up_weight, lowrank)
+                cached.version = version
             return cached.padded
         padded = torch.zeros(
             (up_weight.shape[0], padded_lowrank),
             dtype=up_weight.dtype,
             device=up_weight.device,
         )
-        padded[:, :lowrank].copy_(up_weight)
+        _copy_padded_up_weight(padded, up_weight, lowrank)
         _PADDED_UP_WEIGHTS[key] = _CachedPaddedWeight(
             source=weakref.ref(up_weight), version=version, padded=padded
         )
