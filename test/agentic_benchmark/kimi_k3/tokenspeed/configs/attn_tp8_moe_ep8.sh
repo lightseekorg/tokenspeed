@@ -8,16 +8,18 @@ exec ts serve \
     --ep-size 8 \
     --max-model-len 80000 \
     --max-num-seqs 16 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.9 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
     --kda-backend cutedsl_kda \
     --moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
-    --speculative-algorithm DSPARK \
-    --speculative-draft-model-path Inferact/Kimi-K3-DSpark \
-    --speculative-num-draft-tokens 8 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla \
+    --speculative-num-steps 3 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-eagle-topk 1 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
     --disable-kvstore \
