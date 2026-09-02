@@ -1051,7 +1051,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
-    def test_persistent_topk_matches_torch_for_batch_gt_32(self):
+    def test_persistent_topk_noncluster_fallback_matches_torch(self):
         if not has_persistent_topk():
             self.skipTest("DeepSeek V4 persistent top-k op is not available")
 
@@ -1059,9 +1059,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         device = torch.device("cuda")
         topk = 512
         num_rows = 36
-        stride = 544
+        stride = 65568
+        # More than 32 rows bypasses clusters on capable GPUs. The long live
+        # row exercises the same single-CTA streaming kernel used when cluster
+        # launch is unsupported; short rows verify graph-padded tail handling.
         lengths = torch.tensor(
-            [0, 17] + [520 + (idx % 24) for idx in range(num_rows - 2)],
+            [0, 17, 513, 9000, 33000, 65537]
+            + [520 + (idx % 24) for idx in range(num_rows - 6)],
             device=device,
             dtype=torch.int32,
         )
@@ -1078,11 +1082,178 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             output,
             workspace,
             topk,
-            int(lengths.max().item()),
+            stride,
         )
         torch.cuda.synchronize()
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
+
+    def test_persistent_topk_cluster_path_matches_torch_for_all_supported_k(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6792)
+        device = torch.device("cuda")
+        stride = 262144
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        for topk in (512, 1024, 2048):
+            with self.subTest(topk=topk):
+                lengths = torch.tensor(
+                    [topk + 1, 8192, 65537, 131071, 262143],
+                    device=device,
+                    dtype=torch.int32,
+                )
+                logits = torch.randn(
+                    (lengths.numel(), stride),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                output = torch.full(
+                    (lengths.numel(), topk),
+                    -77,
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    int(lengths.max().item()),
+                )
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_cluster_pdl_is_cuda_graph_capture_safe(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6794)
+        device = torch.device("cuda")
+        topk = 2048
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        for stride, raw_lengths in (
+            (131072, [1024, 8192, 65537, 131071]),
+            (262144, [1024, 8192, 131073, 262143]),
+        ):
+            with self.subTest(stride=stride):
+                lengths = torch.tensor(raw_lengths, device=device, dtype=torch.int32)
+                logits = torch.randn(
+                    (lengths.numel(), stride),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                output = torch.full(
+                    (lengths.numel(), topk),
+                    -77,
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                persistent_topk(logits, lengths, output, workspace, topk, stride)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    persistent_topk(logits, lengths, output, workspace, topk, stride)
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_cluster_specialization_boundaries(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6795)
+        device = torch.device("cuda")
+        topk = 2048
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        # Exercise both sides of the register-cluster and cluster-16 ceilings,
+        # including the portable cluster-8 fallback above 256K.
+        for max_seq_len in (65537, 131072, 131073, 262144, 262145):
+            with self.subTest(max_seq_len=max_seq_len):
+                actual_len = max_seq_len - 1
+                lengths = torch.tensor([actual_len], device=device, dtype=torch.int32)
+                logits = torch.randn(
+                    (1, max_seq_len), device=device, dtype=torch.float32
+                )
+                logits[:, actual_len:] = 1.0e6
+                output = torch.full((1, topk), -77, device=device, dtype=torch.int32)
+
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    max_seq_len,
+                )
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_verify_mode_uses_causal_request_lengths(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6793)
+        device = torch.device("cuda")
+        topk = 512
+        q_len_per_req = 4
+        request_lengths = torch.tensor(
+            [70000, 131071], device=device, dtype=torch.int32
+        )
+        effective_lengths = torch.tensor(
+            [
+                int(raw_len) - (q_len_per_req - 1) + query_idx
+                for raw_len in request_lengths.cpu().tolist()
+                for query_idx in range(q_len_per_req)
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        stride = 131072
+        logits = torch.randn(
+            (effective_lengths.numel(), stride),
+            device=device,
+            dtype=torch.float32,
+        )
+        output = torch.full(
+            (effective_lengths.numel(), topk),
+            -77,
+            device=device,
+            dtype=torch.int32,
+        )
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        persistent_topk(
+            logits,
+            request_lengths,
+            output,
+            workspace,
+            topk,
+            int(request_lengths.max().item()),
+            q_len_per_req,
+        )
+        torch.cuda.synchronize()
+
+        self._assert_persistent_topk_matches_torch(
+            logits, effective_lengths, output, topk
+        )
 
     def test_indexer_mxfp4_cache_matches_reference(self):
         torch.manual_seed(7890)
