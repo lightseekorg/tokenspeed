@@ -4,6 +4,7 @@ api_version: ci.tokenspeed.io/v1
 # performance and must stay speculator-free (Issue #879).
 name: perf-kimi-k3-dspark-mxfp4-tp8ep8-random-4k-1k-mi35x
 type: perf
+workflow_stage: model-test
 triggers:
   - manual
 runner:
