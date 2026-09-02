@@ -40,7 +40,7 @@ def create_nvfp4_weight_pair(
 ) -> None:
     ispp = spec.intermediate_size // spec.tp_size
     w13_weight = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             2 * ispp,
             spec.hidden_size // 2,
@@ -49,7 +49,7 @@ def create_nvfp4_weight_pair(
         requires_grad=False,
     )
     w2_weight = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             spec.hidden_size,
             ispp // 2,
@@ -61,7 +61,7 @@ def create_nvfp4_weight_pair(
     layer.register_parameter("w2_weight", w2_weight)
 
     w13_weight_scale = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             2 * ispp,
             spec.hidden_size // group_size,
@@ -70,7 +70,7 @@ def create_nvfp4_weight_pair(
         requires_grad=False,
     )
     w2_weight_scale = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             spec.hidden_size,
             ispp // group_size,

@@ -15,6 +15,7 @@ on:
         type: choice
         options:
           - "1"
+          - "4"
           - "10"
           - "113"
       concurrency:
@@ -100,6 +101,7 @@ jobs:
       DEEPSWE_MINIMUM_SCORE: ${{ inputs.minimum_score }}
       KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
       KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
+      PIER_KIMI_CODE_BINARY: /cache/kimi-code/0.29.0/bin/kimi
     steps:
       - name: Checkout source
         uses: actions/checkout@v4

@@ -164,6 +164,25 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run([[7, 0, 12]], [4], [5])
 
+    def test_index_plan_preserves_int32_inputs(self):
+        torch = self.torch
+        from tokenspeed.runtime.layers.attention.backends.mamba import (
+            _compute_state_block_index_plan,
+        )
+
+        plan = _compute_state_block_index_plan(
+            4,
+            torch.tensor([4, 7], dtype=torch.int32),
+            torch.tensor([5, 8], dtype=torch.int32),
+        )
+
+        self.assertEqual(plan.before.dtype, torch.int32)
+        self.assertEqual(plan.after.dtype, torch.int32)
+        self.assertEqual(plan.in_slots.dtype, torch.int32)
+        self.assertEqual(plan.out_slots.dtype, torch.int32)
+        self.assertEqual(plan.in_slots.tolist(), [0, 1])
+        self.assertEqual(plan.out_slots.tolist(), [1, 1])
+
     def test_out_slot_pad_raises(self):
         with self.assertRaises(ValueError):
             self._run([[7, -1, 12]], [4], [5])
@@ -412,6 +431,10 @@ class VerifyMetadataTest(unittest.TestCase):
         metadata = self.backend.forward_metadata
         self.assertEqual(metadata.mamba_output_indices.tolist(), [[1, 2, 3, 4]])
         self.assertEqual(metadata.mamba_output_indices.dtype, torch.int32)
+        self.assertEqual(
+            metadata.state_in_blocks_by_group["linear_attention_0"].dtype,
+            torch.int32,
+        )
         self.assertEqual(
             metadata.state_in_blocks_by_group["linear_attention_0"].tolist(),
             [3],

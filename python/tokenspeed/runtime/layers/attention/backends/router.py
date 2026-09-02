@@ -582,9 +582,7 @@ class CacheGroupRouter(AttentionBackend):
         bs = cache_start.shape[0]
         # Window positions run cache_start .. cache_start+n-1; the decode
         # kernel derives them as end-n .. end-1, so feed end = start + n.
-        self.stacks.compute_decode_locations(
-            bs, cache_start + num_tokens, num_tokens
-        )
+        self.stacks.compute_decode_locations(bs, cache_start + num_tokens, num_tokens)
         self._decode_row_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
@@ -785,4 +783,22 @@ class CacheGroupRouter(AttentionBackend):
     def forward_sparse_prefill(self, *args, **kwargs):
         return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
             *args, **kwargs
+        )
+
+    # ------------------------------------------------------------------
+    # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled
+    # indexing runtime through the router.
+    # ------------------------------------------------------------------
+
+    def require_kpool_runtime(self):
+        return self._sole_leaf("require_kpool_runtime").require_kpool_runtime()
+
+    def kpool_prefill_page_table(self, num_requests: int):
+        return self._sole_leaf("kpool_prefill_page_table").kpool_prefill_page_table(
+            num_requests
+        )
+
+    def kpool_decode_page_table(self, row_start: int, num_requests: int):
+        return self._sole_leaf("kpool_decode_page_table").kpool_decode_page_table(
+            row_start, num_requests
         )

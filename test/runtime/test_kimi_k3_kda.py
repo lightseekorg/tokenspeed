@@ -250,12 +250,25 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
 # ---------------------------------------------------------------------------
 
 
-def test_set_kv_pool_binds_contract_state_groups() -> None:
+def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
+    replay_probe = {}
+
+    def probe_replay(_dtype, **kwargs):
+        replay_probe.update(kwargs)
+        return False
+
+    monkeypatch.setattr(kda, "kda_replay_commit_supported", probe_replay)
     pool = _make_kimi_pool("cpu")
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
     assert backend._checkpoint_granularity == pool.arena.prefix_granularity
+    _, state = backend._state_components(backend._state_layer_ids()[0])
+    assert replay_probe == {
+        "recurrent_layout": backend.kda_recurrent_layout,
+        "num_heads": state.shape[1],
+        "head_dim": state.shape[2],
+    }
 
 
 # ---------------------------------------------------------------------------

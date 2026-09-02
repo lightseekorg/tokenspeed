@@ -37,11 +37,7 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    break_point,
-    current_forward_ctx,
-    slice_to_real_tokens,
-)
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.page_table import (
@@ -85,11 +81,12 @@ class GlmDsaPrefillTopK:
     topk_lens: torch.Tensor
     page_table: torch.Tensor
     seq_lens: torch.Tensor
+    kv_seq_lens: torch.Tensor
     max_seq_len: int
     kv_workspace_slots: torch.Tensor
-    row_starts: torch.Tensor
-    row_ends: torch.Tensor
-    candidate_lens_cpu: torch.Tensor
+    row_starts: torch.Tensor | None = None
+    row_ends: torch.Tensor | None = None
+    candidate_lens_cpu: torch.Tensor | None = None
 
 
 @dataclass
@@ -499,13 +496,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         self,
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
+        *,
+        logical_num_tokens: int | None = None,
     ) -> GlmDsaDecodeTopK | None:
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if metadata is None or metadata.page_table is None:
             return None
         num_tokens = indexer_output.query.shape[0]
+        if logical_num_tokens is None:
+            logical_num_tokens = num_tokens
+        if logical_num_tokens < 0 or logical_num_tokens > num_tokens:
+            raise RuntimeError(
+                "GLM DSA logical token count is outside the input capacity: "
+                f"logical={logical_num_tokens}, capacity={num_tokens}"
+            )
         decode_window = self._resolve_decode_window(
-            ctx, metadata, total_tokens=num_tokens
+            ctx, metadata, total_tokens=logical_num_tokens
         )
         if decode_window.num_reqs <= 0 or num_tokens == 0:
             return None
@@ -609,6 +615,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         cached = ctx.dsa_prefill_topk
         if (
             isinstance(cached, GlmDsaPrefillTopK)
+            and cached.row_starts is not None
+            and cached.row_ends is not None
+            and cached.candidate_lens_cpu is not None
             and cached.row_starts.numel() == num_prefill_tokens
         ):
             return self._compute_prefill_topk_indices_portable(
@@ -620,6 +629,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 row_starts=cached.row_starts,
                 row_ends=cached.row_ends,
                 candidate_lens_cpu=cached.candidate_lens_cpu,
+                kv_seq_lens=cached.kv_seq_lens,
                 max_seq_len=cached.max_seq_len,
                 num_prefill_tokens=num_prefill_tokens,
                 topk=self.index_topk,
@@ -696,6 +706,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             row_starts=row_starts_cpu.to(device=device, dtype=torch.int32),
             row_ends=row_ends_cpu.to(device=device, dtype=torch.int32),
             candidate_lens_cpu=candidate_lens_cpu,
+            kv_seq_lens=candidate_lens_cpu.to(
+                device=device, dtype=torch.int32
+            ).contiguous(),
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
             topk=self.index_topk,
@@ -712,6 +725,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
         candidate_lens_cpu: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
         max_seq_len: int,
         num_prefill_tokens: int,
         topk: int,
@@ -744,6 +758,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk_lens=topk_lens,
             page_table=page_table,
             seq_lens=seq_lens.to(device=q.device, dtype=torch.int32),
+            kv_seq_lens=kv_seq_lens,
             max_seq_len=max_seq_len,
             kv_workspace_slots=kv_workspace_slots,
             row_starts=row_starts,
@@ -767,11 +782,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         collectives), none capturable. Under a prefill-graph capture the whole
         attention runs eager (reading the live ``ctx``) while the layer's
         norms + MoE stay graphed; direct call otherwise (see ``break_point``).
-        Padded token-shaped inputs are sliced to the real count the live
-        metadata describes -- DSA and the decode-window split (which derives
-        ``decode_start`` from the total token count) must not see padded rows,
-        or decode rows get sliced out of the padded tail. Mirrors the
-        DeepSeek-V4 DSA break.
         """
         # Empty (idle / DP-idle) batch: explicit skip, like the sibling MLP/MoE forwards.
         if hidden_states.shape[0] == 0:
@@ -790,15 +800,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
-        # Slice only under a breakable capture/replay (see the DeepSeek-V4 break):
-        # eager forwards (incl. MTP draft steps) are never padded. Sliced AFTER
-        # the pre-attn comm: at replay ``_padded_to`` pins ``global_num_tokens``
-        # to the padded bucket, so the comm must see padded-length rows; only
-        # the DSA stack below needs exactly the real rows.
-        _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
-        _token_to_req = getattr(_metadata, "token_to_req_indices", None)
-        if current_forward_ctx() is not None and _token_to_req is not None:
-            positions, qkv = slice_to_real_tokens(_token_to_req.numel(), positions, qkv)
+
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
@@ -943,6 +945,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         output: torch.Tensor,
         *,
         prefill_topk: GlmDsaPrefillTopK,
+        cache_num_tokens: int | None = None,
     ) -> torch.Tensor:
         Q, _ = self.forward_absorb_qkv_proj(
             q,
@@ -950,6 +953,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             positions,
             ctx,
             out_cache_loc,
+            cache_num_tokens=cache_num_tokens,
         )
         attn_output = ctx.attn_backend.forward_sparse_prefill(
             q=Q,
@@ -957,6 +961,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             token_to_kv_pool=ctx.token_to_kv_pool,
             page_table=prefill_topk.page_table,
             seq_lens=prefill_topk.seq_lens,
+            kv_seq_lens=prefill_topk.kv_seq_lens,
             workspace_indices=prefill_topk.workspace_indices,
             topk_lens=prefill_topk.topk_lens,
             kv_workspace_slots=prefill_topk.kv_workspace_slots,

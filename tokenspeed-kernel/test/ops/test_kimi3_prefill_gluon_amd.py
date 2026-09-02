@@ -18,17 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Correctness tests for Kimi K3 prefill Gluon kernels."""
+"""Correctness tests for Kimi K3 prefill Gluon kernels on AMD CDNA4/CDNA5."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
-        "AMD CDNA4 is required for Kimi K3 prefill Gluon tests",
+        "AMD CDNA4 or CDNA5 is required for Kimi K3 prefill Gluon tests",
         allow_module_level=True,
     )
 
@@ -40,9 +40,15 @@ from tokenspeed_kernel.ops.attn_res import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
-    attn_res_rmsnorm_gfx950,
-)
+
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
+        attn_res_rmsnorm_gfx950 as attn_res_rmsnorm_amd,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.attn_res import (  # noqa: E402
+        attn_res_rmsnorm_gfx1250 as attn_res_rmsnorm_amd,
+    )
 
 
 def _attn_res_reference(
@@ -65,6 +71,11 @@ def _attn_res_reference(
         * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
         * output_weight
     ).to(torch.bfloat16)
+
+
+def _bf16_add_rne(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Match the fused kernel's FP32 add followed by BF16 rounding."""
+    return (lhs.float() + rhs.float()).to(torch.bfloat16)
 
 
 def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
@@ -166,7 +177,7 @@ def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
         7168, device="cuda", dtype=torch.bfloat16, generator=generator
     )
 
-    actual = attn_res_rmsnorm_gfx950(
+    actual = attn_res_rmsnorm_amd(
         layer_residual=layer,
         block_residual=history,
         res_weight=res_weight,
@@ -297,7 +308,7 @@ def test_attn_res_delta_and_block_write_batches(tokens: int) -> None:
         block_write_idx=valid_blocks,
     )
 
-    updated_prefix = (original_prefix + delta).to(torch.bfloat16)
+    updated_prefix = _bf16_add_rne(original_prefix, delta)
     expected = _attn_res_reference(
         updated_prefix,
         original_blocks.transpose(0, 1),
@@ -388,7 +399,12 @@ def test_attn_res_model_update_modes_graph_replay(
     prefix = torch.randn(
         tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
     )
-    delta = torch.randn_like(prefix)
+    delta = torch.randn(
+        prefix.shape,
+        device=prefix.device,
+        dtype=prefix.dtype,
+        generator=generator,
+    )
     blocks = torch.randn(
         valid_blocks + 1,
         tokens,
@@ -441,7 +457,7 @@ def test_attn_res_model_update_modes_graph_replay(
     torch.cuda.synchronize()
 
     updated_prefix = (
-        (original_prefix + delta).to(torch.bfloat16) if use_delta else original_prefix
+        _bf16_add_rne(original_prefix, delta) if use_delta else original_prefix
     )
     expected = _attn_res_reference(
         updated_prefix,
@@ -459,6 +475,7 @@ def test_attn_res_model_update_modes_graph_replay(
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 
 
+@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
 @pytest.mark.parametrize("tokens", [1, 17, 8192])
 def test_kimi_topk_prefill_matches_reference(tokens: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(41 + tokens)
@@ -480,6 +497,7 @@ def test_kimi_topk_prefill_matches_reference(tokens: int) -> None:
     torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-7)
 
 
+@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
     tokens = 16384
@@ -509,6 +527,7 @@ def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
 def test_kimi_topk_prefill_ties_choose_smaller_expert_id() -> None:
     logits = torch.zeros(3, 896, device="cuda")
     bias = torch.zeros(896, device="cuda")

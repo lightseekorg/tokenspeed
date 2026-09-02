@@ -156,6 +156,24 @@ class TestLinearAttnConfig(unittest.TestCase):
         )
         self.assertEqual(spec.temporal_state_shape, (32, 128, 128))
 
+    def test_glm53_flash_kda_geometry(self):
+        from tokenspeed.runtime.configs.glm53_flash_config import (
+            Glm53FlashTextConfig,
+        )
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
+
+        text_config = Glm53FlashTextConfig(num_hidden_layers=4)
+        spec = LinearAttnConfig.generate(
+            self._server_args(tp_size=4), self._model(text_config)
+        )
+
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.layer_ids, (0, 1, 2))
+        self.assertEqual(spec.conv_state_shape, (3 * 64 * 128 // 4, 3))
+        self.assertEqual(spec.temporal_state_shape, (64 // 4, 128, 128))
+
     def test_non_hybrid_model_gets_none(self):
         from types import SimpleNamespace
 
@@ -191,6 +209,14 @@ class TestLinearAttnConfig(unittest.TestCase):
             _LINEAR_ATTN_CLS["KimiK3ForConditionalGeneration"], LinearAttnConfig
         )
         self.assertIs(_LINEAR_ATTN_CLS["Qwen3_5MoeForCausalLM"], LinearAttnConfig)
+        self.assertIs(
+            _LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"],
+            LinearAttnConfig,
+        )
+        self.assertNotIn(
+            "Glm53FlashForConditionalGenerationNextN",
+            _LINEAR_ATTN_CLS,
+        )
 
 
 if __name__ == "__main__":

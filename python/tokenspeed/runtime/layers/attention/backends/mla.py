@@ -61,7 +61,8 @@ class MLAPrefillMetadata:
     cum_seq_lens_kv: torch.Tensor | None
     page_table: torch.Tensor | None
     # Host-side metadata.
-    extend_seq_lens_cpu: list[int]
+    extend_prefix_lens_cpu: torch.Tensor
+    extend_seq_lens_cpu: torch.Tensor
     max_extend_seq_len: int
     max_extend_prefix_len: int
     use_absorbed_cached_extend: bool
@@ -246,7 +247,8 @@ class MLAAttnBackend(PagedAttentionBackend):
             cum_extend_seq_lens=cum_extend_seq_lens,
             cum_seq_lens_kv=cum_seq_lens_kv,
             page_table=page_table if use_absorbed_cached_extend else None,
-            extend_seq_lens_cpu=extend_seq_lens_cpu_list,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
             use_absorbed_cached_extend=use_absorbed_cached_extend,

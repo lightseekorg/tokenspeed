@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
+from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
@@ -88,6 +89,58 @@ class DSABackend(PagedAttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
+        self.kpool_runtime = (
+            KPoolRuntime(spec.index_kpool, spec.index_topk)
+            if spec.index_kpool is not None
+            else None
+        )
+        if self.kpool_runtime is not None:
+            # GLM-5.3-Flash (the one KPool consumer) handles padded prefill
+            # replay explicitly in its model code, so the class-level DSA
+            # restriction does not apply to it.
+            self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+
+    def require_kpool_runtime(self) -> KPoolRuntime:
+        """Return the configured KPool runtime for sparse pooled indexing."""
+        if self.kpool_runtime is None:
+            raise RuntimeError("DSA backend was created without KPool configuration")
+        return self.kpool_runtime
+
+    def kpool_prefill_page_table(self, num_requests: int) -> torch.Tensor:
+        """The kernel-page history rows KPool prefill maps its top-k through."""
+        table = self._prefill_page_table
+        if table is None:
+            table = getattr(self.chunked_prefill_metadata, "page_table", None)
+        if table is None:
+            raise RuntimeError("DSA KPool prefill requires a full-history page table")
+        if num_requests < 0 or table.shape[0] < num_requests:
+            raise RuntimeError(
+                "DSA KPool prefill page-table row mismatch: "
+                f"table={table.shape[0]}, requests={num_requests}"
+            )
+        return table[:num_requests]
+
+    def kpool_decode_page_table(
+        self, row_start: int, num_requests: int
+    ) -> torch.Tensor:
+        """The kernel-page history rows KPool decode maps its top-k through."""
+        metadata = self.forward_decode_metadata
+        table = getattr(metadata, "block_kv_indices", None)
+        if table is None:
+            table = getattr(metadata, "page_table", None)
+        row_end = row_start + num_requests
+        if (
+            table is None
+            or row_start < 0
+            or num_requests < 0
+            or table.shape[0] < row_end
+        ):
+            rows = None if table is None else table.shape[0]
+            raise RuntimeError(
+                "DSA KPool decode page-table row mismatch: "
+                f"table={rows}, rows=[{row_start}, {row_end})"
+            )
+        return table[row_start:row_end]
 
     # ------------------------------------------------------------------
     # Delegation surface
@@ -166,6 +219,8 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
+        if self.kpool_runtime is not None:
+            self.kpool_runtime.reset_forward()
         metadata = self.forward_decode_metadata
         if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
@@ -257,6 +312,8 @@ class DSABackend(PagedAttentionBackend):
             )
 
         self._prefill_page_table = None
+        if self.kpool_runtime is not None:
+            self.kpool_runtime.reset_forward()
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cmeta = self._dense_backend.chunked_prefill_metadata
             if cmeta is not None:
@@ -409,6 +466,7 @@ class DSABackend(PagedAttentionBackend):
         token_to_kv_pool,
         page_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        kv_seq_lens: torch.Tensor | None = None,
         workspace_indices: torch.Tensor,
         topk_lens: torch.Tensor,
         kv_workspace_slots: torch.Tensor | None = None,
@@ -431,13 +489,21 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill top-k length mismatch: "
                 f"lens={topk_lens.shape[0]}, q_tokens={q.shape[0]}"
             )
+        if kv_seq_lens is not None and (
+            kv_seq_lens.dim() != 1 or kv_seq_lens.numel() != q.shape[0]
+        ):
+            raise RuntimeError(
+                "DSA sparse prefill physical length mismatch: "
+                f"lens={tuple(kv_seq_lens.shape)}, q_tokens={q.shape[0]}"
+            )
         if q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
-        if workspace_indices.shape != (q.shape[0], self.index_topk):
+        # KPool selection can append up to pool_size - 1 visible tail tokens,
+        # so its workspace may be wider than the configured pooled top-k.
+        if workspace_indices.dim() != 2 or workspace_indices.shape[1] <= 0:
             raise RuntimeError(
                 "DSA sparse prefill top-k shape mismatch: "
-                f"indices={tuple(workspace_indices.shape)}, "
-                f"expected={(q.shape[0], self.index_topk)}"
+                f"indices={tuple(workspace_indices.shape)}"
             )
         if kv_workspace_slots is None:
             raise RuntimeError(
@@ -469,6 +535,11 @@ class DSABackend(PagedAttentionBackend):
             sparse_kv_cache=sparse_kv_cache,
             topk_slots=topk_slots,
             topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+            kv_seq_lens=(
+                kv_seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+                if kv_seq_lens is not None
+                else None
+            ),
             max_seqlen_k=max_seq_len,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -531,7 +602,7 @@ class DSABackend(PagedAttentionBackend):
 
         if topk_indices.dtype != torch.int32:
             topk_indices = topk_indices.to(torch.int32)
-        if topk_indices.shape[-1] != self.index_topk:
+        if topk_indices.shape[-1] != self.index_topk and topk_lens is None:
             raise RuntimeError(
                 "DSA sparse decode top-k width mismatch: "
                 f"indices={topk_indices.shape[-1]}, expected={self.index_topk}"
@@ -583,6 +654,20 @@ class DSABackend(PagedAttentionBackend):
                 )
             topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
 
+        # Physical KV length per query row: verify row t of a request sees
+        # seq_len - (width - 1 - t) tokens (the block's own future is masked
+        # by the kernel's per-row length, not by top-k selection).
+        seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        if q_len_per_req == 1:
+            kv_seq_lens = seq_lens
+        else:
+            offsets = torch.arange(
+                q_len_per_req, device=q.device, dtype=torch.int32
+            ) - (q_len_per_req - 1)
+            kv_seq_lens = (
+                seq_lens.unsqueeze(1).add(offsets).clamp_min(0).reshape(-1).contiguous()
+            )
+
         q_view = q.view(num_tokens, layer.tp_q_head_num, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
@@ -614,6 +699,7 @@ class DSABackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             page_size=self.kernel_page_size,
             q_len_per_req=q_len_per_req,
+            kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )

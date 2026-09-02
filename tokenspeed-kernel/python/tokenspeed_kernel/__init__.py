@@ -49,6 +49,10 @@ from tokenspeed_kernel.ops.attention import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
+    kpool_decode_append,
+    kpool_decode_topk,
+    kpool_prefill_topk,
+    kpool_prefill_write,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -86,6 +90,12 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_fp8_linear,
     warmup_prepared_fp8_linears,
 )
+from tokenspeed_kernel.ops.hyperconnection import (
+    gated_residual_combine,
+    gated_residual_mix,
+    prepare_gated_residual_weight_cache,
+)
+from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
     dsv4_mega_moe_apply,
@@ -133,6 +143,11 @@ __all__ = [
     "mm",
     "prepare_fp8_linear",
     "warmup_prepared_fp8_linears",
+    # hyperconnection
+    "gated_residual_combine",
+    "gated_residual_mix",
+    "grouped_gemma_rmsnorm",
+    "prepare_gated_residual_weight_cache",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -170,6 +185,10 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "kpool_decode_append",
+    "kpool_decode_topk",
+    "kpool_prefill_topk",
+    "kpool_prefill_write",
     # activation
     "add3",
     "prepare_fp8_linear_activation",

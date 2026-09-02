@@ -19,6 +19,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -184,6 +185,54 @@ class TestAttentionBackendChoices(unittest.TestCase):
             MLAAttnBackend(config, spec, kernel_page_size=64).kernel_solution,
             "gluon",
         )
+
+    def test_dsa_routes_dense_attention_by_platform(self):
+        from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+
+        config = object()
+        spec = object()
+        dense_backend = object()
+
+        for platform, cls_name in (
+            (SimpleNamespace(is_nvidia=True, is_amd=False), "TRTLLMMLABackend"),
+            (SimpleNamespace(is_nvidia=False, is_amd=True), "MLAAttnBackend"),
+        ):
+            with (
+                self.subTest(name=cls_name),
+                mock.patch.object(
+                    dsa_backend, cls_name, return_value=dense_backend
+                ) as create,
+            ):
+                self.assertIs(
+                    dsa_backend._make_dense_leaf(config, spec, platform, 64),
+                    dense_backend,
+                )
+                create.assert_called_once_with(config, spec, kernel_page_size=64)
+
+    def test_named_backend_routing_does_not_mutate_source_spec(self):
+        from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+        source = SoftmaxAttnConfig(
+            backend_name="parent",
+            num_attention_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            attn_tp_size=1,
+        )
+        config = SimpleNamespace(component=lambda _: source)
+        routed = {}
+
+        class ProbeBackend:
+            def __init__(self, _config, spec):
+                routed["source_name"] = source.backend_name
+                routed["spec"] = spec
+
+        with mock.patch.object(registry, "_get_backend_cls", return_value=ProbeBackend):
+            registry._create_attn_backend_with_name("child", AttentionArch.MHA, config)
+
+        self.assertEqual(routed["source_name"], "parent")
+        self.assertEqual(routed["spec"].backend_name, "child")
+        self.assertIsNot(routed["spec"], source)
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

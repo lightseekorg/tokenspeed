@@ -21,11 +21,10 @@
 from __future__ import annotations
 
 import functools
-import json
-import logging
 import math
-import os
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -38,8 +37,6 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
-
-logger = logging.getLogger(__name__)
 
 _fp8_dtype = torch.float8_e4m3fn
 _MXFP8_BLOCK_SCALE = ScaleFormat(
@@ -144,49 +141,89 @@ def prepare_block_fp8_matmul_inputs(
     return M, N, K, C
 
 
-@functools.lru_cache
-def get_w8a8_block_fp8_configs(
-    N: int, K: int, block_n: int, block_k: int
-) -> Optional[Dict[int, Any]]:
+_GFX950_W8A8_BLOCK_FP8_SHAPES = frozenset(
+    {
+        (1024, 4096),
+        (2048, 4096),
+        (4096, 512),
+        (4096, 1536),
+        (4096, 3072),
+        (4096, 4096),
+        (6144, 4096),
+    }
+)
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gfx950_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    if (N, K) not in _GFX950_W8A8_BLOCK_FP8_SHAPES or (block_n, block_k) != (128, 128):
+        return None
+
+    if M <= 64:
+        # The narrow output benefits from less M grouping through the
+        # measured M=16 bucket; nearest-bucket dispatch crossed over at M=25.
+        if (N, K) == (1024, 4096) and M <= 24:
+            group_size_m = 1
+        elif (N, K) == (4096, 512):
+            group_size_m = 4
+        else:
+            group_size_m = 8
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": group_size_m,
+            "num_warps": 2,
+            "num_stages": 1,
+        }
+    elif M <= 128:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    return MappingProxyType(config)
+
+
+def get_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    """Select the measured block-FP8 GEMM launch configuration.
+
+    The gfx950 policy is the compact form of a shape sweep over GLM-5.3's
+    dense FP8 projections. Explicit ranges preserve the legacy launch choices
+    without relying on nearest-neighbor lookup through per-shape JSON files.
+    Uncovered architectures, matrix shapes, and scale layouts return ``None``
+    so the portable launch heuristic remains the fallback.
+
+    Args:
+        M: Number of activation rows.
+        N: Output width.
+        K: Reduction width.
+        block_n: Weight-scale block size along N.
+        block_k: Activation and weight-scale block size along K.
+
+    Returns:
+        An immutable mapping of Triton launch parameters when the shape is
+        covered by the gfx950 sweep, otherwise ``None``.
     """
-    Return optimized configurations for the w8a8 block fp8 kernel.
-
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the w8a8 block fp8 kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
-    """
-
-    # First look up if an optimized configuration is available in the configs
-    # directory
-    device_name = (
-        torch.cuda.get_device_name().replace(" ", "_")
-        if torch.cuda.is_available()
-        else "unknown"
-    )
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
-
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(
-                f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
-            )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
-
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        (
-            "Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
-        config_file_path,
-    )
-    return None
+    if not Platform.get().is_cdna4:
+        return None
+    return _get_gfx950_w8a8_block_fp8_config(M, N, K, block_n, block_k)
 
 
 @triton.jit
@@ -474,12 +511,8 @@ def w8a8_block_fp8_matmul_triton(
 
     block_n, block_k = block_size
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-    if configs:
-        # If an optimal configuration map has been found, look up the
-        # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-    else:
+    config = get_w8a8_block_fp8_config(M, N, K, block_n, block_k)
+    if config is None:
         # Default config
         # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:

@@ -560,14 +560,24 @@ class CacheGroupRouterTest(unittest.TestCase):
         deleted DraftPageStaging carried)."""
         router, _ = self._router(is_draft=True)
         raw = torch.tensor([[5, 6, 2], [9, 3, 7]], dtype=torch.int32)
-        tables = {FULL: raw, SWA: raw, "linear_attention_0": torch.ones((2, 2), dtype=torch.int32)}
+        tables = {
+            FULL: raw,
+            SWA: raw,
+            "linear_attention_0": torch.ones((2, 2), dtype=torch.int32),
+        }
         router.refresh_decode_metadata(
-            2, 2, None, torch.tensor([9, 4], dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE, block_tables=tables,
+            2,
+            2,
+            None,
+            torch.tensor([9, 4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
         )
         view = router.draft_history_view()
         self.assertEqual(view.page_size, 4)  # FULL leaf kernel page
-        self.assertEqual(view.max_tokens, 3 * 2 * 4)  # 3 raw cols * ratio 1... width 6? recompute below
+        self.assertEqual(
+            view.max_tokens, 3 * 2 * 4
+        )  # 3 raw cols * ratio 1... width 6? recompute below
         out = torch.zeros(4, dtype=torch.int32)
         router.draft_write_locations_uniform(
             out, cache_start=torch.tensor([4, 7], dtype=torch.int32), num_tokens=2
@@ -578,8 +588,12 @@ class CacheGroupRouterTest(unittest.TestCase):
         # Address stability across refreshes: the same storage is rewritten.
         ptr = view.table.data_ptr()
         router.refresh_decode_metadata(
-            2, 2, None, torch.tensor([9, 4], dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE, block_tables=tables,
+            2,
+            2,
+            None,
+            torch.tensor([9, 4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
         )
         self.assertEqual(router.draft_history_view().table.data_ptr(), ptr)
 

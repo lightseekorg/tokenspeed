@@ -38,6 +38,7 @@ from tokenspeed_kernel.signature import format_signatures
 logger = logging.getLogger(__name__)
 
 platform = current_platform()
+TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
 
 
 if platform.is_nvidia:
@@ -446,7 +447,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -498,7 +499,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({1}),
+            "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -563,7 +564,7 @@ if platform.is_nvidia:
                 "supports_deferred_finalize": frozenset({True, False}),
                 "supports_ep": frozenset({True}),
                 "supports_all_to_all_ep": frozenset({False}),
-                "ispp_alignment": frozenset({1}),
+                "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
                 # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
                 # to NVFP4 itself, which the registry models as "input"
                 # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).

@@ -436,6 +436,12 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
         prefix,
         extend,
     )
+    assert grouped_backend.chunked_prefill_metadata.extend_prefix_lens_cpu.tolist() == (
+        prefix
+    )
+    assert (
+        grouped_backend.chunked_prefill_metadata.extend_seq_lens_cpu.tolist() == extend
+    )
 
     # Chunked-prefill metadata parity with the hand-built page_table build.
     grouped_cm = grouped_backend.chunked_prefill_metadata

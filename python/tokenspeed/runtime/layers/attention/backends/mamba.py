@@ -120,8 +120,8 @@ def _compute_state_block_index_plan(
     seq_lens_before: torch.Tensor,
     seq_lens_after: torch.Tensor,
 ) -> _StateBlockIndexPlan:
-    before = seq_lens_before.to(torch.int64)
-    after = seq_lens_after.to(torch.int64)
+    before = seq_lens_before
+    after = seq_lens_after
     in_slots = torch.div(
         before - 1, checkpoint_granularity, rounding_mode="floor"
     ).clamp_(min=0)
@@ -710,7 +710,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_by_group = self.forward_metadata.state_in_blocks_by_group
         sin_stack = torch.stack(
             [state_in_by_group[group_id][:bs] for group_id in self._state_groups()]
-        ).to(torch.int64)
+        )
         src_rows = sin_stack.index_select(0, tables["group_sel"]).reshape(-1)
         copy_state_rows(
             tables["conv_comp"],

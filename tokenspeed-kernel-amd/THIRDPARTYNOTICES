@@ -40,8 +40,9 @@ https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aite
 https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/_gluon_kernels/gfx1250/attention/pa_decode_sparse.py
 https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/_gluon_kernels/gfx1250/attention/pa_prefill_sparse.py
 
-The GFX950 standard-cache DSA scorer scheduling and FP8 matrix structure are
-informed by ROCm/AITER commit b5c5912cb2bbab5d8c0cc12b08dec391a27bf8df.
+The GFX950 and GFX1250 standard-cache DSA scorer scheduling and FP8 matrix
+structure are informed by ROCm/AITER commit
+b5c5912cb2bbab5d8c0cc12b08dec391a27bf8df.
 Sources:
 https://github.com/ROCm/aiter/blob/b5c5912cb2bbab5d8c0cc12b08dec391a27bf8df/aiter/ops/triton/_gluon_kernels/gfx950/attention/fp8_mqa_logits.py
 https://github.com/ROCm/aiter/blob/b5c5912cb2bbab5d8c0cc12b08dec391a27bf8df/aiter/ops/triton/gluon/pa_mqa_logits.py

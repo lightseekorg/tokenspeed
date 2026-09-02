@@ -148,7 +148,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     get_dspark_topk_idxs_batched,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
-from tokenspeed.runtime.models.deepseek_v4_mtp import DeepseekV4ForCausalLMNextN
+from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import (

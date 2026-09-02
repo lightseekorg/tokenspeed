@@ -110,7 +110,8 @@ class MinimalCacheView(CachePool):
 
 def make_arena(plan, device: str = "cuda", **kwargs) -> CacheArena:
     """Allocate the arena the pool(s) under test are compute views onto."""
-    kwargs.setdefault("cache_group_specs", plan_group_specs(plan))
+    if "cache_group_specs" not in kwargs:
+        kwargs["cache_group_specs"] = plan_group_specs(plan)
     return CacheArena(plan, device, **kwargs)
 
 

@@ -243,7 +243,7 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
 
 def _correction_models():
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3DraftAttentionMLA
-    from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
+    from tokenspeed.runtime.models.glm_moe_dsa_nextn import GlmMoeDsaForCausalLMNextN
     from tokenspeed.runtime.models.llama_eagle3 import LlamaAttention
     from tokenspeed.runtime.models.qwen3_5_nextn import (
         Qwen3_5DraftAttentionDecoderLayer,
@@ -253,7 +253,7 @@ def _correction_models():
         ("llama_eagle3", LlamaAttention._apply_correction),
         ("qwen3_5_nextn", Qwen3_5DraftAttentionDecoderLayer._apply_correction),
         ("deepseek_v3", DeepseekV3DraftAttentionMLA._apply_correction),
-        ("glm5_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
+        ("glm_moe_dsa_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
     ]
 
 

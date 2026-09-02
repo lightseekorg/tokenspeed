@@ -673,6 +673,10 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
         out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        import cutlass.cute as cute
+
+        # Importing MSA must preserve option-bound compilation for other users.
+        assert callable(cute.compile[()])
         out_triton = msa_extend_with_kvcache(solution="triton", **kwargs)
         assert out_cute.dtype == torch.bfloat16
         torch.testing.assert_close(out_cute, out_triton, atol=2e-2, rtol=2e-2)

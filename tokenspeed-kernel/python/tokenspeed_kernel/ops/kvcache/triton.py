@@ -289,9 +289,9 @@ def copy_state_rows(
         src_addresses: CUDA uint64 ``[num_layers]`` base addresses of the
             source slabs (address of row 0).
         dst_addresses: CUDA uint64 ``[num_layers]`` destination base addresses.
-        src_rows: CUDA int64 ``[num_layers * rows_per_layer]`` source row ids,
-            layer-major. A negative id zero-fills its destination row.
-        dst_rows: CUDA int64 tensor, same layout, destination row ids.
+        src_rows: CUDA int32 or int64 ``[num_layers * rows_per_layer]`` source
+            row ids, layer-major. A negative id zero-fills its destination row.
+        dst_rows: CUDA int32 or int64 tensor, same layout, destination row ids.
         row_bytes: Byte width of the copied row payload (divisible by 4).
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
             source slabs in int32 units (``stride_bytes // 4``).
@@ -309,8 +309,9 @@ def copy_state_rows(
         raise ValueError("src_rows must hold rows_per_layer ids per layer")
     if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
         raise ValueError("slab address tables must have dtype torch.uint64")
-    if src_rows.dtype != torch.int64 or dst_rows.dtype != torch.int64:
-        raise ValueError("row id tensors must have dtype torch.int64")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
     if (
         src_row_strides.dtype != torch.int64
         or dst_row_strides.dtype != torch.int64
@@ -535,18 +536,26 @@ def _set_mla_kv_buffer_kernel(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
+        if SANITIZE:
+            src = src.to(tl.float32)
+            src = tl.where(src != src, 0.0, src)
+            src = tl.where(src == float("inf"), MAX_FINITE, src)
+            src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        # Both sides of this runtime branch must produce the same Triton type.
+        # Converting here also lets the store quantize mixed-dtype cache inputs.
+        src = src.to(kv_buffer_ptr.dtype.element_ty)
     else:
         offs_rope = offs - nope_dim
         src = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
-
-    if SANITIZE:
-        src = src.to(tl.float32)
-        src = tl.where(src != src, 0.0, src)
-        src = tl.where(src == float("inf"), MAX_FINITE, src)
-        src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        if SANITIZE:
+            src = src.to(tl.float32)
+            src = tl.where(src != src, 0.0, src)
+            src = tl.where(src == float("inf"), MAX_FINITE, src)
+            src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        src = src.to(kv_buffer_ptr.dtype.element_ty)
 
     tl.store(dst_ptr, src, mask=mask)
 
@@ -596,21 +605,25 @@ def _set_mla_kv_buffer_per_loc_kernel(
         mask=loc_mask[:, None],
     )
 
-    rope_offs = tl.arange(0, rope_dim)
-    src_rope = tl.load(
-        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
-        mask=loc_mask[:, None],
-    )
-    if SANITIZE:
-        src_rope = src_rope.to(tl.float32)
-        src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
-        src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
-        src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
-    tl.store(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
-        src_rope,
-        mask=loc_mask[:, None],
-    )
+    if rope_dim > 0:
+        rope_offs = tl.arange(0, rope_dim)
+        src_rope = tl.load(
+            cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+            mask=loc_mask[:, None],
+        )
+        if SANITIZE:
+            src_rope = src_rope.to(tl.float32)
+            src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
+            src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
+            src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
+        tl.store(
+            kv_buffer_ptr
+            + locs[:, None] * buffer_stride
+            + nope_dim
+            + rope_offs[None, :],
+            src_rope,
+            mask=loc_mask[:, None],
+        )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -648,7 +661,7 @@ def set_mla_kv_buffer_triton(
     # viewed pools copy raw words, so no clamp applies to non-floating tensors.
     float_maxes = [
         torch.finfo(t.dtype).max
-        for t in (cache_k_nope, kv_buffer)
+        for t in (cache_k_nope, cache_k_rope, kv_buffer)
         if t.dtype.is_floating_point
     ]
     max_finite = min(float_maxes) if float_maxes else float("inf")

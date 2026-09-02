@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX950 integration coverage for the standard block-split DSA cache."""
+"""GFX950/GFX1250 integration coverage for the standard block-split DSA cache."""
 
 from __future__ import annotations
 
@@ -26,24 +26,34 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
-        "AMD CDNA4 (GFX950) is required for standard-cache Gluon DSA tests",
+        "AMD GFX950 or GFX1250 is required for standard-cache Gluon DSA tests",
         allow_module_level=True,
     )
 
 from tokenspeed_kernel.ops.kvcache.triton import (  # isort: skip
     index_k_block_split_scatter,
 )
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
-    gluon_dsa_decode_topk_standard_gfx950,
-    gluon_dsa_prefill_topk_standard_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (  # isort: skip
-    _dsa_standard_decode_logits_kernel,
-)
+
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
+        gluon_dsa_decode_topk_standard_gfx950 as _decode_topk,
+        gluon_dsa_prefill_topk_standard_gfx950 as _prefill_topk,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (  # isort: skip
+        _dsa_standard_decode_logits_kernel,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # isort: skip
+        gluon_dsa_decode_topk_standard_gfx1250 as _decode_topk,
+        gluon_dsa_prefill_topk_standard_gfx1250 as _prefill_topk,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (  # isort: skip
+        _dsa_standard_decode_logits_kernel,
+    )
 
 _DEVICE = "cuda"
 _PAGE_SIZE = 64
@@ -278,7 +288,7 @@ def test_standard_cache_decode_matches_weighted_relu_oracle(case: _DecodeCase) -
     if case.heads == 64:
         weights[:, :32].zero_()
 
-    actual, actual_lens = gluon_dsa_decode_topk_standard_gfx950(
+    actual, actual_lens = _decode_topk(
         query,
         weights,
         seq_lens,
@@ -345,7 +355,7 @@ def test_standard_cache_prefill_uses_workspace_rows_not_global_slots(
     )
     weights = _noncompact_weights(row_starts.numel(), heads, weight_dtype, generator)
 
-    actual, actual_lens = gluon_dsa_prefill_topk_standard_gfx950(
+    actual, actual_lens = _prefill_topk(
         query,
         weights,
         workspace_slots,
@@ -403,7 +413,7 @@ def test_standard_cache_decode_accepts_block_split_writer_output() -> None:
     query, _, query_reference = _prepared_query(1, 32, torch.bfloat16, generator)
     weights = _noncompact_weights(1, 32, torch.float32, generator)
 
-    actual, actual_lens = gluon_dsa_decode_topk_standard_gfx950(
+    actual, actual_lens = _decode_topk(
         query,
         weights,
         seq_lens,
@@ -435,7 +445,7 @@ def test_standard_cache_decode_returns_empty_result_for_zero_pages() -> None:
     out = torch.zeros((1, _TOPK), device=_DEVICE, dtype=torch.int32)
     lens_out = torch.full((1,), -1, device=_DEVICE, dtype=torch.int32)
 
-    actual, actual_lens = gluon_dsa_decode_topk_standard_gfx950(
+    actual, actual_lens = _decode_topk(
         query,
         weights,
         seq_lens,
@@ -557,7 +567,7 @@ def test_standard_cache_decode_cuda_graph_replays_changed_inputs(q_len: int) -> 
     lens_out = torch.empty((q_len,), device=_DEVICE, dtype=torch.int32)
 
     def invoke() -> None:
-        gluon_dsa_decode_topk_standard_gfx950(
+        _decode_topk(
             query,
             weights,
             seq_lens,

@@ -203,6 +203,13 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
+_HYBRID_DSA_KDA_TARGET_ARCHITECTURES = {
+    "Glm53FlashForConditionalGeneration",
+}
+_HYBRID_DSA_KDA_ARCHITECTURES = {
+    *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+    "Glm53FlashForConditionalGenerationNextN",
+}
 
 # Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
@@ -232,6 +239,10 @@ class _AttnSideProfile:
     requested_backend: str | None
     is_hybrid_gdn: bool
     is_kda: bool
+    # KDA hybrid whose full-attention layers are DSA (GLM-5.3-Flash); a
+    # subset of ``is_kda`` that selects the DSA history consumer and the
+    # glm53_flash cache family.
+    is_dsa_kda: bool
     is_inkling: bool
     is_deepseek_v4: bool
     is_dspark: bool
@@ -240,7 +251,7 @@ class _AttnSideProfile:
     def is_hybrid_linear(self) -> bool:
         # GDN and KDA both take the hybrid-linear path; they differ only in
         # the linear kernel (GDN scalar decay vs KDA per-channel) and the
-        # base attn arch (MHA vs MLA).
+        # base attn arch (MHA vs MLA vs DSA).
         return self.is_hybrid_gdn or self.is_kda
 
 
@@ -250,11 +261,14 @@ def _resolve_attn_side(
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None) or []
     is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
+    is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     return _AttnSideProfile(
         architectures=tuple(architectures),
         requested_backend=requested_backend,
         is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
-        is_kda=any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
+        is_kda=is_dsa_kda
+        or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
+        is_dsa_kda=is_dsa_kda,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
         # The DSpark draft resolves as a V4 architecture but has no paged
         # attention config of its own; it must not take the V4 branches.
@@ -335,6 +349,7 @@ def _resolve_full_attn_backend_name(
         return _resolve_hybrid_full_backend_name(
             hybrid_request,
             is_kda=profile.is_kda,
+            is_dsa=profile.is_dsa_kda,
             has_cache_plan=True,
         )
     return softmax_attn.backend_name
@@ -363,6 +378,8 @@ def _resolve_cache_family(
         if is_qwen4_exp(model_config.hf_config):
             return "qwen4_exp"
         return "qwen_gdn"
+    if profile.is_dsa_kda:
+        return "glm53_flash"
     if profile.is_kda:
         return "kimi_k3"
     if profile.is_inkling:
@@ -490,7 +507,13 @@ _CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
 # decided by generate() (NextN drafts may carry none).
 _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
     arch: LinearAttnConfig
-    for arch in (*_HYBRID_GDN_ARCHITECTURES, *_HYBRID_MLA_KDA_ARCHITECTURES)
+    for arch in (
+        *_HYBRID_GDN_ARCHITECTURES,
+        *_HYBRID_MLA_KDA_ARCHITECTURES,
+        # GLM NextN is one DSA layer. It reuses the target's mixed-layer
+        # metadata but must not acquire a linear-attention component.
+        *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+    )
 }
 
 
@@ -540,13 +563,11 @@ def _create_attn_backend_with_name(
         # Paged leaves are served through the cache-group router: one leaf
         # per history group, blocks -> kernel pages mapped in one place.
         return create_paged_router(config, arch, backend_name=name)
-    spec = config.component(SoftmaxAttnConfig)
-    original_name = spec.backend_name
-    spec.backend_name = name
-    try:
-        return cls(config, spec)
-    finally:
-        spec.backend_name = original_name
+    spec = dataclasses.replace(
+        config.component(SoftmaxAttnConfig),
+        backend_name=name,
+    )
+    return cls(config, spec)
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
@@ -592,12 +613,15 @@ def _resolve_hybrid_full_backend_name(
     requested_name: str | None,
     *,
     is_kda: bool,
+    is_dsa: bool,
     has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
     name = _BACKEND_ALIASES.get(requested_name, requested_name)
     if name == "hybrid_linear_attn":
         name = None
+    if has_cache_plan and is_dsa and name is None:
+        return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
     if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
@@ -617,8 +641,9 @@ def _create_hybrid_linear_attn_backend(
     """Create a hybrid backend for a linear-attention model over one pool.
 
     GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
-    MLA base). ``pool`` is the model's layer-mapped view over the one
-    shared cache pool; both sub-backends consume its per-group tables.
+    MLA base; GLM-5.3-Flash, DSA base). ``pool`` is the model's layer-mapped
+    view over the one shared cache pool; both sub-backends consume its
+    per-group tables.
     """
     from tokenspeed.runtime.layers.attention.backends.hybrid import (
         HybridLinearAttnBackend,
@@ -662,7 +687,7 @@ def _create_hybrid_linear_attn_backend(
     if linear_attn is None:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
-            "attn layers (skipping mamba backend)",
+            "attn layers in this cache view (skipping linear backend)",
             len(full_attn_layers),
         )
         return full_attn_backend

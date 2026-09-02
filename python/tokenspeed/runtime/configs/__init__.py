@@ -35,7 +35,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import (
 )
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
-from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
 from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3Config
 from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -70,7 +69,6 @@ __all__ = [
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",
-    "MiniMaxM2Config",
     "MiniMaxM3Config",
     "KimiK2Config",
     "KimiK25Config",
