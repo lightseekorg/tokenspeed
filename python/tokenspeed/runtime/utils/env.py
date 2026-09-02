@@ -278,7 +278,6 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
-    TOKENSPEED_MINIMAX_AR_USE_TRITON = EnvBool(False)
 
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
