@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from contextlib import nullcontext
 from typing import Any, NamedTuple
@@ -57,6 +58,8 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from tokenspeed.runtime.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 def _is_prime(value: int) -> bool:
@@ -737,6 +740,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         if self.offload_embedding:
             materialize_ngram_table_on_host(self.ngram_embedding)
+            logger.info(
+                "PLE embedding offload enabled for layer %d: n-gram table "
+                "stored in pinned host memory with local shape %s",
+                self.ple_layer_index,
+                tuple(self.ngram_embedding.weight.shape),
+            )
         # Created on first use rather than here: a host table can be built on a
         # CUDA-less box, and only the prefetch path ever needs the stream.
         self._gather_stream: torch.cuda.Stream | None = None

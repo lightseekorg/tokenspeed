@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -2627,13 +2628,14 @@ def test_ple_host_gather_matches_device_lookup(store_fp8: bool) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
 )
-def test_ple_host_table_skips_device_allocation() -> None:
+def test_ple_host_table_skips_device_allocation(caplog: pytest.LogCaptureFixture) -> None:
     """The table must never be materialized on the device, not even briefly.
 
     A production table is tens of gigabytes, so a construct-then-move
     implementation would OOM before it ever reached the host.
     """
 
+    caplog.set_level(logging.INFO, logger="tokenspeed.runtime.models.qwen4_exp_ple")
     config = Qwen4ExpTextConfig(
         vocab_size=128,
         hidden_size=32,
@@ -2664,4 +2666,5 @@ def test_ple_host_table_skips_device_allocation() -> None:
 
     table_bytes = embedding.ngram_embedding.weight.numel() * 2
     assert growth < table_bytes // 4
+    assert "PLE embedding offload enabled for layer 0" in caplog.text
 
