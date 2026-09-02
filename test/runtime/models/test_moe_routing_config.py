@@ -64,7 +64,3 @@ def test_config_driven_moe_models_propagate_topk_normalization_flag() -> None:
         "python/tokenspeed/runtime/models/qwen3_5_moe.py",
     ):
         assert _normalize_expr(relpath) == "config.norm_topk_prob"
-
-
-def test_minimax_moe_routing_matches_hardcoded_topk_normalization() -> None:
-    assert _normalize_expr("python/tokenspeed/runtime/models/minimax_m2.py") == "True"

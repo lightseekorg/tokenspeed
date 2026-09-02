@@ -51,7 +51,6 @@ from tokenspeed.runtime.configs import (
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
-    MiniMaxM2Config,
     MiniMaxM3Config,
     Qwen2Config,
     Qwen3_5Config,
@@ -80,7 +79,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
     Qwen4ExpConfig.model_type: Qwen4ExpConfig,
     Qwen4ExpTextConfig.model_type: Qwen4ExpTextConfig,
-    MiniMaxM2Config.model_type: MiniMaxM2Config,
     MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
@@ -438,8 +436,6 @@ def get_config(
             and config.architectures[0] == "DeepseekV4ForCausalLM"
         ):
             config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
-        elif config.architectures[0] == "MiniMaxM2ForCausalLM":
-            config.architectures[0] = "LlamaForCausalLMEagle3"
         else:
             config.architectures[0] += "NextN"
 
@@ -547,30 +543,11 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
-# Architectures for which ``tokenizer.json`` encodes the exact pre-tokenizer
-# / normalizer the model was trained with, and whose AutoTokenizer defaults
-# diverge from that. Kimi-K2.5 ships a custom ``TikTokenTokenizer`` via
-# ``trust_remote_code`` that AutoTokenizer already handles correctly, so this
-# verbatim tokenizer path must stay architecture-gated.
-_VERBATIM_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {
-        "MiniMaxM2ForCausalLM",
-    }
-)
 _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     {
         "DeepseekV4ForCausalLM",
     }
 )
-
-
-def prefers_verbatim_fast_tokenizer(architectures: list[str] | None) -> bool:
-    """True if the model's architectures warrant bypassing AutoTokenizer and
-    loading ``PreTrainedTokenizerFast`` from ``tokenizer.json`` verbatim.
-    """
-    if not architectures:
-        return False
-    return any(arch in _VERBATIM_TOKENIZER_ARCHITECTURES for arch in architectures)
 
 
 def prefers_deepseek_v4_tokenizer(architectures: list[str] | None) -> bool:
@@ -727,14 +704,9 @@ def get_tokenizer(
     code parses from the original repo at the snapshot's immutable commit,
     while still holding the lock, so Transformers can resolve sibling imports.
 
-    ``architectures`` is the model's ``config.architectures`` list (caller
-    should pass it when available). It gates whether we bypass AutoTokenizer
-    and load ``PreTrainedTokenizerFast`` from ``tokenizer.json`` verbatim —
-    needed for a small set of models (e.g. MiniMax-M2) whose AutoTokenizer
-    defaults diverge from training. Models with custom tokenizer classes
-    loaded via ``trust_remote_code`` (e.g. Kimi-K2.5's ``TikTokenTokenizer``)
-    must NOT go through the verbatim path; leaving ``architectures`` as None
-    (the default) keeps the safe AutoTokenizer-only behavior.
+    ``architectures`` is the model's ``config.architectures`` list. Callers
+    should pass it when available so model-specific tokenizer handling can be
+    selected.
 
     ``revision`` is the production-facing alias for ``tokenizer_revision``.
     When both are provided they must name the same snapshot.
@@ -760,21 +732,6 @@ def get_tokenizer(
         auto_tokenizer_target: str,
         auto_tokenizer_revision: str | None = None,
     ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-        fast_tokenizer = None
-        if (
-            tokenizer_mode != "slow"
-            and kwargs.get("use_fast", True)
-            and prefers_verbatim_fast_tokenizer(architectures)
-        ):
-            try:
-                fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                    tokenizer_path,
-                    *args,
-                    clean_up_tokenization_spaces=False,
-                )
-            except Exception:
-                fast_tokenizer = None
-
         auto_tokenizer_kwargs = dict(kwargs)
         if auto_tokenizer_revision is not None:
             auto_tokenizer_kwargs["revision"] = auto_tokenizer_revision
@@ -810,15 +767,6 @@ def get_tokenizer(
                 )
                 raise RuntimeError(err_msg) from e
             raise
-
-        # Swap in the fast tokenizer, carrying over chat_template from
-        # tokenizer_config.json if tokenizer.json doesn't have one.
-        if fast_tokenizer is not None and fast_tokenizer is not loaded_tokenizer:
-            if getattr(loaded_tokenizer, "chat_template", None) and not getattr(
-                fast_tokenizer, "chat_template", None
-            ):
-                fast_tokenizer.chat_template = loaded_tokenizer.chat_template
-            loaded_tokenizer = fast_tokenizer
 
         if not isinstance(loaded_tokenizer, PreTrainedTokenizerFast):
             warnings.warn(
