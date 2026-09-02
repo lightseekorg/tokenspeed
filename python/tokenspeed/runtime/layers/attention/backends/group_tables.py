@@ -176,6 +176,11 @@ class GroupTableStacks:
         i = self._index[group_id]
         return self._widths[i] * self._specs[group_id].kernel_page_size
 
+    def group_kernel_page_size(self, group_id: str) -> int:
+        """One group's kernel page size from the host-side spec (the device
+        ``page_sizes`` mirror feeds the kernels; reading it back would sync)."""
+        return int(self._specs[group_id].kernel_page_size)
+
     def table(self, group_id: str, bs: int) -> torch.Tensor:
         """``[bs, W_g]`` kernel page table view of one group."""
         i = self._index[group_id]

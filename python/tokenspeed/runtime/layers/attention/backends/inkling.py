@@ -223,8 +223,10 @@ class InklingAttnBackend(AttentionBackend):
 
     @property
     def _inner_max_context_len(self) -> int:
-        leaf = next(iter(self.inner.leaves.values()))
-        return leaf.max_context_len
+        # Router and bare leaf both expose it (a property raising
+        # AttributeError here would fall through to __getattr__ and surface
+        # as a confusing "inner has no _inner_max_context_len").
+        return self.inner.max_context_len
 
     def __getattr__(self, name):
         # Guard `inner` so a half-constructed wrapper raises AttributeError instead of recursing.

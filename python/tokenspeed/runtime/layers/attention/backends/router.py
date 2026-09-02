@@ -528,10 +528,14 @@ class CacheGroupRouter(AttentionBackend):
         their prefix against.
         """
         i = self._draft_history_index()
+        gid = self.group_ids[i]
+        # Host-side spec, never ``int(self.stacks.page_sizes[i])``: the block
+        # drafters call this inside the captured graph, where a device->host
+        # read is a stream-capture violation.
         return DraftHistoryView(
             table=self.stacks.tables[i],
-            page_size=int(self.stacks.page_sizes[i]),
-            max_tokens=self.stacks.group_capacity_tokens(self.group_ids[i]),
+            page_size=self.stacks.group_kernel_page_size(gid),
+            max_tokens=self.stacks.group_capacity_tokens(gid),
         )
 
     def draft_write_locations_uniform(
@@ -777,6 +781,11 @@ class CacheGroupRouter(AttentionBackend):
     @property
     def data_type(self):
         return self._sole_leaf("data_type").data_type
+
+    @property
+    def max_context_len(self) -> int:
+        # Every leaf sizes from the one config.context_len; any leaf answers.
+        return next(iter(self.leaves.values())).max_context_len
 
     def forward_extend_chunked(self, *args, **kwargs):
         return self._sole_leaf("forward_extend_chunked").forward_extend_chunked(
