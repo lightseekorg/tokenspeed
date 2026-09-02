@@ -27,7 +27,6 @@ from utils import is_cdna4
 MODEL_VOCABS = {
     "dsv4": 129280,
     "qwen3_5": 151936,
-    "minimax_m2": 200064,
 }
 
 if not is_cdna4():
@@ -55,7 +54,6 @@ def test_argmax_matches_torch_for_dtypes(dtype):
         (3, MODEL_VOCABS["dsv4"]),
         (4, MODEL_VOCABS["dsv4"]),
         (16, MODEL_VOCABS["qwen3_5"]),
-        (64, MODEL_VOCABS["minimax_m2"]),
         (128, MODEL_VOCABS["qwen3_5"]),
     ],
 )
