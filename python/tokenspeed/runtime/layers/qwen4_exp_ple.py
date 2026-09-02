@@ -612,7 +612,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
                 starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
                 bundle = (req, col, lengths_t, starts)
-                if torch.cuda.current_stream().is_capturing():
+                if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
                     _UNIFORM_INDEX_CACHE[key] = bundle
             req, col, lengths_t, starts = bundle
         else:
