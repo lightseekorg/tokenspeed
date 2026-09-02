@@ -1,21 +1,1058 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  * SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+ * SPDX-FileCopyrightText: Copyright contributors to the SGLang project
  * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- * SPDX-FileCopyrightText: Copyright contributors to the sgl-kernel project
  * SPDX-FileCopyrightText: Copyright contributors to the FlashInfer project
  *
- * Persistent TopK Scheduler for CSA Indexer.
+ * DeepSeek-V4 persistent radix TopK.
  */
 
 #ifndef TOKENSPEED_KERNEL_DEEPSEEK_V4_PERSISTENT_TOPK_CUH_
 #define TOKENSPEED_KERNEL_DEEPSEEK_V4_PERSISTENT_TOPK_CUH_
 
+/// \file dsv4_persistent_topk.cuh
+/// \brief DeepSeek-V4 (DSA indexer) top-k implementation classes.
+///
+/// This header holds ONLY the device-side implementation classes + helpers; the
+/// `__global__` kernels and the host dispatcher live in csrc/deepseek_v4/topk_v2.cuh.
+///
+/// Design notes:
+///  - top-k (`topk`) is a *runtime* value (<= kMaxTopK = 2048), never a
+///    compile-time constant.
+///  - the output is the page-table transform of the selected raw indices
+///    (`TopKProblem::emit` then `transform_output`).
+///  - each block reads its own `seq_len` (per-batch ragged lengths) -- the host
+///    launches one universal kernel and dispatches per block.
+///  - long rows use length-specialized clusters: eight CTAs retain up to 128K
+///    scores in registers, sixteen CTAs stream 128K--256K rows, and the
+///    portable eight-CTA streaming kernel remains the unbounded fallback.
+///  - long-row cluster launches use CUDA programmatic dependent launch (PDL):
+///    the next grid may initialize before this grid retires, but score reads
+///    remain behind `griddepcontrol.wait` and output completion precedes the
+///    dependent-launch trigger.
+///
+/// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
+/// exact radix tie-break.
+
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cub/cub.cuh>
+#include <cfloat>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <cooperative_groups.h>
+
+#define TS_DEVICE __device__ __forceinline__
+
+namespace tokenspeed {
+
+using fp16_t = __half;
+inline constexpr uint32_t kWarpThreads = 32;
+
+template <typename To, typename From>
+TS_DEVICE To cast(const From& value) {
+  return static_cast<To>(value);
+}
+
+template <>
+TS_DEVICE fp16_t cast<fp16_t, float>(const float& value) {
+  return __float2half_rn(value);
+}
+
+template <>
+TS_DEVICE float cast<float, fp16_t>(const fp16_t& value) {
+  return __half2float(value);
+}
+
+namespace device {
+
+template <typename T>
+TS_DEVICE constexpr T div_ceil(T x, T y) {
+  return (x + y - 1) / y;
+}
+
+template <typename T, size_t N>
+struct alignas(sizeof(T) * N) AlignedVector {
+  static_assert(N > 0 && (N & (N - 1)) == 0);
+  T values[N];
+
+  TS_DEVICE void load(const void* ptr, int64_t offset = 0) {
+    *this = reinterpret_cast<const AlignedVector*>(ptr)[offset];
+  }
+
+  TS_DEVICE void fill(T value) {
+#pragma unroll
+    for (size_t i = 0; i < N; ++i) values[i] = value;
+  }
+
+  TS_DEVICE T& operator[](size_t i) { return values[i]; }
+  TS_DEVICE T operator[](size_t i) const { return values[i]; }
+};
+
+template <bool kUsePDL>
+TS_DEVICE void PDLWaitPrimary() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+#else
+  static_assert(!kUsePDL, "PDL requires Hopper or newer");
+#endif
+}
+
+template <bool kUsePDL>
+TS_DEVICE void PDLTriggerSecondary() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;" :::);
+  }
+#else
+  static_assert(!kUsePDL, "PDL requires Hopper or newer");
+#endif
+}
+
+namespace warp {
+
+template <uint32_t kNumThreads = kWarpThreads, typename T>
+TS_DEVICE T reduce_sum(T value) {
+  static_assert(kNumThreads > 0 && (kNumThreads & (kNumThreads - 1)) == 0);
+#pragma unroll
+  for (uint32_t offset = kNumThreads / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset, kNumThreads);
+  }
+  return value;
+}
+
+}  // namespace warp
+}  // namespace device
+}  // namespace tokenspeed
+
+namespace tokenspeed {
+
+namespace device::topk {
+
+#ifndef USE_ROCM
+namespace cg = cooperative_groups;
+#endif
+
+/// The upstream kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
+inline constexpr uint32_t kWarpSize = kWarpThreads;
+
+// ---------------------------------------------------------------------------
+// Shared-memory storage sized/aligned for several impl `Smem` types
+// ---------------------------------------------------------------------------
+
+/// Compile-time max over a non-empty pack (avoids an <algorithm> dependency).
+template <typename T>
+constexpr T ct_max(T a) {
+  return a;
+}
+template <typename T, typename... Ts>
+constexpr T ct_max(T a, Ts... rest) {
+  const T m = ct_max(rest...);
+  return a > m ? a : m;
+}
+
+/// Static shared-memory buffer sized + aligned to hold any one of the given
+/// impl `Smem` types. A kernel that dispatches across several paths (e.g. the
+/// fused small-batch kernel runs either Streaming or Cluster; the main kernel
+/// runs any of Register2/Register4/Streaming) declares one
+/// `__shared__ MaxSmem<...> smem` and hands `&smem` to whichever forward() it
+/// calls -- instead of hand-picking "the largest" type and relying on it
+/// staying the largest. `&smem` converts to the `void*` the forwards expect;
+/// the buffer is aligned to the strictest member, so the cast is well-aligned.
+template <typename... Smems>
+struct MaxSmem {
+  static constexpr size_t kSize = ct_max(sizeof(Smems)...);
+  static constexpr size_t kAlign = ct_max(alignof(Smems)...);
+  alignas(kAlign) uint8_t storage[kSize];
+};
+
+// ---------------------------------------------------------------------------
+// Order-preserving float -> integer key extraction
+// ---------------------------------------------------------------------------
+
+TS_DEVICE uint32_t extract_exact_bin(float x) {
+  uint32_t bits = __float_as_uint(x);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+template <uint32_t kBits>
+TS_DEVICE uint32_t extract_coarse_bin(float x) {
+  static_assert(0 < kBits && kBits < 15);
+  const auto hx = cast<fp16_t>(x);
+  const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
+  const uint16_t key = (bits & 0x8000) ? ~bits : bits | 0x8000;
+  return key >> (16 - kBits);
+}
+
+// Smallest fp32 value `v` for which `extract_coarse_bin<kBits>(v) >= bin`, i.e. the
+// lower fp32 boundary of coarse bin `bin`. Because `extract_coarse_bin` is monotonic
+// non-decreasing in its argument, the collect pass can classify an element with two
+// fp32 comparisons against these boundaries instead of recomputing the fp16 bin --
+// removing the F2F conversion and bit-twiddle from the (compute-bound) second pass.
+// Returns -inf for bin 0 (everything qualifies) and +inf for bins past the top.
+template <uint32_t kBits>
+TS_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
+  constexpr uint32_t kShift = 16 - kBits;
+  const uint32_t key = bin << kShift;  // ordered16 key at the low edge of `bin`
+  // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
+  // finite keys only.
+  const auto to_finite_val = [](uint32_t okey) -> float {
+    const uint16_t ob = static_cast<uint16_t>(okey);
+    const uint16_t hb = (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
+    return cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
+  };
+  // Fast path, hoisted above the per-key special cases so both keys are
+  // range-checked at once: `key` and `key - 1` both land in the finite band
+  // [0x0401, 0xFBFF] -- every boundary a finite-score threshold produces.
+  // fp16 rounds to nearest, so the fp32 boundary is the midpoint between the
+  // fp16 values at `key` and `key - 1`. (Verified bit-exact against the slow
+  // path for every bin of kBits 10 and 12, and measured faster than either
+  // per-key dispatch or an ordered-bit decrement trick -- the two conversions
+  // are independent and issue in parallel.)
+  if (key - 0x0401u <= 0xFBFFu - 0x0401u && bin < (1u << kBits)) {
+    return 0.5f * (to_finite_val(key) + to_finite_val(key - 1));
+  }
+  // Slow path: an edge of `bin` touches the +/-inf keys or NaN key space.
+  // The ordered-key line is: [0, 0x03FF) negative-NaN space, 0x03FF = -inf,
+  // [0x0400, 0xFC00) finite, 0xFC00 = +inf, (0xFC00, 0xFFFF] positive-NaN
+  // space. Treat the +/-inf keys as +/-65536 (one ideal step past fp16 max,
+  // so the midpoint lands exactly on +/-65520 -- the fp32->fp16
+  // round-to-nearest overflow threshold) and saturate NaN-space keys, keeping
+  // the returned boundaries finite-or-inf and monotone. Otherwise a threshold
+  // bin at/next to the inf bin gets NaN boundaries, the collect pass matches
+  // nothing, and rows whose scores contain >= topk (+/-)inf or >65504 values
+  // come back short -- the padded slots then illegal-address downstream.
+  if (bin == 0) return -FLT_MAX;
+  if (bin >= (1u << kBits)) return FLT_MAX;
+  const auto to_val = [&](uint32_t okey) -> float {
+    constexpr float k_Inf = std::numeric_limits<float>::infinity();
+    if (okey < 0x03FFu) return -k_Inf;
+    if (okey == 0x03FFu) return -65536.0f;
+    if (okey == 0xFC00u) return 65536.0f;
+    if (okey > 0xFC00u) return FLT_MAX;
+    return to_finite_val(okey);
+  };
+  return 0.5f * (to_val(key) + to_val(key - 1));
+}
+
+TS_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
+    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
+#endif
+    if (lane_id >= offset) val += n;
+  }
+  return val;
+}
+
+TS_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+#ifdef USE_ROCM
+  // The ballot covers the whole hardware wave, which on wave64 holds two of
+  // these 32-lane logical warps, so a plain __popc would report the wave's
+  // lower half to both of them. Shift the caller's mask onto this warp's half
+  // and count all 64 bits. __lane_id() / kWarpSize is 0 on wave32.
+  const uint32_t half = __lane_id() / kWarpSize;
+  return __popcll(__ballot(pred) & (static_cast<uint64_t>(mask) << (kWarpSize * half)));
+#else
+  return __popc(__ballot_sync(mask, pred));
+#endif
+}
+
+struct alignas(8) TieValue {
+  float value;
+  uint32_t idx;
+  inline static constexpr TieValue invalid() {
+    return TieValue{-FLT_MAX, 0xFFFFFFFFu};
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Per-batch problem description + page-table transform sink
+// ---------------------------------------------------------------------------
+
+TS_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
+  const uint32_t mask = (1u << page_bits) - 1u;
+  return (page_table[i >> page_bits] << page_bits) | (i & mask);
+}
+
+/// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected raw
+/// index to output slot `pos`; `transform_output` then applies the page-table
+/// transform in a separate pass.
+struct TopKProblem {
+  const float* __restrict__ in;
+  int32_t* __restrict__ out;  // page_indices [topk]
+  const int32_t* __restrict__ page_table;
+  uint32_t topk;
+  uint32_t seq_len;
+  uint32_t page_bits;
+  int32_t bias = 0;  // needed by ragged mode
+
+  TS_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
+    out[pos] = static_cast<int32_t>(raw_idx) + bias;
+  }
+  TS_DEVICE void transform_output(uint32_t t, int32_t raw) const {
+    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Shared configuration + tie handling (exact radix select on the threshold bin)
+// ---------------------------------------------------------------------------
+
+struct TopKConfig {
+  static constexpr uint32_t kMaxTopK = 2048;
+  static constexpr uint32_t kBlockSize = 1024;
+  static constexpr uint32_t kOccupancy = 2;
+  static constexpr uint32_t kNumWarps = kBlockSize / kWarpSize;
+  // kMaxNumTie must be >= kMaxTopK: the collect pass keeps at most kMaxNumTie
+  // threshold-bin candidates, and up to `topk` output slots may have to be
+  // filled from them (above_count can be 0, e.g. heavily tied or all-inf
+  // scores). A smaller cap leaves slots that handle_tie can only pad, and
+  // padded slots inside the first min(seq_len, topk) entries are dereferenced
+  // by downstream sparse attention.
+  static constexpr uint32_t kMaxNumTie = 2048;
+  static constexpr uint32_t kRadixSize = 1 << 8;
+  static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
+  // tie candidates owned per thread in the strided handle_tie loops
+  static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
+  static_assert(kMaxNumTie >= kMaxTopK && kMaxNumTie % kBlockSize == 0 && kBlockSize % kNumWarps == 0);
+
+  struct TieHandleSmem {
+    struct alignas(16) MatchBin {
+      uint32_t bin;
+      uint32_t above_count;
+      uint32_t equal_count;
+      uint32_t _pad = 0;
+    };
+    alignas(128) uint32_t counter;
+    alignas(128) uint32_t counter_final;
+    MatchBin match;
+    uint32_t warp_sum[kNumWarps];
+    uint32_t histogram[2][kRadixSize];
+  };
+
+  /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
+  /// "above" elements already emitted (final output starts at slot `base`);
+  /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  TS_DEVICE static void handle_tie(  //
+      const TieValue* tie_buffer,
+      const TopKProblem& problem,
+      const uint32_t base,
+      const uint32_t num_ties,
+      const uint32_t topk,
+      TieHandleSmem* smem) {
+    constexpr auto is_greater = [](const TieValue& a, const TieValue& b) {
+      return (a.value > b.value) || (a.value == b.value && a.idx < b.idx);
+    };
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+    static_assert(kNumWarps == kWarpSize);
+
+    if (num_ties <= topk) {
+      for (uint32_t t = tx; t < num_ties; t += kBlockSize) {
+        problem.emit(base + t, tie_buffer[t].idx);
+      }
+      for (uint32_t t = num_ties + tx; t < topk; t += kBlockSize) {
+        problem.emit(base + t, base + t);
+      }
+    } else if (num_ties <= kWarpSize) {
+      if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
+      /// NOTE: use long long to avoid mask overflow when num_tie == 32
+      const uint32_t mask = (1ull << num_ties) - 1u;
+      const auto tie = tie_buffer[lane_id];
+      const auto target = tie_buffer[warp_id];
+      const auto rank = warp_sum_bool(is_greater(tie, target), mask);
+      if (lane_id == 0 && rank < topk) problem.emit(base + rank, target.idx);
+    } else if (num_ties <= kWarpSize * 2) {
+      // 64 x 64 topk implementation: each thread takes 2 elements
+      const auto warp_id_0 = warp_id;
+      const auto warp_id_1 = warp_id + kWarpSize;
+      const auto lane_id_1 = lane_id + kWarpSize;
+      const auto invalid = TieValue::invalid();
+      const auto tie_0 = tie_buffer[lane_id];
+      const auto tie_1 = lane_id_1 < num_ties ? tie_buffer[lane_id_1] : invalid;
+      const auto target_0 = tie_buffer[warp_id_0];
+      const auto target_1 = tie_buffer[warp_id_1];
+      if (true) {  // NOTE: warp_id_0 <= kNumWarps < num_ties
+        const auto rank_0 = warp_sum_bool(is_greater(tie_0, target_0));
+        const auto rank_1 = warp_sum_bool(is_greater(tie_1, target_0));
+        const auto rank = rank_0 + rank_1;
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_0.idx);
+      }
+      if (warp_id_1 < num_ties) {
+        const auto rank_0 = warp_sum_bool(is_greater(tie_0, target_1));
+        const auto rank_1 = warp_sum_bool(is_greater(tie_1, target_1));
+        const auto rank = rank_0 + rank_1;
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_1.idx);
+      }
+    } else if (num_ties <= kWarpSize * 4) {
+      // 128 x 128 topk implementation: each thread takes 4 elements and does local sort + merge
+      const auto invalid = TieValue::invalid();
+      const TieValue tie[] = {
+          tie_buffer[lane_id + 0 * kWarpSize],
+          tie_buffer[lane_id + 1 * kWarpSize],
+          lane_id + 2 * kWarpSize < num_ties ? tie_buffer[lane_id + 2 * kWarpSize] : invalid,
+          lane_id + 3 * kWarpSize < num_ties ? tie_buffer[lane_id + 3 * kWarpSize] : invalid,
+      };
+      const TieValue target[] = {
+          tie_buffer[warp_id + 0 * kWarpSize],
+          tie_buffer[warp_id + 1 * kWarpSize],
+          tie_buffer[warp_id + 2 * kWarpSize],
+          tie_buffer[warp_id + 3 * kWarpSize],
+      };
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if (i >= 2 && warp_id + i * kWarpSize >= num_ties) break;
+        uint32_t rank = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          rank += warp_sum_bool(is_greater(tie[j], target[i]));
+        }
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target[i].idx);
+      }
+    } else if (num_ties <= kBlockSize) {
+      // Common case: one candidate per thread.
+      radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem);
+    } else {
+      // Rare overflow case (kBlockSize < num_ties <= kMaxNumTie), kept out of
+      // the common path so it alone pays the multi-item register cost.
+      radix_tie_select<kTieItems>(tie_buffer, problem, base, num_ties, topk, smem);
+    }
+  }
+
+  /// Exact radix select over the tie candidates: each thread owns kItems
+  /// strided elements (inactive beyond num_ties). Requires
+  /// num_ties <= kItems * kBlockSize.
+  template <uint32_t kItems>
+  TS_DEVICE static void radix_tie_select(  //
+      const TieValue* tie_buffer,
+      const TopKProblem& problem,
+      const uint32_t base,
+      const uint32_t num_ties,
+      const uint32_t topk,
+      TieHandleSmem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+
+    bool active[kItems];
+    uint32_t key[kItems];
+    uint32_t idx[kItems];
+    uint32_t write_pos[kItems];
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      const auto t = tx + i * kBlockSize;
+      active[i] = t < num_ties;
+      const auto tie = active[i] ? tie_buffer[t] : TieValue::invalid();
+      key[i] = extract_exact_bin(tie.value);
+      idx[i] = tie.idx;
+      write_pos[i] = topk;
+    }
+    uint32_t topk_remain = topk;
+    if (tx < kRadixSize) smem->histogram[0][tx] = 0;
+    if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
+    __syncthreads();
+    uint32_t total_active = num_ties;
+
+#pragma unroll
+    for (int round = 0; round < 4; round++) {
+      const uint32_t shift = 24 - round * 8;
+      const auto hist_idx = round % 2;
+      const auto histogram = smem->histogram[hist_idx];
+
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
+      }
+      if (round < 3 && tx < kRadixSize) {
+        smem->histogram[hist_idx ^ 1][tx] = 0;
+      }
+      __syncthreads();
+
+      uint32_t hist_val = 0;
+      uint32_t warp_inc = 0;
+      if (tx < kRadixSize) {
+        hist_val = histogram[tx];
+        warp_inc = warp_inclusive_sum(lane_id, hist_val);
+        if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+      }
+      __syncthreads();
+      if (tx < kRadixSize) {
+        const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+        const auto prefix = inter + warp_inc;      // inclusive prefix through this bin
+        const auto above = total_active - prefix;  // elements in bins ABOVE this one
+        // 3. Find threshold bin
+        if (above < topk_remain && above + hist_val >= topk_remain) {
+          smem->match = {tx, above, hist_val};
+        }
+      }
+      __syncthreads();
+
+      const auto [threshold_bin, above_count, equal_count, __] = smem->match;
+      if (round < 3) total_active = equal_count;
+      topk_remain -= above_count;
+
+      // 4. Scatter
+#pragma unroll
+      for (uint32_t i = 0; i < kItems; ++i) {
+        if (!active[i]) continue;
+        const uint32_t bin = (key[i] >> shift) & 0xFFu;
+        if (bin > threshold_bin) {
+          write_pos[i] = atomicAdd(&smem->counter, 1);
+          active[i] = false;
+        } else if (bin < threshold_bin) {
+          active[i] = false;
+        } else if (round == 3) {
+          write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
+        }
+        // my_bin == thr && round < 3: stay active for next round
+      }
+
+      if (round == 3 || topk_remain == 0) break;
+    }
+
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      if (write_pos[i] < topk) problem.emit(base + write_pos[i], idx[i]);
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Radix base: histogram storage + input iteration + threshold-bin search
+// ---------------------------------------------------------------------------
+
+template <uint32_t kHistBits_>
+struct TopKRadixBase : TopKConfig {
+  static constexpr uint32_t kVecSize = 4;
+  static constexpr uint32_t kHistBits = kHistBits_;
+  static constexpr uint32_t kHistSize = 1 << kHistBits;
+  using vec_t = AlignedVector<float, kVecSize>;
+
+  struct Smem {
+    // Keep at least one word per thread so sub-1024-bin specializations can
+    // reuse the same zero/init and prefix-scan code with zero-padded storage.
+    using kHistVec =
+        AlignedVector<uint32_t, (kHistSize + kBlockSize - 1) / kBlockSize>;
+    alignas(128) uint32_t count_eq;
+    alignas(128) uint32_t count_gt;
+    uint32_t threshold_bin;
+    uint32_t warp_sum[kNumWarps];
+    // The coarse histogram is dead once find_threshold() has published
+    // threshold_bin, and the tie machinery only comes alive after that: the
+    // collect pass fills tie.values, then handle_tie works over them with
+    // tie.handle as scratch. Overlaying the two phases keeps the
+    // kMaxNumTie-candidate buffer from growing the block's shared-memory
+    // footprint. tie.handle and tie.values are live TOGETHER, so they sit
+    // side by side inside the overlay, not in a union with each other.
+    union {
+      uint32_t histogram[kHistSize];
+      kHistVec hist_vecs[kBlockSize];
+      struct {
+        TieHandleSmem handle;
+        TieValue values[kMaxNumTie];
+      } tie;
+    };
+  };
+
+ protected:
+  template <typename F>
+  TS_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+    const auto tx = threadIdx.x;
+    const uint32_t num_full = seq_len / kVecSize;  // fully-in-bounds vectors
+
+    vec_t next_vec;
+    uint32_t vi = tx;
+    if (vi < num_full) next_vec.load(in, vi);
+    while (vi < num_full) {
+      const auto cur = next_vec;
+      const auto base = vi * kVecSize;
+      vi += kBlockSize;
+      if (vi < num_full) next_vec.load(in, vi);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        fn(cur[j], base + j);
+      }
+    }
+
+    // Tail: at most one partial vector, `rem` in [0, kVecSize).
+    static_assert(kVecSize <= kBlockSize);  // ensure tail correctness
+    const uint32_t tail_start = num_full * kVecSize;
+    if (tx < seq_len - tail_start) {
+      const auto idx = tail_start + tx;
+      fn(in[idx], idx);
+    }
+  }
+
+  TS_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
+    const auto tx = threadIdx.x;
+    constexpr uint32_t kItems =
+        (kHistSize + kBlockSize - 1) / kBlockSize;
+    uint32_t orig[kItems];
+    const auto hist_vec = smem->hist_vecs[tx];
+    uint32_t tmp_local_sum = 0;
+
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      orig[i] = hist_vec[i];
+      tmp_local_sum += orig[i];
+    }
+
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+    const auto warp_inc = warp_inclusive_sum(lane_id, tmp_local_sum);
+    const auto warp_exc = warp_inc - tmp_local_sum;
+    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+
+    __syncthreads();
+
+    const auto tmp = smem->warp_sum[lane_id];
+    // Exactly one bin satisfies: above < K && above + count >= K
+    uint32_t prefix_sum = warp::reduce_sum(lane_id < warp_id ? tmp : 0);
+    prefix_sum += warp_exc;
+#pragma unroll
+    for (uint32_t i = 0; i < kItems; ++i) {
+      prefix_sum += orig[i];
+      const auto above = seq_len - prefix_sum;
+      if (above < topk && above + orig[i] >= topk) {
+        smem->threshold_bin = tx * kItems + i;
+      }
+    }
+    __syncthreads();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Register path: scores stay resident in registers across both passes (read
+// once). Templated on kLocalVecs so the caller picks the smallest covering
+// kernel -- a larger kLocalVecs raises kMaxSeqLen but its fixed-unrolled loop
+// wastes work on shorter sequences.
+// ---------------------------------------------------------------------------
+
+template <uint32_t kLocalVecs_>
+struct TopKRegister : TopKRadixBase<12> {
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
+  using Smem = typename TopKRadixBase<12>::Smem;
+
+  template <bool kUsePDL>
+  TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+
+    {
+      Smem::kHistVec hist_vec;
+      hist_vec.fill(0);
+      smem->hist_vecs[tx] = hist_vec;
+    }
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    // A vector `vi` is fully in bounds iff vi < num_full; only full vectors are
+    // vector-loaded (16B aligned, never straddling seq_len). The <kVecSize tail is
+    // a scalar remainder on the LAST lanes (which own the fewest full vectors, so
+    // it overlaps the busy lanes' extra vector). The full path has no per-element
+    // bounds check, keeping register pressure low enough to hold all vectors.
+    const uint32_t num_full = problem.seq_len / kVecSize;
+    const uint32_t tail_start = num_full * kVecSize;
+    const uint32_t tail = problem.seq_len - tail_start;
+
+    // Phase 1: load full vectors + build histogram
+    vec_t local_vecs[kLocalVecs];
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+      local_vecs[i].load(problem.in, vi);
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j)
+        atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+    }
+    if (tx >= kBlockSize - tail) {
+      const uint32_t idx = tail_start + tx - (kBlockSize - tail);
+      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[idx])], 1);
+    }
+    __syncthreads();
+
+    // Phase 2: Find the threshold bin
+    find_threshold(problem.topk, problem.seq_len, smem);
+
+    // Phase 3: collect by two fp32 boundaries (raw indices; transform applied later)
+    const auto topk = problem.topk;
+    const auto threshold_bin = smem->threshold_bin;
+    const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
+    const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto collect = [&](float val, uint32_t idx) {
+      if (val >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
+      } else if (val >= v_lo) {
+        const auto count_eq = atomicAdd(&smem->count_eq, 1);
+        if (count_eq < kMaxNumTie) [[likely]]
+          smem->tie.values[count_eq] = {val, idx};
+      }
+    };
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      const auto base = vi * kVecSize;
+      if (vi >= num_full) break;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j)
+        collect(local_vecs[i][j], base + j);
+    }
+    if (tx >= kBlockSize - tail) {
+      const uint32_t idx = tail_start + tx - (kBlockSize - tail);
+      collect(problem.in[idx], idx);
+    }
+
+    // Phase 4: Handle ties.
+    __syncthreads();
+    const auto above_count = smem->count_gt;
+    const auto equal_count = smem->count_eq;
+    const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    const auto tie_count = min(equal_count, kMaxNumTie);
+    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Streaming path: seq_len > 8192 -- two vectorized passes over global memory
+// ---------------------------------------------------------------------------
+
+struct TopKStreaming : TopKRegister<2> {
+ public:
+  static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
+
+  template <bool kUsePDL>
+  TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+
+    {
+      Smem::kHistVec hist_vec;
+      hist_vec.fill(0);
+      smem->hist_vecs[tx] = hist_vec;
+    }
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    // Phase 1: Load and build histogram
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+      const auto bin = extract_coarse_bin<kHistBits>(val);
+      atomicAdd(&smem->histogram[bin], 1);
+    });
+    __syncthreads();
+
+    // Phase 2: Find the threshold bin
+    find_threshold(problem.topk, problem.seq_len, smem);
+
+    // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
+    // from the threshold bin instead of recomputing the fp16 bin per element: an
+    // element is "above" iff val >= v_hi (bin > threshold) and a "tie" iff
+    // v_lo <= val < v_hi (bin == threshold). This drops the F2F + bit-twiddle from
+    // the second full pass over the input.
+    const auto threshold_bin = smem->threshold_bin;
+    const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
+    const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto topk = problem.topk;
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (val >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]] {
+          problem.emit(pos, idx);
+        }
+      } else if (val >= v_lo) {
+        const auto count_eq = atomicAdd(&smem->count_eq, 1);
+        if (count_eq < kMaxNumTie) [[likely]] {
+          smem->tie.values[count_eq] = {val, idx};
+        }
+      }
+    });
+
+    // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
+    // is self-consistent with the fp32 classification above (rather than the fp16
+    // histogram counts), even if rounding moves a boundary element between the
+    // "above" and "tie" sets. above_count is < topk by the threshold-bin invariant,
+    // so the count_gt guard above effectively never triggers.
+    __syncthreads();
+    const auto above_count = smem->count_gt;
+    const auto equal_count = smem->count_eq;
+    const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    const auto tie_count = min(equal_count, kMaxNumTie);
+    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
+// on one batch element via distributed shared memory (one cluster per element).
+//
+// CUDA only: thread-block clusters and distributed shared memory have no CDNA
+// equivalent.
+// ---------------------------------------------------------------------------
+
+#ifndef USE_ROCM
+
+template <uint32_t kClusterSize_, uint32_t kHistBits_ = 9,
+          uint32_t kLocalVecs_ = 0>
+struct TopKCluster : TopKRadixBase<kHistBits_> {
+ public:
+  using Base = TopKRadixBase<kHistBits_>;
+  using Base::find_threshold;
+  using Base::for_each_input;
+  using Base::handle_tie;
+  static constexpr uint32_t kBlockSize = Base::kBlockSize;
+  static constexpr uint32_t kClusterSize = kClusterSize_;
+  static constexpr uint32_t kHistBits = Base::kHistBits;
+  static constexpr uint32_t kHistSize = Base::kHistSize;
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kMaxSeqLen =
+      kLocalVecs == 0
+          ? std::numeric_limits<uint32_t>::max()
+          : kClusterSize * Base::kBlockSize * Base::kVecSize * kLocalVecs;
+  static constexpr uint32_t kMaxNumTie = Base::kMaxNumTie;
+  static constexpr uint32_t kMaxTopK = Base::kMaxTopK;
+  static constexpr uint32_t kTieItems = Base::kTieItems;
+  static constexpr uint32_t kTopKItems = Base::kTopKItems;
+  static constexpr uint32_t kVecSize = Base::kVecSize;
+  using vec_t = typename Base::vec_t;
+  struct Smem : Base::Smem {
+    using kHistVec = typename Base::Smem::kHistVec;
+    uint32_t start_eq_local, start_gt_local;
+    int32_t tmp_out[kMaxTopK];
+  };
+
+  // Process one batch element (one cluster). The PDL wait follows CTA-local
+  // initialization, and the kernel wrapper emits the dependent-launch trigger.
+  // There is no trailing cluster barrier: kernel completion makes the final
+  // local/global writes visible. Writes raw indices to out; the kernel's
+  // transform pass applies the page-table transform.
+  template <bool kUsePDL>
+  TS_DEVICE static void forward(TopKProblem problem, void* _smem) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+    const auto cluster = cg::this_cluster();
+    const auto this_rank = blockIdx.y;
+    const bool is_primary = (this_rank == 0);
+
+    constexpr uint32_t kAlignElems = kWarpSize * kVecSize;
+    const uint32_t chunk_size = div_ceil(problem.seq_len, kClusterSize * kAlignElems) * kAlignElems;
+    const uint32_t chunk_start = min(this_rank * chunk_size, problem.seq_len);
+    const uint32_t chunk_finish = min(chunk_start + chunk_size, problem.seq_len);
+    const uint32_t local_seq_len = chunk_finish - chunk_start;
+    problem.in += chunk_start;
+
+    const uint32_t num_full = local_seq_len / kVecSize;
+    const uint32_t tail_start = num_full * kVecSize;
+    const uint32_t tail = local_seq_len - tail_start;
+    vec_t local_vecs[kLocalVecs == 0 ? 1 : kLocalVecs];
+    float tail_value = 0.0f;
+    uint32_t tail_idx = 0;
+
+    {
+      typename Smem::kHistVec hist_vec;
+      hist_vec.fill(0);
+      smem->hist_vecs[tx] = hist_vec;
+    }
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    if constexpr (kLocalVecs > 0) {
+#pragma unroll
+      for (uint32_t i = 0; i < kLocalVecs; ++i) {
+        const auto vi = tx + kBlockSize * i;
+        if (vi >= num_full) break;
+        local_vecs[i].load(problem.in, vi);
+      }
+      if (tx >= kBlockSize - tail) {
+        tail_idx = tail_start + tx - (kBlockSize - tail);
+        tail_value = problem.in[tail_idx];
+      }
+    }
+
+    // kLocalVecs==0 is the generic two-pass path. Positive specializations
+    // keep the complete per-rank chunk live in registers across threshold
+    // discovery and reuse it during candidate collection.
+    const auto for_each_local = [&](auto&& fn) {
+      if constexpr (kLocalVecs == 0) {
+        for_each_input(problem.in, local_seq_len, fn);
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kLocalVecs; ++i) {
+          const auto vi = tx + kBlockSize * i;
+          if (vi >= num_full) break;
+          const auto base = vi * kVecSize;
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) {
+            fn(local_vecs[i][j], base + j);
+          }
+        }
+        if (tx >= kBlockSize - tail) fn(tail_value, tail_idx);
+      }
+    };
+
+    // Phase 1: Load and build histogram over this rank's contiguous chunk.
+    for_each_local([&](float val, uint32_t) {
+      const auto bin = extract_coarse_bin<kHistBits>(val);
+      atomicAdd(&smem->histogram[bin], 1);
+    });
+    __syncthreads();
+
+    // Phase 1.5: reduce the histogram across the cluster
+    {
+      // 1-shot all-reduce: each rank owns kPartition consecutive bins;
+      // for each owned bin, gather the kClusterSize peer values (one per
+      // consecutive lane) via DSMEM, sum across the lanes, then scatter back.
+      cluster.sync();
+      static_assert(kHistSize <= kBlockSize &&
+                    kHistSize % kClusterSize == 0);
+      constexpr uint32_t kPartition = kHistSize / kClusterSize;
+      const auto start = this_rank * kPartition;
+      if (tx < kHistSize) {
+        const auto which = start + tx / kClusterSize;
+        const auto peer_rank = tx % kClusterSize;
+        const auto addr =
+            cluster.map_shared_rank(&smem->histogram[which], peer_rank);
+        const auto value = *addr;
+        *addr = warp::reduce_sum<kClusterSize>(value);
+      }
+      cluster.sync();
+    }
+
+    // Phase 2: Find the threshold bin (uses global seq_len)
+    find_threshold(problem.topk, problem.seq_len,
+                   static_cast<typename Base::Smem*>(smem));
+
+    // Phase 3: Collect candidates over this rank's chunk; convert local indices
+    // back to global by adding chunk_start. Classify by two fp32 boundaries derived
+    // from the (global) threshold bin instead of recomputing the fp16 bin per
+    // element -- see TopKStreaming for the rationale. threshold_bin is identical
+    // across ranks, so v_hi/v_lo are too.
+    const auto topk = problem.topk;
+    const auto threshold_bin = smem->threshold_bin;
+    const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
+    const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+
+    // Phase 3: collect candidates. The primary scatters straight into
+    // `problem.out`, the others stage into block-local `smem->tmp_out`.
+    //
+    // DO NOT merge these two loops back into one by selecting the destination
+    // first (`cur_out = is_primary ? problem.out : smem->tmp_out`). `problem.out`
+    // can be a shared::cluster (DSMEM) alias of the elected rank's buffer while
+    // `tmp_out` is shared::cta; merging them into a single pointer variable makes
+    // cicc 13.1+ mis-lower the block-local arm on sm_90a and *silently drop every
+    // non-primary rank's staged output* -- `tmp_out` stays zero, and phase 3.5
+    // then faithfully copies zeros to correct DSMEM addresses. The result is a
+    // top-k output where only the primary's slots and the handle_tie tail are
+    // valid, which downstream sparse attention dereferences as garbage KV indices.
+    if (!is_primary) {
+      // stage to tmp_out first before writing to global/DSMEM
+      for_each_local([&](float val, uint32_t local_idx) {
+        const auto idx = chunk_start + local_idx;
+        if (val >= v_hi) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          if (pos < topk) [[likely]] {
+            smem->tmp_out[pos] = idx;
+          }
+        } else if (val >= v_lo) {
+          const auto count_eq = atomicAdd(&smem->count_eq, 1);
+          if (count_eq < kMaxNumTie) [[likely]] {
+            smem->tie.values[count_eq] = {val, idx};
+          }
+        }
+      });
+      __syncthreads();
+      const auto local_above_count = smem->count_gt;
+      const auto local_equal_count = min(smem->count_eq, kMaxNumTie);
+      const auto smem_0 = cluster.map_shared_rank(smem, 0);
+      if (tx == 0) {
+        const auto gt = atomicAdd(&smem_0->count_gt, local_above_count);
+        const auto eq = atomicAdd(&smem_0->count_eq, local_equal_count);
+        smem->start_gt_local = gt;
+        smem->start_eq_local = eq;
+      }
+      __syncthreads();
+      const auto start_gt_local = smem->start_gt_local;
+      const auto start_eq_local = smem->start_eq_local;
+#pragma unroll
+      for (uint32_t i = 0; i < kTieItems; ++i) {
+        const auto t = tx + i * kBlockSize;
+        if (t < local_equal_count && start_eq_local + t < kMaxNumTie) {
+          smem_0->tie.values[start_eq_local + t] = smem->tie.values[t];
+        }
+      }
+
+      cluster.sync();
+
+      const auto start_write = start_gt_local;
+      const auto num_write = local_above_count;
+#pragma unroll
+      for (uint32_t i = 0; i < kTopKItems; ++i) {
+        if (const auto t = tx + i * kBlockSize; t < num_write && start_write + t < topk) {
+          problem.emit(start_write + t, smem->tmp_out[t]);
+        }
+      }
+    } else {
+      for_each_local([&](float val, uint32_t local_idx) {
+        const auto idx = chunk_start + local_idx;
+        if (val >= v_hi) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          if (pos < topk) [[likely]] {
+            problem.emit(pos, idx);
+          }
+        } else if (val >= v_lo) {
+          const auto count_eq = atomicAdd(&smem->count_eq, 1);
+          if (count_eq < kMaxNumTie) [[likely]] {
+            smem->tie.values[count_eq] = {val, idx};
+          }
+        }
+      });
+
+      cluster.sync();
+
+      // Phase 4: Handle ties.
+      const auto above_count = smem->count_gt;
+      const auto equal_count = smem->count_eq;
+      const auto remain_topk = above_count < topk ? topk - above_count : 0;
+      const auto tie_count = min(equal_count, kMaxNumTie);
+      handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+    }
+  }
+};
+
+#endif  // !USE_ROCM
+
+}  // namespace device::topk
+
+}  // namespace tokenspeed
 
 namespace vllm {
 
@@ -24,1304 +1061,201 @@ namespace vllm {
 // as per-request and applies the verify causal bound
 // lengths[row / q] - (q - 1) + (row % q), clamped to >= 0.
 __device__ __forceinline__ uint32_t dsa_topk_row_seq_len(
-    const int32_t* __restrict__ lengths, uint32_t row, uint32_t q_len_per_req) {
+    const int32_t* __restrict__ lengths, uint32_t row,
+    uint32_t q_len_per_req) {
   if (q_len_per_req <= 1) {
     return static_cast<uint32_t>(lengths[row]);
   }
-  uint32_t req = row / q_len_per_req;
-  int j = static_cast<int>(row - req * q_len_per_req);
-  int v = lengths[req] - (static_cast<int>(q_len_per_req) - 1) + j;
-  return v > 0 ? static_cast<uint32_t>(v) : 0;
+  const uint32_t req = row / q_len_per_req;
+  const int j = static_cast<int>(row - req * q_len_per_req);
+  const int value =
+      lengths[req] - (static_cast<int>(q_len_per_req) - 1) + j;
+  return value > 0 ? static_cast<uint32_t>(value) : 0;
 }
 
 namespace persistent {
 
-// ============================================================================
-// Constants
-// ============================================================================
+namespace impl = tokenspeed::device::topk;
 
-constexpr int kThreadsPerBlock = 1024;
-constexpr int RADIX = 256;
-
-// Medium path: all shared state in dynamic smem (no static __shared__,
-// which would inflate the kernel's smem footprint and kill occupancy
-// for the decode/trivial paths).
-constexpr size_t kMediumHistBytes = 2 * (RADIX + 128) * sizeof(int);  // 3072
-constexpr size_t kMediumScalarsBytes = 5 * sizeof(int);               // 20
-constexpr size_t kMediumHeaderSize =
-    (kMediumHistBytes + kMediumScalarsBytes + 127) & ~size_t(127);  // 3200
-constexpr int MAX_BUFFERED_ITEMS = 4096;
-constexpr size_t kSmemMedium =
-    kMediumHeaderSize + 2 * MAX_BUFFERED_ITEMS * sizeof(int);  // 35968
-constexpr uint32_t RADIX_THRESHOLD = 32768;
-
-// Decode path constants
-constexpr int kDecodeBins = 2048;
-constexpr uint32_t HIST2048_THRESHOLD = 8192;
-
-// Large path: fixed shared memory for histograms + scalars
-constexpr size_t kFixedSmemLarge =
-    ((RADIX + RADIX + 5) * sizeof(uint32_t) + 15) & ~size_t(15);
-
-// ============================================================================
-// Common helpers
-// ============================================================================
-
-__device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
-  uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-
-__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
-  __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
-                                 : static_cast<uint16_t>(bits | 0x8000);
-  return static_cast<uint8_t>(key >> 8);
-}
-
-// ============================================================================
-// Vectorized load helpers
-// ============================================================================
-
-// Unconditional float4 load with cache hint (.cg = cache at global level only).
-__device__ __forceinline__ void load_float4(const float* ptr, float& v0,
-                                            float& v1, float& v2, float& v3) {
-  uint32_t r0, r1, r2, r3;
-  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "l"(ptr));
-  v0 = __uint_as_float(r0);
-  v1 = __uint_as_float(r1);
-  v2 = __uint_as_float(r2);
-  v3 = __uint_as_float(r3);
-}
-
-// Per-element predicated scalar loads with -inf default.
-__device__ __forceinline__ void load_float4_predicated(const float* ptr,
-                                                       int base, int seq_len,
-                                                       float& v0, float& v1,
-                                                       float& v2, float& v3) {
-  uint32_t r0, r1, r2, r3;
-  int p0 = (base < seq_len);
-  int p1 = (base + 1 < seq_len);
-  int p2 = (base + 2 < seq_len);
-  int p3 = (base + 3 < seq_len);
-  asm volatile(
-      "{\n"
-      "  .reg .pred pr0, pr1, pr2, pr3;\n"
-      "  setp.ne.u32 pr0, %4, 0;\n"
-      "  setp.ne.u32 pr1, %5, 0;\n"
-      "  setp.ne.u32 pr2, %6, 0;\n"
-      "  setp.ne.u32 pr3, %7, 0;\n"
-      "  mov.u32 %0, 0xFF800000;\n"
-      "  mov.u32 %1, 0xFF800000;\n"
-      "  mov.u32 %2, 0xFF800000;\n"
-      "  mov.u32 %3, 0xFF800000;\n"
-      "  @pr0 ld.global.cg.u32 %0, [%8];\n"
-      "  @pr1 ld.global.cg.u32 %1, [%8+4];\n"
-      "  @pr2 ld.global.cg.u32 %2, [%8+8];\n"
-      "  @pr3 ld.global.cg.u32 %3, [%8+12];\n"
-      "}\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-      : "r"(p0), "r"(p1), "r"(p2), "r"(p3), "l"(ptr));
-  v0 = __uint_as_float(r0);
-  v1 = __uint_as_float(r1);
-  v2 = __uint_as_float(r2);
-  v3 = __uint_as_float(r3);
-}
-
-// ============================================================================
-// Large path: inter-CTA coordination state (one per group)
-// ============================================================================
-
-struct RadixRowState {
-  uint32_t histogram[3][256];  // Triple-buffered histograms
-  uint32_t remaining_k;
-  uint32_t prefix;
-  int arrival_counter;
-  int output_counter;
-};
-
-// ============================================================================
-// Kernel parameters
-// ============================================================================
+constexpr int kThreadsPerBlock = impl::TopKConfig::kBlockSize;
+constexpr uint32_t kRegister2MaxSeqLen =
+    impl::TopKRegister<2>::kMaxSeqLen;
+constexpr uint32_t kRegister4MaxSeqLen =
+    impl::TopKRegister<4>::kMaxSeqLen;
+constexpr uint32_t kClusterSize = 8;
+constexpr uint32_t kClusterFloor = 32768;
+// A 9-bit coarse histogram minimizes fixed histogram work through 64K. Longer
+// rows put enough values into the selected coarse bin that the larger 10-bit
+// histogram wins back more time in the exact tie-break than it costs to build.
+constexpr uint32_t kClusterHist10Floor = 65536;
+constexpr uint32_t kClusterRegister4MaxSeqLen =
+    impl::TopKCluster<8, 10, 4>::kMaxSeqLen;
+// Cluster-16 is a B200-tuned, non-portable launch. Past 256K, keep the portable
+// cluster-8 fallback instead of extrapolating the measured scheduling win.
+constexpr uint32_t kCluster16MaxSeqLen = 262144;
 
 struct PersistentTopKParams {
   const float* __restrict__ input;  // [num_rows, stride]
   int32_t* __restrict__ output;     // [num_rows, top_k]
-  int32_t* __restrict__ lengths;    // [num_rows]
-  RadixRowState* row_states;        // large path: per-group state
+  const int32_t* __restrict__ lengths;
   uint32_t num_rows;
   uint32_t stride;
-  uint32_t top_k;           // actual k value for output stride
-  uint32_t chunk_size;      // large path: elements per CTA
-  uint32_t ctas_per_group;  // 1=medium, >1=large
-  uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
-  uint32_t q_len_per_req;   // >1: `lengths` is per-request (verify causal bound)
+  uint32_t top_k;
+  uint32_t max_seq_len;
+  uint32_t q_len_per_req;
 };
 
-// ============================================================================
-// Decode path: 2048-bin histogram for short sequences (seq_len <= 8192)
-// Uses 11-bit half-precision bins for fine granularity.
-// One histogram pass typically suffices since 8192/2048 = 4 elements/bin avg.
-// ============================================================================
-
-// 11-bit bin from half-precision representation (ascending: high values -> high
-// bins)
-__device__ __forceinline__ uint32_t decode_bin(float x) {
-  __half hx = __float2half(x);
-  uint16_t bits = __half_as_ushort(hx);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
-                                 : static_cast<uint16_t>(bits | 0x8000);
-  return key >> 5;
-}
-
-template <int TopK>
-__device__ __noinline__ void histogram_2048_topk(
-    const float* __restrict__ logits, int32_t* __restrict__ output_indices,
-    int32_t seq_len) {
-  extern __shared__ int decode_smem[];
-  const int tx = threadIdx.x;
-  const int lane = tx & 31;
-
-  // ---- Layout constants ----
-  constexpr int SBASE = 8192 - 8;           // 8184
-  constexpr int RHIST = RADIX + 128;        // 384
-  constexpr int BOFF = 2 * RHIST;           // 768
-  constexpr int DBUF = (SBASE - BOFF) / 2;  // 3708
-  constexpr int MAX_ITEMS_PER_THREAD =
-      (HIST2048_THRESHOLD + kThreadsPerBlock - 1) / kThreadsPerBlock;
-
-  enum : int { sTHR = 0, sOUT = 1, sREF = 2, sFIN = 3, sBUF0 = 4, sBUF1 = 5 };
-
-  // ---- Initialize scalars (prevents stale data from prior rows) ----
-  if (tx < 8) {
-    decode_smem[SBASE + tx] = 0;
-  }
-
-  // ---- Phase 1: Build 2048-bin histogram with float4 vectorized loads ----
-  int* histo = decode_smem;
-  uint16_t reg_bins[MAX_ITEMS_PER_THREAD];
-  int nitems = 0;
-
-  for (int i = tx; i < kDecodeBins; i += kThreadsPerBlock) {
-    histo[i] = 0;
-  }
-  __syncthreads();
-
-  const int n_vec = (seq_len + 3) >> 2;
-  const bool row_aligned = ((reinterpret_cast<uintptr_t>(logits) & 15) == 0);
-
-  for (int i = tx; i < n_vec; i += kThreadsPerBlock) {
-    const int base = i << 2;
-    float v0, v1, v2, v3;
-
-    if (row_aligned && base + 3 < seq_len) {
-      load_float4(logits + base, v0, v1, v2, v3);
-    } else {
-      load_float4_predicated(logits + base, base, seq_len, v0, v1, v2, v3);
-    }
-
-    const uint16_t b0 = static_cast<uint16_t>(decode_bin(v0));
-    const uint16_t b1 = static_cast<uint16_t>(decode_bin(v1));
-    const uint16_t b2 = static_cast<uint16_t>(decode_bin(v2));
-    const uint16_t b3 = static_cast<uint16_t>(decode_bin(v3));
-    reg_bins[nitems++] = b0;
-    reg_bins[nitems++] = b1;
-    reg_bins[nitems++] = b2;
-    reg_bins[nitems++] = b3;
-    atomicAdd(&histo[b0], 1);
-    atomicAdd(&histo[b1], 1);
-    atomicAdd(&histo[b2], 1);
-    atomicAdd(&histo[b3], 1);
-  }
-  __syncthreads();
-
-  // ---- CUB suffix sum ----
-  using BlockScanT = cub::BlockScan<int, kThreadsPerBlock>;
-  const int h0 = histo[2 * tx];
-  const int pair_sum = h0 + histo[2 * tx + 1];
-
-  auto& scan_storage = *reinterpret_cast<typename BlockScanT::TempStorage*>(
-      decode_smem + kDecodeBins);
-
-  int pair_prefix, total;
-  BlockScanT(scan_storage).ExclusiveSum(pair_sum, pair_prefix, total);
-
-  // Find threshold bin purely from registers
-  const int pair_suffix = total - pair_prefix;
-
-  if (pair_suffix >= TopK && (pair_suffix - h0) < TopK) {
-    decode_smem[SBASE + sTHR] = 2 * tx;
-  }
-  {
-    const int right_suf = pair_suffix - h0;
-    const int next_suf = pair_suffix - pair_sum;
-    if (right_suf >= TopK && next_suf < TopK) {
-      decode_smem[SBASE + sTHR] = 2 * tx + 1;
-    }
-  }
-  __syncthreads();
-
-  const int threshold = decode_smem[SBASE + sTHR];
-
-  // ---- Phase 2: Collection with warp-aggregated atomicAdds ----
-  int* bufs[2] = {decode_smem + BOFF, decode_smem + BOFF + DBUF};
-  const int sOUT_abs = SBASE + sOUT;
-  const int sBUF0_abs = SBASE + sBUF0;
-
-  {
-    const uint32_t uthr = static_cast<uint32_t>(threshold);
-    int item = 0;
-    const int n_vec_iters = (n_vec + kThreadsPerBlock - 1) / kThreadsPerBlock;
-
-    for (int iter = 0; iter < n_vec_iters; iter++) {
-      const int i = tx + iter * kThreadsPerBlock;
-      const bool vec_valid = (i < n_vec);
-      const int base_idx = i << 2;
-
-#pragma unroll 4
-      for (int sub = 0; sub < 4; sub++) {
-        const int elem_idx = base_idx + sub;
-        uint32_t bin = 0;
-        if (vec_valid) bin = reg_bins[item++];
-        const bool is_above = vec_valid && (bin > uthr);
-        const bool is_equal = vec_valid && (bin == uthr);
-
-        const uint32_t above_mask = __ballot_sync(0xffffffff, is_above);
-        if (above_mask) {
-          const int above_count = __popc(above_mask);
-          const int above_rank = __popc(above_mask & ((1u << lane) - 1));
-          int above_base;
-          if (lane == 0) {
-            above_base = atomicAdd(&decode_smem[sOUT_abs], above_count);
-          }
-          above_base = __shfl_sync(0xffffffff, above_base, 0);
-          if (is_above) {
-            output_indices[above_base + above_rank] = elem_idx;
-          }
-        }
-
-        const uint32_t equal_mask = __ballot_sync(0xffffffff, is_equal);
-        if (equal_mask) {
-          const int equal_count = __popc(equal_mask);
-          const int equal_rank = __popc(equal_mask & ((1u << lane) - 1));
-          int equal_base;
-          if (lane == 0) {
-            equal_base = atomicAdd(&decode_smem[sBUF0_abs], equal_count);
-          }
-          equal_base = __shfl_sync(0xffffffff, equal_base, 0);
-          if (is_equal && __builtin_expect(equal_base + equal_rank < DBUF, 1)) {
-            bufs[0][equal_base + equal_rank] = elem_idx;
-          }
-        }
-      }
-    }
-  }
-  __syncthreads();
-
-  int remaining_k = TopK - decode_smem[SBASE + sOUT];
-  if (remaining_k <= 0) return;
-
-  // If all buffered elements fit, output them all (common for short seqs)
-  const int raw_buf0 = decode_smem[SBASE + sBUF0];
-  if (raw_buf0 <= remaining_k) {
-    const int nb = (raw_buf0 < DBUF) ? raw_buf0 : DBUF;
-    const int base = decode_smem[SBASE + sOUT];
-    for (int i = tx; i < nb; i += kThreadsPerBlock) {
-      output_indices[base + i] = bufs[0][i];
-    }
-    __syncthreads();
-    return;
-  }
-
-  // ---- Phase 3: Deferred refinement (rare path) ----
-  int* refine[2] = {decode_smem, decode_smem + RHIST};
-  const int num_buf0 = (raw_buf0 < DBUF) ? raw_buf0 : DBUF;
-
-  for (int i = tx; i < RHIST; i += kThreadsPerBlock) {
-    refine[0][i] = 0;
-  }
-  __syncthreads();
-
-  for (int i = tx; i < num_buf0; i += kThreadsPerBlock) {
-    const uint32_t fp32 = convert_to_uint32_v2(logits[bufs[0][i]]);
-    atomicAdd(&refine[0][(fp32 >> 24) & 0xFF], 1);
-  }
-  __syncthreads();
-
-  auto compute_suffix_sum = [&]() {
-#pragma unroll 8
-    for (int i = 0; i < 8; ++i) {
-      if (tx < RADIX) {
-        const int stride = 1 << i;
-        const int s = i & 1;
-        const int d = s ^ 1;
-        int value = refine[s][tx];
-        if (tx < RADIX - stride) value += refine[s][tx + stride];
-        refine[d][tx] = value;
-      }
-      __syncthreads();
-    }
-  };
-
-#pragma unroll 4
-  for (int pass = 0; pass < 4; ++pass) {
-    const int src = pass & 1;
-    const int dst = src ^ 1;
-
-    const int raw_buf = decode_smem[SBASE + sBUF0 + src];
-    const int num_buffered = (raw_buf < DBUF) ? raw_buf : DBUF;
-
-    compute_suffix_sum();
-
-    if (tx < RADIX && refine[0][tx] > remaining_k &&
-        refine[0][tx + 1] <= remaining_k) {
-      decode_smem[SBASE + sREF] = tx;
-      decode_smem[SBASE + sBUF0 + dst] = 0;
-      decode_smem[SBASE + sFIN] = remaining_k - refine[0][tx + 1];
-    }
-    __syncthreads();
-
-    const int ref_thr = decode_smem[SBASE + sREF];
-    remaining_k -= refine[0][ref_thr + 1];
-    const int bit_offset = 24 - pass * 8;
-
-    if (remaining_k == 0) {
-      for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
-        const int idx = bufs[src][i];
-        const uint32_t fp32 = convert_to_uint32_v2(logits[idx]);
-        if (((fp32 >> bit_offset) & 0xFF) > static_cast<uint32_t>(ref_thr)) {
-          const int pos = atomicAdd(&decode_smem[SBASE + sOUT], 1);
-          output_indices[pos] = idx;
-        }
-      }
-      __syncthreads();
-      break;
-    }
-
-    __syncthreads();
-    if (tx < RADIX + 1) refine[0][tx] = 0;
-    __syncthreads();
-
-    for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
-      const int idx = bufs[src][i];
-      const float logit_val = logits[idx];
-      const uint32_t fp32 = convert_to_uint32_v2(logit_val);
-      const int bin = (fp32 >> bit_offset) & 0xFF;
-
-      if (bin > ref_thr) {
-        const int pos = atomicAdd(&decode_smem[SBASE + sOUT], 1);
-        output_indices[pos] = idx;
-      } else if (bin == ref_thr) {
-        if (pass == 3) {
-          const int slot = atomicAdd(&decode_smem[SBASE + sFIN], -1);
-          if (slot > 0) output_indices[TopK - slot] = idx;
-        } else {
-          const int bp = atomicAdd(&decode_smem[SBASE + sBUF0 + dst], 1);
-          if (__builtin_expect(bp < DBUF, 1)) {
-            bufs[dst][bp] = idx;
-            const int nbo = bit_offset - 8;
-            atomicAdd(&refine[0][(fp32 >> nbo) & 0xFF], 1);
-          }
-        }
-      }
-    }
-    __syncthreads();
-  }
-}
-
-// ============================================================================
-// Medium path: coarse FP16 histogram + 4-pass FP32 radix refinement
-// For sequences 8K < seq_len <= 64K.
-// ============================================================================
-
-// sgl-kernel/tilelang-derived medium-path top-k kernel.
-template <int TopK>
-__device__ __noinline__ void histogram_256_topk(
-    const float* __restrict__ logits, int* __restrict__ output_indices,
-    int logits_offset, int seq_len) {
-  // All shared state lives in dynamic shared memory to avoid static
-  extern __shared__ char medium_smem[];
-
-  int (*shared_histogram)[RADIX + 128] =
-      reinterpret_cast<int (*)[RADIX + 128]>(medium_smem);
-  int* medium_scalars = reinterpret_cast<int*>(medium_smem + kMediumHistBytes);
-  int& shared_output_count = medium_scalars[0];
-  int& shared_threshold_bin = medium_scalars[1];
-  int* shared_buffered_count = &medium_scalars[2];
-  int& shared_final_k = medium_scalars[4];
-  int (*buffered_indices)[MAX_BUFFERED_ITEMS] =
-      reinterpret_cast<int (*)[MAX_BUFFERED_ITEMS]>(medium_smem +
-                                                    kMediumHeaderSize);
-
-  const int thread_id = threadIdx.x;
-  int remaining_k = TopK;
-
-  if (thread_id < RADIX + 1) {
-    shared_histogram[0][thread_id] = 0;
-  }
-  __syncthreads();
-
-  for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-    const auto bin = convert_to_uint8(logits[idx + logits_offset]);
-    atomicAdd(&shared_histogram[0][bin], 1);
-  }
-  __syncthreads();
-
-  auto compute_cumulative_sum = [&]() {
-#pragma unroll 8
-    for (int i = 0; i < 8; ++i) {
-      if (__builtin_expect(thread_id < RADIX, 1)) {
-        const int stride = 1 << i;
-        const int src_buffer = i & 1;
-        const int dst_buffer = src_buffer ^ 1;
-        int value = shared_histogram[src_buffer][thread_id];
-        if (thread_id < RADIX - stride) {
-          value += shared_histogram[src_buffer][thread_id + stride];
-        }
-        shared_histogram[dst_buffer][thread_id] = value;
-      }
-      __syncthreads();
-    }
-  };
-
-  compute_cumulative_sum();
-
-  if (thread_id < RADIX && shared_histogram[0][thread_id] > remaining_k &&
-      shared_histogram[0][thread_id + 1] <= remaining_k) {
-    shared_threshold_bin = thread_id;
-    shared_buffered_count[0] = 0;
-    shared_output_count = 0;
-  }
-  __syncthreads();
-
-  const int threshold_bin = shared_threshold_bin;
-  remaining_k -= shared_histogram[0][threshold_bin + 1];
-
-  if (remaining_k == 0) {
-    for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-      const int bin = convert_to_uint8(logits[idx + logits_offset]);
-      if (bin > threshold_bin) {
-        const int output_pos = atomicAdd(&shared_output_count, 1);
-        output_indices[output_pos] = idx;
-      }
-    }
-    __syncthreads();
-    return;
-  }
-
-  __syncthreads();
-  if (thread_id < RADIX + 1) {
-    shared_histogram[0][thread_id] = 0;
-  }
-  __syncthreads();
-
-  for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-    const float logit_value = logits[idx + logits_offset];
-    const int bin = convert_to_uint8(logit_value);
-    if (bin > threshold_bin) {
-      const int output_pos = atomicAdd(&shared_output_count, 1);
-      output_indices[output_pos] = idx;
-    } else if (bin == threshold_bin) {
-      const int buffer_pos = atomicAdd(&shared_buffered_count[0], 1);
-      if (__builtin_expect(buffer_pos < MAX_BUFFERED_ITEMS, 1)) {
-        buffered_indices[0][buffer_pos] = idx;
-        const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
-        const int next_bin = (fp32_bits >> 24) & 0xFF;
-        atomicAdd(&shared_histogram[0][next_bin], 1);
-      }
-    }
-  }
-  __syncthreads();
-
-#pragma unroll 4
-  for (int pass = 0; pass < 4; ++pass) {
-    const int src_buffer = pass % 2;
-    const int dst_buffer = src_buffer ^ 1;
-    const int raw_buffered = shared_buffered_count[src_buffer];
-    const int num_buffered =
-        (raw_buffered < MAX_BUFFERED_ITEMS) ? raw_buffered : MAX_BUFFERED_ITEMS;
-
-    compute_cumulative_sum();
-
-    if (thread_id < RADIX && shared_histogram[0][thread_id] > remaining_k &&
-        shared_histogram[0][thread_id + 1] <= remaining_k) {
-      shared_threshold_bin = thread_id;
-      shared_buffered_count[dst_buffer] = 0;
-      shared_final_k = remaining_k - shared_histogram[0][thread_id + 1];
-    }
-    __syncthreads();
-
-    const int threshold_bin = shared_threshold_bin;
-    remaining_k -= shared_histogram[0][threshold_bin + 1];
-    const int bit_offset = 24 - pass * 8;
-
-    if (remaining_k == 0) {
-      for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
-        const int idx = buffered_indices[src_buffer][i];
-        const uint32_t fp32_bits =
-            convert_to_uint32_v2(logits[idx + logits_offset]);
-        const int bin = (fp32_bits >> bit_offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const int output_pos = atomicAdd(&shared_output_count, 1);
-          output_indices[output_pos] = idx;
-        }
-      }
-      __syncthreads();
-      break;
-    }
-
-    __syncthreads();
-    if (thread_id < RADIX + 1) {
-      shared_histogram[0][thread_id] = 0;
-    }
-    __syncthreads();
-
-    for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
-      const int idx = buffered_indices[src_buffer][i];
-      const float logit_value = logits[idx + logits_offset];
-      const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
-      const int bin = (fp32_bits >> bit_offset) & 0xFF;
-      if (bin > threshold_bin) {
-        const int output_pos = atomicAdd(&shared_output_count, 1);
-        output_indices[output_pos] = idx;
-      } else if (bin == threshold_bin) {
-        if (pass == 3) {
-          const int slot = atomicAdd(&shared_final_k, -1);
-          if (slot > 0) {
-            output_indices[TopK - slot] = idx;
-          }
-        } else {
-          const int buffer_pos =
-              atomicAdd(&shared_buffered_count[dst_buffer], 1);
-          if (__builtin_expect(buffer_pos < MAX_BUFFERED_ITEMS, 1)) {
-            buffered_indices[dst_buffer][buffer_pos] = idx;
-            const int next_bit_offset = bit_offset - 8;
-            const int next_bin = (fp32_bits >> next_bit_offset) & 0xFF;
-            atomicAdd(&shared_histogram[0][next_bin], 1);
-          }
-        }
-      }
-    }
-    __syncthreads();
-  }
-}
-
-// ============================================================================
-// Inter-CTA sync primitives
-// ============================================================================
-
-__device__ __forceinline__ int ld_acquire(int* ptr) {
-  int state = 0;
-#if (__CUDA_ARCH__ >= 700)
-  asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
-               : "=r"(state)
-               : "l"(ptr));
-#else
-  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
-#endif
-  return state;
-}
-
-__device__ __forceinline__ void red_release(int* ptr, int val) {
-#if (__CUDA_ARCH__ >= 700)
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
-               :
-               : "l"(ptr), "r"(val));
-#else
-  __threadfence();
-  atomicAdd(ptr, val);
-#endif
-}
-
-__device__ __forceinline__ void st_release(int* ptr, int val) {
-#if (__CUDA_ARCH__ >= 700)
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val));
-#else
-  __threadfence();
-  atomicExch(ptr, val);
-#endif
-}
-
-__device__ __forceinline__ void wait_ge(int* ptr, int target_val,
-                                        int thread_idx) {
-  if (thread_idx == 0) {
-#pragma unroll 1
-    while (ld_acquire(ptr) < target_val) {
-    }
-  }
-  __syncthreads();
-}
-
-// ============================================================================
-// Large path: multi-CTA radix select for sequences > 64K
-//
-// Each row is processed by a group of CTAs. Each CTA loads its chunk into
-// shared memory as ordered uint32, then participates in 4 rounds of
-// coordinated radix select via global-memory histograms and barriers.
-// ============================================================================
-
-// ============================================================================
-// FlashInfer-derived multi-CTA cooperative RadixTopK for a single large row.
-// ============================================================================
-
-template <int TopK, uint32_t VEC_SIZE>
-__device__ void radix_topk(const float* __restrict__ row_input,
-                           int32_t* __restrict__ row_output, uint32_t seq_len,
-                           uint32_t my_chunk_start, uint32_t chunk_size,
-                           uint32_t* local_histogram, uint32_t* suffix_sum,
-                           uint32_t* shared_scalars, uint32_t* shared_ordered,
-                           RadixRowState* state, uint32_t cta_in_group,
-                           uint32_t ctas_per_group, int& barrier_phase,
-                           uint32_t iter, uint32_t tx) {
-  const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
-                                    ? my_chunk_start + chunk_size
-                                    : seq_len;
-  const uint32_t actual_chunk_size =
-      (my_chunk_start < seq_len) ? (my_chunk_end - my_chunk_start) : 0;
-
-  // -- Stage 1: Load chunk to shared memory as ordered uint32 --
-  {
-    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
-         i += kThreadsPerBlock * VEC_SIZE) {
-      const float* src = row_input + my_chunk_start + i;
-      if constexpr (VEC_SIZE == 4) {
-        float4 v = *reinterpret_cast<const float4*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
-        shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
-        shared_ordered[i + 3] = convert_to_uint32_v2(v.w);
-      } else if constexpr (VEC_SIZE == 2) {
-        float2 v = *reinterpret_cast<const float2*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
-      } else {
-        shared_ordered[i] = convert_to_uint32_v2(*src);
-      }
-    }
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
-         i += kThreadsPerBlock) {
-      shared_ordered[i] = convert_to_uint32_v2(row_input[my_chunk_start + i]);
-    }
-  }
-  __syncthreads();
-
-  // -- Init radix select state --
-  if (tx == 0) {
-    shared_scalars[0] = 0;     // prefix
-    shared_scalars[1] = TopK;  // remaining_k
-  }
-  __syncthreads();
-
-  // -- Initial barrier --
-  if (tx == 0) {
-    red_release(&state->arrival_counter, 1);
-  }
-  wait_ge(&state->arrival_counter,
-          (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
-  barrier_phase++;
-  __syncthreads();
-
-  if (cta_in_group == 0 && tx == 0) {
-    st_release(&state->output_counter, 0);
-  }
-
-  // -- Stage 2: 4 rounds of radix select --
-  for (uint32_t round = 0; round < 4; round++) {
-    const uint32_t global_round = iter * 4 + round;
-    const uint32_t shift = 24 - round * 8;
-    const uint32_t prefix = shared_scalars[0];
-    const uint32_t remaining_k = shared_scalars[1];
-
-    uint32_t* current_hist = state->histogram[global_round % 3];
-    uint32_t* next_hist = state->histogram[(global_round + 1) % 3];
-
-    for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
-      local_histogram[i] = 0;
-    }
-    __syncthreads();
-
-    for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-      uint32_t ordered = shared_ordered[i];
-      uint32_t mask = (round == 0) ? 0u : (~0u << (32 - round * 8));
-      if ((ordered & mask) == prefix) {
-        uint32_t bucket = (ordered >> shift) & 0xFF;
-        atomicAdd(&local_histogram[bucket], 1);
-      }
-    }
-    __syncthreads();
-
-    for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
-      if (local_histogram[i] > 0) {
-        atomicAdd(&current_hist[i], local_histogram[i]);
-      }
-    }
-
-    if (cta_in_group == 0) {
-      for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
-        next_hist[i] = 0;
-      }
-    }
-
-    if (tx == 0) {
-      red_release(&state->arrival_counter, 1);
-    }
-    wait_ge(&state->arrival_counter,
-            (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
-    barrier_phase++;
-    __syncthreads();
-
-    for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
-      suffix_sum[i] = current_hist[i];
-    }
-    __syncthreads();
-
-    for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
-      uint32_t val = 0;
-      if (tx < RADIX) {
-        val = suffix_sum[tx];
-        if (tx + stride < RADIX) val += suffix_sum[tx + stride];
-      }
-      __syncthreads();
-      if (tx < RADIX) suffix_sum[tx] = val;
-      __syncthreads();
-    }
-
-    if (tx == 0) {
-      shared_scalars[2] = 0;
-      shared_scalars[3] = remaining_k;
-    }
-    __syncthreads();
-
-    if (tx < RADIX) {
-      uint32_t count_ge = suffix_sum[tx];
-      uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-      if (count_ge >= remaining_k && count_gt < remaining_k) {
-        shared_scalars[2] = tx;
-        shared_scalars[3] = remaining_k - count_gt;
-      }
-    }
-    __syncthreads();
-
-    if (tx == 0) {
-      shared_scalars[0] = prefix | (shared_scalars[2] << shift);
-      shared_scalars[1] = shared_scalars[3];
-    }
-    __syncthreads();
-  }  // end 4 radix rounds
-
-  // -- Count local > pivot elements --
-  const uint32_t ordered_pivot = shared_scalars[0];
-
-  if (tx == 0) suffix_sum[0] = 0;
-  __syncthreads();
-
-  uint32_t my_gt_count = 0;
-  for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-    if (shared_ordered[i] > ordered_pivot) my_gt_count++;
-  }
-  for (int offset = 16; offset > 0; offset /= 2) {
-    my_gt_count += __shfl_down_sync(0xffffffff, my_gt_count, offset);
-  }
-  if (tx % 32 == 0 && my_gt_count > 0) {
-    atomicAdd(&suffix_sum[0], my_gt_count);
-  }
-  __syncthreads();
-  const uint32_t local_gt_count = suffix_sum[0];
-
-  // -- Stage 3: Collect top-k indices --
-  if (tx == 0) {
-    local_histogram[0] = 0;
-    if (local_gt_count > 0) {
-      local_histogram[1] =
-          atomicAdd(&state->output_counter, static_cast<int>(local_gt_count));
-    }
-  }
-  __syncthreads();
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-    if (shared_ordered[i] > ordered_pivot) {
-      uint32_t local_pos = atomicAdd(&local_histogram[0], 1);
-      int pos = static_cast<int>(local_histogram[1]) + local_pos;
-      row_output[pos] = static_cast<int32_t>(my_chunk_start + i);
-    }
-  }
-
-  if (tx == 0) {
-    red_release(&state->arrival_counter, 1);
-  }
-  wait_ge(&state->arrival_counter,
-          (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
-  barrier_phase++;
-  __syncthreads();
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
-    if (shared_ordered[i] == ordered_pivot) {
-      int pos = atomicAdd(&state->output_counter, 1);
-      if (pos < TopK) {
-        row_output[pos] = static_cast<int32_t>(my_chunk_start + i);
-      }
-    }
-  }
-}
-
-// ============================================================================
-// Persistent kernel — BS≤32, decode/medium/large paths with RadixTopK
-// BS>32 uses standalone histogram_256_buffered_topk (separate kernel,
-// see filtered_topk.cuh)
-// ============================================================================
-
-template <int TopK = 2048, uint32_t VEC_SIZE = 1>
+template <int TopK, int Level>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     persistent_topk_kernel(PersistentTopKParams params) {
-  const uint32_t tx = threadIdx.x;
-  extern __shared__ uint8_t smem_raw[];
+  static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
+  static_assert(Level >= 0 && Level <= 2);
 
-  // ========================================================================
-  // Group mode: multi-CTA groups with static round-robin row assignment.
-  // Non-large rows: CTA-0 handles trivial/decode/medium.
-  // Large rows: all CTAs in the group cooperate via RadixTopK.
-  // ========================================================================
-  const uint32_t ctas_per_group = params.ctas_per_group;
-  const uint32_t group_id = blockIdx.x / ctas_per_group;
-  const uint32_t cta_in_group = blockIdx.x % ctas_per_group;
-  const uint32_t num_groups = gridDim.x / ctas_per_group;
-  const uint32_t chunk_size = params.chunk_size;
+  const uint32_t row = blockIdx.x;
+  if (row >= params.num_rows) return;
 
-  if (blockIdx.x >= num_groups * ctas_per_group) return;
-
-  // Early exit: non-CTA-0 threads are never needed if no large rows exist
-  if (cta_in_group != 0 && params.max_seq_len <= RADIX_THRESHOLD) return;
-
-  uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem_raw);
-  uint32_t* suffix_sum = local_histogram + RADIX;
-  uint32_t* shared_scalars = suffix_sum + RADIX;
-  uint32_t* shared_ordered =
-      reinterpret_cast<uint32_t*>(smem_raw + kFixedSmemLarge);
-
-  // RadixRowState for multi-CTA cooperative radix. The launcher clears this
-  // workspace before the kernel starts; initializing it from a single CTA here
-  // would race other CTAs entering the first inter-CTA barrier.
-  RadixRowState* state = &params.row_states[group_id];
-
-  int barrier_phase = 0;
-  const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;
-
-  for (uint32_t iter = 0; iter < total_iters; iter++) {
-    // Static round-robin: all CTAs in the group implicitly agree on the row
-    uint32_t row_idx = group_id + iter * num_groups;
-    if (row_idx >= params.num_rows) break;
-
-    const uint32_t seq_len =
-        dsa_topk_row_seq_len(params.lengths, row_idx, params.q_len_per_req);
-    int32_t* row_output = params.output + row_idx * params.top_k;
-    const float* row_input = params.input + row_idx * params.stride;
-
-    if (seq_len <= RADIX_THRESHOLD) {
-      if (cta_in_group == 0) {
-        if (seq_len <= static_cast<uint32_t>(TopK)) {
-          // Trivial case: seq_len <= TopK
-          for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);
-               i += kThreadsPerBlock) {
-            row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
-          }
-        } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
-          histogram_2048_topk<TopK>(row_input, row_output, seq_len);
-        } else {
-          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
-        }
-      }
-      continue;
+  const uint32_t seq_len =
+      dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
+  int32_t* row_output = params.output + row * params.top_k;
+  if (seq_len <= static_cast<uint32_t>(TopK)) {
+    for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
+         i += kThreadsPerBlock) {
+      row_output[i] = i < seq_len ? static_cast<int32_t>(i) : -1;
     }
-
-    const uint32_t my_chunk_start = cta_in_group * chunk_size;
-    radix_topk<TopK, VEC_SIZE>(
-        row_input, row_output, seq_len, my_chunk_start, chunk_size,
-        local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+    return;
   }
+
+  using Register2 = impl::TopKRegister<2>;
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  __shared__ impl::MaxSmem<typename Register2::Smem, typename Register4::Smem,
+                           typename Streaming::Smem>
+      smem;
+
+  const impl::TopKProblem problem{
+      .in = params.input + row * params.stride,
+      .out = row_output,
+      .page_table = nullptr,
+      .topk = static_cast<uint32_t>(TopK),
+      .seq_len = seq_len,
+      .page_bits = 0,
+  };
+
+  if constexpr (Level == 0) {
+    Register2::forward<false>(problem, &smem);
+  } else if constexpr (Level == 1) {
+    Register4::forward<false>(problem, &smem);
+  } else {
+    if (seq_len <= kRegister4MaxSeqLen) {
+      Register4::forward<false>(problem, &smem);
+    } else {
+      Streaming::forward<false>(problem, &smem);
+    }
+  }
+}
+
+template <int TopK, bool kUsePDL, typename Cluster>
+__device__ __forceinline__ void cluster_topk_body(
+    PersistentTopKParams params, void* smem) {
+  static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+
+  const uint32_t row = blockIdx.x;
+  if (row >= params.num_rows) return;
+  const uint32_t rank = blockIdx.y;
+  const uint32_t worker_rank = row % Cluster::kClusterSize;
+  const uint32_t seq_len =
+      dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
+  int32_t* row_output = params.output + row * params.top_k;
+  const auto cluster = cooperative_groups::this_cluster();
+
+  if (seq_len <= static_cast<uint32_t>(TopK)) {
+    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
+    if (rank == worker_rank) {
+      for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
+           i += kThreadsPerBlock) {
+        row_output[i] = i < seq_len ? static_cast<int32_t>(i) : -1;
+      }
+    }
+    cluster.sync();
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+
+  const impl::TopKProblem problem{
+      .in = params.input + row * params.stride,
+      .out = row_output,
+      .page_table = nullptr,
+      .topk = static_cast<uint32_t>(TopK),
+      .seq_len = seq_len,
+      .page_bits = 0,
+  };
+
+  if (seq_len <= kRegister4MaxSeqLen) {
+    if (rank == worker_rank) Register4::forward<kUsePDL>(problem, smem);
+  } else if (seq_len <= kClusterFloor) {
+    if (rank == worker_rank) Streaming::forward<kUsePDL>(problem, smem);
+  } else {
+    Cluster::forward<kUsePDL>(problem, smem);
+    // Cluster::forward's last DSMEM consumer is already preceded by a
+    // cluster-wide barrier. Once it returns, each CTA only completes local or
+    // global-memory writes, and kernel completion provides the launch-wide
+    // visibility guarantee; a final cluster barrier only serializes teardown.
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  // Non-cluster paths may leave every rank but one idle while that rank still
+  // uses its CTA-local storage, so keep their explicit rendezvous.
+  cluster.sync();
+  tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    __cluster_dims__(1, kClusterSize, 1)
+        cluster_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<kClusterSize, kClusterHistBits>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 1)
+    __cluster_dims__(1, 8, 1)
+        cluster8_register4_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<8, kClusterHistBits, 4>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    __cluster_dims__(1, 16, 1)
+        cluster16_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<16, kClusterHistBits>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
 }  // namespace persistent
-
-// ============================================================================
-// FlashInfer FilteredTopK (BS>32 dispatch) — float32 only.
-// Lives in namespace vllm (not persistent).
-// ============================================================================
-
-#define FLASHINFER_CUDA_CALL(func, ...) \
-  {                                     \
-    cudaError_t e = (func);             \
-    if (e != cudaSuccess) {             \
-      return e;                         \
-    }                                   \
-  }
-
-#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
-
-template <typename T, size_t N>
-struct vec_t {
-  T data[N];
-
-  FLASHINFER_INLINE T& operator[](size_t i) { return data[i]; }
-  FLASHINFER_INLINE const T& operator[](size_t i) const { return data[i]; }
-
-  FLASHINFER_INLINE void cast_load(const T* ptr) {
-#pragma unroll
-    for (size_t i = 0; i < N; ++i) {
-      data[i] = ptr[i];
-    }
-  }
-
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
-#pragma unroll
-    for (size_t i = 0; i < N; ++i) {
-      ptr[i] = data[i];
-    }
-  }
-};
-#undef FLASHINFER_INLINE
-
-// FilteredTopK traits for different data types
-template <typename DType>
-struct FilteredTopKTraits;
-
-// Specialization for float (32-bit): coarse histogram uses FP16 high 8 bits, 4
-// refinement rounds
-template <>
-struct FilteredTopKTraits<float> {
-  using OrderedType = uint32_t;
-  static constexpr int NUM_REFINE_ROUNDS = 4;
-  static constexpr int FIRST_REFINE_SHIFT = 24;
-
-  __device__ __forceinline__ static uint8_t ToCoarseKey(float x) {
-    // Convert to FP16 representation and extract high 8 bits
-    __half h = __float2half_rn(x);
-    uint16_t bits = __half_as_ushort(h);
-    uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
-                                   : static_cast<uint16_t>(bits | 0x8000);
-    return static_cast<uint8_t>(key >> 8);
-  }
-
-  __device__ __forceinline__ static OrderedType ToOrdered(float x) {
-    uint32_t bits = __float_as_uint(x);
-    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-  }
-};
-
-constexpr uint32_t FILTERED_TOPK_BLOCK_THREADS = 1024;
-constexpr uint32_t FILTERED_TOPK_SMEM_INPUT_SIZE =
-    16 * 1024;  // 16K indices per buffer
-constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
-    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 128KB
-
-/*!
- * \brief Filtered Top-K kernel for ragged sequences.
- *
- * \tparam DType Data type (float, half, nv_bfloat16)
- * \tparam IdType Index type (int32_t)
- * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
- */
-template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048>
-__global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
-    FilteredTopKUnifiedKernel(const DType* __restrict__ input,
-                              IdType* __restrict__ output,
-                              const IdType* __restrict__ lengths,
-                              uint32_t num_rows, uint32_t top_k,
-                              uint32_t max_len, uint32_t q_len_per_req) {
-  constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
-  constexpr int RADIX = 256;
-  constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
-
-  const uint32_t bid = blockIdx.x;
-  const int tx = threadIdx.x;
-
-  if (bid >= num_rows) return;
-
-  const int length =
-      (lengths != nullptr)
-          ? static_cast<int>(dsa_topk_row_seq_len(lengths, bid, q_len_per_req))
-          : static_cast<int>(max_len);
-  const DType* score = input + bid * max_len;
-  IdType* dst = output + bid * top_k;
-
-  // Trivial case: length <= top_k
-  if (length <= static_cast<int>(top_k)) {
-    for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
-      dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
-    }
-    return;
-  }
-
-  // Static shared memory
-  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
-  alignas(128) __shared__ int s_counter;
-  alignas(128) __shared__ int s_threshold_bin_id;
-  alignas(128) __shared__ int s_num_input[2];
-  alignas(128) __shared__ int s_indices[MAX_K];
-
-  auto& s_histogram = s_histogram_buf[0];
-
-  // Dynamic shared memory for input double buffer
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
-
-  using Traits = FilteredTopKTraits<DType>;
-  int topk = top_k;
-
-  // Stage 1: 8-bit coarse histogram with vectorized loads
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
-  __syncthreads();
-
-  vec_t<DType, VEC_SIZE> score_vec;
-
-  const int aligned_length = (length / VEC_SIZE) * VEC_SIZE;
-#pragma unroll 2
-  for (int base = tx * VEC_SIZE; base < aligned_length;
-       base += BLOCK_SIZE * VEC_SIZE) {
-    score_vec.cast_load(&score[base]);
-#pragma unroll
-    for (int j = 0; j < VEC_SIZE; ++j) {
-      const auto bin = Traits::ToCoarseKey(score_vec[j]);
-      atomicAdd(&s_histogram[bin], 1);
-    }
-  }
-  // Handle tail
-  for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
-    const auto bin = Traits::ToCoarseKey(score[i]);
-    atomicAdd(&s_histogram[bin], 1);
-  }
-  __syncthreads();
-
-  // Suffix sum
-  const auto run_cumsum = [&]() {
-#pragma unroll 8
-    for (int i = 0; i < 8; ++i) {
-      if (tx < RADIX) {
-        const auto j = 1 << i;
-        const auto k = i & 1;
-        auto value = s_histogram_buf[k][tx];
-        if (tx < RADIX - j) {
-          value += s_histogram_buf[k][tx + j];
-        }
-        s_histogram_buf[k ^ 1][tx] = value;
-      }
-      __syncthreads();
-    }
-  };
-
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
-  }
-  __syncthreads();
-
-  const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
-
-  constexpr int NUM_ROUNDS = Traits::NUM_REFINE_ROUNDS;
-  constexpr int FIRST_SHIFT = Traits::FIRST_REFINE_SHIFT;
-
-  if (topk == 0) {
-    // Collect indices where bin > threshold
-#pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < aligned_length;
-         base += BLOCK_SIZE * VEC_SIZE) {
-      score_vec.cast_load(&score[base]);
-#pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
-        const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
-        if (bin > threshold_bin) {
-          const auto pos = atomicAdd(&s_counter, 1);
-          s_indices[pos] = base + j;
-        }
-      }
-    }
-    // Handle tail
-    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(Traits::ToCoarseKey(score[i]));
-      if (bin > threshold_bin) {
-        const auto pos = atomicAdd(&s_counter, 1);
-        s_indices[pos] = i;
-      }
-    }
-    __syncthreads();
-  } else {
-    __syncthreads();
-    if (tx < RADIX + 1) s_histogram[tx] = 0;
-    __syncthreads();
-
-    // Filter + histogram for refinement
-    auto filter_and_add_to_histogram = [&](auto raw_input, int index) {
-      const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
-      if (bin > threshold_bin) {
-        const auto pos = atomicAdd(&s_counter, 1);
-        s_indices[pos] = index;
-      } else if (bin == threshold_bin) {
-        const auto pos = atomicAdd(&s_num_input[0], 1);
-        if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
-          s_input_idx[0][pos] = index;
-          const auto ordered = Traits::ToOrdered(raw_input);
-          const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
-          atomicAdd(&s_histogram[sub_bin], 1);
-        }
-      }
-    };
-#pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < aligned_length;
-         base += BLOCK_SIZE * VEC_SIZE) {
-      score_vec.cast_load(&score[base]);
-#pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
-        filter_and_add_to_histogram(score_vec[j], base + j);
-      }
-    }
-    // Handle tail
-    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
-      filter_and_add_to_histogram(score[i], i);
-    }
-    __syncthreads();
-
-    // Stage 2: refine with 8bit radix passes
-#pragma unroll
-    for (int round = 0; round < NUM_ROUNDS; ++round) {
-      __shared__ int s_last_remain;
-      const auto r_idx = round % 2;
-
-      const auto _raw_num_input = s_num_input[r_idx];
-      const auto num_input =
-          (_raw_num_input < SMEM_INPUT_SIZE) ? _raw_num_input : SMEM_INPUT_SIZE;
-
-      run_cumsum();
-      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-        s_threshold_bin_id = tx;
-        s_num_input[r_idx ^ 1] = 0;
-        s_last_remain = topk - s_histogram[tx + 1];
-      }
-      __syncthreads();
-
-      const auto threshold = s_threshold_bin_id;
-      topk -= s_histogram[threshold + 1];
-
-      const int offset = FIRST_SHIFT - round * 8;
-      const bool is_last_round = (round == NUM_ROUNDS - 1);
-
-      if (topk == 0) {
-        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-          const auto idx = s_input_idx[r_idx][i];
-          const auto bin = (Traits::ToOrdered(score[idx]) >> offset) & 0xFF;
-          if (static_cast<int>(bin) > threshold) {
-            const auto pos = atomicAdd(&s_counter, 1);
-            s_indices[pos] = idx;
-          }
-        }
-        __syncthreads();
-        break;
-      } else {
-        __syncthreads();
-        if (tx < RADIX + 1) s_histogram[tx] = 0;
-        __syncthreads();
-        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-          const auto idx = s_input_idx[r_idx][i];
-          const auto raw_input = score[idx];
-          const auto bin = (Traits::ToOrdered(raw_input) >> offset) & 0xFF;
-          if (static_cast<int>(bin) > threshold) {
-            const auto pos = atomicAdd(&s_counter, 1);
-            s_indices[pos] = idx;
-          } else if (static_cast<int>(bin) == threshold) {
-            if (is_last_round) {
-              const auto pos = atomicAdd(&s_last_remain, -1);
-              if (pos > 0) {
-                s_indices[top_k - pos] = idx;
-              }
-            } else {
-              const auto pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);
-              if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
-                s_input_idx[r_idx ^ 1][pos] = idx;
-                const auto bin32 = Traits::ToOrdered(raw_input);
-                const auto sub_bin = (bin32 >> (offset - 8)) & 0xFF;
-                atomicAdd(&s_histogram[sub_bin], 1);
-              }
-            }
-          }
-        }
-        __syncthreads();
-      }
-    }
-  }
-
-  // Output phase - mode-specific
-#pragma unroll 2
-  for (int base = tx; base < static_cast<int>(top_k); base += BLOCK_SIZE) {
-    const int idx = s_indices[base];
-    dst[base] = static_cast<IdType>(idx);
-  }
-}
-
-// Helper to compute GCD for VEC_SIZE selection
-constexpr uint32_t gcd(uint32_t a, uint32_t b) {
-  while (b != 0) {
-    uint32_t t = b;
-    b = a % b;
-    a = t;
-  }
-  return a;
-}
-
-// Compute optimal VEC_SIZE based on max_len and dtype
-// Returns 1, 2, 4, or 8
-template <typename DType>
-constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
-  constexpr int MAX_VEC = 16 / sizeof(DType);  // 4 for float32, 8 for fp16/bf16
-  // Use GCD to find largest power-of-2 divisor
-  const uint32_t g = gcd(max_len, static_cast<uint32_t>(MAX_VEC));
-  return static_cast<int>(g);
-}
-
-template <typename DType, typename IdType, uint32_t MAX_K = 2048>
-cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
-                                        IdType* lengths, uint32_t num_rows,
-                                        uint32_t top_k_val, uint32_t max_len,
-                                        uint32_t q_len_per_req,
-                                        cudaStream_t stream = 0) {
-  constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
-  constexpr int MAX_VEC = 16 / sizeof(DType);
-
-  dim3 grid(num_rows);
-  dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input,    &output_indices, &lengths,       &num_rows,
-                  &top_k_val, &max_len,       &q_len_per_req};
-
-  const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
-
-#define DISPATCH_VEC_SIZE(VS)                                               \
-  if (vec_size == VS) {                                                     \
-    auto kernel = FilteredTopKUnifiedKernel<DType, IdType, VS, MAX_K>;      \
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(                              \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, \
-                                          smem_size, stream));              \
-    return cudaSuccess;                                                     \
-  }
-
-  DISPATCH_VEC_SIZE(1)
-  DISPATCH_VEC_SIZE(2)
-  DISPATCH_VEC_SIZE(4)
-  if constexpr (MAX_VEC >= 8) {
-    DISPATCH_VEC_SIZE(8)
-  }
-#undef DISPATCH_VEC_SIZE
-
-  return cudaSuccess;
-}
-
 }  // namespace vllm
+
+#undef TS_DEVICE
 
 #endif  // TOKENSPEED_KERNEL_DEEPSEEK_V4_PERSISTENT_TOPK_CUH_
