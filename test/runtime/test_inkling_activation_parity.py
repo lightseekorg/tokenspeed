@@ -170,11 +170,17 @@ class _Harness:
 
     def __init__(self, model, text, device="cuda"):
         from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
+        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+            CacheGroupGeometry,
+        )
         from tokenspeed.runtime.layers.attention.backends.inkling import (
             InklingAttnBackend,
             InklingConvStatePool,
         )
         from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.router import (
+            CacheGroupRouter,
+        )
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
         from tokenspeed.runtime.layers.attention.kv_cache.mha import (
@@ -203,7 +209,30 @@ class _Harness:
             kv_cache_quant_method="none",
             components=(spec,),
         )
-        inner = MHAAttnBackend(config, spec, kernel_page_size=PAGE_SIZE)
+        # Production composition: the Inkling wrapper sits over a
+        # CacheGroupRouter, one MHA leaf per attention cache group (the
+        # layers' group_ids are the cache_layer_types labels; sliding layers
+        # split into sub-groups). Write locations are router-owned: the layer
+        # call carries none, the router derives them from block_tables.
+        self.attn_groups = tuple(dict.fromkeys(text.cache_layer_types))
+        leaves = {
+            gid: MHAAttnBackend(config, spec, kernel_page_size=PAGE_SIZE)
+            for gid in self.attn_groups
+        }
+        inner = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device=device)
+        inner.bind(
+            CacheGroupGeometry(
+                granularities={gid: PAGE_SIZE for gid in self.attn_groups},
+                families={gid: "history" for gid in self.attn_groups},
+                full_history_group_id=(
+                    "full_attention"
+                    if "full_attention" in self.attn_groups
+                    else self.attn_groups[0]
+                ),
+                history_block_granularity=PAGE_SIZE,
+            ),
+            leaves,
+        )
         from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         # One arena, one view over it: the pool owns no memory or geometry.
@@ -272,14 +301,21 @@ class _Harness:
         self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
         for p in range(max_pages - 1):
             self.page_table[REQ_SLOT, p] = p + 1
+        # Router tables are batch-row-major ([bs, cols]); every attention
+        # group shares this one request's page row over the single pool.
+        attn_table = self.page_table[REQ_SLOT : REQ_SLOT + 1]
+        self.block_tables = {
+            **self.conv_tables,
+            **{gid: attn_table for gid in self.attn_groups},
+        }
         self.seq_len = 0
         # Unified decode path: decode metadata is refreshed into persistent
         # buffers allocated here (production allocates them unconditionally
         # at ForwardStepRunner construction, enforce-eager included). The
-        # inner here is a bare MHA leaf, so mirror the router->leaf calling
-        # convention: leaves take only max_bs (runner extras stop at the
-        # router).
-        inner.set_cache_pool(self.kv_pool)
+        # router is hand-bound above, so bind the pool to its leaves the way
+        # set_cache_pool would.
+        for leaf in leaves.values():
+            leaf.set_cache_pool(self.kv_pool)
         self.backend.init_cuda_graph_state(max_bs=4)
 
     def _ctx(self, mode):
@@ -295,6 +331,18 @@ class _Harness:
         pos = torch.arange(start, start + n, device=self.device)
         return (pos // PAGE_SIZE + 1) * PAGE_SIZE + pos % PAGE_SIZE
 
+    def _check_write_locations(self, mode, start, n):
+        """Pin the router-derived KV write slots to the page map above: every
+        layer's group shares the request's page row, so every layer writes
+        the same token locations the old explicit out_cache_loc named."""
+        expected = self._token_locs(start, n)
+        for layer in self.model.model.layers:
+            got = self.backend.write_locations(layer.attn, mode).long()
+            assert torch.equal(got, expected), (
+                f"layer {layer.attn.layer_id} ({layer.attn.group_id!r}) {mode}: "
+                f"write locs {got.tolist()} != {expected.tolist()}"
+            )
+
     def prefill(self, input_ids):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
@@ -307,20 +355,19 @@ class _Harness:
             num_extends=1,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            block_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=seq_lens,
             extend_seq_lens_cpu=torch.tensor([T]),
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device=dev),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
             extend_with_prefix=False,
-            block_tables=self.conv_tables,
+            block_tables=self.block_tables,
         )
         self.seq_len = T
-        out_cache_loc = self._token_locs(0, T)
+        self._check_write_locations(ForwardMode.EXTEND, 0, T)
         ids = torch.tensor(input_ids, device=dev)
         positions = torch.arange(T, device=dev)
-        return self._layer_states(ids, positions, ForwardMode.EXTEND, out_cache_loc)
+        return self._layer_states(ids, positions, ForwardMode.EXTEND)
 
     def decode(self, token_id):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -335,18 +382,14 @@ class _Harness:
             req_pool_indices,
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_table=self.page_table,
-            block_tables={
-                **self.conv_tables,
-                "full_attention": self.page_table[REQ_SLOT : REQ_SLOT + 1],
-            },
+            block_tables=self.block_tables,
         )
-        out_cache_loc = self._token_locs(self.seq_len - 1, 1)
+        self._check_write_locations(ForwardMode.DECODE, self.seq_len - 1, 1)
         ids = torch.tensor([token_id], device=dev)
         positions = torch.tensor([self.seq_len - 1], device=dev)
-        return self._layer_states(ids, positions, ForwardMode.DECODE, out_cache_loc)
+        return self._layer_states(ids, positions, ForwardMode.DECODE)
 
-    def _layer_states(self, ids, positions, mode, out_cache_loc):
+    def _layer_states(self, ids, positions, mode):
         """Run embed + layers through the real stack, yielding per-layer h
         (fused add-norm convention: the comparable value is output+residual).
         """
@@ -360,7 +403,7 @@ class _Harness:
         tau = None  # exactly 1.0 below log_scaling_n_floor; off on both sides
         residual = None
         for li, layer in enumerate(m.layers):
-            h, residual = layer(h, residual, ctx, out_cache_loc, log_scaling_tau=tau)
+            h, residual = layer(h, residual, ctx, log_scaling_tau=tau)
             states.append((f"layer{li}", (h + residual).clone()))
         h, _ = m.norm(h, residual)
         states.append(("final_norm", h.clone()))
