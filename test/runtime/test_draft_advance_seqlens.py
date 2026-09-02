@@ -13,6 +13,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_capture_warmup_seq_len,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
@@ -68,6 +71,17 @@ def _seqlens_field(be, metadata):
     if isinstance(be, TRTLLMMHAAttnBackend):
         return metadata.cache_seqlens_int32
     return metadata.seq_lens
+
+
+@pytest.mark.parametrize("spec_width", [1, 2, 4, 8])
+def test_mtp_capture_warmup_seq_len_survives_worst_case_verify(spec_width):
+    capture_len = get_capture_warmup_seq_len(spec_width, has_drafter=True)
+    post_verify_len = capture_len - (spec_width - 1)
+    assert post_verify_len >= spec_width
+
+
+def test_non_spec_capture_warmup_seq_len_is_unchanged():
+    assert get_capture_warmup_seq_len(1, has_drafter=False) == 1
 
 
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
@@ -240,7 +254,7 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
 
 def _correction_models():
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3DraftAttentionMLA
-    from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
+    from tokenspeed.runtime.models.glm_moe_dsa_nextn import GlmMoeDsaForCausalLMNextN
     from tokenspeed.runtime.models.llama_eagle3 import LlamaAttention
     from tokenspeed.runtime.models.qwen3_5_nextn import (
         Qwen3_5DraftAttentionDecoderLayer,
@@ -250,7 +264,7 @@ def _correction_models():
         ("llama_eagle3", LlamaAttention._apply_correction),
         ("qwen3_5_nextn", Qwen3_5DraftAttentionDecoderLayer._apply_correction),
         ("deepseek_v3", DeepseekV3DraftAttentionMLA._apply_correction),
-        ("glm5_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
+        ("glm_moe_dsa_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
     ]
 
 

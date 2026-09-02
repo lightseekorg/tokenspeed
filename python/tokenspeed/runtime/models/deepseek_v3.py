@@ -81,7 +81,10 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -363,7 +366,11 @@ class DeepseekV3MoE(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
 
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        # Warm the shared-expert branch serially on its capture stream, then
+        # overlap it with routed experts during capture.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if num_tokens > 0:
@@ -849,12 +856,23 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
+        cache_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
         # group-derived locations on the cache-group path.
-        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
-            self.attn_mqa, out_cache_loc, ctx.forward_mode
+        query_tokens = q.shape[0]
+        if cache_num_tokens is None:
+            cache_num_tokens = query_tokens
+        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
+            raise RuntimeError(
+                "MLA cache write count is outside the query capacity: "
+                f"writes={cache_num_tokens}, queries={query_tokens}"
+            )
+        cache_out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mqa,
+            out_cache_loc[:cache_num_tokens],
+            ctx.forward_mode,
         )
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
@@ -891,15 +909,19 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope_raw = K[..., : self.kv_lora_rank]
             k_pe_raw = K[..., self.kv_lora_rank :]
 
-            fused_kv_arg = create_fused_mla_set_kv_buffer_arg(
-                k_nope=k_nope_raw,
-                rope_dim=self.qk_rope_head_dim,
-                rotary_emb=self.rotary_emb,
-                out_cache_loc=out_cache_loc,
-                token_to_kv_pool=ctx.token_to_kv_pool,
-                layer_id=self.attn_mqa.layer_id,
-                num_q_heads=self.num_local_heads,
-                q_nope=q_nope_absorbed,
+            fused_kv_arg = (
+                create_fused_mla_set_kv_buffer_arg(
+                    k_nope=k_nope_raw,
+                    rope_dim=self.qk_rope_head_dim,
+                    rotary_emb=self.rotary_emb,
+                    out_cache_loc=cache_out_cache_loc,
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    layer_id=self.attn_mqa.layer_id,
+                    num_q_heads=self.num_local_heads,
+                    q_nope=q_nope_absorbed,
+                )
+                if cache_num_tokens == query_tokens
+                else None
             )
             if fused_kv_arg is not None:
                 # One launch for RoPE (or its absence), the FP8 quantize, and
@@ -944,9 +966,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             # Write FP8 KV cache (single write, no double-write)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                out_cache_loc,
-                cache_k_nope=key_fp8[..., : self.kv_lora_rank],
-                cache_k_rope=key_fp8[..., self.kv_lora_rank :],
+                cache_out_cache_loc,
+                cache_k_nope=key_fp8[:cache_num_tokens, ..., : self.kv_lora_rank],
+                cache_k_rope=key_fp8[:cache_num_tokens, ..., self.kv_lora_rank :],
             )
             return query_fp8, key_fp8
 
@@ -956,12 +978,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_nope=K[..., : self.kv_lora_rank],
                     rope_dim=self.qk_rope_head_dim,
                     rotary_emb=self.rotary_emb,
-                    out_cache_loc=out_cache_loc,
+                    out_cache_loc=cache_out_cache_loc,
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
                     num_q_heads=self.num_local_heads,
                 )
                 if self.attention_backend in self._MLA_KERNEL_BACKENDS
+                and cache_num_tokens == query_tokens
                 else None
             )
             if fused_mla_kv_arg is not None:
@@ -998,9 +1021,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                out_cache_loc,
-                cache_k_nope=K[..., : self.kv_lora_rank],
-                cache_k_rope=K[..., self.kv_lora_rank :],
+                cache_out_cache_loc,
+                cache_k_nope=K[:cache_num_tokens, ..., : self.kv_lora_rank],
+                cache_k_rope=K[:cache_num_tokens, ..., self.kv_lora_rank :],
             )
 
         return Q, K
@@ -1132,13 +1155,12 @@ class DeepseekV3AttentionMLA(nn.Module):
 
             v_fp8 = fp8_quantize(v)
 
-            # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
+            # The cache scatter converts the compressed BF16 latent directly to FP8.
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
-                cache_k_nope=kv_a_fp8.unsqueeze(1),
+                cache_k_nope=kv_a.unsqueeze(1),
                 cache_k_rope=k_pe_for_cache,
             )
 

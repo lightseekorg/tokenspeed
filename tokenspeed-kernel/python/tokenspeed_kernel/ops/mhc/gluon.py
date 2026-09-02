@@ -61,9 +61,9 @@ if current_platform().is_amd:
             }
         ),
         traits={
-            "num_tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "num_tokens": frozenset(range(1, 65)),
             "hc_mult": frozenset({4}),
-            "hidden_size": frozenset({7168}),
+            "hidden_size": frozenset({4096, 7168}),
             "sinkhorn_iters": frozenset({20}),
         },
         priority=Priority.SPECIALIZED,

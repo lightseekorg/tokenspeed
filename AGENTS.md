@@ -3,6 +3,10 @@
 > If a `AGENTS.local.md` file exists alongside this file, read and respect it--
 > it contains developer-specific overrides that supplement this shared guidance.
 
+## Collaboration principle
+
+Core features will be designed and implemented by the TokenSpeed core team. This isn't a matter of distrust in external contributions — writing code has gotten cheaper, but reviewing it, validating it, and deploying it safely at production scale hasn't. If anything, that cost has gone up. As Steve Jobs put it, A players want to work with A players. We believe the gap between the best people and average people is more than tenfold.
+
 ## Development environment
 
 * Before any work, check local Python venv and activate if one exists.

@@ -16,6 +16,24 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
+class _SyntheticPool:
+    def __init__(self, layout, arena=None):
+        self._layout = layout
+        if arena is None:
+            arena = SimpleNamespace(
+                cache_group_specs=tuple(
+                    SimpleNamespace(group_id=group.group_id) for group in layout.groups
+                )
+            )
+        self.arena = arena
+
+    def cache_transfer_layout(self):
+        return self._layout
+
+    def register_layerwise_load_tracker(self, tracker):
+        self.load_tracker = tracker
+
+
 class CacheEventPayloadTest(unittest.TestCase):
     def setUp(self):
         try:
@@ -423,6 +441,32 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
+    def _make_executor(self, layout, *, draft_layout=None, io_backend):
+        pool = _SyntheticPool(layout)
+        draft_pool = (
+            _SyntheticPool(draft_layout, pool.arena)
+            if draft_layout is not None
+            else None
+        )
+        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
+            executor = self.executor_module.L2CacheExecutor(
+                pool,
+                draft_pool=draft_pool,
+                host_ratio=1.0,
+                host_size_gb=0,
+                io_backend=io_backend,
+            )
+        self.addCleanup(executor.shutdown)
+        return executor, pool, draft_pool
+
+    def _single_group_layout(self, buffer, *fields):
+        return self.CacheTransferLayout(
+            4,
+            (self.CacheGroupLayout("full", 1, fields),),
+            (buffer,),
+            tuple((field.field_id,) for field in fields),
+        )
+
     def test_real_transfer_restores_compact_multigroup_layout_byte_exactly(self):
         torch = self.torch
         first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -448,26 +492,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
         )
 
-        class SyntheticPool:
-            def cache_transfer_layout(self):
-                return layout
-
-            def register_layerwise_load_tracker(self, tracker):
-                self.load_tracker = tracker
-
-        pool = SyntheticPool()
-        pool.arena = SimpleNamespace(
-            cache_group_specs=tuple(
-                SimpleNamespace(group_id=group.group_id) for group in layout.groups
-            ),
-        )
-        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.L2CacheExecutor(
-                pool,
-                host_ratio=1.0,
-                host_size_gb=0,
-                io_backend="direct",
-            )
+        executor, pool, _ = self._make_executor(layout, io_backend="direct")
 
         # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).
         first[16:20].fill_(0x11)
@@ -519,7 +544,42 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
         )
-        executor.shutdown()
+
+    def test_real_transfer_restores_merged_owner_draft_subset_once(self):
+        torch = self.torch
+        device = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        target_fields = (
+            self.CacheField("layer.0.k", 0, 8, 8, 4),
+            self.CacheField("layer.1.k", 0, 48, 8, 4),
+        )
+        target_layout = self._single_group_layout(device, *target_fields)
+        draft_layout = self._single_group_layout(device, target_fields[1])
+        executor, target_pool, draft_pool = self._make_executor(
+            target_layout, draft_layout=draft_layout, io_backend="kernel"
+        )
+
+        device[16:20].fill_(0x11)
+        device[56:60].fill_(0x12)
+        torch.cuda.synchronize()
+        executor._start_writing([7], [(0, 1, 1)])  # pylint: disable=protected-access
+        torch.cuda.synchronize()
+        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
+
+        device.fill_(0xEE)
+        torch.cuda.synchronize()
+        load_index = executor._start_loading(  # pylint: disable=protected-access
+            [9], [(0, 2, 1)]
+        )
+        self.assertIsNotNone(load_index)
+        target_pool.load_tracker.set_consumers(load_index)
+        draft_pool.load_tracker.set_consumers(load_index)
+        target_pool.load_tracker.wait_for_layer(0)
+        target_pool.load_tracker.wait_for_layer(1)
+        draft_pool.load_tracker.wait_for_layer(0)
+        torch.cuda.synchronize()
+        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [9])
+        self.assertEqual(device[24:28].tolist(), [0x11] * 4)
+        self.assertEqual(device[64:68].tolist(), [0x12] * 4)
 
 
 if __name__ == "__main__":

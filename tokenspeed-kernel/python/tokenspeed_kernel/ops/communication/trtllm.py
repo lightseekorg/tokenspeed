@@ -36,11 +36,9 @@ __all__ = [
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
     "allreduce_residual_rmsnorm",
-    "minimax_allreduce_rms_qk",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
-    "trtllm_create_ipc_workspace_for_minimax",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -61,11 +59,9 @@ ensure_workspace_initialized = error_fn
 group_spans_nodes = error_fn
 allreduce_residual_attnres_combine = error_fn
 allreduce_lane_latent_norm = error_fn
-minimax_allreduce_rms_qk = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
-trtllm_create_ipc_workspace_for_minimax = error_fn
 
 if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
@@ -78,11 +74,9 @@ if current_platform().is_nvidia:
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
-        minimax_allreduce_rms_qk,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
-        trtllm_create_ipc_workspace_for_minimax,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
         trtllm_reducescatter_fusion,

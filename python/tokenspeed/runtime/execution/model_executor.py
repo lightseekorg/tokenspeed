@@ -250,10 +250,11 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
+        # Most DSA sparse indexers read the attention backend's
         # ``chunked_prefill_metadata`` from inside the captured prefill segment,
         # but the prefill graph rebinds only the live ForwardContext at replay --
         # the backend metadata object stays frozen at capture-time (dummy) values.
+        # GLM-5.3-Flash handles padded replay explicitly.
         # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
         # replay pads token rows to a bucket while their cache metadata remains
         # real-token shaped. Keep those prefills eager so padding can never
@@ -267,7 +268,10 @@ class ModelExecutorConfig:
         )
         disable_prefill_graph = (
             bool(server_args.disable_prefill_graph)
-            or (model_config.attention_arch == AttentionArch.DSA)
+            or (
+                model_config.attention_arch == AttentionArch.DSA
+                and getattr(model_config.hf_config, "model_type", None) != "glm53_flash"
+            )
             or qwen4_exp_has_side_state
         )
 

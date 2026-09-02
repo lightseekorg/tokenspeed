@@ -53,7 +53,6 @@ MODEL_VOCABS = {
     "dsv4": 129280,
     "qwen3_5": 151936,
     "kimi_k2_5": 163840,
-    "minimax_m2": 200064,
     "gpt_oss": 201088,
 }
 
@@ -68,7 +67,7 @@ def _need_cuda():
 # ---------------------------------------------------------------------------
 
 
-# Speculative-decoding-style small batches × all 5 real model vocabs. Mirrors
+# Speculative-decoding-style small batches across real model vocabs. Mirrors
 # ``bench_argmax.py::DEFAULT_M`` so the kernel coverage tested here matches the
 # one we benchmark.
 _KERNEL_M_VALUES = [1, 4, 16, 64, 128]
@@ -98,7 +97,6 @@ def test_argmax_matches_torch_for_kernel_shapes(M, N):
         (1, MODEL_VOCABS["dsv4"]),
         (16, MODEL_VOCABS["qwen3_5"]),
         (64, MODEL_VOCABS["kimi_k2_5"]),
-        (4, MODEL_VOCABS["minimax_m2"]),
         (32, MODEL_VOCABS["gpt_oss"]),
     ],
 )
