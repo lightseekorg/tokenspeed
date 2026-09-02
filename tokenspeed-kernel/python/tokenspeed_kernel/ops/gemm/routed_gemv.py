@@ -347,6 +347,7 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (32, 2560, 2560): "ll_bf16",  # 4.106 vs 5.681 us (1.38x)
         # 12800x2560
         (2, 12800, 2560): "skinny",  # 11.489 vs 13.797 us (1.20x)
+        (4, 12800, 2560): "ll_bf16",  # 13.113 vs 13.682 us (1.04x)
         # TP4-only shapes (three independent sweeps).
         # 320x2560
         (2, 320, 2560): "skinny",  # 1.969 vs 5.501 us (2.79x)
