@@ -436,8 +436,12 @@ class FlashInferSamplingBackend(SamplingBackend):
             accept_length = self._accept_length_local_buf[:bs]
         else:
             pool_indices = sampling_info.req_pool_indices
-            coins = self._coins_buf
-            final_coins = self._final_coins_buf
+            # prepare_step filled the coin buffers in the step's full batch
+            # order; a MIXED round's verify sees only the decode suffix, so
+            # read each row's own coins at its batch offset.
+            row0 = sampling_info.batch_row_offset
+            coins = self._coins_buf[row0 : row0 + bs]
+            final_coins = self._final_coins_buf[row0 : row0 + bs]
             predict = self._predict_buf[: bs * num_tokens_per_req]
             accept_index = (
                 self._accept_index_buf[: bs * num_tokens_per_req]

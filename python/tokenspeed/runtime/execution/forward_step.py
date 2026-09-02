@@ -294,6 +294,12 @@ class ForwardStepRunner:
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        # The capture side stream. Created here, not in capture(): the
+        # prefill graph shares it (PrefillGraph._capture_bucket reads
+        # decode_wrapper.stream), and a backend may declare
+        # decode_graph=False while leaving the prefill graph on — decode
+        # capture never runs then, but the attribute must still exist.
+        self.stream = self.device_module.Stream()
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -308,7 +314,6 @@ class ForwardStepRunner:
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
-            self.stream = self.device_module.Stream()
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)

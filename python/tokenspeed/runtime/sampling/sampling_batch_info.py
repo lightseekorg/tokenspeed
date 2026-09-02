@@ -65,6 +65,12 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
+    # First batch row this info covers, relative to the step's full batch.
+    # Per-step row-indexed backend buffers (the coin buffers a mixed round's
+    # prepare_step filled in prefill-then-decode order) must be read at this
+    # offset — a MIXED round's verify() sees only the decode suffix.
+    batch_row_offset: int = 0
+
     # Device
     device: str = "cuda"
 
@@ -93,4 +99,5 @@ class SamplingBatchInfo:
             req_pool_indices=_slice(self.req_pool_indices),
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
+            batch_row_offset=self.batch_row_offset + (s.start or 0),
         )
