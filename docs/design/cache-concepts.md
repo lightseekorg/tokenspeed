@@ -596,9 +596,9 @@ view, mirrored by the host tier. Specifically:
   kernel-page stacks, and derives every KV write location — extend spans,
   the decode/verify window, and the drafters' published step windows — from
   those same tables (`backends/write_locations.py`, pure functions). Paged
-  leaves see kernel vocabulary only. The bridge's packed upload layout
-  (`CacheBatchMetadata`) is the one sanctioned scheduler↔router coupling:
-  the router's fused unpack reads it directly. Models and the runner never
+  leaves see kernel vocabulary only. The bridge's per-group table views
+  (`CacheBatchMetadata`) are the router's input — block vocabulary in,
+  kernel pages out, one expand launch per group. Models and the runner never
   compute locations — `write_locations(layer, mode)` is the single accessor
   (`unified_path.md`, "Write locations have one owner").
 * The slot *arithmetic* itself lives in the mapping layer in exactly two

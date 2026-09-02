@@ -79,23 +79,29 @@ class GroupTableSpec:
         return self.block_granularity // self.kernel_page_size
 
 
-@triton.jit
-def _unpack_kernel(
-    src_ptr,  # packed int32 upload holding every group's rows back-to-back
-    meta_ptr,  # [G, 4] int32: (element offset, source columns, page ratio, width)
-    dst_ptr,  # [G, max_bs, Wmax] int32
-    stride_g,
-    stride_b,
+@triton.jit(do_not_specialize=["cols", "src_stride_b", "actual_bs"])
+def _unpack_group_kernel(
+    src_ptr,  # this group's raw table [>= actual_bs, cols] int32
+    dst_ptr,  # this group's stack rows [max_bs, Wmax] int32
+    cols,
+    src_stride_b,
+    ratio,
+    width,
+    dst_stride_b,
     wmax,
     actual_bs,
     BLOCK_W: tl.constexpr,
 ):
-    g = tl.program_id(0)
-    b = tl.program_id(1)  # grid axis 1 == padded bs
-    off = tl.load(meta_ptr + g * 4).to(tl.int64)
-    cols = tl.load(meta_ptr + g * 4 + 1).to(tl.int64)
-    ratio = tl.load(meta_ptr + g * 4 + 2).to(tl.int64)
-    width = tl.load(meta_ptr + g * 4 + 3).to(tl.int64)
+    """Expand one group's raw block table into its kernel-page stack rows.
+
+    One launch per group with plain scalar arguments: the per-step values
+    (column count, source stride, live rows) change every step, and hosting
+    them in a device-side metadata tensor would cost a pinned staging
+    allocation plus an H2D copy on the latency-critical bs=1 refresh path.
+    ``do_not_specialize`` keeps those varying scalars from triggering
+    recompiles.
+    """
+    b = tl.program_id(0)  # grid == padded bs
     live = b < actual_bs
     w_off = tl.arange(0, BLOCK_W)
     for w0 in range(0, wmax, BLOCK_W):
@@ -105,15 +111,15 @@ def _unpack_kernel(
         # tail: always the null page 0, never expansion residue (the slot
         # kernels clamp at the stack's wmax, so they can read them).
         in_row = live & (src_col < cols) & (w < width)
-        raw = tl.load(src_ptr + off + b * cols + src_col, mask=in_row, other=0)
+        raw = tl.load(
+            src_ptr + b.to(tl.int64) * src_stride_b + src_col, mask=in_row, other=0
+        )
         # Holes and ragged padding (id <= 0) collapse onto the dummy page 0;
         # a real page expands to its ratio consecutive kernel pages.
         page = tl.maximum(raw, 0).to(tl.int64) * ratio + w % ratio
         page = tl.where(raw > 0, page, 0)
         vals = tl.where(in_row, page, 0)
-        tl.store(
-            dst_ptr + g * stride_g + b * stride_b + w, vals.to(tl.int32), mask=w < wmax
-        )
+        tl.store(dst_ptr + b * dst_stride_b + w, vals.to(tl.int32), mask=w < wmax)
 
 
 class GroupTableStacks:
@@ -159,7 +165,6 @@ class GroupTableStacks:
         self.page_sizes = torch.tensor(
             [spec.kernel_page_size for spec in groups], dtype=torch.int32, device=device
         )
-        self._unpack_meta_device = torch.zeros((g, 4), dtype=torch.int32, device=device)
 
     # ------------------------------------------------------------------
     # Views
@@ -244,57 +249,31 @@ class GroupTableStacks:
                     f"cache group {gid!r} table has {src.shape[0]} rows for a live "
                     f"batch of {actual_bs}"
                 )
-        if not self._fill_packed(bs, actual_bs, srcs):
-            self._fill_per_group(bs, actual_bs, srcs)
+        if self.tables.is_cuda:
+            wmax = self.tables.shape[2]
+            block_w = 128 if wmax >= 128 else 64
+            for i, src in enumerate(srcs):
+                if src.stride(1) != 1:
+                    src = src.contiguous()
+                _unpack_group_kernel[(bs,)](
+                    src,
+                    self.tables[i],
+                    src.shape[1],
+                    src.stride(0),
+                    self._ratios[i],
+                    self._widths[i],
+                    self.tables.stride(1),
+                    wmax,
+                    actual_bs,
+                    BLOCK_W=block_w,
+                )
+            return
+        self._fill_torch(bs, actual_bs, srcs)
 
-    def _fill_packed(
-        self, bs: int, actual_bs: int, srcs: Sequence[torch.Tensor]
-    ) -> bool:
-        """One launch over the bridge's packed upload. Requires every source
-        to be a view of one storage with the same row count (the bridge
-        contract); anything else takes the per-group path."""
-        if not self.tables.is_cuda or actual_bs == 0:
-            return False
-        base = srcs[0].untyped_storage().data_ptr()
-        rows = srcs[0].shape[0]
-        for src in srcs:
-            if (
-                src.untyped_storage().data_ptr() != base
-                or src.shape[0] != rows
-                or src.shape[1] == 0
-                or src.stride(1) != 1
-                or src.stride(0) != src.shape[1]
-            ):
-                return False
-        # Fresh pinned host staging each step: a persistent one would race
-        # the next step's fill under overlap scheduling.
-        meta = torch.empty((len(srcs), 4), dtype=torch.int32, pin_memory=True)
-        for i, src in enumerate(srcs):
-            meta[i, 0] = src.storage_offset()
-            meta[i, 1] = src.shape[1]
-            meta[i, 2] = self._ratios[i]
-            meta[i, 3] = self._widths[i]
-        self._unpack_meta_device.copy_(meta, non_blocking=True)
-        src0 = srcs[0]
-        packed = torch.as_strided(
-            src0, (src0.untyped_storage().nbytes() // 4,), (1,), storage_offset=0
-        )
-        wmax = self.tables.shape[2]
-        _unpack_kernel[(len(srcs), bs)](
-            packed,
-            self._unpack_meta_device,
-            self.tables,
-            self.tables.stride(0),
-            self.tables.stride(1),
-            wmax,
-            actual_bs,
-            BLOCK_W=128 if wmax >= 128 else 64,
-        )
-        return True
-
-    def _fill_per_group(
+    def _fill_torch(
         self, bs: int, actual_bs: int, srcs: Sequence[torch.Tensor]
     ) -> None:
+        """CPU reference of the unpack kernel (unit tests)."""
         for i, src in enumerate(srcs):
             dst = self.tables[i, :bs]
             width = self._widths[i]

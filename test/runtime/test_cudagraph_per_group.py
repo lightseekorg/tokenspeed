@@ -48,13 +48,13 @@ def _stacks(device, max_bs=6):
     )
 
 
-class PackedUnpackParityTest(unittest.TestCase):
-    """The one-launch packed unpack must agree with the per-group reference
-    at shapes the bridge really produces: shared storage, per-group column
-    counts, holes and ragged -1 pads, padded rows."""
+class UnpackKernelParityTest(unittest.TestCase):
+    """The per-group unpack launch must agree with the torch reference at
+    shapes the bridge really produces: shared packed storage, per-group
+    column counts, holes and ragged -1 pads, padded rows."""
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_packed_matches_per_group_at_odd_shapes(self):
+    def test_kernel_matches_torch_reference_at_odd_shapes(self):
         torch.manual_seed(7)
         rows = 5
         for bs, actual_bs, cols in ((5, 3, (7, 5, 3)), (4, 4, (2, 9, 1))):
@@ -67,29 +67,21 @@ class PackedUnpackParityTest(unittest.TestCase):
                 for c in cols:
                     srcs.append(packed[off : off + rows * c].view(rows, c))
                     off += rows * c
-                stacks_packed = _stacks("cuda")
-                stacks_plain = _stacks("cuda")
+                stacks_cuda = _stacks("cuda")
+                stacks_ref = _stacks("cuda")
                 # Sentinel residue: both paths must overwrite/zero the same cells.
-                stacks_packed.tables.fill_(99)
-                stacks_plain.tables.fill_(99)
-                self.assertTrue(stacks_packed._fill_packed(bs, actual_bs, srcs))
-                stacks_plain._fill_per_group(bs, actual_bs, srcs)
+                stacks_cuda.tables.fill_(99)
+                stacks_ref.tables.fill_(99)
+                stacks_cuda.fill(bs, actual_bs, dict(zip((G0, G1, G2), srcs)))
+                stacks_ref._fill_torch(bs, actual_bs, srcs)
                 torch.testing.assert_close(
-                    stacks_packed.tables[:, :bs], stacks_plain.tables[:, :bs]
-                )
-                # And the public entry point picks the packed path here.
-                stacks_packed.tables.fill_(99)
-                stacks_packed.fill(bs, actual_bs, dict(zip((G0, G1, G2), srcs)))
-                torch.testing.assert_close(
-                    stacks_packed.tables[:, :bs], stacks_plain.tables[:, :bs]
+                    stacks_cuda.tables[:, :bs], stacks_ref.tables[:, :bs]
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_separate_storages_fall_back_to_the_per_group_path(self):
+    def test_separate_storages_take_the_same_kernel(self):
         stacks = _stacks("cuda")
         srcs = [torch.ones((2, 3), dtype=torch.int32, device="cuda") for _ in range(3)]
-        self.assertFalse(stacks._fill_packed(2, 2, srcs))
-        # The public fill still lands the same expansion through the fallback.
         stacks.fill(2, 2, dict(zip((G0, G1, G2), srcs)))
         # Ratio 4 group: raw page 1 -> kernel pages 4..7, truncated to width 5.
         self.assertEqual(stacks.table(G2, 2)[0].tolist(), [4, 5, 6, 7, 4])

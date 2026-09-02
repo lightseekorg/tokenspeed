@@ -286,10 +286,12 @@ Consumers take their own groups by positive claim
 Inside the router, `GroupTableStacks` holds the `[G, max_bs, Wmax]`
 kernel-page table stack and the `[G, max_bs * N]` decode write-location
 stack — scratch the leaves copy from, not graph-recorded storage. The fill
-is one fused unpack/expand launch over the bridge's packed upload (that
-packed layout is the one sanctioned scheduler↔router coupling); padding
-rows (`[actual_bs, bs)`) and each group's column tail resolve to null page
-0. The slot math lives in `write_locations.py` as pure functions with one
+is one expand launch per group with plain scalar arguments (column count,
+source stride, live rows) — no device-side metadata tensor, because the
+per-step pinned staging + H2D it would need lands on the bs=1 latency
+path; padding rows (`[actual_bs, bs)`) and each group's column tail resolve
+to null page 0. The bridge's `{gid: view}` dict is the router's input; the
+router does not depend on the views sharing one storage. The slot math lives in `write_locations.py` as pure functions with one
 invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
 raw-table locations bit for bit.

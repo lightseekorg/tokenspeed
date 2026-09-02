@@ -199,24 +199,25 @@ class GroupTableStacksTest(unittest.TestCase):
             stacks.decode_locations(FULL, 1, 3)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_packed_fill_matches_per_group_fill(self):
+    def test_cuda_fill_matches_torch_reference(self):
         torch.manual_seed(1)
-        stacks_packed = self._stacks("cuda", max_bs=8)
-        stacks_plain = self._stacks("cuda", max_bs=8)
+        stacks_cuda = self._stacks("cuda", max_bs=8)
+        stacks_ref = self._stacks("cuda", max_bs=8)
         rows, cols = 5, 3
+        # Bridge layout: per-group views of one packed storage (holes -1/0).
         packed = torch.randint(
             -1, 20, (2 * rows * cols,), dtype=torch.int32, device="cuda"
         )
         full = packed[: rows * cols].view(rows, cols)
         swa = packed[rows * cols :].view(rows, cols)
         raw = {FULL: full, SWA: swa}
-        self.assertTrue(stacks_packed._fill_packed(7, 5, [full, swa]))
-        stacks_plain._fill_per_group(7, 5, [full, swa])
-        torch.testing.assert_close(stacks_packed.tables, stacks_plain.tables)
-        # And the public entry point picks the packed path for shared storage.
-        stacks_packed.tables.zero_()
-        stacks_packed.fill(7, 5, raw)
-        torch.testing.assert_close(stacks_packed.tables, stacks_plain.tables)
+        stacks_cuda.fill(7, 5, raw)
+        stacks_ref._fill_torch(7, 5, [full, swa])
+        torch.testing.assert_close(stacks_cuda.tables, stacks_ref.tables)
+        # Non-shared storage and a strided source take the same kernel path.
+        stacks_cuda.tables.zero_()
+        stacks_cuda.fill(7, 5, {FULL: full.clone(), SWA: swa.clone()})
+        torch.testing.assert_close(stacks_cuda.tables, stacks_ref.tables)
 
 
 class _StubLeaf(PagedAttentionBackend):
