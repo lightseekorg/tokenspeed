@@ -1,0 +1,91 @@
+api_version: ci.tokenspeed.io/v1
+# GPQA-Diamond at the tensor-parallel MoE placement (A8W4, fp8 activations), one half of a controlled pair with the tp8ep8 twin.
+#
+# Companion to the GSM8K pair, covering what GSM8K cannot. There both arms sit
+# near 98%, which bounds any A8W4-vs-A16W4 difference to about 1.1 points on
+# grade-school arithmetic -- but a deficit that only appears on hard multi-step
+# reasoning would not surface at that ceiling.
+#
+# GPQA-Diamond is 198 graduate-level problems, so the power is lower: the
+# detection floor is roughly 5 points against GSM8K's 1.1. It is deliberately
+# the weaker test on harder material rather than a replacement, and a null here
+# extends the bound rather than tightening it.
+#
+# The two files differ only in --ep-size. Manual trigger.
+name: eval-kimi-k3-mxfp4-tp8ep1-gpqa-diamond-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --tp 8
+    --ep-size 1
+    --attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 65536
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+    --reasoning-parser kimi_k3
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 1200
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ];
+    then GPQA_DATASET_HUB=modelscope;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}';
+    else GPQA_DATASET_HUB=huggingface;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}';
+    fi;
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gpqa_diamond
+    --dataset-hub "$GPQA_DATASET_HUB"
+    --dataset-args "$GPQA_DATASET_ARGS"
+    --eval-batch-size 16
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+# Greedy, like the GSM8K pair: each arm becomes a deterministic function of its
+# weights, so a difference between the arms is attributable rather than sampled.
+#
+# max_tokens is 8192 rather than GSM8K's 4096. GPQA is graduate-level and the
+# reasoning runs longer, and a binding cap does not merely depress the scores --
+# it converts a verbosity difference between the arms into an apparent accuracy
+# difference. That is not hypothetical: at a 256-token cap this pair read
+# 0.736/0.707 with tp8ep1 averaging 2 tokens more output, and the 2.9-point gap
+# collapsed to 0.5 once the cap was lifted clear.
+report:
+  github_step_summary: true
+# No score_threshold: the quantity of interest is the difference between the
+# arms, and a per-arm bar reports on one at a time while saying nothing about it.

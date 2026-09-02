@@ -38,7 +38,9 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
-        "count": 2,
+        # 4 with the Kimi-K3 tp8ep1/tp8ep8 pair, which extends the placement
+        # comparison from GSM8K's ceiling onto harder reasoning.
+        "count": 4,
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {

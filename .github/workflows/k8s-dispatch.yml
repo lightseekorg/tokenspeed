@@ -36,6 +36,8 @@ on:
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-dspark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-gsm8k-amd.yaml
+          - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-gpqa-diamond-amd.yaml
+          - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-gpqa-diamond-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-gsm8k-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
