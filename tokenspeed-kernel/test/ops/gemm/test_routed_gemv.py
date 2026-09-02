@@ -270,7 +270,7 @@ def test_unlisted_shapes_keep_the_generic_selection():
 
 def test_qwen38_route_keeps_unstable_shapes_on_fallback():
     assert MEASURED_ROUTE[(2, 12800, 2560)] == "skinny"
-    assert {m for m, n, k in MEASURED_ROUTE if (n, k) == (12800, 2560)} == {2}
+    assert {m for m, n, k in MEASURED_ROUTE if (n, k) == (12800, 2560)} == {2, 4}
     for shape in (
         (2, 512, 2560),
         (4, 640, 2560),

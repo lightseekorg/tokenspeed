@@ -61,12 +61,12 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.utils import add_prefix
 
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-# Uniform-batch index bundles, keyed by the shape that fully determines them, so
-# a captured graph holds no kernels for them at all. Entries are never evicted:
-# a replay reads the addresses its capture recorded, so freeing one would let
-# the allocator hand that memory to someone else and feed a replay another
-# tensor's bytes. The key set is bounded by the capture buckets and each bundle
-# is a few index rows, so holding them costs little.
+# Uniform-batch index bundles captured into a CUDA graph. During capture the
+# (bs, max_len) pair is fixed per bucket, so entries are bounded by the capture
+# set. Entries are never evicted: a replay reads the addresses its capture
+# recorded, so freeing one would let the allocator hand that memory to someone
+# else and feed a replay another tensor's bytes. Eager calls compute fresh
+# tensors instead of caching, so varied prefill lengths cannot grow this dict.
 _UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
 
 
@@ -587,10 +587,12 @@ class Qwen4ExpPLELayer(nn.Module):
         is why :meth:`Qwen4ExpPLELayer.forward` has to run as an eager break
         rather than being captured.
 
-        The uniform bundle is memoized, since ``(bs, max_len)`` is fixed for a
-        capture bucket and recomputing it cost seven elementwise kernels per
-        replay. The cached tensors are shared between calls, so consumers must
-        treat them as read-only.
+        The uniform bundle is memoized during CUDA graph capture, since
+        ``(bs, max_len)`` is fixed for a capture bucket and recomputing it cost
+        seven elementwise kernels per replay. Eager calls compute fresh tensors
+        to avoid unbounded cache growth from varying prefill lengths. The
+        cached tensors are shared between calls, so consumers must treat them
+        as read-only.
 
         ``starts`` is each request's first flat token index. It belongs to the
         bundle because every consumer of ``req`` needs it to reach the tokens
@@ -610,7 +612,8 @@ class Qwen4ExpPLELayer(nn.Module):
                 lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
                 starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
                 bundle = (req, col, lengths_t, starts)
-                _UNIFORM_INDEX_CACHE[key] = bundle
+                if torch.cuda.current_stream().is_capturing():
+                    _UNIFORM_INDEX_CACHE[key] = bundle
             req, col, lengths_t, starts = bundle
         else:
             positions = torch.arange(total, device=device, dtype=torch.long)
