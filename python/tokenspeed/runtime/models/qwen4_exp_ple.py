@@ -725,7 +725,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # at production sizes. Constructing on meta keeps that allocation from
         # ever touching the device.
         self.offload_embedding = bool(
-            getattr(config, "ple_offload_embedding", False)
+            getattr(config, "ple_offload_embedding", True)
         )
         with torch.device("meta") if self.offload_embedding else nullcontext():
             self.ngram_embedding = VocabParallelEmbedding(

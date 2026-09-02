@@ -208,6 +208,8 @@ def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
     assert config.short_conv_layer_ids == [0, 2]
     assert config.short_conv_state_shape == (64, 9)
     assert config.ngram_context_len == 2
+    assert config.ple_offload_embedding
+    assert not Qwen4ExpTextConfig(ple_offload_embedding=False).ple_offload_embedding
 
 
 def test_qwen4_exp_flat_config_preserves_text_rope_parameters() -> None:
@@ -2653,7 +2655,6 @@ def test_ple_host_table_skips_device_allocation(caplog: pytest.LogCaptureFixture
         hc_count=2,
         num_experts=None,
         eos_token_id=7,
-        ple_offload_embedding=True,
     )
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
