@@ -5,9 +5,7 @@
  * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  * SPDX-FileCopyrightText: Copyright contributors to the FlashInfer project
  *
- * DeepSeek-V4 persistent radix TopK. Forked from SGLang topk_v2 at
- * ce7e79b32c5dc3e2c7536dbe7f3b4e041195c1a6 and adapted to TokenSpeed's
- * raw-index output ABI and verify-mode q_len_per_req semantics.
+ * DeepSeek-V4 persistent radix TopK.
  */
 
 #ifndef TOKENSPEED_KERNEL_DEEPSEEK_V4_PERSISTENT_TOPK_CUH_
@@ -26,7 +24,13 @@
 ///    (`TopKProblem::emit` then `transform_output`).
 ///  - each block reads its own `seq_len` (per-batch ragged lengths) -- the host
 ///    launches one universal kernel and dispatches per block.
-///  - the cluster size is fixed at 8 (dynamic persistent clusters are hard).
+///  - long rows use length-specialized clusters: eight CTAs retain up to 128K
+///    scores in registers, sixteen CTAs stream 128K--256K rows, and the
+///    portable eight-CTA streaming kernel remains the unbounded fallback.
+///  - long-row cluster launches use CUDA programmatic dependent launch (PDL):
+///    the next grid may initialize before this grid retires, but score reads
+///    remain behind `griddepcontrol.wait` and output completion precedes the
+///    dependent-launch trigger.
 ///
 /// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
 /// exact radix tie-break.
@@ -40,32 +44,32 @@
 #include <limits>
 #include <cooperative_groups.h>
 
-#define SGL_DEVICE __device__ __forceinline__
+#define TS_DEVICE __device__ __forceinline__
 
-namespace sglang {
+namespace tokenspeed {
 
 using fp16_t = __half;
 inline constexpr uint32_t kWarpThreads = 32;
 
 template <typename To, typename From>
-SGL_DEVICE To cast(const From& value) {
+TS_DEVICE To cast(const From& value) {
   return static_cast<To>(value);
 }
 
 template <>
-SGL_DEVICE fp16_t cast<fp16_t, float>(const float& value) {
+TS_DEVICE fp16_t cast<fp16_t, float>(const float& value) {
   return __float2half_rn(value);
 }
 
 template <>
-SGL_DEVICE float cast<float, fp16_t>(const fp16_t& value) {
+TS_DEVICE float cast<float, fp16_t>(const fp16_t& value) {
   return __half2float(value);
 }
 
 namespace device {
 
 template <typename T>
-SGL_DEVICE constexpr T div_ceil(T x, T y) {
+TS_DEVICE constexpr T div_ceil(T x, T y) {
   return (x + y - 1) / y;
 }
 
@@ -74,28 +78,45 @@ struct alignas(sizeof(T) * N) AlignedVector {
   static_assert(N > 0 && (N & (N - 1)) == 0);
   T values[N];
 
-  SGL_DEVICE void load(const void* ptr, int64_t offset = 0) {
+  TS_DEVICE void load(const void* ptr, int64_t offset = 0) {
     *this = reinterpret_cast<const AlignedVector*>(ptr)[offset];
   }
 
-  SGL_DEVICE void fill(T value) {
+  TS_DEVICE void fill(T value) {
 #pragma unroll
     for (size_t i = 0; i < N; ++i) values[i] = value;
   }
 
-  SGL_DEVICE T& operator[](size_t i) { return values[i]; }
-  SGL_DEVICE T operator[](size_t i) const { return values[i]; }
+  TS_DEVICE T& operator[](size_t i) { return values[i]; }
+  TS_DEVICE T operator[](size_t i) const { return values[i]; }
 };
 
 template <bool kUsePDL>
-SGL_DEVICE void PDLWaitPrimary() {
-  static_assert(!kUsePDL, "TokenSpeed's standalone launcher does not use PDL");
+TS_DEVICE void PDLWaitPrimary() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+#else
+  static_assert(!kUsePDL, "PDL requires Hopper or newer");
+#endif
+}
+
+template <bool kUsePDL>
+TS_DEVICE void PDLTriggerSecondary() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;" :::);
+  }
+#else
+  static_assert(!kUsePDL, "PDL requires Hopper or newer");
+#endif
 }
 
 namespace warp {
 
 template <uint32_t kNumThreads = kWarpThreads, typename T>
-SGL_DEVICE T reduce_sum(T value) {
+TS_DEVICE T reduce_sum(T value) {
   static_assert(kNumThreads > 0 && (kNumThreads & (kNumThreads - 1)) == 0);
 #pragma unroll
   for (uint32_t offset = kNumThreads / 2; offset > 0; offset /= 2) {
@@ -106,9 +127,9 @@ SGL_DEVICE T reduce_sum(T value) {
 
 }  // namespace warp
 }  // namespace device
-}  // namespace sglang
+}  // namespace tokenspeed
 
-namespace sglang {
+namespace tokenspeed {
 
 namespace device::topk {
 
@@ -116,7 +137,7 @@ namespace device::topk {
 namespace cg = cooperative_groups;
 #endif
 
-/// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
+/// The upstream kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
 // ---------------------------------------------------------------------------
@@ -153,13 +174,13 @@ struct MaxSmem {
 // Order-preserving float -> integer key extraction
 // ---------------------------------------------------------------------------
 
-SGL_DEVICE uint32_t extract_exact_bin(float x) {
+TS_DEVICE uint32_t extract_exact_bin(float x) {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
 template <uint32_t kBits>
-SGL_DEVICE uint32_t extract_coarse_bin(float x) {
+TS_DEVICE uint32_t extract_coarse_bin(float x) {
   static_assert(0 < kBits && kBits < 15);
   const auto hx = cast<fp16_t>(x);
   const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
@@ -174,7 +195,7 @@ SGL_DEVICE uint32_t extract_coarse_bin(float x) {
 // removing the F2F conversion and bit-twiddle from the (compute-bound) second pass.
 // Returns -inf for bin 0 (everything qualifies) and +inf for bins past the top.
 template <uint32_t kBits>
-SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
+TS_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   constexpr uint32_t kShift = 16 - kBits;
   const uint32_t key = bin << kShift;  // ordered16 key at the low edge of `bin`
   // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
@@ -218,7 +239,7 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   return 0.5f * (to_val(key) + to_val(key - 1));
 }
 
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
+TS_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
 #ifndef USE_ROCM
@@ -231,7 +252,7 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   return val;
 }
 
-SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+TS_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
 #ifdef USE_ROCM
   // The ballot covers the whole hardware wave, which on wave64 holds two of
   // these 32-lane logical warps, so a plain __popc would report the wave's
@@ -256,7 +277,7 @@ struct alignas(8) TieValue {
 // Per-batch problem description + page-table transform sink
 // ---------------------------------------------------------------------------
 
-SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
+TS_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
   const uint32_t mask = (1u << page_bits) - 1u;
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
@@ -273,10 +294,10 @@ struct TopKProblem {
   uint32_t page_bits;
   int32_t bias = 0;  // needed by ragged mode
 
-  SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
+  TS_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
-  SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
+  TS_DEVICE void transform_output(uint32_t t, int32_t raw) const {
     out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
   }
 };
@@ -320,7 +341,7 @@ struct TopKConfig {
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
-  SGL_DEVICE static void handle_tie(  //
+  TS_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
       const TopKProblem& problem,
       const uint32_t base,
@@ -411,7 +432,7 @@ struct TopKConfig {
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
   template <uint32_t kItems>
-  SGL_DEVICE static void radix_tie_select(  //
+  TS_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
       const TopKProblem& problem,
       const uint32_t base,
@@ -544,7 +565,7 @@ struct TopKRadixBase : TopKConfig {
 
  protected:
   template <typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  TS_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
     const auto tx = threadIdx.x;
     const uint32_t num_full = seq_len / kVecSize;  // fully-in-bounds vectors
 
@@ -571,7 +592,7 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
-  SGL_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
+  TS_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
     const auto tx = threadIdx.x;
     constexpr uint32_t kItems =
         (kHistSize + kBlockSize - 1) / kBlockSize;
@@ -623,7 +644,7 @@ struct TopKRegister : TopKRadixBase<12> {
   using Smem = typename TopKRadixBase<12>::Smem;
 
   template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
+  TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -723,7 +744,7 @@ struct TopKStreaming : TopKRegister<2> {
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
   template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
+  TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -796,24 +817,42 @@ struct TopKStreaming : TopKRegister<2> {
 
 #ifndef USE_ROCM
 
-template <uint32_t kClusterSize_>
-struct TopKCluster : TopKRadixBase<9> {
+template <uint32_t kClusterSize_, uint32_t kHistBits_ = 9,
+          uint32_t kLocalVecs_ = 0>
+struct TopKCluster : TopKRadixBase<kHistBits_> {
  public:
+  using Base = TopKRadixBase<kHistBits_>;
+  using Base::find_threshold;
+  using Base::for_each_input;
+  using Base::handle_tie;
+  static constexpr uint32_t kBlockSize = Base::kBlockSize;
   static constexpr uint32_t kClusterSize = kClusterSize_;
-  static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
-  using Base = TopKRadixBase<9>;
+  static constexpr uint32_t kHistBits = Base::kHistBits;
+  static constexpr uint32_t kHistSize = Base::kHistSize;
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kMaxSeqLen =
+      kLocalVecs == 0
+          ? std::numeric_limits<uint32_t>::max()
+          : kClusterSize * Base::kBlockSize * Base::kVecSize * kLocalVecs;
+  static constexpr uint32_t kMaxNumTie = Base::kMaxNumTie;
+  static constexpr uint32_t kMaxTopK = Base::kMaxTopK;
+  static constexpr uint32_t kTieItems = Base::kTieItems;
+  static constexpr uint32_t kTopKItems = Base::kTopKItems;
+  static constexpr uint32_t kVecSize = Base::kVecSize;
+  using vec_t = typename Base::vec_t;
   struct Smem : Base::Smem {
-    using kHistVec = Base::Smem::kHistVec;
+    using kHistVec = typename Base::Smem::kHistVec;
     uint32_t start_eq_local, start_gt_local;
     int32_t tmp_out[kMaxTopK];
   };
 
-  // Process ONE batch element (one cluster). NO PDL and NO trailing barrier --
-  // the persistent kernel does PDLWaitPrimary once before its item loop and a
-  // cluster.sync() after each forward(). Writes raw indices to out; the kernel's
+  // Process one batch element (one cluster). The PDL wait follows CTA-local
+  // initialization, and the kernel wrapper emits the dependent-launch trigger.
+  // There is no trailing cluster barrier: kernel completion makes the final
+  // local/global writes visible. Writes raw indices to out; the kernel's
   // transform pass applies the page-table transform.
   template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  TS_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cg::this_cluster();
@@ -827,6 +866,13 @@ struct TopKCluster : TopKRadixBase<9> {
     const uint32_t local_seq_len = chunk_finish - chunk_start;
     problem.in += chunk_start;
 
+    const uint32_t num_full = local_seq_len / kVecSize;
+    const uint32_t tail_start = num_full * kVecSize;
+    const uint32_t tail = local_seq_len - tail_start;
+    vec_t local_vecs[kLocalVecs == 0 ? 1 : kLocalVecs];
+    float tail_value = 0.0f;
+    uint32_t tail_idx = 0;
+
     {
       typename Smem::kHistVec hist_vec;
       hist_vec.fill(0);
@@ -839,8 +885,42 @@ struct TopKCluster : TopKRadixBase<9> {
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
 
+    if constexpr (kLocalVecs > 0) {
+#pragma unroll
+      for (uint32_t i = 0; i < kLocalVecs; ++i) {
+        const auto vi = tx + kBlockSize * i;
+        if (vi >= num_full) break;
+        local_vecs[i].load(problem.in, vi);
+      }
+      if (tx >= kBlockSize - tail) {
+        tail_idx = tail_start + tx - (kBlockSize - tail);
+        tail_value = problem.in[tail_idx];
+      }
+    }
+
+    // kLocalVecs==0 is the generic two-pass path. Positive specializations
+    // keep the complete per-rank chunk live in registers across threshold
+    // discovery and reuse it during candidate collection.
+    const auto for_each_local = [&](auto&& fn) {
+      if constexpr (kLocalVecs == 0) {
+        for_each_input(problem.in, local_seq_len, fn);
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kLocalVecs; ++i) {
+          const auto vi = tx + kBlockSize * i;
+          if (vi >= num_full) break;
+          const auto base = vi * kVecSize;
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) {
+            fn(local_vecs[i][j], base + j);
+          }
+        }
+        if (tx >= kBlockSize - tail) fn(tail_value, tail_idx);
+      }
+    };
+
     // Phase 1: Load and build histogram over this rank's contiguous chunk.
-    for_each_input(problem.in, local_seq_len, [&](float val, uint32_t) {
+    for_each_local([&](float val, uint32_t) {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
@@ -895,7 +975,7 @@ struct TopKCluster : TopKRadixBase<9> {
     // valid, which downstream sparse attention dereferences as garbage KV indices.
     if (!is_primary) {
       // stage to tmp_out first before writing to global/DSMEM
-      for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
+      for_each_local([&](float val, uint32_t local_idx) {
         const auto idx = chunk_start + local_idx;
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -941,7 +1021,7 @@ struct TopKCluster : TopKRadixBase<9> {
         }
       }
     } else {
-      for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
+      for_each_local([&](float val, uint32_t local_idx) {
         const auto idx = chunk_start + local_idx;
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -972,7 +1052,7 @@ struct TopKCluster : TopKRadixBase<9> {
 
 }  // namespace device::topk
 
-}  // namespace sglang
+}  // namespace tokenspeed
 
 namespace vllm {
 
@@ -995,7 +1075,7 @@ __device__ __forceinline__ uint32_t dsa_topk_row_seq_len(
 
 namespace persistent {
 
-namespace impl = sglang::device::topk;
+namespace impl = tokenspeed::device::topk;
 
 constexpr int kThreadsPerBlock = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kRegister2MaxSeqLen =
@@ -1004,6 +1084,15 @@ constexpr uint32_t kRegister4MaxSeqLen =
     impl::TopKRegister<4>::kMaxSeqLen;
 constexpr uint32_t kClusterSize = 8;
 constexpr uint32_t kClusterFloor = 32768;
+// A 9-bit coarse histogram minimizes fixed histogram work through 64K. Longer
+// rows put enough values into the selected coarse bin that the larger 10-bit
+// histogram wins back more time in the exact tie-break than it costs to build.
+constexpr uint32_t kClusterHist10Floor = 65536;
+constexpr uint32_t kClusterRegister4MaxSeqLen =
+    impl::TopKCluster<8, 10, 4>::kMaxSeqLen;
+// Cluster-16 is a B200-tuned, non-portable launch. Past 256K, keep the portable
+// cluster-8 fallback instead of extrapolating the measured scheduling win.
+constexpr uint32_t kCluster16MaxSeqLen = 262144;
 
 struct PersistentTopKParams {
   const float* __restrict__ input;  // [num_rows, stride]
@@ -1065,25 +1154,24 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   }
 }
 
-template <int TopK>
-__global__ void __launch_bounds__(kThreadsPerBlock, 2)
-    __cluster_dims__(1, kClusterSize, 1)
-        cluster_topk_kernel(PersistentTopKParams params) {
+template <int TopK, bool kUsePDL, typename Cluster>
+__device__ __forceinline__ void cluster_topk_body(
+    PersistentTopKParams params, void* smem) {
   static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
-  using Cluster = impl::TopKCluster<kClusterSize>;
 
   const uint32_t row = blockIdx.x;
   if (row >= params.num_rows) return;
   const uint32_t rank = blockIdx.y;
-  const uint32_t worker_rank = row % kClusterSize;
+  const uint32_t worker_rank = row % Cluster::kClusterSize;
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   const auto cluster = cooperative_groups::this_cluster();
 
   if (seq_len <= static_cast<uint32_t>(TopK)) {
+    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
     if (rank == worker_rank) {
       for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
            i += kThreadsPerBlock) {
@@ -1091,6 +1179,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
       }
     }
     cluster.sync();
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -1102,30 +1191,71 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
       .seq_len = seq_len,
       .page_bits = 0,
   };
-  __shared__ impl::MaxSmem<typename Register4::Smem,
-                           typename Streaming::Smem, typename Cluster::Smem>
-      smem;
 
   if (seq_len <= kRegister4MaxSeqLen) {
-    if (rank == worker_rank) Register4::forward<false>(problem, &smem);
+    if (rank == worker_rank) Register4::forward<kUsePDL>(problem, smem);
   } else if (seq_len <= kClusterFloor) {
-    if (rank == worker_rank) Streaming::forward<false>(problem, &smem);
+    if (rank == worker_rank) Streaming::forward<kUsePDL>(problem, smem);
   } else {
-    Cluster::forward<false>(problem, &smem);
+    Cluster::forward<kUsePDL>(problem, smem);
     // Cluster::forward's last DSMEM consumer is already preceded by a
     // cluster-wide barrier. Once it returns, each CTA only completes local or
     // global-memory writes, and kernel completion provides the launch-wide
     // visibility guarantee; a final cluster barrier only serializes teardown.
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
-  // Non-cluster paths may leave seven ranks idle while one rank still uses its
-  // CTA-local storage, so keep their explicit rendezvous.
+  // Non-cluster paths may leave every rank but one idle while that rank still
+  // uses its CTA-local storage, so keep their explicit rendezvous.
   cluster.sync();
+  tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    __cluster_dims__(1, kClusterSize, 1)
+        cluster_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<kClusterSize, kClusterHistBits>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 1)
+    __cluster_dims__(1, 8, 1)
+        cluster8_register4_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<8, kClusterHistBits, 4>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
+}
+
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    __cluster_dims__(1, 16, 1)
+        cluster16_topk_kernel(PersistentTopKParams params) {
+  static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
+  using Register4 = impl::TopKRegister<4>;
+  using Streaming = impl::TopKStreaming;
+  using Cluster = impl::TopKCluster<16, kClusterHistBits>;
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
+      smem;
+  cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
 }  // namespace persistent
 }  // namespace vllm
 
-#undef SGL_DEVICE
+#undef TS_DEVICE
 
 #endif  // TOKENSPEED_KERNEL_DEEPSEEK_V4_PERSISTENT_TOPK_CUH_

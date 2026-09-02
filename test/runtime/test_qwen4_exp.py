@@ -399,6 +399,38 @@ def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
         indexer._topk_solution(1, small, 1, 64)
 
 
+def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.ReplicatedLinear",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.GemmaRMSNorm",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        hidden_size=64,
+        rms_norm_eps=1e-6,
+    )
+    indexer = QSAIndexer(
+        config,
+        mapping=SimpleNamespace(),
+        layer_id=0,
+        quant_config=None,
+        prefix="model.layers.0.attn",
+        rotary_emb=SimpleNamespace(rotary_dim=16),
+    )
+
+    assert indexer._persistent_topk_workspace.dtype == torch.uint8
+    assert indexer._persistent_topk_workspace.numel() == 1024 * 1024
+    assert "_persistent_topk_workspace" not in indexer.state_dict()
+
+
 def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
@@ -656,6 +688,11 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
+    indexer.register_buffer(
+        "_persistent_topk_workspace",
+        torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
+        persistent=False,
+    )
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
 

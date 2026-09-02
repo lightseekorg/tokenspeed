@@ -712,6 +712,13 @@ object:
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
+QSA's default materialized-score path uses the persistent radix top-k on
+NVIDIA. It passes each row's live compressed-block count to the kernel, so a
+page table sized for the maximum CUDA Graph context does not make the top-k
+selector rescan the padded tail. The portable Triton selector remains the
+fallback when the CUDA kernel is unavailable; the bounded-memory streaming
+path remains available for score matrices over the configured logits budget.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

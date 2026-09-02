@@ -445,6 +445,42 @@ namespace {
 
 constexpr int64_t kRadixTopkWorkspaceSize = 1024 * 1024;
 
+cudaError_t launch_persistent_cluster_topk(
+    const vllm::persistent::PersistentTopKParams& params,
+    uint32_t num_rows, uint32_t cluster_size, cudaStream_t stream,
+    void (*kernel)(vllm::persistent::PersistentTopKParams),
+    bool allow_nonportable_cluster_size = false) {
+  namespace P = vllm::persistent;
+  if (allow_nonportable_cluster_size) {
+    const cudaError_t attribute_error = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    if (attribute_error != cudaSuccess) return attribute_error;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(num_rows, cluster_size, 1);
+  config.blockDim = dim3(P::kThreadsPerBlock);
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+
+  cudaLaunchAttribute attributes[2]{};
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[0].val.programmaticStreamSerializationAllowed = true;
+  attributes[1].id = cudaLaunchAttributeClusterDimension;
+  attributes[1].val.clusterDim = {1, cluster_size, 1};
+  config.attrs = attributes;
+  config.numAttrs = 2;
+
+  return cudaLaunchKernelEx(&config, kernel, params);
+}
+
+bool is_unsupported_cluster16_error(cudaError_t error) {
+  return error == cudaErrorInvalidValue ||
+         error == cudaErrorInvalidConfiguration ||
+         error == cudaErrorInvalidClusterSize ||
+         error == cudaErrorNotSupported;
+}
+
 template <int TopK>
 void launch_persistent_topk(const TensorView& logits,
                             const TensorView& lengths,
@@ -469,10 +505,36 @@ void launch_persistent_topk(const TensorView& logits,
   params.max_seq_len = static_cast<uint32_t>(max_seq_len);
   params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
 
+  cudaError_t launch_error = cudaSuccess;
   if (max_seq_len > P::kClusterFloor && num_rows <= 32) {
-    const dim3 grid(static_cast<uint32_t>(num_rows), P::kClusterSize, 1);
-    P::cluster_topk_kernel<TopK>
-        <<<grid, P::kThreadsPerBlock, 0, stream>>>(params);
+    const auto rows = static_cast<uint32_t>(num_rows);
+    if (max_seq_len > P::kClusterHist10Floor &&
+        max_seq_len <= P::kClusterRegister4MaxSeqLen) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, 8, stream,
+          P::cluster8_register4_topk_kernel<TopK, 10, true>);
+    } else if (max_seq_len > P::kClusterRegister4MaxSeqLen &&
+               max_seq_len <= P::kCluster16MaxSeqLen) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, 16, stream,
+          P::cluster16_topk_kernel<TopK, 10, true>, true);
+      if (is_unsupported_cluster16_error(launch_error)) {
+        // A cluster of 16 CTAs is an architecture-specific optimization. Keep
+        // the portable cluster-8 implementation as the correctness fallback.
+        (void)cudaGetLastError();
+        launch_error = launch_persistent_cluster_topk(
+            params, rows, P::kClusterSize, stream,
+            P::cluster_topk_kernel<TopK, 10, true>);
+      }
+    } else if (max_seq_len > P::kClusterHist10Floor) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, P::kClusterSize, stream,
+          P::cluster_topk_kernel<TopK, 10, true>);
+    } else {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, P::kClusterSize, stream,
+          P::cluster_topk_kernel<TopK, 9, true>);
+    }
   } else if (max_seq_len <= P::kRegister2MaxSeqLen) {
     P::persistent_topk_kernel<TopK, 0>
         <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
@@ -484,7 +546,8 @@ void launch_persistent_topk(const TensorView& logits,
         <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
   }
 
-  cudaError_t err = cudaGetLastError();
+  cudaError_t err =
+      launch_error == cudaSuccess ? cudaGetLastError() : launch_error;
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "dsv4_persistent_topk failed: " << cudaGetErrorString(err);
 }
