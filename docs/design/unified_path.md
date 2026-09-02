@@ -324,6 +324,13 @@ The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
 `for_graph_replay` tile-schedule swap, and the MLA family's `num_extends`
 decode-row slicing (`override_num_extends`).
 
+One side channel exists beyond the table: `set_request_slots(req_pool_indices)`,
+a no-op by default, which the router calls on every leaf after each
+metadata build (extend init, decode refresh, capture seeding). It serves a
+leaf that owns per-request side state indexed by pool slot — DSA's KPool
+tails — and doubles as that state's per-forward reset point. Paged KV
+leaves ignore it; it carries no table or page vocabulary.
+
 ## Write locations have one owner
 
 `write_locations(layer, forward_mode)` on the top-level backend is the ONLY
