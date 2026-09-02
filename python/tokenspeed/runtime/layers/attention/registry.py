@@ -449,17 +449,22 @@ def create_paged_router(
 
     spec = config.component(SoftmaxAttnConfig)
     name = backend_name if backend_name is not None else spec.backend_name
+    if name == "hybrid_linear_attn":
+        # The composite sentinel _apply_backend_overrides writes into
+        # server_args (and MHAConfig.generate copies into the spec). It
+        # names the WRAPPER; the leaf under it auto-resolves from the arch.
+        name = None
     leaf_cls = _get_backend_cls(name, arch)
 
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id
         kernel_page_size = leaf_cls.resolve_kernel_page_size(config, block_granularity)
-        original_name = spec.backend_name
-        spec.backend_name = name
-        try:
-            return leaf_cls(config, spec, kernel_page_size=kernel_page_size)
-        finally:
-            spec.backend_name = original_name
+        # A fresh spec, never a mutate-restore of the shared component: leaf
+        # construction happens lazily at set_cache_pool, and several leaves
+        # interpret backend_name themselves (MHA/MLA kernel-solution maps),
+        # so a wrapper-selecting name like 'dsa' must not reach them.
+        leaf_spec = dataclasses.replace(spec, backend_name=name)
+        return leaf_cls(config, leaf_spec, kernel_page_size=kernel_page_size)
 
     return CacheGroupRouter(
         leaf_factory,

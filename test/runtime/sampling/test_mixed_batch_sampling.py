@@ -56,6 +56,12 @@ from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
+# The FlashInfer sampling softmax/chain kernels are CUDA-only solutions;
+# ROCm has no registration for them (AMD serving uses the triton backend).
+requires_flashinfer_kernels = pytest.mark.skipif(
+    not torch.cuda.is_available() or bool(torch.version.hip),
+    reason="flashinfer sampling kernels require CUDA (not ROCm)",
+)
 
 VOCAB = 256
 POOL = 8
@@ -78,7 +84,7 @@ def test_slice_accumulates_batch_row_offset():
     assert info[:4].batch_row_offset == 0
 
 
-@requires_cuda
+@requires_flashinfer_kernels
 def test_verify_reads_decode_rows_own_coins():
     """verify() over a MIXED round's decode suffix must consume the decode
     rows' coin draws, not the prefill rows' (buffer head)."""
@@ -155,7 +161,7 @@ def test_verify_reads_decode_rows_own_coins():
     torch.testing.assert_close(seen["coins"], decode_coins)
 
 
-@requires_cuda
+@requires_flashinfer_kernels
 def test_mixed_round_preserves_prefill_outputs():
     """The executor's mixed arm snapshots sample() outputs before verify()
     reuses the packed output buffers."""

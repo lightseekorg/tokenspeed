@@ -453,10 +453,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 raise RuntimeError(
                     f"DeepSeek V4 {phase} table {group_id!r} must be rank 2"
                 )
-            if int(table.shape[0]) != bs:
+            if int(table.shape[0]) < actual_bs:
                 raise RuntimeError(
                     f"DeepSeek V4 {phase} table {group_id!r} has "
-                    f"{int(table.shape[0])} rows, expected bs={bs}"
+                    f"{int(table.shape[0])} rows, expected at least "
+                    f"actual_bs={actual_bs}"
                 )
             if int(table.shape[1]) <= 0:
                 raise RuntimeError(
@@ -476,18 +477,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 materialized[group_id] = table
                 continue
             out = output_buffers[group_id]
-            rows, columns = table.shape
-            if out.ndim != 2 or out.shape[0] < rows or out.shape[1] < columns:
+            # The graph replays bs (padded) rows; the scheduler delivers rows
+            # for the live requests only. Copy the live rows and null the
+            # padding tail so padded replay rows resolve to no page.
+            rows = min(int(table.shape[0]), bs)
+            columns = int(table.shape[1])
+            if out.ndim != 2 or out.shape[0] < bs or out.shape[1] < columns:
                 raise ValueError(
-                    f"output table for {group_id!r} cannot hold {tuple(table.shape)}"
+                    f"output table for {group_id!r} cannot hold "
+                    f"{bs}x{columns} rows"
                 )
             if out.dtype != table.dtype or out.device != table.device:
                 raise ValueError(
                     f"output table for {group_id!r} must match input dtype and device"
                 )
-            out[:rows].fill_(-1)
-            out[:rows, :columns].copy_(table)
-            materialized[group_id] = out[:rows]
+            out[:bs].fill_(-1)
+            out[:rows, :columns].copy_(table[:rows])
+            materialized[group_id] = out[:bs]
         return materialized
 
     def _assert_active_cache_pages(
@@ -2207,6 +2213,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self._publish_decode(metadata)
         else:
             self.forward_metadata = metadata
+
+    def publish_draft_step_locations(self, cache_start, num_tokens):
+        """No-op by design: V4's KV writes derive from its own per-group
+        slot mappings, rebuilt each draft step by
+        :meth:`advance_draft_forward_metadata` (the drafter calls both). No
+        router window exists to publish; returning None keeps the drafter
+        loop backend-agnostic."""
+        del cache_start, num_tokens
+        return None
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         if self.draft_rounds is None or self.forward_prefill_metadata is None:

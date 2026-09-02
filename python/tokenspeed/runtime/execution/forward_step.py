@@ -673,6 +673,11 @@ class ForwardStepRunner:
                 block_tables=tables,
                 num_tokens=bs * self.max_tokens_per_req,
             )
+            # Block drafters (DFLASH) re-run the unified refresh inside their
+            # step loop with this round's tables; capture warm-ups run that
+            # loop eagerly before any live decode has published tables, so
+            # seed the placeholders here too.
+            self.drafter.round_block_tables = tables
 
     def _prepare_decode_metadata(
         self,

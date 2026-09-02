@@ -235,6 +235,14 @@ class InklingAttnBackend(AttentionBackend):
     def child_backends(self):
         return (self.inner,)
 
+    def set_cache_pool(self, cache_pool) -> None:
+        # Explicit forward: the base class DEFINES set_cache_pool (it only
+        # stores the pool), so the __getattr__ fallback never fires — without
+        # this the inner router would keep zero leaves and die at
+        # init_cuda_graph_state.
+        self.cache_pool = cache_pool
+        self.inner.set_cache_pool(cache_pool)
+
     @property
     def cache_consumer_families(self):
         return frozenset(self.inner.cache_consumer_families) | {"state"}

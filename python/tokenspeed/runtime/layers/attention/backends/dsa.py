@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode,
@@ -51,10 +53,14 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 def _make_dense_leaf(
     config: AttnConfig, spec: DSAConfig, platform, kernel_page_size: int
 ) -> PagedAttentionBackend:
+    # The dense delegate interprets spec.backend_name itself (the MLA leaf's
+    # kernel-solution map only knows its own names) — the 'dsa' name that
+    # selected THIS wrapper must not leak through.
+    dense_spec = dataclasses.replace(spec, backend_name=None)
     if platform.is_nvidia:
-        return TRTLLMMLABackend(config, spec, kernel_page_size=kernel_page_size)
+        return TRTLLMMLABackend(config, dense_spec, kernel_page_size=kernel_page_size)
     if platform.is_amd:
-        return MLAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
+        return MLAAttnBackend(config, dense_spec, kernel_page_size=kernel_page_size)
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 

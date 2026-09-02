@@ -203,7 +203,7 @@ class _Harness:
             kv_cache_quant_method="none",
             components=(spec,),
         )
-        inner = MHAAttnBackend(config, spec)
+        inner = MHAAttnBackend(config, spec, kernel_page_size=PAGE_SIZE)
         from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         # One arena, one view over it: the pool owns no memory or geometry.
