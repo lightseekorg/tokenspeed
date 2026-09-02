@@ -327,7 +327,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # Construct offloaded tables on meta so production-sized tables never
         # transiently consume device memory before moving to pinned host RAM.
         self.offload_embedding = bool(
-            getattr(config, "ple_offload_embedding", False)
+            getattr(config, "ple_offload_embedding", True)
         )
         with torch.device("meta") if self.offload_embedding else nullcontext():
             self.ngram_embedding = VocabParallelEmbedding(

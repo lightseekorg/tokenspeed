@@ -55,7 +55,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         ple_embed_dim: int | None = None,
         ple_conv_kernel_size: int = 4,
         ple_embed_dtype: str | None = None,
-        ple_offload_embedding: bool = False,
+        ple_offload_embedding: bool = True,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
         ngram_vocab_size_base: int = 20_000_000,
