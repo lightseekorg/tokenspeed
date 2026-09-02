@@ -554,6 +554,7 @@ class PrefillGraph:
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
+            extend_with_prefix=False,
             **extra_metadata_kwargs,
         )
         return ctx

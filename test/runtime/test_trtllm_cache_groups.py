@@ -192,6 +192,7 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
     def test_decode_mode_init_is_a_contract_violation(self):
         torch = self.torch
         b = self._leaf()
+        no_extends = torch.zeros(0, dtype=torch.int32)
         with self.assertRaisesRegex(RuntimeError, "refresh_decode_metadata"):
             b.init_forward_metadata(
                 1,
@@ -199,6 +200,11 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
                 torch.ones(1, dtype=torch.int32),
                 torch.zeros((1, 8), dtype=torch.int32),
                 self.ForwardMode.DECODE,
+                extend_seq_lens=no_extends,
+                extend_seq_lens_cpu=no_extends,
+                extend_prefix_lens=no_extends,
+                extend_prefix_lens_cpu=no_extends,
+                extend_with_prefix=False,
             )
 
 

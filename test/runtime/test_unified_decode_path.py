@@ -329,6 +329,68 @@ class RunnerSignatureConformanceTest(_TorchCase):
         ),
     )
 
+    def test_init_forward_metadata_binds_the_runner_call_shape(self):
+        """The runner's extend call: five positionals, then block_tables and
+        the five extend fields as required keywords (no defaults anywhere),
+        plus the model-side extras a node may ignore."""
+        import importlib
+        import inspect
+
+        for module_name, cls_name in self._RUNNER_CLASSES:
+            try:
+                cls = getattr(importlib.import_module(module_name), cls_name)
+            except (ImportError, ModuleNotFoundError) as exc:
+                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
+            sig = inspect.signature(cls.init_forward_metadata)
+            with self.subTest(backend=cls_name):
+                try:
+                    # (self, bs, num_extends, req_pool_indices, seq_lens, mode, ...)
+                    sig.bind(
+                        None,
+                        8,
+                        8,
+                        None,
+                        None,
+                        None,
+                        block_tables={},
+                        extend_seq_lens=None,
+                        extend_seq_lens_cpu=None,
+                        extend_prefix_lens=None,
+                        extend_prefix_lens_cpu=None,
+                        extend_with_prefix=False,
+                        positions=None,
+                        global_num_tokens=None,
+                        all_decode_or_idle=False,
+                        capture_hidden_mode=None,
+                        num_tokens=8,
+                    )
+                except TypeError as exc:
+                    self.fail(f"{cls_name}.init_forward_metadata: {exc}")
+                for name in (
+                    "extend_seq_lens",
+                    "extend_seq_lens_cpu",
+                    "extend_prefix_lens",
+                    "extend_prefix_lens_cpu",
+                    "extend_with_prefix",
+                ):
+                    param = sig.parameters.get(name)
+                    if param is None:
+                        # Composites forward ``*args, **kwargs`` to children
+                        # that declare the field themselves.
+                        self.assertTrue(
+                            any(
+                                p.kind is inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()
+                            ),
+                            f"{cls_name}.init_forward_metadata lacks {name}",
+                        )
+                        continue
+                    self.assertIs(
+                        param.default,
+                        inspect.Parameter.empty,
+                        f"{cls_name}.init_forward_metadata gives {name} a default",
+                    )
+
     def test_capture_signatures_bind_the_runner_kwarg_set(self):
         import importlib
         import inspect

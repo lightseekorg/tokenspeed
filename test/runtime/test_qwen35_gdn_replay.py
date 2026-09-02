@@ -88,6 +88,9 @@ def _make_backend(conv_state, recurrent_state, *, replay: bool):
     )
     backend = MambaAttnBackend(*_config(replay=replay))
     backend.set_kv_pool(pool)
+    # The persistent decode buffers exist from construction, as at the
+    # wrapper (the verify refresh writes into them).
+    backend.init_cuda_graph_state(BATCH)
     return backend, pool
 
 
@@ -153,12 +156,12 @@ def _forward_verify(backend, pool, inputs, *, layer_id=0):
 
 def _prepare_verify(backend, pool, inputs):
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
-    backend.init_forward_metadata(
-        bs=BATCH,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device=DEVICE),
-        seq_lens=torch.tensor([7, 7], dtype=torch.int32, device=DEVICE),
+    backend.refresh_decode_metadata(
+        BATCH,
+        BATCH,
+        torch.tensor([0, 1], dtype=torch.int32, device=DEVICE),
+        torch.tensor([7, 7], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
-        tokens_per_req=DRAFT_TOKENS,
         block_tables={"linear_attention": tables},
     )
     return _forward_verify(backend, pool, inputs)
@@ -272,7 +275,6 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
 def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     conv, recurrent = _initial_pools()
     backend, pool = _make_backend(conv, recurrent, replay=True)
-    backend.init_cuda_graph_state(BATCH)
     backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
     inputs = _inputs(seed=37)
 
@@ -352,6 +354,7 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
             pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
         backend = MambaAttnBackend(*_config(replay=replay))
         backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(BATCH)
         return backend, pool
 
     replay_backend, replay_pool = make_backend(

@@ -168,11 +168,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
-        extend_with_prefix: bool = False,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ):
         if not forward_mode.is_extend_or_mixed():
@@ -183,9 +183,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        assert (
-            extend_seq_lens_cpu is not None
-        ), "trtllm extend requires extend_seq_lens_cpu (pinned-CPU mirror) to avoid GPU sync"
         cache_seqlens_int32 = seq_lens[:bs]
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens[:bs], dim=0, dtype=torch.int32), (1, 0)
@@ -199,15 +196,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # extend_seq_lens_cpu holds those new-token counts in either case.
         max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
 
-        if extend_with_prefix and (
-            (extend_prefix_lens_cpu is not None and any(extend_prefix_lens_cpu))
-            or (extend_prefix_lens is not None and any(extend_prefix_lens.tolist()))
-        ):
-            if extend_prefix_lens is None:
-                raise RuntimeError(
-                    "TRTLLMMHAAttnBackend requires extend_prefix_lens tensor "
-                    "when extend_with_prefix is true."
-                )
+        if extend_with_prefix and bool(extend_prefix_lens_cpu[:bs].any()):
             extend_lens = seq_lens[:bs] - extend_prefix_lens[:bs]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)

@@ -256,6 +256,7 @@ class _StubLeaf(PagedAttentionBackend):
         self, bs, num_extends, seq_lens, page_table, forward_mode, **kw
     ):
         self.calls.append(("init", bs, num_extends, page_table.clone(), forward_mode))
+        self.last_init_kwargs = kw
 
     def refresh_decode_metadata(
         self,
@@ -475,12 +476,19 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=new.clone(),
             extend_prefix_lens=prefix,
             extend_prefix_lens_cpu=prefix.clone(),
+            extend_with_prefix=True,
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-1]
         self.assertEqual(
             (kind, bs, num_extends, mode), ("init", 2, 2, ForwardMode.EXTEND)
         )
         self.assertEqual(page_table.tolist(), [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0]])
+        # The prefix flag rides along with the extend lengths to every leaf:
+        # FlashMLA sizes its paged-prefix plan by it, and a dropped flag
+        # overran that plan in-kernel (chunked prefill IMA).
+        for leaf in leaves.values():
+            self.assertIs(leaf.last_init_kwargs["extend_with_prefix"], True)
+            self.assertIs(leaf.last_init_kwargs["extend_prefix_lens"], prefix)
         locs = router.write_locations(_layer(FULL), ForwardMode.EXTEND)
         # req 0 positions 4..8 over pages [5,6,0]: 24,25,26,27, then page 0 -> 0.
         # req 1 positions 0..3 over page 9: 36..39.
@@ -495,9 +503,20 @@ class CacheGroupRouterTest(unittest.TestCase):
             2,
         )
         self.assertIs(leaves[FULL].calls[-1][2], locs)
+        no_extends = torch.zeros(0, dtype=torch.int32)
         with self.assertRaisesRegex(RuntimeError, "serves extend/mixed/idle"):
             router.init_forward_metadata(
-                2, 0, None, seq_lens, ForwardMode.DECODE, block_tables=self._tables()
+                2,
+                0,
+                None,
+                seq_lens,
+                ForwardMode.DECODE,
+                block_tables=self._tables(),
+                extend_seq_lens=no_extends,
+                extend_seq_lens_cpu=no_extends,
+                extend_prefix_lens=no_extends,
+                extend_prefix_lens_cpu=no_extends,
+                extend_with_prefix=False,
             )
 
     def test_mixed_round_slices_decode_rows_after_the_extend_rows(self):
@@ -515,6 +534,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
             extend_prefix_lens=torch.tensor([4], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            extend_with_prefix=True,
         )
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),

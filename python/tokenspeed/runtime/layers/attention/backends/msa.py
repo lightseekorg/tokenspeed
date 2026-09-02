@@ -163,10 +163,11 @@ class MSAAttnBackend(PagedAttentionBackend):
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
@@ -175,10 +176,6 @@ class MSAAttnBackend(PagedAttentionBackend):
                 "MSA decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
-        assert extend_seq_lens is not None
-        assert extend_seq_lens_cpu is not None
-        assert extend_prefix_lens is not None
-        assert extend_prefix_lens_cpu is not None
 
         seq_lens = seq_lens[:bs]
 

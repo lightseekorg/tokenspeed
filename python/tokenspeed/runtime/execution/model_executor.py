@@ -1039,11 +1039,17 @@ class ModelExecutor:
             # The draft router's idle refresh zeroes its history stack rows,
             # so the captured drafter steps' KV writes land on the dummy
             # page (#955's aliasing hazard is handled at the table source).
+            ib = self.input_buffers
             with nvtx_range("forward_step idle", color="blue"):
                 self.forward_step(
                     bs=0,
                     ctx=ctx,
                     sampling_info=sampling_info,
+                    extend_with_prefix=False,
+                    extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
+                    extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
+                    extend_seq_lens=ib.extend_seq_lens_buf[:0],
+                    extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
                 )
             return
 

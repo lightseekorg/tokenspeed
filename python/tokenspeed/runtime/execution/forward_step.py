@@ -174,8 +174,9 @@ class ForwardStepRunner:
     Callers always use the same interface::
 
         output_tokens, output_lengths, output_logprobs = runner(
-            bs, ctx, sampling_info, block_table,
-            extend_with_prefix=..., extend_prefix_lens=...,
+            bs, ctx, sampling_info,
+            extend_with_prefix=..., extend_prefix_lens=..., ...,
+            block_tables=block_tables,
         )
     """
 
@@ -862,11 +863,12 @@ class ForwardStepRunner:
         bs: int,
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
-        extend_with_prefix: bool = False,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
+        *,
+        extend_with_prefix: bool,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
     ):
@@ -879,6 +881,10 @@ class ForwardStepRunner:
         code the graph recorded runs eagerly. Extend/mixed batches keep the
         eager ``init_forward_metadata`` construction path. The caller does not
         need to know which path was taken.
+
+        The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
+        input buffers on every call — empty for a pure decode or the idle
+        replay, which never read them.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs

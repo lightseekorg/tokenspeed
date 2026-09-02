@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -275,16 +276,16 @@ def _prepare_gdn_decode_state_path(
 
 
 def _build_cu_extend_seq_lens_cpu(
-    extend_seq_lens_cpu: torch.Tensor | None, expected_len: int
+    extend_seq_lens_cpu: torch.Tensor, expected_len: int
 ) -> torch.Tensor:
     """Host prefix sum of the scheduler's extend lengths, as an int64 tensor.
 
     The contents must equal ``query_start_loc`` — a wrong copy silently
     corrupts the kernels' host chunk plans. Both are built together here in
     ``init_forward_metadata`` (mirroring MHA's ``cu_extend_seq_lens_cpu``),
-    so absence or length misalignment can only mean a caller broke that
-    contract: fail loudly instead of silently degrading to a
-    stream-synchronizing boundary re-read inside the kernel.
+    so a length misalignment can only mean a caller broke that contract:
+    fail loudly instead of silently degrading to a stream-synchronizing
+    boundary re-read inside the kernel.
 
     Args:
         extend_seq_lens_cpu: CPU per-sequence extend lengths.
@@ -295,14 +296,9 @@ def _build_cu_extend_seq_lens_cpu(
         ``expected_len`` entries.
 
     Raises:
-        RuntimeError: the lengths are absent or disagree with
-            ``query_start_loc`` on the sequence count.
+        RuntimeError: the lengths disagree with ``query_start_loc`` on the
+            sequence count.
     """
-    if extend_seq_lens_cpu is None:
-        raise RuntimeError(
-            "extend metadata requires the scheduler's host extend lengths; "
-            "the executor provides them for every extend batch"
-        )
     if extend_seq_lens_cpu.numel() + 1 != expected_len:
         raise RuntimeError(
             "host extend lengths disagree with query_start_loc on the "
@@ -412,36 +408,31 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._checkpoint_granularity = int(checkpoint_granularities.pop())
 
-    def _state_block_bounds(
+    @staticmethod
+    def _decode_state_block_bounds(
+        bs: int, seq_lens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-request (before, after) token counts for a q_len-1 decode:
+        ``seq_lens`` counts the tokens computed AFTER this forward."""
+        after = seq_lens[:bs]
+        return after - 1, after
+
+    def _extend_state_block_bounds(
         self,
         bs: int,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        kwargs: dict,
+        num_extends: int,
+        extend_prefix_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-request (before, after) token counts for dual-index paging.
-
-        seq_lens counts the tokens computed AFTER this forward (decode:
-        q_len 1; extend: prefix + chunk). Computed once per batch and shared
-        by every state group.
-        """
+        """Per-request (before, after) token counts for an extend / MIXED
+        forward: the leading extend rows start at their cached prefix, the
+        trailing decode rows ``spec_num_tokens`` before ``seq_lens``.
+        Computed once per batch and shared by every state group."""
         after = seq_lens[:bs]
-        if forward_mode.is_decode_or_idle():
-            before = after - 1
-        else:
-            num_extends = int(kwargs.get("num_extends", bs))
-            if not 0 <= num_extends <= bs:
-                raise ValueError("num_extends must be between 0 and bs")
-            extend_prefix_lens = kwargs.get("extend_prefix_lens")
-            if extend_prefix_lens is not None:
-                extend_before = extend_prefix_lens[:num_extends].to(
-                    device=after.device, dtype=after.dtype
-                )
-            else:
-                extend_before = torch.zeros_like(after[:num_extends])
-            before = torch.cat(
-                (extend_before, after[num_extends:] - self.spec_num_tokens)
-            )
+        extend_before = extend_prefix_lens[:num_extends].to(
+            device=after.device, dtype=after.dtype
+        )
+        before = torch.cat((extend_before, after[num_extends:] - self.spec_num_tokens))
         return before, after
 
     def _state_layer_ids(self) -> list[int]:
@@ -451,14 +442,15 @@ class MambaAttnBackend(AttentionBackend):
     def _state_groups(self) -> tuple[str, ...]:
         return self._state_group_ids
 
-    def _state_rows(self, kwargs: dict, group_id: str) -> torch.Tensor:
+    def _state_rows(
+        self, block_tables: Mapping[str, torch.Tensor], group_id: str
+    ) -> torch.Tensor:
         """This forward's raw block table for one state group.
 
         State paging reads the delivered per-group dict directly (the same
         complete mapping every node receives); a missing declared group is a
         delivery bug, not a fallback point.
         """
-        block_tables = kwargs.get("block_tables") or {}
         rows = block_tables.get(group_id)
         if rows is None:
             raise RuntimeError(
@@ -486,7 +478,7 @@ class MambaAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         draft_token_num: int,
-        kwargs: dict,
+        block_tables: Mapping[str, torch.Tensor],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
         """Target-verify state paging: per-group committed-state pages.
 
@@ -500,7 +492,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: dict[str, torch.Tensor] = {}
         tables: dict[str, torch.Tensor] = {}
         rows_by_group = {
-            group_id: self._state_rows(kwargs, group_id)
+            group_id: self._state_rows(block_tables, group_id)
             for group_id in self._state_groups()
         }
         if not rows_by_group:
@@ -842,18 +834,19 @@ class MambaAttnBackend(AttentionBackend):
 
     def _cache_contract_state_blocks(
         self,
-        bs: int,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        kwargs: dict,
+        before: torch.Tensor,
+        after: torch.Tensor,
+        block_tables: Mapping[str, torch.Tensor],
         *,
         validate: bool | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Per-state-group (state_in, state_out) page-id mappings for this
-        forward from the operation-bound cache metadata.
+        forward from the delivered per-group tables.
 
-        The dual-index gather runs ONCE per state group per batch — never per
-        layer. State layers select their group's entry via
+        ``before`` / ``after`` are the per-request token counts around this
+        forward (see the ``_*_state_block_bounds`` helpers). The dual-index
+        gather runs ONCE per state group per batch — never per layer. State
+        layers select their group's entry via
         ``pool.state_group_by_layer[layer_id]`` at forward time.
 
         validate: explicit True/False wins; None (the hot-path default)
@@ -865,7 +858,6 @@ class MambaAttnBackend(AttentionBackend):
         """
         if validate is None:
             validate = cache_debug_enabled()
-        before, after = self._state_block_bounds(bs, seq_lens, forward_mode, kwargs)
         plan = _compute_state_block_index_plan(
             self._checkpoint_granularity, before, after
         )
@@ -873,7 +865,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: dict[str, torch.Tensor] = {}
         state_out_blocks: dict[str, torch.Tensor] = {}
         for group_id in self._state_group_ids:
-            rows = self._state_rows(kwargs, group_id)
+            rows = self._state_rows(block_tables, group_id)
             table_width = rows.shape[1]
             out_slots_safe = out_slots_by_width.get(table_width)
             if out_slots_safe is None:
@@ -893,152 +885,82 @@ class MambaAttnBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = ForwardMode.DECODE,
+        forward_mode: ForwardMode,
+        *,
+        block_tables: Mapping[str, torch.Tensor],
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
-    ):
-        is_target_verify = (
-            forward_mode.is_decode_or_idle()
-            and not self.is_draft
-            and self.spec_num_tokens > 1
-        )
-        is_draft_extend = (
-            forward_mode.is_decode_or_idle()
-            and self.is_draft
-            and self.spec_num_tokens > 1
-        )
-
-        num_extends = int(
-            kwargs.get(
-                "num_extends",
-                bs if forward_mode.is_extend_or_mixed() else 0,
+    ) -> None:
+        del req_pool_indices, extend_prefix_lens_cpu, extend_with_prefix, kwargs
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                "Mamba decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend/mixed/idle ({forward_mode})"
             )
-        )
         if not 0 <= num_extends <= bs:
             raise ValueError("num_extends must be between 0 and bs")
-        mamba_output_indices = None
-        cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
-        extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
-        if extend_seq_lens_cpu is not None:
-            extend_seq_lens_cpu = extend_seq_lens_cpu[:num_extends]
-        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
+        if forward_mode.is_idle():
+            # Idle warmup carries no requests and never reaches the state
+            # kernels (the router returns early); the rows only take the
+            # decode query shape — one token, or the verify window under
+            # speculation — so the warm-up forward is sized like a decode.
+            tokens_per_req = self.spec_num_tokens
             query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
+                0,
+                bs * tokens_per_req + 1,
+                step=tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
             )
-        elif forward_mode.is_extend_or_mixed() or is_target_verify or is_draft_extend:
-            if is_target_verify or is_draft_extend:
-                tokens_per_req = kwargs.get(
-                    "tokens_per_req", self.speculative_num_draft_tokens
-                )
-                query_start_loc = torch.arange(
-                    0,
-                    bs * tokens_per_req + 1,
-                    step=tokens_per_req,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+            if tokens_per_req > 1:
                 set_total_chunks_hint_uniform(bs, tokens_per_req, query_start_loc)
-            else:
-                if extend_seq_lens_cpu is None:
-                    raise RuntimeError(
-                        "extend metadata requires the scheduler's host extend "
-                        "lengths; the executor provides them for every extend "
-                        "batch"
-                    )
-                extend_start_loc = kwargs.get("extend_start_loc")
-                extend_seq_lens = kwargs.get("extend_seq_lens")
-                if forward_mode.is_mixed():
-                    if extend_seq_lens is None:
-                        raise RuntimeError(
-                            "mixed GDN metadata requires extend sequence lengths"
-                        )
-                    query_lens = torch.full(
-                        (bs,),
-                        self.spec_num_tokens,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    query_lens[:num_extends] = extend_seq_lens[:num_extends]
-                    query_start_loc = torch.zeros(
-                        bs + 1, dtype=torch.int32, device=self.device
-                    )
-                    torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
-                    extend_seq_lens_cpu = torch.cat(
-                        (
-                            extend_seq_lens_cpu,
-                            torch.full(
-                                (bs - num_extends,),
-                                self.spec_num_tokens,
-                                dtype=torch.int32,
-                            ),
-                        )
-                    )
-                elif extend_start_loc is not None and extend_seq_lens is not None:
-                    query_start_loc = torch.empty(
-                        (bs + 1,), dtype=torch.int32, device=self.device
-                    )
-                    query_start_loc[:bs] = extend_start_loc
-                    query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
-                else:
-                    extend_prefix_lens = kwargs.get("extend_prefix_lens")
-                    if extend_prefix_lens is not None:
-                        extend_lens = (seq_lens[:bs] - extend_prefix_lens[:bs]).to(
-                            torch.int32
-                        )
-                    else:
-                        # No prefix: all tokens are new
-                        extend_lens = seq_lens[:bs].to(torch.int32)
-                    query_start_loc = torch.zeros(
-                        bs + 1, dtype=torch.int32, device=self.device
-                    )
-                    torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
-                set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
-                cu_extend_seq_lens_cpu = _build_cu_extend_seq_lens_cpu(
-                    extend_seq_lens_cpu, query_start_loc.numel()
-                )
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+            self.forward_metadata = MambaForwardMetadata(
+                query_start_loc=query_start_loc
+            )
+            return
+
+        # The extend rows lead with their new-token counts; a MIXED round's
+        # decode rows each carry spec_num_tokens verify tokens.
+        query_lens = torch.full(
+            (bs,), self.spec_num_tokens, dtype=torch.int32, device=self.device
+        )
+        query_lens[:num_extends] = extend_seq_lens[:num_extends]
+        query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
+        extend_seq_lens_cpu = torch.cat(
+            (
+                extend_seq_lens_cpu[:num_extends],
+                torch.full(
+                    (bs - num_extends,), self.spec_num_tokens, dtype=torch.int32
+                ),
+            )
+        )
+        set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
+        cu_extend_seq_lens_cpu = _build_cu_extend_seq_lens_cpu(
+            extend_seq_lens_cpu, query_start_loc.numel()
+        )
 
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
-        # Idle/bs==0 forwards carry no requests and never reach the mamba
-        # forward (router returns early), so no tables are required.
-        if bs > 0 and not forward_mode.is_idle():
-            if is_draft_extend:
-                raise RuntimeError("state paging on a draft worker is unsupported")
-            if is_target_verify:
-                draft_token_num = int(
-                    kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
-                )
-                (
-                    state_in_blocks_by_group,
-                    verify_committed,
-                    verify_tables,
-                ) = self._verify_state_blocks(bs, seq_lens, draft_token_num, kwargs)
-                # Slab out pages are unused under verify; alias in so shape
-                # contracts hold.
-                state_out_blocks_by_group = state_in_blocks_by_group
-                self._ensure_verify_scratch(bs, draft_token_num)
-                mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
-                self._verify_commit_ctx = (
-                    verify_committed,
-                    verify_tables,
-                    draft_token_num,
-                    state_in_blocks_by_group,
-                )
-            else:
-                (
-                    state_in_blocks_by_group,
-                    state_out_blocks_by_group,
-                ) = self._cache_contract_state_blocks(
-                    bs, seq_lens, forward_mode, kwargs
-                )
+        if bs > 0:
+            before, after = self._extend_state_block_bounds(
+                bs, seq_lens, num_extends, extend_prefix_lens
+            )
+            (
+                state_in_blocks_by_group,
+                state_out_blocks_by_group,
+            ) = self._cache_contract_state_blocks(before, after, block_tables)
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
-            mamba_output_indices=mamba_output_indices,
-            extend_prefix_lens=kwargs.get("extend_prefix_lens"),
+            extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             state_in_blocks_by_group=state_in_blocks_by_group,
@@ -1158,14 +1080,12 @@ class MambaAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         *,
         forward_mode: ForwardMode,
-        block_table: torch.Tensor | None = None,
+        block_tables: Mapping[str, torch.Tensor],
         num_extends: int = 0,
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
-        # State attention has no page table; the shared decode call's
-        # block_table keyword is unused.
-        del block_table
+        del kwargs
         real_bs = actual_bs
         num_padding = bs - actual_bs
         req_pool_indices = req_pool_indices[:bs]
@@ -1234,7 +1154,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                 ) = self._verify_state_blocks(
-                    real_bs, seq_lens, draft_token_num, kwargs
+                    real_bs, seq_lens, draft_token_num, block_tables
                 )
                 self._verify_commit_ctx = (
                     verify_committed,
@@ -1276,9 +1196,7 @@ class MambaAttnBackend(AttentionBackend):
             # bs==0 idle replay carries no operation-bound metadata; every row
             # is a dummy padded row, so skip the dual-index gather entirely.
             state_in_blocks_by_group, state_out_blocks_by_group = (
-                self._replay_contract_state_blocks(
-                    bs, real_bs, seq_lens, forward_mode, kwargs
-                )
+                self._replay_contract_state_blocks(bs, real_bs, seq_lens, block_tables)
             )
 
         self.forward_metadata = MambaForwardMetadata(
@@ -1293,8 +1211,7 @@ class MambaAttnBackend(AttentionBackend):
         bs: int,
         real_bs: int,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        kwargs: dict,
+        block_tables: Mapping[str, torch.Tensor],
     ) -> tuple[dict, dict]:
         """Fill the per-bs persistent state-block buffers for a decode replay.
 
@@ -1304,7 +1221,6 @@ class MambaAttnBackend(AttentionBackend):
         to the eager chain when the tape preconditions do not hold (seq_lens
         dtype, group count, debug validation).
         """
-        block_tables = kwargs.get("block_tables") or {}
         gids = self._state_group_ids
         use_tape = (
             not cache_debug_enabled()
@@ -1356,10 +1272,8 @@ class MambaAttnBackend(AttentionBackend):
         state_in_by = state_out_by = None
         if real_bs > 0:
             state_in_by, state_out_by = self._cache_contract_state_blocks(
-                real_bs,
-                seq_lens,
-                forward_mode,
-                kwargs,
+                *self._decode_state_block_bounds(real_bs, seq_lens),
+                block_tables,
                 validate=None,
             )
         in_by_group: dict[str, torch.Tensor] = {}

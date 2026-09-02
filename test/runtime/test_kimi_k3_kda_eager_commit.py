@@ -51,6 +51,9 @@ class _Harness:
         )
         self.backend = KdaAttnBackend(config, spec)
         self.backend.set_kv_pool(self.pool)
+        # The persistent decode buffers exist from construction, as at the
+        # wrapper (the verify refresh below writes into them).
+        self.backend.init_cuda_graph_state(config.max_bs)
         if eager_replay and not self.backend._replay_active:
             pytest.skip("KDA replay commit kernel unavailable")
         if not eager_replay:
@@ -89,10 +92,11 @@ class _Harness:
             for group_id in _STATE_GROUPS
         }
         delivered = _tables_for(self.contract, tables, DEV)
-        self.backend.init_forward_metadata(
-            bs=bs,
-            req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+        self.backend.refresh_decode_metadata(
+            bs,
+            bs,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
             block_tables=delivered,
         )
@@ -191,7 +195,6 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     seq_lens = [8 + T] * len(rpis)
     bs = len(rpis)
 
-    captured.backend.init_cuda_graph_state(captured.backend.max_bs)
     warm_inputs = captured.inputs(bs, 211)
     captured.prepare_metadata(rpis, pages, seq_lens)
     captured.forward(warm_inputs, bs)

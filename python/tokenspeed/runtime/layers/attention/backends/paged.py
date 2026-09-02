@@ -175,10 +175,11 @@ class PagedAttentionBackend(ABC):
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ) -> None:
         """Build extend/mixed (or idle warmup) metadata.
@@ -191,8 +192,11 @@ class PagedAttentionBackend(ABC):
                 batch-ordered and padded (row i is batch position i).
             forward_mode: EXTEND, MIXED or IDLE; a DECODE call is a contract
                 violation (decode metadata is :meth:`refresh_decode_metadata`).
-            extend_*: Per-request new-token / prefix lengths with their
-                pinned host mirrors; None only on idle warmup.
+            extend_*: ``[>= num_extends]`` per-request new-token / prefix
+                lengths with their pinned host mirrors (empty on idle warmup).
+            extend_with_prefix: Whether any extend row continues a cached or
+                chunked prefix (some ``extend_prefix_lens`` entry is non-zero);
+                leaves that size ragged-vs-paged prefill metadata read it.
         """
 
     @abstractmethod

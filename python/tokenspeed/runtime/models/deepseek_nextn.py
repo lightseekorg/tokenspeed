@@ -172,22 +172,27 @@ class DeepseekModelNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        if captured_hidden_states is None:
-            raise ValueError("DeepSeek NextN requires captured_hidden_states.")
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if ctx.forward_mode.is_idle():
+            # A DP idle forward carries no rows and exists only so this
+            # rank joins the decoder's MoE collectives; there is no target
+            # hidden state to fuse, so feed eh_proj an empty row block.
+            fused = self.eh_proj.weight.new_zeros((0, self.eh_proj.in_features))
         else:
-            hidden_states = input_embeds
-
-        hidden_states = self.eh_proj(
-            torch.cat(
+            if captured_hidden_states is None:
+                raise ValueError("DeepSeek NextN requires captured_hidden_states.")
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            fused = torch.cat(
                 (
                     self.enorm(hidden_states),
                     self.hnorm(captured_hidden_states),
                 ),
                 dim=-1,
             )
-        )
+
+        hidden_states = self.eh_proj(fused)
 
         residual = None
         if CP_METADATA:
@@ -465,6 +470,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         cached_a_proj.pop(q_a_proj_name)
                         cached_a_proj.pop(kv_a_proj_name)
                 else:
+                    # Experts this rank owns were consumed by ``moe_loader``
+                    # above; under ep_size > 1 the remaining expert weights
+                    # belong to other ranks.
+                    if ".mlp.experts." in name:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

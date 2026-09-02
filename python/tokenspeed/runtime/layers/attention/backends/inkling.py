@@ -390,10 +390,11 @@ class InklingAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ):
         if forward_mode.is_mixed():
@@ -409,16 +410,11 @@ class InklingAttnBackend(AttentionBackend):
             )
         # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
         group_tables = kwargs.get("block_tables") or {}
-        extend_total = (
-            int(sum(extend_seq_lens_cpu[:bs]))
-            if forward_mode.is_extend_or_mixed() and extend_seq_lens_cpu is not None
-            else None
-        )
+        extend_total = int(sum(extend_seq_lens_cpu[:bs].tolist()))
         # In-bucket extends must use armed PFG statics: captured sconv kernels baked their addresses.
         pfg_total = -1
         if (
             self._pfg_seq_idx is not None
-            and extend_total is not None
             and extend_total <= self._pfg_seq_idx.shape[0]
             and bs <= self._pfg_max_bs
         ):
@@ -447,19 +443,17 @@ class InklingAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_with_prefix=extend_with_prefix,
             **kwargs,
         )
 
         cache_indices = req_pool_indices[:bs].to(torch.int32)
-        assert extend_seq_lens is not None and extend_prefix_lens is not None
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(extend_seq_lens[:bs], dim=0, dtype=torch.int32),
             (1, 0),
         )
         has_initial_state = extend_prefix_lens[:bs] > 0
-        seq_idx = None
-        if extend_total is not None:
-            seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
+        seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
         if pfg_total >= 0:
             # PFG statics: tail qsl closes the PAD request's empty chunk; tail seq_idx marks pads PAD.
             self._pfg_qsl[: bs + 1].copy_(query_start_loc)

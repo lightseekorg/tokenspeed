@@ -377,10 +377,11 @@ class CacheGroupRouter(AttentionBackend):
         forward_mode: ForwardMode,
         *,
         block_tables: Mapping[str, torch.Tensor],
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ) -> None:
         """Extend / mixed / idle-warmup metadata for every leaf.
@@ -388,6 +389,9 @@ class CacheGroupRouter(AttentionBackend):
         Expands each group's raw table into the stack, computes the extend
         write spans (and, for a MIXED round, the decode rows' verify window),
         then hands every leaf its ``[bs, max_num_pages]`` kernel page table.
+        ``extend_with_prefix`` (some extend row continues a cached or
+        chunked prefix) travels with the extend lengths: leaves size their
+        paged-prefix metadata by it, so it must reach them unchanged.
         """
         del req_pool_indices, kwargs
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -401,8 +405,6 @@ class CacheGroupRouter(AttentionBackend):
         self._extend_write_locations = None
         self._decode_row_offset = 0
         if forward_mode.is_extend_or_mixed() and num_extends > 0:
-            assert extend_seq_lens is not None and extend_prefix_lens is not None
-            assert extend_seq_lens_cpu is not None
             total = int(sum(int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()))
             self._extend_write_locations = self.stacks.extend_locations(
                 extend_prefix_lens[:num_extends], extend_seq_lens[:num_extends], total
@@ -423,6 +425,7 @@ class CacheGroupRouter(AttentionBackend):
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_with_prefix=extend_with_prefix,
             )
 
     def refresh_decode_metadata(

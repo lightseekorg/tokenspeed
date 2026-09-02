@@ -608,103 +608,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             head_dim,
         )
 
-    def _query_lens(
-        self,
-        bs: int,
-        num_tokens: int,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode | None,
-        num_extends: int,
-        extend_seq_lens_cpu: torch.Tensor | None,
-        extend_prefix_lens_cpu: torch.Tensor | None,
-        extend_prefix_lens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if forward_mode is not None and forward_mode.is_decode_or_idle():
-            if forward_mode.is_decode() and num_tokens != bs:
-                if bs == 0:
-                    return torch.zeros(0, dtype=torch.int32, device=seq_lens.device)
-                if num_tokens % bs != 0:
-                    raise RuntimeError(
-                        "DeepSeek V4 packed decode metadata expects uniformly "
-                        f"packed tokens per request, got num_tokens={num_tokens}, "
-                        f"bs={bs}"
-                    )
-                tokens_per_req = num_tokens // bs
-                return torch.full(
-                    (bs,),
-                    tokens_per_req,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-            return torch.ones(bs, dtype=torch.int32, device=seq_lens.device)
-        if forward_mode is not None and forward_mode.is_mixed():
-            verify_width = max(1, int(self.speculative_num_draft_tokens))
-            lens = torch.full(
-                (bs,),
-                verify_width,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            num_prefill_reqs = max(0, min(int(num_extends), bs))
-            if num_prefill_reqs == 0:
-                return lens
-            if extend_seq_lens_cpu is not None and extend_seq_lens_cpu.numel() > 0:
-                lens[:num_prefill_reqs] = extend_seq_lens_cpu[:num_prefill_reqs].to(
-                    seq_lens.device, dtype=torch.int32
-                )
-            elif extend_prefix_lens_cpu is not None:
-                prefix = extend_prefix_lens_cpu[:num_prefill_reqs].to(
-                    seq_lens.device, dtype=torch.int32
-                )
-                lens[:num_prefill_reqs] = (
-                    seq_lens[:num_prefill_reqs].to(torch.int32) - prefix
-                ).clamp_min(0)
-            elif extend_prefix_lens is not None:
-                prefix = extend_prefix_lens[:num_prefill_reqs].to(torch.int32)
-                lens[:num_prefill_reqs] = (
-                    seq_lens[:num_prefill_reqs].to(torch.int32) - prefix
-                ).clamp_min(0)
-            else:
-                lens[:num_prefill_reqs] = seq_lens[:num_prefill_reqs].to(torch.int32)
-            return lens
-        if extend_seq_lens_cpu is not None:
-            return extend_seq_lens_cpu[:bs].to(seq_lens.device, dtype=torch.int32)
-        if extend_prefix_lens_cpu is not None:
-            prefix = extend_prefix_lens_cpu[:bs].to(seq_lens.device, dtype=torch.int32)
-            return (seq_lens[:bs].to(torch.int32) - prefix).clamp_min(0)
-        if extend_prefix_lens is not None:
-            prefix = extend_prefix_lens[:bs].to(torch.int32)
-            return (seq_lens[:bs].to(torch.int32) - prefix).clamp_min(0)
-        return seq_lens[:bs].to(torch.int32)
-
-    def _query_lens_cpu(
-        self,
-        bs: int,
-        forward_mode: ForwardMode | None,
-        num_extends: int,
-        extend_seq_lens_cpu: torch.Tensor | None,
-        extend_prefix_lens_cpu: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        if forward_mode is not None and forward_mode.is_decode_or_idle():
-            return torch.ones(bs, dtype=torch.int32)
-        if forward_mode is not None and forward_mode.is_mixed():
-            verify_width = max(1, int(self.speculative_num_draft_tokens))
-            lens = torch.full((bs,), verify_width, dtype=torch.int32)
-            num_prefill_reqs = max(0, min(int(num_extends), bs))
-            if num_prefill_reqs == 0:
-                return lens
-            if extend_seq_lens_cpu is None:
-                return None
-            lens[:num_prefill_reqs] = extend_seq_lens_cpu[:num_prefill_reqs].to(
-                dtype=torch.int32, device="cpu"
-            )
-            return lens
-        if extend_seq_lens_cpu is not None:
-            return extend_seq_lens_cpu[:bs].to(dtype=torch.int32, device="cpu")
-        if extend_prefix_lens_cpu is not None:
-            return None
-        return None
-
     # ------------------------------------------------------------------
     # Slot publication — the ONLY writers of the three metadata slots.
     #
@@ -793,28 +696,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_forward_metadata(
         self,
         bs: int,
+        num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        block_table: torch.Tensor = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
+        forward_mode: ForwardMode,
+        *,
+        block_tables: Mapping[str, torch.Tensor],
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ) -> None:
-        if forward_mode is not None and forward_mode.is_decode():
+        if forward_mode.is_decode():
             raise RuntimeError(
                 "DeepSeek V4 decode metadata goes through "
                 "refresh_decode_metadata; init_forward_metadata only serves "
                 "extend/mixed/idle"
             )
         dsv4_reset_attention_state()
-        incoming_block_tables = kwargs.pop("block_tables", None) or {}
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         num_tokens_arg = kwargs.pop("num_tokens", None)
         positions = kwargs.get("positions")
-        num_extends_arg = kwargs.pop("num_extends", None)
-        num_extends = bs if num_extends_arg is None else int(num_extends_arg)
         if num_tokens_arg is not None:
             num_tokens = int(num_tokens_arg)
         elif isinstance(positions, torch.Tensor):
@@ -827,125 +731,93 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # layers, which have no dedicated group: the first (smallest-ratio)
         # compressed-KV full-history group's table (row i == batch position i).
         base_page_table = None
-        if incoming_block_tables:
-            base_group_id = first_v4_compressed_kv_group_id(incoming_block_tables)
+        if block_tables:
+            base_group_id = first_v4_compressed_kv_group_id(block_tables)
             if base_group_id is not None:
-                base_page_table = incoming_block_tables[base_group_id]
-            if self._expected_cache_group_ids is None:
-                # No published group contract (warmup placeholders, unit
-                # fixtures): accept the named tables as-is, like the former
-                # dedicated placeholder channel did.
-                block_tables = incoming_block_tables
-            else:
+                base_page_table = block_tables[base_group_id]
+            if self._expected_cache_group_ids is not None:
                 block_tables = self._prepare_cache_group_tables(
-                    incoming_block_tables,
+                    block_tables,
                     bs=bs,
                     actual_bs=bs,
                     seq_lens=seq_lens,
                     device=device,
                     phase="eager",
                 )
+            # Without a published group contract (warmup placeholders, unit
+            # fixtures) the named tables are accepted as-is.
         elif bs > 0 and self._expected_cache_group_ids:
             raise RuntimeError(
                 "DeepSeek V4 eager metadata is missing live cache group tables"
             )
-        else:
-            block_tables = incoming_block_tables
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
-        query_lens = self._query_lens(
-            bs,
-            num_tokens,
-            seq_lens,
-            forward_mode,
-            num_extends,
-            extend_seq_lens_cpu,
-            extend_prefix_lens_cpu,
-            extend_prefix_lens,
-        )
-        metadata_forward_mode = forward_mode
-        if forward_mode is not None and forward_mode.is_mixed():
-            num_prefill_reqs = max(0, min(num_extends, bs))
-        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
-            num_prefill_reqs = bs
-        else:
-            num_prefill_reqs = 0
-        query_lens_cpu = self._query_lens_cpu(
-            bs,
-            forward_mode,
-            num_extends,
-            extend_seq_lens_cpu,
-            extend_prefix_lens_cpu,
-        )
-        seq_lens_cpu = None
-        if extend_prefix_lens_cpu is not None and query_lens_cpu is not None:
-            prefix_count = min(
-                int(extend_prefix_lens_cpu.numel()),
-                (
-                    num_prefill_reqs
-                    if forward_mode is not None and forward_mode.is_mixed()
-                    else bs
-                ),
-            )
-            if prefix_count == bs:
-                seq_lens_cpu = (
-                    extend_prefix_lens_cpu[:bs].to(dtype=torch.int32, device="cpu")
-                    + query_lens_cpu[:bs]
-                )
-            else:
-                # Mixed decode rows do not have a complete host sequence-length
-                # mirror. Preserve their exact values for decode metadata while
-                # keeping the all-prefill path synchronization-free.
-                seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
-            if prefix_count:
-                seq_lens_cpu[:prefix_count] = (
-                    extend_prefix_lens_cpu[:prefix_count].to(
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                    + query_lens_cpu[:prefix_count]
-                )
-        elif (
-            extend_seq_lens_cpu is not None
-            and forward_mode is not None
-            and forward_mode.is_mixed()
+
+        # Per-request query lengths, on device and as a host mirror: the
+        # extend rows lead with their new-token counts, a MIXED round's decode
+        # rows each carry the verify window, idle placeholders one token.
+        verify_width = max(1, int(self.speculative_num_draft_tokens))
+        num_prefill_reqs = 0 if forward_mode.is_idle() else num_extends
+        if num_prefill_reqs and (
+            extend_seq_lens_cpu.device.type != "cpu"
+            or extend_prefix_lens_cpu.device.type != "cpu"
+            or extend_seq_lens_cpu.numel() < num_prefill_reqs
+            or extend_prefix_lens_cpu.numel() < num_prefill_reqs
         ):
-            seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
-        prefill_seq_lens: list[int] = []
-        prefill_query_lens: list[int] = []
-        if num_prefill_reqs:
-            if (
-                seq_lens_cpu is None
-                or query_lens_cpu is None
-                or seq_lens_cpu.device.type != "cpu"
-                or query_lens_cpu.device.type != "cpu"
-                or seq_lens_cpu.numel() < num_prefill_reqs
-                or query_lens_cpu.numel() < num_prefill_reqs
-            ):
-                raise RuntimeError(
-                    "DeepSeek V4 prefill metadata requires complete CPU sequence "
-                    "and query length mirrors"
+            raise RuntimeError(
+                "DeepSeek V4 prefill metadata requires complete CPU sequence "
+                "and query length mirrors"
+            )
+        if forward_mode.is_idle():
+            query_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            query_lens_cpu = torch.ones(bs, dtype=torch.int32)
+        else:
+            query_lens = torch.full(
+                (bs,), verify_width, dtype=torch.int32, device=device
+            )
+            query_lens[:num_extends] = extend_seq_lens[:num_extends].to(
+                device=device, dtype=torch.int32
+            )
+            query_lens_cpu = torch.full((bs,), verify_width, dtype=torch.int32)
+            query_lens_cpu[:num_extends] = extend_seq_lens_cpu[:num_extends].to(
+                dtype=torch.int32, device="cpu"
+            )
+        if num_prefill_reqs == bs:
+            # Every row is an extend row: the host mirrors describe the whole
+            # batch, so no device sync is needed.
+            seq_lens_cpu = (
+                extend_prefix_lens_cpu[:bs].to(dtype=torch.int32, device="cpu")
+                + query_lens_cpu
+            )
+        else:
+            # Mixed decode rows (and idle placeholders) have no host mirror of
+            # their cache length: sync once for the batch, then overlay the
+            # extend rows' exact mirrors.
+            seq_lens_cpu = seq_lens.to(dtype=torch.int32, device="cpu")
+            seq_lens_cpu[:num_prefill_reqs] = (
+                extend_prefix_lens_cpu[:num_prefill_reqs].to(
+                    dtype=torch.int32, device="cpu"
                 )
-            prefill_seq_lens = [
-                int(value) for value in seq_lens_cpu[:num_prefill_reqs].tolist()
-            ]
-            prefill_query_lens = [
-                int(value) for value in query_lens_cpu[:num_prefill_reqs].tolist()
-            ]
-            if any(
-                query_len < 0 or seq_len < query_len
-                for seq_len, query_len in zip(
-                    prefill_seq_lens, prefill_query_lens, strict=True
-                )
-            ):
-                raise RuntimeError(
-                    "DeepSeek V4 prefill CPU length mirrors contain an invalid "
-                    "sequence/query pair"
-                )
+                + query_lens_cpu[:num_prefill_reqs]
+            )
+        prefill_seq_lens = [int(v) for v in seq_lens_cpu[:num_prefill_reqs].tolist()]
+        prefill_query_lens = [
+            int(v) for v in query_lens_cpu[:num_prefill_reqs].tolist()
+        ]
+        if any(
+            query_len < 0 or seq_len < query_len
+            for seq_len, query_len in zip(
+                prefill_seq_lens, prefill_query_lens, strict=True
+            )
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 prefill CPU length mirrors contain an invalid "
+                "sequence/query pair"
+            )
 
         if num_prefill_reqs == bs:
             max_seq_len = max(prefill_seq_lens, default=0)
-            if forward_mode is not None and forward_mode.is_extend():
+            if forward_mode.is_extend():
                 max_seq_len += max(self.speculative_num_steps - 1, 0)
             max_pages = (
                 max_seq_len + self.kernel_page_size - 1
@@ -1005,23 +877,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 output_size=num_prefill_tokens,
             )
         else:
+            metadata_tokens = sum(int(value) for value in query_lens_cpu.tolist())
             output_size = num_tokens
             if num_tokens_arg is None and not isinstance(positions, torch.Tensor):
-                if query_lens_cpu is not None:
-                    output_size = sum(int(value) for value in query_lens_cpu.tolist())
+                output_size = metadata_tokens
             if (
-                forward_mode is not None
-                and forward_mode.is_mixed()
+                forward_mode.is_mixed()
                 and num_tokens_arg is not None
-                and query_lens_cpu is not None
+                and metadata_tokens != num_tokens
             ):
-                metadata_tokens = sum(int(value) for value in query_lens_cpu.tolist())
-                if metadata_tokens != num_tokens:
-                    raise RuntimeError(
-                        "DeepSeek V4 mixed metadata token count mismatch: "
-                        f"query_lens describe {metadata_tokens} tokens, packed input "
-                        f"has {num_tokens}"
-                    )
+                raise RuntimeError(
+                    "DeepSeek V4 mixed metadata token count mismatch: "
+                    f"query_lens describe {metadata_tokens} tokens, packed input "
+                    f"has {num_tokens}"
+                )
             token_to_req = torch.repeat_interleave(
                 req_ids,
                 query_lens.clamp_min(0),
@@ -1054,16 +923,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             query_lens_cpu=query_lens_cpu,
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
-            forward_mode=metadata_forward_mode,
+            forward_mode=forward_mode,
         )
-        if metadata_forward_mode is not None and metadata_forward_mode.is_idle():
+        if forward_mode.is_idle():
             # A pure DECODE init raises at the top, so idle is the only
             # decode-shaped mode left here.
             self._publish_decode(metadata)
-        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
-            self._publish_prefill(metadata)
         else:
-            self.forward_metadata = metadata
+            self._publish_prefill(metadata)
 
     def _update_decode_swa_metadata(
         self,

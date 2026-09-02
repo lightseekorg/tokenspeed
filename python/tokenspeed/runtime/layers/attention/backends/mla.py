@@ -151,10 +151,11 @@ class MLAAttnBackend(PagedAttentionBackend):
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ) -> None:
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):

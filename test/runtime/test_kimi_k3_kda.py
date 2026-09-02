@@ -313,10 +313,12 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     # Decode: request 0 crosses into its second page, request 1 stays inside
     # its first page.
     seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=bs,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=seq_lens,
+    backend.init_cuda_graph_state(max_bs=bs)
+    backend.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         block_tables=delivered,
     )
@@ -407,6 +409,7 @@ class _KDAHarness:
     H = 4
     D = 128
     WIDTH = 4
+    MAX_BS = 4
 
     def __init__(self, pool, contract, layer_ids, device="cuda", seed=0):
         torch.manual_seed(seed)
@@ -418,6 +421,7 @@ class _KDAHarness:
         self.value_dim = self.H * self.D
         self.conv_dim = 3 * self.key_dim
         self.backend = _backend(device, contract_pool=pool)
+        self.backend.init_cuda_graph_state(max_bs=self.MAX_BS)
         # Per-layer weights and full token streams (so each group is proven
         # independent, not accidentally identical).
         self.params = {}
@@ -467,33 +471,42 @@ class _KDAHarness:
             lower_bound=_LOWER_BOUND,
         )
 
-    def init_metadata(self, tables, seq_lens, mode, extend_prefix_lens=None):
-        bs = len(seq_lens)
+    def _delivered(self, tables):
         np_tables = {
             gid: np.asarray(rows, dtype=np.int32) for gid, rows in tables.items()
         }
-        delivered = _tables_for(self.contract, np_tables, self.device)
-        kwargs = dict(
-            block_tables=delivered,
-        )
-        if extend_prefix_lens is not None:
-            kwargs["extend_prefix_lens"] = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32, device=self.device
-            )
-        if mode.is_extend_or_mixed():
-            # The executor guarantees host extend lengths for every extend
-            # batch; model that contract here.
-            prefix = extend_prefix_lens or [0] * bs
-            kwargs["extend_seq_lens_cpu"] = torch.tensor(
-                [int(s) - int(p) for s, p in zip(seq_lens, prefix)],
-                dtype=torch.int32,
-            )
+        return _tables_for(self.contract, np_tables, self.device)
+
+    def extend_metadata(self, tables, seq_lens, extend_prefix_lens):
+        """An EXTEND batch: every row extends, the executor's host mirrors
+        carry each row's new-token and prefix lengths."""
+        bs = len(seq_lens)
+        prefix_cpu = torch.tensor(extend_prefix_lens, dtype=torch.int32)
+        new_cpu = torch.tensor(seq_lens, dtype=torch.int32) - prefix_cpu
         self.backend.init_forward_metadata(
             bs=bs,
+            num_extends=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            forward_mode=mode,
-            **kwargs,
+            forward_mode=ForwardMode.EXTEND,
+            block_tables=self._delivered(tables),
+            extend_seq_lens=new_cpu.to(self.device),
+            extend_seq_lens_cpu=new_cpu,
+            extend_prefix_lens=prefix_cpu.to(self.device),
+            extend_prefix_lens_cpu=prefix_cpu,
+            extend_with_prefix=bool(prefix_cpu.any()),
+        )
+
+    def decode_metadata(self, tables, seq_lens):
+        """A decode step: the same unpadded refresh the runner issues."""
+        bs = len(seq_lens)
+        self.backend.refresh_decode_metadata(
+            bs,
+            bs,
+            torch.arange(bs, dtype=torch.int32, device=self.device),
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._delivered(tables),
         )
 
     def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1):
@@ -646,9 +659,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 
     outputs = {layer_id: [] for layer_id in [0, 1, 2]}
     # Prefill 3 tokens: in = null page 0 (zero state), out = slot 0.
-    h.init_metadata(
-        tables, seq_lens=[3], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
-    )
+    h.extend_metadata(tables, seq_lens=[3], extend_prefix_lens=[0])
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
         assert md.state_in_blocks_by_group[gid].tolist() == [0]
@@ -670,7 +681,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
     }
     snapshot = {}
     for step, pos in enumerate(range(3, 6)):
-        h.init_metadata(tables, seq_lens=[pos + 1], mode=ForwardMode.DECODE)
+        h.decode_metadata(tables, seq_lens=[pos + 1])
         md = h.backend.forward_metadata
         for gid in _STATE_GROUPS:
             assert md.state_in_blocks_by_group[gid].tolist() == [
@@ -773,9 +784,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     b_full = cat(prefix, b_new)
 
     # 1) A prefills the shared 4-token prefix -> snapshot page 1.
-    h.init_metadata(
-        tables_for([[1]]), seq_lens=[4], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
-    )
+    h.extend_metadata(tables_for([[1]]), seq_lens=[4], extend_prefix_lens=[0])
     a_outs = [h.extend(layer_id, prefix["mixed"], prefix["g_raw"], prefix["beta_raw"])]
     conv = pool.get_component(layer_id, "conv_state")
     ssm = pool.get_component(layer_id, "recurrent_state")
@@ -784,7 +793,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert snap_ssm.abs().max().item() > 0.0
 
     # 2) A decodes token 5: crossing out of the snapshot (in=1, out=2).
-    h.init_metadata(tables_for([[1, 2]]), seq_lens=[5], mode=ForwardMode.DECODE)
+    h.decode_metadata(tables_for([[1, 2]]), seq_lens=[5])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
     assert md.state_out_blocks_by_group[gid].tolist() == [2]
@@ -802,12 +811,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 
     # 3) B resumes from the shared snapshot: extend prefix=4 -> 7 tokens
     #    (in = shared page 1, out = fresh page 3; page 1 must stay intact).
-    h.init_metadata(
-        tables_for([[1, 3]]),
-        seq_lens=[7],
-        mode=ForwardMode.EXTEND,
-        extend_prefix_lens=[4],
-    )
+    h.extend_metadata(tables_for([[1, 3]]), seq_lens=[7], extend_prefix_lens=[4])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
     assert md.state_out_blocks_by_group[gid].tolist() == [3]
@@ -821,11 +825,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 
     # 4) Batched decode: A token 6 (in-page evolution on page 2) and B token 8
     #    (crossing to page 5) in ONE forward — isolation between requests.
-    h.init_metadata(
-        tables_for([[1, 2], [1, 3]]),
-        seq_lens=[6, 8],
-        mode=ForwardMode.DECODE,
-    )
+    h.decode_metadata(tables_for([[1, 2], [1, 3]]), seq_lens=[6, 8])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
     assert md.state_out_blocks_by_group[gid].tolist() == [2, 3]
@@ -887,9 +887,7 @@ def test_kda_cache_pool_component_views_end_to_end(
     streams = {layer_id: h.token_stream(total) for layer_id in layer_ids}
 
     outputs = {layer_id: [] for layer_id in layer_ids}
-    h.init_metadata(
-        tables, seq_lens=[8], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
-    )
+    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0])
     for layer_id in layer_ids:
         s = streams[layer_id]
         outputs[layer_id].append(
@@ -920,7 +918,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         _indexed_decode_spy,
     )
     for pos in range(8, total):
-        h.init_metadata(tables, seq_lens=[pos + 1], mode=ForwardMode.DECODE)
+        h.decode_metadata(tables, seq_lens=[pos + 1])
         for layer_id in layer_ids:
             s = streams[layer_id]
             outputs[layer_id].append(

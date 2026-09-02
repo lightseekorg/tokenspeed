@@ -40,6 +40,19 @@ seq_lens, *, forward_mode, block_tables, num_extends, for_graph_replay,
 DECODE call raises. There is deliberately no fresh-allocation decode arm
 anywhere. `init_forward_metadata_replay_cuda_graph` no longer exists.
 
+Its extend inputs are one required, keyword-only bundle on every node —
+runner-facing (`base.py`: router, V4, Mamba/KDA, composites) and leaf
+(`paged.py`) alike: `extend_seq_lens`, `extend_seq_lens_cpu`,
+`extend_prefix_lens`, `extend_prefix_lens_cpu` are plain `torch.Tensor`
+(`[>= num_extends]` rows; empty, never `None`, when there are no extend
+rows) and `extend_with_prefix` is a plain `bool`. No default values: the
+runner passes the `[:num_extends]` slices of its input buffers on every
+call (the idle replay passes the empty `[:0]` slices), so a node that reads
+a field can never see a silently-defaulted one. This is deliberate — a
+`= False` default once hid `extend_with_prefix` being swallowed by a
+composite's `**kwargs`, and FlashMLA planned a ragged prefill for a
+prefix-cached batch.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -378,6 +391,13 @@ down to the router and V4).
   path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rnE '^\s+extend_(seq|prefix)_lens(_cpu)?: torch\.Tensor \| None,|
+  extend_with_prefix: bool = False' python/tokenspeed/runtime/layers/attention/backends/`
+  must stay empty — no `init_forward_metadata` parameter in the extend
+  bundle is optional or defaulted (`test/runtime/test_unified_decode_path.py`
+  binds the runner call shape against every runner-facing node and every
+  leaf). Metadata dataclasses may still hold `None` for fields a decode
+  batch does not carry; the contract is about the call, not the record.
 * `grep -rn "select_out_cache_loc\|DraftPageStaging\|tables_self_padding\|
   cache_active_pages_must_be_real\|engine_owned_group_ids" python/` must
   stay empty — write locations have one accessor (`write_locations`), and

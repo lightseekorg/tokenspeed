@@ -122,10 +122,11 @@ class IdleReplayScrubTest(unittest.TestCase):
             def padded_bs(self, bs, ctx):
                 return padded_bs
 
-            def __call__(self, bs, ctx, sampling_info):
+            def __call__(self, bs, ctx, sampling_info, **extend_kwargs):
                 # The runner's idle metadata prep refreshed the draft router
                 # with placeholders before this call; snapshot what the
                 # drafter's recorded kernels would read.
+                captured["extend_kwargs"] = extend_kwargs
                 _refresh(router, padded_bs, 0, None)
                 captured["rows"] = router.draft_history_view().table[:padded_bs].clone()
 
@@ -134,6 +135,10 @@ class IdleReplayScrubTest(unittest.TestCase):
             token_to_kv_pool=None,
             input_buffers=SimpleNamespace(
                 req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
+                extend_prefix_lens_buf=torch.zeros(8, dtype=torch.int32),
+                extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
+                extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
+                extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(
@@ -157,6 +162,16 @@ class IdleReplayScrubTest(unittest.TestCase):
             ),
         )
         self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
+        # The idle replay hands the runner empty extend slices, never None.
+        extend_kwargs = captured["extend_kwargs"]
+        self.assertIs(extend_kwargs["extend_with_prefix"], False)
+        for name in (
+            "extend_prefix_lens",
+            "extend_prefix_lens_cpu",
+            "extend_seq_lens",
+            "extend_seq_lens_cpu",
+        ):
+            self.assertEqual(extend_kwargs[name].numel(), 0, name)
 
 
 if __name__ == "__main__":

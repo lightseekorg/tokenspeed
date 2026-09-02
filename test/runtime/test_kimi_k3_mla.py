@@ -397,6 +397,7 @@ def _init_prefill(backend, page_table, prefix, extend):
         extend_prefix_lens_cpu=torch.tensor(prefix, dtype=torch.int32),
         extend_seq_lens=torch.tensor(extend, device="cuda", dtype=torch.int32),
         extend_seq_lens_cpu=torch.tensor(extend, dtype=torch.int32),
+        extend_with_prefix=any(p > 0 for p in prefix),
     )
     return seq_lens
 

@@ -159,10 +159,11 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         *,
         block_tables: Mapping[str, torch.Tensor],
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ) -> None:
         """Build metadata for an extend / mixed (or idle warmup) forward.
@@ -178,8 +179,10 @@ class AttentionBackend(ABC):
             forward_mode: EXTEND, MIXED or IDLE.
             block_tables: ``group_id -> [>= bs, cols]`` int32 raw scheduler
                 tables for every published group (placeholders on warmup).
-            extend_*: Per-request new-token / prefix lengths and their pinned
-                host mirrors; None only on idle warmup.
+            extend_*: ``[>= num_extends]`` per-request new-token / prefix
+                lengths and their pinned host mirrors (empty on idle warmup).
+            extend_with_prefix: Whether any extend row continues a cached or
+                chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
             **kwargs: Model-side extras (positions, capture mode, ...) a
                 node may ignore.
         """

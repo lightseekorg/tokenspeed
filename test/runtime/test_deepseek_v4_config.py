@@ -186,6 +186,20 @@ def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
     )
 
 
+def _extend_kwargs(
+    extend_seq_lens_cpu: torch.Tensor, extend_prefix_lens_cpu: torch.Tensor
+) -> dict:
+    """The ``init_forward_metadata`` extend bundle for a CPU-device backend:
+    the device tensors mirror the host ones."""
+    return dict(
+        extend_seq_lens=extend_seq_lens_cpu.clone(),
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_prefix_lens=extend_prefix_lens_cpu.clone(),
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+    )
+
+
 def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
     """The spec set a ratio vector declares, in the recipe's own order."""
     ratios = {int(ratio) for ratio in layer_ratio}
@@ -2964,12 +2978,15 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=3,
+            num_extends=1,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            block_table=torch.zeros((3, 1), dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
-            num_extends=1,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([7], dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+            ),
         )
 
         metadata = backend.forward_metadata
@@ -3008,17 +3025,18 @@ class TestDeepseekV4Config(unittest.TestCase):
                 total_tokens = prefill_tokens + 2 * verify_width
                 backend.init_forward_metadata(
                     bs=3,
+                    num_extends=1,
                     num_tokens=total_tokens,
                     req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
                     seq_lens=torch.tensor(
                         [prefill_tokens, 100, 200], dtype=torch.int32
                     ),
                     forward_mode=ForwardMode.MIXED,
-                    block_table=torch.zeros((3, 256), dtype=torch.int32),
-                    extend_seq_lens_cpu=torch.tensor(
-                        [prefill_tokens], dtype=torch.int32
+                    block_tables={},
+                    **_extend_kwargs(
+                        torch.tensor([prefill_tokens], dtype=torch.int32),
+                        torch.zeros(1, dtype=torch.int32),
                     ),
-                    num_extends=1,
                 )
 
                 metadata = backend.forward_metadata
@@ -3070,13 +3088,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         ):
             backend.init_forward_metadata(
                 bs=2,
+                num_extends=1,
                 num_tokens=10,
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([7, 20], dtype=torch.int32),
                 forward_mode=ForwardMode.MIXED,
-                block_table=torch.zeros((2, 64), dtype=torch.int32),
-                extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
-                num_extends=1,
+                block_tables={},
+                **_extend_kwargs(
+                    torch.tensor([7], dtype=torch.int32),
+                    torch.zeros(1, dtype=torch.int32),
+                ),
             )
 
     def test_deepseek_v4_prefill_metadata_uses_complete_cpu_mirrors(self):
@@ -3098,14 +3119,16 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend.init_forward_metadata(
             bs=2,
+            num_extends=2,
             num_tokens=14,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([17, 65], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
-            block_table=torch.zeros((2, 2), dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.tensor([12, 56], dtype=torch.int32),
-            num_extends=2,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([5, 9], dtype=torch.int32),
+                torch.tensor([12, 56], dtype=torch.int32),
+            ),
         )
 
         metadata = backend.forward_metadata
@@ -3134,19 +3157,21 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
+        # Host mirrors shorter than the extend rows they must describe.
+        short = torch.zeros(0, dtype=torch.int32)
         with self.assertRaisesRegex(
             RuntimeError,
             "prefill metadata requires complete CPU sequence and query length mirrors",
         ):
             backend.init_forward_metadata(
                 bs=1,
+                num_extends=1,
                 num_tokens=3,
                 req_pool_indices=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([5], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
-                block_table=torch.zeros((1, 1), dtype=torch.int32),
-                extend_prefix_lens_cpu=torch.tensor([2], dtype=torch.int32),
-                num_extends=1,
+                block_tables={},
+                **_extend_kwargs(short, torch.tensor([2], dtype=torch.int32)),
             )
 
         with self.assertRaisesRegex(
@@ -3155,13 +3180,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         ):
             backend.init_forward_metadata(
                 bs=1,
+                num_extends=1,
                 num_tokens=3,
                 req_pool_indices=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([131], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
-                block_table=torch.zeros((1, 3), dtype=torch.int32),
-                extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
-                num_extends=1,
+                block_tables={},
+                **_extend_kwargs(torch.tensor([3], dtype=torch.int32), short),
             )
 
     def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
@@ -3277,14 +3302,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.prefill_chunk_size = 2
         backend.init_forward_metadata(
             bs=3,
+            num_extends=3,
             num_tokens=6,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([4, 7, 9], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
-            block_table=torch.zeros((3, 1), dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([2, 1, 3], dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.tensor([2, 6, 6], dtype=torch.int32),
-            num_extends=3,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([2, 1, 3], dtype=torch.int32),
+                torch.tensor([2, 6, 6], dtype=torch.int32),
+            ),
         )
         metadata = backend.forward_metadata
         assert metadata is not None
@@ -3369,13 +3396,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         page_table = torch.zeros((2, 64), dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
+            num_extends=1,
             num_tokens=7 + verify_width,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.MIXED,
-            block_table=page_table,
-            extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
-            num_extends=1,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([7], dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+            ),
         )
         mixed_metadata = backend.forward_metadata
         self.assertIsNotNone(mixed_metadata)
@@ -3829,15 +3859,17 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=3,
+            num_extends=1,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={
                 V4_SWA_KV_GROUP_ID: torch.tensor([[10], [20], [30]], dtype=torch.int32)
             },
-            extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.tensor([2, 8, 11], dtype=torch.int32),
-            num_extends=1,
+            **_extend_kwargs(
+                torch.tensor([3, 1, 1], dtype=torch.int32),
+                torch.tensor([2, 8, 11], dtype=torch.int32),
+            ),
         )
         metadata = backend.forward_metadata
         self.assertIsNotNone(metadata)
@@ -3921,13 +3953,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=4,
+            num_extends=3,
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            block_table=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([3, 4, 1, 1], dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.tensor([2, 5, 11], dtype=torch.int32),
-            num_extends=3,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([3, 4, 1, 1], dtype=torch.int32),
+                torch.tensor([2, 5, 11], dtype=torch.int32),
+            ),
         )
 
         metadata = backend.forward_metadata
@@ -3967,12 +4001,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_forward_metadata(
             bs=3,
+            num_extends=1,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
-            num_extends=1,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([3, 1, 1], dtype=torch.int32),
+                torch.tensor([2], dtype=torch.int32),
+            ),
         )
         calls = []
 
@@ -4072,13 +4109,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.forward_prefill_metadata = stale_prefill_metadata
         backend.init_forward_metadata(
             bs=3,
+            num_extends=1,
             num_tokens=5,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            block_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
-            num_extends=1,
+            block_tables={},
+            **_extend_kwargs(
+                torch.tensor([3, 1, 1], dtype=torch.int32),
+                torch.tensor([2], dtype=torch.int32),
+            ),
         )
         mixed_metadata = backend.forward_metadata
         self.assertIs(backend.forward_prefill_metadata, mixed_metadata)
@@ -5341,13 +5381,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         page_table = torch.tensor([[10]], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=1,
+            num_extends=1,
             num_tokens=6,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
-            block_table=page_table,
-            extend_seq_lens_cpu=seq_lens.cpu(),
-            extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            block_tables={},
+            **_extend_kwargs(seq_lens.cpu(), torch.zeros(1, dtype=torch.int32)),
         )
         backend.init_cuda_graph_state(max_bs=max(1, 4))
         backend.refresh_decode_metadata(

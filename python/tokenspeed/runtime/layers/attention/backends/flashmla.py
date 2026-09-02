@@ -241,11 +241,11 @@ class FlashMLABackend(PagedAttentionBackend):
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
-        extend_with_prefix: bool = False,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ):
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -309,23 +309,26 @@ class FlashMLABackend(PagedAttentionBackend):
         self,
         seq_lens: torch.Tensor,
         extend_with_prefix: bool,
-        extend_prefix_lens: torch.Tensor | None,
+        extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
-        if extend_prefix_lens is None:
-            raise RuntimeError(
-                "FlashMLABackend.init_forward_metadata requires "
-                "extend_prefix_lens in extend mode."
-            )
         seq_lens_cpu = seq_lens.cpu()
         seq_lens_sum = seq_lens_cpu.sum().item()
         self.last_seq_lens_sum = seq_lens_sum
 
         extend_no_prefix = not extend_with_prefix
+        if extend_no_prefix and bool(extend_prefix_lens_cpu.any()):
+            # The ragged plan sizes its paged kv_indices by the prefix sum
+            # (zero here), so a prefixed row would overrun it in-kernel.
+            raise RuntimeError(
+                "FlashMLABackend: extend_with_prefix is False but "
+                f"extend_prefix_lens={extend_prefix_lens_cpu.tolist()} has a "
+                "cached/chunked prefix"
+            )
         use_ragged = (
             not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
         )
