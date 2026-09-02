@@ -1084,6 +1084,97 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
+    def test_persistent_topk_cluster_path_matches_torch_for_all_supported_k(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6792)
+        device = torch.device("cuda")
+        stride = 131072
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        for topk in (512, 1024, 2048):
+            with self.subTest(topk=topk):
+                lengths = torch.tensor(
+                    [topk + 1, 8192, 65537, 131071],
+                    device=device,
+                    dtype=torch.int32,
+                )
+                logits = torch.randn(
+                    (lengths.numel(), stride),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                output = torch.full(
+                    (lengths.numel(), topk),
+                    -77,
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    int(lengths.max().item()),
+                )
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_verify_mode_uses_causal_request_lengths(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6793)
+        device = torch.device("cuda")
+        topk = 512
+        q_len_per_req = 4
+        request_lengths = torch.tensor(
+            [70000, 131071], device=device, dtype=torch.int32
+        )
+        effective_lengths = torch.tensor(
+            [
+                int(raw_len) - (q_len_per_req - 1) + query_idx
+                for raw_len in request_lengths.cpu().tolist()
+                for query_idx in range(q_len_per_req)
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        stride = 131072
+        logits = torch.randn(
+            (effective_lengths.numel(), stride),
+            device=device,
+            dtype=torch.float32,
+        )
+        output = torch.full(
+            (effective_lengths.numel(), topk),
+            -77,
+            device=device,
+            dtype=torch.int32,
+        )
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        persistent_topk(
+            logits,
+            request_lengths,
+            output,
+            workspace,
+            topk,
+            int(request_lengths.max().item()),
+            q_len_per_req,
+        )
+        torch.cuda.synchronize()
+
+        self._assert_persistent_topk_matches_torch(
+            logits, effective_lengths, output, topk
+        )
+
     def test_indexer_mxfp4_cache_matches_reference(self):
         torch.manual_seed(7890)
         device = torch.device("cuda")
