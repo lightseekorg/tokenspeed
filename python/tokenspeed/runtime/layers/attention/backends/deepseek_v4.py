@@ -484,8 +484,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             columns = int(table.shape[1])
             if out.ndim != 2 or out.shape[0] < bs or out.shape[1] < columns:
                 raise ValueError(
-                    f"output table for {group_id!r} cannot hold "
-                    f"{bs}x{columns} rows"
+                    f"output table for {group_id!r} cannot hold " f"{bs}x{columns} rows"
                 )
             if out.dtype != table.dtype or out.device != table.device:
                 raise ValueError(
