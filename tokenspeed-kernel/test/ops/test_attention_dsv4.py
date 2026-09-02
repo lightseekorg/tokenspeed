@@ -1051,7 +1051,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
-    def test_persistent_topk_matches_torch_for_batch_gt_32(self):
+    def test_persistent_topk_noncluster_fallback_matches_torch(self):
         if not has_persistent_topk():
             self.skipTest("DeepSeek V4 persistent top-k op is not available")
 
@@ -1059,9 +1059,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         device = torch.device("cuda")
         topk = 512
         num_rows = 36
-        stride = 544
+        stride = 65568
+        # More than 32 rows bypasses clusters on capable GPUs. The long live
+        # row exercises the same single-CTA streaming kernel used when cluster
+        # launch is unsupported; short rows verify graph-padded tail handling.
         lengths = torch.tensor(
-            [0, 17] + [520 + (idx % 24) for idx in range(num_rows - 2)],
+            [0, 17, 513, 9000, 33000, 65537]
+            + [520 + (idx % 24) for idx in range(num_rows - 6)],
             device=device,
             dtype=torch.int32,
         )
@@ -1078,7 +1082,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             output,
             workspace,
             topk,
-            int(lengths.max().item()),
+            stride,
         )
         torch.cuda.synchronize()
 

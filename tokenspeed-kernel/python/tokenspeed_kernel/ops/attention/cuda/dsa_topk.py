@@ -24,14 +24,16 @@ Selects the per-row top-k over a dense indexer-logits matrix with the native CUD
 persistent-radix ``persistent_topk`` kernel: each row's valid context length is
 read from ``lengths`` so padded columns beyond a request's context are never
 scanned, and tie handling is delegated to the kernel. This is the ragged path
-behind the DSA decode top-k selection, so callers pre-mask nothing. Long-row
-cluster launches use CUDA programmatic dependent launch on Hopper and newer;
-their shared-memory setup can overlap the preceding grid's tail while an
-in-kernel dependency wait keeps score reads ordered. Rows through 128K use a
+behind the DSA decode top-k selection, so callers pre-mask nothing. On devices
+with cluster-launch support, long-row kernels use CUDA programmatic dependent
+launch: their shared-memory setup can overlap the preceding grid's tail while
+an in-kernel dependency wait keeps score reads ordered. Rows through 128K use a
 single-load, register-resident cluster-8 specialization, 128K--256K rows use a
 cluster-16 streaming specialization when the device supports it, and longer
-rows retain the portable cluster-8 fallback. CUDA Graphs may capture a static
-maximum width because each replay still dispatches from runtime lengths.
+rows retain the portable cluster-8 path. Devices without cluster-launch support
+fall back to the original single-CTA streaming kernel. CUDA Graphs may capture
+a static maximum width because each replay still dispatches from runtime
+lengths.
 """
 
 from __future__ import annotations
