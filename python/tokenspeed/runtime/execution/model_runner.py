@@ -188,7 +188,6 @@ class ModelRunner:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -227,7 +226,6 @@ class ModelRunner:
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

@@ -230,6 +230,15 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
     return metadata, forward_op
 
 
+def block_tables_for(contract, tables, device, *, filler_page: int = 1):
+    """The bridge-shaped per-group dict for a contract: packed storage,
+    contract order, missing groups filled with one filler page per row."""
+    metadata, forward_op = cache_metadata_for(
+        contract, tables, device, filler_page=filler_page
+    )
+    return dict(metadata.tables(active_forward_op=forward_op))
+
+
 def full_attention_metadata_for(pool, full_table_np, device):
     return cache_metadata_for(
         pool.arena.runtime_contract,

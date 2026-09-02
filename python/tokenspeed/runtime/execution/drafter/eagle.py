@@ -79,7 +79,6 @@ class Eagle(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner,
-        page_staging=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -93,7 +92,6 @@ class Eagle(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            page_staging=page_staging,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -114,13 +112,6 @@ class Eagle(BaseDrafter):
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
-
-        # Persistent output buffer for the draft step's compute_out_cache_loc.
-        self.draft_out_cache_loc_buf = torch.empty(
-            (self.input_buffers.max_bs * (spec_num_steps - 1),),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -272,7 +263,6 @@ class Eagle(BaseDrafter):
             ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[:input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
@@ -309,14 +299,6 @@ class Eagle(BaseDrafter):
                 + draft_input.accept_lengths[num_extends:]
             )
 
-        # Write cache slots for steps 1..N-1.
-        cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
-        self.page_staging.out_cache_loc_uniform(
-            out=cache_locs,
-            cache_start=cache_start,
-            num_tokens=self.spec_num_steps - 1,
-        )
-        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
@@ -351,12 +333,18 @@ class Eagle(BaseDrafter):
             )
             self._attach_dsa_topk(ctx, dsa_topk)
 
-            out_cache_loc = cache_locs[:, i - 1].contiguous()
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
             _advance_draft_forward_metadata_if_supported(
                 ctx.attn_backend,
                 draft_seq_lens,
+            )
+            # Publish this step's one write slot per request (the chain's
+            # advancing position, seq_len - 1): step i writes position
+            # cache_start + (i - 1).
+            self.attn_backend.publish_draft_step_locations(
+                cache_start=positions,
+                num_tokens=1,
             )
 
             with nvtx_range("draft_forward", color="red"):
@@ -364,7 +352,6 @@ class Eagle(BaseDrafter):
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
-                    out_cache_loc=out_cache_loc,
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )

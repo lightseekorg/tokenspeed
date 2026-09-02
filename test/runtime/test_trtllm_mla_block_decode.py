@@ -6,7 +6,6 @@ from unittest import mock
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import trtllm_mla
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLMMLABackend,
@@ -31,14 +30,15 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.trtllm_workspace = torch.empty(1, dtype=torch.uint8)
     backend.device = torch.device("cpu")
     backend.max_num_pages = backend._calc_padded_blocks(backend.max_context_len)
-    backend._cache_groups_bound = False
-    backend.decode_cuda_graph_metadata = {}
-    backend.decode_cuda_graph_out_cache_loc = None
     backend.forward_decode_metadata = None
+    backend.page_table_buf = None
+    backend.seq_lens_buf = None
+    backend._decode_views_by_bs = {}
     return backend
 
 
 def test_eager_draft_page_table_is_not_expanded_twice() -> None:
+    """The router hands the leaf kernel pages; the refresh copies them as-is."""
     backend = _backend(draft_block_decode=True)
     kernel_page_table = torch.tensor([[6, 7, 10, 11, 14, 15]], dtype=torch.int32)
 
@@ -46,10 +46,8 @@ def test_eager_draft_page_table_is_not_expanded_twice() -> None:
     backend.refresh_decode_metadata(
         1,
         1,
-        torch.tensor([1], dtype=torch.int64),
         torch.tensor([12], dtype=torch.int32),
-        forward_mode=ForwardMode.DECODE,
-        page_table=kernel_page_table,
+        kernel_page_table,
     )
 
     block_table = backend.forward_decode_metadata.page_table
@@ -62,23 +60,20 @@ def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
     backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
         seq_lens=torch.tensor([1, 1], dtype=torch.int32),
-        forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
     )
     kernel_page_table = torch.tensor(
         [[6, 7, 10, 11], [14, 15, 18, 19]], dtype=torch.int32
     )
 
-    # DraftPageStaging publishes kernel pages; the replay must copy them as-is
+    # The router publishes kernel pages; the replay must copy them as-is
     # (identity), never re-expand. seq_lens fit the 4-page (page_size=2) table.
     backend.refresh_decode_metadata(
         2,
         2,
-        torch.tensor([0, 1], dtype=torch.int64),
         torch.tensor([8, 8], dtype=torch.int32),
-        forward_mode=ForwardMode.DECODE,
-        page_table=kernel_page_table,
+        kernel_page_table,
         for_graph_replay=True,
     )
 
@@ -99,11 +94,11 @@ def _layer() -> SimpleNamespace:
 
 def test_fill_block_decode_seq_lens_publishes_clamped_lengths() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.cuda_graph_seq_lens = torch.zeros(2, dtype=torch.int32)
+    backend.init_cuda_graph_state(max_bs=2)
 
     backend.fill_block_decode_seq_lens(2, torch.tensor([3, 99], dtype=torch.int32))
 
-    assert backend.cuda_graph_seq_lens.tolist() == [4, 64]
+    assert backend.seq_lens_buf.tolist() == [4, 64]
 
 
 def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> None:

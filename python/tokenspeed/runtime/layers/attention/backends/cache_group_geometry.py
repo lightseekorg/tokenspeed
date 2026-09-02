@@ -33,10 +33,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import torch
-
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
-
 
 @dataclass(frozen=True)
 class CacheGroupGeometry:
@@ -120,67 +116,4 @@ def learn_cache_group_geometry(
             if full_history is not None
             else default_granularity
         ),
-    )
-
-
-def resolve_full_history_table(
-    block_tables,
-    geometry: CacheGroupGeometry,
-    bs: int,
-    *,
-    kernel_page_size: int,
-    max_kernel_pages: int,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """This forward's full-attention table in the backend's kernel pages.
-
-    Expands the wrapper-delivered raw group table (block-granularity page
-    ids, batch-ordered rows) into kernel pages of width ``max_kernel_pages``;
-    -1 holes clamp into the null page 0's kernel range. Returns None when no
-    table was delivered (warmup placeholders, idle before binding) — the
-    caller falls back to ``page_table``. ``out`` writes the expansion into a
-    persistent buffer (its rows past the raw table's are the caller's to
-    null).
-    """
-    if not block_tables or geometry.full_history_group_id is None:
-        return None
-    raw = block_tables.get(geometry.full_history_group_id)
-    if raw is None:
-        return None
-    if raw.shape[0] < bs:
-        raise RuntimeError(
-            f"full-attention table has {raw.shape[0]} rows but the "
-            f"batch has {bs} requests"
-        )
-    return expand_history_table(
-        raw,
-        history_block_granularity=geometry.history_block_granularity
-        or kernel_page_size,
-        kernel_page_size=kernel_page_size,
-        max_kernel_pages=max_kernel_pages,
-        out=out,
-    )
-
-
-def expand_history_table(
-    raw: torch.Tensor,
-    history_block_granularity: int,
-    kernel_page_size: int,
-    max_kernel_pages: int,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Expand a batch-ordered raw table (scheduler pages of the full-history
-    grain) into kernel pages, ``max_kernel_pages`` wide.
-
-    The staged draft page table and the wrapper's group tables share this
-    one mapping (the write-location math ``table[i, pos // P] * P + pos % P``
-    is page-size invariant, so the expansion is the only grain-sensitive
-    step).
-    """
-    return expand_page_table(
-        raw,
-        block_granularity=history_block_granularity,
-        kernel_page_size=kernel_page_size,
-        max_kernel_pages=max_kernel_pages,
-        out=out,
     )

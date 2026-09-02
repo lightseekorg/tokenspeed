@@ -117,7 +117,6 @@ class GlmMoeDsaModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -157,7 +156,6 @@ class GlmMoeDsaModelNextN(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
         )
 
@@ -305,7 +303,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
@@ -313,7 +310,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
             )
         self._apply_first_step_correction(ctx)

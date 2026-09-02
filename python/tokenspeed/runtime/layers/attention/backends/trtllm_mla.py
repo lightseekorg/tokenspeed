@@ -19,9 +19,7 @@
 # SOFTWARE.
 
 """
-MLA attention backend for TokenSpeed scheduling.
-
-Uses fused kernels optimized for SM100 (Blackwell) GPUs.
+MLA attention leaf using fused kernels optimized for SM100 (Blackwell) GPUs.
 """
 
 from __future__ import annotations
@@ -40,14 +38,8 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
-    resolve_full_history_table,
-)
-from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
-    graph_verify_q_len,
-    mla_decode_out_cache_loc,
-    verify_q_len,
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -57,9 +49,6 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_DEFAULT_PAGE_SIZE,
     TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
@@ -126,31 +115,23 @@ class TRTLLMMLADecodeMetadata:
     page_table: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Cache-group path only: absolute latent write locations, request-major, with
-    # ``q_len_per_req`` entries per row (1 outside target verify).
-    out_cache_loc: torch.Tensor | None = None
+    # Verify window width baked into the graph views (1 outside target verify).
     q_len_per_req: int = 1
 
 
-class TRTLLMMLABackend(AttentionBackend):
-    """trtllm_mla attention backend using fused kernels."""
+class TRTLLMMLABackend(PagedAttentionBackend):
+    """trtllm_mla leaf using fused kernels."""
 
-    # The refresh nulls its own dummy table rows, so the wrapper must pass
-    # UNPADDED tables (no per-step F.pad).
-    tables_self_padding = True
+    default_kernel_page_size = TRTLLM_MLA_DEFAULT_PAGE_SIZE
 
-    def __init__(self, config: AttnConfig, spec: MLAConfig):
-        super().__init__(config, spec)
-
-        self.max_context_len = config.context_len
-        self.kernel_page_size = (
-            config.kernel_page_size
-            if config.kernel_page_size is not None
-            else TRTLLM_MLA_DEFAULT_PAGE_SIZE
-        )
-        # Cache-group (LCM) state. The trtllm kernel walks pages at page_size,
-        # padded to the fused-kernel block constraint (see _calc_padded_blocks).
-        self._cache_groups_bound = False
+    def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
+        if kernel_page_size not in TRTLLM_MLA_SUPPORTED_PAGE_SIZES:
+            raise ValueError(
+                f"trtllm_mla backend requires page_size 32 or 64, got {kernel_page_size}"
+            )
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        # The trtllm kernel walks pages at page_size, padded to the
+        # fused-kernel block constraint.
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
@@ -162,25 +143,20 @@ class TRTLLMMLABackend(AttentionBackend):
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.draft_block_decode = config.draft_block_decode
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         # Workspace zero-initialized for the fused kernel semaphore.
         self.trtllm_workspace = get_trtllm_workspace_buffer(config.device)
-
-        # Validate page_size
-        if self.kernel_page_size not in TRTLLM_MLA_SUPPORTED_PAGE_SIZES:
-            raise ValueError(
-                f"trtllm_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
-            )
 
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
-        self.decode_cuda_graph_metadata: dict[int, TRTLLMMLADecodeMetadata] = {}
-        self.decode_cuda_graph_page_table = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
+        self.page_table_buf: torch.Tensor | None = None
+        self.seq_lens_buf: torch.Tensor | None = None
+        self._decode_views_by_bs: dict[int, TRTLLMMLADecodeMetadata] = {}
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
@@ -190,64 +166,22 @@ class TRTLLMMLABackend(AttentionBackend):
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
 
-    def _create_page_table(
-        self,
-        batch_size: int,
-        max_blocks: int,
-        source_table: torch.Tensor,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Copy a batch-ordered kernel page table into TRTLLM metadata.
-
-        ``source_table`` is batch-ordered (row i == batch position i) and must
-        already be in this backend's kernel-page units — callers expand raw
-        scheduler tables through ``_expand_history_table`` first (warmup
-        placeholders are empty/dummy and copy as-is).
-        """
-        if out is None:
-            out = torch.zeros(
-                (batch_size, max_blocks), dtype=torch.int32, device=self.device
-            )
-        else:
-            out[:batch_size].zero_()
-
-        copy_len = min(max_blocks, source_table.shape[1])
-
-        # Pages beyond actual seq_len are 0 (from the table init); the kernel
-        # uses seq_lens to bound access so these padding entries are never read.
-        out[:batch_size, :copy_len] = source_table[:batch_size, :copy_len]
-
-        return out
-
     # ---- Metadata initialization ----
 
     def init_forward_metadata(
         self,
         bs: int,
         num_extends: int,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
         page_table: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        extend_seq_lens: torch.Tensor | None = None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
+        extend_prefix_lens: torch.Tensor | None = None,
+        extend_prefix_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
-        kwargs.pop("cache_metadata", None)
-        kwargs.pop("forward_batch", None)
-        full_history_table = resolve_full_history_table(
-            kwargs.pop("block_tables", None),
-            self._geometry,
-            bs,
-            kernel_page_size=self.kernel_page_size,
-            max_kernel_pages=self.max_num_pages,
-        )
-        if full_history_table is not None:
-            self._cache_groups_bound = True
-        elif self.is_draft and bs > 0:
-            # The drafter drives this backend directly with no group tables;
-            # the batch-ordered draft page table (row i is batch position i)
-            # carries raw scheduler pages, expanded by the decode refresh
-            # like any full-history table.
-            self._cache_groups_bound = True
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "trtllm_mla decode metadata goes through refresh_decode_metadata; "
@@ -256,28 +190,19 @@ class TRTLLMMLABackend(AttentionBackend):
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
-                req_pool_indices=req_pool_indices[:num_extends],
-                page_table=page_table,
-                extend_prefix_lens=kwargs.pop("extend_prefix_lens"),
-                extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
-                extend_seq_lens=kwargs.pop("extend_seq_lens"),
-                extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
+                page_table=page_table[:num_extends],
+                extend_prefix_lens=extend_prefix_lens[:num_extends],
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
+                extend_seq_lens=extend_seq_lens[:num_extends],
+                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
             )
         # Target mixed/idle batches carry decode rows whose metadata this
-        # init must cover. A draft's decode metadata instead comes from the
-        # wrapper's refresh_decode_metadata after this init (the unified
-        # draft contract).
+        # init must cover; the same in-place refresh serves them. A draft's
+        # decode metadata instead comes from the wrapper's refresh after this
+        # init (the unified draft contract).
         if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
-            self._init_decode_metadata(
-                bs,
-                num_extends,
-                req_pool_indices,
-                seq_lens,
-                page_table,
-                full_history_table=full_history_table,
-                q_len_per_req=verify_q_len(
-                    self.spec_num_tokens, self.is_draft, forward_mode
-                ),
+            self.refresh_decode_metadata(
+                bs, bs, seq_lens, page_table, num_extends=num_extends
             )
 
     @contextmanager
@@ -290,87 +215,14 @@ class TRTLLMMLABackend(AttentionBackend):
         finally:
             self.forward_decode_metadata.num_extends = prev
 
-    def _init_decode_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        full_history_table: torch.Tensor | None = None,
-        q_len_per_req: int = 1,
-    ):
-        # For target_verify, the draft tokens have already been written to the KV
-        # cache. The seq_lens passed in should already reflect the full context.
-        # Use max_context_len to avoid GPU->CPU sync from seq_lens.max().item()
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-
-        out_cache_loc = None
-        if full_history_table is not None:
-            # The table is already in kernel pages; copy into a buffer padded
-            # to the fused-kernel block constraint. DSA's sparse top-k slots
-            # are mapped through this same table, so it must come from the
-            # group geometry rather than the raw ``page_table`` argument.
-            page_table = self._create_page_table(bs, max_blocks, full_history_table)
-            out_cache_loc = mla_decode_out_cache_loc(
-                full_history_table,
-                seq_lens,
-                page_size=self.kernel_page_size,
-                batch_size=bs,
-                validate_pages=cache_debug_enabled(),
-                q_len_per_req=q_len_per_req,
-            )
-        else:
-            page_table = self._create_page_table(bs, max_blocks, page_table)
-
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
-            num_extends=num_extends,
-            page_table=page_table,
-            max_seq_len_k=self.max_context_len,
-            seq_lens_k=seq_lens,
-            out_cache_loc=out_cache_loc,
-            q_len_per_req=q_len_per_req,
-        )
-
-    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Table-derived latent write locations on the cache-group path.
-
-        Identity when not cache-group bound or idle. A draft owns its per-step
-        locations (it passes ``num_extends == bs`` by its own convention), so it
-        keeps the caller's. Target decode writes the whole verify window.
-        """
-        if (
-            not self._cache_groups_bound
-            or forward_mode is None
-            or forward_mode.is_idle()
-            or self.is_draft
-        ):
-            return out_cache_loc
-        if not forward_mode.is_decode():
-            return out_cache_loc
-        metadata = self.forward_decode_metadata
-        if metadata is None or metadata.out_cache_loc is None:
-            return out_cache_loc
-        locs = metadata.out_cache_loc[metadata.num_extends * metadata.q_len_per_req :]
-        if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
-            raise RuntimeError(
-                f"trtllm_mla write locations cover {locs.shape[0]} tokens but "
-                f"the caller provided {out_cache_loc.shape[0]}"
-            )
-        return locs
-
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor | None = None,
-        page_table: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
-        extend_prefix_lens_cpu: torch.Tensor | None = None,
-        extend_seq_lens: torch.Tensor | None = None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
+        page_table: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
     ):
         max_seq_len = self.max_context_len
         cum_seq_lens = torch.zeros(
@@ -392,6 +244,10 @@ class TRTLLMMLABackend(AttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        # The table is batch-ordered (row i == batch position i).
+        req_pool_indices = torch.arange(
+            num_extends, dtype=torch.int64, device=page_table.device
+        )
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -402,12 +258,7 @@ class TRTLLMMLABackend(AttentionBackend):
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table,
-            # page_table is batch-ordered (row i == batch position i).
-            torch.arange(
-                extend_prefix_lens.shape[0],
-                dtype=torch.int64,
-                device=page_table.device,
-            ),
+            req_pool_indices,
             self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
@@ -423,38 +274,23 @@ class TRTLLMMLABackend(AttentionBackend):
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
+            page_table=page_table,
         )
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int, **kwargs):
-        # Own the cache-seqlens buffer; replay copies the live lengths in, so
-        # graph state does not depend on the controller mutating a shared tensor.
-        self.cuda_graph_seq_lens = torch.zeros(
-            max_bs, dtype=torch.int32, device=self.device
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        # Own the cache-seqlens buffer; every refresh copies the live lengths
+        # in, so graph state never depends on a shared mutable tensor.
+        self.seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+        self.page_table_buf = torch.zeros(
+            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-        self.decode_cuda_graph_page_table = torch.zeros(
-            (max_bs, max_blocks), dtype=torch.int32, device=self.device
-        )
-        # Persistent write-location buffer whose address the captured graph
-        # records; replay refreshes it in place. Target verify records
-        # spec_num_tokens locations per request; a draft owns its per-step
-        # locations and never reads it (select_out_cache_loc's draft guard).
-        if not self.is_draft:
-            self.decode_cuda_graph_out_cache_loc = torch.zeros(
-                max_bs * max(1, self.spec_num_tokens),
-                dtype=torch.int64,
-                device=self.device,
-            )
-        else:
-            self.decode_cuda_graph_out_cache_loc = None
+        self._decode_views_by_bs = {}
 
-    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
-        # Pre-build the per-bs views for the base default capture (the MLA
-        # group binding is latched by refresh when tables arrive).
-        del cache_group_ids
-        self._decode_views(bs)
+    @property
+    def decode_seq_lens_buffer(self) -> torch.Tensor:
+        return self.seq_lens_buf
 
     def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
@@ -462,106 +298,43 @@ class TRTLLMMLABackend(AttentionBackend):
         One builder for capture and refresh; cached per bs — pointer-stable,
         no storage allocated.
         """
-        metadata = self.decode_cuda_graph_metadata.get(bs)
+        metadata = self._decode_views_by_bs.get(bs)
         if metadata is not None:
             return metadata
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-        capture_q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
-        out_cache_loc = None
-        if self.decode_cuda_graph_out_cache_loc is not None:
-            out_cache_loc = self.decode_cuda_graph_out_cache_loc[: bs * capture_q_len]
         metadata = TRTLLMMLADecodeMetadata(
             num_extends=0,
-            page_table=self.decode_cuda_graph_page_table[:bs, :max_blocks],
+            page_table=self.page_table_buf[:bs],
             max_seq_len_k=self.max_context_len,
-            seq_lens_k=self.cuda_graph_seq_lens[:bs],
-            out_cache_loc=out_cache_loc,
-            q_len_per_req=capture_q_len,
+            seq_lens_k=self.seq_lens_buf[:bs],
+            q_len_per_req=self.verify_floor,
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self._decode_views_by_bs[bs] = metadata
         return metadata
 
-    # Capture is inherited (base default: bind_decode_views + idle refresh).
+    # Capture is inherited (the leaf default: idle refresh over the same buffers).
 
     def refresh_decode_metadata(
         self,
         bs: int,
         actual_bs: int,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
         *,
-        forward_mode: ForwardMode,
-        page_table: torch.Tensor | None = None,
         num_extends: int = 0,
         for_graph_replay: bool = False,
-        **kwargs,
     ) -> None:
-        if forward_mode is not None and forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"trtllm_mla decode refresh not supported for {forward_mode}"
-            )
-
+        del for_graph_replay
         metadata = self._decode_views(bs)
         # The cached view bakes num_extends=0; a mixed round's decode rows
         # start after the extend rows, so publish this round's split.
         metadata.num_extends = num_extends
-
-        # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
-        # views it).
-        q_len = metadata.q_len_per_req
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-
-        # The wrapper's per-group tables refresh the block table whenever
-        # delivered — decode-only PD nodes included (they never run an extend
-        # forward, so an extend-latched gate would leave the kernel on a
-        # stale/zero block table instead of the transferred KV).
-        full_history_table = resolve_full_history_table(
-            kwargs.get("block_tables"),
-            self._geometry,
-            0,
-            kernel_page_size=self.kernel_page_size,
-            max_kernel_pages=self.max_num_pages,
-        )
-        if full_history_table is not None:
-            self._cache_groups_bound = True
-        elif self.is_draft and bs > 0 and page_table is not None:
-            # Draft: the staged batch-ordered table carries raw scheduler
-            # pages; expand into this backend's kernel pages.
-            full_history_table = self._expand_history_table(page_table[:bs])
-        if full_history_table is not None:
-            # Live tables carry one row per REAL request; the idle replay's
-            # synthesized placeholder rows are all dummies (actual_bs caps).
-            real_bs = min(int(full_history_table.shape[0]), bs, actual_bs)
-            if real_bs > 0:
-                self._create_page_table(
-                    real_bs,
-                    metadata.page_table.shape[1],
-                    full_history_table,
-                    metadata.page_table,
-                )
-            if metadata.out_cache_loc is not None and real_bs > 0:
-                mla_decode_out_cache_loc(
-                    full_history_table,
-                    self.cuda_graph_seq_lens,
-                    page_size=self.kernel_page_size,
-                    batch_size=real_bs,
-                    validate_pages=cache_debug_enabled(),
-                    out=metadata.out_cache_loc,
-                    q_len_per_req=q_len,
-                )
-            # Padded rows resolve to the null page 0.
-            metadata.page_table[real_bs:bs].zero_()
-            if metadata.out_cache_loc is not None:
-                metadata.out_cache_loc[real_bs * q_len : bs * q_len].zero_()
-        elif page_table is not None:
-            self._create_page_table(
-                bs,
-                metadata.page_table.shape[1],
-                page_table,
-                metadata.page_table,
-            )
-
+        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        # The persistent buffer is padded to the fused-kernel block constraint;
+        # columns past the router table's width stay 0 (never read: the kernel
+        # bounds access by seq_lens).
+        cols = min(page_table.shape[1], self.max_num_pages)
+        self.page_table_buf[:bs, :cols].copy_(page_table[:bs, :cols])
         self.forward_decode_metadata = metadata
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
@@ -573,7 +346,7 @@ class TRTLLMMLABackend(AttentionBackend):
         """
         if not self.draft_block_decode:
             raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
-        self.cuda_graph_seq_lens[:bs].copy_(
+        self.seq_lens_buf[:bs].copy_(
             block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
         )
 
@@ -667,6 +440,23 @@ class TRTLLMMLABackend(AttentionBackend):
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "trtllm_mla has no dense extend kernel; DeepSeek's model path runs "
+            "prefill through forward_extend_chunked"
+        )
 
     def forward_extend_chunked(
         self,

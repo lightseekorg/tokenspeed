@@ -233,7 +233,6 @@ def _refresh_decode_indexer_schedule_metadata(
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
-    cache_active_pages_must_be_real = True
     cache_consumer_families = frozenset({"history", "state"})
     # The refresh replaces metadata.cache wholesale each step (the bespoke
     # multi-group slot mapping travels on the live cache_metadata object);
@@ -419,32 +418,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 f"DeepSeek V4 cache group specs were not initialized before {phase}"
             )
-        items = list(block_tables.items())
-        delivered: list[str] = []
-        for group_id, _ in items:
-            if not isinstance(group_id, str) or not group_id:
-                raise RuntimeError(
-                    f"DeepSeek V4 {phase} cache group IDs must be nonempty strings"
-                )
-            delivered.append(group_id)
-        delivered_ids = tuple(delivered)
-        if delivered_ids != expected:
-            delivered_set = set(delivered_ids)
-            expected_set = set(expected)
-            if delivered_set == expected_set:
-                detail = f"wrong order: got={delivered_ids!r} expected={expected!r}"
-            else:
-                detail = (
-                    f"missing={sorted(expected_set - delivered_set)} "
-                    f"extra={sorted(delivered_set - expected_set)}"
-                )
-            raise RuntimeError(f"DeepSeek V4 {phase} cache group mismatch: {detail}")
+        # Consume this backend's declared groups out of the delivered dict,
+        # in contract order; extras ride to their own consumers (the runner
+        # hands every node the same complete mapping). A missing declared
+        # group is a delivery bug.
+        missing = [gid for gid in expected if gid not in block_tables]
+        if missing:
+            raise RuntimeError(
+                f"DeepSeek V4 {phase} cache group mismatch: missing={missing} "
+                f"(delivered: {sorted(map(str, block_tables))})"
+            )
+        items = [(gid, block_tables[gid]) for gid in expected]
 
         expected_device = torch.device(device)
         if expected_device.type == "cuda" and expected_device.index is None:
             expected_device = torch.device("cuda", torch.cuda.current_device())
         validated: dict[str, torch.Tensor] = {}
-        for group_id, (_, value) in zip(delivered_ids, items, strict=True):
+        for group_id, value in items:
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"DeepSeek V4 {phase} table {group_id!r} must be torch.Tensor"
@@ -819,8 +809,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "extend/mixed/idle"
             )
         dsv4_reset_attention_state()
-        cache_metadata = kwargs.pop("cache_metadata", None)
-        forward_batch = kwargs.pop("forward_batch", None)
         incoming_block_tables = kwargs.pop("block_tables", None) or {}
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         num_tokens_arg = kwargs.pop("num_tokens", None)
@@ -839,23 +827,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # layers, which have no dedicated group: the first (smallest-ratio)
         # compressed-KV full-history group's table (row i == batch position i).
         base_page_table = None
-        if cache_metadata is not None:
-            scheduler_tables = dict(
-                cache_metadata.tables(active_forward_op=forward_batch)
-            )
-            base_group_id = first_v4_compressed_kv_group_id(scheduler_tables)
-            if base_group_id is not None:
-                base_page_table = scheduler_tables[base_group_id]
-            block_tables = self._prepare_cache_group_tables(
-                scheduler_tables,
-                bs=bs,
-                actual_bs=bs,
-                seq_lens=seq_lens,
-                device=device,
-                phase="eager",
-            )
-            block_table_base_offsets = {}
-        elif incoming_block_tables:
+        if incoming_block_tables:
             base_group_id = first_v4_compressed_kv_group_id(incoming_block_tables)
             if base_group_id is not None:
                 base_page_table = incoming_block_tables[base_group_id]
@@ -2079,7 +2051,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         is_packed_decode = (
             forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
         )
-        total_tokens = self.graph.fill_packed_rows(
+        self.graph.fill_packed_rows(
             bs=bs,
             actual_bs=bs,
             tokens_per_req=tokens_per_req,
@@ -2179,8 +2151,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         dsv4_reset_attention_state()
-        cache_metadata = kwargs.pop("cache_metadata", None)
-        forward_batch = kwargs.pop("forward_batch", None)
         block_tables = kwargs.pop("block_tables", None) or {}
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         if actual_bs < 0 or actual_bs > bs:
@@ -2220,13 +2190,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # Base page table for ratio<=1 indexer layers: the first (smallest-ratio)
         # compressed-KV full-history group's batch-ordered table.
         base_page_table = None
-        if cache_metadata is not None:
-            base_group_id = first_v4_compressed_kv_group_id(cache_metadata.group_ids)
-            if base_group_id is not None:
-                base_page_table = cache_metadata.require_table(
-                    base_group_id, active_forward_op=forward_batch
-                )
-        elif block_tables:
+        if block_tables:
             base_group_id = first_v4_compressed_kv_group_id(block_tables)
             if base_group_id is not None:
                 base_page_table = block_tables[base_group_id]
@@ -2263,20 +2227,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         elif actual_bs > 0 and block_tables:
             metadata_block_tables = self._prepare_cache_group_tables(
                 block_tables,
-                bs=bs,
-                actual_bs=actual_bs,
-                seq_lens=seq_lens,
-                device=seq_lens.device,
-                phase="replay",
-                output_buffers=self.graph.block_tables,
-            )
-            metadata_base_offsets = {}
-        elif cache_metadata is not None:
-            scheduler_tables = dict(
-                cache_metadata.tables(active_forward_op=forward_batch)
-            )
-            metadata_block_tables = self._prepare_cache_group_tables(
-                scheduler_tables,
                 bs=bs,
                 actual_bs=actual_bs,
                 seq_lens=seq_lens,

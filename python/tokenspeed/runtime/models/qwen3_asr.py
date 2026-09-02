@@ -182,7 +182,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         ctx,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -211,7 +210,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

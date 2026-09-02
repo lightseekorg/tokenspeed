@@ -515,7 +515,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=None,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -838,10 +837,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        attn_output = self.attn(q, k, v, ctx)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -851,11 +849,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Full attention forward pass."""
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
+        attn_output = self._attn(q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -873,7 +870,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -889,7 +885,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -1005,7 +1000,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
@@ -1060,7 +1054,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                 )
 
             # Process deepstack embeddings if provided
@@ -1484,7 +1477,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1497,7 +1489,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             )
 
@@ -1512,7 +1503,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

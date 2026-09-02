@@ -124,7 +124,6 @@ class DFlash(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner | None = None,
-        page_staging=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -137,7 +136,6 @@ class DFlash(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            page_staging=page_staging,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -190,19 +188,12 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.page_staging is None:
-            raise ValueError("Native DFLASH requires the staged draft page table.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
         max_bs = self.input_buffers.max_bs
         self.draft_seq_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
-        )
-        self.draft_out_cache_loc_buf = torch.empty(
-            (max_bs * self.draft_query_width,),
-            dtype=torch.int32,
-            device=self.device,
         )
         # None means probed-and-unavailable; unset means not probed yet.
         self._dist_argmax_state: object = _UNSET
@@ -525,7 +516,15 @@ class DFlash(BaseDrafter):
         lengths[base_ctx.num_extends :] = self.spec_num_tokens
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
+        # The TARGET round's write vector, from the target router (the pools
+        # share one page-id space): the extend span for prefill rows, the
+        # verify window behind it for decode rows — the same token order the
+        # hidden states arrive in.
+        target_backend = base_ctx.attn_backend
+        cache_locs = target_backend.decode_window_locations()
+        if base_ctx.num_extends > 0:
+            cache_locs = torch.cat((target_backend.extend_span_locations(), cache_locs))
+        cache_locs = cache_locs[: base_ctx.input_num_tokens]
 
         decode_only = base_ctx.num_extends == 0
         if (
@@ -975,18 +974,11 @@ class DFlash(BaseDrafter):
         # NOTE: callers (run/_run_overlap) write current_tokens directly into
         # block_ids_buf[:bs, 0] before invoking _draft_native
         block_positions = self.block_positions_buf[:bs]
-        cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         if not prepared:
             torch.add(
                 prefix_lens.unsqueeze(1),
                 self.block_offsets,
                 out=block_positions,
-            )
-
-            self.page_staging.out_cache_loc_uniform(
-                out=cache_locs,
-                cache_start=prefix_lens,
-                num_tokens=self.draft_query_width,
             )
 
         is_capturing = (
@@ -1004,11 +996,20 @@ class DFlash(BaseDrafter):
                 req_pool_indices,
                 seq_lens_after,
                 forward_mode=ForwardMode.DECODE,
-                page_table=self.page_staging.table,
+                block_tables=self.round_block_tables,
                 num_extends=metadata_num_extends,
             )
         else:
             self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)
+        # The block's write window (draft_query_width slots per request at
+        # prefix..prefix+width-1). Published AFTER the refresh: the refresh
+        # republishes the verify-shaped window, and the draft model's
+        # write_locations fetch must see the block window instead. In-graph:
+        # one fused launch over the router's address-stable location stack.
+        self.attn_backend.publish_draft_step_locations(
+            cache_start=prefix_lens,
+            num_tokens=self.draft_query_width,
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -1028,7 +1029,6 @@ class DFlash(BaseDrafter):
                 ctx=ctx,
                 input_ids=flat_ids,
                 positions=block_positions.reshape(-1),
-                out_cache_loc=cache_locs,
                 captured_hidden_states=None,
                 input_embeds=input_embeds,
                 kv_sync_event=kv_sync_event,
@@ -1094,23 +1094,18 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         current_tokens = self.block_ids_buf[:bs, 0]
         if base_ctx.num_extends == 0:
-            draft_cache_locs = self.draft_out_cache_loc_buf[
-                : bs * self.draft_query_width
-            ]
-            max_draft_prefix = self.page_staging.max_tokens - self.draft_query_width
+            history = self.attn_backend.draft_history_view()
+            max_draft_prefix = history.max_tokens - self.draft_query_width
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                page_table=self.page_staging.table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
-                out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.page_staging.block_granularity,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1141,30 +1136,29 @@ class DFlash(BaseDrafter):
 
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        max_draft_prefix = self.page_staging.max_tokens - self.draft_query_width
+        history = self.attn_backend.draft_history_view()
+        max_draft_prefix = history.max_tokens - self.draft_query_width
 
         current_tokens = self.block_ids_buf[:bs, 0]
-        draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         dflash_prepare_decode(
             output_tokens=output_tokens,
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            page_table=self.page_staging.table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
-            out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.page_staging.block_granularity,
             max_draft_prefix=max_draft_prefix,
         )
 
         if not self._incremental_kv_write_done:
             # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
             positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-            cache_locs = self.input_buffers.out_cache_loc_buf[
+            # Decode-only path (see can_overlap): the target router's verify
+            # window is the round's full write vector.
+            cache_locs = base_ctx.attn_backend.decode_window_locations()[
                 : base_ctx.input_num_tokens
             ]
             main_stream = torch.cuda.current_stream()

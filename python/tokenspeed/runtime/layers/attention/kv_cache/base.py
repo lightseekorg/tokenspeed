@@ -110,6 +110,39 @@ def derive_state_groups_by_layer(
     return mapping
 
 
+def derive_paged_group_ids(
+    arena: CacheArena, *, first_layer: int, num_layers: int
+) -> tuple[str, ...]:
+    """The history-family cache groups this view's layers deposit KV in.
+
+    Read back from the planned fields like the state mapping above: a
+    group counts when some per-layer field inside the view's layer window
+    is declared in it. This is the group set a ``CacheGroupRouter`` builds
+    one paged leaf for — a draft view over a shared arena sees only the
+    groups its own layers use, never the target's whole set.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+
+    Returns:
+        Sorted group ids, possibly empty (a view with no paged layers).
+    """
+    history = {
+        str(spec.group_id)
+        for spec in arena.cache_group_specs
+        if spec.family == "history"
+    }
+    found: set[str] = set()
+    for field in arena.plan.fields:
+        if _layer_plane(field.field_id, first_layer, num_layers) is None:
+            continue
+        if field.group_id in history:
+            found.add(str(field.group_id))
+    return tuple(sorted(found))
+
+
 class CachePool(ABC):
     """One model's typed layer window onto a shared cache arena.
 
@@ -154,6 +187,16 @@ class CachePool(ABC):
             dtype,
             self._field_layer_offset,
             rank,
+        )
+
+    @property
+    def paged_group_ids(self) -> tuple[str, ...]:
+        """History-family groups this view's layers write KV into (sorted);
+        the router builds one paged leaf per id."""
+        return derive_paged_group_ids(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
         )
 
     def _field_layer_id(self, layer_id: int) -> int:

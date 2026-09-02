@@ -656,7 +656,6 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -673,7 +672,6 @@ class MiniMaxM3Attention(nn.Module):
             k,
             v,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             **attn_kwargs,
         )
         output, _ = self.o_proj(attn_output)
@@ -816,7 +814,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -837,7 +834,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1741,7 +1737,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1755,7 +1750,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             )
         if self.multimodal_embedder is None:
@@ -1776,7 +1770,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

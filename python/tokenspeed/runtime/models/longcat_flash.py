@@ -497,7 +497,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
@@ -520,7 +519,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.moe_comm,
         )
         hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
@@ -553,7 +551,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.branch_comm[1],
         )
         hidden_states, residual = self.branch_comm[1].post_attn_reduce_norm(
@@ -617,7 +614,6 @@ class _RuntimeLongcatModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: _ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
@@ -640,7 +636,6 @@ class _RuntimeLongcatModel(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                 )
 

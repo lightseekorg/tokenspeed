@@ -184,7 +184,6 @@ class BaseTransformerModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
 
@@ -226,7 +225,6 @@ class BaseTransformerModel(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                     aux_hidden_states=aux_hidden_states if capture else None,
                 )

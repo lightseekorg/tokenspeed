@@ -193,8 +193,9 @@ def test_every_hybrid_wrapper_forwards_the_sub_backend_dtype():
         checked.append(cls.__name__)
 
     # The scan is only worth anything if it reaches the wrappers K3 runs on.
-    for required in ("HybridLinearAttnBackend", "HybridKDABackend"):
-        assert required in checked, f"{required} was not reached by the scan"
+    # K3 runs on HybridLinearAttnBackend (the KDA-specific subclass was an
+    # empty shell and is gone).
+    assert "HybridLinearAttnBackend" in checked
 
 
 def test_dead_nope_query_branch_is_gone():

@@ -757,7 +757,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -799,9 +798,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
         _token_to_req = getattr(_metadata, "token_to_req_indices", None)
         if current_forward_ctx() is not None and _token_to_req is not None:
-            positions, qkv, out_cache_loc = slice_to_real_tokens(
-                _token_to_req.numel(), positions, qkv, out_cache_loc
-            )
+            positions, qkv = slice_to_real_tokens(_token_to_req.numel(), positions, qkv)
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
@@ -822,6 +819,30 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_prefill_tokens = decode_window.start
         decode_start = decode_window.start
         decode_end = decode_window.end
+
+        # The round's KV write slots, by sub-mode: the extend span for the
+        # prefill rows, the decode rows' verify window behind them. The
+        # indexer's full-round index_k write consumes the concatenation
+        # (eager-only here: this break never runs inside a captured graph).
+        backend = ctx.attn_backend
+        prefill_locs = (
+            backend.write_locations(self.attn_mqa, ForwardMode.EXTEND)
+            if num_prefill_tokens > 0
+            else None
+        )
+        decode_locs = (
+            backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            if num_decode_tokens > 0
+            else None
+        )
+        if prefill_locs is not None and decode_locs is not None:
+            out_cache_loc = torch.cat((prefill_locs, decode_locs))
+        elif prefill_locs is not None:
+            out_cache_loc = prefill_locs
+        elif decode_locs is not None:
+            out_cache_loc = decode_locs
+        else:
+            out_cache_loc = torch.empty(0, dtype=torch.int64, device=q_norm.device)
 
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
@@ -874,7 +895,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 q[:num_prefill_tokens],
                 latent_cache[:num_prefill_tokens],
                 prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
+                prefill_locs,
                 attn_output[:num_prefill_tokens],
                 prefill_topk=ctx.dsa_prefill_topk,
             )
@@ -901,7 +922,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 q[decode_start:decode_end],
                 latent_cache[decode_start:decode_end],
                 decode_ctx,
-                out_cache_loc[decode_start:decode_end],
+                decode_locs,
                 attn_output[decode_start:decode_end],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
@@ -972,7 +993,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             Q,
             K,
             ctx,
-            out_cache_loc,
             output,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
@@ -983,7 +1003,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         Q,
         K,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
@@ -997,7 +1016,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             K,
             K[..., : self.kv_lora_rank] if K is not None else None,
             ctx,
-            out_cache_loc,
             save_kv_cache=need_save_kv,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
@@ -1104,7 +1122,6 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1119,7 +1136,6 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             if ctx.accept_lengths is not None:

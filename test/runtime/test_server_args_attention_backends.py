@@ -180,7 +180,10 @@ class TestAttentionBackendChoices(unittest.TestCase):
             components=(spec,),
         )
 
-        self.assertEqual(MLAAttnBackend(config, spec).kernel_solution, "gluon")
+        self.assertEqual(
+            MLAAttnBackend(config, spec, kernel_page_size=64).kernel_solution,
+            "gluon",
+        )
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

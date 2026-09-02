@@ -106,7 +106,7 @@ def _run_fused_reduce_norm(
     state: ExecutionState,
 ) -> ExecutionState:
     hidden_states, residual = module(state.hidden_states, state.residual, state.ctx)
-    return ExecutionState(hidden_states, residual, state.ctx, state.out_cache_loc)
+    return ExecutionState(hidden_states, residual, state.ctx)
 
 
 def _run_norm(module: nn.Module, state: ExecutionState) -> ExecutionState:
@@ -115,7 +115,7 @@ def _run_norm(module: nn.Module, state: ExecutionState) -> ExecutionState:
     else:
         residual = state.hidden_states
         hidden_states = module(state.hidden_states)
-    return ExecutionState(hidden_states, residual, state.ctx, state.out_cache_loc)
+    return ExecutionState(hidden_states, residual, state.ctx)
 
 
 def _run_attention(
@@ -127,9 +127,8 @@ def _run_attention(
         positions=positions,
         hidden_states=state.hidden_states,
         ctx=state.ctx,
-        out_cache_loc=state.out_cache_loc,
     )
-    return ExecutionState(hidden_states, state.residual, state.ctx, state.out_cache_loc)
+    return ExecutionState(hidden_states, state.residual, state.ctx)
 
 
 def _run_moe(module: nn.Module, state: ExecutionState) -> ExecutionState:
@@ -139,12 +138,12 @@ def _run_moe(module: nn.Module, state: ExecutionState) -> ExecutionState:
     hidden_states = module(
         state.hidden_states, num_global_tokens, max_num_tokens_per_gpu
     )
-    return ExecutionState(hidden_states, state.residual, state.ctx, state.out_cache_loc)
+    return ExecutionState(hidden_states, state.residual, state.ctx)
 
 
 def _run_hidden_states_only(module: nn.Module, state: ExecutionState) -> ExecutionState:
     hidden_states = module(state.hidden_states)
-    return ExecutionState(hidden_states, state.residual, state.ctx, state.out_cache_loc)
+    return ExecutionState(hidden_states, state.residual, state.ctx)
 
 
 # ---------------------------------------------------------------------------

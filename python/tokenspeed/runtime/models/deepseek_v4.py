@@ -107,9 +107,11 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     fused_qnorm_rope_kv_insert,
     save_deepseek_v4_compressor_state,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-    _group_slot_mapping_from_raw,
-    _mask_invalid_graph_tokens,
+from tokenspeed.runtime.layers.attention.page_table import (
+    group_slot_mapping_from_raw as _group_slot_mapping_from_raw,
+)
+from tokenspeed.runtime.layers.attention.page_table import (
+    mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -1470,7 +1472,6 @@ def _deepseek_v4_sanitize_swa_slot_mapping(
 def _deepseek_v4_swa_slot_mapping(
     ctx: ForwardContext,
     positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
 ) -> torch.Tensor:
     """Build the SWA write-slot mapping, already sanitized for cache inserts.
 
@@ -1479,21 +1480,29 @@ def _deepseek_v4_swa_slot_mapping(
     Sanitizing here keeps the mask/clamp elementwise chain at once per step;
     doing it per layer previously baked ~7 tiny kernels x 61 layers into the
     captured decode graph.
+
+    Degraded metadata fails closed: a missing SWA table (warmup placeholders)
+    or token rows the metadata does not describe (a draft step whose
+    token_to_req does not match q's rows) map every slot to -1 — skipped
+    writes, never a mis-addressed one.
     """
     if positions.numel() == 0:
-        return out_cache_loc
+        return torch.empty(0, dtype=torch.int64, device=positions.device)
     metadata = _deepseek_v4_forward_metadata(ctx)
     if metadata is None:
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
-    if cache_metadata.swa_page_table is None:
-        slot_mapping = out_cache_loc
-    elif token_to_req_indices.numel() != positions.numel() and (
-        token_to_req_indices.numel() <= 0
-        or positions.numel() % token_to_req_indices.numel() != 0
+    if cache_metadata.swa_page_table is None or (
+        token_to_req_indices.numel() != positions.numel()
+        and (
+            token_to_req_indices.numel() <= 0
+            or positions.numel() % token_to_req_indices.numel() != 0
+        )
     ):
-        slot_mapping = out_cache_loc
+        slot_mapping = torch.full(
+            (positions.numel(),), -1, dtype=torch.int64, device=positions.device
+        )
     else:
         slot_mapping = _group_slot_mapping_from_raw(
             positions,
@@ -2245,7 +2254,6 @@ class DeepseekV4Compressor(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         layer_index: int,
         cos_sin_cache: torch.Tensor,
         *,
@@ -2816,7 +2824,6 @@ class DeepseekV4Indexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         layer_index: int,
         cos_sin_cache: torch.Tensor,
         compressor_slot_cache: dict,
@@ -2879,7 +2886,6 @@ class DeepseekV4Indexer(nn.Module):
                 hidden_states=hidden_states,
                 positions=positions,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 layer_index=layer_index,
                 cos_sin_cache=cos_sin_cache,
                 state_cache=indexer_state,
@@ -3179,7 +3185,6 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
@@ -3219,14 +3224,11 @@ class DeepseekV4Attention(nn.Module):
         # with metadata whose token_to_req_indices does NOT describe q's rows.
         token_to_req = getattr(metadata, "token_to_req_indices", None)
         if current_forward_ctx() is not None and token_to_req is not None:
-            positions, hidden_states, out_cache_loc, swa_slot_mapping = (
-                slice_to_real_tokens(
-                    token_to_req.numel(),
-                    positions,
-                    hidden_states,
-                    out_cache_loc,
-                    swa_slot_mapping,
-                )
+            positions, hidden_states, swa_slot_mapping = slice_to_real_tokens(
+                token_to_req.numel(),
+                positions,
+                hidden_states,
+                swa_slot_mapping,
             )
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
@@ -3257,11 +3259,7 @@ class DeepseekV4Attention(nn.Module):
             # Cross-layer SWA slot mapping (per-token, layer-invariant), first layer computes.
             swa_slot_mapping = ctx.dsa_swa_slot_mapping
             if swa_slot_mapping is None:
-                swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-                    ctx,
-                    positions,
-                    out_cache_loc,
-                )
+                swa_slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
                 ctx.dsa_swa_slot_mapping = swa_slot_mapping
 
         def insert_swa_cache() -> None:
@@ -3284,7 +3282,6 @@ class DeepseekV4Attention(nn.Module):
                     hidden_states=hidden_states,
                     positions=positions,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                     layer_index=self.cache_layer_index,
                     cos_sin_cache=cos_sin_cache,
                     compressor_slot_cache=compressor_slot_cache,
@@ -3317,7 +3314,6 @@ class DeepseekV4Attention(nn.Module):
                         qr=qr,
                         positions=positions,
                         ctx=ctx,
-                        out_cache_loc=out_cache_loc,
                         layer_index=self.cache_layer_index,
                         cos_sin_cache=cos_sin_cache,
                         compressor_slot_cache=compressor_slot_cache,
@@ -3496,7 +3492,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
@@ -3538,7 +3533,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 swa_slot_mapping,
                 compressor_slot_cache,
             )
@@ -3732,7 +3726,6 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_inbound: PPStageState | None = None,
     ) -> tuple[torch.Tensor | PPStageState, list[torch.Tensor] | None]:
@@ -3764,7 +3757,6 @@ class DeepseekV4Model(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 input_ids,
                 None,  # swa_slot_mapping: first break computes + caches on ctx
                 None,  # compressor_slot_cache: shared dict created on ctx

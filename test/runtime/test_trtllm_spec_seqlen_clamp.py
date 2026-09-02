@@ -13,14 +13,15 @@ Root cause analyzed in dashllm1.log (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
         to every downstream layer, including the linear-attn (mamba) layers,
         whose conv/ssm state then accumulates NaN -> accept_rate collapses.
 
-The MHA backend already guards this (``seq_lens[:bs].clamp_min(
-self.spec_num_tokens)``). This test pins the equivalent guard for the trtllm
-backend: ``_init_multi_token_metadata`` (and the CUDA-graph capture builder)
-must expose ``cache_seqlens_int32 >= spec_num_tokens`` so padded rows keep a
-non-empty causal span. Plain single-token decode (q_len=1) is unaffected.
+The guard now lives in the unified ``refresh_decode_metadata``: whenever
+speculation is on it refreshes ``spec_cache_seqlens_buf`` with
+``clamp_min(spec_num_tokens)`` and points the verify slot
+(``forward_prefill_metadata``) at it, so padded rows keep a non-empty causal
+span on every path — eager decode, capture seeding and graph replay alike.
+Plain single-token decode (the decode slot) is never clamped.
 
 The test builds a CPU-only backend (``device="cpu"``) so it needs no GPU and no
-real KV pool; it exercises the metadata builders directly.
+real KV pool; it exercises the metadata refresh directly.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.trtllm import (
     TRTLLMMHAAttnBackend,
 )
@@ -36,6 +36,7 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
 SPEC_NUM_TOKENS = 4
+PAGE = 64
 
 
 def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
@@ -50,8 +51,8 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=64,
-        kernel_page_size=64,
+        prefix_granularity=PAGE,
+        kernel_page_size=PAGE,
         context_len=4096,
         max_bs=8,
         max_graph_bs=8,
@@ -61,31 +62,27 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         is_draft=is_draft,
         components=(spec,),
     )
-    return TRTLLMMHAAttnBackend(cfg, spec)
+    return TRTLLMMHAAttnBackend(cfg, spec, kernel_page_size=PAGE)
 
 
-def _page_table(req_pool_size: int, max_pages: int) -> torch.Tensor:
-    # Each request maps to a couple of distinct page ids; row 0 is the
-    # reserved/padding row. Values are arbitrary but valid (>=0).
-    table = torch.zeros((req_pool_size + 1, max_pages), dtype=torch.int32)
-    for r in range(req_pool_size + 1):
-        table[r, 0] = r
+def _page_table(bs: int, max_pages: int) -> torch.Tensor:
+    # Batch-ordered kernel pages; values are arbitrary but valid (>= 0).
+    table = torch.zeros((bs, max_pages), dtype=torch.int32)
+    for r in range(bs):
+        table[r, 0] = r + 1
     return table
 
 
-def test_multi_token_metadata_clamps_padded_seqlen_runtime():
-    """Runtime (non-CUDA-graph) verify path clamps seq_len < spec_num_tokens."""
+def test_verify_refresh_clamps_padded_seqlen_runtime():
+    """Eager (non-graph) verify refresh clamps seq_len < spec_num_tokens."""
     be = _make_backend()
+    be.init_cuda_graph_state(8)
     bs = 4
     # Two real rows (long context) + two "padded" rows with seq_len=1, exactly
     # the layout that triggered the NaN (real_bs=2, padded to 4).
     seq_lens = torch.tensor([512, 300, 1, 1], dtype=torch.int32)
-    req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
-    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
-    be._init_multi_token_metadata(
-        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, page_table
-    )
+    be.refresh_decode_metadata(bs, 2, seq_lens, _page_table(bs, be.max_num_pages))
     cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
 
     # Every row must have at least spec_num_tokens keys so no query row in the
@@ -102,15 +99,12 @@ def test_multi_token_metadata_clamps_padded_seqlen_runtime():
 def test_clamp_does_not_mutate_shared_seq_lens():
     """The clamp must write into a private buffer, never the caller's tensor."""
     be = _make_backend()
+    be.init_cuda_graph_state(8)
     bs = 3
     seq_lens = torch.tensor([1, 1, 256], dtype=torch.int32)
     original = seq_lens.clone()
-    req_pool_indices = torch.tensor([0, 0, 1], dtype=torch.int32)
-    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
-    be._init_multi_token_metadata(
-        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, page_table
-    )
+    be.refresh_decode_metadata(bs, bs, seq_lens, _page_table(bs, be.max_num_pages))
 
     # Caller's seq_lens is unchanged; clamped values live in a separate buffer.
     assert torch.equal(seq_lens, original)
@@ -120,75 +114,64 @@ def test_clamp_does_not_mutate_shared_seq_lens():
 
 
 def test_plain_decode_seqlen_not_clamped():
-    """Plain single-token decode (q_len=1) must NOT be clamped: a seq_len of 1
-    is valid there (1 query attends to 1 key)."""
+    """The single-token decode slot (q_len=1) must NOT be clamped: a seq_len
+    of 1 is valid there (1 query attends to 1 key)."""
     be = _make_backend(is_draft=True)
     be.init_cuda_graph_state(8)
     bs = 3
     seq_lens = torch.tensor([1, 5, 9], dtype=torch.int32)
-    req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32)
 
-    # page_table=None skips the (GPU-only) page-table gather; this test pins
-    # the seq_lens handling only.
-    be.refresh_decode_metadata(
-        bs,
-        bs,
-        req_pool_indices,
-        seq_lens,
-        forward_mode=ForwardMode.DECODE,
-        page_table=None,
-    )
+    be.refresh_decode_metadata(bs, bs, seq_lens, _page_table(bs, be.max_num_pages))
     cache_seqlens = be.forward_decode_metadata.cache_seqlens_int32
 
-    # Draft decode copies seq_lens verbatim (no clamp): seq_len=1 stays 1.
+    # The decode slot copies seq_lens verbatim (no clamp): seq_len=1 stays 1.
     assert int(cache_seqlens[0]) == 1
     assert torch.equal(cache_seqlens, seq_lens[:bs])
 
 
-def test_cuda_graph_capture_builder_clamps():
-    """CUDA-graph capture builder points cache_seqlens at the clamped buffer."""
+def test_cuda_graph_capture_seeding_clamps():
+    """Capture seeding (the idle refresh) points the verify slot's
+    cache_seqlens at the clamped buffer."""
     be = _make_backend()
     max_bs = 8
     be.init_cuda_graph_state(max_bs)
 
     bs = 4
-    be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
+    # Capture seq_lens are all 1s (idle rows).
+    be.init_forward_metadata_capture_cuda_graph(
+        bs, torch.ones((max_bs,), dtype=torch.int32), _page_table(bs, be.max_num_pages)
+    )
     cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
 
     assert int(cache_seqlens.min()) >= SPEC_NUM_TOKENS
     # Must be the dedicated clamped buffer, not the plain cache-seqlens buffer.
     assert cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
-    assert cache_seqlens.data_ptr() != be.cuda_graph_seq_lens.data_ptr()
+    assert cache_seqlens.data_ptr() != be.seq_lens_buf.data_ptr()
 
 
 def test_draft_replay_refreshes_spec_cache_seqlens_buf():
-    """Draft replay must refresh spec_cache_seqlens_buf (draft step 1 is multi-token)."""
+    """Draft replay must refresh spec_cache_seqlens_buf (draft step 1 is
+    multi-token) through the same unified refresh."""
     be = _make_backend(is_draft=True)
     max_bs = 8
     be.init_cuda_graph_state(max_bs)
 
     bs = 4
-    # At capture time, seq_lens are all 1s (padded rows).
-    capture_seq_lens = torch.ones((max_bs,), dtype=torch.int32)
-    # Capture: multi-token metadata (step 1) + decode metadata (steps 2+).
-    be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
-    be._init_decode_metadata_capture(bs, capture_seq_lens)
-
-    # At capture, spec_cache_seqlens_buf was seeded from all-ones → clamped to 4.
+    # Capture: seq_lens are all 1s (idle rows) -> clamped to spec.
+    be.init_forward_metadata_capture_cuda_graph(
+        bs, torch.ones((max_bs,), dtype=torch.int32), _page_table(bs, be.max_num_pages)
+    )
     capture_vals = be.spec_cache_seqlens_buf[:bs].clone()
     assert int(capture_vals.min()) >= SPEC_NUM_TOKENS
-    assert int(capture_vals[0]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
+    assert int(capture_vals[0]) == SPEC_NUM_TOKENS  # 1 -> clamped to 4
 
     # Replay with real seq_lens (two real rows + two padded).
     real_seq_lens = torch.tensor([512, 300, 1, 1], dtype=torch.int32)
-    req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
     be.refresh_decode_metadata(
         bs,
-        bs,
-        req_pool_indices,
+        2,
         real_seq_lens,
-        forward_mode=ForwardMode.DECODE,
-        page_table=None,  # skip page-table gather (Triton kernel)
+        _page_table(bs, be.max_num_pages),
         for_graph_replay=True,
     )
 
@@ -196,8 +179,8 @@ def test_draft_replay_refreshes_spec_cache_seqlens_buf():
     replay_vals = be.spec_cache_seqlens_buf[:bs]
     assert int(replay_vals[0]) == 512  # real, no clamp needed
     assert int(replay_vals[1]) == 300  # real, no clamp needed
-    assert int(replay_vals[2]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
-    assert int(replay_vals[3]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
+    assert int(replay_vals[2]) == SPEC_NUM_TOKENS  # 1 -> clamped to 4
+    assert int(replay_vals[3]) == SPEC_NUM_TOKENS  # 1 -> clamped to 4
 
     # forward_prefill_metadata must point at spec_cache_seqlens_buf.
     prefill_cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32

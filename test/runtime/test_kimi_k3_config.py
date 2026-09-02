@@ -183,6 +183,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         backend = SimpleNamespace(
             spec_num_tokens=1,
             chunked_prefill_metadata=metadata,
+            write_locations=lambda layer, mode: torch.arange(4),
         )
         ctx = ForwardContext(
             attn_backend=backend,
@@ -196,6 +197,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.nn.Module.__init__(attention)
         attention.num_local_heads = 2
         attention.v_head_dim = 3
+        attention.attn_mha = SimpleNamespace(group_id="full_attention")
         attention.forward_normal_chunked = mock.Mock()
         attention.forward_absorb = mock.Mock()
 
@@ -205,7 +207,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             q=torch.empty(4, 2, 8),
             latent_cache=torch.empty(4, 1, 8),
             ctx=ctx,
-            out_cache_loc=torch.arange(4),
             output_gate=output_gate,
         )
 
@@ -409,7 +410,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                             positions=torch.empty(rows, dtype=torch.int64),
                             hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
                             ctx=ctx,
-                            out_cache_loc=torch.empty(0, dtype=torch.int64),
                             comm_manager=None,
                         )
 

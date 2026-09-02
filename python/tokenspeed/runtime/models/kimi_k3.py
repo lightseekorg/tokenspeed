@@ -571,7 +571,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
@@ -604,7 +603,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             q,
             latent_cache,
             ctx,
-            out_cache_loc,
             output_gate=gate if fuse_value_gate else None,
             absorbed_query=absorbed_query,
         )
@@ -1188,7 +1186,6 @@ class KimiLinearKDA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
@@ -1228,7 +1225,6 @@ class KimiLinearKDA(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -2209,7 +2205,6 @@ class KimiLinearDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one AttnRes launch on each side of the attention collective."""
@@ -2228,7 +2223,6 @@ class KimiLinearDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=h,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.comm_manager,
             attnres_partial_args=None,
         )
@@ -2308,7 +2302,6 @@ class KimiLinearDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._fused_attnres_graph_available(hidden_states, block_residual):
@@ -2316,7 +2309,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 block_residual,
             )
 
@@ -2424,7 +2416,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=h,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
             )
@@ -2665,7 +2656,6 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_inbound: PPStageState | None = None,
         **kwargs,
@@ -2705,7 +2695,7 @@ class KimiLinearModel(nn.Module):
         for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
             layer = self.layers[layer_idx]
             prefix_sum, block_residual = layer(
-                positions, prefix_sum, ctx, out_cache_loc, block_residual
+                positions, prefix_sum, ctx, block_residual
             )
             if capture_dflash and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
@@ -3354,7 +3344,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         ctx: "ForwardContext",
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         if self.language_model is None:
@@ -3369,7 +3358,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

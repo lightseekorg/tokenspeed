@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends.mamba import (
     MambaAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.qsa import bind_qsa_indexers

@@ -22,7 +22,6 @@
 
 from collections.abc import Sequence
 
-import torch
 from torch import nn
 
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -76,10 +75,11 @@ class PagedAttention(nn.Module):
         k,
         v,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        """Run this layer's attention; KV write locations come from the
+        backend (``write_locations``), never from the caller."""
         if k is not None:
             # For cross-layer sharing, kv can be None
             if v is None:
@@ -96,7 +96,6 @@ class PagedAttention(nn.Module):
             k,
             v,
             self,
-            out_cache_loc,
             ctx.token_to_kv_pool,
             ctx.forward_mode,
             ctx.bs,

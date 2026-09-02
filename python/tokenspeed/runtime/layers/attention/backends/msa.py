@@ -18,13 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MiniMax sparse attention backend and dense/sparse router."""
+"""MiniMax sparse attention leaf and the dense/sparse hybrid composite."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,8 +44,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
-    learn_cache_group_geometry,
+from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
@@ -58,8 +58,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 from tokenspeed.runtime.layers.attention.registry import (
     register_backend,
 )
-from tokenspeed.runtime.layers.attention.utils import build_page_table
-from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -77,8 +75,7 @@ class MSAExtendMetadata:
     #   cu_seqlens_kv: the cumsum version of seq_lens
     # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
-    # page_table is None on the cache path (per-group page_tables route reads).
-    page_table: torch.Tensor | None
+    page_table: torch.Tensor
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
@@ -91,98 +88,27 @@ class MSAExtendMetadata:
     seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
-    # Per-group page tables (group_id -> [num_reqs, max_pages]); None on
-    # the cache path (DFLASH block-decode drafts still use it).
-    page_tables: dict[str, torch.Tensor] | None = None
-    # Per-group KV write locations (group_id -> [num_tokens] int32),
-    # built with page_tables — same groups, same lifecycle.
-    out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(kw_only=True)
 class MSADecodeMetadata:
-    # page_table is None on the cache path (per-group page_tables route reads).
-    page_table: torch.Tensor | None
+    page_table: torch.Tensor
     seq_lens: torch.Tensor
-    # Per-group tables/write-locs; see MSAExtendMetadata.
-    page_tables: dict[str, torch.Tensor] | None = None
-    out_cache_locs: dict[str, torch.Tensor] | None = None
-    # Per-forward view of the backend's shared decode score buffer, pre-filled
-    # with -inf and reused by every sparse layer. None on paths that keep the
-    # per-layer allocation (draft/DFLASH, or before the buffer is allocated).
+    # Per-forward view of the leaf's shared decode score buffer, pre-filled
+    # with -inf and reused by every sparse layer.
     score_out: torch.Tensor | None = None
 
 
-class MSAAttnBackend(AttentionBackend):
-    """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
+class MSAAttnBackend(PagedAttentionBackend):
+    """MiniMax sparse attention leaf routed through tokenspeed_kernel APIs."""
 
-    # The refresh nulls its own dummy table rows, so the wrapper must pass
-    # UNPADDED tables (no per-step F.pad).
-    tables_self_padding = True
+    default_kernel_page_size = MSA_PAGE_SIZE
 
-    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
-        """Pre-build the per-bs views with the capture-time group set pinned,
-        so the base default capture records the exact per-group views the
-        refresh repoints at."""
-        if cache_group_ids:
-            # Verify keeps [bs]-row tables plus [bs*N] location views.
-            assert not (
-                self.draft_block_decode and self.spec_num_tokens > 1
-            ), "cache_group_ids is unsupported with DFLASH block decode"
-        self._decode_views(bs, cache_group_ids=cache_group_ids)
+    def __init__(self, config: AttnConfig, spec: MSAConfig, *, kernel_page_size: int):
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
 
-    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Per-group write locations for out-of-backend KV writers (fused
-        RoPE prewrite): the write must land in the pages this layer's group
-        reads, never the scheduler's single-table locations. Draft chains own
-        their per-step locations, so they must keep the caller-provided
-        tensor."""
-        metadata = self._prewrite_metadata(forward_mode)
-        if metadata is None or metadata.out_cache_locs is None:
-            return out_cache_loc
-        return self._select_out_cache_loc(
-            layer, metadata, out_cache_loc, prefer_caller=self.is_draft
-        )
-
-    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
-        """Re-anchor the k-row decode metadata to the committed frontier:
-        seq_lens becomes ``frontier`` and the grouped write locs cover
-        positions ``frontier-k..frontier-1``. Accept-dependent, so pure
-        tensor ops recomputed per graph replay; the next metadata init
-        resets."""
-        md = self.forward_decode_metadata
-        fields = {"seq_lens": frontier}
-        if md.out_cache_locs is not None:
-            fields["out_cache_locs"] = self._compute_decode_out_cache_locs(
-                md.page_tables,
-                frontier,
-                self.spec_num_tokens,
-            )
-        self.forward_decode_metadata = replace(md, **fields)
-
-    # Unconditional: safety comes from the publication rule
-    # (kv_cache.recipes.publish) plus the replay
-    # stale-table guard. drop the flag.
-
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        return False
-
-    def __init__(self, config: AttnConfig, spec: MSAConfig) -> None:
-        super().__init__(config, spec)
-
-        # Static information needed for metadata construction and kernel dispatch
-        self.max_context_len = config.context_len
-        self.kernel_page_size = (
-            config.kernel_page_size
-            if config.kernel_page_size is not None
-            else MSA_PAGE_SIZE
-        )
-        self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
         self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
-        self.head_dim = spec.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_fp8 = self.kv_cache_dtype in (
@@ -201,9 +127,11 @@ class MSAAttnBackend(AttentionBackend):
         # (whole block in one decode forward), with uniform non-causal seq_lens.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MSADecodeMetadata | None = None
         self.forward_extend_metadata: MSAExtendMetadata | None = None
+        self.page_table_buf: torch.Tensor | None = None
+        self.seq_lens_buf: torch.Tensor | None = None
+        self._decode_views_by_bs: dict[int, MSADecodeMetadata] = {}
 
         # Persistent decode index-score buffer, shared across sparse layers so
         # the indexer's -inf tail is reset once per forward instead of a
@@ -231,17 +159,14 @@ class MSAAttnBackend(AttentionBackend):
         self,
         bs: int,
         num_extends: int,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
-        # Warmup/placeholder callers omit the extend arrays, so they must be
-        # optional.
+        *,
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
-        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
@@ -256,27 +181,6 @@ class MSAAttnBackend(AttentionBackend):
         assert extend_prefix_lens_cpu is not None
 
         seq_lens = seq_lens[:bs]
-
-        page_tables = self._consumed_group_tables(block_tables)
-        out_cache_locs = None
-        if page_tables:
-            # The cache path routes every read/write through the per-group
-            # tables; a shared single page_table would be dead work.
-            page_table = None
-            out_cache_locs = self._compute_extend_out_cache_locs(
-                page_tables,
-                extend_prefix_lens_cpu[:bs],
-                extend_seq_lens_cpu[:bs],
-            )
-            self._maybe_check_group_write_locs(page_tables, out_cache_locs)
-            page_tables = self._kernel_page_tables(page_tables)
-        else:
-            page_table = build_page_table(
-                req_pool_indices[:bs],
-                page_table,
-                self.kernel_page_size,
-                self.max_context_len,
-            )
 
         # Create cumulative sum of the sequence lengths for Q and KV.
         extend_seq_lens = extend_seq_lens[:bs]
@@ -299,7 +203,7 @@ class MSAAttnBackend(AttentionBackend):
         seq_lens_cpu = [p + e for p, e in zip(prefix_lens_cpu, extend_seq_lens_cpu)]
 
         self.forward_extend_metadata = MSAExtendMetadata(
-            page_table=page_table,
+            page_table=page_table[:bs],
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
             cu_extend_seq_lens=cu_extend_seq_lens,
@@ -310,154 +214,78 @@ class MSAAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
-            page_tables=page_tables,
-            out_cache_locs=out_cache_locs,
         )
 
-    def init_cuda_graph_state(
-        self,
-        max_bs: int,
-        cache_group_specs: Sequence = (),
-        **kwargs,
-    ):
-        # State-family groups (GDN/mamba pages) belong to the mamba backend;
-        # learn their ids from the pool's specs so every table/location path
-        # here (eager, capture, replay) sheds them.
-        self._geometry = learn_cache_group_geometry(
-            cache_group_specs, default_granularity=self.kernel_page_size
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        rows = max_bs * (self.spec_num_tokens if self.block_decode_active else 1)
+        self.page_table_buf = torch.zeros(
+            (rows, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-
-        self.cuda_graph_decode_metadata = {}
-        # Per-group persistent buffers, lazily allocated at first
-        # capture. parallels cuda_graph_page_table.
-        # Initialized before the DFLASH early return: replay reads the dict
-        # unconditionally for the stale-table guard.
-        self._init_group_graph_buffers(max_bs)
-        if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block: expand to spec_num_tokens decode rows per
-            # request (one row per block position), so max_seqlen_q == 1 per row
-            # and every block query attends over the whole block (non-causal).
-            self.cuda_graph_page_table, self.cuda_graph_seq_lens = (
-                self._make_spec_metadata_buffers(max_bs, self.device)
-            )
-            self.cuda_graph_page_table.zero_()
-            # seq_lens are filled from the live draft length inside the captured
-            # graph; seed a valid baseline so any pre-broadcast read stays in range.
-            self.cuda_graph_seq_lens.fill_(self.spec_num_tokens)
-            return
-        self.cuda_graph_page_table = torch.zeros(
-            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
+        # Own the cache-seqlens buffer; under block decode the drafter fills
+        # it in-graph, so seed a valid baseline.
+        self.seq_lens_buf = torch.full(
+            (rows,),
+            self.spec_num_tokens if self.block_decode_active else 0,
+            dtype=torch.int32,
+            device=self.device,
         )
-        # Own the cache-seqlens buffer; replay copies the live lengths in.
-        self.cuda_graph_seq_lens = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=self.device
-        )
+        self._decode_views_by_bs = {}
 
-    def _decode_views(
-        self,
-        bs: int,
-        cache_group_ids: tuple[str, ...] | None = None,
-    ) -> MSADecodeMetadata:
-        """Per-bs decode metadata views over the persistent buffers.
+    @property
+    def decode_seq_lens_buffer(self) -> torch.Tensor:
+        return self.seq_lens_buf
 
-        One builder for capture and refresh; cached per bs — pointer-stable,
-        no storage allocated. ``cache_group_ids`` pins the group set at
-        capture time; lazy callers reuse it.
-        """
-        if cache_group_ids is not None:
-            self._decode_view_group_ids = cache_group_ids
-        metadata = self.cuda_graph_decode_metadata.get(bs)
-        if metadata is not None:
-            return metadata
-        if self.draft_block_decode and self.spec_num_tokens > 1:
-            expanded_bs = bs * self.spec_num_tokens
-            metadata = MSADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:expanded_bs, :],
-                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-            )
-        else:
-            gids = getattr(self, "_decode_view_group_ids", None)
-            if gids is None:
-                gids = tuple(self.cuda_graph_page_tables)
-            page_tables, out_cache_locs = self._capture_group_views(
-                bs,
-                gids,
-                tokens_per_req=self.tokens_per_req,
-            )
-            metadata = MSADecodeMetadata(
-                # Grouped captures route reads through the per-group tables;
-                # the shared single page_table is never filled on that path.
-                page_table=(
-                    None
-                    if page_tables is not None
-                    else self.cuda_graph_page_table[:bs, :]
-                ),
-                seq_lens=self.cuda_graph_seq_lens[:bs],
-                page_tables=page_tables,
-                out_cache_locs=out_cache_locs,
-                score_out=self.decode_score_buffer[: bs * self.tokens_per_req],
-            )
-        self.cuda_graph_decode_metadata[bs] = metadata
+    def _decode_views(self, bs: int) -> MSADecodeMetadata:
+        """Per-bs decode metadata views over the persistent buffers; one
+        builder for capture and refresh, cached per bs — pointer-stable."""
+        metadata = self._decode_views_by_bs.get(bs)
+        if metadata is None:
+            if self.block_decode_active:
+                rows = bs * self.spec_num_tokens
+                metadata = MSADecodeMetadata(
+                    page_table=self.page_table_buf[:rows],
+                    seq_lens=self.seq_lens_buf[:rows],
+                )
+            else:
+                metadata = MSADecodeMetadata(
+                    page_table=self.page_table_buf[:bs],
+                    seq_lens=self.seq_lens_buf[:bs],
+                    score_out=self.decode_score_buffer[: bs * self.tokens_per_req],
+                )
+            self._decode_views_by_bs[bs] = metadata
         return metadata
 
-    # Capture is inherited (base default: bind_decode_views + idle refresh).
-    # It relies on the runner seeding capture seq_lens >= the verify floor:
-    # the refresh below copies them without a clamp.
+    # Capture is inherited (the leaf default: idle refresh over the same
+    # buffers). It relies on the runner seeding capture seq_lens >= the
+    # verify floor: the refresh below copies them without a clamp.
 
     def refresh_decode_metadata(
         self,
         bs: int,
         actual_bs: int,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
         *,
-        forward_mode: ForwardMode,
-        page_table: torch.Tensor | None = None,
         num_extends: int = 0,
         for_graph_replay: bool = False,
-        block_tables: dict[str, torch.Tensor] | None = None,
-        **kwargs,
     ) -> None:
-        assert not forward_mode.is_extend_or_mixed()
-
-        if self.draft_block_decode and self.spec_num_tokens > 1:
+        del num_extends
+        if self.block_decode_active:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block rows. The staged table carries raw
-            # scheduler pages — expand into kernel pages first. Under replay
-            # the block-end seq_lens are re-derived inside the captured graph
+            # spec_num_tokens block rows. Under replay the block-end seq_lens
+            # are re-derived inside the captured graph
             # (fill_block_decode_seq_lens); eager fills them here.
-            base_page_table = self._expand_history_table(page_table[:bs])
-            self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
-                bs, self.spec_num_tokens, self.max_num_pages
-            ).copy_(base_page_table[:, None, :])
-            # Eager has no in-graph writer; the capture default's idle
-            # refresh (actual_bs == 0) must seed the same safe baseline the
-            # recorded fill_block_decode_seq_lens overwrites on replay.
+            spec = self.spec_num_tokens
+            self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(
+                page_table[:bs, None, :]
+            )
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = self._decode_views(bs)
             return
 
-        # Every pool publishes at least one history group now, so the
-        # per-group capture buffers always exist; the pre-LCM single-table
-        # gather has no remaining producer. The actual_bs == 0 arm (capture
-        # seeding / idle) computes nothing over live rows, so group-less unit
-        # fixtures may pass through it.
-        if not self.cuda_graph_page_tables and actual_bs > 0:
-            raise RuntimeError(
-                "MSA decode without per-group capture buffers: the pool "
-                "published no cache groups, which the LCM contract forbids"
-            )
-        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
-
-        if block_tables:
-            self._fill_group_graph_buffers(
-                bs,
-                block_tables,
-                self.cuda_graph_seq_lens,
-                tokens_per_req=self.tokens_per_req,
-            )
-
+        self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
         # Reset the shared score buffer to -inf before the forward; the
         # score kernels overwrite only visible blocks, leaving the tail.
@@ -495,14 +323,6 @@ class MSAAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        out_cache_loc = self._select_out_cache_loc(
-            layer,
-            metadata,
-            out_cache_loc,
-        )
-        page_table = self._select_page_table(layer, metadata)
-        if page_table is None:
-            raise RuntimeError("MSA decode requires a page table.")
         self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         k_cache, v_cache, index_k_cache = self._get_sparse_caches(
             layer, token_to_kv_pool
@@ -520,7 +340,7 @@ class MSAAttnBackend(AttentionBackend):
             v_cache=v_cache,
             index_k_cache=index_k_cache,
             slot_mapping=out_cache_loc,
-            page_table=page_table,
+            page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             topk=self.index_topk_blocks,
             page_size=self.kernel_page_size,
@@ -576,11 +396,7 @@ class MSAAttnBackend(AttentionBackend):
         index_q = index_q[:real_tokens]
         index_k = index_k[:real_tokens]
 
-        out_cache_loc = self._select_out_cache_loc(layer, metadata, out_cache_loc)
         out_cache_loc = out_cache_loc[:real_tokens]
-        page_table = self._select_page_table(layer, metadata)
-        if page_table is None:
-            raise RuntimeError("MSA prefill requires a page table.")
         self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         k_cache, v_cache, index_k_cache = self._get_sparse_caches(
             layer, token_to_kv_pool
@@ -595,7 +411,7 @@ class MSAAttnBackend(AttentionBackend):
             v_cache=v_cache,
             index_k_cache=index_k_cache,
             slot_mapping=out_cache_loc,
-            page_table=page_table,
+            page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             cu_seqlens_q=metadata.cu_extend_seq_lens,
             prefix_lens=metadata.extend_prefix_lens,
@@ -628,7 +444,7 @@ class MSAAttnBackend(AttentionBackend):
     ) -> None:
         if k is None:
             return
-        k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
+        k, v = trim_kv_to_locs(out_cache_loc, k, v)
 
         if (
             self.kv_cache_dtype == torch.float8_e4m3fn
@@ -670,57 +486,6 @@ class MSAAttnBackend(AttentionBackend):
         )
         return k_cache, v_cache
 
-    def _make_spec_metadata_buffers(
-        self,
-        bs: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        expanded_bs = bs * self.spec_num_tokens
-        cuda_graph_page_table = torch.empty(
-            (expanded_bs, self.max_num_pages),
-            dtype=torch.int32,
-            device=device,
-        )
-        cuda_graph_seq_lens = torch.empty(
-            (expanded_bs,),
-            dtype=torch.int32,
-            device=device,
-        )
-        return (cuda_graph_page_table, cuda_graph_seq_lens)
-
-    def _fill_spec_metadata_uniform(
-        self,
-        expanded_page_table: torch.Tensor,
-        expanded_seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        """Expand spec metadata with a uniform (non-causal) seq_len per row.
-
-        Replicates the full seq_len to all spec_num_tokens rows of a request so
-        each row decodes with max_seqlen_q == 1 over the whole block. Used by the
-        DFLASH drafter so every block query attends over the entire block
-        (non-causal block-diffusion drafting), as opposed to the target's
-        unexpanded causal multi-query verify path.
-        """
-        bs = seq_lens.shape[0]
-        spec_num_tokens = self.spec_num_tokens
-        expanded_page_table = expanded_page_table.view(
-            bs, spec_num_tokens, self.max_num_pages
-        )
-        expanded_page_table.copy_(page_table[:, None, :])
-        # Clamp to max_context_len so the draft decode never asks the attention
-        # kernel for more than max_num_pages worth of page-table columns. The
-        # block-end length is prefix + spec_num_tokens, which can exceed
-        # max_context_len for a request near the context limit; without the
-        # clamp the kernel reads page_table[:, >= max_num_pages] out of bounds
-        # (CUDA illegal memory access). Mirrors fill_block_decode_seq_lens on the
-        # cuda-graph path (this eager path is taken by mixed prefill+decode
-        # batches even when cuda graphs are enabled).
-        expanded_seq_lens.view(bs, spec_num_tokens).copy_(
-            seq_lens.clamp(spec_num_tokens, self.max_context_len)[:, None]
-        )
-
     def _get_sparse_caches(self, layer: PagedAttention, token_to_kv_pool):
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         k_cache = k_cache.permute(0, 2, 1, 3)
@@ -742,51 +507,45 @@ class MSAAttnBackend(AttentionBackend):
 
 
 class MSAHybridAttnBackend(AttentionBackend):
-    """Minimax hybrid attention backend that dispatches to either a dense or sparse backend per layer."""
+    """MiniMax hybrid composite: one router of dense leaves and one of sparse
+    leaves over the same history groups, dispatched per layer id."""
 
     def __init__(self, config: AttnConfig, spec: MSAConfig) -> None:
         from tokenspeed.runtime.layers.attention.registry import (
-            _create_attn_backend_with_name,
+            create_paged_router,
         )
 
         super().__init__(config, spec)
-        full_attn_backend = _create_attn_backend_with_name(
-            spec.full_attn_backend_name,
-            AttentionArch.MHA,
+        self.full_router = create_paged_router(
             config,
+            AttentionArch.MHA,
+            backend_name=spec.full_attn_backend_name,
         )
-        sparse_attn_backend = MSAAttnBackend(config, spec)
-        self.full_attn_backend = full_attn_backend
-        self.sparse_attn_backend = sparse_attn_backend
-        self.sparse_layer_ids = sparse_attn_backend.sparse_layer_ids
+        self.sparse_router = create_paged_router(
+            config,
+            AttentionArch.MSA,
+            backend_name="msa_leaf",
+        )
+        self.sparse_layer_ids = spec.sparse_layer_ids
         logger.info(
             "Created MiniMax hybrid attention backend: %d dense layers, "
-            "%d sparse layers (dense=%s, sparse=%s)",
+            "%d sparse layers",
             len(spec.compute_layer_types) - len(spec.sparse_layer_ids),
             len(spec.sparse_layer_ids),
-            type(full_attn_backend).__name__,
-            type(sparse_attn_backend).__name__,
         )
 
-    def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
+    def _router_for_layer(self, layer_id: int):
         if layer_id in self.sparse_layer_ids:
-            return self.sparse_attn_backend
-        return self.full_attn_backend
+            return self.sparse_router
+        return self.full_router
 
     def child_backends(self) -> tuple[AttentionBackend, ...]:
-        return (self.full_attn_backend, self.sparse_attn_backend)
-
-    @property
-    def cache_consumer_families(self) -> frozenset[str]:
-        """Cache families consumed by the dense and sparse children."""
-        return frozenset(self.full_attn_backend.cache_consumer_families) | frozenset(
-            self.sparse_attn_backend.cache_consumer_families
-        )
+        return (self.full_router, self.sparse_router)
 
     def set_cache_pool(self, cache_pool) -> None:
         self.cache_pool = cache_pool
-        self.full_attn_backend.set_cache_pool(cache_pool)
-        self.sparse_attn_backend.set_cache_pool(cache_pool)
+        self.full_router.set_cache_pool(cache_pool)
+        self.sparse_router.set_cache_pool(cache_pool)
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -795,36 +554,57 @@ class MSAHybridAttnBackend(AttentionBackend):
         del forward_mode
         return False
 
+    def write_locations(self, layer, forward_mode):
+        return self._router_for_layer(layer.layer_id).write_locations(
+            layer, forward_mode
+        )
+
     def init_forward_metadata(self, *args, **kwargs):
-        self.full_attn_backend.init_forward_metadata(*args, **kwargs)
-        self.sparse_attn_backend.init_forward_metadata(*args, **kwargs)
+        self.full_router.init_forward_metadata(*args, **kwargs)
+        self.sparse_router.init_forward_metadata(*args, **kwargs)
 
-    def init_cuda_graph_state(
-        self,
-        max_bs: int,
-        **kwargs,
-    ) -> None:
-        self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
-        self.sparse_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+    def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+        self.full_router.init_cuda_graph_state(max_bs, **kwargs)
+        self.sparse_router.init_cuda_graph_state(max_bs, **kwargs)
 
-    # Capture is inherited: the base default binds and refreshes through the
-    # two fan-outs below, and both children are default-capture themselves.
-
-    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
-        self.full_attn_backend.bind_decode_views(bs, cache_group_ids)
-        self.sparse_attn_backend.bind_decode_views(bs, cache_group_ids)
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        self.full_router.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.sparse_router.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
 
     def refresh_decode_metadata(self, *args, **kwargs) -> None:
-        self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
-        self.sparse_attn_backend.refresh_decode_metadata(*args, **kwargs)
+        self.full_router.refresh_decode_metadata(*args, **kwargs)
+        self.sparse_router.refresh_decode_metadata(*args, **kwargs)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        self.full_attn_backend.advance_draft_forward_metadata(seq_lens)
-        self.sparse_attn_backend.advance_draft_forward_metadata(seq_lens)
+        self.full_router.advance_draft_forward_metadata(seq_lens)
+        self.sparse_router.advance_draft_forward_metadata(seq_lens)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        self.full_router.update_draft_forward_metadata(frontier)
+        self.sparse_router.update_draft_forward_metadata(frontier)
+
+    def draft_history_view(self):
+        return self.full_router.draft_history_view()
+
+    def draft_write_locations_uniform(self, out, cache_start, num_tokens):
+        return self.full_router.draft_write_locations_uniform(
+            out, cache_start, num_tokens
+        )
+
+    def publish_draft_step_locations(self, cache_start, num_tokens):
+        # Both routers must present the step window: sparse layers write KV too.
+        self.sparse_router.publish_draft_step_locations(cache_start, num_tokens)
+        return self.full_router.publish_draft_step_locations(cache_start, num_tokens)
+
+    def decode_window_locations(self):
+        return self.full_router.decode_window_locations()
+
+    def extend_span_locations(self):
+        return self.full_router.extend_span_locations()
 
     def configure_runtime(self, **kwargs) -> None:
-        self.full_attn_backend.configure_runtime(**kwargs)
-        self.sparse_attn_backend.configure_runtime(**kwargs)
+        self.full_router.configure_runtime(**kwargs)
+        self.sparse_router.configure_runtime(**kwargs)
 
     def register_step_counter(self, step_counter) -> None:
         # The hybrid backend records exactly one step per model layer.
@@ -837,7 +617,6 @@ class MSAHybridAttnBackend(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         forward_mode: ForwardMode,
         bs: int,
@@ -854,10 +633,12 @@ class MSAHybridAttnBackend(AttentionBackend):
         if forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
-        backend = self._backend_for_layer(layer.layer_id)
+        router = self._router_for_layer(layer.layer_id)
+        out_cache_loc = router.write_locations(layer, forward_mode)
+        leaf = router._leaf_for(layer)
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
-                return backend.forward_decode(
+                return leaf.forward_decode(
                     q,
                     k,
                     v,
@@ -868,7 +649,7 @@ class MSAHybridAttnBackend(AttentionBackend):
                     save_kv_cache=save_kv_cache,
                     **kwargs,
                 )
-            return backend.forward_extend(
+            return leaf.forward_extend(
                 q,
                 k,
                 v,
@@ -881,21 +662,8 @@ class MSAHybridAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def forward_decode(
-        self, q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
-    ):
-        return self._backend_for_layer(layer.layer_id).forward_decode(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
-        )
 
-    def forward_extend(
-        self, q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
-    ):
-        return self._backend_for_layer(layer.layer_id).forward_extend(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
-        )
-
-
+register_backend("msa_leaf", {AttentionArch.MSA}, MSAAttnBackend)
 register_backend(
     "msa",
     {AttentionArch.MSA},

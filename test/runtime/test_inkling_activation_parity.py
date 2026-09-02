@@ -307,7 +307,7 @@ class _Harness:
             num_extends=1,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            page_table=self.page_table,
+            block_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=seq_lens,
             extend_seq_lens_cpu=torch.tensor([T]),
@@ -334,7 +334,7 @@ class _Harness:
             req_pool_indices,
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            page_table=self.page_table,
+            block_table=self.page_table,
             block_tables={
                 **self.conv_tables,
                 "full_attention": self.page_table[REQ_SLOT : REQ_SLOT + 1],

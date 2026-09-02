@@ -128,62 +128,30 @@ def compute_out_cache_loc_kernel(
         tl.store(output_ptrs, cache_locs, mask=mask)
 
 
-def compute_out_cache_loc(
-    out_cache_loc_ptr,
-    input_lengths: torch.Tensor,  # [batch_size]
-    cache_start: torch.Tensor,  # [batch_size]
-    page_table: torch.Tensor,  # [batch_size, max_pages], batch-ordered
-    page_size: int,
-) -> None:
-    batch_size = input_lengths.shape[0]
-    max_pages = page_table.shape[1]
-
-    cumsum_lengths = torch.cumsum(input_lengths, dim=0)
-
-    BLOCK_SIZE = 128
-    grid = (batch_size,)
-
-    compute_out_cache_loc_kernel[grid](
-        input_lengths,
-        cache_start,
-        page_table,
-        cumsum_lengths,
-        out_cache_loc_ptr,
-        0,  # uniform_input_length unused when input_lengths_ptr is not None
-        page_size=page_size,
-        max_pages=max_pages,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-
 @triton.jit(do_not_specialize=["max_pages"])
 def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]
     valid_cache_lengths_ptr,  # [req_pool_size+1]
-    page_table_ptr,  # [batch_size, max_pages], batch-ordered
     # Outputs
-    out_cache_loc_ptr,  # [batch_size * uniform_input_length]
     positions_ptr,  # [batch_size * uniform_input_length]
     seq_lens_out_ptr,  # [batch_size]
     # Scalars
     uniform_input_length,
-    page_size: tl.constexpr,
-    max_pages,  # runtime: constexpr here recompiles per page-table width
     BLOCK_SIZE: tl.constexpr,
 ):
-    """One launch fuses the decode-uniform path's four small kernels.
+    """One launch fuses the decode-uniform path's small prep kernels.
 
     Replaces:
       valid_cache_lengths.index_select(0, req_pool_indices)
-      compute_out_cache_loc_uniform
       compute_position_triton (decode branch)
       torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
 
     Each program handles one request. We do one GMEM read of
     `valid_cache_lengths[pool_idx]` (runtime state is pool-indexed) and reuse
-    it for the seq_lens write, the position writes, and the out_cache_loc
-    page-table lookup; the page table itself is batch-ordered.
+    it for the seq_lens write and the position writes. KV write locations are
+    NOT produced here — the attention backends own all slot math
+    (CacheGroupRouter / write_locations).
     """
     req_idx = tl.program_id(0)
     pool_idx = tl.load(req_pool_indices_ptr + req_idx)
@@ -199,60 +167,33 @@ def fused_decode_input_prep_kernel(
         block_start = block_idx * BLOCK_SIZE
         token_offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = token_offsets < uniform_input_length
-
-        positions_local = cache_start + token_offsets
-        page_indices = positions_local // page_size
-        overflow = page_indices >= max_pages
-        # Clamp to last valid page to avoid OOB GMEM read.
-        page_indices = tl.minimum(page_indices, max_pages - 1)
-        offsets_in_page = positions_local % page_size
-
-        page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
-        page_ids = tl.load(page_ptrs, mask=mask, other=0)
-        cache_locs = page_ids * page_size + offsets_in_page
-        # Route overflow tokens to slot 0 (fixed safe dummy target).
-        cache_locs = tl.where(overflow, 0, cache_locs)
-
-        tl.store(
-            out_cache_loc_ptr + output_offset + token_offsets,
-            cache_locs,
-            mask=mask,
-        )
         tl.store(
             positions_ptr + output_offset + token_offsets,
-            positions_local,
+            cache_start + token_offsets,
             mask=mask,
         )
 
 
 def fused_decode_input_prep(
-    out_cache_loc_ptr,
     positions_ptr,
     seq_lens_out_ptr,
     req_pool_indices: torch.Tensor,  # [batch_size]
     valid_cache_lengths: torch.Tensor,  # [req_pool_size+1]
     uniform_input_length: int,
-    page_table: torch.Tensor,  # [batch_size, max_pages], batch-ordered
-    page_size: int,
 ) -> None:
-    """Decode-only fast path: one Triton launch writes out_cache_loc,
-    positions, and seq_lens, reading `valid_cache_lengths[pool_idx]`
-    directly so the per-iter indexSelect + add are gone too.
+    """Decode-only fast path: one Triton launch writes positions and
+    seq_lens, reading `valid_cache_lengths[pool_idx]` directly so the
+    per-iter indexSelect + add are gone too.
     """
     batch_size = req_pool_indices.shape[0]
-    max_pages = page_table.shape[1]
     BLOCK_SIZE = 128
     grid = (batch_size,)
     fused_decode_input_prep_kernel[grid](
         req_pool_indices,
         valid_cache_lengths,
-        page_table,
-        out_cache_loc_ptr,
         positions_ptr,
         seq_lens_out_ptr,
         uniform_input_length,
-        page_size=page_size,
-        max_pages=max_pages,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -263,15 +204,11 @@ def dflash_prepare_decode_kernel(
     accept_lengths_ptr,
     req_pool_indices_ptr,
     valid_cache_lengths_ptr,
-    page_table_ptr,
     draft_seq_lens_ptr,
     block_ids_ptr,
     block_positions_ptr,
-    out_cache_loc_ptr,
     verify_width: tl.constexpr,
     draft_query_width: tl.constexpr,
-    page_size: tl.constexpr,
-    max_pages,  # runtime: constexpr here recompiles per page-table width
     max_draft_prefix,
     block_ids_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -299,39 +236,25 @@ def dflash_prepare_decode_kernel(
         mask=mask,
     )
 
-    page_indices = positions // page_size
-    overflow = page_indices >= max_pages
-    page_indices = tl.minimum(page_indices, max_pages - 1)
-    offsets_in_page = positions % page_size
-    # The drafter's page table is batch-ordered (row i == batch position i).
-    page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
-    page_ids = tl.load(page_ptrs, mask=mask, other=0)
-    cache_locs = page_ids * page_size + offsets_in_page
-    cache_locs = tl.where(overflow, 0, cache_locs)
-    tl.store(
-        out_cache_loc_ptr + req_idx * draft_query_width + offsets,
-        cache_locs,
-        mask=mask,
-    )
-
 
 def dflash_prepare_decode(
     output_tokens: torch.Tensor,
     accept_lengths: torch.Tensor,
     req_pool_indices: torch.Tensor,
     valid_cache_lengths: torch.Tensor,
-    page_table: torch.Tensor,
     draft_seq_lens: torch.Tensor,
     block_ids: torch.Tensor,
     block_positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
     verify_width: int,
     draft_query_width: int,
-    page_size: int,
     max_draft_prefix: int,
 ) -> None:
+    """Advance the DFLASH block anchor in one launch: the committed prefix
+    length (clamped to the draft table's capacity), the anchor token, and the
+    block's positions. Write locations are NOT computed here — the drafter
+    publishes the block window through the draft router
+    (``publish_draft_step_locations``), the single slot-math owner."""
     batch_size = req_pool_indices.shape[0]
-    max_pages = page_table.shape[1]
     BLOCK_SIZE = triton.next_power_of_2(draft_query_width)
     grid = (batch_size,)
     dflash_prepare_decode_kernel[grid](
@@ -339,15 +262,11 @@ def dflash_prepare_decode(
         accept_lengths,
         req_pool_indices,
         valid_cache_lengths,
-        page_table,
         draft_seq_lens,
         block_ids,
         block_positions,
-        out_cache_loc,
         verify_width=verify_width,
         draft_query_width=draft_query_width,
-        page_size=page_size,
-        max_pages=max_pages,
         max_draft_prefix=max_draft_prefix,
         block_ids_stride=block_ids.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,

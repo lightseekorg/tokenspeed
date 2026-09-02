@@ -20,14 +20,17 @@
 
 """Unified decode path invariants (docs/design/unified_path.md).
 
-CPU-only checks of the single-decode-path contract:
+CPU-only checks of the single-decode-path contract over the router + leaf
+architecture:
 
-* eager refresh and padded graph refresh write the SAME persistent buffers
-  and produce identical live rows (eager is "refresh + forward", replay is
-  "refresh + graph.replay()");
+* eager refresh and padded graph refresh write the SAME persistent leaf
+  buffers and produce identical live rows (eager is "refresh + forward",
+  replay is "refresh + graph.replay()");
 * per-bs metadata views are pointer-stable and lazily built for a bs never
   captured (the above-ladder decode path);
-* the persistent buffers are sized by max decode bs, not the capture ladder.
+* the persistent buffers are sized by max decode bs, not the capture ladder;
+* every leaf class carries the uniform leaf signature, every runner-facing
+  node the runner signature (conformance).
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     CacheGroupGeometry,
 )
@@ -49,15 +53,7 @@ from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
 MAX_DECODE_BS = 8
 LADDER_BS = 4  # capture ladder max, deliberately below MAX_DECODE_BS
 MAX_NUM_PAGES = 6
-
-
-def _decode_mode():
-    return SimpleNamespace(
-        is_mixed=lambda: False,
-        is_extend_or_mixed=lambda: False,
-        is_idle=lambda: False,
-        is_decode_or_idle=lambda: True,
-    )
+FULL = "full_attention"
 
 
 class _TorchCase(unittest.TestCase):
@@ -69,7 +65,11 @@ class _TorchCase(unittest.TestCase):
         self.torch = torch
 
 
-class _MhaCase(_TorchCase):
+class _RouterCase(_TorchCase):
+    """A single-group router over a real MHA leaf, buffers sized by
+    MAX_DECODE_BS (the wrapper passes max_decode_bs to
+    init_cuda_graph_state, never the capture-ladder max)."""
+
     def setUp(self):
         super().setUp()
         try:
@@ -78,52 +78,53 @@ class _MhaCase(_TorchCase):
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        torch = self.torch
-        backend = MHAAttnBackend.__new__(MHAAttnBackend)
-        backend.spec_num_tokens = 1
-        backend.is_draft = False
-        backend.draft_block_decode = False
-        backend.engine_owned_group_ids = frozenset()
-        backend._geometry = CacheGroupGeometry(
-            granularities={"full_attention": 2}, history_block_granularity=2
+        from tokenspeed.runtime.layers.attention.backends.router import (
+            CacheGroupRouter,
         )
-        backend.max_num_pages = MAX_NUM_PAGES
-        backend.kernel_page_size = 2
-        backend.device = "cpu"
-        backend.cuda_graph_decode_metadata = {}
-        # Buffers sized by MAX_DECODE_BS (the wrapper passes max_decode_bs to
-        # init_cuda_graph_state, never the capture-ladder max).
-        backend.cuda_graph_page_table = torch.zeros(
-            (MAX_DECODE_BS, MAX_NUM_PAGES), dtype=torch.int32
-        )
-        backend.cuda_graph_seq_lens = torch.ones(MAX_DECODE_BS, dtype=torch.int32)
-        backend._init_group_graph_buffers(MAX_DECODE_BS)
-        self.backend = backend
 
-    def _tables(self, bs):
         torch = self.torch
-        return {
-            "full_attention": (
-                torch.arange(1, bs * 2 + 1, dtype=torch.int32).reshape(bs, 2)
-            )
-        }
+        leaf = MHAAttnBackend.__new__(MHAAttnBackend)
+        leaf.spec_num_tokens = 1
+        leaf.is_draft = False
+        leaf.draft_block_decode = False
+        leaf.max_num_pages = MAX_NUM_PAGES
+        leaf.max_context_len = MAX_NUM_PAGES * 2
+        leaf.kernel_page_size = 2
+        leaf.device = "cpu"
+        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router.bind(
+            CacheGroupGeometry(
+                granularities={FULL: 2},
+                families={FULL: "history"},
+                full_history_group_id=FULL,
+                history_block_granularity=2,
+            ),
+            {FULL: leaf},
+        )
+        router.init_cuda_graph_state(MAX_DECODE_BS)
+        self.router = router
+        self.leaf = leaf
+        del torch
+
+    def _tables(self, rows):
+        torch = self.torch
+        return {FULL: torch.arange(1, rows * 2 + 1, dtype=torch.int32).reshape(rows, 2)}
 
     def _refresh(self, bs, actual_bs, seq_lens, replay):
         torch = self.torch
-        self.backend.refresh_decode_metadata(
+        self.router.refresh_decode_metadata(
             bs,
             actual_bs,
             torch.arange(bs, dtype=torch.int64),
             seq_lens,
-            forward_mode=_decode_mode(),
-            page_table=torch.zeros((bs, MAX_NUM_PAGES), dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(actual_bs) if actual_bs else self._tables(bs),
             for_graph_replay=replay,
-            block_tables=self._tables(actual_bs),
         )
-        return self.backend.forward_decode_metadata
+        return self.leaf.forward_decode_metadata
 
 
-class EagerMatchesPaddedReplayTest(_MhaCase):
+class EagerMatchesPaddedReplayTest(_RouterCase):
     def test_live_rows_identical_across_paths(self):
         torch = self.torch
         seq = torch.tensor([5, 4], dtype=torch.int32)
@@ -131,81 +132,65 @@ class EagerMatchesPaddedReplayTest(_MhaCase):
         # Padded graph refresh: 2 live rows in a 4-row graph batch.
         padded_seq = torch.cat([seq, torch.ones(2, dtype=torch.int32)])
         self._refresh(LADDER_BS, 2, padded_seq, replay=True)
-        replay_tables = {
-            gid: buf[:2].clone()
-            for gid, buf in self.backend.cuda_graph_page_tables.items()
-        }
-        replay_locs = {
-            gid: buf[:2].clone()
-            for gid, buf in self.backend.cuda_graph_out_cache_locs.items()
-        }
+        replay_table = self.leaf.page_table_buf[:2].clone()
+        replay_locs = self.router.write_locations(
+            SimpleNamespace(group_id=FULL, layer_id=0), ForwardMode.DECODE
+        )[:2].clone()
         # Padded rows landed on the null page.
-        for buf in self.backend.cuda_graph_page_tables.values():
-            self.assertTrue((buf[2:LADDER_BS] == 0).all())
+        self.assertTrue((self.leaf.page_table_buf[2:LADDER_BS] == 0).all())
 
         # Eager refresh at the true bs (unpadded) over the same buffers.
         md = self._refresh(2, 2, seq, replay=False)
-        for gid in replay_tables:
-            torch.testing.assert_close(
-                self.backend.cuda_graph_page_tables[gid][:2], replay_tables[gid]
-            )
-            torch.testing.assert_close(
-                self.backend.cuda_graph_out_cache_locs[gid][:2], replay_locs[gid]
-            )
-        # Metadata views the SAME persistent storage on both paths.
-        self.assertEqual(
-            md.page_tables["full_attention"].data_ptr(),
-            self.backend.cuda_graph_page_tables["full_attention"].data_ptr(),
+        torch.testing.assert_close(self.leaf.page_table_buf[:2], replay_table)
+        torch.testing.assert_close(
+            self.router.write_locations(
+                SimpleNamespace(group_id=FULL, layer_id=0), ForwardMode.DECODE
+            )[:2],
+            replay_locs,
         )
+        # Metadata views the SAME persistent storage on both paths.
+        self.assertEqual(md.page_table.data_ptr(), self.leaf.page_table_buf.data_ptr())
 
 
-class AboveLadderDecodeTest(_MhaCase):
+class AboveLadderDecodeTest(_RouterCase):
     def test_refresh_serves_bs_above_capture_ladder(self):
         torch = self.torch
         bs = MAX_DECODE_BS  # above LADDER_BS: no graph exists, same refresh
         seq = torch.arange(3, 3 + bs, dtype=torch.int32)
         md = self._refresh(bs, bs, seq, replay=False)
         self.assertEqual(md.seq_lens.shape[0], bs)
-        torch.testing.assert_close(self.backend.cuda_graph_seq_lens[:bs], seq)
+        torch.testing.assert_close(self.leaf.seq_lens_buf[:bs], seq)
         # Lazy per-bs views: built once, pointer-stable on the next refresh.
         md2 = self._refresh(bs, bs, seq + 1, replay=False)
         self.assertIs(md2, md)
 
 
-class DefaultCaptureTest(_MhaCase):
-    """The base default capture (bind views + idle refresh) over a real
-    cache-group backend: it binds the same cached per-bs views a refresh
-    binds, seeds the same buffers, and is idempotent across the capture-time
-    re-init sequence (4 warmups + 2 re-inits per capture)."""
+class DefaultCaptureTest(_RouterCase):
+    """The default capture (idle fill + leaf idle refresh) over a real
+    router: it binds the same cached per-bs views a refresh binds, seeds
+    the same buffers, and is idempotent across the capture-time re-init
+    sequence (4 warmups + 2 re-inits per capture)."""
 
     def _default_capture(self, bs, seq_lens):
-        from tokenspeed.runtime.layers.attention.backends.base import (
-            AttentionBackend,
-        )
-
         torch = self.torch
-        # Explicitly the BASE default: exercises the inherited capture even
-        # while a backend still carries a bespoke override.
-        AttentionBackend.init_forward_metadata_capture_cuda_graph(
-            self.backend,
+        placeholder = {FULL: torch.zeros((bs, 1), dtype=torch.int32)}
+        self.router.init_forward_metadata_capture_cuda_graph(
             bs,
             torch.arange(bs, dtype=torch.int64),
             seq_lens,
-            _decode_mode(),
-            cache_group_ids=("full_attention",),
-            page_table=torch.zeros((bs, MAX_NUM_PAGES), dtype=torch.int32),
+            ForwardMode.DECODE,
+            block_tables=placeholder,
         )
-        return self.backend.forward_decode_metadata
+        return self.leaf.forward_decode_metadata
 
     def test_capture_binds_cached_views_and_seeds_buffers(self):
         torch = self.torch
         seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
         md = self._default_capture(LADDER_BS, seq)
-        self.assertIs(md, self.backend.cuda_graph_decode_metadata[LADDER_BS])
-        torch.testing.assert_close(self.backend.cuda_graph_seq_lens[:LADDER_BS], seq)
-        # Idle refresh: no live tables were read, group buffers stay null.
-        for buf in self.backend.cuda_graph_page_tables.values():
-            self.assertTrue((buf[:LADDER_BS] == 0).all())
+        self.assertIs(md, self.leaf._decode_views_by_bs[LADDER_BS])
+        torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], seq)
+        # Idle fill: no live tables were read, leaf buffers stay null.
+        self.assertTrue((self.leaf.page_table_buf[:LADDER_BS] == 0).all())
 
     def test_capture_is_idempotent_and_pointer_stable(self):
         from tokenspeed.runtime.execution.graph_ptr_guard import (
@@ -215,10 +200,10 @@ class DefaultCaptureTest(_MhaCase):
         torch = self.torch
         seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
         md = self._default_capture(LADDER_BS, seq)
-        snap = snapshot_graph_metadata(self.backend)
+        snap = snapshot_graph_metadata(self.router)
         for _ in range(5):
             self.assertIs(self._default_capture(LADDER_BS, seq), md)
-        self.assertEqual(snapshot_graph_metadata(self.backend), snap)
+        self.assertEqual(snapshot_graph_metadata(self.router), snap)
 
     def test_replay_refresh_rebinds_the_captured_views(self):
         torch = self.torch
@@ -228,18 +213,18 @@ class DefaultCaptureTest(_MhaCase):
         self.assertIs(self._refresh(LADDER_BS, 2, padded_seq, replay=True), md)
 
 
-class CaptureSignatureConformanceTest(_TorchCase):
-    """Every backend's capture accepts the full runner kwarg set.
+class LeafSignatureConformanceTest(_TorchCase):
+    """Every paged leaf class carries the uniform leaf contract.
 
-    The runner passes cache_group_ids / page_table (and V4's placeholder
-    kwargs) whenever the pool publishes them; a bespoke override with a
-    narrower signature TypeErrors at boot on exactly the configs that need
-    it (the DSA wrapper shipped that bug once)."""
+    The router calls every leaf with the same positional/keyword shape; a
+    narrower bespoke signature TypeErrors on exactly the configs that need
+    it. Runner-facing nodes (router, composites, V4, state) are checked
+    against the runner kwarg set separately below.
+    """
 
-    _BACKEND_CLASSES = (
+    _LEAF_CLASSES = (
         ("tokenspeed.runtime.layers.attention.backends.mha", "MHAAttnBackend"),
         ("tokenspeed.runtime.layers.attention.backends.msa", "MSAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAHybridAttnBackend"),
         ("tokenspeed.runtime.layers.attention.backends.trtllm", "TRTLLMMHAAttnBackend"),
         ("tokenspeed.runtime.layers.attention.backends.mla", "MLAAttnBackend"),
         ("tokenspeed.runtime.layers.attention.backends.trtllm_mla", "TRTLLMMLABackend"),
@@ -249,19 +234,94 @@ class CaptureSignatureConformanceTest(_TorchCase):
         ),
         ("tokenspeed.runtime.layers.attention.backends.flashmla", "FlashMLABackend"),
         ("tokenspeed.runtime.layers.attention.backends.dsa", "DSABackend"),
+    )
+
+    def _classes(self):
+        import importlib
+
+        for module_name, cls_name in self._LEAF_CLASSES:
+            try:
+                yield getattr(importlib.import_module(module_name), cls_name)
+            except (ImportError, ModuleNotFoundError) as exc:
+                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
+
+    def test_every_leaf_is_a_paged_attention_backend(self):
+        from tokenspeed.runtime.layers.attention.backends.paged import (
+            PagedAttentionBackend,
+        )
+
+        for cls in self._classes():
+            with self.subTest(backend=cls.__name__):
+                self.assertTrue(issubclass(cls, PagedAttentionBackend))
+
+    def test_constructor_takes_injected_kernel_page_size(self):
+        import inspect
+
+        for cls in self._classes():
+            with self.subTest(backend=cls.__name__):
+                sig = inspect.signature(cls.__init__)
+                param = sig.parameters.get("kernel_page_size")
+                self.assertIsNotNone(param, f"{cls.__name__} lacks kernel_page_size")
+                self.assertEqual(param.kind, param.KEYWORD_ONLY)
+
+    def test_refresh_signature_binds_the_leaf_call_shape(self):
+        import inspect
+
+        for cls in self._classes():
+            with self.subTest(backend=cls.__name__):
+                sig = inspect.signature(cls.refresh_decode_metadata)
+                try:
+                    # (self, bs, actual_bs, seq_lens, page_table, ...)
+                    sig.bind(
+                        None, 8, 8, None, None, num_extends=0, for_graph_replay=True
+                    )
+                except TypeError as exc:
+                    self.fail(f"{cls.__name__}.refresh_decode_metadata: {exc}")
+
+    def test_init_forward_metadata_binds_the_leaf_call_shape(self):
+        import inspect
+
+        for cls in self._classes():
+            with self.subTest(backend=cls.__name__):
+                sig = inspect.signature(cls.init_forward_metadata)
+                try:
+                    # (self, bs, num_extends, seq_lens, page_table, mode, ...)
+                    sig.bind(
+                        None,
+                        8,
+                        8,
+                        None,
+                        None,
+                        None,
+                        extend_seq_lens=None,
+                        extend_seq_lens_cpu=None,
+                        extend_prefix_lens=None,
+                        extend_prefix_lens_cpu=None,
+                        extend_with_prefix=False,
+                    )
+                except TypeError as exc:
+                    self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
+
+
+class RunnerSignatureConformanceTest(_TorchCase):
+    """Every runner-facing node accepts the runner's kwarg set."""
+
+    _RUNNER_CLASSES = (
+        ("tokenspeed.runtime.layers.attention.backends.router", "CacheGroupRouter"),
+        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAHybridAttnBackend"),
         (
             "tokenspeed.runtime.layers.attention.backends.deepseek_v4",
             "DeepseekV4AttentionBackend",
         ),
         (
-            "tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn",
+            "tokenspeed.runtime.layers.attention.backends.mamba",
             "MambaAttnBackend",
         ),
         (
-            "tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn",
+            "tokenspeed.runtime.layers.attention.backends.hybrid",
             "HybridLinearAttnBackend",
         ),
-        ("tokenspeed.runtime.layers.attention.backends.hybrid_kda", "KdaAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.kda", "KdaAttnBackend"),
         ("tokenspeed.runtime.layers.attention.backends.inkling", "InklingAttnBackend"),
         (
             "tokenspeed.runtime.layers.attention.backends.qwen4_exp",
@@ -273,7 +333,7 @@ class CaptureSignatureConformanceTest(_TorchCase):
         import importlib
         import inspect
 
-        for module_name, cls_name in self._BACKEND_CLASSES:
+        for module_name, cls_name in self._RUNNER_CLASSES:
             try:
                 cls = getattr(importlib.import_module(module_name), cls_name)
             except (ImportError, ModuleNotFoundError) as exc:
@@ -282,17 +342,7 @@ class CaptureSignatureConformanceTest(_TorchCase):
             with self.subTest(backend=cls_name):
                 try:
                     # (self, bs, req_pool_indices, seq_lens, forward_mode, ...)
-                    sig.bind(
-                        None,
-                        8,
-                        None,
-                        None,
-                        None,
-                        cache_group_ids=("full_attention",),
-                        page_table=None,
-                        block_tables=None,
-                        num_tokens=8,
-                    )
+                    sig.bind(None, 8, None, None, None, block_tables={}, num_tokens=8)
                 except TypeError as exc:
                     self.fail(
                         f"{cls_name}.init_forward_metadata_capture_cuda_graph "
@@ -300,13 +350,10 @@ class CaptureSignatureConformanceTest(_TorchCase):
                     )
 
     def test_init_cuda_graph_state_signatures_bind_the_runner_kwarg_set(self):
-        # The runner passes the same extras to every backend, unfiltered
-        # (the old signature-probing helper is gone); a narrower signature
-        # TypeErrors at boot.
         import importlib
         import inspect
 
-        for module_name, cls_name in self._BACKEND_CLASSES:
+        for module_name, cls_name in self._RUNNER_CLASSES:
             try:
                 cls = getattr(importlib.import_module(module_name), cls_name)
             except (ImportError, ModuleNotFoundError) as exc:
@@ -385,10 +432,11 @@ class GraphPtrGuardWalkTest(_TorchCase):
         self.assertIn("_Wrapper._StubBackend.forward_decode_metadata.stable", set(snap))
 
 
-class MhaPtrGuardTest(_MhaCase):
-    """The guard over a real backend's refresh: the positive arm pins the
-    per-bs view cache, the negative arm is the address-freezing bug class
-    (buffer reallocated, views lazily rebuilt over fresh storage)."""
+class RouterPtrGuardTest(_RouterCase):
+    """The guard over a real router refresh: the positive arm pins the
+    per-bs view cache (leaf metadata + router write-loc views), the
+    negative arm is the address-freezing bug class (buffer reallocated,
+    views lazily rebuilt over fresh storage)."""
 
     def setUp(self):
         super().setUp()
@@ -411,23 +459,28 @@ class MhaPtrGuardTest(_MhaCase):
 
     def test_refresh_keeps_captured_identities(self):
         self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
-        snap = self.snapshot(self.backend)
+        snap = self.snapshot(self.router)
+        # The router's write-loc views are part of the walked surface.
+        self.assertTrue(
+            any("decode_write_locations" in path for path in snap),
+            sorted(snap),
+        )
         # Fresh lengths, same buffers: replay refresh must not move anything.
         self._refresh(LADDER_BS, 2, self._padded_seq() + 1, replay=True)
-        self.verify(self.backend, snap, context="test")
+        self.verify(self.router, snap, context="test")
 
     def test_reallocated_buffer_breaches_the_guard(self):
         torch = self.torch
         self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
-        snap = self.snapshot(self.backend)
+        snap = self.snapshot(self.router)
         # The bug class the guard exists for: a persistent buffer is
         # reallocated and the per-bs views are lazily rebuilt over the new
         # storage — the captured graph keeps reading the old addresses.
-        self.backend.cuda_graph_seq_lens = torch.ones(MAX_DECODE_BS, dtype=torch.int32)
-        self.backend.cuda_graph_decode_metadata.clear()
+        self.leaf.seq_lens_buf = torch.ones(MAX_DECODE_BS, dtype=torch.int32)
+        self.leaf._decode_views_by_bs.clear()
         self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
         with self.assertRaisesRegex(RuntimeError, r"seq_lens"):
-            self.verify(self.backend, snap, context="test")
+            self.verify(self.router, snap, context="test")
 
 
 if __name__ == "__main__":

@@ -174,7 +174,7 @@ class ForwardStepRunner:
     Callers always use the same interface::
 
         output_tokens, output_lengths, output_logprobs = runner(
-            bs, ctx, sampling_info, page_table,
+            bs, ctx, sampling_info, block_table,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
     """
@@ -193,15 +193,9 @@ class ForwardStepRunner:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
-        page_table: torch.Tensor | None = None,
         decode_graph_supported: bool = True,
     ):
         self.config = config
-        # The executor's address-stable staged full-history table — the same
-        # object every live __call__ passes as page_table. Capture hands it
-        # to the backends so the default capture's idle refresh runs the very
-        # arm replay runs (its dummy rows are zero at capture time).
-        self.page_table = page_table
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -263,6 +257,31 @@ class ForwardStepRunner:
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
+
+        # One placeholder table set serves capture, the idle replay and any
+        # pre-contract warmup: per published group, a zero (null-page) table
+        # of the full capture width — always-contract delivery, so no backend
+        # carries a "no tables" arm. Allocated once, sliced per call.
+        self._placeholder_tables = {
+            str(spec.group_id): torch.zeros(
+                (
+                    self.max_decode_bs,
+                    compute_max_logical_pages_for_capture(
+                        spec,
+                        max_context_len=(
+                            self.max_tokens_per_req * self.max_decode_bs
+                            if self.context_len <= 0
+                            else self.context_len
+                        ),
+                        max_tokens_per_req=self.max_tokens_per_req,
+                        overlap_schedule_depth=self.overlap_schedule_depth,
+                    ),
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for spec in token_to_kv_pool.arena.cache_group_specs
+        }
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
@@ -616,243 +635,37 @@ class ForwardStepRunner:
         finally:
             _is_cuda_graph_phase = old_cuda_graph_phase
 
-    def _capture_group_block_tables(self, bs: int, pool) -> dict | None:
-        specs = tuple(pool.arena.cache_group_specs)
-        if not specs:
-            return None
-        out = {}
-        for spec in specs:
-            max_pages = compute_max_logical_pages_for_capture(
-                spec,
-                max_context_len=(
-                    self.max_tokens_per_req * self.max_decode_bs
-                    if self.context_len <= 0
-                    else self.context_len
-                ),
-                max_tokens_per_req=self.max_tokens_per_req,
-                overlap_schedule_depth=self.overlap_schedule_depth,
-            )
-            out[str(spec.group_id)] = torch.zeros(
-                (bs, max_pages),
-                dtype=torch.int32,
-                device=self.device,
-            )
-        return out
+    def placeholder_block_tables(self, bs: int) -> dict[str, torch.Tensor]:
+        """Per-group placeholder tables for capture / idle / warmup forwards.
 
-    def _cache_group_ids(self, pool) -> tuple[str, ...]:
-        """Group ids for per-group CUDA-graph capture: real tables only
-        arrive at replay, so capture needs just the ids to allocate its
-        persistent per-group buffers."""
-        return tuple(str(spec.group_id) for spec in pool.arena.cache_group_specs)
-
-    def _draft_cache_group_ids(self) -> tuple[str, ...]:
-        """Per-group page tables consumed by the drafter.
-
-        DFLASH block decode owns an independent draft page table and must stay
-        on that single-table path. Other draft heads share the target's
-        page-id space (EAGLE writes its own pool tensors at the same indices),
-        so each draft group consumes the target tables for the cache families
-        declared by its backend.
-
-        A draft pool that publishes its own specs (Inkling MTP: mixed full/SWA
-        depths) names exactly the groups its layers carry. Older draft paths
-        without a separate pool select the same families from the target pool.
+        Every published group gets a full-width zero table (null page 0,
+        always safe to dereference): the delivery contract holds on every
+        path, so no backend needs a "no tables" arm. Slices of one persistent
+        allocation — address-stable across captures and replays.
         """
-        if self.draft_attn_backend is None:
-            return ()
-        if self.draft_attn_backend.draft_block_decode:
-            return ()
-        families = frozenset(
-            getattr(
-                self.draft_attn_backend,
-                "cache_consumer_families",
-                ("history",),
-            )
-        )
-        draft_arena = getattr(self.draft_token_to_kv_pool, "arena", None)
-        draft_specs = getattr(draft_arena, "cache_group_specs", ())
-        if draft_specs:
-            return tuple(
-                str(spec.group_id) for spec in draft_specs if spec.family in families
-            )
-        return tuple(
-            str(spec.group_id)
-            for spec in self.token_to_kv_pool.arena.cache_group_specs
-            if spec.family in families
-        )
-
-    def _draft_group_tables(self, block_tables):
-        """Subset of the target's per-group tables the drafter consumes."""
-        gids = self._draft_cache_group_ids()
-        if not gids or not block_tables:
-            return None
-        subset = {gid: block_tables[gid] for gid in gids if gid in block_tables}
-        return subset or None
+        return {gid: table[:bs] for gid, table in self._placeholder_tables.items()}
 
     def _init_capture_metadata(self, bs: int):
-        capture_kwargs = {}
-        if self.attn_backend.cache_active_pages_must_be_real:
-            # Capture-time placeholder tables, only for backends that
-            # validate live-page geometry at capture (V4); the others bind
-            # persistent buffers from cache_group_ids alone.
-            group_block_tables = self._capture_group_block_tables(
-                bs,
-                self.token_to_kv_pool,
-            )
-            if group_block_tables is not None:
-                capture_kwargs["block_tables"] = group_block_tables
-                if self.drafter is not None:
-                    capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
-        cache_group_ids = self._cache_group_ids(self.token_to_kv_pool)
-        if cache_group_ids:
-            capture_kwargs["cache_group_ids"] = cache_group_ids
-        if self.page_table is not None:
-            capture_kwargs["page_table"] = self.page_table
+        tables = self.placeholder_block_tables(bs)
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
             ForwardMode.DECODE,
-            **capture_kwargs,
+            block_tables=tables,
+            num_tokens=bs * self.max_tokens_per_req,
         )
         if self.draft_attn_backend is not None:
-            draft_kwargs = {}
-            if (
-                self.draft_token_to_kv_pool is not None
-                and self.draft_attn_backend.cache_active_pages_must_be_real
-            ):
-                draft_group_block_tables = self._capture_group_block_tables(
-                    bs,
-                    self.draft_token_to_kv_pool,
-                )
-                if draft_group_block_tables is not None:
-                    draft_kwargs["block_tables"] = draft_group_block_tables
-                    draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
-            draft_group_ids = self._draft_cache_group_ids()
-            if draft_group_ids:
-                draft_kwargs["cache_group_ids"] = draft_group_ids
-            if self.drafter is not None:
-                # Same staged table the draft's live refresh reads
-                # (_prepare_decode_metadata passes drafter.page_staging.table).
-                draft_kwargs["page_table"] = self.drafter.page_staging.table
+            # One arena, one contract: the draft consumes its own groups out
+            # of the same placeholder set.
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
                 ForwardMode.DECODE,
-                **draft_kwargs,
-            )
-
-    def _idle_block_tables(self, padded_bs: int) -> dict | None:
-        """Minimal per-group tables for the bs==0 idle replay: all rows are
-        dummy rows, so one column of page-0 entries per group is valid.
-        None when the pool publishes no groups."""
-        specs = tuple(self.token_to_kv_pool.arena.cache_group_specs)
-        if not specs:
-            return None
-        table = torch.zeros((padded_bs, 1), dtype=torch.int32, device=self.device)
-        return {str(spec.group_id): table for spec in specs}
-
-    @staticmethod
-    def _pad_block_tables_to_padded_bs(
-        block_tables: dict,
-        *,
-        actual_bs: int,
-        padded_bs: int,
-        pad_value: int = -1,
-    ) -> dict:
-        """Pad each table with dummy rows up to ``padded_bs``.
-
-        Group-table captures pass page 0; backends using a sentinel tail keep
-        -1. See the MHA replay guard for the padding contract.
-        """
-        if actual_bs < 0 or padded_bs < actual_bs:
-            raise RuntimeError(
-                "Grouped cache table batch contract requires "
-                f"0 <= actual_bs <= padded_bs, got {actual_bs=} {padded_bs=}"
-            )
-        out = {}
-        for key, table in block_tables.items():
-            if not isinstance(table, torch.Tensor):
-                out[key] = table
-                continue
-            if table.ndim < 1:
-                raise RuntimeError(
-                    f"Grouped cache table {key!r} must have a batch dimension"
-                )
-            rows = int(table.shape[0])
-            if rows not in {actual_bs, padded_bs}:
-                raise RuntimeError(
-                    f"Grouped cache table {key!r} has {rows} rows; expected "
-                    f"actual_bs={actual_bs} or padded_bs={padded_bs}"
-                )
-            if rows == padded_bs:
-                out[key] = table
-                continue
-            out[key] = torch.nn.functional.pad(
-                table,
-                (0, 0, 0, padded_bs - rows),
-                value=pad_value,
-            )
-        return out
-
-    @staticmethod
-    def _pad_offsets_to_padded_bs(
-        base_offsets: dict,
-        *,
-        actual_bs: int,
-        padded_bs: int,
-    ) -> dict:
-        if padded_bs <= actual_bs:
-            return base_offsets
-        out = {}
-        for key, off in base_offsets.items():
-            if not isinstance(off, torch.Tensor):
-                out[key] = off
-                continue
-            rows = int(off.shape[0])
-            if rows == padded_bs:
-                out[key] = off
-                continue
-            # Base 0: padded rows have no real request; the paired padded
-            # table row is invalid (-1).
-            out[key] = torch.nn.functional.pad(
-                off,
-                (0, padded_bs - rows),
-                value=0,
-            )
-        return out
-
-    def _decode_stale_table_guard(self, actual_bs: int, block_tables) -> None:
-        """Fail loudly instead of preparing decode metadata over stale/zero
-        page tables — eager and replay alike, every backend family.
-
-        The pool's published groups are the tables the unified refresh copies
-        into the persistent decode buffers; a missing or incomplete delivery
-        means the kernels would read whatever those buffers held last.
-        ``actual_bs == 0`` (idle replay, capture seeding) carries no live
-        rows and synthesizes its own placeholders downstream.
-        """
-        if actual_bs <= 0:
-            return
-        published = self._cache_group_ids(self.token_to_kv_pool)
-        if not published:
-            return
-        if not block_tables:
-            raise RuntimeError(
-                "ForwardStepRunner decode: pool publishes cache groups "
-                f"{sorted(published)} but block_tables is missing/empty at "
-                f"bs={actual_bs}; the persistent decode buffers would serve "
-                "stale page tables."
-            )
-        missing = set(published) - set(block_tables)
-        if missing:
-            raise RuntimeError(
-                f"ForwardStepRunner decode: block_tables at bs={actual_bs} "
-                f"is missing published groups {sorted(missing)} (delivered: "
-                f"{sorted(block_tables)}); those groups' persistent decode "
-                "buffers would go stale."
+                block_tables=tables,
+                num_tokens=bs * self.max_tokens_per_req,
             )
 
     def _prepare_decode_metadata(
@@ -861,102 +674,33 @@ class ForwardStepRunner:
         actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         *,
         use_graph: bool,
-        **kwargs,
+        block_tables: dict | None = None,
+        **cache_kwargs,
     ):
         """The single decode metadata path — graph replay AND eager decode.
 
-        Assembles per-group tables once (row padding is a no-op when
-        ``padded_bs == actual_bs``, i.e. every eager call), then refreshes the
-        target backend's persistent decode buffers and the draft's.
+        Hands the bridge's per-group tables to the target backend and then
+        the draft backend (each consumes its own groups; padding is theirs).
+        The bs==0 idle replay carries no live tables, so the placeholder set
+        stands in — same shape as capture, all rows null pages.
         """
-        block_table_base_offsets = kwargs.pop("block_table_base_offsets", None)
-        block_tables = kwargs.pop("block_tables", None)
-        group_placeholder_tables = kwargs.pop("group_placeholder_tables", None)
-
-        # The bs==0 idle replay carries no live tables: synthesize minimal
-        # valid ones so the backends' stale-table guards hold. Eager idle
-        # bypasses the wrapper entirely (see execute_idle_forward).
-        if actual_bs == 0 and use_graph:
-            if (
-                group_placeholder_tables is None
-                and self.attn_backend.cache_active_pages_must_be_real
-            ):
-                # A backend that validates live-page geometry (V4) needs
-                # full-width capture placeholders on idle rather than the
-                # 1-column zero tables below.
-                group_placeholder_tables = self._capture_group_block_tables(
-                    padded_bs,
-                    self.token_to_kv_pool,
-                )
-            if not block_tables:
-                block_tables = self._idle_block_tables(padded_bs)
-        if group_placeholder_tables is not None:
-            table_bs = next(
-                (
-                    int(table.shape[0])
-                    for table in group_placeholder_tables.values()
-                    if isinstance(table, torch.Tensor)
-                ),
-                int(req_pool_indices.shape[0]),
-            )
-            group_placeholder_tables = self._pad_block_tables_to_padded_bs(
-                group_placeholder_tables,
-                actual_bs=table_bs,
-                padded_bs=padded_bs,
-            )
-            if block_table_base_offsets is not None:
-                block_table_base_offsets = self._pad_offsets_to_padded_bs(
-                    block_table_base_offsets,
-                    actual_bs=actual_bs,
-                    padded_bs=padded_bs,
-                )
-            kwargs["block_tables"] = group_placeholder_tables
-            if block_table_base_offsets is not None:
-                kwargs["block_table_base_offsets"] = block_table_base_offsets
-        padded_block_tables = None
-        if block_tables is not None and (
-            not self.attn_backend.tables_self_padding
-            or (
-                self.draft_attn_backend is not None
-                and not self.draft_attn_backend.tables_self_padding
-            )
-        ):
-            # Normalize once so target and draft consume the same authoritative
-            # replay rows. In particular, an actual batch smaller than the
-            # selected graph batch must not reach the draft as an unpadded map.
-            padded_block_tables = self._pad_block_tables_to_padded_bs(
-                block_tables,
-                actual_bs=actual_bs,
-                padded_bs=padded_bs,
-                pad_value=0,
-            )
-        if block_tables is not None:
-            if self.attn_backend.tables_self_padding:
-                # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
-                kwargs["block_tables"] = block_tables
-            else:
-                kwargs["block_tables"] = padded_block_tables
-        if not use_graph and block_table_base_offsets is not None:
-            # Live replay reads offsets through cache_metadata; only the eager
-            # path and the padded placeholder branch above feed them directly.
-            kwargs["block_table_base_offsets"] = block_table_base_offsets
-        # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req, so
-        # this is the same value both paths passed before unification
+        if actual_bs == 0 and use_graph and not block_tables:
+            block_tables = self.placeholder_block_tables(padded_bs)
+        # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req
         # (backends that key off their own buffers ignore it).
-        kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+        cache_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.refresh_decode_metadata(
             padded_bs,
             actual_bs,
             req_pool_indices,
             seq_lens,
             forward_mode=forward_mode,
-            page_table=page_table,
+            block_tables=block_tables,
             for_graph_replay=use_graph,
-            **kwargs,
+            **cache_kwargs,
         )
         if self.draft_attn_backend is not None:
             # Seed the drafter-owned buffer for the round: models and the
@@ -966,37 +710,20 @@ class ForwardStepRunner:
             # drafters) or advance_draft_forward_metadata.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
-            draft_attn_kwargs = {}
-            if group_placeholder_tables is not None:
-                # Idle replay: the padded placeholder pair travels together.
-                draft_attn_kwargs["block_tables"] = group_placeholder_tables
-                if block_table_base_offsets is not None:
-                    draft_attn_kwargs["block_table_base_offsets"] = (
-                        block_table_base_offsets
-                    )
-            elif not use_graph and block_table_base_offsets is not None:
-                # Live replay reads offsets through cache_metadata; only
-                # eager feeds them directly.
-                draft_attn_kwargs["block_table_base_offsets"] = block_table_base_offsets
-            draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
-            draft_table_source = (
-                block_tables
-                if self.draft_attn_backend.tables_self_padding
-                else padded_block_tables
-            )
-            draft_group_tables = self._draft_group_tables(draft_table_source)
-            if draft_group_tables is not None:
-                draft_attn_kwargs["block_tables"] = draft_group_tables
             self.draft_attn_backend.refresh_decode_metadata(
                 padded_bs,
                 actual_bs,
                 req_pool_indices,
                 draft_seq_lens,
                 forward_mode=ForwardMode.DECODE,
-                page_table=self.drafter.page_staging.table,
+                block_tables=block_tables,
                 for_graph_replay=use_graph,
-                **draft_attn_kwargs,
+                num_tokens=padded_bs * self.max_tokens_per_req,
             )
+            # Block drafters re-run the same refresh inside their step loop;
+            # hand them this round's tables (dies with the drafter-side
+            # refresh once the router owns the draft write locations).
+            self.drafter.round_block_tables = block_tables
 
     @nvtx_range("attn_meta_prep", color="orange")
     def _init_forward_metadata(
@@ -1005,7 +732,6 @@ class ForwardStepRunner:
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -1019,7 +745,6 @@ class ForwardStepRunner:
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            page_table=page_table,
             forward_mode=forward_mode,
             **kwargs,
         )
@@ -1035,23 +760,11 @@ class ForwardStepRunner:
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             draft_extend_kwargs = dict(kwargs)
-            # Drafter consumes its own groups' tables (see _draft_group_tables).
-            draft_group_tables = self._draft_group_tables(kwargs.get("block_tables"))
-            if draft_extend_kwargs.get("block_tables") is not None:
-                draft_extend_kwargs["block_tables"] = draft_group_tables
-            # cache_metadata describes the target pool and exposes all target
-            # cache groups. A draft consumes the wrapper-selected group subset
-            # above plus its staged batch-ordered page table (the same page
-            # ids a contract draft would resolve from the metadata), never
-            # the target metadata itself — exactly like the decode path.
-            draft_extend_kwargs.pop("cache_metadata", None)
-            draft_extend_kwargs.pop("forward_batch", None)
             self.draft_attn_backend.init_forward_metadata(
                 bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                page_table=self.drafter.page_staging.table,
                 forward_mode=forward_mode,
                 **draft_extend_kwargs,
             )
@@ -1063,13 +776,6 @@ class ForwardStepRunner:
             # Refresh writes decode-slot metadata only, so rounds that run no
             # decode steps (vanilla MTP extend depths, DFLASH block decode)
             # simply leave it unread or overwrite it per step.
-            draft_refresh_kwargs = {}
-            if draft_group_tables is not None:
-                draft_refresh_kwargs["block_tables"] = draft_group_tables
-            if kwargs.get("block_table_base_offsets") is not None:
-                draft_refresh_kwargs["block_table_base_offsets"] = kwargs[
-                    "block_table_base_offsets"
-                ]
             self.draft_attn_backend.refresh_decode_metadata(
                 padded_bs,
                 padded_bs,
@@ -1077,9 +783,9 @@ class ForwardStepRunner:
                 draft_seq_lens,
                 forward_mode=ForwardMode.DECODE,
                 num_extends=num_extends,
-                page_table=self.drafter.page_staging.table,
-                **draft_refresh_kwargs,
+                block_tables=kwargs.get("block_tables"),
             )
+            self.drafter.round_block_tables = kwargs.get("block_tables")
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -1156,18 +862,13 @@ class ForwardStepRunner:
         bs: int,
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
-        page_table: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
-        out_cache_loc: torch.Tensor | None = None,
         block_tables: dict | None = None,
-        block_table_base_offsets: dict | None = None,
-        cache_metadata=None,
-        forward_batch=None,
     ):
         """
         Unified forward entry point.
@@ -1201,54 +902,35 @@ class ForwardStepRunner:
         if use_graph:
             self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
-        # V4 (bespoke multi-group slot mapping) and KDA state paging still
-        # build metadata from the cache contract object; the MLA family now
-        # consumes only the per-group block_tables like every other backend.
-        # Thread it only when present so non-contract paths remain unchanged.
-        cache_kwargs = (
-            {
-                "cache_metadata": cache_metadata,
-                "forward_batch": forward_batch,
-            }
-            if cache_metadata is not None
-            else {}
-        )
-
-        # Extend/mixed stale-table guard: with >1 published group the
-        # single-table fallback would serve first-group pages to every layer
-        # (a single group's table IS the single table, so one group may
-        # legitimately omit it). Decode delivery is checked below by
-        # _decode_stale_table_guard, eager and replay alike.
-        if (
-            ctx.forward_mode.is_extend_or_mixed()
-            and bs > 0
-            and not block_tables
-            and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
-        ):
-            raise RuntimeError(
-                "ForwardStepRunner eager forward: pool publishes "
-                f"{len(self.token_to_kv_pool.arena.cache_group_specs)} "
-                "cache groups and the backend consumes group tables, "
-                f"but block_tables is missing/empty at bs={bs} "
-                f"({ctx.forward_mode.name}); the single-table fallback "
-                "would use one group's pages for all layers."
+        # Live delivery guard: a live batch must carry every published
+        # group's table — the persistent decode buffers (and the extend
+        # metadata) would otherwise serve stale pages. The bs==0 idle replay
+        # synthesizes placeholders downstream.
+        if bs > 0 and not ctx.forward_mode.is_idle():
+            published = tuple(
+                str(spec.group_id)
+                for spec in self.token_to_kv_pool.arena.cache_group_specs
             )
+            missing = set(published) - set(block_tables or {})
+            if missing:
+                raise RuntimeError(
+                    f"ForwardStepRunner: block_tables at bs={bs} "
+                    f"({ctx.forward_mode.name}) is missing published cache "
+                    f"groups {sorted(missing)} (delivered: "
+                    f"{sorted(block_tables or {})})."
+                )
 
         # _can_use_graph already requires a decode mode, so this branches on
         # the mode alone: decode → unified refresh; extend/mixed → construct.
         if ctx.forward_mode.is_decode():
-            self._decode_stale_table_guard(bs, block_tables)
             self._prepare_decode_metadata(
                 padded_bs,
                 bs,
                 req_pool_indices,
                 seq_lens,
-                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 use_graph=use_graph,
-                block_table_base_offsets=block_table_base_offsets,
                 block_tables=block_tables,
-                **cache_kwargs,
             )
         else:
             # Extend/mixed (and the never-in-practice eager idle): dynamic
@@ -1258,7 +940,6 @@ class ForwardStepRunner:
                 ctx.num_extends,
                 req_pool_indices,
                 seq_lens,
-                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,
@@ -1266,14 +947,11 @@ class ForwardStepRunner:
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 positions=positions,
-                out_cache_loc=out_cache_loc,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 num_tokens=ctx.input_num_tokens,
                 block_tables=block_tables,
-                block_table_base_offsets=block_table_base_offsets,
-                **cache_kwargs,
             )
 
         if use_graph:

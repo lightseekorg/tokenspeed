@@ -89,7 +89,6 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -104,7 +103,6 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
@@ -171,7 +169,6 @@ class DeepseekModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -206,7 +203,6 @@ class DeepseekModelNextN(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
         )
 
@@ -285,7 +281,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
@@ -293,7 +288,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
             )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)

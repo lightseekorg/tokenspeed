@@ -187,7 +187,6 @@ class BaseCausalLM(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -197,7 +196,6 @@ class BaseCausalLM(nn.Module):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             **model_kwargs,
         )
         if not self.mapping.is_last_pp_rank:

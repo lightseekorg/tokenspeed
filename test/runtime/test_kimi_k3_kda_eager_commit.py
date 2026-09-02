@@ -8,14 +8,14 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
-from test.runtime.conftest import cache_metadata_for as _metadata_for
+from test.runtime.conftest import block_tables_for as _tables_for
 from test.runtime.conftest import kimi_recipe as _kimi_recipe
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from types import SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.mamba import (
     MambaAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
@@ -88,14 +88,13 @@ class _Harness:
             group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
             for group_id in _STATE_GROUPS
         }
-        metadata, op = _metadata_for(self.contract, tables, DEV)
+        delivered = _tables_for(self.contract, tables, DEV)
         self.backend.init_forward_metadata(
             bs=bs,
             req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
-            cache_metadata=metadata,
-            forward_batch=op,
+            block_tables=delivered,
         )
 
     def forward(self, inputs, bs):
@@ -238,7 +237,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
             for group_id in _STATE_GROUPS
         }
-        metadata, op = _metadata_for(captured.contract, tables, DEV)
+        delivered = _tables_for(captured.contract, tables, DEV)
         seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
         captured.backend.refresh_decode_metadata(
             bs,
@@ -247,8 +246,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             seq_lens_tensor,
             forward_mode=ForwardMode.DECODE,
             for_graph_replay=True,
-            cache_metadata=metadata,
-            forward_batch=op,
+            block_tables=delivered,
         )
         replay_inputs = captured.inputs(bs, 227 + round_index)
         for name, value in replay_inputs.items():
@@ -273,7 +271,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
         for group_id in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(captured.contract, tables, DEV)
+    delivered = _tables_for(captured.contract, tables, DEV)
     seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
     captured.backend.refresh_decode_metadata(
         bs,
@@ -282,8 +280,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         seq_lens_tensor,
         forward_mode=ForwardMode.DECODE,
         for_graph_replay=True,
-        cache_metadata=metadata,
-        forward_batch=op,
+        block_tables=delivered,
     )
     replay_inputs = captured.inputs(bs, 251)
     for name, value in replay_inputs.items():

@@ -656,7 +656,6 @@ class MiniMaxM2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] == 0:
@@ -685,7 +684,11 @@ class MiniMaxM2Attention(nn.Module):
             fused_kv_arg = create_fused_set_kv_buffer_arg(
                 value=v_3d,
                 layer=self.attn,
-                out_cache_loc=out_cache_loc,
+                # Prewrite at this layer's group locations, fetched from the
+                # backend (the one owner of KV write slots).
+                out_cache_loc=ctx.attn_backend.write_locations(
+                    self.attn, ctx.forward_mode
+                ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )
 
@@ -704,7 +707,6 @@ class MiniMaxM2Attention(nn.Module):
                 None,
                 save_kv_cache=False,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
 
         else:
@@ -713,7 +715,7 @@ class MiniMaxM2Attention(nn.Module):
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
-            attn_output = self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
+            attn_output = self.attn(q, k, v, ctx=ctx)
 
         output, _ = self.o_proj(attn_output)
 

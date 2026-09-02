@@ -52,9 +52,8 @@ def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
         token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=1024),
     )
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-    out_cache_loc = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
 
-    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions, out_cache_loc)
+    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
 
     assert slot_mapping.tolist() == [20, 21, 42, 43]
 
@@ -88,9 +87,8 @@ def test_deepseek_v4_swa_slot_mapping_prefers_draft_prefill_metadata():
         token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=1024),
     )
     positions = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int32)
-    out_cache_loc = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int32)
 
-    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions, out_cache_loc)
+    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
 
     assert slot_mapping.tolist() == [20, 21, 22, 40, 41]
 
@@ -117,9 +115,8 @@ def test_deepseek_v4_swa_slot_mapping_masks_invalid_and_overflow_slots():
         token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=43),
     )
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-    out_cache_loc = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
 
-    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions, out_cache_loc)
+    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
 
     # Raw mapping is [20, 21, 42, 43]: index 2 is masked by is_valid_token,
     # index 3 exceeds the 43-slot capacity.
@@ -144,15 +141,12 @@ def test_deepseek_v4_swa_slot_mapping_fails_closed_without_capacity():
         ),
     )
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-    out_cache_loc = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
 
     zero_capacity_ctx = SimpleNamespace(
         attn_backend=SimpleNamespace(forward_metadata=metadata),
         token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=0),
     )
-    slot_mapping = _deepseek_v4_swa_slot_mapping(
-        zero_capacity_ctx, positions, out_cache_loc
-    )
+    slot_mapping = _deepseek_v4_swa_slot_mapping(zero_capacity_ctx, positions)
     assert slot_mapping.tolist() == [-1, -1, -1, -1]
 
     no_capacity_ctx = SimpleNamespace(
@@ -160,7 +154,7 @@ def test_deepseek_v4_swa_slot_mapping_fails_closed_without_capacity():
         token_to_kv_pool=SimpleNamespace(swa_block_size=2),
     )
     with pytest.raises(AttributeError, match="swa_capacity_slots"):
-        _deepseek_v4_swa_slot_mapping(no_capacity_ctx, positions, out_cache_loc)
+        _deepseek_v4_swa_slot_mapping(no_capacity_ctx, positions)
 
 
 def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata():
@@ -184,11 +178,12 @@ def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata
         token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=1024),
     )
     positions = torch.arange(5, dtype=torch.int32)
-    out_cache_loc = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int32)
 
-    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions, out_cache_loc)
+    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
 
-    assert torch.equal(slot_mapping, out_cache_loc)
+    # Metadata that does not describe q's rows fails closed: every slot is
+    # masked to -1 (skipped write), never a raw-vector passthrough.
+    assert slot_mapping.tolist() == [-1] * 5
 
 
 def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():

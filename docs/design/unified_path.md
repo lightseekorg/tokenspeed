@@ -23,16 +23,15 @@ path nothing exercised routinely.
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
-seq_lens, *, forward_mode, block_table, num_extends, for_graph_replay,
+seq_lens, *, forward_mode, block_tables, num_extends, for_graph_replay,
 **cache_kwargs)` is the ONLY way decode metadata is prepared:
 
 * **capture** (`init_forward_metadata_capture_cuda_graph`) is INHERITED: the
-  base default binds the per-bs views (`bind_decode_views`, implemented per
-  backend over its `_decode_views` builder) and runs the idle-refresh arm
-  (`actual_bs=0`,
+  base default runs the idle-refresh arm (`actual_bs=0`,
   `for_graph_replay=True`) against the runner-seeded seq_lens and the
-  address-stable staged block_table — never live tables. Only a genuine
-  capture-only asymmetry overrides it (see "Capture is inherited");
+  runner's placeholder tables (`placeholder_block_tables`) — never live
+  tables. Only a genuine capture-only asymmetry overrides it (see "Capture
+  is inherited");
 * **replay** = refresh (`for_graph_replay=True`) + `graph.replay()`;
 * **eager decode** = refresh (`for_graph_replay=False`) + the same forward
   Python the graph recorded.
@@ -62,12 +61,12 @@ request's cache. Eager passes `bs == actual_bs` (unpadded — no wasted FLOPs);
 
 ### Pointer-stable per-bs views from one builder
 
-Per-bs metadata objects (`decode_cuda_graph_metadata[bs]` and friends) are
-views over the persistent buffers, built by a single `_decode_views(bs)`
-builder shared by capture and refresh, cached per bs. A bs never captured
-(above-ladder decode, enforce-eager) builds its views lazily on first refresh
-— no new storage, one-time cost. Views must be pointer-stable: a captured
-graph holds their addresses forever.
+Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's
+`decode_write_locations` views) are views over the persistent buffers, built
+by a single per-bs builder shared by capture and refresh, cached per bs. A bs
+never captured (above-ladder decode, enforce-eager) builds its views lazily
+on first refresh — no new storage, one-time cost. Views must be
+pointer-stable: a captured graph holds their addresses forever.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -89,29 +88,30 @@ express.
 
 ### Capture is inherited
 
-`init_forward_metadata_capture_cuda_graph` has a base default — bind the
-per-bs views (`bind_decode_views`), then run the idle-refresh arm
-(`actual_bs=0`, `for_graph_replay=True`) — and that default IS the capture
+`init_forward_metadata_capture_cuda_graph` has a base default — run the
+idle-refresh arm (`actual_bs=0`, `for_graph_replay=True`) over the same
+persistent buffers replay refreshes — at both tiers: `AttentionBackend`
+(runner-facing; the router's version idle-fills its table stacks, republishes
+the decode write-location views, then runs each leaf's capture hook) and
+`PagedAttentionBackend` (kernel-facing leaves). That default IS the capture
 for every backend except a closed list of sanctioned overrides, each tied to
 something the idle refresh cannot express:
 
-* **FlashMLA** (slim, calls super): installs the keepalive tile-schedule
-  object whose schedule-build the graph records;
-* **DeepseekV4**: capture-phase placeholder-table validation
-  (`cache_active_pages_must_be_real`) and the packed `tokens_per_req` row
-  machinery;
+* **FlashMLA** (leaf): installs the keepalive tile-schedule object whose
+  schedule-build the graph records (flash_mla freezes its schedule on the
+  first kernel call against a sched-meta);
+* **DeepseekV4**: the packed `tokens_per_req` row machinery and its bespoke
+  multi-group metadata build;
 * **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
   query-start-loc, which the idle refresh deliberately zeroes;
-* **HybridLinearAttnBackend**: a two-line fan-out so Mamba's real capture is
-  reached;
-* **Inkling**: conv-state seeding; its refresh hard-requires conv tables.
+* **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
+  capture must seed real lengths);
+* **HybridLinearAttnBackend / MSAHybrid**: pure fan-out to their children so
+  the real captures above are reached.
 
-Bind-only overrides (`MLAAttnBackend`, `CuteDSLMLABackend`) exist solely to
-latch `_cache_groups_bound` before the views are built. A new backend
-implements `refresh_decode_metadata` + `init_cuda_graph_state` and inherits
-capture; a new override must name its kernel-imposed asymmetry here. Every
-capture signature must accept the runner kwarg set (`cache_group_ids`,
-`block_table`, `**kwargs`) — pinned by
+A new backend implements `refresh_decode_metadata` + `init_cuda_graph_state`
+and inherits capture; a new override must name its kernel-imposed asymmetry
+here. Leaf capture/refresh signatures are pinned by
 `test_unified_decode_path.py::CaptureSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
@@ -151,7 +151,12 @@ mixed/idle decode arms that remain serve the target's decode rows only.
 Drafters republish their in-loop seq_lens edits explicitly each step via
 `advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
 (vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
-drafter mutates behind the backend's back.
+drafter mutates behind the backend's back. Those two hooks are deliberately
+seq-lens-only: Eagle's step-0 rejected-tail correction fires
+`advance_draft_forward_metadata` BEFORE the step-0 attention has consumed
+the verify-shaped write window, so the write-window publication is a
+separate, explicit drafter-loop call (`publish_draft_step_locations`, see
+"Write locations have one owner").
 
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh
@@ -211,9 +216,8 @@ the same reason: single-token decode is a width-1 candidate window.
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
 to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
 where the clamp is the identity). What legitimately remains conditional on
-the drafter is the *draft model's existence* — draft backend refresh,
-DraftPageStaging, the drafter loop itself — not the sampling or metadata
-shape of the target.
+the drafter is the *draft model's existence* — draft backend refresh and the
+drafter loop itself — not the sampling or metadata shape of the target.
 
 ### Outputs are persistent-buffer slices on both paths
 
@@ -241,92 +245,153 @@ refresh replaces wholesale each step). What unification still can NOT
 test: mempool reuse and hostfunc semantics — the e2e regression matrix keeps
 graph-on and graph-off configurations for this reason.
 
-## One block-table route, one unit
+## One block-table route: router + leaves
 
-Every backend consumes the wrapper's per-group `block_tables` kwarg — raw
-scheduler tables in block-granularity page ids — and there is no capability
-flag saying so (`uses_cache_groups` was deleted once it was universally
-True). The invariant replacing it: **any table a backend receives — the
-per-group `block_tables`, the staged draft `block_table`, a warmup
-placeholder — carries raw scheduler pages; kernel-page expansion happens
-inside the backend, through the one shared `expand_history_table`
-(`cache_group_geometry.py`; the base `set_cache_pool` learns the
-full-history grain from the pool's specs into one `CacheGroupGeometry`
-value object)**. The routing surface lives on `AttentionBackend` itself:
-the write-location slot math lives in `group_write_locations.py` as pure
-functions, and every persistent decode buffer lives in one composed
-`decode_buffers.DecodeBuffers`, built at graph-state init. It carries two
-tiers: the stacked per-group tables/locations with their shared fill
-machinery, and the single-table slots (`seq_lens` / `page_table` /
-`out_cache_loc`) whose geometry is kernel-shaped — the owning backend
-allocates and fills those (the MLA family constructs the bare, stack-less
-form; folding their fills into the group machinery is the next unification
-milestone). Inside the stack, page vocabulary stays with paged-KV consumers
-(`cache-concepts.md`): attention-consumed groups get consumer-page-grain
-`group_page_tables` plus write-location views, while wrapper-owned (Inkling
-conv) groups ride the stack tail as block-granularity `owned_block_tables`
-with no location views (the wrapper keeps its own write-loc machinery).
-`CacheBatchMetadata` no longer carries a `kernel_table` expansion;
-`cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
-KDA state paging only. `cache_active_pages_must_be_real` remains a separate
-axis — it marks backends that validate live-page geometry and so need real
-capture placeholder tables (V4), not who supplies tables.
+The layering between the scheduler's block vocabulary and the kernels' page
+vocabulary is fixed, with exactly one conversion point:
 
-Table delivery is guarded at the one dispatch point, not per backend:
-`ForwardStepRunner._decode_stale_table_guard` fails a live decode
-(`actual_bs > 0`, eager and replay alike, every backend family) whose
-`block_tables` omit any published group — the persistent decode buffers
-would otherwise serve stale pages. Extend/mixed keep the wrapper's
-`>1 groups` guard (a single group's table IS the single table, so the
-fallback is legal there). The per-backend `_replay_stale_guard` is gone.
+| layer | sees | never sees |
+|---|---|---|
+| C++ scheduler | per-group `BlockTable`s: rows in `block_granularity` logical index, entries are `CacheBlock` ids | kernel pages, backends |
+| bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
+| **`CacheGroupRouter`** | group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, ALL write-location slot math | kernel calls |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
+| state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
-`DraftPageStaging` survives but is no longer a mapping owner: its publish is
-a pure copy + padded-row scrub into the one address-stable buffer the
-drafters' in-graph write-location kernels record at capture
-(`DraftPageStaging.out_cache_loc_uniform`; per-forward group tables are
-fresh tensors, so an address-stable shadow is physically required). The
-write-location math is page-size invariant — `table[i, pos // P] * P +
-pos % P` addresses the same token at any page size — so the staging resolves
-absolute slots directly over the raw table, exactly like
-`fill_input_buffers`' out_cache_loc path. (`CacheView`, the former wrapper
-that carried this math, is gone — its only production retention was
-`full_history`, so the class and the never-reached sliding-ring kernel
-branch were folded away.)
+The runner (`ForwardStepRunner`) does one thing with tables: hand the
+bridge's `block_tables` dict to the top-level backend. Capture / idle /
+prefill-graph dummy forwards use the runner's `placeholder_block_tables(bs)`
+(full-width zero tables, null page 0, slices of one persistent allocation) —
+**always-contract delivery**: the dict is complete on every path, so no
+backend carries a "no tables" arm. Delivery is guarded at both dispatch
+points: the runner's inline live-delivery check and the router's
+`_check_live_delivery` fail a live batch whose dict omits any consumed
+group — the persistent decode buffers would otherwise serve stale pages.
+Consumers take their own groups by positive claim
+(`cache_consumer_families`); extra groups ride through untouched.
 
-Deleted flags, for the record: `needs_group_block_tables`,
-`cache_group_tables_replace_draft_page_table`,
-`reads_staged_draft_page_table`, and finally `uses_cache_groups` itself.
-None carried information not already implied by the pool's published specs.
+Inside the router, `GroupTableStacks` holds the `[G, max_bs, Wmax]`
+kernel-page table stack and the `[G, max_bs * N]` decode write-location
+stack — scratch the leaves copy from, not graph-recorded storage. The fill
+is one fused unpack/expand launch over the bridge's packed upload (that
+packed layout is the one sanctioned scheduler↔router coupling); padding
+rows (`[actual_bs, bs)`) and each group's column tail resolve to null page
+0. The slot math lives in `write_locations.py` as pure functions with one
+invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
+invariant, so locations computed over the kernel-page stack equal
+raw-table locations bit for bit.
+
+`CacheBatchMetadata` travels no further than the runner; no backend receives
+it (`cache_metadata` / `forward_batch` kwargs are gone). V4 consumes the
+same `block_tables` dict through its bespoke metadata build.
+
+Deleted, for the record: `decode_buffers.py`, `group_write_locations.py`,
+`draft_page_staging.py`, `expand_history_table` as a backend-side step, and
+the capability flags `uses_cache_groups`, `needs_group_block_tables`,
+`tables_self_padding`, `cache_active_pages_must_be_real`,
+`engine_owned_group_ids`, `table_tail_pad`. None carried information not
+already implied by the pool's published specs plus the always-contract
+delivery.
+
+## Single-table leaves
+
+A paged softmax attention leaf (`PagedAttentionBackend`: MHA, MLA, FlashMLA,
+TRTLLM, TRTLLM-MLA, TokenSpeed-MLA, MSA, DSA-over-dense) consumes exactly
+the pre-cache-group interface — `page_table` (kernel pages, batch-ordered,
+padded to `[bs, max_num_pages]`), `seq_lens`, `out_cache_loc` — and never
+perceives cache groups. Leaves own their persistent decode buffers
+(`page_table_buf`, `seq_lens_buf`) and copy the router's stack slice in on
+each refresh; they do not alias router storage. A single-group model is a
+router with one leaf; there is no single-table special case anywhere.
+
+The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
+`block_decode_active` (spec verify geometry as a clamp floor), FlashMLA's
+`for_graph_replay` tile-schedule swap, and the MLA family's `num_extends`
+decode-row slicing (`override_num_extends`).
+
+## Write locations have one owner
+
+`write_locations(layer, forward_mode)` on the top-level backend is the ONLY
+accessor for KV write slots — models, drafters and the runner neither
+compute nor thread location vectors. `PagedAttention.forward`,
+`AttentionBackend.forward`, `model_runner.forward` and every model forward
+chain carry no `out_cache_loc` parameter; `InputBuffers` has no location
+buffer; `fill_input_buffers` takes no table.
+
+* **Extend**: `init_forward_metadata` computes each group's span over the
+  stacks (`[sum(extend_seq_lens)]`, request-major); `write_locations(layer,
+  EXTEND)` returns exactly that span.
+* **Decode / verify**: `refresh_decode_metadata` publishes the token-major
+  `[rows * N]` window views (`decode_write_locations`, pointer-stable per
+  bs — the graph records them through the leaves' KV writes, and the
+  pointer guard walks this slot). A MIXED round's draft refresh sets
+  `_decode_row_offset = num_extends` so DECODE reads skip the extend rows.
+* **Draft steps**: the drafters declare each step's window, the router owns
+  the math and the address-stable storage. `publish_draft_step_locations(
+  cache_start, n)` computes the window over the location stack (the same
+  fused launch the decode refresh records — in-graph safe) and points
+  `write_locations` at it: Eagle publishes its one advancing slot per step,
+  vanilla MTP its re-anchored k-window once per round, DFLASH its block
+  window after each block refresh (order matters: the refresh republishes
+  the verify-shaped window). `draft_write_locations_uniform(out, start, n)`
+  is the side-write variant — scratch resolution over the full-history
+  table (`draft_history_view`) that must not clobber the published window
+  (DFLASH's target-KV injection, DSpark context windows).
+* **Cross-backend reads**: `decode_window_locations()` /
+  `extend_span_locations()` expose the full-history group's published
+  windows; DFLASH reads the TARGET router's windows through them to copy
+  target-aligned KV into the draft cache (the pools share one page-id
+  space).
+* **Model-side direct writes** (fused RoPE prewrite, MLA latent
+  `set_mla_kv_buffer`, V4 group writes, QSA) fetch
+  `ctx.attn_backend.write_locations(layer, mode)` immediately before the
+  write. A model path that writes multiple mode windows in one shot (the
+  MLA draft's step-0 full-row write) concatenates the EXTEND span and the
+  DECODE window — eager-only, MIXED rounds never run under a captured
+  graph. V4 composes the shared token-shaped resolve
+  (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
+  degraded mapping fails closed to `-1` (skipped write), never to a raw
+  fallback vector.
 
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
-The group mixins are gone — the routing surface lives on
-`AttentionBackend` (per-group selection, DecodeBuffers composition) and
-the two write-location kernels stay two sets of pure functions
-(`group_write_locations.py`); unifying that math with V4's bespoke slot
-mapping is the final block-table-owner milestone (`cache-concepts.md`
-Principle 5).
+The write-location kernels stay pure functions (`write_locations.py`);
+unifying that math with V4's bespoke slot mapping remains the final
+mapping-owner milestone (`cache-concepts.md` Principle 5 — owners are now
+down to the router and V4).
 
 ## Regression gates
 
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live rows over the same buffers; lazy
   above-ladder views are pointer-stable; the graph_ptr_guard walk reports a
-  rebound tensor by path and honors `graph_unstable_metadata_fields`.
+  rebound tensor by path and honors `graph_unstable_metadata_fields`; leaf
+  capture/refresh signature conformance.
+* `test/runtime/test_cache_group_router.py` — router slot math, expansion,
+  padding, placeholder delivery, per-group dispatch, draft window
+  publication and address stability.
 * `test/runtime/test_cudagraph_per_group.py`,
-  `test_group_write_locations.py` — wrapper padding wiring and per-group
-  write-location math on the unified path.
+  `test_group_write_locations.py` — per-group padding wiring and the
+  write-location edge cases (holes, overflow, MTP re-anchor) on the unified
+  path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rn "select_out_cache_loc\|DraftPageStaging\|tables_self_padding\|
+  cache_active_pages_must_be_real\|engine_owned_group_ids" python/` must
+  stay empty — write locations have one accessor (`write_locations`), and
+  table delivery has no capability flags.
+* `grep -rn "out_cache_loc" python/tokenspeed/runtime/models/` matches only
+  `write_locations(...)` fetches and the helper parameters they feed —
+  never a forward-chain parameter threaded from the runner.
 * `grep -rn "AttentionArch.DSA\|qwen4_exp_has_side_state"
   python/tokenspeed/runtime/execution/` must stay empty — backend-imposed
   graph restrictions are `cuda_graph_support` declarations
   (`test/runtime/test_cudagraph_support_resolution.py`).
 * `grep -rn "def init_forward_metadata_capture_cuda_graph" python/` matches
-  only the base default and the sanctioned overrides listed in "Capture is
-  inherited".
+  only the defaults (`base.py`, `paged.py`, `router.py`) and the sanctioned
+  overrides listed in "Capture is inherited".
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
-  capture is inherited from the base default (bind views + idle refresh).
-  Only a kernel-imposed capture asymmetry justifies an override.
+  capture is inherited from the base default (idle refresh). Only a
+  kernel-imposed capture asymmetry justifies an override.

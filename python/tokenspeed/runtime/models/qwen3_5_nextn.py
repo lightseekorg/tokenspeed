@@ -86,10 +86,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         if ctx.accept_lengths is None:
-            return super()._attn(q, k, v, gate, ctx, out_cache_loc)
+            return super()._attn(q, k, v, gate, ctx)
 
         self._apply_correction(ctx)
         q = q.index_select(0, ctx.gather_ids)
@@ -106,7 +105,6 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             k,
             v,
             decode_ctx,
-            out_cache_loc,
             record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
         )
         if gate is not None:
@@ -251,7 +249,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -284,7 +281,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 input_embeds=hidden_states,
             )
 

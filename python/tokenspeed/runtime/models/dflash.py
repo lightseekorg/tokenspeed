@@ -157,7 +157,6 @@ class DFlashAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -175,6 +174,9 @@ class DFlashAttention(nn.Module):
         )
         k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
         v_cache = v.view(-1, self.num_kv_heads, self.head_dim)
+        # Model-side pool write: slots come from the backend (the drafter
+        # publishes each step's window before the forward).
+        out_cache_loc = ctx.attn_backend.write_locations(self.attn, ctx.forward_mode)
         if ctx.token_to_kv_pool.dtype == torch.float8_e4m3fn:
             k_buf, v_buf = ctx.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
             fused_fp8_set_kv_buffer(
@@ -201,7 +203,6 @@ class DFlashAttention(nn.Module):
             None,
             None,
             ctx,
-            out_cache_loc,
             save_kv_cache=False,
         )
         if len(attn_output.size()) == 3:
@@ -313,7 +314,6 @@ class DFlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if ctx.forward_mode.is_idle():
@@ -342,7 +342,6 @@ class DFlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
 
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
@@ -449,7 +448,6 @@ class DFlashDraftModel(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         kv_sync_event=None,
@@ -472,7 +470,6 @@ class DFlashDraftModel(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 residual=residual,
             )
 

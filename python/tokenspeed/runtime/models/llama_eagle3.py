@@ -88,16 +88,15 @@ class LlamaAttention(BaseLlamaAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         # Active draft first step (drafter set up gather_ids + accept_lengths).
         # Covers both decode catch-up and prefill catch-up; multi-step decode
         # delegates to base.
         if ctx.accept_lengths is None:
-            return super()._attn(positions, q, k, v, ctx, out_cache_loc)
+            return super()._attn(positions, q, k, v, ctx)
 
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
+            fused_kv_arg = self._build_fused_kv_arg(v, ctx)
             if fused_kv_arg is not None:
                 # Trim only on the sliced single-token decode path; the
                 # post-slice fallback below still runs full N-row attn and
@@ -114,7 +113,6 @@ class LlamaAttention(BaseLlamaAttention):
                     None,
                     None,
                     self.attn,
-                    out_cache_loc,
                     ctx.token_to_kv_pool,
                     ForwardMode.DECODE,
                     ctx.bs,
@@ -122,9 +120,7 @@ class LlamaAttention(BaseLlamaAttention):
                     record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
                 )
         q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
-            0, ctx.gather_ids
-        )
+        return self.attn(q, k, v, ctx=ctx).index_select(0, ctx.gather_ids)
 
     def _apply_correction(self, ctx: ForwardContext) -> None:
         """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
@@ -287,7 +283,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
@@ -330,7 +325,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         residual = self._maybe_narrow_residual(residual, ctx)
 
@@ -365,7 +359,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
@@ -377,7 +370,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 embeds,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 final_norm,
                 fuse_embed_reduce=fuse_embed_reduce,
@@ -411,7 +403,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         residual = self._maybe_narrow_residual(residual, ctx)
         hidden_states, residual = self.comm_manager.post_attn_comm(
@@ -513,7 +504,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor = None,
         hidden_states: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -565,7 +555,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
             embeds,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
             self.norm,
             fuse_embed_reduce=fuse_embed_reduce,
@@ -646,11 +635,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict

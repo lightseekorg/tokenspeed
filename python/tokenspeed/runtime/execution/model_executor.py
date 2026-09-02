@@ -41,7 +41,6 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -334,63 +333,16 @@ class ModelExecutor:
             kv_pool=token_to_kv_pool,
         )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
-
-        # The batch-ordered full-history table backs out_cache_loc and the
-        # draft page table. First contract group with family=history and
-        # retention=full_history.
-        self._full_history_group_id = next(
-            (
-                str(spec.group_id)
-                for spec in self._cache_runtime_contract.group_specs
-                if spec.family == "history" and spec.retention == "full_history"
-            ),
-            None,
-        )
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
 
-        # Everything indexes tables in raw scheduler pages of block_granularity
-        # tokens; kernel-page expansion happens inside each backend. The grain
-        # comes off the draft view's arena (the plan's P), never from the view
-        # itself -- a recipe may pin a P the config never saw.
-        self._block_granularity = int(
-            _cache_arena_attr(draft_token_to_kv_pool, "prefix_granularity", 0)
-            or config.prefix_granularity
-        )
-
-        # physical_context_len already covers the spec-verify overshoot of a
-        # finished request lingering one overlap step, including the lingering
-        # step's next draft block (see _SPEC_OVERSHOOT_SPANS in server_args.py).
-        # A write past this width would go out of bounds and hang the attention
-        # kernel; the output processor's physical-extent tripwire raises first.
-        max_num_pages_per_req = (
-            config.physical_context_len + self._block_granularity - 1
-        ) // self._block_granularity
-
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
-        # Address-stable staging of the full-history table for in-graph draft
-        # consumers; also the zero/dummy placeholder for idle/warmup forwards
-        # before the cache contract binds. Single writer; unit is the raw
-        # scheduler page; publish scrubs [bs, padded_bs).
-        self._draft_staging = DraftPageStaging(
-            max_bs=max_bs,
-            max_pages_per_req=max_num_pages_per_req,
-            block_granularity=self._block_granularity,
-            full_history_group_id=self._full_history_group_id,
-            device=self.device,
-        )
-        self.draft_page_table = self._draft_staging.table
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            # Indexes the scheduler's full-history table: scheduler-table page ids.
-            page_size=self._block_granularity,
-            # The cache arena reserves parent 0 as the null page, so slot 0
-            # is the dummy slot padded tokens write into.
-            dummy_kv_slot=0,
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
@@ -418,7 +370,6 @@ class ModelExecutor:
                 draft_model_runner=draft_model_runner,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
-                page_staging=self._draft_staging,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
@@ -508,7 +459,6 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
-            page_table=self.draft_page_table,
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
@@ -526,7 +476,6 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            page_table=self.draft_page_table,
             drafter=self.drafter,
             graph_supported=graph_support.prefill_graph,
         )
@@ -641,7 +590,6 @@ class ModelExecutor:
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
-                    out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
                 )
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
@@ -677,19 +625,6 @@ class ModelExecutor:
             self.grammar_runtime
             if isinstance(self.grammar_runtime, EagerGrammarBuffers)
             else None
-        )
-
-    def _publish_draft_page_table(self, forward_op, block_tables) -> None:
-        """Stage the full-history table for the draft (see DraftPageStaging).
-
-        The upcoming replay may read up to the widest captured batch; without
-        the wrapper's padded_bs at hand, scrub through the table end.
-        """
-        if self.drafter is None:
-            return
-        bs = len(forward_op.request_pool_indices)
-        self._draft_staging.publish(
-            block_tables, bs=bs, padded_bs=self.draft_page_table.shape[0]
         )
 
     def _pp_recv_stage_state(self, num_tokens: int):
@@ -767,7 +702,6 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
-                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
                 req_pool_indices=req_pool_indices,
                 seq_lens=self.input_buffers.seq_lens_buf[:bs],
                 extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -793,7 +727,6 @@ class ModelExecutor:
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
-            self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
             req_pool_indices=req_pool_indices,
             seq_lens=self.input_buffers.seq_lens_buf[:bs],
             extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
@@ -958,7 +891,9 @@ class ModelExecutor:
             self.drafter._prepare_incremental_proj(
                 ctx.input_num_tokens,
                 self.input_buffers.positions_buf[: ctx.input_num_tokens],
-                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
+                # Decode-only rounds (the num_extends == 0 gate above): the
+                # target's verify window is the round's full write vector.
+                self.attn_backend.decode_window_locations()[: ctx.input_num_tokens],
             )
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
@@ -1101,16 +1036,14 @@ class ModelExecutor:
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.
-            # A rank that previously served a larger batch still has real page
-            # ids in the padded_bs rows the captured drafter steps read; their
-            # draft KV writes would alias live requests' pages (#955).
-            self._draft_staging.publish(None, bs=0, padded_bs=padded_bs)
+            # The draft router's idle refresh zeroes its history stack rows,
+            # so the captured drafter steps' KV writes land on the dummy
+            # page (#955's aliasing hazard is handled at the table source).
             with nvtx_range("forward_step idle", color="blue"):
                 self.forward_step(
                     bs=0,
                     ctx=ctx,
                     sampling_info=sampling_info,
-                    page_table=self.draft_page_table,
                 )
             return
 
@@ -1122,7 +1055,6 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
-            out_cache_loc=empty,
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1158,7 +1090,6 @@ class ModelExecutor:
                     draft_ctx,
                     input_ids=empty,
                     positions=empty,
-                    out_cache_loc=empty,
                     spec_step_idx=step_idx,
                 )
 
@@ -1323,24 +1254,10 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-            # out_cache_loc reads the batch-ordered full-history table (row i ==
-            # batch position i). Without a full-history group the zeroed draft
-            # table stands in (out_cache_loc then lands on the dummy page 0;
-            # such pools address their KV through their own per-group tables).
-            page_table = (
-                block_tables.get(self._full_history_group_id)
-                if self._full_history_group_id is not None
-                else None
-            )
-            if page_table is None:
-                page_table = self.draft_page_table
-            # Drafts read their pages from the batch-ordered draft page table.
-            self._publish_draft_page_table(forward_op, block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
-                out_loc_table=page_table,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
@@ -1486,7 +1403,6 @@ class ModelExecutor:
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
-                        page_table=self.draft_page_table,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                             :num_extends
@@ -1501,10 +1417,6 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
-                        cache_metadata=cache_metadata,
-                        forward_batch=(
-                            forward_op if cache_metadata is not None else None
-                        ),
                     )
                     if timing_enabled:
                         forward_step_ms = (

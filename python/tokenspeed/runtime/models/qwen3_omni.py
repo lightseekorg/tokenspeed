@@ -109,7 +109,6 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -129,7 +128,6 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )
@@ -333,7 +331,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -350,7 +347,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
         ):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
         input_embeds, model_kwargs = self.multimodal_embedder.apply(
             input_ids=input_ids,
@@ -363,7 +360,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

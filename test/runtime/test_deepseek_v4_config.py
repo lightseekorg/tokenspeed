@@ -80,8 +80,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
-    _group_slot_mapping_from_raw,
-    _mask_invalid_graph_tokens,
     _split_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
@@ -94,6 +92,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.page_table import (
+    group_slot_mapping_from_raw as _group_slot_mapping_from_raw,
+)
+from tokenspeed.runtime.layers.attention.page_table import (
+    mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import (
@@ -507,7 +511,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 spec_step_idx=0,
             ):
                 self.received_spec_step_idx = spec_step_idx
@@ -525,7 +528,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             ctx=None,
             input_ids=empty,
             positions=empty,
-            out_cache_loc=empty,
             spec_step_idx=2,
         )
 
@@ -539,7 +541,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
             ):
                 return "ok"
 
@@ -555,7 +556,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             ctx=None,
             input_ids=empty,
             positions=empty,
-            out_cache_loc=empty,
             spec_step_idx=2,
         )
 
@@ -571,7 +571,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             ):
                 self.received_kwargs = kwargs
@@ -589,7 +588,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             ctx=None,
             input_ids=empty,
             positions=empty,
-            out_cache_loc=empty,
             spec_step_idx=2,
         )
 
@@ -871,22 +869,10 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
 
-    def test_cuda_graph_group_table_padding_uses_invalid_page_rows(self):
-        table = torch.tensor([[5, -1]], dtype=torch.int32)
-        padded = ForwardStepRunner._pad_block_tables_to_padded_bs(
-            {"v4.swa": table},
-            actual_bs=1,
-            padded_bs=3,
-        )
-
-        self.assertEqual(padded["v4.swa"].tolist(), [[5, -1], [-1, -1], [-1, -1]])
-
     def test_cuda_graph_replay_keeps_idle_actual_bs_with_padded_group_tables(self):
         captured = {}
 
         class FakeBackend:
-            tables_self_padding = False
-            cache_active_pages_must_be_real = False
             draft_block_decode = False
             cache_consumer_families = frozenset({"history"})
 
@@ -899,18 +885,17 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = None
         wrapper.max_tokens_per_req = 1
         wrapper.token_to_kv_pool = _fake_pool()
+        wrapper._placeholder_tables = {
+            "v4.swa": torch.zeros((4, 1), dtype=torch.int32),
+        }
 
         wrapper._prepare_decode_metadata(
             4,
             0,
-            req_pool_indices=torch.zeros(4, dtype=torch.int32),
-            seq_lens=torch.ones(4, dtype=torch.int32),
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
-            group_placeholder_tables={
-                "v4.swa": torch.zeros((4, 1), dtype=torch.int32),
-            },
         )
 
         # (padded_bs, actual_bs) are the leading positional args.
@@ -925,10 +910,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": {}, "draft": {}}
 
         class FakeBackend:
-            tables_self_padding = False
-            cache_active_pages_must_be_real = False
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
 
             def __init__(self, key):
                 self.key = key
@@ -941,7 +923,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
@@ -949,28 +930,20 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_token_to_kv_pool = _fake_pool()
 
         table = torch.tensor([[7], [8]], dtype=torch.int32)
-        offsets = {"v4.swa": torch.tensor([1, 2], dtype=torch.int64)}
         wrapper._prepare_decode_metadata(
             4,
             2,
-            req_pool_indices=torch.zeros(4, dtype=torch.int32),
-            seq_lens=torch.ones(4, dtype=torch.int32),
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
-            group_placeholder_tables={"v4.swa": table},
-            block_table_base_offsets=offsets,
+            block_tables={"v4.swa": table},
         )
 
+        # The draft consumes its own groups out of the SAME delivered dict;
+        # row padding is the backend's job now.
         draft_kwargs = captured["draft"]["kwargs"]
-        self.assertEqual(
-            draft_kwargs["block_tables"]["v4.swa"].tolist(),
-            [[7], [8], [-1], [-1]],
-        )
-        self.assertEqual(
-            draft_kwargs["block_table_base_offsets"]["v4.swa"].tolist(),
-            [1, 2, 0, 0],
-        )
+        self.assertIs(draft_kwargs["block_tables"]["v4.swa"], table)
         self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
         draft_seq_lens = captured["draft"]["args"][3]
         self.assertEqual(
@@ -983,8 +956,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            tables_self_padding = False
-            cache_active_pages_must_be_real = False
             draft_block_decode = False
             cache_consumer_families = frozenset({"history"})
 
@@ -1002,7 +973,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool()
@@ -1014,7 +984,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            block_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         )
@@ -1043,8 +1012,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            tables_self_padding = False
-            cache_active_pages_must_be_real = False
             draft_block_decode = False
             cache_consumer_families = frozenset({"history"})
 
@@ -1057,8 +1024,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             def refresh_decode_metadata(self, *args, **kwargs):
                 captured[self.key].append((args, kwargs))
 
-        target_cache_metadata = object()
-        forward_batch = object()
         swa_table = torch.ones((1, 1), dtype=torch.int32)
         state_table = torch.full((1, 1), 2, dtype=torch.int32)
 
@@ -1067,7 +1032,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool(
@@ -1083,30 +1047,22 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=1,
             req_pool_indices=torch.zeros(1, dtype=torch.int32),
             seq_lens=torch.ones(1, dtype=torch.int32),
-            block_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             block_tables={"v4.swa_kv": swa_table, "v4.state": state_table},
-            cache_metadata=target_cache_metadata,
-            forward_batch=forward_batch,
         )
 
-        self.assertIs(captured["target"][0][1]["cache_metadata"], target_cache_metadata)
-        self.assertIs(captured["target"][0][1]["forward_batch"], forward_batch)
-        # Two steps per round (init + decode refresh); both consume only the
-        # identity-selected group subset, never the target cache metadata.
+        # Two steps per round (init + decode refresh); both receive the same
+        # delivered dict — each node consumes its own groups, so there is no
+        # per-side table subsetting (and no cache-metadata side channel).
         self.assertEqual(len(captured["draft"]), 2)
         for _, draft_kwargs in captured["draft"]:
-            self.assertNotIn("cache_metadata", draft_kwargs)
-            self.assertNotIn("forward_batch", draft_kwargs)
-            self.assertEqual(tuple(draft_kwargs["block_tables"]), ("v4.swa_kv",))
             self.assertIs(draft_kwargs["block_tables"]["v4.swa_kv"], swa_table)
+            self.assertIs(draft_kwargs["block_tables"]["v4.state"], state_table)
 
     def test_cuda_graph_eager_draft_decode_aliases_drafter_seq_lens_buffer(self):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            tables_self_padding = False
-            cache_active_pages_must_be_real = False
             draft_block_decode = False
             cache_consumer_families = frozenset({"history"})
 
@@ -1121,7 +1077,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_staging=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
             owns_eager_decode_metadata=False,
         )
@@ -1132,9 +1087,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper._prepare_decode_metadata(
             2,
             2,
-            req_pool_indices=torch.zeros(2, dtype=torch.int32),
-            seq_lens=seq_lens,
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             use_graph=False,
         )
@@ -2730,22 +2684,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         }
         malformed = []
         malformed.append(({"fine": valid["fine"]}, "group mismatch"))
-        malformed.append(
-            (
-                {
-                    "fine": valid["fine"],
-                    "coarse": valid["coarse"],
-                    "extra": valid["fine"],
-                },
-                "group mismatch",
-            )
-        )
-        malformed.append(
-            (
-                {"coarse": valid["coarse"], "fine": valid["fine"]},
-                "wrong order",
-            )
-        )
         malformed.append(
             (
                 {**valid, "fine": valid["fine"].to(torch.int64)},
@@ -5845,7 +5783,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 qr=torch.zeros((2, 8)),
                 positions=torch.tensor([6, 7], dtype=torch.int64),
                 ctx=ctx,
-                out_cache_loc=torch.zeros(2, dtype=torch.int64),
                 layer_index=0,
                 cos_sin_cache=torch.empty((1, 1)),
                 compressor_slot_cache={},

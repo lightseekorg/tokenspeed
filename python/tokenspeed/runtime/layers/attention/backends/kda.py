@@ -50,8 +50,7 @@ from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
 )
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    HybridLinearAttnBackend,
+from tokenspeed.runtime.layers.attention.backends.mamba import (
     MambaAttnBackend,
     logger,
 )
@@ -856,12 +855,3 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state
-
-
-class HybridKDABackend(HybridLinearAttnBackend):
-    """Composite backend for KDA hybrid models (full attention + KDA layers).
-
-    Identical to ``HybridLinearAttnBackend`` today; it exists so KDA-only
-    composite surface (deferred-commit settlement, lifecycle hooks) has a
-    home that other linear hybrids never inherit.
-    """

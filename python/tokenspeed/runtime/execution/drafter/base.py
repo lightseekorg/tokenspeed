@@ -55,7 +55,6 @@ class BaseDrafter:
         draft_model_runner: ModelRunner | None = None,
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
-        page_staging=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
@@ -65,11 +64,12 @@ class BaseDrafter:
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
-        # The staged batch-ordered page table (row i == batch position i,
-        # raw scheduler pages, refreshed each forward by
-        # DraftPageStaging.publish). Write-location math goes through it so
-        # page ids and page-size arithmetic stay out of drafters.
-        self.page_staging = page_staging
+        # This round's per-group scheduler tables, published by the runner's
+        # metadata prep; block drafters re-run the unified refresh with them
+        # inside their step loop (write locations themselves come from the
+        # draft router: publish_draft_step_locations serves the step window,
+        # draft_write_locations_uniform resolves side-write scratch).
+        self.round_block_tables = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size

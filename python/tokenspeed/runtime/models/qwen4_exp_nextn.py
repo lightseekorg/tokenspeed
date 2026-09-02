@@ -107,10 +107,9 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         if ctx.accept_lengths is None:
-            return super()._attn(q, k, v, gate, ctx, out_cache_loc)
+            return super()._attn(q, k, v, gate, ctx)
         from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
         self._apply_correction(ctx)
@@ -123,7 +122,6 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
             k,
             v,
             decode_ctx,
-            out_cache_loc,
             record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
         )
         if gate is not None:
@@ -149,9 +147,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
-            else self.self_attention(
-                kwargs["positions"], mixed, ctx, kwargs["out_cache_loc"]
-            )
+            else self.self_attention(kwargs["positions"], mixed, ctx)
         )
         if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
             residuals = tuple(
@@ -278,7 +274,6 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -301,7 +296,6 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 input_embeds=fused,
             )
         return self.logits_processor(

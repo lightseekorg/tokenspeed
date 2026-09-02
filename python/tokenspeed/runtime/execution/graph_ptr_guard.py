@@ -50,6 +50,9 @@ _GRAPH_METADATA_SLOTS = (
     "forward_decode_metadata",
     "forward_metadata",
     "conv_decode_metadata",
+    # The router's per-group decode write-slot views (recorded through the
+    # leaves' KV writes).
+    "decode_write_locations",
 )
 
 _MAX_WALK_DEPTH = 8

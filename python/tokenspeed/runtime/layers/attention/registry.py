@@ -412,6 +412,46 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     return cls
 
 
+def create_paged_router(
+    config: AttnConfig,
+    arch: AttentionArch,
+    *,
+    backend_name: str | None = None,
+) -> AttentionBackend:
+    """Build the CacheGroupRouter for one side's paged attention.
+
+    The router builds one ``PagedAttentionBackend`` leaf per paged
+    (history-family) cache group of the pool view bound later via
+    ``set_cache_pool``; each leaf's kernel page size resolves from the
+    config override, the leaf class default, or the group's own block
+    granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
+    """
+    from tokenspeed.runtime.layers.attention.backends.router import (
+        CacheGroupRouter,
+    )
+
+    spec = config.component(SoftmaxAttnConfig)
+    name = backend_name if backend_name is not None else spec.backend_name
+    leaf_cls = _get_backend_cls(name, arch)
+
+    def leaf_factory(group_id: str, block_granularity: int):
+        del group_id
+        kernel_page_size = leaf_cls.resolve_kernel_page_size(config, block_granularity)
+        original_name = spec.backend_name
+        spec.backend_name = name
+        try:
+            return leaf_cls(config, spec, kernel_page_size=kernel_page_size)
+        finally:
+            spec.backend_name = original_name
+
+    return CacheGroupRouter(
+        leaf_factory,
+        is_draft=bool(config.is_draft),
+        spec_num_tokens=config.speculative_num_draft_tokens or 1,
+        device=config.device,
+    )
+
+
 def _validate_lcm_page_size(
     config: AttnConfig,
     *,
@@ -481,8 +521,9 @@ def _create_attn_backend(
     arch: AttentionArch,
     config: AttnConfig,
 ) -> AttentionBackend:
-    spec = config.component(SoftmaxAttnConfig)
-    return _get_backend_cls(spec.backend_name, arch)(config, spec)
+    return _create_attn_backend_with_name(
+        config.component(SoftmaxAttnConfig).backend_name, arch, config
+    )
 
 
 def _create_attn_backend_with_name(
@@ -490,11 +531,20 @@ def _create_attn_backend_with_name(
     arch: AttentionArch,
     config: AttnConfig,
 ) -> AttentionBackend:
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        PagedAttentionBackend,
+    )
+
+    cls = _get_backend_cls(name, arch)
+    if issubclass(cls, PagedAttentionBackend):
+        # Paged leaves are served through the cache-group router: one leaf
+        # per history group, blocks -> kernel pages mapped in one place.
+        return create_paged_router(config, arch, backend_name=name)
     spec = config.component(SoftmaxAttnConfig)
     original_name = spec.backend_name
     spec.backend_name = name
     try:
-        return _get_backend_cls(name, arch)(config, spec)
+        return cls(config, spec)
     finally:
         spec.backend_name = original_name
 
@@ -570,12 +620,13 @@ def _create_hybrid_linear_attn_backend(
     MLA base). ``pool`` is the model's layer-mapped view over the one
     shared cache pool; both sub-backends consume its per-group tables.
     """
-    from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
-        HybridKDABackend,
+    from tokenspeed.runtime.layers.attention.backends.hybrid import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.kda import (
         KdaAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-        HybridLinearAttnBackend,
+    from tokenspeed.runtime.layers.attention.backends.mamba import (
         MambaAttnBackend,
     )
 
@@ -639,8 +690,9 @@ def _create_hybrid_linear_attn_backend(
     # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
-    hybrid_cls = HybridKDABackend if is_kda else HybridLinearAttnBackend
-    backend = hybrid_cls(full_attn_backend, linear_attn_backend, full_attn_layers)
+    backend = HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, full_attn_layers
+    )
     logger.info(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),

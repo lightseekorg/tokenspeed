@@ -555,12 +555,11 @@ and never touches packing. No refactor needed here.
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state
   attention has no page table, so the shared call's keyword is absorbed unused
-  via `**kwargs`. And `input_buffer.py::fill_input_buffers` takes a
-  unit-neutral `out_loc_table`: the batch-ordered table `out_cache_loc`
-  derives from, which is the scheduler's full-history table on the target path
-  and the staged draft table on the drafter path.
+  via `**kwargs`. `input_buffer.py` carries no table at all anymore: KV write
+  locations are backend-owned (`write_locations`), so the runner's input prep
+  writes positions and seq_lens only.
 
-### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
+### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
 leaking it; `expand_page_table` (`attention/page_table.py`) is the single
@@ -581,30 +580,40 @@ view, mirrored by the host tier. Specifically:
 * Spec geometry is shape-checked at construction: row geometry and
   `checkpoint_granularity` are mutually exclusive, both positive, and
   family-gated (`CacheGroupSpec.__post_init__`).
-* Group consumption is claimed positively, from one declaration: a backend
-  keeps exactly the delivered `block_tables` entries whose family it
-  declared in `cache_consumer_families`, minus wrapper-owned group ids
-  (`AttentionBackend._consumed_group_ids` / `_consumed_group_tables`, fed
-  by `CacheGroupGeometry.families`; the CUDA-graph table stacks and capture
-  views select from the same set). The declaration that already drives the
-  boot-time family check (`validate_scheduler_config`) and the draft table
-  selection thus also drives the runtime filter — there is no separate
-  known-foreign subtract list to keep in sync when a new family appears. A
-  table delivered for a group the bound pool never published fails loudly.
-
-Remaining known item (deliberate, separate project): the mapping *primitive*
-is single and the *owners* are down to three — the MHA-family slot math and
-the MLA-family slot math (both sets of pure functions in
-`backends/group_write_locations.py`, fed by the one shared
-`CacheGroupGeometry`; every backend consumes the wrapper's per-group
-`block_tables` in raw scheduler pages and expands through the shared
-`expand_history_table`; `CacheBatchMetadata.kernel_table` was deleted when
-the MLA family moved onto that route, see `unified_path.md`), and
-DeepSeek-V4's bespoke slot mapping. `DraftPageStaging` is no longer an
-owner: its publish is a pure copy + scrub in raw pages (the address-stable
-shadow the drafters' in-graph write-location kernels need), with no page
-mapping of its own. Consolidating the two location-math families and V4
-means touching every backend family at once; do it as its own milestone.
+* Group consumption is claimed positively, from one declaration: each
+  consumer takes exactly the delivered `block_tables` entries for the
+  groups it serves — the router builds one leaf per paged (history-family)
+  group of its bound pool view and fails a live batch missing any of them;
+  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
+  group ids. `cache_consumer_families` remains the boot-time coverage
+  declaration (`validate_scheduler_config`). Extra delivered groups ride
+  through untouched; a table for a group the bound pool never published
+  fails loudly.
+* The logical→physical conversion has ONE home per pool view:
+  `CacheGroupRouter` (`backends/router.py`) learns each group's
+  `block_granularity` and each leaf's `kernel_page_size` into one
+  `CacheGroupGeometry`, expands the bridge's raw block tables into
+  kernel-page stacks, and derives every KV write location — extend spans,
+  the decode/verify window, and the drafters' published step windows — from
+  those same tables (`backends/write_locations.py`, pure functions). Paged
+  leaves see kernel vocabulary only. The bridge's packed upload layout
+  (`CacheBatchMetadata`) is the one sanctioned scheduler↔router coupling:
+  the router's fused unpack reads it directly. Models and the runner never
+  compute locations — `write_locations(layer, mode)` is the single accessor
+  (`unified_path.md`, "Write locations have one owner").
+* The slot *arithmetic* itself lives in the mapping layer in exactly two
+  spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
+  is page-size invariant): the router's stacked window/span math
+  (`backends/write_locations.py`, failing to slot 0 — the reserved dummy
+  page) and the token-shaped resolve
+  (`attention/page_table.py::group_slot_mapping_from_raw` +
+  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
+  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
+  a *composer*, not an owner: its SWA / compressor-state / indexer-state
+  writes call the shared token-shaped resolve over its delivered tables;
+  only the compression-boundary orchestration (per-ratio strides, boundary
+  masks, the fused dsv4 kernel) is V4-specific
+  (`kv_cache/hybrid_deepseek_v4.py`).
 
 ### Principle 6 — provenance discipline: fixed
 

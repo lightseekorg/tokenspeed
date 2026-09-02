@@ -735,12 +735,9 @@ class TestCheckpointMetadata(unittest.TestCase):
         self.assertEqual(len(inner_calls), 1)
         self.assertEqual(inner_calls[0].tolist(), [130])
 
-    def test_update_draft_forward_metadata_recomputes_group_locs(self):
-        """The hook must replace seq_lens with the frontier and point
-        the grouped write locs at the k positions ending there."""
-        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
-            CacheGroupGeometry,
-        )
+    def test_update_draft_forward_metadata_reanchors_seq_lens(self):
+        """The MTP re-anchor must replace the leaf's decode seq_lens with the
+        committed frontier (the drafter supplies its own write locations)."""
         from tokenspeed.runtime.layers.attention.backends.mha import (
             MHAAttnBackend,
             MHADecodeMetadata,
@@ -749,22 +746,16 @@ class TestCheckpointMetadata(unittest.TestCase):
         host = MHAAttnBackend.__new__(MHAAttnBackend)
         host.kernel_page_size = 2
         host.spec_num_tokens = 4
-        host._geometry = CacheGroupGeometry(granularities={"g": 2})
-        table = torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda")
+        host.seq_lens_buf = torch.tensor([8], dtype=torch.int32, device="cuda")
         host.forward_decode_metadata = MHADecodeMetadata(
-            page_table=None,
-            seq_lens=torch.tensor([8], dtype=torch.int32, device="cuda"),
-            page_tables={"g": table},
-            out_cache_locs={"g": torch.zeros(4, dtype=torch.int32, device="cuda")},
+            page_table=torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda"),
+            seq_lens=host.seq_lens_buf[:1],
         )
         frontier = torch.tensor([6], dtype=torch.int32, device="cuda")
 
-        host.update_draft_forward_metadata(frontier)
+        host.advance_draft_forward_metadata(frontier)
 
-        md = host.forward_decode_metadata
-        self.assertEqual(md.seq_lens.tolist(), [6])
-        # Positions 2..5 with page size 2 over table row [7, 8, 9].
-        self.assertEqual(md.out_cache_locs["g"].tolist(), [16, 17, 18, 19])
+        self.assertEqual(host.forward_decode_metadata.seq_lens.tolist(), [6])
 
 
 if __name__ == "__main__":

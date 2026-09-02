@@ -30,6 +30,12 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.page_table import (
+    mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
+)
+from tokenspeed.runtime.layers.attention.page_table import (
+    safe_page_ids as _safe_page_ids,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -75,97 +81,6 @@ def _split_block_tables_into_v4_metadata(
         compressor_state_base,
         indexer_state_base,
     )
-
-
-def _safe_page_ids(
-    block_table: torch.Tensor,
-    req_indices: torch.Tensor,
-    page_indices: torch.Tensor,
-) -> torch.Tensor:
-    req_i64 = req_indices.to(torch.int64)
-    page_i64 = page_indices.to(torch.int64)
-    sentinel = torch.full_like(page_i64, -1, dtype=torch.int64)
-    rows = int(block_table.shape[0]) if block_table.ndim >= 1 else 0
-    cols = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
-    if rows <= 0 or cols <= 0:
-        return sentinel
-    valid = (req_i64 >= 0) & (req_i64 < rows) & (page_i64 >= 0) & (page_i64 < cols)
-    safe_req = req_i64.clamp(0, rows - 1)
-    safe_page = page_i64.clamp(0, cols - 1)
-    page_ids = block_table[safe_req, safe_page].to(torch.int64)
-    return torch.where(valid, page_ids, sentinel)
-
-
-def _expand_group_values_for_tokens(
-    values: torch.Tensor,
-    num_tokens: int,
-    name: str,
-) -> torch.Tensor:
-    if values.numel() == num_tokens:
-        return values
-    if values.numel() <= 0 or num_tokens % values.numel() != 0:
-        raise RuntimeError(
-            f"DeepSeek V4 {name} has incompatible shape for packed tokens: "
-            f"{values.numel()} entries for {num_tokens} tokens"
-        )
-    return values.repeat_interleave(num_tokens // values.numel())
-
-
-def _group_slot_mapping_from_raw(
-    positions: torch.Tensor,
-    req_indices: torch.Tensor,
-    block_table: torch.Tensor,
-    rows_per_page: int,
-    entry_stride_tokens: int = 1,
-    base_offsets: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if rows_per_page <= 0:
-        raise ValueError(f"rows_per_page must be > 0, got {rows_per_page}")
-    if entry_stride_tokens <= 0:
-        raise ValueError(f"entry_stride_tokens must be > 0, got {entry_stride_tokens}")
-    pos_i64 = positions.to(torch.int64)
-    logical_row = torch.div(pos_i64, entry_stride_tokens, rounding_mode="floor")
-    logical_page = torch.div(logical_row, rows_per_page, rounding_mode="floor")
-    offsets = logical_row % rows_per_page
-    req_indices = _expand_group_values_for_tokens(
-        req_indices,
-        positions.numel(),
-        "request indices",
-    )
-    table_page = logical_page
-    if base_offsets is not None:
-        req_i64 = req_indices.to(torch.int64)
-        rows = int(base_offsets.shape[0])
-        if rows <= 0:
-            table_page = logical_page.new_full(logical_page.shape, -1)
-        else:
-            valid_req = (req_i64 >= 0) & (req_i64 < rows)
-            safe_req = req_i64.clamp(0, rows - 1)
-            base = base_offsets.to(
-                device=logical_page.device,
-                dtype=torch.int64,
-            )[safe_req]
-            table_page = torch.where(valid_req, logical_page - base, -1)
-    page_ids = _safe_page_ids(block_table, req_indices, table_page)
-    slots = page_ids * rows_per_page + offsets
-    return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
-
-
-def _mask_invalid_graph_tokens(
-    slot_mapping: torch.Tensor,
-    is_valid_token: torch.Tensor | None,
-) -> torch.Tensor:
-    if is_valid_token is None:
-        return slot_mapping
-    valid = _expand_group_values_for_tokens(
-        is_valid_token,
-        slot_mapping.numel(),
-        "slot validity mask",
-    ).to(
-        device=slot_mapping.device,
-        dtype=torch.bool,
-    )
-    return torch.where(valid, slot_mapping, torch.full_like(slot_mapping, -1))
 
 
 def _compressed_boundary_mask(

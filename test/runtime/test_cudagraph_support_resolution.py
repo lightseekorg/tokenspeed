@@ -88,7 +88,7 @@ class ResolutionTest(_CudaGraphSupportCase):
         child = self._stub(self.support_cls(prefill_graph=False))
         wrapper = self._stub(children=(child,))
         with self.assertLogs(
-            "tokenspeed.runtime.layers.attention.backends.base", level="INFO"
+            "tokenspeed.runtime.layers.attention.backends.support", level="INFO"
         ) as logs:
             self.resolve(wrapper)
         self.assertTrue(any("_Stub" in line for line in logs.output))

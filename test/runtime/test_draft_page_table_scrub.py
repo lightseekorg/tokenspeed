@@ -1,3 +1,14 @@
+"""Rows past the current batch must never keep a prior batch's page ids.
+
+CUDA-graph replay reads padded_bs rows straight off the draft router's
+full-history stack (row i IS batch position i, so the req-pool sink row does
+not shield it). A stale id left by an earlier, larger batch routes the
+multi-step draft's KV writes into another request's pages; the victim then
+mispredicts permanently (#955: M3 EAGLE3 accept 0.665 -> 0.0015). The
+router's fill contract carries the scrub now: rows [actual_bs, bs) and every
+idle row are the null page 0.
+"""
+
 from __future__ import annotations
 
 import os
@@ -7,103 +18,102 @@ from types import SimpleNamespace
 
 import torch
 
-# CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.types import DpForwardMetadata
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
+
+FULL = "full_attention"
 
 
-def _staging(rows: int = 8, columns: int = 4):
-    return DraftPageStaging(
-        max_bs=rows,
-        max_pages_per_req=columns,
-        block_granularity=128,
-        full_history_group_id="full_attention",
-        device="cpu",
+class _Leaf:
+    """Metadata-only leaf stub (the scrub lives in the router's stack)."""
+
+    kernel_page_size = 128
+    max_num_pages = 4
+    verify_floor = 1
+
+    def init_cuda_graph_state(self, max_bs):
+        pass
+
+    def refresh_decode_metadata(self, *args, **kwargs):
+        pass
+
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        pass
+
+
+def _draft_router(rows: int = 8) -> CacheGroupRouter:
+    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router.bind(
+        CacheGroupGeometry(
+            granularities={FULL: 128},
+            families={FULL: "history"},
+            full_history_group_id=FULL,
+            history_block_granularity=128,
+        ),
+        {FULL: _Leaf()},
+    )
+    router.init_cuda_graph_state(rows)
+    return router
+
+
+def _refresh(router, bs, actual_bs, table):
+    router.refresh_decode_metadata(
+        bs,
+        actual_bs,
+        None,
+        torch.ones(bs, dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables={FULL: table} if table is not None else {},
     )
 
 
-def _publish(staging, bs, table):
-    staging.publish({"full_attention": table}, bs=bs, padded_bs=staging.table.shape[0])
-
-
-class DraftPageTableScrubTest(unittest.TestCase):
-    """Rows past the current batch must never keep a prior batch's page ids.
-
-    CUDA-graph replay reads padded_bs rows straight off this table (row i IS
-    batch position i, so the req-pool sink row does not shield it). A stale
-    id left by an earlier, larger batch routes the multi-step draft's KV
-    writes into another request's pages; the victim then mispredicts
-    permanently (#955: M3 EAGLE3 accept 0.665 -> 0.0015).
-    """
-
+class DraftHistoryScrubTest(unittest.TestCase):
     def test_smaller_batch_clears_prior_rows(self):
-        st = _staging()
-        _publish(
-            st,
-            4,
-            torch.tensor([[7, 8], [9, 10], [11, 12], [13, 14]], dtype=torch.int32),
-        )
-        # Re-publish with a smaller batch: rows [1:] must be inert.
-        _publish(st, 1, torch.tensor([[3, 4]], dtype=torch.int32))
-        self.assertTrue(torch.equal(st.table[1:], torch.zeros_like(st.table[1:])))
+        router = _draft_router()
+        _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
+        _refresh(router, 8, 2, torch.full((2, 4), 3, dtype=torch.int32))
+        view = router.draft_history_view()
+        self.assertTrue((view.table[2:] == 0).all(), view.table)
+        self.assertTrue((view.table[:2] == 3).all())
 
-    def test_smaller_batch_keeps_active_rows(self):
-        st = _staging()
-        _publish(st, 2, torch.tensor([[7, 8], [9, 10]], dtype=torch.int32))
-        _publish(st, 1, torch.tensor([[3, 4]], dtype=torch.int32))
-        expected = torch.tensor([3, 4, 0, 0], dtype=torch.int32)
-        self.assertTrue(torch.equal(st.table[0], expected))
-
-    def test_scrub_only_publish_clears_padded_rows(self):
-        # The idle path publishes with no tables: scrub must still run.
-        st = _staging()
-        st.table[:6] = 7
-        st.publish(None, bs=0, padded_bs=4)
-        self.assertTrue(torch.equal(st.table[:4], torch.zeros_like(st.table[:4])))
-        # Rows past padded_bs are untouched (not read by this replay).
-        self.assertTrue(bool((st.table[4:6] == 7).all()))
-
-    def test_groupless_contract_still_scrubs(self):
-        # A contract without a full-history group skips the copy, but the
-        # placeholder must stay inert for its other consumers.
-        st = DraftPageStaging(
-            max_bs=8,
-            max_pages_per_req=4,
-            block_granularity=128,
-            full_history_group_id=None,
-            device="cpu",
+    def test_padded_replay_rows_resolve_to_the_dummy_slot(self):
+        router = _draft_router()
+        _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
+        _refresh(router, 4, 1, torch.full((1, 4), 3, dtype=torch.int32))
+        out = torch.zeros(8, dtype=torch.int32)
+        router.draft_write_locations_uniform(
+            out, cache_start=torch.zeros(4, dtype=torch.int32), num_tokens=2
         )
-        st.table[:] = 7
-        st.publish(
-            {"full_attention": torch.tensor([[3]], dtype=torch.int32)},
-            bs=1,
-            padded_bs=8,
-        )
-        self.assertTrue(torch.equal(st.table[1:], torch.zeros_like(st.table[1:])))
+        # Rows 1..3 are padding: their pages are null, so slots are 0.
+        self.assertEqual(out[2:].tolist(), [0] * 6)
+
+    def test_idle_refresh_zeroes_every_row(self):
+        router = _draft_router()
+        _refresh(router, 8, 8, torch.full((8, 4), 9, dtype=torch.int32))
+        _refresh(router, 8, 0, None)
+        self.assertTrue((router.draft_history_view().table == 0).all())
 
 
 class IdleReplayScrubTest(unittest.TestCase):
-    """The idle replay path skips the batch publish, so it must scrub on its
-    own.
-
-    A DP rank that served a large batch and then goes idle replays the
-    captured drafter graph at padded_bs while another rank decodes; without
-    the idle-path scrub the stale rows route idle draft KV writes into
-    live pages (codex P2 on #955).
-    """
+    """A DP rank that served a large batch and then goes idle replays the
+    captured drafter graph at padded_bs while another rank decodes; the idle
+    refresh must present null rows to the drafter's recorded kernels."""
 
     def test_idle_replay_sees_zeroed_rows(self):
         padded_bs = 4
-        rows, columns = 8, 4
         captured = {}
-        staging = _staging(rows=rows, columns=columns)
+        router = _draft_router()
+        _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
 
         class _Step:
             def can_run(self, bs, ctx):
@@ -112,29 +122,29 @@ class IdleReplayScrubTest(unittest.TestCase):
             def padded_bs(self, bs, ctx):
                 return padded_bs
 
-            def __call__(self, bs, ctx, sampling_info, page_table):
-                captured["rows"] = page_table[:padded_bs].clone()
+            def __call__(self, bs, ctx, sampling_info):
+                # The runner's idle metadata prep refreshed the draft router
+                # with placeholders before this call; snapshot what the
+                # drafter's recorded kernels would read.
+                _refresh(router, padded_bs, 0, None)
+                captured["rows"] = router.draft_history_view().table[:padded_bs].clone()
 
         ex = SimpleNamespace(
             attn_backend=None,
             token_to_kv_pool=None,
             input_buffers=SimpleNamespace(
-                req_pool_indices_buf=torch.zeros(rows, dtype=torch.int64),
+                req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
                 fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
             ),
             runtime_states=SimpleNamespace(
-                valid_cache_lengths=torch.zeros(rows, dtype=torch.int32),
+                valid_cache_lengths=torch.zeros(8, dtype=torch.int32),
                 vocab_size=32,
             ),
             device="cpu",
             config=SimpleNamespace(output_length=1),
             capturable_grammar=None,
-            _draft_staging=staging,
-            draft_page_table=staging.table,
             forward_step=_Step(),
         )
-        # Simulate a prior larger batch leaving real ids behind.
-        staging.table[:6] = 7
         ModelExecutor.execute_idle_forward(
             ex,
             DpForwardMetadata(
@@ -146,10 +156,7 @@ class IdleReplayScrubTest(unittest.TestCase):
                 need_idle_forward=True,
             ),
         )
-        self.assertIn("rows", captured)
-        self.assertTrue(
-            torch.equal(captured["rows"], torch.zeros_like(captured["rows"]))
-        )
+        self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
 
 
 if __name__ == "__main__":

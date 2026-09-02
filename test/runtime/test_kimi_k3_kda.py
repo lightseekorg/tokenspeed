@@ -46,7 +46,7 @@ _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
-from test.runtime.conftest import cache_metadata_for as _metadata_for
+from test.runtime.conftest import block_tables_for as _tables_for
 from test.runtime.conftest import layer_for_group as _kda_layer_for_group
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from test.runtime.conftest import requires_cuda
@@ -54,9 +54,9 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends import hybrid_kda, hybrid_linear_attn
-from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends import kda, mamba
+from tokenspeed.runtime.layers.attention.backends.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.mamba import (
     compute_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -84,7 +84,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         captured.update(kwargs)
         return SimpleNamespace(out=torch.empty(1, 1, 2, 4), final_state=final)
 
-    monkeypatch.setattr(hybrid_kda, "kda_paged_prefill", fake_prefill)
+    monkeypatch.setattr(kda, "kda_paged_prefill", fake_prefill)
     query = torch.empty(1, 1, 2, 3)
     value = torch.empty(1, 1, 2, 4)
     _, final_state = backend._prefill_scan(
@@ -285,18 +285,18 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     page_size = pool.arena.prefix_granularity
 
     plan_calls = 0
-    real = hybrid_linear_attn._compute_state_block_index_plan
+    real = mamba._compute_state_block_index_plan
 
     def counting(*args, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(hybrid_linear_attn, "_compute_state_block_index_plan", counting)
+    monkeypatch.setattr(mamba, "_compute_state_block_index_plan", counting)
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
-    metadata, forward_op = _metadata_for(pool.arena.runtime_contract, tables, "cpu")
+    delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
     # Decode: request 0 crosses into its second page, request 1 stays inside
     # its first page.
     seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
@@ -305,8 +305,7 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=seq_lens,
         forward_mode=ForwardMode.DECODE,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables=delivered,
     )
 
     # Conversion and slot arithmetic run once for the whole batch. Each state
@@ -353,7 +352,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     }
     # Distinct per-group tables so the refresh is provably group-specific.
     tables = _kimi_tables(bs=2, width=4, base=1)
-    metadata, forward_op = _metadata_for(pool.arena.runtime_contract, tables, "cpu")
+    delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
     # bs 2 requests, one padding row (real_bs 1). Decode: before = seq-1.
     backend.refresh_decode_metadata(
         2,
@@ -362,8 +361,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         torch.tensor([5, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         for_graph_replay=True,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables=delivered,
     )
     md = backend.forward_metadata
     for gid in _STATE_GROUPS:
@@ -461,10 +459,9 @@ class _KDAHarness:
         np_tables = {
             gid: np.asarray(rows, dtype=np.int32) for gid, rows in tables.items()
         }
-        metadata, forward_op = _metadata_for(self.contract, np_tables, self.device)
+        delivered = _tables_for(self.contract, np_tables, self.device)
         kwargs = dict(
-            cache_metadata=metadata,
-            forward_batch=forward_op,
+            block_tables=delivered,
         )
         if extend_prefix_lens is not None:
             kwargs["extend_prefix_lens"] = torch.tensor(
@@ -892,7 +889,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
-    indexed_decode = hybrid_kda.kda_paged_decode
+    indexed_decode = kda.kda_paged_decode
 
     def _indexed_decode_spy(*args, **kwargs):
         nonlocal indexed_decode_calls
@@ -905,7 +902,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         _unexpected_megafuse,
     )
     monkeypatch.setattr(
-        hybrid_kda,
+        kda,
         "kda_paged_decode",
         _indexed_decode_spy,
     )
@@ -949,7 +946,7 @@ def test_mask_fresh_initial_state_zeroes_recycled_bytes() -> None:
     """Fresh sequences must not inherit a recycled page's stale bytes as
     their initial recurrent state: only rows with real history keep the
     gathered state."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    from tokenspeed.runtime.layers.attention.backends.mamba import (
         _mask_fresh_initial_state,
     )
 

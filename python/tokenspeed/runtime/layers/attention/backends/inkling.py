@@ -181,10 +181,9 @@ class InklingAttnBackend(AttentionBackend):
         # Paged conv geometry (see _inkling_conv_columns). Mandatory: the
         # sconv state always has its paged bridges; there is no rolling mode.
         self.conv_columns = conv_columns
-        # The conv groups are wrapper-owned: the inner backend must skip
-        # their write-loc math and capture buffers (see AttentionBackend's
-        # engine_owned_group_ids).
-        inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
+        # The conv groups are state-family: the inner router builds leaves
+        # for history groups only, so it never sees them; this wrapper reads
+        # them straight out of block_tables.
         # Two slots, like forward_prefill_metadata / forward_decode_metadata
         # on the inner backend: extend init writes the prefill slot, decode
         # capture/refresh write the decode slot, readers route by the live
@@ -221,6 +220,11 @@ class InklingAttnBackend(AttentionBackend):
         self._checkpoint_streams: dict[
             tuple[int, int, int, str], tuple[torch.Tensor, ...]
         ] = {}
+
+    @property
+    def _inner_max_context_len(self) -> int:
+        leaf = next(iter(self.inner.leaves.values()))
+        return leaf.max_context_len
 
     def __getattr__(self, name):
         # Guard `inner` so a half-constructed wrapper raises AttributeError instead of recursing.
@@ -384,8 +388,8 @@ class InklingAttnBackend(AttentionBackend):
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -438,7 +442,6 @@ class InklingAttnBackend(AttentionBackend):
             num_extends,
             req_pool_indices,
             seq_lens,
-            page_table,
             forward_mode,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -449,15 +452,10 @@ class InklingAttnBackend(AttentionBackend):
 
         cache_indices = req_pool_indices[:bs].to(torch.int32)
         assert extend_seq_lens is not None and extend_prefix_lens is not None
-        # Reuse the cumsum the inner backend just computed for this batch.
-        inner_md = self.inner.forward_extend_metadata
-        if inner_md is not None:
-            query_start_loc = inner_md.cu_extend_seq_lens
-        else:
-            query_start_loc = torch.nn.functional.pad(
-                torch.cumsum(extend_seq_lens[:bs], dim=0, dtype=torch.int32),
-                (1, 0),
-            )
+        query_start_loc = torch.nn.functional.pad(
+            torch.cumsum(extend_seq_lens[:bs], dim=0, dtype=torch.int32),
+            (1, 0),
+        )
         has_initial_state = extend_prefix_lens[:bs] > 0
         seq_idx = None
         if extend_total is not None:
@@ -533,6 +531,24 @@ class InklingAttnBackend(AttentionBackend):
                 else None
             ),
         )
+
+    def write_locations(self, layer, forward_mode):
+        return self.inner.write_locations(layer, forward_mode)
+
+    def draft_history_view(self):
+        return self.inner.draft_history_view()
+
+    def publish_draft_step_locations(self, cache_start, num_tokens):
+        return self.inner.publish_draft_step_locations(cache_start, num_tokens)
+
+    def draft_write_locations_uniform(self, out, cache_start, num_tokens):
+        return self.inner.draft_write_locations_uniform(out, cache_start, num_tokens)
+
+    def decode_window_locations(self):
+        return self.inner.decode_window_locations()
+
+    def extend_span_locations(self):
+        return self.inner.extend_span_locations()
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Re-anchor the k-row conv metadata and the inner backend's
@@ -628,13 +644,13 @@ class InklingAttnBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        inner = self.inner
+        inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         if k is not None:
             k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         metadata = inner.forward_decode_metadata
-        out_cache_loc = inner._select_out_cache_loc(layer, metadata, out_cache_loc)
+        out_cache_loc = self.inner.write_locations(layer, ForwardMode.DECODE)
         if save_kv_cache:
             # Decode-side rows and write locs must agree exactly: a shorter
             # loc vector would make _save_kv_cache silently TRIM the rows
@@ -661,7 +677,7 @@ class InklingAttnBackend(AttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=inner._select_page_table(layer, metadata),
+            page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             max_seqlen_k=inner.max_context_len,
             rel_logits=rel_logits,
@@ -701,7 +717,7 @@ class InklingAttnBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        inner = self.inner
+        inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
@@ -711,7 +727,8 @@ class InklingAttnBackend(AttentionBackend):
         # its handoff are bucket-shaped. Scrub the padded rows instead of using
         # the plain MHA path's exact-row kernel contract.
         scrub_padding_tail(_num_real, q, k, v)
-        out_cache_loc = inner._select_out_cache_loc(layer, metadata, out_cache_loc)
+        out_cache_loc = self.inner.write_locations(layer, ForwardMode.EXTEND)
+        out_cache_loc = out_cache_loc[:_num_real]
         plan = rel_mha_plan(
             dtype=torch.float8_e4m3fn if inner.is_fp8 else inner.qkv_dtype,
             head_dim=inner.head_dim,
@@ -759,7 +776,7 @@ class InklingAttnBackend(AttentionBackend):
             cu_seqlens_kv=metadata.cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=inner._select_page_table(layer, metadata),
+            page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=inner.max_context_len,
@@ -853,7 +870,7 @@ class InklingAttnBackend(AttentionBackend):
         )
         self._pfg_col_tables = {
             g: torch.full(
-                (self._pfg_max_bs + 1, -(-self.inner.max_context_len // bt)),
+                (self._pfg_max_bs + 1, -(-self._inner_max_context_len // bt)),
                 -1,
                 dtype=torch.int32,
                 device=device,
@@ -891,23 +908,18 @@ class InklingAttnBackend(AttentionBackend):
         # seq_lens_buf; replay copies the live lengths in, so graph state does
         # not depend on the controller mutating a shared tensor in place.
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        # Adopted stacked views are filled by the inner backend's packed
-        # unpack (GroupGraphBuffers.fill); pad rows hit dummy slot 0.
-        inner_tabs = getattr(self.inner, "cuda_graph_owned_block_tables", {})
+        # Wrapper-owned persistent conv tables, refreshed from block_tables
+        # each decode step.
         groups = self.conv_columns["group_block_tokens"]
-        self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
-        if self._graph_col_tables_adopted:
-            self._graph_col_tables = {g: inner_tabs[g] for g in groups}
-        else:
-            self._graph_col_tables = {
-                g: torch.full(
-                    (max_bs, -(-self.inner.max_context_len // bt)),
-                    1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for g, bt in groups.items()
-            }
+        self._graph_col_tables = {
+            g: torch.full(
+                (max_bs, -(-self._inner_max_context_len // bt)),
+                1,
+                dtype=torch.int32,
+                device=device,
+            )
+            for g, bt in groups.items()
+        }
         self._graph_cache_indices = torch.full(
             (max_bs,), PAD_SLOT_ID, dtype=torch.int32, device=device
         )
@@ -960,7 +972,6 @@ class InklingAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         *,
         forward_mode: ForwardMode,
-        page_table: torch.Tensor | None = None,
         num_extends: int = 0,
         for_graph_replay: bool = False,
         **kwargs,
@@ -971,7 +982,6 @@ class InklingAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             forward_mode=forward_mode,
-            page_table=page_table,
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
             **kwargs,
@@ -983,18 +993,12 @@ class InklingAttnBackend(AttentionBackend):
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
         group_tables = kwargs.get("block_tables") or {}
-        adopted_filled = getattr(self, "_graph_col_tables_adopted", False) and getattr(
-            self.inner, "_packed_group_unpack_ran", False
-        )
         for g, buf in self._graph_col_tables.items():
             src = group_tables.get(g)
             if src is None:
                 raise RuntimeError(
                     f"paged sconv decode: no {g!r} table in block_tables"
                 )
-            if adopted_filled:
-                # The inner backend's packed unpack already filled the shared stack rows this step.
-                continue
             cols = min(src.shape[1], buf.shape[1])
             rows = min(src.shape[0], bs)
             buf[:rows, :cols].copy_(src[:rows, :cols])

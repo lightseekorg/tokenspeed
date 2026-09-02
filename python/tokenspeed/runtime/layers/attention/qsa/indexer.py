@@ -850,11 +850,10 @@ class QSAIndexer(nn.Module):
     ) -> torch.Tensor:
         metadata = self._metadata(ctx)
         full_backend = self._full_backend(ctx)
-        full_locs = (
-            out_cache_loc
-            if getattr(full_backend, "is_draft", False)
-            else metadata.out_cache_locs[FULL_ATTENTION]
-        )[: k.shape[0]]
+        # The caller fetched the full-attention group's window from the
+        # backend (write_locations) — the one write-location source on both
+        # the target and draft paths.
+        full_locs = out_cache_loc[: k.shape[0]]
         q = q.view(-1, attention_layer.tp_q_head_num, attention_layer.head_dim)
         k = k.view(-1, attention_layer.tp_k_head_num, attention_layer.head_dim)
         v = v.view(-1, attention_layer.tp_v_head_num, attention_layer.v_head_dim)

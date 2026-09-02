@@ -49,7 +49,6 @@ class ExecutionState:
     hidden_states: torch.Tensor
     residual: torch.Tensor | None
     ctx: ForwardContext
-    out_cache_loc: torch.Tensor
 
 
 StepRunner = Callable[[ExecutionState, torch.Tensor], ExecutionState]
@@ -136,7 +135,6 @@ class CompiledDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -148,7 +146,7 @@ class CompiledDecoderLayer(nn.Module):
         if hidden_states.shape[0] == 0 and not self.has_rsag_comms:
             return hidden_states, residual
 
-        state = ExecutionState(hidden_states, residual, ctx, out_cache_loc)
+        state = ExecutionState(hidden_states, residual, ctx)
 
         for step in self.steps:
             if is_idle and step.skip_on_idle:
@@ -158,9 +156,7 @@ class CompiledDecoderLayer(nn.Module):
                 hidden_states, residual = comm(
                     state.hidden_states, state.residual, state.ctx
                 )
-                state = ExecutionState(
-                    hidden_states, residual, state.ctx, state.out_cache_loc
-                )
+                state = ExecutionState(hidden_states, residual, state.ctx)
 
             state = step.runner(state, positions)
 
@@ -175,8 +171,6 @@ class CompiledDecoderLayer(nn.Module):
                 hidden_states, residual = comm(
                     state.hidden_states, state.residual, state.ctx
                 )
-                state = ExecutionState(
-                    hidden_states, residual, state.ctx, state.out_cache_loc
-                )
+                state = ExecutionState(hidden_states, residual, state.ctx)
 
         return state.hidden_states, state.residual

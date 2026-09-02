@@ -31,8 +31,6 @@ from test.runtime.conftest import requires_cuda
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_kernel,
     compute_out_cache_loc_uniform,
-    dflash_prepare_decode_kernel,
-    fused_decode_input_prep_kernel,
 )
 
 _P = 16  # kernel page size for the tests
@@ -124,14 +122,14 @@ def test_capture_replay_address_stability() -> None:
 
 @pytest.mark.parametrize(
     "kernel",
-    [
-        compute_out_cache_loc_kernel,
-        fused_decode_input_prep_kernel,
-        dflash_prepare_decode_kernel,
-    ],
-    ids=["out_cache_loc", "fused_decode_input_prep", "dflash_prepare_decode"],
+    [compute_out_cache_loc_kernel],
+    ids=["out_cache_loc"],
 )
 def test_max_pages_is_not_constexpr(kernel) -> None:
-    """Re-annotating it ``tl.constexpr`` is the regression to catch."""
+    """Re-annotating it ``tl.constexpr`` is the regression to catch.
+
+    Only the uniform slot-resolve kernel still reads a page table; the
+    decode-prep and DFLASH-prep kernels stopped producing write locations
+    (the router owns all slot math)."""
     parameter = inspect.signature(kernel.fn).parameters["max_pages"]
     assert parameter.annotation is inspect.Parameter.empty

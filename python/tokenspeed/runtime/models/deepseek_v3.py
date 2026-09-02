@@ -646,7 +646,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -666,7 +665,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
+        attn_output = self._attn(positions, q, latent_cache, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -709,7 +708,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         output_gate: torch.Tensor | None = None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -723,6 +721,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         token count). The decode token count comes from the live ctx; the real
         prefill token count from the live attention metadata (the same source
         the padding scrub uses). Padded tail rows produce discarded garbage.
+        Each half fetches its own KV write span from the backend by mode:
+        EXTEND returns exactly the extend token span, DECODE exactly the
+        decode rows' verify window — no full-batch vector to slice.
         """
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
@@ -751,13 +752,16 @@ class DeepseekV3AttentionMLA(nn.Module):
             # Use absorbed attention for cached-prefix extend when supported by
             # the backend and profitable for this query shape; otherwise use
             # normal chunked prefill.
+            prefill_locs = ctx.attn_backend.write_locations(
+                self.attn_mha, ForwardMode.EXTEND
+            )
             if getattr(cmeta, "use_absorbed_cached_extend", False):
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
                     q[:num_prefill_tokens],
                     latent_cache[:num_prefill_tokens],
                     prefill_ctx,
-                    out_cache_loc[:num_prefill_tokens],
+                    prefill_locs,
                     attn_output[:num_prefill_tokens],
                 )
             else:
@@ -766,7 +770,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                     q[:num_prefill_tokens],
                     latent_cache[:num_prefill_tokens],
                     prefill_ctx,
-                    out_cache_loc[:num_prefill_tokens],
+                    prefill_locs,
                     attn_output[:num_prefill_tokens],
                 )
 
@@ -783,7 +787,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 q[num_prefill_tokens:real_total],
                 latent_cache[num_prefill_tokens:real_total],
                 decode_ctx,
-                out_cache_loc[num_prefill_tokens:real_total],
+                ctx.attn_backend.write_locations(self.attn_mha, ForwardMode.DECODE),
                 attn_output[num_prefill_tokens:real_total],
                 output_gate=(
                     None
@@ -850,12 +854,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Model-owned KV writes route their locations through the backend:
-        # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the cache-group path.
-        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
-            self.attn_mqa, out_cache_loc, ctx.forward_mode
-        )
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
@@ -1015,16 +1013,24 @@ class DeepseekV3AttentionMLA(nn.Module):
         record_kv_cache: bool | None = None,
         output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
-        # Other backends write KV in the attention backend.
+        # The KV write is model-owned on every arm: the MLA kernel backends
+        # wrote the latent in forward_absorb_qkv_proj; the others (FlashMLA)
+        # write here at the caller's explicit locations — the draft's
+        # one-shot first step covers the extend AND decode windows together,
+        # which no single backend-mode fetch describes.
         if self.attention_backend in self._MLA_KERNEL_BACKENDS:
-            need_save_kv = False
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank] if K is not None else None
         else:
-            need_save_kv = True
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank]
+            if K is not None:
+                ctx.token_to_kv_pool.set_mla_kv_buffer(
+                    self.attn_mqa,
+                    out_cache_loc,
+                    K[..., : self.kv_lora_rank],
+                    K[..., self.kv_lora_rank :],
+                )
 
         use_projected_value_decode = (
             output_gate is not None
@@ -1036,8 +1042,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_for_attn,
             v_for_attn,
             ctx,
-            out_cache_loc,
-            save_kv_cache=need_save_kv,
+            save_kv_cache=False,
             record_kv_cache=record_kv_cache,
             value_weight=self.w_vc if use_projected_value_decode else None,
             output_gate=output_gate if use_projected_value_decode else None,
@@ -1069,7 +1074,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         q, k, v = self.forward_normal_chunked_kv_prepare(
             positions, q, latent_cache, ctx, out_cache_loc
         )
-        return self.forward_normal_chunked_kv_core(q, k, v, ctx, out_cache_loc, output)
+        return self.forward_normal_chunked_kv_core(q, k, v, ctx, output)
 
     def forward_normal_chunked_kv_prepare(
         self,
@@ -1079,11 +1084,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the cache-group path).
-        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
-            self.attn_mha, out_cache_loc, ctx.forward_mode
-        )
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -1172,7 +1172,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
         attn_backend = ctx.attn_backend
@@ -1282,7 +1281,6 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if ctx.accept_lengths is None:
@@ -1291,11 +1289,24 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 q,
                 latent_cache,
                 ctx,
-                out_cache_loc,
                 absorbed_query=absorbed_query,
             )
 
         self._apply_correction(ctx)
+
+        # This step writes every input row's KV in one shot: the extend span
+        # (when a MIXED round carries prefill rows) followed by the decode
+        # rows' verify window. Mixed rounds never run under a captured graph,
+        # so the concatenation is eager-only.
+        backend = ctx.attn_backend
+        out_cache_loc = backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
+        if ctx.num_extends > 0:
+            out_cache_loc = torch.cat(
+                (
+                    backend.write_locations(self.attn_mqa, ForwardMode.EXTEND),
+                    out_cache_loc,
+                )
+            )
 
         # Full q/latent_cache write all KV cache rows; only the live rows
         # (ctx.gather_ids) run the absorbed decode attention, so the output is
@@ -1450,7 +1461,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
 
@@ -1466,7 +1476,6 @@ class DeepseekV3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -1566,7 +1575,6 @@ class DeepseekV3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
@@ -1612,7 +1620,6 @@ class DeepseekV3Model(nn.Module):
                     positions,
                     hidden_states,
                     ctx,
-                    out_cache_loc,
                     residual,
                 )
         if not ctx.forward_mode.is_idle():
@@ -2056,7 +2063,6 @@ class Eagle3MlaDecoderLayer(nn.Module):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
@@ -2081,7 +2087,6 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=fused_norm_out,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
 
@@ -2185,7 +2190,6 @@ class Eagle3MlaModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -2223,7 +2227,6 @@ class Eagle3MlaModel(nn.Module):
             embeds,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
         )
 
@@ -2320,11 +2323,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict
