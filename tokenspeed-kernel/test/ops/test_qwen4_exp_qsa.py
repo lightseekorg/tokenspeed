@@ -927,6 +927,7 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         )
         out.fill_(7)
 
+    monkeypatch.setattr(qsa_ops, "_is_nvidia", True)
     monkeypatch.setattr(qsa_ops, "has_ragged_decode_topk", lambda: True)
     monkeypatch.setattr(qsa_ops, "ragged_decode_topk", fake_radix_topk)
     monkeypatch.setattr(
