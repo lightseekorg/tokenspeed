@@ -275,12 +275,12 @@ class _Harness:
         self.seq_len = 0
         # Unified decode path: decode metadata is refreshed into persistent
         # buffers allocated here (production allocates them unconditionally
-        # at ForwardStepRunner construction, enforce-eager included).
+        # at ForwardStepRunner construction, enforce-eager included). The
+        # inner here is a bare MHA leaf, so mirror the router->leaf calling
+        # convention: leaves take only max_bs (runner extras stop at the
+        # router).
         inner.set_cache_pool(self.kv_pool)
-        self.backend.init_cuda_graph_state(
-            max_bs=4,
-            cache_group_specs=tuple(self.kv_pool.arena.cache_group_specs),
-        )
+        self.backend.init_cuda_graph_state(max_bs=4)
 
     def _ctx(self, mode):
         return SimpleNamespace(
