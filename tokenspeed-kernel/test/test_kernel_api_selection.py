@@ -827,6 +827,90 @@ def test_bmm_nvfp4_signature_uses_fixed_block_shape() -> None:
         assert tensor_format.scale.block_shape == (16,)
 
 
+def _nvfp4_a16_prepared_scales(
+    n: int, k: int, dtype: torch.dtype = torch.float8_e4m3fn
+) -> torch.Tensor:
+    n_tiles = (n + 127) // 128
+    k_tiles = (k // 16 + 3) // 4
+    return torch.empty((1, n_tiles, k_tiles, 32, 4, 4), dtype=dtype).permute(
+        3, 4, 1, 5, 2, 0
+    )
+
+
+def _mm_nvfp4_a16() -> torch.Tensor:
+    a = torch.empty((4, 128), dtype=torch.bfloat16)
+    b = torch.empty((128, 64), dtype=torch.uint8)
+    b_scales = _nvfp4_a16_prepared_scales(128, 128)
+    return tokenspeed_kernel.mm(
+        a,
+        b,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        quant="nvfp4_a16",
+    )
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.uint8])
+def test_gemm_nvfp4_a16_signature_is_dense_by_block16(
+    scale_dtype: torch.dtype,
+) -> None:
+    a = torch.empty((4, 128), dtype=torch.bfloat16)
+    b = torch.empty((128, 64), dtype=torch.uint8)
+    b_scales = _nvfp4_a16_prepared_scales(128, 128, scale_dtype)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        None,
+        b_scales,
+        torch.bfloat16,
+        "nvfp4_a16",
+        None,
+    )
+
+    a_format = signature.format_for("a")
+    b_format = signature.format_for("b")
+    assert a_format is not None
+    assert a_format.format == "dense"
+    assert a_format.storage_dtype == torch.bfloat16
+    assert a_format.scale is None
+    assert b_format is not None
+    assert b_format.format == "nvfp4"
+    assert b_format.storage_dtype == torch.uint8
+    assert b_format.scale is not None
+    assert b_format.scale.block_shape == (16,)
+
+
+def test_gemm_nvfp4_a16_square_weight_uses_weight_rows_for_n(monkeypatch) -> None:
+    a = torch.empty((4, 144), dtype=torch.bfloat16)
+    b = torch.empty((144, 72), dtype=torch.uint8)
+    b_scales = _nvfp4_a16_prepared_scales(144, 144)
+
+    def kernel(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        **kwargs,
+    ) -> torch.Tensor:
+        return torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype)
+
+    def select_nvfp4_a16(*args, traits, **kwargs) -> SelectedKernel:
+        assert traits["n_align_16"] is True
+        return SelectedKernel("test_nvfp4_a16_shape", kernel)
+
+    monkeypatch.setattr(_gemm_pkg, "select_kernel", select_nvfp4_a16)
+    actual = tokenspeed_kernel.mm(
+        a,
+        b,
+        B_scales=b_scales,
+        quant="nvfp4_a16",
+    )
+
+    assert actual.shape == (4, 144)
+
+
 def _mm_mxfp4() -> torch.Tensor:
     a = torch.empty((4, 32), dtype=torch.uint8)
     b = torch.empty((128, 32), dtype=torch.uint8)
@@ -3873,6 +3957,24 @@ _CASES = [
         "mm",
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4_a16",
+        _mm_nvfp4_a16,
+        id_suffix="nvfp4-a16",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4_a16",
+        _mm_nvfp4_a16,
+        id_suffix="nvfp4-a16",
     ),
     _case(
         _is_cdna4,

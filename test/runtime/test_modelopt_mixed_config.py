@@ -82,6 +82,66 @@ def test_from_config_rejects_unknown_algo():
         )
 
 
+def test_qwen35_w4a16_and_static_fp8_routing():
+    from tokenspeed.runtime.layers.dense import (
+        Fp8LinearMethod,
+        Nvfp4W4A16LinearMethod,
+    )
+
+    config = ModelOptMixedConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quant_method": "modelopt",
+            "ignore": ["mtp*", "mtp.layers.0*"],
+            "quantized_layers": {
+                "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                    "quant_algo": "FP8"
+                },
+                "model.language_model.layers.0.linear_attn.in_proj_z": {
+                    "quant_algo": "FP8"
+                },
+                "model.language_model.layers.0.mlp.gate_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "model.language_model.layers.0.mlp.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+            },
+        }
+    )
+    # Qwen3_5ForConditionalGeneration declares no quant_module_name_replacements:
+    # resolve_model keeps the "model.language_model" scope and attention layers
+    # keep "self_attn", so runtime quant-lookup prefixes equal the checkpoint
+    # quantized_layers keys verbatim. Apply nothing.
+
+    assert config.exclude_modules == ["mtp*", "mtp.layers.0*"]
+    assert config.group_size == 16
+    assert config.fp8_static_config.activation_scheme == "static"
+    assert config.fp8_static_config.weight_block_size is None
+    assert isinstance(
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.language_model.layers.0.mlp.gate_up_proj",
+        ),
+        Nvfp4W4A16LinearMethod,
+    )
+    assert isinstance(
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz",
+        ),
+        Fp8LinearMethod,
+    )
+    assert config.is_quantized_layer(
+        "model.language_model.layers.0.linear_attn.in_proj_qkv"
+    )
+    assert not config.is_quantized_layer(
+        "model.language_model.layers.0.linear_attn.in_proj_b"
+    )
+
+
 # Layer 4 mimics a Kimi-K3 MLA layer, layer 6 a KDA layer (realistic
 # checkpoint entry names; routing itself is purely per-leaf).
 _FP8_PB_WO_LAYERS = {

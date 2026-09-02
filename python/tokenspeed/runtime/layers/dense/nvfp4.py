@@ -204,6 +204,110 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
         return out.view(x_fp4.size(0), w_n)
 
 
+class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
+    """Linear method for BF16 activations and packed NVFP4 weights."""
+
+    # Checkpoint tensors this method never consumes. W4A16 keeps activations in
+    # bf16, so any exported per-tensor activation ``input_scale`` is residual and
+    # is dropped at load time.
+    ignored_checkpoint_params = frozenset({"input_scale"})
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+        self.group_size = quant_config.group_size
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        weight = Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        weight.output_dim = 0
+        weight.input_dim = 1
+        if weight_loader:
+            weight.weight_loader = weight_loader
+        layer.register_parameter("weight", weight)
+
+        weight_scale = Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.group_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        weight_scale.output_dim = 0
+        weight_scale.input_dim = 1
+        if weight_loader:
+            weight_scale.weight_loader = weight_loader
+        layer.register_parameter("weight_scale", weight_scale)
+
+        weight_scale_2 = Parameter(
+            torch.full(
+                (len(output_partition_sizes),),
+                torch.finfo(torch.float32).min,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        weight_scale_2.needs_scalar_to_array = True
+        if weight_loader:
+            weight_scale_2.weight_loader = weight_loader
+        layer.register_parameter("weight_scale_2", weight_scale_2)
+
+    def process_weights_after_loading(self, layer):
+        if layer.interleave_linear_and_gate:
+            raise NotImplementedError(
+                "NVFP4 W4A16 does not support interleaved linear/gate weights"
+            )
+
+        alpha = layer.weight_scale_2.max().to(torch.float32)
+        weight, weight_scale, alpha = tokenspeed_kernel.prepare_nvfp4_a16_weights(
+            layer.weight,
+            swizzle_blockscale_2d(layer.weight_scale),
+            alpha,
+        )
+        layer.weight = Parameter(weight, requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        layer.weight_scale_2 = Parameter(alpha, requires_grad=False)
+        layer.alpha = layer.weight_scale_2
+
+    def apply(self, layer, x, bias=None):
+        if x.dtype is not torch.bfloat16:
+            raise ValueError(
+                f"FlashInfer CuTe-DSL W4A16 requires BF16 input, got {x.dtype}"
+            )
+        return tokenspeed_kernel.mm(
+            x,
+            layer.weight,
+            A_scales=None,
+            B_scales=layer.weight_scale,
+            bias=bias,
+            out_dtype=x.dtype,
+            alpha=layer.alpha,
+            quant="nvfp4_a16",
+            override=layer.override_kernel_name,
+        )
+
+
 # -------------------------------------------------------------------------
 # Utilities for FP4 linear method
 # -------------------------------------------------------------------------
