@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import os
 import sys
-from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
 
 import pytest
 import torch
-from cache_pool_test_utils import make_arena
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
+# ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``
+# absolute imports) both need to be importable when run_ci_suite executes this
+# file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+
+from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
+
+from cache_pool_test_utils import make_arena
+from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
@@ -221,3 +228,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     # Both views name the one arena, so a clear through either zeros it.
     draft_pool.clear_kv_buffers()
     assert not torch.count_nonzero(draft_pool.kv_buffer[0])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
