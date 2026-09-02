@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
@@ -206,6 +208,8 @@ def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
     assert config.short_conv_layer_ids == [0, 2]
     assert config.short_conv_state_shape == (64, 9)
     assert config.ngram_context_len == 2
+    assert config.ple_offload_embedding
+    assert not Qwen4ExpTextConfig(ple_offload_embedding=False).ple_offload_embedding
 
 
 def test_qwen4_exp_flat_config_preserves_text_rope_parameters() -> None:
@@ -2297,8 +2301,46 @@ def test_ple_fp8_dequant_gather_matches_bf16() -> None:
     assert relative.median() < 0.07
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+@pytest.mark.parametrize("store_fp8", [False, True])
+def test_ple_host_prefetch_matches_inline_gather(store_fp8: bool) -> None:
+    """The side-stream prefetch must land the same rows as the inline gather.
+
+    ``start_flat_gather`` issues the copy on a private stream and returns before
+    it lands; ``finish_flat_gather`` is the join. A missing barrier would read
+    the destination early and diverge nondeterministically, so equality here is
+    what proves the cross-stream handoff is ordered.
+    """
+
+    _, host = _ngram_embedding_pair(store_fp8)
+
+    lengths = [5, 1, 9]
+    tokens = sum(lengths)
+    torch.manual_seed(4)
+    input_ids = torch.randint(0, 128, (tokens,), device="cuda")
+    initial = torch.full((len(lengths), 2), 7, dtype=torch.long, device="cuda")
+    req = torch.repeat_interleave(
+        torch.arange(len(lengths), device="cuda"),
+        torch.tensor(lengths, device="cuda"),
+    )
+    col = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+    starts = torch.cumsum(
+        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
+    )
+
+    inline, _ = host.forward_flat(input_ids, initial, req, col, starts)
+    gathered, _ = host.start_flat_gather(input_ids, initial, req, col, starts)
+    prefetched = host.finish_flat_gather(gathered)
+
+    assert host._gather_stream is not None
+    torch.testing.assert_close(prefetched, inline, rtol=0, atol=0)
+
+
 def _ple_checkpoint_loader_stub(
     store_dtype: torch.dtype,
+    offload: bool = False,
 ) -> tuple[torch.nn.Module, Qwen4ExpNGramEmbedding]:
     root = torch.nn.Module()
     ple = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
@@ -2307,9 +2349,11 @@ def _ple_checkpoint_loader_stub(
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
     ple._checkpoint_weight_scale = 1.0
+    ple.offload_embedding = offload
 
     embedding = torch.nn.Module()
     embedding.org_vocab_size = 8
+    embedding.num_embeddings_per_partition = 8
     embedding.shard_indices = SimpleNamespace(
         org_vocab_start_index=0,
         org_vocab_end_index=8,
@@ -2319,10 +2363,91 @@ def _ple_checkpoint_loader_stub(
         torch.nn.Parameter(torch.empty(8, 4, dtype=store_dtype), requires_grad=False),
     )
     ple.ngram_embedding = embedding
-    if ple.embed_store_dtype is not None:
+    # Offloaded FP8 tables carry a per-tensor scalar instead of a per-row buffer.
+    if ple.embed_store_dtype is not None and not offload:
         ple.register_buffer("ngram_embedding_scale", torch.ones(8))
     root.ple = ple
     return root, ple
+
+
+def test_ple_offload_loader_records_scalar_scale_without_row_buffer() -> None:
+    """A pre-quantized checkpoint into an offloaded table keeps a scalar scale.
+
+    Offloading exists to keep the table off the device, so the loader must not
+    fall back to a per-row scale buffer; it records the single checkpoint scale
+    and leaves the FP8 payload untouched for the gather kernel to dequant.
+    """
+
+    root, ple = _ple_checkpoint_loader_stub(torch.float8_e4m3fn, offload=True)
+    source = torch.tensor(
+        [
+            [-48.0, 72.0, -80.0, 64.0],
+            [10.0, 20.0, 144.0, -88.0],
+            [1.0, -2.0, 3.0, -4.0],
+            [32.0, 40.0, -56.0, 8.0],
+            [0.5, -0.5, 0.25, -0.25],
+            [96.0, -112.0, 128.0, -144.0],
+            [6.0, 7.0, 8.0, 9.0],
+            [-16.0, -24.0, 48.0, 80.0],
+        ],
+        dtype=torch.float8_e4m3fn,
+    )
+    checkpoint_scale = torch.tensor([2.0e-4], dtype=torch.bfloat16)
+    weights = [
+        ("ple.ngram_embedding.weight_scale", checkpoint_scale),
+        ("ple.ngram_embedding.shard_0.weight", source),
+    ]
+
+    loaded = load_qwen4_exp_weights(
+        root,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        weights,
+        include_visual=False,
+    )
+
+    assert getattr(ple, "ngram_embedding_scale", None) is None
+    assert ple._checkpoint_weight_scale == pytest.approx(
+        checkpoint_scale.float().item()
+    )
+    # The FP8 payload is preserved verbatim; the scale is applied only at gather.
+    assert torch.equal(ple.ngram_embedding.weight, source)
+    assert loaded == {"ple.ngram_embedding.weight"}
+
+
+@_requires_cuda
+def test_ple_offload_loader_online_quantizes_bf16_to_host() -> None:
+    """A compute-dtype checkpoint under offload is quantized online, per row.
+
+    Offloading does not require a pre-quantized checkpoint: a bf16 source is
+    quantized one streamed shard at a time, its FP8 payload written to the
+    host table, and the per-row scales populate a device buffer allocated
+    lazily -- the buffer the offline FP8 path (which offloading targets) never
+    needs.
+    """
+
+    root, ple = _ple_checkpoint_loader_stub(torch.float8_e4m3fn, offload=True)
+    assert getattr(ple, "ngram_embedding_scale", None) is None
+    torch.manual_seed(5)
+    source = torch.randn(8, 4, dtype=torch.bfloat16)
+    weights = [("ple.ngram_embedding.shard_0.weight", source)]
+
+    loaded = load_qwen4_exp_weights(
+        root,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        weights,
+        include_visual=False,
+    )
+
+    expected_payload, expected_scale = quantize_ple_embedding_rows(source)
+    scale_buffer = getattr(ple, "ngram_embedding_scale", None)
+    assert scale_buffer is not None and scale_buffer.is_cuda
+    assert scale_buffer.shape == (8,)
+    # The payload is the online FP8 quantization; the per-row scales dequant it.
+    assert torch.equal(ple.ngram_embedding.weight, expected_payload)
+    torch.testing.assert_close(scale_buffer.cpu(), expected_scale)
+    assert loaded == {"ple.ngram_embedding.weight"}
 
 
 @pytest.mark.parametrize("scale_first", [False, True])
@@ -2399,3 +2524,148 @@ def test_should_exclude_quant_module_expands_fused_members() -> None:
         f"{mlp}.gate_up_proj", [f"{mlp}.gate_proj", f"{mlp}.up_proj"]
     )
     assert not should_exclude_quant_module(f"{mlp}.gate_up_proj", [f"{mlp}.up_proj"])
+
+
+def _ngram_embedding_pair(
+    store_fp8: bool,
+) -> tuple[Qwen4ExpNGramEmbedding, Qwen4ExpNGramEmbedding]:
+    """A device-resident and a host-offloaded n-gram table holding equal rows.
+
+    ``ngram_vocab_size_base`` is tiny here so the two tables fit side by side;
+    the hash geometry that decides which rows are read is unaffected by it.
+    """
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=257,
+        make_ngram_vocab_size_divisible_by=8,
+        ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    built = []
+    for offload in (False, True):
+        config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
+        with torch.device("cuda"):
+            built.append(
+                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, "ple_embedding")
+            )
+    device, host = built
+
+    torch.manual_seed(3)
+    rows = torch.randn(
+        device.ngram_embedding.weight.shape, dtype=torch.bfloat16, device="cuda"
+    )
+    if store_fp8:
+        # An offloaded table is pre-quantized offline with a single per-tensor
+        # scale, so quantize the whole table against one amax rather than
+        # per-row. The device path reads it from its per-row buffer (filled with
+        # the constant); the host path reads the scalar from _checkpoint_weight_scale.
+        values = rows.to(torch.float32)
+        scale = (values.abs().amax() / 448.0).clamp_min(1e-12)
+        payload = (values / scale).to(torch.float8_e4m3fn)
+        scale = float(scale)
+        device.ngram_embedding_scale.fill_(scale)
+        assert not hasattr(host, "ngram_embedding_scale") or (
+            getattr(host, "ngram_embedding_scale", None) is None
+        )
+        host._checkpoint_weight_scale = scale
+    else:
+        payload = rows
+    device.ngram_embedding.weight.data.copy_(payload)
+    host.ngram_embedding.weight.data.copy_(payload.cpu())
+    return device, host
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+@pytest.mark.parametrize("store_fp8", [False, True])
+def test_ple_host_gather_matches_device_lookup(store_fp8: bool) -> None:
+    device, host = _ngram_embedding_pair(store_fp8)
+
+    assert not host.ngram_embedding.weight.is_cuda
+    # Pageable host storage has no device-visible address; the gather kernel
+    # would fault on it rather than fall back.
+    assert host.ngram_embedding.weight.is_pinned()
+
+    lengths = [5, 1, 9]
+    tokens = sum(lengths)
+    torch.manual_seed(4)
+    input_ids = torch.randint(0, 128, (tokens,), device="cuda")
+    initial = torch.full((len(lengths), 2), 7, dtype=torch.long, device="cuda")
+    req = torch.repeat_interleave(
+        torch.arange(len(lengths), device="cuda"),
+        torch.tensor(lengths, device="cuda"),
+    )
+    col = torch.cat(
+        [torch.arange(length, device="cuda") for length in lengths]
+    )
+    starts = torch.cumsum(
+        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
+    )
+
+    expected, _ = device.forward_flat(input_ids, initial, req, col, starts)
+    got, _ = host.forward_flat(input_ids, initial, req, col, starts)
+
+    assert got.shape == expected.shape
+    assert got.dtype == expected.dtype
+    # Both paths read the same stored payload and apply the same per-row scale,
+    # so the only permitted difference is the order of the fp8 -> compute cast.
+    torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+def test_ple_host_table_skips_device_allocation(caplog: pytest.LogCaptureFixture) -> None:
+    """The table must never be materialized on the device, not even briefly.
+
+    A production table is tens of gigabytes, so a construct-then-move
+    implementation would OOM before it ever reached the host.
+    """
+
+    caplog.set_level(logging.INFO, logger="tokenspeed.runtime.models.qwen4_exp_ple")
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=1_000_003,
+        make_ngram_vocab_size_divisible_by=8,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.max_memory_allocated()
+    with torch.device("cuda"):
+        embedding = Qwen4ExpNGramEmbedding(
+            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+        )
+    growth = torch.cuda.max_memory_allocated() - before
+
+    table_bytes = embedding.ngram_embedding.weight.numel() * 2
+    assert growth < table_bytes // 4
+    assert "PLE embedding offload enabled for layer 0" in caplog.text
+

@@ -55,6 +55,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         ple_embed_dim: int | None = None,
         ple_conv_kernel_size: int = 4,
         ple_embed_dtype: str | None = None,
+        ple_offload_embedding: bool = True,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
         ngram_vocab_size_base: int = 20_000_000,
@@ -82,6 +83,11 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         # model dtype; "float8_e4m3fn" stores the table in FP8 with online
         # per-row quantization at load time (halves the table's memory).
         self.ple_embed_dtype = ple_embed_dtype
+        # Keep the n-gram table in page-locked host memory and let the gather
+        # kernel read it over PCIe/C2C. The table scales with
+        # ngram_vocab_size_base and does not fit in device memory at production
+        # sizes; host residency trades interconnect bandwidth for capacity.
+        self.ple_offload_embedding = bool(ple_offload_embedding)
         self.ngram_size = int(ngram_size)
         self.heads_per_ngram = int(heads_per_ngram)
         self.ngram_vocab_size_base = int(ngram_vocab_size_base)
