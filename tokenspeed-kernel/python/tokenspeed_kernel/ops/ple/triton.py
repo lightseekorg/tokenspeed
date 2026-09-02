@@ -97,9 +97,7 @@ def _ngram_ids_kernel(
         tail_row = req * tail_block_rows + 1 + col
         carried_mask = rows < batch_size
         for s in tl.static_range(N - 1):
-            carried = tl.load(
-                init_ptr + rows * (N - 1) + s, mask=carried_mask, other=0
-            )
+            carried = tl.load(init_ptr + rows * (N - 1) + s, mask=carried_mask, other=0)
             tl.store(
                 tail_ptr + (rows * tail_block_rows) * (N - 1) + s,
                 carried,
@@ -124,9 +122,7 @@ def _ngram_ids_kernel(
         ).to(tl.int64)
         raw = tl.where(from_init, raw_init, raw_tok)
         if WRITE_TAIL and p <= N - 2:
-            tl.store(
-                tail_ptr + tail_row * (N - 1) + (N - 2 - p), raw, mask=mask
-            )
+            tl.store(tail_ptr + tail_row * (N - 1) + (N - 2 - p), raw, mask=mask)
         tok = tl.where(blocked, eos_token, raw)
         mixed = mixed ^ (tok * tl.load(mult_ptr + p))
         blocked = blocked | (tok == eos_token)
@@ -389,9 +385,7 @@ def _ple_conv_final_kernel(
                 other=0.0,
             )
             tl.store(
-                windows_ptr
-                + ((req * windows_block_rows) * C + ch) * STATE
-                + s,
+                windows_ptr + ((req * windows_block_rows) * C + ch) * STATE + s,
                 carried,
                 mask=cmask,
             )
