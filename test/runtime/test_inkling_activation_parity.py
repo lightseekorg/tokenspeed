@@ -337,9 +337,10 @@ class _Harness:
         the same token locations the old explicit out_cache_loc named."""
         expected = self._token_locs(start, n)
         for layer in self.model.model.layers:
-            got = self.backend.write_locations(layer.attn, mode).long()
+            paged = layer.attn.attn  # InklingAttention -> its PagedAttention
+            got = self.backend.write_locations(paged, mode).long()
             assert torch.equal(got, expected), (
-                f"layer {layer.attn.layer_id} ({layer.attn.group_id!r}) {mode}: "
+                f"layer {paged.layer_id} ({paged.group_id!r}) {mode}: "
                 f"write locs {got.tolist()} != {expected.tolist()}"
             )
 
