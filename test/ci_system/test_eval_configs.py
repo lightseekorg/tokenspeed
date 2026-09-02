@@ -42,7 +42,9 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 7,
+        # 9 with the Kimi-K3 tp8ep1/tp8ep8 pair, which uses GSM8K's larger,
+        # greedy sample to compare the two MoE placements against each other.
+        "count": 9,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {

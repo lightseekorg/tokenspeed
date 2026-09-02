@@ -1,0 +1,82 @@
+api_version: ci.tokenspeed.io/v1
+# GSM8K at the tensor-parallel MoE placement (A8W4, fp8 activations), one half of a controlled pair with the tp8ep8 twin.
+#
+# Purpose: decide whether A8W4's fp8 activations cost accuracy against A16W4's
+# bf16. AIME26 cannot answer that. It runs 30 problems at temperature 1.0, so
+# the sampling noise alone is +/-1.6 problems and separating a 3-point gap needs
+# roughly 1200 problems per arm -- about 40 repeats of the set. Six runs across
+# both placements have produced 0.867-0.933 with the arms overlapping, which is
+# consistent with a real difference and equally consistent with none.
+#
+# GSM8K fixes both defects at once. It is 1319 problems, so the standard error
+# on a difference falls to about 0.85 points and a 3-point gap lands near 3.9
+# sigma; and it runs greedy (do_sample false, temperature 0), so each arm is a
+# deterministic function of its weights and repeated runs of one arm agree
+# exactly. Every difference between the arms is therefore attributable rather
+# than sampled.
+#
+# The two files differ only in --ep-size. Manual trigger: this answers a
+# specific question and should not consume the 8-GPU runner per commit.
+name: eval-kimi-k3-mxfp4-tp8ep1-gsm8k-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --tp 8
+    --ep-size 1
+    --attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 65536
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+    --reasoning-parser kimi_k3
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 1200
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 16
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":256}'
+report:
+  github_step_summary: true
+# No score_threshold: this pair exists to compare two placements against each
+# other, not to gate. A bar here would report on one arm at a time and say
+# nothing about the difference, which is the whole quantity of interest.
