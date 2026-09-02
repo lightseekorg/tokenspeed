@@ -54,7 +54,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.hybrid import (
     HybridLinearAttnBackend,
 )
@@ -973,15 +972,15 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        # The paged side is a CacheGroupRouter whose sole leaf is the DSA
+        # backend; the router forwards the single-group DSA surface (KPool
+        # runtime, page tables, metadata). The hybrid target wraps it behind
+        # its KDA sibling, the MTP draft (no KDA layers) hands it over bare.
         if isinstance(ctx.attn_backend, HybridLinearAttnBackend):
             dsa_backend = ctx.attn_backend.full_attn_backend
-        elif isinstance(ctx.attn_backend, DSABackend):
-            dsa_backend = ctx.attn_backend
         else:
-            raise TypeError(
-                "GLM-5.3-Flash sparse attention requires a DSA backend, got "
-                f"{type(ctx.attn_backend).__name__}."
-            )
+            dsa_backend = ctx.attn_backend
+        # Fails fast on a non-DSA leaf (no KPool runtime to require).
         kpool_runtime = dsa_backend.require_kpool_runtime()
         kpool_runtime.ensure_prefill_plan(
             ctx,
