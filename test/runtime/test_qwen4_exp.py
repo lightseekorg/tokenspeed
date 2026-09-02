@@ -1838,7 +1838,7 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
     not torch.cuda.is_available(), reason="triton n-gram kernel requires CUDA"
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2]])
+@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
 def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     stub = _ngram_stub(ngram_size)
     context_len = ngram_size - 1
@@ -1882,6 +1882,31 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     )
     assert torch.equal(ids_only.cpu(), reference)
     assert no_tail is None
+
+    stride = max(lengths, default=0) + 1
+    scratch = torch.full(
+        ((bs + 1) * stride, context_len), -1, dtype=torch.long, device="cuda"
+    )
+    direct_ids, direct_tail = flat(
+        flat_ids.cuda(),
+        initial.cuda(),
+        req,
+        col,
+        starts,
+        need_tail=False,
+        tail_out=scratch,
+        tail_block_rows=stride,
+    )
+    assert torch.equal(direct_ids.cpu(), reference)
+    assert direct_tail is None
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows].cpu(), initial)
+    token_rows = req * stride + 1 + col
+    assert torch.equal(scratch[token_rows].cpu(), contexts[:, 1:])
+    untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
+    untouched[token_rows] = False
+    assert torch.all(scratch[untouched] == -1)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -2005,8 +2030,8 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
-    lengths = [3, 1, 5]
+@pytest.mark.parametrize("lengths", [[3, 1, 5], [0, 4, 2], [0, 0]])
+def test_ple_conv_scatters_windows_into_verify_scratch(lengths) -> None:
     channels = 8
     dtype = torch.bfloat16
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
@@ -2042,14 +2067,17 @@ def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
         windows_block_rows=stride,
     )
 
-    # Same conv results, with the windows landing in their rollback rows and
-    # nothing else in the scratch disturbed.
+    # Same conv results, with carried and token windows landing in their
+    # rollback rows and nothing else in the scratch disturbed.
     assert torch.equal(scattered[0], packed[0])
     assert torch.equal(scattered[1], packed[1])
     assert scattered[2] is scratch
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows], initial)
     token_rows = req * stride + 1 + col
     assert torch.equal(scratch[token_rows], packed[2])
     untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
     untouched[token_rows] = False
     assert not scratch[untouched].any()
 

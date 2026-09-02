@@ -60,11 +60,14 @@ def _ngram_ids_kernel(
     out_ptr,
     tail_ptr,
     total,
+    batch_size,
+    tail_block_rows,
     eos_token,
     N: tl.constexpr,
     HPN: tl.constexpr,
     H: tl.constexpr,
     WRITE_TAIL: tl.constexpr,
+    SCATTER_TAIL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -89,9 +92,23 @@ def _ngram_ids_kernel(
     col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)
     start = tl.load(starts_ptr + req, mask=mask, other=0).to(tl.int64)
 
+    tail_row = rows.to(tl.int64)
+    if SCATTER_TAIL:
+        tail_row = req * tail_block_rows + 1 + col
+        carried_mask = rows < batch_size
+        for s in tl.static_range(N - 1):
+            carried = tl.load(
+                init_ptr + rows * (N - 1) + s, mask=carried_mask, other=0
+            )
+            tl.store(
+                tail_ptr + (rows * tail_block_rows) * (N - 1) + s,
+                carried,
+                mask=carried_mask,
+            )
+
     anchor = tl.load(ids_ptr + start + col, mask=mask, other=0).to(tl.int64)
     if WRITE_TAIL:
-        tl.store(tail_ptr + rows * (N - 1) + (N - 2), anchor, mask=mask)
+        tl.store(tail_ptr + tail_row * (N - 1) + (N - 2), anchor, mask=mask)
     mixed = anchor * tl.load(mult_ptr)
     blocked = anchor != anchor
     for p in tl.static_range(1, N):
@@ -107,7 +124,9 @@ def _ngram_ids_kernel(
         ).to(tl.int64)
         raw = tl.where(from_init, raw_init, raw_tok)
         if WRITE_TAIL and p <= N - 2:
-            tl.store(tail_ptr + rows * (N - 1) + (N - 2 - p), raw, mask=mask)
+            tl.store(
+                tail_ptr + tail_row * (N - 1) + (N - 2 - p), raw, mask=mask
+            )
         tok = tl.where(blocked, eos_token, raw)
         mixed = mixed ^ (tok * tl.load(mult_ptr + p))
         blocked = blocked | (tok == eos_token)
@@ -321,8 +340,11 @@ def _ple_conv_final_kernel(
     lengths_ptr,
     starts_ptr,
     final_ptr,
+    windows_ptr,
+    windows_block_rows,
     C,
     STATE: tl.constexpr,
+    WRITE_CARRIED: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -360,6 +382,19 @@ def _ple_conv_final_kernel(
             tl.where(from_state, x_state, x_tok),
             mask=cmask,
         )
+        if WRITE_CARRIED:
+            carried = tl.load(
+                initial_ptr + (req * C + ch) * STATE + s,
+                mask=cmask,
+                other=0.0,
+            )
+            tl.store(
+                windows_ptr
+                + ((req * windows_block_rows) * C + ch) * STATE
+                + s,
+                carried,
+                mask=cmask,
+            )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 

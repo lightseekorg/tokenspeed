@@ -272,6 +272,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         col: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool,
+        tail_out: torch.Tensor | None = None,
+        tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return ple_ngram_ids(
             input_ids,
@@ -286,6 +288,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             heads_per_ngram=self.heads_per_ngram,
             eos_token_id=self.eos_token_id,
             need_tail=need_tail,
+            tail_out=tail_out,
+            tail_block_rows=tail_block_rows,
         )
 
     def _dequant(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
@@ -320,11 +324,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         col: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool = False,
+        tail_out: torch.Tensor | None = None,
+        tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """CUDA path: embed n-grams without materializing the window matrix."""
 
         ids, tail = self._ngram_ids_flat_cuda(
-            input_ids, initial, req, col, starts, need_tail
+            input_ids,
+            initial,
+            req,
+            col,
+            starts,
+            need_tail,
+            tail_out,
+            tail_block_rows,
         )
         # Reduce the flattened [tokens, heads * head_dim] view instead of the
         # 3D lookup: the lamport backend folds trailing dims into token count
@@ -659,16 +672,17 @@ class Qwen4ExpPLELayer(nn.Module):
 
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
-        ``windows_out`` receives the per-token state windows directly, one
-        ``windows_block_rows`` row block per request with the carried state in
-        row 0, so the verify scratch is filled without a packed intermediate.
+        On CUDA, ``windows_out`` receives the carried row and per-token state
+        windows directly. The fallback caller fills its carried row separately.
         """
         device = values.device
         req, col, lengths_t, starts, max_len, total, bs = (
             index if index is not None else self._batch_indices(lengths, device)
         )
         state_len = self.conv_state_len
-        if total == 0:
+        if total == 0 and not (
+            values.is_cuda and state_len and windows_out is not None
+        ):
             return (
                 values,
                 initial.clone(),
@@ -978,15 +992,32 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         initial_conv = self._read_pages(conv_field, input_pages)
         index = self._batch_indices(lengths, input_ids.device)
-        req, col, lengths_t, starts, _, total, bs = index
+        req, col, lengths_t, starts, _, total, _ = index
         flat_ids = input_ids.flatten()
         verify = metadata.mamba_output_indices is not None
+        context_scratch = conv_scratch = None
+        scratch_stride = 0
+        if verify:
+            # Both CUDA state producers write directly into this stable rollback
+            # workspace, including each request's carried row.
+            width = max(lengths, default=0)
+            context_scratch, conv_scratch = self._verify_scratch_for(
+                ctx.bs,
+                width,
+                linear_backend,
+            )
+            scratch_stride = width + 1
         if flat_ids.is_cuda:
-            # The n-gram windows are gathered inside the hash kernel; the
-            # [tokens, ngram_size] context matrix is never materialized. The
-            # raw verify-scratch rows (tail) are only emitted under verify.
-            embeddings, context_tail = self.ple_embedding.forward_flat(
-                flat_ids, initial_context, req, col, starts, need_tail=verify
+            # The n-gram windows are gathered inside the hash kernel; verify
+            # writes their state rows directly instead of returning a packed tail.
+            embeddings, _ = self.ple_embedding.forward_flat(
+                flat_ids,
+                initial_context,
+                req,
+                col,
+                starts,
+                tail_out=context_scratch,
+                tail_block_rows=scratch_stride,
             )
             # Only the non-verify branch writes it back, and ``verify`` is fixed
             # when a graph is captured, so skipping here keeps the gather and
@@ -1009,18 +1040,6 @@ class Qwen4ExpPLELayer(nn.Module):
             gated, normalized = self._gate_and_norm_cuda(key, hidden_states, value)
         else:
             gated, normalized = self._gate_and_norm_torch(key, hidden_states, value)
-        context_scratch = conv_scratch = None
-        scratch_stride = 0
-        if verify:
-            # Acquired before the conv so its kernel can scatter the per-token
-            # state windows straight into the rollback rows.
-            width = max(lengths, default=0)
-            context_scratch, conv_scratch = self._verify_scratch_for(
-                ctx.bs,
-                width,
-                linear_backend,
-            )
-            scratch_stride = width + 1
         conv_output, final_conv, _ = self._conv_sequences(
             normalized,
             initial_conv,
@@ -1032,24 +1051,15 @@ class Qwen4ExpPLELayer(nn.Module):
             windows_block_rows=scratch_stride,
         )
 
-        if verify:
-            # Row 0 of every (width + 1)-strided block holds the carried state;
-            # the conv already filled the token rows that follow it. The scratch
-            # is exactly bs blocks long, so those rows are a plain stride and the
-            # slice copies them instead of materializing an index to scatter
-            # through. A bs mismatch would raise here rather than write the
-            # wrong rows, which the index form could do silently.
+        if verify and not flat_ids.is_cuda:
+            # The fallback has no fused producers, so it fills the same rollback
+            # layout after computing the packed state windows.
             context_scratch[::scratch_stride] = initial_context
             conv_scratch[::scratch_stride] = initial_conv
-            if total and total == bs * width:
-                # Uniform widths keep each request's token rows contiguous, so
-                # the tail reshapes onto the block view as one strided copy.
-                context_scratch.view(bs, scratch_stride, -1)[:, 1:] = context_tail.view(
-                    bs, width, -1
-                )
-            elif total:
-                context_scratch[req * scratch_stride + 1 + col] = context_tail
-        else:
+            if total:
+                token_rows = req * scratch_stride + 1 + col
+                context_scratch[token_rows] = context_tail
+        elif not verify:
             self._write_pages(context_field, output_pages, final_context)
             self._write_pages(conv_field, output_pages, final_conv)
         return conv_output

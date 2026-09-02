@@ -72,6 +72,8 @@ def ple_ngram_ids(
     heads_per_ngram: int,
     eos_token_id: int,
     need_tail: bool = False,
+    tail_out: torch.Tensor | None = None,
+    tail_block_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Hash one n-gram id per head straight from the flat token stream.
 
@@ -87,7 +89,9 @@ def ple_ngram_ids(
         ngram_size: Window width, including the anchor.
         heads_per_ngram: Independent hash heads per window position.
         eos_token_id: Token that blocks the window from reaching further left.
-        need_tail: Also emit the raw trailing window (verify scratch rows).
+        need_tail: Also return the packed raw trailing windows.
+        tail_out: Optional verify scratch receiving carried and trailing contexts.
+        tail_block_rows: Rows reserved per request in ``tail_out``.
 
     Returns:
         A pair of the int64 ids shaped ``[total_tokens, ngram_heads]`` and, when
@@ -95,20 +99,37 @@ def ple_ngram_ids(
         ``[total_tokens, ngram_size - 1]`` (``None`` otherwise).
     """
 
+    if need_tail and tail_out is not None:
+        raise ValueError("need_tail and tail_out are mutually exclusive")
     total = input_ids.shape[0]
+    batch_size = initial.shape[0]
     device = input_ids.device
-    ngram_heads = (ngram_size - 1) * heads_per_ngram
+    context_len = ngram_size - 1
+    ngram_heads = context_len * heads_per_ngram
     ids = torch.empty((total, ngram_heads), dtype=torch.long, device=device)
     tail = (
-        torch.empty((total, ngram_size - 1), dtype=torch.long, device=device)
+        torch.empty((total, context_len), dtype=torch.long, device=device)
         if need_tail
         else None
     )
-    if total == 0:
+    scatter_tail = tail_out is not None
+    if scatter_tail:
+        if (
+            tail_out.device != device
+            or tail_out.dtype != initial.dtype
+            or not tail_out.is_contiguous()
+            or tail_out.ndim != 2
+            or tail_out.shape[1] != context_len
+        ):
+            raise ValueError("tail_out must be a contiguous context scratch tensor")
+        if tail_block_rows <= 0 or tail_out.shape[0] < batch_size * tail_block_rows:
+            raise ValueError("tail_out is smaller than the requested block layout")
+    work_items = max(total, batch_size) if scatter_tail else total
+    if work_items == 0:
         return ids, tail
     block = 256
     use_pdl = pdl_enabled()
-    _ngram_ids_kernel[(_triton.cdiv(total, block),)](
+    _ngram_ids_kernel[(_triton.cdiv(work_items, block),)](
         input_ids.contiguous(),
         initial.contiguous(),
         req,
@@ -118,13 +139,16 @@ def ple_ngram_ids(
         vocab_sizes,
         offsets,
         ids,
-        tail if need_tail else ids,
+        tail_out if scatter_tail else tail if need_tail else ids,
         total,
+        batch_size,
+        tail_block_rows,
         eos_token_id,
         N=ngram_size,
         HPN=heads_per_ngram,
         H=ngram_heads,
-        WRITE_TAIL=need_tail,
+        WRITE_TAIL=need_tail or scatter_tail,
+        SCATTER_TAIL=scatter_tail,
         ENABLE_PDL=use_pdl,
         BLOCK=block,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -244,12 +268,11 @@ def ple_conv_sequences(
         add_terms: Up to two full-width addends folded into the epilogue, each
             applied in order with a round to the output dtype in between. Only
             the last dimension has to be dense.
-        windows: Destination for the per-token sliding state windows. ``None``
-            skips the emission entirely.
+        windows: Destination for sliding state windows. ``None`` skips them.
         windows_block_rows: Rows per request in ``windows`` when scattering.
-        scatter_windows: Place each window at its verify scratch row
-            (``req * windows_block_rows + 1 + col``) instead of at its own
-            packed row.
+        scatter_windows: Place carried state in each block's first row and token
+            windows at ``req * windows_block_rows + 1 + col`` instead of packed
+            rows.
 
     Returns:
         A triple of the conv output shaped like ``values``, the trailing state
@@ -272,6 +295,8 @@ def ple_conv_sequences(
     gated = addends[0] if len(addends) > 0 else values_c
     residual = addends[1] if len(addends) > 1 else values_c
     if windows is None:
+        if scatter_windows:
+            raise ValueError("scatter_windows requires a windows destination")
         # Dummy target: WRITE_WINDOWS=False never stores through it. Decode
         # and non-verify prefill skip the [T, C, state_len] materialization.
         windows = values.new_empty((0, channels, state_len))
@@ -280,52 +305,67 @@ def ple_conv_sequences(
         # The kernel addresses rows as a dense [rows, C, state_len] block, and
         # a copy would silently drop the writes, so refuse anything else
         # rather than repack.
-        if not windows.is_contiguous():
-            raise ValueError("windows must be contiguous")
+        if (
+            windows.device != values.device
+            or not windows.is_contiguous()
+            or windows.ndim != 3
+            or tuple(windows.shape[1:]) != (channels, state_len)
+        ):
+            raise ValueError("windows must be a contiguous state-window tensor")
+        if scatter_windows and (
+            windows_block_rows <= 0
+            or windows.shape[0] < batch_size * windows_block_rows
+        ):
+            raise ValueError("windows is smaller than the requested block layout")
         write_windows = True
     block_c = 256
-    grid = (total_tokens, _triton.cdiv(channels, block_c))
     use_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-    _ple_dilated_conv_kernel[grid](
-        values_c,
-        initial_c,
-        weight.contiguous(),
-        req,
-        col,
-        starts,
-        conv_output,
-        windows,
-        gated,
-        residual,
-        windows_block_rows,
-        gated.stride(0),
-        residual.stride(0),
-        channels,
-        D=dilation,
-        K=kernel_size,
-        STATE=state_len,
-        WRITE_WINDOWS=write_windows,
-        SCATTER_WINDOWS=scatter_windows,
-        ADD_GATED=len(addends) > 0,
-        ADD_RESIDUAL=len(addends) > 1,
-        ENABLE_PDL=use_pdl,
-        BLOCK_C=block_c,
-        **pdl_kwargs,
-    )
+    if total_tokens:
+        grid = (total_tokens, _triton.cdiv(channels, block_c))
+        _ple_dilated_conv_kernel[grid](
+            values_c,
+            initial_c,
+            weight.contiguous(),
+            req,
+            col,
+            starts,
+            conv_output,
+            windows,
+            gated,
+            residual,
+            windows_block_rows,
+            gated.stride(0),
+            residual.stride(0),
+            channels,
+            D=dilation,
+            K=kernel_size,
+            STATE=state_len,
+            WRITE_WINDOWS=write_windows,
+            SCATTER_WINDOWS=scatter_windows,
+            ADD_GATED=len(addends) > 0,
+            ADD_RESIDUAL=len(addends) > 1,
+            ENABLE_PDL=use_pdl,
+            BLOCK_C=block_c,
+            **pdl_kwargs,
+        )
     final_conv = values.new_empty((batch_size, channels, state_len))
-    _ple_conv_final_kernel[(batch_size, _triton.cdiv(channels, block_c))](
-        values_c,
-        initial_c,
-        lengths,
-        starts,
-        final_conv,
-        channels,
-        STATE=state_len,
-        ENABLE_PDL=use_pdl,
-        BLOCK_C=block_c,
-        **pdl_kwargs,
-    )
+    if batch_size:
+        _ple_conv_final_kernel[(batch_size, _triton.cdiv(channels, block_c))](
+            values_c,
+            initial_c,
+            lengths,
+            starts,
+            final_conv,
+            windows,
+            windows_block_rows,
+            channels,
+            STATE=state_len,
+            WRITE_CARRIED=scatter_windows,
+            ENABLE_PDL=use_pdl,
+            BLOCK_C=block_c,
+            **pdl_kwargs,
+        )
     return conv_output, final_conv, windows
 
 
