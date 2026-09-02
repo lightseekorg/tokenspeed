@@ -47,6 +47,9 @@ class _Leaf:
     def refresh_decode_metadata(self, *args, **kwargs):
         pass
 
+    def set_request_slots(self, req_pool_indices):
+        pass
+
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         pass
 
@@ -70,7 +73,7 @@ def _refresh(router, bs, actual_bs, table):
     router.refresh_decode_metadata(
         bs,
         actual_bs,
-        None,
+        torch.arange(bs, dtype=torch.int32),
         torch.ones(bs, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         block_tables={FULL: table} if table is not None else {},

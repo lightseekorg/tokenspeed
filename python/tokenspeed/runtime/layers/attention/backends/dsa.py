@@ -106,6 +106,14 @@ class DSABackend(PagedAttentionBackend):
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
 
+    def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
+        # KPool's tail state is indexed by request-pool slot, and its
+        # per-forward plan must not outlive the metadata build that
+        # produced it: the router publishes the slots after every build,
+        # which is exactly the reset point.
+        if self.kpool_runtime is not None:
+            self.kpool_runtime.reset_forward(req_pool_indices)
+
     def require_kpool_runtime(self) -> KPoolRuntime:
         """Return the configured KPool runtime for sparse pooled indexing."""
         if self.kpool_runtime is None:
@@ -225,8 +233,6 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
-        if self.kpool_runtime is not None:
-            self.kpool_runtime.reset_forward()
         metadata = self.forward_decode_metadata
         if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
@@ -318,8 +324,6 @@ class DSABackend(PagedAttentionBackend):
             )
 
         self._prefill_page_table = None
-        if self.kpool_runtime is not None:
-            self.kpool_runtime.reset_forward()
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cmeta = self._dense_backend.chunked_prefill_metadata
             if cmeta is not None:

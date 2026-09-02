@@ -16,6 +16,8 @@ import sys
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -97,7 +99,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         router.refresh_decode_metadata(
             bs,
             bs,
-            None,
+            torch.arange(bs, dtype=torch.int32),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             block_tables=raw_by_group,

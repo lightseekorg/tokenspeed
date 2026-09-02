@@ -393,7 +393,7 @@ class CacheGroupRouter(AttentionBackend):
         chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
-        del req_pool_indices, kwargs
+        del kwargs
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "decode metadata goes through refresh_decode_metadata; "
@@ -427,6 +427,7 @@ class CacheGroupRouter(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_with_prefix=extend_with_prefix,
             )
+            leaf.set_request_slots(req_pool_indices[:bs])
 
     def refresh_decode_metadata(
         self,
@@ -443,7 +444,7 @@ class CacheGroupRouter(AttentionBackend):
     ) -> None:
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
-        del req_pool_indices, kwargs
+        del kwargs
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
@@ -463,6 +464,7 @@ class CacheGroupRouter(AttentionBackend):
                 num_extends=num_extends,
                 for_graph_replay=for_graph_replay,
             )
+            leaf.set_request_slots(req_pool_indices[:bs])
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -477,7 +479,7 @@ class CacheGroupRouter(AttentionBackend):
         """Capture seeding: the idle fill over the same stacks replay
         refreshes, then each leaf's own capture hook (the leaf default is
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
-        del req_pool_indices, kwargs
+        del kwargs
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
@@ -489,6 +491,7 @@ class CacheGroupRouter(AttentionBackend):
             leaf.init_forward_metadata_capture_cuda_graph(
                 bs, seq_lens, self.stacks.table(gid, bs)
             )
+            leaf.set_request_slots(req_pool_indices[:bs])
 
     # ------------------------------------------------------------------
     # Draft write locations (the drafters' in-graph slot math)

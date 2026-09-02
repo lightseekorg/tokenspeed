@@ -259,6 +259,9 @@ class _StubLeaf(PagedAttentionBackend):
         self.calls.append(("init", bs, num_extends, page_table.clone(), forward_mode))
         self.last_init_kwargs = kw
 
+    def set_request_slots(self, req_pool_indices):
+        self.calls.append(("slots", req_pool_indices.clone()))
+
     def refresh_decode_metadata(
         self,
         bs,
@@ -334,7 +337,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.refresh_decode_metadata(
             4,
             2,
-            None,
+            torch.arange(4, dtype=torch.int32),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(),
@@ -352,7 +355,7 @@ class CacheGroupRouterTest(unittest.TestCase):
                 [0] * 12,
             ],
         )
-        self.assertEqual(leaves[FULL].calls[-1], ("refresh", 4, 2, 0, False))
+        self.assertEqual(leaves[FULL].calls[-2], ("refresh", 4, 2, 0, False))
 
     def test_forward_dispatches_by_group_with_group_write_locations(self):
         router, leaves = self._router()
@@ -364,7 +367,12 @@ class CacheGroupRouterTest(unittest.TestCase):
             "linear_attention_0": torch.ones((2, 2), dtype=torch.int32),
         }
         router.refresh_decode_metadata(
-            2, 2, None, seq_lens, forward_mode=ForwardMode.DECODE, block_tables=tables
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
         )
         q = torch.zeros(2)
         router.forward(q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2)
@@ -387,13 +395,18 @@ class CacheGroupRouterTest(unittest.TestCase):
         seq_lens = torch.tensor([9, 4, 1, 1], dtype=torch.int32)
         tables = self._tables()
         router.refresh_decode_metadata(
-            4, 2, None, seq_lens, forward_mode=ForwardMode.DECODE, block_tables=tables
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
         )
         first = router.decode_write_locations
         router.refresh_decode_metadata(
             4,
             1,
-            None,
+            torch.arange(4, dtype=torch.int32),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(1),
@@ -413,7 +426,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.refresh_decode_metadata(
             2,
             2,
-            None,
+            torch.arange(2, dtype=torch.int32),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(),
@@ -443,7 +456,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             router.refresh_decode_metadata(
                 2,
                 2,
-                None,
+                torch.arange(2, dtype=torch.int32),
                 torch.tensor([9, 4], dtype=torch.int32),
                 forward_mode=ForwardMode.DECODE,
                 block_tables=tables,
@@ -452,7 +465,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.refresh_decode_metadata(
             2,
             0,
-            None,
+            torch.arange(2, dtype=torch.int32),
             torch.tensor([1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             block_tables={
@@ -469,7 +482,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.init_forward_metadata(
             2,
             2,
-            None,
+            torch.arange(2, dtype=torch.int32),
             seq_lens,
             ForwardMode.EXTEND,
             block_tables=self._tables(),
@@ -479,7 +492,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prefix_lens_cpu=prefix.clone(),
             extend_with_prefix=True,
         )
-        kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-1]
+        kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
         self.assertEqual(
             (kind, bs, num_extends, mode), ("init", 2, 2, ForwardMode.EXTEND)
         )
@@ -509,7 +522,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             router.init_forward_metadata(
                 2,
                 0,
-                None,
+                torch.arange(2, dtype=torch.int32),
                 seq_lens,
                 ForwardMode.DECODE,
                 block_tables=self._tables(),
@@ -527,7 +540,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.init_forward_metadata(
             2,
             1,
-            None,
+            torch.arange(2, dtype=torch.int32),
             seq_lens,
             ForwardMode.MIXED,
             block_tables=self._tables(),
@@ -554,16 +567,38 @@ class CacheGroupRouterTest(unittest.TestCase):
         }
         router.init_forward_metadata_capture_cuda_graph(
             4,
-            None,
+            torch.arange(4, dtype=torch.int32),
             torch.ones(4, dtype=torch.int32),
             ForwardMode.DECODE,
             block_tables=placeholder,
         )
-        self.assertEqual(leaves[FULL].calls[-1], ("refresh", 4, 0, 0, True))
+        self.assertEqual(leaves[FULL].calls[-2], ("refresh", 4, 0, 0, True))
         self.assertEqual(int(leaves[FULL].page_table_buf.abs().sum()), 0)
         self.assertEqual(
             router.decode_write_locations.by_group[SWA].tolist(), [0, 0, 0, 0]
         )
+
+    def test_request_slots_reach_every_leaf_after_each_metadata_build(self):
+        # The one side channel beyond page_table/seq_lens: leaves owning
+        # per-request side state (DSA's KPool tails) learn this forward's
+        # pool slots after the build that could have reset them.
+        router, leaves = self._router()
+        req = torch.tensor([7, 3], dtype=torch.int32)
+        seq = torch.tensor([5, 9], dtype=torch.int32)
+        router.refresh_decode_metadata(
+            2,
+            2,
+            req,
+            seq,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+            num_extends=0,
+            for_graph_replay=False,
+        )
+        for leaf in leaves.values():
+            kinds = [c[0] for c in leaf.calls]
+            self.assertEqual(kinds[-2:], ["refresh", "slots"])
+            self.assertEqual(leaf.calls[-1][1].tolist(), [7, 3])
 
     def test_single_group_model_surface_proxies_to_the_sole_leaf(self):
         leaf = _StubLeaf(4)
@@ -589,7 +624,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.refresh_decode_metadata(
             2,
             2,
-            None,
+            torch.arange(2, dtype=torch.int32),
             torch.tensor([9, 4], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             block_tables=tables,
@@ -611,7 +646,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.refresh_decode_metadata(
             2,
             2,
-            None,
+            torch.arange(2, dtype=torch.int32),
             torch.tensor([9, 4], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             block_tables=tables,

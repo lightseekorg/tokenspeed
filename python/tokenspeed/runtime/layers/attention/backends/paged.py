@@ -272,6 +272,17 @@ class PagedAttentionBackend(ABC):
     ) -> bool:
         return False
 
+    def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
+        """Publish this forward's ``[bs]`` request-pool slots (batch order).
+
+        The one side channel beyond ``page_table`` / ``seq_lens``: a leaf that
+        owns per-request side state indexed by pool slot (DSA's KPool tails)
+        reads it; paged KV leaves need nothing but the table. The router
+        calls this after every metadata build (extend init, decode refresh,
+        capture seeding), before the model runs. Default: no-op.
+        """
+        del req_pool_indices
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------

@@ -194,7 +194,7 @@ class MtpReanchorTest(unittest.TestCase):
         router.refresh_decode_metadata(
             2,
             2,
-            None,
+            torch.arange(2, dtype=torch.int32),
             torch.tensor([9, 7], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             block_tables={FULL: raw, SWA: raw},
