@@ -76,6 +76,7 @@ def test_kimi3_router_projection_auto_splits_on_token_count() -> None:
         x = hidden_states.expand(m, -1).contiguous()
         with (
             mock.patch.object(kimi3_module.Platform, "get", return_value=platform),
+            mock.patch.object(kimi3_module, "pdl_enabled", return_value=False),
             mock.patch.object(
                 kimi3_module, "_mm_out_dtype_supported", return_value=True
             ),

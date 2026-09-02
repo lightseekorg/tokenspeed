@@ -195,6 +195,28 @@ def all_reduce_latent_norm(
     )
 
 
+def can_acquire_all_reduce_outputs(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> bool:
+    """Whether ``acquire_all_reduce_outputs`` returns producer-direct memory.
+
+    ``acquire_all_reduce_outputs`` always returns writable buffers, falling
+    back to ordinary allocations the collective has to stage. Ask here when the
+    buffers are only worth taking if the reduction consumes them in place.
+
+    This is COLLECTIVE in the same sense the acquire is: every rank of
+    ``group`` must call it with identical arguments, or the group will disagree
+    on which collective the tail runs.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.can_acquire_all_reduce_outputs(shapes, like, group, op=op)
+
+
 def acquire_all_reduce_outputs(
     shapes: tuple[tuple[int, ...], ...],
     like: torch.Tensor,

@@ -41,11 +41,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
-    # `runner` is the platform a task targets, and carries its vendor
-    # classification. `runs_on` is the machine that hosts it, and differs
-    # whenever the target platform is not the host's own hardware.
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    runs-on: ${{ matrix.runner }}
+    # Leave setup and reporting headroom around the simulator's 60-minute run.
+    timeout-minutes: ${{ matrix.runner == 'amd-mi450-sim' && 75 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}

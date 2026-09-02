@@ -34,7 +34,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 8,
+        "count": 11,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -132,6 +132,19 @@ def test_evalscope_configs_use_expected_dataset_sources():
         len(paths) == expected_total
     ), f"expected {expected_total} EvalScope configs, found {len(paths)}"
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
+
+
+def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
+    path = EVAL_CONFIG_DIR / "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    command = shlex.split(task["eval"]["command"])
+
+    assert task["retries"] == 1
+    assert task["runner"]["env"]["b200-2gpu"]["GPT_OSS_EVAL_BATCH_SIZE"] == "64"
+    assert (
+        task["runner"]["env"]["amd-mi35x-2gpu-test"]["GPT_OSS_EVAL_BATCH_SIZE"] == "16"
+    )
+    assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
 
 
 def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():

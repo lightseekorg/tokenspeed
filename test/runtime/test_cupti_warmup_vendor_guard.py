@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The CUPTI graph-capture warm-up must not run on AMD.
+"""The CUPTI graph-capture warm-up is opt-in, on every vendor.
 
 ``_init_for_cuda_graphs()`` opens an empty profiler session so that CUPTI is
 loaded before any CUDA graph is captured. On ROCm there is no CUPTI: torch
@@ -29,9 +29,13 @@ entries, on every rank, in eager and graph mode alike -- silently, since the
 request still reports success.
 
 Measured on 8x gfx950 serving Kimi-K3: 0 GPU events on all 8 ranks with the
-warm-up, 62k kernel events in the same decode trace without it.
+warm-up, 62k kernel events in the same decode trace without it. CUPTI behaves
+the same way -- measured on CUDA 13.0 / torch 2.13, 2xGB300 TP8: 0 kernel
+events with the warm-up, 933k across 340 graph replays without it, and no
+launch failure from attaching after capture. So the warm-up is off unless
+``TOKENSPEED_CUPTI_GRAPH_WARMUP`` asks for it.
 
-CPU-only: no CUDA context, no profiler session, just the vendor decision.
+CPU-only: no CUDA context, no profiler session, just the gate decision.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ from tokenspeed.runtime.engine import event_loop  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
-def _run(*, is_amd: bool, cuda_available: bool = True) -> bool:
+def _run(*, is_amd: bool, cuda_available: bool = True, enabled: bool = True) -> bool:
     """Return whether the CUPTI warm-up was invoked."""
     called = False
 
@@ -68,9 +72,19 @@ def _run(*, is_amd: bool, cuda_available: bool = True) -> bool:
             return_value=SimpleNamespace(is_amd=is_amd),
         ),
         mock.patch.dict(sys.modules, {"torch.profiler._utils": fake_utils}),
+        mock.patch.object(
+            event_loop.envs.TOKENSPEED_CUPTI_GRAPH_WARMUP, "get", return_value=enabled
+        ),
     ):
         event_loop.maybe_warm_cupti_for_graph_capture()
     return called
+
+
+def test_the_warmup_is_off_by_default():
+    # It kills activity collection for the life of the process, which is a
+    # worse deal than the capture-order hazard it guards.
+    assert _run(is_amd=False, enabled=False) is False
+    assert _run(is_amd=True, enabled=False) is False
 
 
 def test_amd_skips_the_cupti_warmup():
@@ -78,7 +92,7 @@ def test_amd_skips_the_cupti_warmup():
     assert _run(is_amd=True) is False
 
 
-def test_nvidia_still_warms_cupti():
+def test_nvidia_warms_cupti_when_asked():
     """The warm-up must be preserved where it is needed."""
     assert _run(is_amd=False) is True
 

@@ -33,11 +33,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import (
-    dense_tensor_format,
-    format_signature,
-    format_signatures,
-)
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
@@ -110,7 +106,10 @@ if platform.is_nvidia:
     )
 
 if platform.is_blackwell or platform.is_hopper:
-    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    from flashinfer.mla import (
+        BatchMLAPagedAttentionWrapper,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -119,7 +118,47 @@ if platform.is_blackwell or platform.is_hopper:
 
 _workspace_buffer: torch.Tensor | None = None
 _dsa_sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
+_dsa_sparse_counter_buffers: dict[torch.device, torch.Tensor] = {}
+_retired_dsa_sparse_counter_buffers: list[torch.Tensor] = []
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
+
+
+def _register_flashinfer_trtllm_dsa(
+    mode: str,
+    *,
+    name: str,
+    q_len_per_req: frozenset[int],
+    qk_nope_head_dim: frozenset[int],
+    qk_rope_head_dim: frozenset[int],
+    topk: frozenset[int],
+):
+    return register_kernel(
+        "attention",
+        mode,
+        name=name,
+        solution="flashinfer_trtllm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            "q", "dense", {torch.bfloat16, torch.float8_e4m3fn}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "page_size": frozenset({64}),
+            "q_len_per_req": q_len_per_req,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "topk": topk,
+            "kv_cache_available": frozenset({True}),
+            "sparse_kv_cache_available": frozenset({False, True}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+    )
 
 
 def _get_dsa_sparse_workspace(device: torch.device | str) -> torch.Tensor:
@@ -167,6 +206,134 @@ def _topk_lens_or_count(
     if topk_lens is not None:
         return topk_lens.to(device=topk_slots.device, dtype=torch.int32).contiguous()
     return (topk_slots >= 0).sum(dim=-1, dtype=torch.int32).contiguous()
+
+
+def _get_dsa_sparse_counter_buffer(
+    device: torch.device | str,
+    num_tokens: int,
+    num_heads: int,
+) -> torch.Tensor:
+    device = torch.device(device)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        int(num_tokens), int(num_heads), int(sm_count)
+    )
+    counter = _dsa_sparse_counter_buffers.get(device)
+    if counter is None or counter.numel() < required_bytes:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer DSA counter workspace must be initialized before "
+                "CUDA Graph capture."
+            )
+        if counter is not None:
+            _retired_dsa_sparse_counter_buffers.append(counter)
+        counter = torch.zeros(required_bytes, dtype=torch.uint8, device=device)
+        _dsa_sparse_counter_buffers[device] = counter
+    return counter
+
+
+def _prepare_nope_sparse_slots(
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    kv_seq_lens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if topk_lens is None or kv_seq_lens is None:
+        raise ValueError("NoPE sparse MLA requires topk_lens and kv_seq_lens")
+    return (
+        torch.nn.functional.pad(topk_slots, (0, 1), value=-1),
+        kv_seq_lens.to(device=topk_slots.device, dtype=torch.int32).contiguous(),
+        topk_lens.to(device=topk_slots.device, dtype=torch.int32).contiguous(),
+    )
+
+
+def _flashinfer_trtllm_dsa_impl(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    kv_seq_lens: torch.Tensor | None = None,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
+) -> torch.Tensor:
+    del sparse_kv_cache, q_len_per_req
+    if kv_cache is None:
+        raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
+    if return_lse:
+        raise RuntimeError("FlashInfer/TRTLLM sparse MLA does not support return_lse")
+    if logit_cap != 0.0:
+        raise RuntimeError("FlashInfer/TRTLLM sparse MLA does not support logit_cap")
+    if q.dim() == 3:
+        num_tokens = q.shape[0]
+        q_kernel = q.view(num_tokens, 1, q.shape[1], q.shape[2])
+    elif q.dim() == 4:
+        num_tokens = q.shape[0] * q.shape[1]
+        q_kernel = q.reshape(num_tokens, 1, q.shape[2], q.shape[3])
+    else:
+        raise ValueError(f"unsupported q shape {tuple(q.shape)}")
+    if topk_slots.dim() != 2 or topk_slots.shape[0] != num_tokens:
+        raise ValueError(
+            "topk_slots must be [query_tokens, topk], got "
+            f"{tuple(topk_slots.shape)} for {num_tokens} query tokens"
+        )
+
+    topk_slots = topk_slots.to(device=q.device, dtype=torch.int32).contiguous()
+    sparse_topk_lens = None
+    if qk_rope_head_dim == 0:
+        # KPool's 2051 slots need one padding entry for the TRTLLM kernel.
+        topk_slots, seq_lens, sparse_topk_lens = _prepare_nope_sparse_slots(
+            topk_slots,
+            topk_lens,
+            kv_seq_lens,
+        )
+    else:
+        seq_lens = _topk_lens_or_count(topk_slots, topk_lens)
+
+    kv_dtype = q.dtype if q.dtype == torch.float8_e4m3fn else kv_cache.dtype
+    kv = _flashinfer_trtllm_mla_kv_cache(kv_cache, page_size, kv_dtype)
+    output_shape = (num_tokens, 1, q_kernel.shape[2], int(kv_lora_rank))
+    kernel_out = None
+    if out is not None:
+        if out.numel() != math.prod(output_shape):
+            raise ValueError(
+                f"out has {out.numel()} elements, expected {math.prod(output_shape)}"
+            )
+        kernel_out = out.view(output_shape)
+
+    result = trtllm_batch_decode_with_kv_cache_mla(
+        query=q_kernel,
+        kv_cache=kv,
+        workspace_buffer=_get_dsa_sparse_workspace(q.device),
+        qk_nope_head_dim=int(qk_nope_head_dim),
+        kv_lora_rank=int(kv_lora_rank),
+        qk_rope_head_dim=int(qk_rope_head_dim),
+        block_tables=topk_slots.view(num_tokens, 1, -1),
+        seq_lens=seq_lens,
+        max_seq_len=int(max_seqlen_k),
+        sparse_mla_top_k=topk_slots.shape[-1],
+        out=kernel_out,
+        bmm1_scale=float(k_scale) * float(softmax_scale),
+        bmm2_scale=1.0,
+        backend="trtllm-gen",
+        multi_ctas_kv_counter_buffer=_get_dsa_sparse_counter_buffer(
+            q.device, num_tokens, q_kernel.shape[2]
+        ),
+        sparse_mla_top_k_lens=sparse_topk_lens,
+        enable_pdl=_resolve_enable_pdl(enable_pdl),
+    )
+    if out is not None:
+        return out
+    return result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
@@ -325,165 +492,49 @@ if platform.is_nvidia and platform.is_hopper_plus:
             enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
-    @register_kernel(
-        "attention",
+    @_register_flashinfer_trtllm_dsa(
         "dsa_decode",
         name="flashinfer_trtllm_dsa_decode",
-        solution="flashinfer_trtllm",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(q=dense_tensor_format(torch.bfloat16)),
-                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
-            }
-        ),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
-            "qk_nope_head_dim": frozenset({128, 192}),
-            "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-        },
+        q_len_per_req=frozenset({1, 2, 3, 4, 5, 6}),
+        qk_nope_head_dim=frozenset({128, 192}),
+        qk_rope_head_dim=frozenset({64}),
+        topk=frozenset({512, 1024, 2048}),
     )
-    def flashinfer_trtllm_dsa_decode(
-        q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
-        sparse_kv_cache: torch.Tensor | None,
-        topk_slots: torch.Tensor,
-        topk_lens: torch.Tensor | None,
-        max_seqlen_k: int,
-        qk_nope_head_dim: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        softmax_scale: float,
-        page_size: int,
-        q_len_per_req: int = 1,
-        logit_cap: float = 0.0,
-        k_scale: float = 1.0,
-        return_lse: bool = False,
-        out: torch.Tensor | None = None,
-        enable_pdl: bool | None = None,
-    ) -> torch.Tensor:
-        if kv_cache is None:
-            raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
-        if return_lse:
-            raise RuntimeError(
-                "FlashInfer/TRTLLM sparse MLA does not support return_lse"
-            )
-        if logit_cap != 0.0:
-            raise RuntimeError(
-                "FlashInfer/TRTLLM sparse MLA does not support logit_cap"
-            )
-        if q.dim() == 3:
-            num_tokens = q.shape[0]
-            q_kernel = q.view(num_tokens, 1, q.shape[1], q.shape[2])
-        elif q.dim() == 4:
-            num_tokens = q.shape[0] * q.shape[1]
-            q_kernel = q.reshape(num_tokens, 1, q.shape[2], q.shape[3])
-        else:
-            raise ValueError(f"unsupported q shape {tuple(q.shape)}")
-        kv_dtype = q.dtype if q.dtype == torch.float8_e4m3fn else kv_cache.dtype
-        kv = _flashinfer_trtllm_mla_kv_cache(kv_cache, page_size, kv_dtype)
-        seq_lens = _topk_lens_or_count(topk_slots, topk_lens)
-        result = trtllm_batch_decode_with_kv_cache_mla(
-            query=q_kernel,
-            kv_cache=kv,
-            workspace_buffer=_get_dsa_sparse_workspace(q.device),
-            qk_nope_head_dim=int(qk_nope_head_dim),
-            kv_lora_rank=int(kv_lora_rank),
-            qk_rope_head_dim=int(qk_rope_head_dim),
-            block_tables=topk_slots.view(num_tokens, 1, -1),
-            seq_lens=seq_lens,
-            max_seq_len=int(max_seqlen_k),
-            sparse_mla_top_k=topk_slots.shape[-1],
-            bmm1_scale=float(k_scale) * float(softmax_scale),
-            backend="trtllm-gen",
-            enable_pdl=_resolve_enable_pdl(enable_pdl),
-        )
-        result = result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
-        if out is not None:
-            out.reshape_as(result).copy_(result)
-            return out
-        return result
+    def flashinfer_trtllm_dsa_decode(**kwargs) -> torch.Tensor:
+        return _flashinfer_trtllm_dsa_impl(**kwargs)
 
-    @register_kernel(
-        "attention",
+    @_register_flashinfer_trtllm_dsa(
+        "dsa_decode",
+        name="flashinfer_trtllm_nope_dsa_decode",
+        q_len_per_req=frozenset({1, 2, 3, 4, 5, 6}),
+        qk_nope_head_dim=frozenset({256}),
+        qk_rope_head_dim=frozenset({0}),
+        topk=frozenset({2051}),
+    )
+    def flashinfer_trtllm_nope_dsa_decode(**kwargs) -> torch.Tensor:
+        return _flashinfer_trtllm_dsa_impl(**kwargs)
+
+    @_register_flashinfer_trtllm_dsa(
         "dsa_prefill",
         name="flashinfer_trtllm_dsa_prefill",
-        solution="flashinfer_trtllm",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(q=dense_tensor_format(torch.bfloat16)),
-                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
-            }
-        ),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({128, 192}),
-            "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-        },
+        q_len_per_req=frozenset({1}),
+        qk_nope_head_dim=frozenset({128, 192}),
+        qk_rope_head_dim=frozenset({64}),
+        topk=frozenset({512, 1024, 2048}),
     )
-    def flashinfer_trtllm_dsa_prefill(
-        q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
-        sparse_kv_cache: torch.Tensor | None,
-        topk_slots: torch.Tensor,
-        topk_lens: torch.Tensor | None,
-        max_seqlen_k: int,
-        qk_nope_head_dim: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        softmax_scale: float,
-        page_size: int,
-        q_len_per_req: int = 1,
-        logit_cap: float = 0.0,
-        k_scale: float = 1.0,
-        return_lse: bool = False,
-        out: torch.Tensor | None = None,
-        enable_pdl: bool | None = None,
-    ) -> torch.Tensor:
-        return flashinfer_trtllm_dsa_decode(
-            q=q,
-            kv_cache=kv_cache,
-            sparse_kv_cache=sparse_kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            logit_cap=logit_cap,
-            k_scale=k_scale,
-            return_lse=return_lse,
-            out=out,
-            enable_pdl=enable_pdl,
-        )
+    def flashinfer_trtllm_dsa_prefill(**kwargs) -> torch.Tensor:
+        return _flashinfer_trtllm_dsa_impl(**kwargs)
+
+    @_register_flashinfer_trtllm_dsa(
+        "dsa_prefill",
+        name="flashinfer_trtllm_nope_dsa_prefill",
+        q_len_per_req=frozenset({1}),
+        qk_nope_head_dim=frozenset({256}),
+        qk_rope_head_dim=frozenset({0}),
+        topk=frozenset({2051}),
+    )
+    def flashinfer_trtllm_nope_dsa_prefill(**kwargs) -> torch.Tensor:
+        return _flashinfer_trtllm_dsa_impl(**kwargs)
 
 
 # ------------------------------------------------------------------------------

@@ -331,12 +331,43 @@ def _mark_warmed(backend: str, dev: int, m: int, n: int, k: int) -> None:
             _warmed.add((backend, dev, m, n, k))
 
 
-@functools.lru_cache(maxsize=32)
+# Measured (m, n, k) -> (block_size, outputs_per_block, k_unroll, vector_width).
+SKINNY_CONFIG_ROUTE: MappingProxyType[
+    tuple[int, int, int], tuple[int, int, int, int]
+] = MappingProxyType(
+    {
+        (2, 768, 1536): (96, 2, 1, 16),
+        (3, 768, 1536): (96, 2, 1, 16),
+        (4, 768, 1536): (96, 2, 1, 16),
+        (2, 1152, 1536): (96, 4, 1, 16),
+        (3, 1152, 1536): (96, 4, 1, 16),
+        (2, 1536, 1536): (96, 4, 1, 16),
+        (3, 1536, 1536): (96, 4, 1, 16),
+        (2, 2304, 1536): (96, 4, 1, 16),
+        (1, 320, 2560): (160, 2, 1, 16),
+        (2, 320, 2560): (160, 2, 1, 16),
+        (1, 512, 2560): (160, 2, 1, 16),
+        (2, 512, 2560): (160, 2, 1, 16),
+        (1, 640, 2560): (160, 2, 1, 16),
+        (2, 640, 2560): (160, 2, 1, 16),
+        (4, 640, 2560): (160, 2, 1, 16),
+        (5, 1536, 7168): (224, 2, 1, 16),
+        (6, 1536, 7168): (64, 2, 1, 16),
+    }
+)
+
+
+@functools.lru_cache(maxsize=256)
 def _skinny_config(m: int, n: int, k: int):
+    """The measured config for this shape, else the vendor heuristic."""
     from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
         shape_dynamic_skinny_gemm,
     )
 
+    tuned = SKINNY_CONFIG_ROUTE.get((m, n, k))
+    if tuned is not None:
+        return SkinnyGemmConfig(m, *tuned)
     return shape_dynamic_skinny_gemm.default_config(m, n, k)
 
 
@@ -373,6 +404,10 @@ def skinny_gemv(
     config = _skinny_config(m, n, k)
     # default_config can emit a config supports() rejects; fall back, don't raise.
     if not shape_dynamic_skinny_gemm.supports(config, m, n, k):
+        return _torch_decode_gemv(x, weight, out)
+    # supports() cannot see pointer alignment; the kernel asserts it at launch.
+    align = config.vector_width * x.element_size()
+    if x.data_ptr() % align or weight.data_ptr() % align:
         return _torch_decode_gemv(x, weight, out)
     # DLPack refuses requires_grad tensors; detach is a zero-copy view.
     result = shape_dynamic_skinny_gemm(x.detach(), weight.detach(), config, out=out)

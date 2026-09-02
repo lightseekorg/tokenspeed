@@ -63,6 +63,7 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -87,6 +88,15 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Glm53FlashConfig.model_type: Glm53FlashConfig,
+    "glm5_next": Glm53FlashConfig,
+}
+
+_GLM53_FLASH_ARCHITECTURE_ALIASES = {
+    "Glm5NextForConditionalGeneration": "Glm53FlashForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN": (
+        "Glm53FlashForConditionalGenerationNextN"
+    ),
 }
 
 
@@ -207,6 +217,25 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     ):
         return
     config.__dict__["architectures"] = list(raw_archs)
+
+
+def _normalize_glm53_flash_metadata(config: PretrainedConfig) -> None:
+    """Collapse legacy checkpoint names at the config-loading boundary."""
+    architectures = getattr(config, "architectures", None) or []
+    if not (
+        isinstance(config, Glm53FlashConfig)
+        or any(arch in _GLM53_FLASH_ARCHITECTURE_ALIASES for arch in architectures)
+    ):
+        return
+
+    config.model_type = Glm53FlashConfig.model_type
+    config.__dict__["architectures"] = [
+        _GLM53_FLASH_ARCHITECTURE_ALIASES.get(arch, arch) for arch in architectures
+    ]
+    for nested_name in ("text_config", "vision_config"):
+        nested = getattr(config, nested_name, None)
+        if nested is not None:
+            nested.model_type = type(nested).model_type
 
 
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
@@ -355,6 +384,7 @@ def get_config(
     config._name_or_path = model
 
     _materialize_architectures(config, raw_config)
+    _normalize_glm53_flash_metadata(config)
     _restore_raw_glm_dsa_fields(config, raw_config)
     _restore_raw_dflash_fields(config, raw_config)
 
@@ -425,6 +455,9 @@ def get_config(
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
         "KimiK3Config",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
+        "Glm53FlashConfig",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",

@@ -169,7 +169,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     )
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda_batched_replay_uses_raw_gate",
-        lambda dtype: False,
+        lambda dtype, **kwargs: False,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,

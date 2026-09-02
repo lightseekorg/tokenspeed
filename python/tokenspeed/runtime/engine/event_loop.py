@@ -94,23 +94,32 @@ logger = get_colorful_logger(__name__)
 
 
 def maybe_warm_cupti_for_graph_capture() -> None:
-    """Preload CUPTI before any CUDA graph is captured. NVIDIA only.
+    """Preload CUPTI before any CUDA graph is captured. Opt-in.
 
-    A profiler that first attaches AFTER capture invalidates the captured
-    graphs -- every later replay dies with cudaErrorLaunchFailure -- which
-    would forbid runtime ``/start_profile`` on graph-mode servers. One empty
-    profiler session loads CUPTI ahead of every capture, making runtime
-    attach/detach safe.
+    The warm-up guards a hazard reported on older stacks: a profiler that
+    first attaches AFTER capture invalidates the captured graphs -- every
+    later replay dies with cudaErrorLaunchFailure -- which would forbid
+    runtime ``/start_profile`` on graph-mode servers. One empty profiler
+    session loads CUPTI ahead of every capture.
 
-    Both the hazard and the remedy are CUDA-specific. CUPTI is CUDA's
-    profiling interface; ROCm routes torch profiling through roctracer, where
-    this empty warm-up session instead leaves activity collection permanently
-    dead for the life of the process: every subsequent ``/start_profile``
-    returns a trace with ``cpu_op`` entries but zero ``"cat": "kernel"``
-    events, on every rank, in eager and graph mode alike. So skip it on AMD.
+    It is off by default because it defeats its own purpose: the empty session
+    leaves activity collection dead for the life of the process, so every
+    later ``/start_profile`` returns a trace with ``cpu_op`` entries and zero
+    ``"cat": "kernel"`` events, on every rank, in eager and graph mode alike.
+    That was documented for ROCm's roctracer and is CUPTI's behaviour too --
+    on CUDA 13.0 / torch 2.13, 2xGB300 TP8, a profiled decode yields 0 kernel
+    events with the warm-up and 933k across 340 graph replays without it. The
+    hazard did not reproduce there either: all 340 replays ran after the
+    attach with no launch failure.
+
+    ``TOKENSPEED_CUPTI_GRAPH_WARMUP=1`` restores it on a stack that still
+    needs it, at the cost of GPU profiling. AMD ignores that request: on
+    roctracer the warm-up has the same cost and no upside.
     """
     from tokenspeed_kernel.platform import current_platform
 
+    if not envs.TOKENSPEED_CUPTI_GRAPH_WARMUP.get():
+        return
     if not torch.cuda.is_available() or current_platform().is_amd:
         return
 

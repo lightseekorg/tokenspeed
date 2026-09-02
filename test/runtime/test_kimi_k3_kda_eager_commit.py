@@ -362,6 +362,31 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     assert harness.backend._batched_replay_ready
 
 
+def test_uneven_state_groups_bind_batched_replay():
+    """Replay uses each layer's cache group instead of equal-size partitions."""
+    harness = _Harness(eager_replay=True)
+    first_group, second_group = _STATE_GROUPS[:2]
+    moved_layer = next(
+        layer_id
+        for layer_id in harness.layer_ids
+        if harness.pool.state_group_by_layer[layer_id] == second_group
+    )
+    harness.pool.state_group_by_layer[moved_layer] = first_group
+    harness.backend.set_kv_pool(harness.pool)
+
+    pages = {group: [2] for group in _STATE_GROUPS}
+    harness.prepare_metadata([0], pages, [8 + T])
+    harness.forward(harness.inputs(1, 713), 1)
+
+    expected = [
+        harness.backend._replay_group_rows[harness.pool.state_group_by_layer[layer_id]]
+        for layer_id in harness.layer_ids
+    ]
+    assert harness.backend._batched_replay_ready
+    assert harness.backend._replay_group_indices.tolist() == expected
+    assert expected.count(0) != expected.count(1)
+
+
 def test_verify_scratch_cannot_grow_after_preallocation():
     """Scratch is allocated once; any later capacity overrun fails loudly."""
     harness = _Harness(eager_replay=True)

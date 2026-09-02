@@ -31,6 +31,8 @@ reductions over one resident key tile.
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
+    "_dsa_kpool_prefill_logits_kernel",
+    "_dsa_kpool_prefill_plan_logits_kernel",
     "_dsa_standard_decode_logits_kernel",
     "_dsa_standard_prefill_logits_kernel",
 ]
@@ -313,6 +315,62 @@ def _score_head_tile(
 
 
 @gluon.jit
+def _fold_weighted_heads_in_logical_order(
+    head_scores,
+    head_weights,
+    mfma_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    contributions = head_scores * head_weights[:, None]
+    output_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
+    gather_indices = gl.zeros(
+        [BLOCK_N],
+        dtype=gl.int32,
+        layout=output_layout,
+    )[None, :]
+    scores = gl.zeros([BLOCK_N], dtype=gl.float32, layout=output_layout)
+    for head in gl.static_range(0, 32):
+        contribution = gl.gather(contributions, gather_indices + head, axis=0)
+        contribution = gl.convert_layout(
+            gl.reshape(contribution, [BLOCK_N]),
+            output_layout,
+        )
+        scores += contribution
+    return scores
+
+
+@gluon.jit
+def _score_head_tile_ordered_head_fold(
+    query,
+    key,
+    head_weights,
+    mfma_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    Q_IS_FP8: gl.constexpr,
+):
+    accumulator = gl.zeros([32, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+    if Q_IS_FP8:
+        head_scores = gl.amd.cdna4.mfma_scaled(
+            a=query,
+            a_scale=None,
+            a_format="e4m3",
+            b=key,
+            b_scale=None,
+            b_format="e4m3",
+            acc=accumulator,
+        )
+    else:
+        head_scores = gl.amd.cdna4.mfma(query, key, accumulator)
+    head_scores = _relu_f32(head_scores)
+    return _fold_weighted_heads_in_logical_order(
+        head_scores,
+        head_weights,
+        mfma_layout,
+        BLOCK_N,
+    )
+
+
+@gluon.jit
 def _score_key_tile(
     query_0,
     weight_0,
@@ -353,6 +411,46 @@ def _score_key_tile(
 
 
 @gluon.jit
+def _score_key_tile_ordered_head_fold(
+    query_0,
+    weight_0,
+    query_1,
+    weight_1,
+    raw_key,
+    key_scales,
+    model_scale,
+    mfma_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    Q_IS_FP8: gl.constexpr,
+):
+    if Q_IS_FP8:
+        key = raw_key
+    else:
+        key = raw_key.to(gl.bfloat16)
+    key = gl.convert_layout(key, dot_b_layout)
+    scores = _score_head_tile_ordered_head_fold(
+        query_0,
+        key,
+        weight_0,
+        mfma_layout,
+        BLOCK_N,
+        Q_IS_FP8,
+    )
+    if NUM_HEADS == 64:
+        scores += _score_head_tile_ordered_head_fold(
+            query_1,
+            key,
+            weight_1,
+            mfma_layout,
+            BLOCK_N,
+            Q_IS_FP8,
+        )
+    return scores * key_scales * model_scale
+
+
+@gluon.jit
 def _standard_cache_logits_body(
     q,
     q_scales,
@@ -363,6 +461,7 @@ def _standard_cache_logits_body(
     row_starts,
     row_ends,
     seq_lens,
+    req_ids,
     block_table,
     logits,
     stride_q_row,
@@ -377,9 +476,11 @@ def _standard_cache_logits_body(
     model_scale,
     max_candidates,
     q_len_per_req,
+    pool_offset,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
+    POOL_SIZE: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -387,17 +488,38 @@ def _standard_cache_logits_body(
     NUM_WARPS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
     IS_PREFILL: gl.constexpr,
+    IS_KPOOL: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
     row_id = gl.program_id(0)
     split_id = gl.program_id(1)
-    if IS_PREFILL:
+    if IS_KPOOL:
+        if IS_PREFILL:
+            request_id = 0
+            workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
+            workspace_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
+            output_base = workspace_start + pool_offset
+            candidate_start = gl.minimum(output_base, workspace_end)
+            candidate_end = gl.minimum(output_base + CHUNK_N, workspace_end)
+        else:
+            request_id = gl.load(req_ids + row_id).to(gl.int32)
+            num_pools = (
+                gl.maximum(gl.load(seq_lens + row_id).to(gl.int32), 0) // POOL_SIZE
+            )
+            output_base = pool_offset
+            candidate_start = pool_offset
+            candidate_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
+            candidate_end = gl.minimum(candidate_end, max_candidates)
+    elif IS_PREFILL:
         request_id = row_id
+        output_base = 0
         candidate_start = gl.maximum(gl.load(row_starts + row_id), 0)
         candidate_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
     else:
         request_id = row_id // q_len_per_req
+        output_base = 0
         q_offset = row_id - request_id * q_len_per_req
         candidate_start = split_id * CHUNK_N
         candidate_end = gl.load(seq_lens + request_id).to(gl.int32)
@@ -556,23 +678,40 @@ def _standard_cache_logits_body(
                 IS_PREFILL,
                 USE_BUFFER_LOAD,
             )
-        scores = _score_key_tile(
-            query_0,
-            weight_0,
-            query_1,
-            weight_1,
-            raw_key,
-            key_scales,
-            model_scale,
-            mfma_layout,
-            dot_b_layout,
-            NUM_HEADS,
-            BLOCK_N,
-            Q_IS_FP8,
-        )
+        if ORDERED_HEAD_FOLD:
+            scores = _score_key_tile_ordered_head_fold(
+                query_0,
+                weight_0,
+                query_1,
+                weight_1,
+                raw_key,
+                key_scales,
+                model_scale,
+                mfma_layout,
+                dot_b_layout,
+                NUM_HEADS,
+                BLOCK_N,
+                Q_IS_FP8,
+            )
+        else:
+            scores = _score_key_tile(
+                query_0,
+                weight_0,
+                query_1,
+                weight_1,
+                raw_key,
+                key_scales,
+                model_scale,
+                mfma_layout,
+                dot_b_layout,
+                NUM_HEADS,
+                BLOCK_N,
+                Q_IS_FP8,
+            )
+        output_column = tile_start - output_base if IS_KPOOL else tile_start
         output_offsets = (
             row_id.to(gl.int64) * logits_stride
-            + tile_start.to(gl.int64)
+            + output_column.to(gl.int64)
             + output_columns.to(gl.int64)
         )
         if USE_BUFFER_STORE:
@@ -632,6 +771,7 @@ def _dsa_standard_prefill_logits_kernel(
         row_starts,
         row_ends,
         row_ends,
+        row_ends,
         block_table,
         logits,
         stride_q_row,
@@ -646,9 +786,11 @@ def _dsa_standard_prefill_logits_kernel(
         model_scale,
         workspace_rows,
         1,
+        0,
         PAGE_SIZE,
         ROW_BYTES,
         PAGE_STRIDE_BYTES,
+        1,
         NUM_HEADS,
         HEAD_DIM,
         BLOCK_N,
@@ -656,6 +798,183 @@ def _dsa_standard_prefill_logits_kernel(
         NUM_WARPS,
         Q_IS_FP8,
         True,
+        False,
+        False,
+        USE_BUFFER_LOAD,
+        USE_BUFFER_STORE,
+    )
+
+
+@gluon.jit
+def _dsa_kpool_prefill_logits_kernel(
+    q,
+    q_scales,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    causal_lens,
+    req_ids,
+    block_table,
+    logits,
+    row_ends,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_qs_row,
+    stride_qs_head,
+    stride_w_row,
+    stride_w_head,
+    block_table_stride,
+    logits_stride,
+    model_scale,
+    max_candidates,
+    pool_offset,
+    PAGE_SIZE: gl.constexpr,
+    ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
+    POOL_SIZE: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WINDOW_COLS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    row_id = gl.program_id(0)
+    num_pools = gl.maximum(gl.load(causal_lens + row_id).to(gl.int32), 0) // POOL_SIZE
+    window_end = gl.minimum(num_pools, pool_offset + WINDOW_COLS)
+    window_end = gl.minimum(window_end, max_candidates)
+    local_end = gl.maximum(window_end - pool_offset, 0)
+    gl.store(row_ends + row_id, local_end)
+
+    _standard_cache_logits_body(
+        q,
+        q_scales,
+        index_k_fp8,
+        index_k_scale,
+        weights,
+        block_table,
+        causal_lens,
+        row_ends,
+        causal_lens,
+        req_ids,
+        block_table,
+        logits,
+        stride_q_row,
+        stride_q_head,
+        stride_q_dim,
+        stride_qs_row,
+        stride_qs_head,
+        stride_w_row,
+        stride_w_head,
+        block_table_stride,
+        logits_stride,
+        model_scale,
+        max_candidates,
+        1,
+        pool_offset,
+        PAGE_SIZE,
+        ROW_BYTES,
+        PAGE_STRIDE_BYTES,
+        POOL_SIZE,
+        NUM_HEADS,
+        HEAD_DIM,
+        BLOCK_N,
+        WINDOW_COLS,
+        NUM_WARPS,
+        False,
+        False,
+        True,
+        ORDERED_HEAD_FOLD,
+        USE_BUFFER_LOAD,
+        USE_BUFFER_STORE,
+    )
+
+
+@gluon.jit
+def _dsa_kpool_prefill_plan_logits_kernel(
+    q,
+    q_scales,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    pool_workspace_slots,
+    row_starts,
+    row_ends,
+    logits,
+    local_row_ends,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_qs_row,
+    stride_qs_head,
+    stride_w_row,
+    stride_w_head,
+    logits_stride,
+    model_scale,
+    workspace_rows,
+    pool_offset,
+    PAGE_SIZE: gl.constexpr,
+    ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
+    POOL_SIZE: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WINDOW_COLS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ORDERED_HEAD_FOLD: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    row_id = gl.program_id(0)
+    workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
+    workspace_end = gl.minimum(gl.load(row_ends + row_id), workspace_rows)
+    row_pools = gl.maximum(workspace_end - workspace_start, 0)
+    local_end = gl.minimum(gl.maximum(row_pools - pool_offset, 0), WINDOW_COLS)
+    gl.store(local_row_ends + row_id, local_end)
+
+    _standard_cache_logits_body(
+        q,
+        q_scales,
+        index_k_fp8,
+        index_k_scale,
+        weights,
+        pool_workspace_slots,
+        row_starts,
+        row_ends,
+        row_ends,
+        row_ends,
+        row_ends,
+        logits,
+        stride_q_row,
+        stride_q_head,
+        stride_q_dim,
+        stride_qs_row,
+        stride_qs_head,
+        stride_w_row,
+        stride_w_head,
+        0,
+        logits_stride,
+        model_scale,
+        workspace_rows,
+        1,
+        pool_offset,
+        PAGE_SIZE,
+        ROW_BYTES,
+        PAGE_STRIDE_BYTES,
+        POOL_SIZE,
+        NUM_HEADS,
+        HEAD_DIM,
+        BLOCK_N,
+        WINDOW_COLS,
+        NUM_WARPS,
+        False,
+        True,
+        True,
+        ORDERED_HEAD_FOLD,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
     )
@@ -705,6 +1024,7 @@ def _dsa_standard_decode_logits_kernel(
         seq_lens,
         seq_lens,
         seq_lens,
+        seq_lens,
         block_table,
         logits,
         stride_q_row,
@@ -719,15 +1039,19 @@ def _dsa_standard_decode_logits_kernel(
         model_scale,
         max_candidates,
         q_len_per_req,
+        0,
         PAGE_SIZE,
         ROW_BYTES,
         PAGE_STRIDE_BYTES,
+        1,
         NUM_HEADS,
         HEAD_DIM,
         BLOCK_N,
         CHUNK_N,
         NUM_WARPS,
         Q_IS_FP8,
+        False,
+        False,
         False,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,

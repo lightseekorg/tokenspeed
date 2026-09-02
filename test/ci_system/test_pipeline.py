@@ -106,24 +106,6 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert not is_amd_runner("gb200-4gpu-perf")
 
 
-def test_mi450_sim_uses_self_hosted_cpu_runner(tmp_path):
-    _write_task_yaml(
-        tmp_path,
-        "mi450-sim.yaml",
-        _default_body("mi450-sim", ["amd-mi450-sim"]),
-    )
-
-    matrix = build_matrix(
-        tmp_path,
-        tmp_path,
-        trigger="per-commit",
-        runner_group="amd",
-    )
-
-    assert matrix["include"][0]["runner"] == "amd-mi450-sim"
-    assert "runs_on" not in matrix["include"][0]
-
-
 @pytest.mark.parametrize(
     ("declared", "effective"),
     [
@@ -1073,6 +1055,101 @@ def test_validate_task_rejects_per_label_optional_with_non_boolean_value(tmp_pat
 
     with pytest.raises(ValueError, match=r"optional values must be booleans"):
         validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_accepts_retries_on_eval(tmp_path):
+    body = _default_body("eval-a", ["b200-4gpu"], extra="retries: 1\n")
+    body = body.replace(
+        "type: ut\nworkflow_stage: unit-test\n",
+        "type: eval\nworkflow_stage: model-test\n",
+    )
+    path = _write_task_yaml(tmp_path, "eval-retries.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_retries_on_ut(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="retries: 1\n")
+    path = _write_task_yaml(tmp_path, "ut-retries.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"retries is only supported"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_negative_retries(tmp_path):
+    body = _default_body("eval-a", ["b200-4gpu"], extra="retries: -1\n")
+    body = body.replace(
+        "type: ut\nworkflow_stage: unit-test\n",
+        "type: eval\nworkflow_stage: model-test\n",
+    )
+    path = _write_task_yaml(tmp_path, "neg-retries.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"retries must be a non-negative integer"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
+    task = {
+        "name": "eval-retry",
+        "type": "eval",
+        "retries": 1,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "server": {
+            "command": "serve",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {"command": "run eval"},
+    }
+    result_json = tmp_path / "result.json"
+    eval_calls = {"n": 0}
+    server_starts = {"n": 0}
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "summarize_task_targets", lambda *_: {})
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda runner, env, cwd, dry_run, reuse_state, setup_mode: (env, None),
+    )
+    monkeypatch.setattr(pipeline, "cleanup_runner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "poll_readiness", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "kill_ready_port_listener", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "summarize_command_output", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline, "summarize_eval_accept_rate", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "check_eval_score_threshold", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "stop_server", lambda *a, **k: None)
+
+    def fake_start_server(*args, **kwargs):
+        server_starts["n"] += 1
+        return object()
+
+    def fake_shell_run(command, **kwargs):
+        if command == "run eval":
+            eval_calls["n"] += 1
+            if eval_calls["n"] == 1:
+                raise RuntimeError("command failed with exit code 1: run eval")
+            return {"command": command, "returncode": 0, "output": "ok"}
+        return {"command": command, "returncode": 0, "output": ""}
+
+    monkeypatch.setattr(pipeline, "start_server", fake_start_server)
+    monkeypatch.setattr(pipeline, "shell_run", fake_shell_run)
+
+    return_code = pipeline.execute_task(
+        config="task.yaml",
+        runner="b200v2-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_json),
+    )
+
+    assert return_code == 0
+    assert eval_calls["n"] == 2
+    assert server_starts["n"] == 2
+    assert result_json.exists()
 
 
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):

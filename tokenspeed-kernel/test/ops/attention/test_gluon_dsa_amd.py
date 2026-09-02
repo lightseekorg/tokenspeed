@@ -16,6 +16,9 @@ if not (is_cdna4() or is_cdna5()):
         allow_module_level=True,
     )
 
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
+    attention as gfx950_dsa_backend,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: E402
     _trim_topk_slots_for_context,
 )
@@ -32,6 +35,9 @@ if is_cdna4():
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
         gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        gluon_dsa_logical_topk_gfx950 as gluon_logical_topk_indices,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
@@ -986,6 +992,94 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
+@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
+def test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs() -> None:
+    cols = 1024
+    topk = 512
+    ascending = torch.arange(cols, device="cuda", dtype=torch.float32)
+    logits = torch.stack((ascending, -ascending, ascending)).contiguous()
+    row_starts = torch.tensor([0, 123, 400], device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor([cols, 900, 410], device="cuda", dtype=torch.int32)
+    out = torch.empty((3, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((3,), device="cuda", dtype=torch.int32)
+
+    actual_out, actual_lens = gluon_logical_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert actual_out is out
+    assert actual_lens is lens_out
+    expected = torch.full_like(out, -1)
+    expected[0] = torch.arange(512, 1024, device="cuda", dtype=torch.int32)
+    expected[1] = torch.arange(123, 635, device="cuda", dtype=torch.int32)
+    expected[2, :10] = torch.arange(400, 410, device="cuda", dtype=torch.int32)
+    expected_lens = torch.tensor([512, 512, 10], device="cuda", dtype=torch.int32)
+    candidates = [
+        (
+            torch.arange(int(start), int(end), device="cuda", dtype=torch.long),
+            logits[row, int(start) : int(end)],
+        )
+        for row, (start, end) in enumerate(zip(row_starts, row_ends, strict=True))
+    ]
+    _assert_topk_matches(
+        actual_out,
+        actual_lens,
+        expected,
+        expected_lens,
+        candidates,
+    )
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
+def test_gluon_logical_topk_indices_validates_tensor_contract() -> None:
+    logits = torch.empty((2, 1024), device="cuda", dtype=torch.float32)
+    row_starts = torch.zeros((2,), device="cuda", dtype=torch.int32)
+    row_ends = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="2-D"):
+        gluon_logical_topk_indices(logits[0], row_starts, row_ends, topk=512)
+    with pytest.raises(TypeError, match="float32"):
+        gluon_logical_topk_indices(
+            logits.to(torch.bfloat16), row_starts, row_ends, topk=512
+        )
+    with pytest.raises(ValueError, match="logits must be contiguous"):
+        gluon_logical_topk_indices(
+            torch.empty((1024, 2), device="cuda", dtype=torch.float32).T,
+            row_starts,
+            row_ends,
+            topk=512,
+        )
+    with pytest.raises(ValueError, match="row_starts must have shape"):
+        gluon_logical_topk_indices(logits, row_starts[:1], row_ends, topk=512)
+    with pytest.raises(TypeError, match="row_ends must be int32"):
+        gluon_logical_topk_indices(
+            logits, row_starts, row_ends.to(torch.int64), topk=512
+        )
+    with pytest.raises(ValueError, match="out must have shape"):
+        gluon_logical_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=512,
+            out=torch.empty((2, 511), device="cuda", dtype=torch.int32),
+        )
+    with pytest.raises(TypeError, match="lens_out must be int32"):
+        gluon_logical_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=512,
+            lens_out=torch.empty((2,), device="cuda", dtype=torch.int64),
+        )
+    with pytest.raises(ValueError, match="supports topk"):
+        gluon_logical_topk_indices(logits, row_starts, row_ends, topk=64)
+
+
 def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
     device = "cuda"
     page_size = 64
@@ -1484,6 +1578,290 @@ def test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens() -> None:
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="GLM-5.3-Flash native FP8 MFMA decode is specific to gfx950",
+)
+def test_dsa_decode_glm53_flash_native_fp8_mfma() -> None:
+    device = "cuda"
+    num_heads = 16
+    num_slots = 2051
+    topk = 2051
+    valid_topk = 2048
+    kv_lora_rank = 512
+    qk_nope_head_dim = 256
+    generator = _generator(device, 1201)
+
+    q = _randn_bf16(
+        (1, num_heads, kv_lora_rank), device=device, generator=generator
+    ).to(torch.float8_e4m3fn)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank), device=device, generator=generator
+    ).to(torch.float8_e4m3fn)
+    topk_slots = torch.full((1, topk), -1, device=device, dtype=torch.int32)
+    topk_slots[0, :valid_topk] = torch.randperm(
+        num_slots, device=device, generator=generator
+    )[:valid_topk]
+    topk_lens = torch.tensor([valid_topk], device=device, dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
+
+    out = gluon_dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=0,
+        softmax_scale=softmax_scale,
+        page_size=64,
+    )
+    selected = kv_cache[topk_slots[0, :valid_topk].long()].float()
+    probs = torch.softmax(q[0].float() @ selected.T * softmax_scale, dim=-1)
+    ref = probs @ selected
+
+    assert out.shape == (1, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out[0].float(), ref, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "topk", "expected_splits"),
+    ((1, 1024, 4), (16, 1024, 4), (32, 2048, 8), (64, 2048, 4)),
+)
+def test_dsa_native_fp8_split_schedule(
+    tokens: int, topk: int, expected_splits: int
+) -> None:
+    assert (
+        gfx950_dsa_backend._select_num_kv_splits(
+            num_tokens=tokens,
+            num_heads=16,
+            topk_width=topk,
+            max_seqlen_k=topk,
+            is_fp8=True,
+            native_fp8=True,
+        )
+        == expected_splits
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "qk_rope_head_dim", "expected_splits"),
+    ((1, 0, 1), (16, 0, 16), (32, 0, 1), (64, 0, 4), (64, 64, 1)),
+)
+def test_dsa_glm53_bf16_split_schedule(
+    tokens: int, qk_rope_head_dim: int, expected_splits: int
+) -> None:
+    assert (
+        gfx950_dsa_backend._select_num_kv_splits(
+            num_tokens=tokens,
+            num_heads=16,
+            topk_width=2048,
+            max_seqlen_k=2047,
+            is_fp8=False,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        == expected_splits
+    )
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="GLM-5.3-Flash BF16 decode is specific to gfx950",
+)
+@pytest.mark.parametrize("tokens", (16, 64))
+def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
+    device = "cuda"
+    num_heads = 16
+    num_slots = 256
+    topk = 2048
+    kv_lora_rank = 512
+    qk_nope_head_dim = 256
+    generator = _generator(device, 1204 + tokens)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank), device=device, generator=generator
+    )
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank), device=device, generator=generator
+    )
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor(
+        [(row * 17) % (num_slots + 1) for row in range(tokens)],
+        device=device,
+        dtype=torch.int32,
+    )
+    for row, length in enumerate(topk_lens.tolist()):
+        topk_slots[row, :length] = torch.randperm(
+            num_slots, device=device, generator=generator
+        )[:length]
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
+
+    out = gluon_dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=2047,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=0,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=4,
+    )
+    ref = _dsa_reference(
+        q,
+        kv_cache,
+        torch.empty((num_slots, 0), dtype=q.dtype, device=device),
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="GLM-5.3-Flash BF16 prefill is specific to gfx950",
+)
+def test_dsa_prefill_glm53_flash_bf16_dense_mfma(monkeypatch) -> None:
+    device = "cuda"
+    num_heads = 16
+    num_slots = 2051
+    topk = 2051
+    valid_topk = 2048
+    kv_lora_rank = 512
+    qk_nope_head_dim = 256
+    generator = _generator(device, 1202)
+
+    q = _randn_bf16((1, num_heads, kv_lora_rank), device=device, generator=generator)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank), device=device, generator=generator
+    )
+    topk_slots = torch.full((1, topk), -1, device=device, dtype=torch.int32)
+    topk_slots[0, :valid_topk] = torch.randperm(
+        num_slots, device=device, generator=generator
+    )[:valid_topk]
+    topk_lens = torch.tensor([valid_topk], device=device, dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
+
+    mfma_calls = 0
+    mfma_kernel = gfx950_dsa_backend._dsa_dense_mfma_kv_kernel
+
+    class _TrackedMfmaKernel:
+        def __getitem__(self, grid):
+            launch = mfma_kernel[grid]
+
+            def track_launch(*args, **kwargs):
+                nonlocal mfma_calls
+                mfma_calls += 1
+                return launch(*args, **kwargs)
+
+            return track_launch
+
+    monkeypatch.setattr(
+        gfx950_dsa_backend, "_dsa_dense_mfma_kv_kernel", _TrackedMfmaKernel()
+    )
+    out = gluon_dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=0,
+        softmax_scale=softmax_scale,
+        page_size=64,
+    )
+    selected = kv_cache[topk_slots[0, :valid_topk].long()].float()
+    probs = torch.softmax(q[0].float() @ selected.T * softmax_scale, dim=-1)
+    ref = probs @ selected
+
+    assert mfma_calls == 1
+    assert out.shape == (1, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out[0].float(), ref, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="GLM-5.3-Flash padded prefill is specific to gfx950",
+)
+def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
+    device = "cuda"
+    tokens = 4
+    num_heads = 16
+    num_slots = 64
+    topk = 2051
+    kv_lora_rank = 512
+    generator = _generator(device, 1203)
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank),
+        device=device,
+        generator=generator,
+    )
+    q[2:].fill_(float("nan"))
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank),
+        device=device,
+        generator=generator,
+    )
+    kv_cache[0].fill_(float("nan"))
+    topk_slots = torch.full(
+        (tokens, topk),
+        -1,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_lens = torch.tensor([16, 12, 0, 0], device=device, dtype=torch.int32)
+    for row, length in enumerate(topk_lens[:2].tolist()):
+        topk_slots[row, :length] = (
+            torch.randperm(
+                num_slots - 1,
+                generator=generator,
+                device=device,
+            )[:length]
+            + 1
+        )
+    softmax_scale = kv_lora_rank**-0.5
+
+    out = gluon_dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=256,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=0,
+        softmax_scale=softmax_scale,
+        page_size=64,
+    )
+
+    for row, length in enumerate(topk_lens[:2].tolist()):
+        selected = kv_cache[topk_slots[row, :length].long()].float()
+        probs = torch.softmax(q[row].float() @ selected.T * softmax_scale, dim=-1)
+        torch.testing.assert_close(
+            out[row].float(),
+            probs @ selected,
+            rtol=8e-2,
+            atol=8e-2,
+        )
+    assert torch.isfinite(out).all()
+    assert torch.count_nonzero(out[2:]).item() == 0
 
 
 @pytest.mark.parametrize(

@@ -27,7 +27,7 @@ the prefill path (large M), where the fused single-CTA align does not scale
 (O(G^2) rank tile). Written in **Gluon** so the whole MoE compiles through one
 Gluon backend.
 
-Kernels:
+Large-route kernels:
   1. ``_init_kernel``   -- parallel fill of the padding sentinel / zero weights
                            and zero of the per-expert count buffer.
   2. ``_count_kernel``  -- **parallel** per-CTA ``gl.histogram`` of an N-chunk,
@@ -40,6 +40,11 @@ Kernels:
   4. ``_scatter_kernel``-- parallel: each routed slot atomically claims a rank
                            within its expert (``buffer_atomic_add`` old value)
                            and writes its packed id + weight to that row.
+
+For at most 1024 routed slots, ``_prepare_small_kernel`` combines output
+initialization, histogram, and prefix construction in one workgroup. The
+existing parallel scatter remains separate, avoiding both three launches and
+the quadratic stable-rank tile used by the decode-only fused aligner.
 
 Order within an expert is arbitrary (atomics), unlike the stable reference, but
 MoE is order-independent. Outputs stay padded to their compile-time upper bound
@@ -166,6 +171,95 @@ def _offsets_kernel(
 
 
 @gluon.jit
+def _prepare_small_kernel(
+    exp_ptr,
+    N,
+    num_experts,
+    block_m,
+    nb_max,
+    sti_ptr,
+    sw_ptr,
+    sei_ptr,
+    row_off_ptr,
+    fill_ctr_ptr,
+    num_valid_ptr,
+    num_blocks_ptr,
+    sentinel,
+    BLOCK_G: gl.constexpr,
+    BLOCK_E: gl.constexpr,
+    BLOCK_NB: gl.constexpr,
+    EM_MAX: gl.constexpr,
+    INIT_TILE: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NW: gl.constexpr,
+):
+    """Initialize outputs and construct small-route offsets in one workgroup."""
+    LG: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    LE: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    LI: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW, 1], [1, 0])
+
+    for r0 in gl.static_range(0, EM_MAX, INIT_TILE):
+        r = r0 + gl.arange(0, INIT_TILE, layout=LI)
+        gl.store(
+            sti_ptr + r,
+            gl.full([INIT_TILE], sentinel, gl.int32, layout=LI),
+            mask=r < EM_MAX,
+        )
+        gl.store(
+            sw_ptr + r,
+            gl.full([INIT_TILE], 0.0, gl.float32, layout=LI),
+            mask=r < EM_MAX,
+        )
+
+    g = gl.arange(0, BLOCK_G, layout=LG)
+    gmask = g < N
+    global_e = gl.load(exp_ptr + g, mask=gmask, other=EXPERT_START + num_experts)
+    local_e = global_e - EXPERT_START
+    route_mask = gmask & (local_e >= 0) & (local_e < num_experts)
+    safe_e = gl.where(route_mask, local_e, num_experts)
+    counts = gl.histogram(safe_e, BLOCK_E, mask=route_mask, layout=LE)
+
+    e_ids = gl.arange(0, BLOCK_E, layout=LE)
+    valid_e = e_ids < num_experts
+    blocks_pe = (counts + block_m - 1) // block_m
+    padded = blocks_pe * block_m
+    row_off = gl.associative_scan(padded, 0, _add) - padded
+    blocks_incl = gl.associative_scan(blocks_pe, 0, _add)
+    num_valid = gl.sum(padded, 0)
+    num_blocks = gl.sum(blocks_pe, 0)
+
+    gl.store(row_off_ptr + e_ids, row_off, mask=valid_e)
+    gl.store(
+        fill_ctr_ptr + e_ids,
+        gl.full([BLOCK_E], 0.0, gl.float32, layout=LE),
+        mask=valid_e,
+    )
+    gl.store(num_valid_ptr, num_valid)
+    gl.store(num_blocks_ptr, num_blocks)
+
+    for b0 in range(0, nb_max, BLOCK_NB):
+        bb = b0 + gl.arange(0, BLOCK_NB, layout=gl.SliceLayout(1, LT))
+        bi_row = gl.expand_dims(
+            gl.convert_layout(blocks_incl, gl.SliceLayout(0, LT)), 0
+        )
+        ve_row = gl.expand_dims(
+            gl.convert_layout(valid_e.to(gl.int32), gl.SliceLayout(0, LT)), 0
+        )
+        expert_b = gl.sum(
+            ((bi_row <= gl.expand_dims(bb, 1)) & (ve_row == 1)).to(gl.int32), axis=1
+        )
+        bb_l = b0 + gl.arange(0, BLOCK_NB, layout=LE)
+        expert_l = gl.convert_layout(expert_b, LE)
+        sei_val = gl.where(
+            bb_l < num_blocks,
+            expert_l,
+            gl.full([BLOCK_NB], -1, gl.int32, layout=LE),
+        )
+        gl.store(sei_ptr + bb_l, sei_val, mask=bb_l < nb_max)
+
+
+@gluon.jit
 def _scatter_kernel(
     exp_ptr,  # [N] int32 flat topk_ids
     w_ptr,  # [N] float32 flat topk_weights
@@ -248,42 +342,67 @@ def moe_align_block_size_device(
     sei = torch.empty(nb_max, dtype=torch.int32, device=device)
     row_off = torch.empty(BLOCK_E, dtype=torch.int32, device=device)
     fill_ctr = torch.empty(BLOCK_E, dtype=torch.float32, device=device)
-    counts = torch.zeros(
-        BLOCK_E, dtype=torch.float32, device=device
-    )  # count_kernel accum
     meta = torch.empty(2, dtype=torch.int32, device=device)  # [EM, num_blocks]
 
-    INIT_BLOCK = 1024
-    _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
-        sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4
-    )
-    BLOCK_N = 1024
-    _count_kernel[(triton.cdiv(N, BLOCK_N),)](
-        exp_flat,
-        N,
-        num_experts,
-        counts,
-        BLOCK_N=BLOCK_N,
-        BLOCK_E=BLOCK_E,
-        EXPERT_START=expert_start,
-        NW=4,
-        num_warps=4,
-    )
-    _offsets_kernel[(1,)](
-        counts,
-        num_experts,
-        block_m,
-        nb_max,
-        row_off,
-        fill_ctr,
-        sei,
-        meta[0:1],
-        meta[1:2],
-        BLOCK_E=BLOCK_E,
-        BLOCK_NB=64,
-        NW=4,
-        num_warps=4,
-    )
+    if N <= 1024:
+        _prepare_small_kernel[(1,)](
+            exp_flat,
+            N,
+            num_experts,
+            block_m,
+            nb_max,
+            sti,
+            sw,
+            sei,
+            row_off,
+            fill_ctr,
+            meta[0:1],
+            meta[1:2],
+            sentinel,
+            BLOCK_G=triton.next_power_of_2(N),
+            BLOCK_E=BLOCK_E,
+            BLOCK_NB=64,
+            EM_MAX=EM_max,
+            INIT_TILE=triton.next_power_of_2(min(1024, EM_max)),
+            EXPERT_START=expert_start,
+            NW=4,
+            num_warps=4,
+        )
+    else:
+        counts = torch.zeros(
+            BLOCK_E, dtype=torch.float32, device=device
+        )  # count_kernel accum
+        INIT_BLOCK = 1024
+        _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
+            sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4
+        )
+        BLOCK_N = 1024
+        _count_kernel[(triton.cdiv(N, BLOCK_N),)](
+            exp_flat,
+            N,
+            num_experts,
+            counts,
+            BLOCK_N=BLOCK_N,
+            BLOCK_E=BLOCK_E,
+            EXPERT_START=expert_start,
+            NW=4,
+            num_warps=4,
+        )
+        _offsets_kernel[(1,)](
+            counts,
+            num_experts,
+            block_m,
+            nb_max,
+            row_off,
+            fill_ctr,
+            sei,
+            meta[0:1],
+            meta[1:2],
+            BLOCK_E=BLOCK_E,
+            BLOCK_NB=64,
+            NW=4,
+            num_warps=4,
+        )
     _scatter_kernel[(triton.cdiv(N, 256),)](
         exp_flat,
         w_flat,

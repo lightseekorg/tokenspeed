@@ -50,6 +50,99 @@ def test_mm_reference_rejects_out_dtype_mismatch() -> None:
         tokenspeed_kernel.mm(a, b, out=out, override="torch_mm")
 
 
+@pytest.mark.parametrize(
+    ("n", "k"),
+    (
+        (6144, 4096),
+        (4096, 3072),
+        (2048, 4096),
+        (4096, 1536),
+        (4096, 4096),
+        (1024, 4096),
+        (4096, 512),
+    ),
+)
+def test_mi350_glm53_dense_fp8_decode_config(
+    monkeypatch: pytest.MonkeyPatch, n: int, k: int
+) -> None:
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    monkeypatch.setattr(
+        triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
+    )
+
+    small = triton_gemm.get_w8a8_block_fp8_config(64, n, k, 128, 128)
+    medium = triton_gemm.get_w8a8_block_fp8_config(65, n, k, 128, 128)
+    large = triton_gemm.get_w8a8_block_fp8_config(129, n, k, 128, 128)
+
+    assert small is not None
+    assert medium is not None
+    assert large is not None
+    assert small["BLOCK_SIZE_N"] == 32
+    assert small["num_warps"] == 2
+    assert medium["BLOCK_SIZE_N"] == 64
+    assert large["BLOCK_SIZE_M"] == 32
+
+
+@pytest.mark.parametrize(
+    ("m", "expected_group_size"),
+    ((1, 1), (16, 1), (24, 1), (25, 8), (64, 8)),
+)
+def test_mi350_narrow_dense_fp8_group_boundary(
+    monkeypatch: pytest.MonkeyPatch, m: int, expected_group_size: int
+) -> None:
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    monkeypatch.setattr(
+        triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
+    )
+
+    config = triton_gemm.get_w8a8_block_fp8_config(m, 1024, 4096, 128, 128)
+
+    assert config is not None
+    assert config["GROUP_SIZE_M"] == expected_group_size
+
+
+def test_mi350_short_k_dense_fp8_group_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    monkeypatch.setattr(
+        triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
+    )
+
+    small = triton_gemm.get_w8a8_block_fp8_config(64, 4096, 512, 128, 128)
+    medium = triton_gemm.get_w8a8_block_fp8_config(65, 4096, 512, 128, 128)
+
+    assert small is not None
+    assert medium is not None
+    assert small["GROUP_SIZE_M"] == 4
+    assert medium["GROUP_SIZE_M"] == 8
+
+
+@pytest.mark.parametrize(
+    ("is_cdna4", "n", "k", "block_n", "block_k"),
+    (
+        (False, 4096, 4096, 128, 128),
+        (True, 4096, 2048, 128, 128),
+        (True, 4096, 4096, 64, 128),
+        (True, 4096, 4096, 128, 64),
+    ),
+)
+def test_dense_fp8_tuning_falls_back_outside_gfx950_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    is_cdna4: bool,
+    n: int,
+    k: int,
+    block_n: int,
+    block_k: int,
+) -> None:
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    monkeypatch.setattr(
+        triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=is_cdna4))
+    )
+
+    assert triton_gemm.get_w8a8_block_fp8_config(64, n, k, block_n, block_k) is None
+
+
 def test_bmm_rejects_batch_mismatch() -> None:
     a = torch.empty((2, 4, 8), dtype=torch.bfloat16)
     b = torch.empty((3, 16, 8), dtype=torch.bfloat16)
