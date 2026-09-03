@@ -254,12 +254,13 @@ Address-freezing bugs — a refresh that binds metadata views over storage the
 captured graph never recorded — are assertable: capture snapshots the tensor
 identities reachable from the decode-metadata slots (`graph_ptr_guard`), and
 `TOKENSPEED_GRAPH_DEBUG=1` re-verifies them before every replay (production
-replays pay one bool check). Per-step-mutable objects a replay never reads
-through Python are exempted via `graph_unstable_metadata_fields` (two
-occupants: FlashMLA's eager tile schedule, and V4's `cache` slot, which
-refresh replaces wholesale each step). What unification still can NOT
-test: mempool reuse and hostfunc semantics — the e2e regression matrix keeps
-graph-on and graph-off configurations for this reason.
+replays pay one bool check). The snapshot has no exemption list: every
+tensor a slot reaches is an address the refresh must keep. Per-step-mutable
+objects a kernel owns (FlashMLA's tile schedule, which the kernel builds and
+freezes on first use) therefore live on the backend, outside the slots, not
+on the views. What unification still can NOT test: mempool reuse and
+hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
+configurations for this reason.
 
 ## One block-table route: router + leaves
 
@@ -397,8 +398,14 @@ down to the router and V4).
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live rows over the same buffers; lazy
   above-ladder views are pointer-stable; the graph_ptr_guard walk reports a
-  rebound tensor by path and honors `graph_unstable_metadata_fields`; leaf
+  rebound tensor by path and pins every tensor under the slots; FlashMLA's
+  tile schedule stays off the views (capture keeps its object alive, replay
+  refresh leaves it alone, eager takes a fresh one per step); leaf
   capture/refresh signature conformance.
+* `test/runtime/test_deepseek_v4_config.py` — a V4 replay refresh leaves
+  every address the capture recorded in place under the guard, the `cache`
+  slot's group tables included, for the target's packed views and the
+  draft's borrowed step views.
 * `test/runtime/test_cache_group_router.py` — router slot math, expansion,
   padding, placeholder delivery, per-group dispatch, draft window
   publication and address stability.

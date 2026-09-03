@@ -534,15 +534,14 @@ class GraphPtrGuardWalkTest(_TorchCase):
         torch = self.torch
 
         class _StubBackend:
-            graph_unstable_metadata_fields = frozenset({"volatile"})
-
             def __init__(self):
                 self.forward_decode_metadata = SimpleNamespace(
                     stable=torch.zeros(4),
-                    volatile=torch.zeros(2),
                     nested={"a": torch.ones(3)},
                     scalar=7,
                 )
+                # Backend-owned per-step scratch: outside the walked slots.
+                self.scratch = torch.zeros(2)
 
             def child_backends(self):
                 return ()
@@ -550,16 +549,19 @@ class GraphPtrGuardWalkTest(_TorchCase):
         self.stub_cls = _StubBackend
         self.stub = _StubBackend()
 
-    def test_snapshot_records_tensors_and_skips_unstable_fields(self):
+    def test_snapshot_records_every_tensor_under_the_slots(self):
         snap = self.guard.snapshot_graph_metadata(self.stub)
-        paths = set(snap)
-        self.assertIn("_StubBackend.forward_decode_metadata.stable", paths)
-        self.assertIn("_StubBackend.forward_decode_metadata.nested['a']", paths)
-        self.assertNotIn("_StubBackend.forward_decode_metadata.volatile", paths)
+        self.assertEqual(
+            set(snap),
+            {
+                "_StubBackend.forward_decode_metadata.stable",
+                "_StubBackend.forward_decode_metadata.nested['a']",
+            },
+        )
 
-    def test_unstable_field_may_mutate_between_replays(self):
+    def test_backend_scratch_outside_the_slots_may_move(self):
         snap = self.guard.snapshot_graph_metadata(self.stub)
-        self.stub.forward_decode_metadata.volatile = self.torch.zeros(2)
+        self.stub.scratch = self.torch.zeros(2)
         self.guard.verify_graph_metadata(self.stub, snap, context="test")
 
     def test_rebound_tensor_is_reported_with_its_path(self):

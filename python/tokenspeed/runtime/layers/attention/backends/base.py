@@ -90,10 +90,6 @@ class AttentionBackend(ABC):
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None
-    # Metadata attribute names exempt from the capture-time pointer-identity
-    # snapshot (graph_ptr_guard): sanctioned per-step-mutable objects the
-    # replayed kernels do not read through Python.
-    graph_unstable_metadata_fields: frozenset[str] = frozenset()
     # Static CUDA-graph capability of this class; the executor AND-composes
     # it over the target+draft trees (resolve_cuda_graph_support).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()

@@ -67,10 +67,6 @@ class PagedAttentionBackend(ABC):
 
     # Static CUDA-graph capability of this leaf class (see support.py).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
-    # Metadata attribute names exempt from the capture-time pointer snapshot
-    # (graph_ptr_guard): per-step-mutable objects the replayed kernels never
-    # read through Python (FlashMLA's eager tile schedule).
-    graph_unstable_metadata_fields: frozenset[str] = frozenset()
     # Whether a block draft (DFLASH/DSpark) expands decode rows to
     # spec_num_tokens per request; set from config by leaves that support it.
     draft_block_decode: bool = False

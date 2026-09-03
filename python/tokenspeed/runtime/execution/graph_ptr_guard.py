@@ -88,7 +88,7 @@ def _is_backend_like(obj) -> bool:
     return callable(getattr(obj, "refresh_decode_metadata", None))
 
 
-def _walk(obj, path: str, out: dict, seen: set, unstable: frozenset, depth: int):
+def _walk(obj, path: str, out: dict, seen: set, depth: int):
     if obj is None or depth <= 0:
         return
     if isinstance(obj, torch.Tensor):
@@ -107,31 +107,28 @@ def _walk(obj, path: str, out: dict, seen: set, unstable: frozenset, depth: int)
     seen.add(id(obj))
     if isinstance(obj, dict):
         for key, value in obj.items():
-            _walk(value, f"{path}[{key!r}]", out, seen, unstable, depth - 1)
+            _walk(value, f"{path}[{key!r}]", out, seen, depth - 1)
         return
     if isinstance(obj, (list, tuple)):
         for index, value in enumerate(obj):
-            _walk(value, f"{path}[{index}]", out, seen, unstable, depth - 1)
+            _walk(value, f"{path}[{index}]", out, seen, depth - 1)
         return
     attrs = getattr(obj, "__dict__", None)
     if attrs is None:
         return
     for name, value in attrs.items():
-        if name in unstable:
-            continue
-        _walk(value, f"{path}.{name}", out, seen, unstable, depth - 1)
+        _walk(value, f"{path}.{name}", out, seen, depth - 1)
 
 
 def _walk_backend(backend, prefix: str, out: dict, seen: set) -> None:
     if id(backend) in seen:
         return
     seen.add(id(backend))
-    unstable = frozenset(getattr(backend, "graph_unstable_metadata_fields", ()))
     attrs = getattr(backend, "__dict__", {})
     for slot in _GRAPH_METADATA_SLOTS:
         metadata = attrs.get(slot)
         if metadata is not None:
-            _walk(metadata, f"{prefix}.{slot}", out, seen, unstable, _MAX_WALK_DEPTH)
+            _walk(metadata, f"{prefix}.{slot}", out, seen, _MAX_WALK_DEPTH)
     for child in backend.child_backends():
         _walk_backend(child, f"{prefix}.{type(child).__name__}", out, seen)
 
@@ -140,11 +137,13 @@ def snapshot_graph_metadata(backend) -> dict[str, tuple]:
     """Record the identity of every tensor reachable from ``backend``'s
     decode-graph-visible metadata slots (recursing into ``child_backends()``).
 
+    Every tensor a slot reaches is pinned: per-step-mutable objects the
+    kernels own (FlashMLA's tile schedule) live on the backend, outside the
+    slots, rather than being exempted here.
+
     Args:
         backend: An attention backend whose decode metadata a captured graph
-            reads. Fields named in the backend's
-            ``graph_unstable_metadata_fields`` are excluded (sanctioned
-            per-step-mutable objects, e.g. FlashMLA's eager tile schedule).
+            reads.
 
     Returns:
         ``{path: (data_ptr, shape, stride, dtype, device)}`` — one entry per
