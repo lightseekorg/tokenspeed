@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
 
 _DRAFT_INVALID_POSITION = torch.iinfo(torch.int64).min
+_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 class QSAIndexer(nn.Module):
@@ -149,6 +150,13 @@ class QSAIndexer(nn.Module):
             tuple[int, torch.device],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        # Stable caller-owned scratch lets the materialized score path use the
+        # persistent radix top-k without allocating workspace per layer call.
+        self.register_buffer(
+            "_persistent_topk_workspace",
+            torch.empty((_PERSISTENT_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8),
+            persistent=False,
+        )
 
     @staticmethod
     def _full_backend(ctx: ForwardContext) -> CacheGroupRouter:
@@ -636,9 +644,8 @@ class QSAIndexer(nn.Module):
                 logical_positions, self.compress_ratio
             )
         cache = compressed.view(-1, 1, self.index_head_dim)
-        # Streaming block top-k: scores are computed tile by tile against
-        # each request's page table, so neither the expanded slot matrix nor
-        # the dense FP32 score matrix is ever materialized.
+        # Auto normally materializes scores for persistent radix selection;
+        # oversized matrices retain the zero-materialization streaming path.
         selected_blocks = qwen4_exp_qsa_block_topk(
             q,
             cache,
@@ -651,6 +658,7 @@ class QSAIndexer(nn.Module):
             solution=self._topk_solution(
                 q.shape[0], qsa_page_table, qsa_page_expansion, page_size
             ),
+            persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=pdl_enabled(),
         )
         return qwen4_exp_qsa_selected_tokens(

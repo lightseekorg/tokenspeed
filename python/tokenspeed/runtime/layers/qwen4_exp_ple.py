@@ -26,9 +26,13 @@ import math
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.ops.ple import (
+    ple_conv_sequences,
+    ple_gate_norm,
+    ple_ngram_ids,
+    ple_page_gather,
+    ple_page_scatter,
+)
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
@@ -55,6 +59,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from tokenspeed.runtime.utils import add_prefix
+
+_IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+# Uniform-batch index bundles captured into a CUDA graph. During capture the
+# (bs, max_len) pair is fixed per bucket, so entries are bounded by the capture
+# set. Entries are never evicted: a replay reads the addresses its capture
+# recorded, so freeing one would let the allocator hand that memory to someone
+# else and feed a replay another tensor's bytes. Eager calls compute fresh
+# tensors instead of caching, so varied prefill lengths cannot grow this dict.
+_UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
 
 
 def _is_prime(value: int) -> bool:
@@ -99,409 +112,6 @@ def quantize_ple_embedding_rows(
     scale = (values.abs().amax(dim=1) / _PLE_FP8_MAX).clamp_min(1e-12)
     quantized = (values / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
     return quantized, scale
-
-
-@triton.jit
-def _ngram_ids_kernel(
-    ids_ptr,
-    init_ptr,
-    req_ptr,
-    col_ptr,
-    starts_ptr,
-    mult_ptr,
-    sizes_ptr,
-    offsets_ptr,
-    out_ptr,
-    tail_ptr,
-    total,
-    eos_token,
-    N: tl.constexpr,
-    HPN: tl.constexpr,
-    H: tl.constexpr,
-    WRITE_TAIL: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Fused per-token n-gram hash ids straight from the flat token stream.
-
-    The window matrix is never materialized: each row walks left from its
-    anchor through the virtual layout ``[carried context (N-1) | tokens]``,
-    zeroes tokens behind an EOS boundary, folds the SplitMix multipliers via
-    XOR and emits every head's ``mixed % prime + offset`` id. Products stay
-    below 2**63 by construction of ``layer_multipliers``, so C-style ``%``
-    matches ``torch.remainder``. With ``WRITE_TAIL`` the raw trailing window
-    (``contexts[:, 1:]`` of the legacy layout, i.e. the verify-scratch rows)
-    is emitted from the same loads.
-    """
-
-    pid = tl.program_id(0)
-    rows = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = rows < total
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    req = tl.load(req_ptr + rows, mask=mask, other=0).to(tl.int64)
-    col = tl.load(col_ptr + rows, mask=mask, other=0).to(tl.int64)
-    start = tl.load(starts_ptr + req, mask=mask, other=0).to(tl.int64)
-
-    anchor = tl.load(ids_ptr + start + col, mask=mask, other=0).to(tl.int64)
-    if WRITE_TAIL:
-        tl.store(tail_ptr + rows * (N - 1) + (N - 2), anchor, mask=mask)
-    mixed = anchor * tl.load(mult_ptr)
-    blocked = anchor != anchor
-    for p in tl.static_range(1, N):
-        v = col + (N - 1) - p
-        from_init = v < (N - 1)
-        raw_init = tl.load(
-            init_ptr + req * (N - 1) + v, mask=mask & from_init, other=0
-        ).to(tl.int64)
-        raw_tok = tl.load(
-            ids_ptr + tl.maximum(start + (v - (N - 1)), 0),
-            mask=mask & (~from_init),
-            other=0,
-        ).to(tl.int64)
-        raw = tl.where(from_init, raw_init, raw_tok)
-        if WRITE_TAIL and p <= N - 2:
-            tl.store(tail_ptr + rows * (N - 1) + (N - 2 - p), raw, mask=mask)
-        tok = tl.where(blocked, eos_token, raw)
-        mixed = mixed ^ (tok * tl.load(mult_ptr + p))
-        blocked = blocked | (tok == eos_token)
-        for h in tl.static_range(0, HPN):
-            head = (p - 1) * HPN + h
-            size = tl.load(sizes_ptr + head)
-            offset = tl.load(offsets_ptr + head)
-            tl.store(out_ptr + rows * H + head, mixed % size + offset, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _ple_page_gather_kernel(
-    field_ptr,
-    page_ptr,
-    out_ptr,
-    default,
-    field_row_stride,
-    N,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Read one cache row per page id, substituting ``default`` for null pages.
-
-    Page id 0 is the null page, so its row is replaced rather than read. The
-    masked load supplies the fill, which keeps the replacement inside the one
-    pass instead of allocating a full-size ``default`` block and selecting
-    against it. ``field_row_stride`` carries the plan's page stride, which the
-    arena is free to pad past the row's own extent.
-    """
-
-    row = tl.program_id(0)
-    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = off < N
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    page = tl.load(page_ptr + row).to(tl.int64)
-    field_dtype = field_ptr.dtype.element_ty
-    value = tl.load(
-        field_ptr + tl.maximum(page, 0) * field_row_stride + off,
-        mask=mask & (page > 0),
-        other=default.to(field_dtype),
-    )
-    tl.store(out_ptr + row * N + off, value, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _ple_page_scatter_kernel(
-    field_ptr,
-    page_ptr,
-    values_ptr,
-    field_row_stride,
-    N,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Write one row per page id, leaving null pages alone.
-
-    Rows bound for page id 0 are simply not stored, so no placeholder row has
-    to be built and copied over itself.
-    """
-
-    row = tl.program_id(0)
-    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = off < N
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    page = tl.load(page_ptr + row).to(tl.int64)
-    value = tl.load(values_ptr + row * N + off, mask=mask, other=0)
-    tl.store(
-        field_ptr + tl.maximum(page, 0) * field_row_stride + off,
-        value.to(field_ptr.dtype.element_ty),
-        mask=mask & (page > 0),
-    )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _ple_dilated_conv_kernel(
-    values_ptr,
-    initial_ptr,
-    weight_ptr,
-    req_ptr,
-    col_ptr,
-    starts_ptr,
-    out_ptr,
-    windows_ptr,
-    gated_ptr,
-    residual_ptr,
-    windows_block_rows,
-    gated_row_stride,
-    residual_row_stride,
-    C,
-    D: tl.constexpr,
-    K: tl.constexpr,
-    STATE: tl.constexpr,
-    WRITE_WINDOWS: tl.constexpr,
-    SCATTER_WINDOWS: tl.constexpr,
-    ADD_GATED: tl.constexpr,
-    ADD_RESIDUAL: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    """Fused dilated depthwise conv + SiLU over the packed-free layout.
-
-    Each program covers one token and a channel block. The virtual per-request
-    sequence is ``[carried state (STATE cols) | tokens]``; tap ``k`` of output
-    column ``c`` reads virtual position ``c + k*D`` and sources it from the
-    carried state or the flat token tensor directly, so the batched pack /
-    transpose / unfold glue disappears. When ``WRITE_WINDOWS`` is set the
-    per-token sliding state windows (verify scratch input) are emitted from
-    the same loads; ``SCATTER_WINDOWS`` then places each one at its verify
-    scratch row instead of a packed one-row-per-token buffer, so the rollback
-    rows are filled in place and the full-size window tensor never exists.
-
-    ``ADD_GATED`` / ``ADD_RESIDUAL`` fold the two full-width additions that
-    follow the conv (the gated value stream and the incoming hidden states)
-    into this epilogue, so neither the bare conv output nor the PLE delta ever
-    reaches memory. Each addend is rounded to the store dtype before the next
-    one is applied, which reproduces the separate ``gated + conv_output`` and
-    ``hidden_states + delta`` tensor adds bit-for-bit whenever that dtype is
-    narrower than the fp32 accumulator. A pure fp32 stream has no such
-    rounding barrier, so the SiLU product stays unrounded into the first add
-    and results may differ by one ulp at operand scale (in the more accurate
-    direction).
-    """
-
-    token = tl.program_id(0)
-    block = tl.program_id(1)
-    ch = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    cmask = ch < C
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    req = tl.load(req_ptr + token).to(tl.int64)
-    col = tl.load(col_ptr + token).to(tl.int64)
-    start = tl.load(starts_ptr + req).to(tl.int64)
-    out_dtype = out_ptr.dtype.element_ty
-
-    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    for k in tl.static_range(K):
-        v = col + k * D
-        from_state = v < STATE
-        tok_idx = tl.maximum(start + (v - STATE), 0)
-        x_state = tl.load(
-            initial_ptr + (req * C + ch) * STATE + v,
-            mask=cmask & from_state,
-            other=0.0,
-        ).to(tl.float32)
-        x_tok = tl.load(
-            values_ptr + tok_idx * C + ch,
-            mask=cmask & (~from_state),
-            other=0.0,
-        ).to(tl.float32)
-        x = tl.where(from_state, x_state, x_tok)
-        w = tl.load(weight_ptr + ch * K + k, mask=cmask, other=0.0).to(tl.float32)
-        acc += w * x
-    silu = acc * (1.0 / (1.0 + tl.exp(-acc)))
-    result = silu.to(out_dtype)
-    if ADD_GATED:
-        gated = tl.load(
-            gated_ptr + token * gated_row_stride + ch, mask=cmask, other=0.0
-        )
-        result = (result.to(tl.float32) + gated.to(tl.float32)).to(out_dtype)
-    if ADD_RESIDUAL:
-        residual = tl.load(
-            residual_ptr + token * residual_row_stride + ch, mask=cmask, other=0.0
-        )
-        result = (result.to(tl.float32) + residual.to(tl.float32)).to(out_dtype)
-    tl.store(out_ptr + token * C + ch, result, mask=cmask)
-
-    if WRITE_WINDOWS:
-        # The verify scratch holds one ``windows_block_rows`` row block per
-        # request whose first row is the carried state, so token ``col`` of
-        # request ``req`` owns row ``req * windows_block_rows + 1 + col``. The
-        # packed layout is one row per token instead.
-        wrow = token.to(tl.int64)
-        if SCATTER_WINDOWS:
-            wrow = req * windows_block_rows + 1 + col
-        win_dtype = windows_ptr.dtype.element_ty
-        for s in tl.static_range(STATE):
-            v = col + 1 + s
-            from_state = v < STATE
-            tok_idx = tl.maximum(start + (v - STATE), 0)
-            w_state = tl.load(
-                initial_ptr + (req * C + ch) * STATE + v,
-                mask=cmask & from_state,
-                other=0.0,
-            ).to(win_dtype)
-            w_tok = tl.load(
-                values_ptr + tok_idx * C + ch,
-                mask=cmask & (~from_state),
-                other=0.0,
-            ).to(win_dtype)
-            tl.store(
-                windows_ptr + (wrow * C + ch) * STATE + s,
-                tl.where(from_state, w_state, w_tok),
-                mask=cmask,
-            )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _ple_conv_final_kernel(
-    values_ptr,
-    initial_ptr,
-    lengths_ptr,
-    starts_ptr,
-    final_ptr,
-    C,
-    STATE: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    """Trailing conv window per request (the state carried to the next step).
-
-    Reads virtual positions ``length .. length + STATE - 1``; zero-length
-    requests naturally pass their carried state through unchanged.
-    """
-
-    req = tl.program_id(0).to(tl.int64)
-    block = tl.program_id(1)
-    ch = block * BLOCK_C + tl.arange(0, BLOCK_C)
-    cmask = ch < C
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    length = tl.load(lengths_ptr + req).to(tl.int64)
-    start = tl.load(starts_ptr + req).to(tl.int64)
-    out_dtype = final_ptr.dtype.element_ty
-    for s in tl.static_range(STATE):
-        v = length + s
-        from_state = v < STATE
-        tok_idx = tl.maximum(start + (v - STATE), 0)
-        x_state = tl.load(
-            initial_ptr + (req * C + ch) * STATE + v,
-            mask=cmask & from_state,
-            other=0.0,
-        ).to(out_dtype)
-        x_tok = tl.load(
-            values_ptr + tok_idx * C + ch,
-            mask=cmask & (~from_state),
-            other=0.0,
-        ).to(out_dtype)
-        tl.store(
-            final_ptr + (req * C + ch) * STATE + s,
-            tl.where(from_state, x_state, x_tok),
-            mask=cmask,
-        )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _ple_gate_norm_kernel(
-    key_ptr,
-    query_ptr,
-    value_ptr,
-    key_gw_ptr,
-    query_gw_ptr,
-    conv_gw_ptr,
-    gated_ptr,
-    normalized_ptr,
-    eps,
-    inv_sqrt_d,
-    key_stride,
-    query_stride,
-    value_stride,
-    HC: tl.constexpr,
-    D: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Fused PLE gating: three grouped Gemma RMSNorms plus the query-key
-    gate collapse into one launch.
-
-    Everything between the key/value projections and the short conv is
-    row-local per ``(token, hc branch)``: normalize the key and query
-    slices, dot them into a signed-sqrt sigmoid gate, scale the shared
-    value row, then re-normalize for the conv input. Norm math runs in
-    fp32 with a store-dtype round-trip after each norm so the fused
-    output bit-matches the unfused module chain.
-    """
-
-    token = tl.program_id(0)
-    branch = tl.program_id(1)
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < D
-    row = token * (HC * D) + branch * D
-    out_dtype = gated_ptr.dtype.element_ty
-
-    # Static gamma buffers load before the PDL wait: they are not written by
-    # the preceding kernel, so this prologue overlaps its tail.
-    key_gw = tl.load(key_gw_ptr + branch * D + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    query_gw = tl.load(query_gw_ptr + branch * D + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    conv_gw = tl.load(conv_gw_ptr + branch * D + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-
-    key = tl.load(
-        key_ptr + token * key_stride + branch * D + offs, mask=mask, other=0.0
-    ).to(tl.float32)
-    query = tl.load(
-        query_ptr + token * query_stride + branch * D + offs, mask=mask, other=0.0
-    ).to(tl.float32)
-    value = tl.load(value_ptr + token * value_stride + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-
-    key_norm = key * tl.rsqrt(tl.sum(key * key, 0) / D + eps) * key_gw
-    query_norm = query * tl.rsqrt(tl.sum(query * query, 0) / D + eps) * query_gw
-    key_norm = key_norm.to(out_dtype).to(tl.float32)
-    query_norm = query_norm.to(out_dtype).to(tl.float32)
-
-    gate = tl.sum(key_norm * query_norm, 0) * inv_sqrt_d
-    magnitude = tl.sqrt(tl.maximum(tl.abs(gate), 1e-6))
-    gate = tl.where(gate > 0, magnitude, tl.where(gate < 0, -magnitude, 0.0))
-    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
-
-    gated = (sigmoid * value).to(out_dtype)
-    tl.store(gated_ptr + row + offs, gated, mask=mask)
-
-    gated_f = gated.to(tl.float32)
-    normalized = gated_f * tl.rsqrt(tl.sum(gated_f * gated_f, 0) / D + eps) * conv_gw
-    tl.store(
-        normalized_ptr + row + offs,
-        normalized.to(normalized_ptr.dtype.element_ty),
-        mask=mask,
-    )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -662,41 +272,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         col: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool,
+        tail_out: torch.Tensor | None = None,
+        tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        total = input_ids.shape[0]
-        device = input_ids.device
-        ids = torch.empty((total, self.ngram_heads), dtype=torch.long, device=device)
-        tail = (
-            torch.empty((total, self.ngram_size - 1), dtype=torch.long, device=device)
-            if need_tail
-            else None
-        )
-        if total == 0:
-            return ids, tail
-        block = 256
-        use_pdl = pdl_enabled()
-        _ngram_ids_kernel[(triton.cdiv(total, block),)](
-            input_ids.contiguous(),
-            initial.contiguous(),
+        return ple_ngram_ids(
+            input_ids,
+            initial,
             req,
             col,
             starts,
             self.layer_multipliers,
             self.ngram_heads_vocab_sizes,
             self.ngram_heads_offsets,
-            ids,
-            tail if need_tail else ids,
-            total,
-            self.eos_token_id,
-            N=self.ngram_size,
-            HPN=self.heads_per_ngram,
-            H=self.ngram_heads,
-            WRITE_TAIL=need_tail,
-            ENABLE_PDL=use_pdl,
-            BLOCK=block,
-            **({"launch_pdl": True} if use_pdl else {}),
+            ngram_size=self.ngram_size,
+            heads_per_ngram=self.heads_per_ngram,
+            eos_token_id=self.eos_token_id,
+            need_tail=need_tail,
+            tail_out=tail_out,
+            tail_block_rows=tail_block_rows,
         )
-        return ids, tail
 
     def _dequant(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         """Cast the FP8 lookup to compute dtype and apply per-row scales.
@@ -730,11 +324,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         col: torch.Tensor,
         starts: torch.Tensor,
         need_tail: bool = False,
+        tail_out: torch.Tensor | None = None,
+        tail_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """CUDA path: embed n-grams without materializing the window matrix."""
 
         ids, tail = self._ngram_ids_flat_cuda(
-            input_ids, initial, req, col, starts, need_tail
+            input_ids,
+            initial,
+            req,
+            col,
+            starts,
+            need_tail,
+            tail_out,
+            tail_block_rows,
         )
         # Reduce the flattened [tokens, heads * head_dim] view instead of the
         # 3D lookup: the lamport backend folds trailing dims into token count
@@ -903,31 +506,18 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> torch.Tensor:
         """One cache row per page id, with null pages read as ``default``."""
 
-        rows = page_ids.shape[0]
         if not field.is_cuda:
             page_ids = page_ids.to(torch.long)
             valid = page_ids > 0
             values = field.index_select(0, page_ids.clamp_min(0))
             mask = valid.view(-1, *([1] * (values.ndim - 1)))
             return torch.where(mask, values, torch.full_like(values, default))
-        out = field.new_empty((rows, *field.shape[1:]))
-        if rows == 0:
-            return out
-        numel = out[0].numel()
-        block = min(1024, triton.next_power_of_2(numel))
-        use_pdl = pdl_enabled()
-        _ple_page_gather_kernel[(rows, triton.cdiv(numel, block))](
+        return ple_page_gather(
             field,
             page_ids,
-            out,
-            default,
             Qwen4ExpPLELayer._page_row_stride(field),
-            numel,
-            ENABLE_PDL=use_pdl,
-            BLOCK=block,
-            **({"launch_pdl": True} if use_pdl else {}),
+            default,
         )
-        return out
 
     @staticmethod
     def _write_pages(
@@ -937,7 +527,6 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> None:
         """Store one row per page id, skipping null pages."""
 
-        rows = page_ids.shape[0]
         if not field.is_cuda:
             valid = page_ids > 0
             safe_pages = page_ids.to(torch.long).clamp_min(0)
@@ -952,20 +541,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 stored_values,
             )
             return
-        if rows == 0:
-            return
-        numel = values[0].numel()
-        block = min(1024, triton.next_power_of_2(numel))
-        use_pdl = pdl_enabled()
-        _ple_page_scatter_kernel[(rows, triton.cdiv(numel, block))](
+        ple_page_scatter(
             field,
             page_ids,
-            values.contiguous(),
+            values,
             Qwen4ExpPLELayer._page_row_stride(field),
-            numel,
-            ENABLE_PDL=use_pdl,
-            BLOCK=block,
-            **({"launch_pdl": True} if use_pdl else {}),
         )
 
     def _lengths(self, metadata, total_tokens: int, bs: int) -> list[int]:
@@ -1007,6 +587,13 @@ class Qwen4ExpPLELayer(nn.Module):
         is why :meth:`Qwen4ExpPLELayer.forward` has to run as an eager break
         rather than being captured.
 
+        The uniform bundle is memoized during CUDA graph capture, since
+        ``(bs, max_len)`` is fixed for a capture bucket and recomputing it cost
+        seven elementwise kernels per replay. Eager calls compute fresh tensors
+        to avoid unbounded cache growth from varying prefill lengths. The
+        cached tensors are shared between calls, so consumers must treat them
+        as read-only.
+
         ``starts`` is each request's first flat token index. It belongs to the
         bundle because every consumer of ``req`` needs it to reach the tokens
         themselves, and the ragged path has to compute it for ``col`` anyway.
@@ -1015,13 +602,21 @@ class Qwen4ExpPLELayer(nn.Module):
         bs = len(lengths)
         total = int(sum(lengths))
         max_len = max(lengths) if lengths else 0
-        positions = torch.arange(total, device=device, dtype=torch.long)
         if bs and max_len > 0 and max_len * bs == total:
-            req = positions // max_len
-            col = positions - req * max_len
-            lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
-            starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
+            key = (bs, max_len, device)
+            bundle = _UNIFORM_INDEX_CACHE.get(key)
+            if bundle is None:
+                positions = torch.arange(total, device=device, dtype=torch.long)
+                req = positions // max_len
+                col = positions - req * max_len
+                lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
+                starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
+                bundle = (req, col, lengths_t, starts)
+                if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                    _UNIFORM_INDEX_CACHE[key] = bundle
+            req, col, lengths_t, starts = bundle
         else:
+            positions = torch.arange(total, device=device, dtype=torch.long)
             lengths_t = torch.tensor(lengths, device=device, dtype=torch.long)
             ends = torch.cumsum(lengths_t, dim=0)
             starts = ends - lengths_t
@@ -1080,16 +675,17 @@ class Qwen4ExpPLELayer(nn.Module):
 
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
-        ``windows_out`` receives the per-token state windows directly, one
-        ``windows_block_rows`` row block per request with the carried state in
-        row 0, so the verify scratch is filled without a packed intermediate.
+        On CUDA, ``windows_out`` receives the carried row and per-token state
+        windows directly. The fallback caller fills its carried row separately.
         """
         device = values.device
         req, col, lengths_t, starts, max_len, total, bs = (
             index if index is not None else self._batch_indices(lengths, device)
         )
         state_len = self.conv_state_len
-        if total == 0:
+        if total == 0 and not (
+            values.is_cuda and state_len and windows_out is not None
+        ):
             return (
                 values,
                 initial.clone(),
@@ -1144,85 +740,40 @@ class Qwen4ExpPLELayer(nn.Module):
         windows_out: torch.Tensor | None = None,
         windows_block_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(add_terms) > 2:
-            raise ValueError("the fused conv epilogue folds at most two addends")
         channels = self.hc_hidden_size
         state_len = self.conv_state_len
         if starts is None:
             # Callers normally hand over the index bundle's copy; only direct
             # callers passing bare positional indices pay for the scan.
             starts = torch.cumsum(lengths_t, dim=0) - lengths_t
-        weight = self.conv1d.weight.view(channels, self.conv_kernel_size)
-        initial_c = initial.contiguous()
-        values_c = values.contiguous()
-        conv_output = torch.empty_like(values_c)
-        # Row strides let strided addends feed the kernel without a contiguity
-        # copy; only the last dim must be dense. Unused slots alias values_c,
-        # which the ADD_* constexprs keep unread.
-        addends = [
-            term if term.stride(-1) == 1 else term.contiguous() for term in add_terms
-        ]
-        gated = addends[0] if len(addends) > 0 else values_c
-        residual = addends[1] if len(addends) > 1 else values_c
         if windows_out is not None:
             if not need_intermediate:
                 raise ValueError("windows_out needs need_intermediate=True")
-            # The kernel addresses rows as a dense [rows, C, state_len] block,
-            # and a copy would silently drop the writes, so refuse anything
-            # else rather than repack.
-            if not windows_out.is_contiguous():
-                raise ValueError("windows_out must be contiguous")
             windows = windows_out
         elif need_intermediate:
             windows = values.new_empty((total, channels, state_len))
         else:
-            # Dummy target: WRITE_WINDOWS=False never stores through it. Decode
-            # and non-verify prefill skip the [T, C, state_len] materialization.
-            windows = values.new_empty((0, channels, state_len))
-        block_c = 256
-        grid = (total, triton.cdiv(channels, block_c))
-        use_pdl = pdl_enabled()
-        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-        _ple_dilated_conv_kernel[grid](
-            values_c,
-            initial_c,
-            weight.contiguous(),
+            # Decode and non-verify prefill skip the [T, C, state_len]
+            # materialization entirely.
+            windows = None
+        return ple_conv_sequences(
+            values,
+            initial,
+            self.conv1d.weight.view(channels, self.conv_kernel_size),
             req,
             col,
-            starts,
-            conv_output,
-            windows,
-            gated,
-            residual,
-            windows_block_rows,
-            gated.stride(0),
-            residual.stride(0),
-            channels,
-            D=self.ngram_size,
-            K=self.conv_kernel_size,
-            STATE=state_len,
-            WRITE_WINDOWS=need_intermediate,
-            SCATTER_WINDOWS=windows_out is not None,
-            ADD_GATED=len(addends) > 0,
-            ADD_RESIDUAL=len(addends) > 1,
-            ENABLE_PDL=use_pdl,
-            BLOCK_C=block_c,
-            **pdl_kwargs,
-        )
-        final_conv = values.new_empty((bs, channels, state_len))
-        _ple_conv_final_kernel[(bs, triton.cdiv(channels, block_c))](
-            values_c,
-            initial_c,
             lengths_t,
             starts,
-            final_conv,
-            channels,
-            STATE=state_len,
-            ENABLE_PDL=use_pdl,
-            BLOCK_C=block_c,
-            **pdl_kwargs,
+            total_tokens=total,
+            batch_size=bs,
+            dilation=self.ngram_size,
+            kernel_size=self.conv_kernel_size,
+            state_len=state_len,
+            add_terms=add_terms,
+            windows=windows,
+            windows_block_rows=windows_block_rows,
+            scatter_windows=windows_out is not None,
         )
-        return conv_output, final_conv, windows
 
     def _conv_sequences_torch(
         self,
@@ -1377,41 +928,17 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        total = key.shape[0]
-        gated = key.new_empty((total, self.hc_hidden_size))
-        normalized = torch.empty_like(gated)
-        if total == 0:
-            return gated, normalized
-        # Row strides let kv_proj's split views feed the kernel without a
-        # contiguity copy; only the last dim must be dense.
-        if key.stride(-1) != 1:
-            key = key.contiguous()
-        if hidden_states.stride(-1) != 1:
-            hidden_states = hidden_states.contiguous()
-        if value.stride(-1) != 1:
-            value = value.contiguous()
-        use_pdl = pdl_enabled()
-        _ple_gate_norm_kernel[(total, self.hc_count)](
+        return ple_gate_norm(
             key,
             hidden_states,
             value,
             self.norm_key.gemma_weight,
             self.norm_query.gemma_weight,
             self.norm_conv.gemma_weight,
-            gated,
-            normalized,
-            self.norm_key.variance_epsilon,
-            1.0 / math.sqrt(self.hidden_size),
-            key.stride(0),
-            hidden_states.stride(0),
-            value.stride(0),
-            HC=self.hc_count,
-            D=self.hidden_size,
-            ENABLE_PDL=use_pdl,
-            BLOCK_D=triton.next_power_of_2(self.hidden_size),
-            **({"launch_pdl": True} if use_pdl else {}),
+            hc_count=self.hc_count,
+            hidden_size=self.hidden_size,
+            eps=self.norm_key.variance_epsilon,
         )
-        return gated, normalized
 
     @break_point
     def forward(
@@ -1468,18 +995,40 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         initial_conv = self._read_pages(conv_field, input_pages)
         index = self._batch_indices(lengths, input_ids.device)
-        req, col, lengths_t, starts, _, total, bs = index
+        req, col, lengths_t, starts, _, total, _ = index
         flat_ids = input_ids.flatten()
         verify = metadata.mamba_output_indices is not None
-        if flat_ids.is_cuda:
-            # The n-gram windows are gathered inside the hash kernel; the
-            # [tokens, ngram_size] context matrix is never materialized. The
-            # raw verify-scratch rows (tail) are only emitted under verify.
-            embeddings, context_tail = self.ple_embedding.forward_flat(
-                flat_ids, initial_context, req, col, starts, need_tail=verify
+        context_scratch = conv_scratch = None
+        scratch_stride = 0
+        if verify:
+            # Both CUDA state producers write directly into this stable rollback
+            # workspace, including each request's carried row.
+            width = max(lengths, default=0)
+            context_scratch, conv_scratch = self._verify_scratch_for(
+                ctx.bs,
+                width,
+                linear_backend,
             )
-            final_context = self._final_context(
-                flat_ids, initial_context, lengths_t, starts
+            scratch_stride = width + 1
+        if flat_ids.is_cuda:
+            # The n-gram windows are gathered inside the hash kernel; verify
+            # writes their state rows directly instead of returning a packed tail.
+            embeddings, _ = self.ple_embedding.forward_flat(
+                flat_ids,
+                initial_context,
+                req,
+                col,
+                starts,
+                tail_out=context_scratch,
+                tail_block_rows=scratch_stride,
+            )
+            # Only the non-verify branch writes it back, and ``verify`` is fixed
+            # when a graph is captured, so skipping here keeps the gather and
+            # its ten elementwise kernels out of the captured verify graph.
+            final_context = (
+                None
+                if verify
+                else self._final_context(flat_ids, initial_context, lengths_t, starts)
             )
         else:
             contexts, final_context = self._token_contexts(
@@ -1494,18 +1043,6 @@ class Qwen4ExpPLELayer(nn.Module):
             gated, normalized = self._gate_and_norm_cuda(key, hidden_states, value)
         else:
             gated, normalized = self._gate_and_norm_torch(key, hidden_states, value)
-        context_scratch = conv_scratch = None
-        scratch_stride = 0
-        if verify:
-            # Acquired before the conv so its kernel can scatter the per-token
-            # state windows straight into the rollback rows.
-            width = max(lengths, default=0)
-            context_scratch, conv_scratch = self._verify_scratch_for(
-                ctx.bs,
-                width,
-                linear_backend,
-            )
-            scratch_stride = width + 1
         conv_output, final_conv, _ = self._conv_sequences(
             normalized,
             initial_conv,
@@ -1517,15 +1054,15 @@ class Qwen4ExpPLELayer(nn.Module):
             windows_block_rows=scratch_stride,
         )
 
-        if verify:
-            # Row 0 of every (width + 1)-strided block holds the carried state;
-            # the conv already filled the token rows that follow it.
-            init_rows = torch.arange(bs, device=input_ids.device) * scratch_stride
-            context_scratch[init_rows] = initial_context
-            conv_scratch[init_rows] = initial_conv
+        if verify and not flat_ids.is_cuda:
+            # The fallback has no fused producers, so it fills the same rollback
+            # layout after computing the packed state windows.
+            context_scratch[::scratch_stride] = initial_context
+            conv_scratch[::scratch_stride] = initial_conv
             if total:
-                context_scratch[req * scratch_stride + 1 + col] = context_tail
-        else:
+                token_rows = req * scratch_stride + 1 + col
+                context_scratch[token_rows] = context_tail
+        elif not verify:
             self._write_pages(context_field, output_pages, final_context)
             self._write_pages(conv_field, output_pages, final_conv)
         return conv_output

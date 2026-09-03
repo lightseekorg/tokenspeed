@@ -298,6 +298,21 @@ def _resolve_attention_family(
     return None
 
 
+def _is_dflash2_mla(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> bool:
+    architectures = _model_architectures(hf_config, hf_text_config)
+    dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
+        hf_config, "dflash_config", None
+    )
+    return (
+        "DFlash2DraftModel" in architectures
+        and isinstance(dflash_config, dict)
+        and dflash_config.get("attention_mode") == "mla"
+    )
+
+
 def _apply_attention_family_defaults(
     server_args: ServerArgs,
     spec: _AttentionFamilySpec,
@@ -555,6 +570,8 @@ class ModelConfig:
         if attention_family is not None:
             _apply_attention_family_defaults(server_args, attention_family)
             attention_family.configure(self)
+        elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
+            configure_mla_attention(self)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA

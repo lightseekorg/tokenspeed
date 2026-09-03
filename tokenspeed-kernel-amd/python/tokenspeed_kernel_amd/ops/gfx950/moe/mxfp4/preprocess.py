@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Model-load helpers for the gfx950 A4W4 MoE package.
+"""Model-load helpers for the gfx950 MXFP4-weight MoE package.
 
 The package-prefill kernels consume the same gdot128-preshuffled weight storage
 that the decode/prefill stages use, but with the ``(E, N, K/2)`` /

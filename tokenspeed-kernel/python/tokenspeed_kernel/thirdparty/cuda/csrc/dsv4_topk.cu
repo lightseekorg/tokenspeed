@@ -445,6 +445,72 @@ namespace {
 
 constexpr int64_t kRadixTopkWorkspaceSize = 1024 * 1024;
 
+cudaError_t launch_persistent_cluster_topk(
+    const vllm::persistent::PersistentTopKParams& params,
+    uint32_t num_rows, uint32_t cluster_size, cudaStream_t stream,
+    void (*kernel)(vllm::persistent::PersistentTopKParams),
+    bool allow_nonportable_cluster_size = false) {
+  namespace P = vllm::persistent;
+  if (allow_nonportable_cluster_size) {
+    const cudaError_t attribute_error = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    if (attribute_error != cudaSuccess) return attribute_error;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(num_rows, cluster_size, 1);
+  config.blockDim = dim3(P::kThreadsPerBlock);
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+
+  cudaLaunchAttribute attributes[2]{};
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[0].val.programmaticStreamSerializationAllowed = true;
+  attributes[1].id = cudaLaunchAttributeClusterDimension;
+  attributes[1].val.clusterDim = {1, cluster_size, 1};
+  config.attrs = attributes;
+  config.numAttrs = 2;
+
+  return cudaLaunchKernelEx(&config, kernel, params);
+}
+
+bool device_supports_cluster_launch(int device_id) {
+  int supported = 0;
+  const cudaError_t error = cudaDeviceGetAttribute(
+      &supported, cudaDevAttrClusterLaunch, device_id);
+  if (error != cudaSuccess) {
+    // Treat an unavailable capability query conservatively. Clear the runtime
+    // error before launching the non-cluster fallback below.
+    (void)cudaGetLastError();
+    return false;
+  }
+  return supported != 0;
+}
+
+bool is_unsupported_cluster_launch_error(cudaError_t error) {
+  return error == cudaErrorInvalidValue ||
+         error == cudaErrorInvalidConfiguration ||
+         error == cudaErrorInvalidClusterSize ||
+         error == cudaErrorNotSupported;
+}
+
+template <int TopK>
+void launch_noncluster_persistent_topk(
+    const vllm::persistent::PersistentTopKParams& params,
+    int64_t num_rows, int64_t max_seq_len, cudaStream_t stream) {
+  namespace P = vllm::persistent;
+  if (max_seq_len <= P::kRegister2MaxSeqLen) {
+    P::persistent_topk_kernel<TopK, 0>
+        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
+  } else if (max_seq_len <= P::kRegister4MaxSeqLen) {
+    P::persistent_topk_kernel<TopK, 1>
+        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
+  } else {
+    P::persistent_topk_kernel<TopK, 2>
+        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
+  }
+}
+
 template <int TopK>
 void launch_persistent_topk(const TensorView& logits,
                             const TensorView& lengths,
@@ -457,149 +523,66 @@ void launch_persistent_topk(const TensorView& logits,
 
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.size(1);
+  (void)workspace;
 
-  int device = 0;
-  cudaError_t err = cudaGetDevice(&device);
-  TVM_FFI_ICHECK(err == cudaSuccess)
-      << "cudaGetDevice failed: " << cudaGetErrorString(err);
+  P::PersistentTopKParams params;
+  params.input = static_cast<float*>(logits.data_ptr());
+  params.output = static_cast<int32_t*>(output.data_ptr());
+  params.lengths = static_cast<int32_t*>(lengths.data_ptr());
+  params.num_rows = static_cast<uint32_t>(num_rows);
+  params.stride = static_cast<uint32_t>(stride);
+  params.top_k = static_cast<uint32_t>(TopK);
+  params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+  params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
 
-  int num_sms = 0;
-  int max_smem_per_block = 0;
-  err = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-  TVM_FFI_ICHECK(err == cudaSuccess)
-      << "cudaDevAttrMultiProcessorCount query failed: "
-      << cudaGetErrorString(err);
-  err = cudaDeviceGetAttribute(&max_smem_per_block,
-                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                               device);
-  TVM_FFI_ICHECK(err == cudaSuccess)
-      << "cudaDevAttrMaxSharedMemoryPerBlockOptin query failed: "
-      << cudaGetErrorString(err);
-
-  if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
-    cudaError_t status =
-        vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
-            static_cast<float*>(logits.data_ptr()),
-            static_cast<int32_t*>(output.data_ptr()),
-            static_cast<int32_t*>(lengths.data_ptr()),
-            static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
-            static_cast<uint32_t>(stride),
-            static_cast<uint32_t>(q_len_per_req), stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "FilteredTopK failed: " << cudaGetErrorString(status);
+  cudaError_t launch_error = cudaSuccess;
+  const bool use_cluster =
+      max_seq_len > P::kClusterFloor && num_rows <= 32 &&
+      device_supports_cluster_launch(logits.device().device_id);
+  if (use_cluster) {
+    const auto rows = static_cast<uint32_t>(num_rows);
+    if (max_seq_len > P::kClusterHist10Floor &&
+        max_seq_len <= P::kClusterRegister4MaxSeqLen) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, 8, stream,
+          P::cluster8_register4_topk_kernel<TopK, 10, true>);
+    } else if (max_seq_len > P::kClusterRegister4MaxSeqLen &&
+               max_seq_len <= P::kCluster16MaxSeqLen) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, 16, stream,
+          P::cluster16_topk_kernel<TopK, 10, true>, true);
+      if (is_unsupported_cluster_launch_error(launch_error)) {
+        // A cluster of 16 CTAs is an architecture-specific optimization. Keep
+        // the portable cluster-8 implementation as the correctness fallback.
+        (void)cudaGetLastError();
+        launch_error = launch_persistent_cluster_topk(
+            params, rows, P::kClusterSize, stream,
+            P::cluster_topk_kernel<TopK, 10, true>);
+      }
+    } else if (max_seq_len > P::kClusterHist10Floor) {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, P::kClusterSize, stream,
+          P::cluster_topk_kernel<TopK, 10, true>);
+    } else {
+      launch_error = launch_persistent_cluster_topk(
+          params, rows, P::kClusterSize, stream,
+          P::cluster_topk_kernel<TopK, 9, true>);
+    }
+    if (is_unsupported_cluster_launch_error(launch_error)) {
+      // Some Hopper SKUs reject cluster launches despite sharing sm_90 with
+      // cluster-capable devices. Fall back to the original single-CTA kernel.
+      (void)cudaGetLastError();
+      launch_noncluster_persistent_topk<TopK>(params, num_rows, max_seq_len,
+                                               stream);
+      launch_error = cudaSuccess;
+    }
   } else {
-    TVM_FFI_ICHECK(workspace.size(0) >= kRadixTopkWorkspaceSize)
-        << "workspace too small for persistent topk";
-
-    int effective_max_smem;
-    if (num_rows <= 4) {
-      effective_max_smem =
-          std::min(max_smem_per_block, static_cast<int>(P::kSmemMedium));
-    } else if (num_rows <= 8) {
-      constexpr int kSmemCapMedium = 48 * 1024;
-      effective_max_smem = std::min(max_smem_per_block, kSmemCapMedium);
-    } else {
-      effective_max_smem = max_smem_per_block;
-    }
-
-    TVM_FFI_ICHECK(static_cast<size_t>(effective_max_smem) >
-                   P::kFixedSmemLarge)
-        << "insufficient shared memory for persistent topk";
-    size_t available_for_ordered =
-        static_cast<size_t>(effective_max_smem) - P::kFixedSmemLarge;
-    uint32_t max_chunk_elements =
-        static_cast<uint32_t>(available_for_ordered / sizeof(uint32_t));
-
-    uint32_t vec_size = 1;
-    if (stride % 4 == 0) {
-      vec_size = 4;
-    } else if (stride % 2 == 0) {
-      vec_size = 2;
-    }
-
-    max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
-    uint32_t min_chunk = vec_size * P::kThreadsPerBlock;
-    if (max_chunk_elements < min_chunk) {
-      max_chunk_elements = min_chunk;
-    }
-
-    uint32_t ctas_per_group =
-        (static_cast<uint32_t>(stride) + max_chunk_elements - 1) /
-        max_chunk_elements;
-    uint32_t chunk_size =
-        (static_cast<uint32_t>(stride) + ctas_per_group - 1) / ctas_per_group;
-    chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
-    if (chunk_size > max_chunk_elements) {
-      chunk_size = max_chunk_elements;
-    }
-
-    size_t smem_size = P::kFixedSmemLarge + chunk_size * sizeof(uint32_t);
-    if (smem_size < P::kSmemMedium) {
-      smem_size = P::kSmemMedium;
-    }
-
-    int occupancy = 1;
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
-        smem_size);
-    TVM_FFI_ICHECK(err == cudaSuccess)
-        << "persistent topk occupancy query failed: "
-        << cudaGetErrorString(err);
-    if (occupancy < 1) {
-      occupancy = 1;
-    }
-
-    uint32_t max_resident_ctas = static_cast<uint32_t>(num_sms) * occupancy;
-    uint32_t num_groups = std::min(max_resident_ctas / ctas_per_group,
-                                   static_cast<uint32_t>(num_rows));
-    if (num_groups == 0) {
-      num_groups = 1;
-    }
-    uint32_t total_ctas = num_groups * ctas_per_group;
-
-    size_t state_bytes = num_groups * sizeof(P::RadixRowState);
-    TVM_FFI_ICHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes))
-        << "workspace too small, need " << state_bytes << " bytes";
-    err = cudaMemsetAsync(workspace.data_ptr(), 0, state_bytes, stream);
-    TVM_FFI_ICHECK(err == cudaSuccess)
-        << "failed to clear persistent topk workspace: "
-        << cudaGetErrorString(err);
-
-    P::PersistentTopKParams params;
-    params.input = static_cast<float*>(logits.data_ptr());
-    params.output = static_cast<int32_t*>(output.data_ptr());
-    params.lengths = static_cast<int32_t*>(lengths.data_ptr());
-    params.num_rows = static_cast<uint32_t>(num_rows);
-    params.stride = static_cast<uint32_t>(stride);
-    params.top_k = static_cast<uint32_t>(TopK);
-    params.chunk_size = chunk_size;
-    params.row_states =
-        reinterpret_cast<P::RadixRowState*>(workspace.data_ptr());
-    params.ctas_per_group = ctas_per_group;
-    params.max_seq_len = static_cast<uint32_t>(max_seq_len);
-    params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
-
-#define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                      \
-  do {                                                                       \
-    auto kernel = &P::persistent_topk_kernel<TOPK_VAL, VS>;                  \
-    cudaError_t err = cudaFuncSetAttribute(                                  \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);     \
-    TVM_FFI_ICHECK(err == cudaSuccess)                                       \
-        << "Failed to set smem: " << cudaGetErrorString(err);               \
-    kernel<<<total_ctas, P::kThreadsPerBlock, smem_size, stream>>>(params);  \
-  } while (0)
-
-    if (vec_size == 4) {
-      LAUNCH_PERSISTENT(TopK, 4);
-    } else if (vec_size == 2) {
-      LAUNCH_PERSISTENT(TopK, 2);
-    } else {
-      LAUNCH_PERSISTENT(TopK, 1);
-    }
-#undef LAUNCH_PERSISTENT
+    launch_noncluster_persistent_topk<TopK>(params, num_rows, max_seq_len,
+                                             stream);
   }
 
-  err = cudaGetLastError();
+  cudaError_t err =
+      launch_error == cudaSuccess ? cudaGetLastError() : launch_error;
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "dsv4_persistent_topk failed: " << cudaGetErrorString(err);
 }

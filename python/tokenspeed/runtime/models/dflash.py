@@ -33,9 +33,7 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -127,20 +125,14 @@ class DFlashAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
-        # Same labels the draft cache plan groups by (single window, so the
-        # published group id is the bare layer type).
-        layer_types = get_dflash_layer_types(config)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=sliding_window,
-            group_id=(
-                layer_types[layer_id] if layer_types is not None else FULL_ATTENTION
-            ),
+            sliding_window_size=_get_dflash_layer_sliding_window(config, layer_id),
+            group_id=get_dflash_layer_cache_group_id(config, layer_id),
         )
 
     def _apply_qk_norm(
@@ -363,6 +355,8 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
+    decoder_layer_cls = DFlashDecoderLayer
+
     def __init__(
         self,
         config,
@@ -376,7 +370,7 @@ class DFlashDraftModel(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
-                DFlashDecoderLayer(
+                self.decoder_layer_cls(
                     config=config,
                     mapping=mapping,
                     layer_id=i,
@@ -555,6 +549,20 @@ def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
             "DFLASH config.layer_types must be a sequence of attention type strings."
         )
     return layer_types
+
+
+def get_dflash_layer_cache_group_id(config: Any, layer_id: int) -> str:
+    """The cache group a draft layer's KV lives in: its ``layer_types`` label.
+
+    The merged cache plan groups draft layers by the draft config's own
+    ``layer_types`` (single window, so the published group id is the bare
+    label) and falls back to the full-history group when the config carries
+    no labels.
+    """
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return FULL_ATTENTION
+    return str(layer_types[layer_id])
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> int | None:

@@ -24,12 +24,17 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.cuda.dsa_topk import (
+    has_ragged_decode_topk,
+    ragged_decode_topk,
+)
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     triton_topk_from_logits,
 )
 from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
+_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 @triton.heuristics(
@@ -2172,16 +2177,18 @@ def _qwen4_exp_qsa_block_topk_logits(
     page_size: int,
     block_topk: int,
     page_expansion: int,
+    persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    """Materialized path: score every block to FP32, select with DSA top-k.
+    """Materialized path: score every block to FP32, then radix-select.
 
     Writes the ``[rows, num_blocks]`` score matrix (blocks at or beyond
-    ``complete_blocks`` are ``-inf``) and feeds it to
-    ``triton_topk_from_logits``, whose radix pipeline takes over for
-    large column counts and which is the attach point for CUDA / CuTe DSL
-    selection backends. Callers bound the score matrix via the routing
-    heuristic in ``qwen4_exp_qsa_block_topk``.
+    ``complete_blocks`` are ``-inf``). On NVIDIA, a valid caller-owned
+    workspace routes selection through the length-aware persistent CUDA radix
+    kernel; ``complete_blocks`` prevents the selector from rescanning
+    graph-padded columns. Other platforms and direct callers without a
+    workspace retain the portable Triton top-k fallback. Callers bound the
+    score matrix via the routing heuristic in ``qwen4_exp_qsa_block_topk``.
     """
 
     rows = query.shape[0]
@@ -2216,6 +2223,28 @@ def _qwen4_exp_qsa_block_topk_logits(
         num_stages=2,
         **pdl_kwargs,
     )
+    if (
+        _is_nvidia
+        and persistent_topk_workspace is not None
+        and block_topk in (512, 1024, 2048)
+        and persistent_topk_workspace.is_cuda
+        and persistent_topk_workspace.device == logits.device
+        and persistent_topk_workspace.dtype == torch.uint8
+        and persistent_topk_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
+        and has_ragged_decode_topk()
+    ):
+        selected = torch.empty(
+            (rows, block_topk), dtype=torch.int32, device=query.device
+        )
+        ragged_decode_topk(
+            logits,
+            selected,
+            block_topk,
+            lengths=complete_blocks,
+            workspace=persistent_topk_workspace,
+            max_seq_len=num_blocks,
+        )
+        return selected
     return triton_topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
 
 
@@ -2231,6 +2260,7 @@ def qwen4_exp_qsa_block_topk(
     page_expansion: int = 1,
     max_partial_bytes: int = 32 * 1024 * 1024,
     solution: str = "stream",
+    persistent_topk_workspace: torch.Tensor | None = None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Select the highest-scoring compressed blocks for each query row.
@@ -2251,8 +2281,11 @@ def qwen4_exp_qsa_block_topk(
             (``stream`` solution only).
         solution: ``"stream"`` fuses scoring and selection without
             materializing scores (default); ``"logits"`` materializes the
-            ``[rows, num_blocks]`` FP32 scores and selects via the DSA
-            top-k kernels.
+            ``[rows, num_blocks]`` FP32 scores and radix-selects them.
+        persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
+            of at least 1 MiB. The ``"logits"`` solution uses it for the
+            length-aware persistent radix top-k when that kernel is available;
+            otherwise selection falls back to portable Triton.
         enable_pdl: Allow programmatic dependent launch between the
             producer and selection kernels on NVIDIA GPUs.
 
@@ -2289,6 +2322,7 @@ def qwen4_exp_qsa_block_topk(
             page_size=page_size,
             block_topk=block_topk,
             page_expansion=page_expansion,
+            persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
     return _qwen4_exp_qsa_block_topk_stream(

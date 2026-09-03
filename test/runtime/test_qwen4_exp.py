@@ -65,6 +65,15 @@ from tokenspeed.runtime.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.qwen4_exp_ple import (
+    QWEN4_EXP_PLE_CACHE_GROUP,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLELayer,
+    _nth_prime_after,
+    quantize_ple_embedding_rows,
+    qwen4_exp_ple_context_field,
+    qwen4_exp_ple_conv_field,
+)
 from tokenspeed.runtime.models import qwen4_exp_nextn
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
@@ -73,15 +82,6 @@ from tokenspeed.runtime.models.qwen4_exp import (
     _qwen4_exp_uses_sparse_moe,
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
-)
-from tokenspeed.runtime.models.qwen4_exp_ple import (
-    QWEN4_EXP_PLE_CACHE_GROUP,
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
-    _nth_prime_after,
-    quantize_ple_embedding_rows,
-    qwen4_exp_ple_context_field,
-    qwen4_exp_ple_conv_field,
 )
 
 _requires_cuda = pytest.mark.skipif(
@@ -533,6 +533,38 @@ def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
         indexer._topk_solution(1, small, 1, 64)
 
 
+def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.ReplicatedLinear",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.GemmaRMSNorm",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        hidden_size=64,
+        rms_norm_eps=1e-6,
+    )
+    indexer = QSAIndexer(
+        config,
+        mapping=SimpleNamespace(),
+        layer_id=0,
+        quant_config=None,
+        prefix="model.layers.0.attn",
+        rotary_emb=SimpleNamespace(rotary_dim=16),
+    )
+
+    assert indexer._persistent_topk_workspace.dtype == torch.uint8
+    assert indexer._persistent_topk_workspace.numel() == 1024 * 1024
+    assert "_persistent_topk_workspace" not in indexer.state_dict()
+
+
 def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
@@ -802,6 +834,11 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
+    indexer.register_buffer(
+        "_persistent_topk_workspace",
+        torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
+        persistent=False,
+    )
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
 
@@ -1984,7 +2021,7 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
     not torch.cuda.is_available(), reason="triton n-gram kernel requires CUDA"
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2]])
+@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
 def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     stub = _ngram_stub(ngram_size)
     context_len = ngram_size - 1
@@ -2028,6 +2065,31 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     )
     assert torch.equal(ids_only.cpu(), reference)
     assert no_tail is None
+
+    stride = max(lengths, default=0) + 1
+    scratch = torch.full(
+        ((bs + 1) * stride, context_len), -1, dtype=torch.long, device="cuda"
+    )
+    direct_ids, direct_tail = flat(
+        flat_ids.cuda(),
+        initial.cuda(),
+        req,
+        col,
+        starts,
+        need_tail=False,
+        tail_out=scratch,
+        tail_block_rows=stride,
+    )
+    assert torch.equal(direct_ids.cpu(), reference)
+    assert direct_tail is None
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows].cpu(), initial)
+    token_rows = req * stride + 1 + col
+    assert torch.equal(scratch[token_rows].cpu(), contexts[:, 1:])
+    untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
+    untouched[token_rows] = False
+    assert torch.all(scratch[untouched] == -1)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -2151,8 +2213,8 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
-    lengths = [3, 1, 5]
+@pytest.mark.parametrize("lengths", [[3, 1, 5], [0, 4, 2], [0, 0]])
+def test_ple_conv_scatters_windows_into_verify_scratch(lengths) -> None:
     channels = 8
     dtype = torch.bfloat16
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
@@ -2188,14 +2250,17 @@ def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
         windows_block_rows=stride,
     )
 
-    # Same conv results, with the windows landing in their rollback rows and
-    # nothing else in the scratch disturbed.
+    # Same conv results, with carried and token windows landing in their
+    # rollback rows and nothing else in the scratch disturbed.
     assert torch.equal(scattered[0], packed[0])
     assert torch.equal(scattered[1], packed[1])
     assert scattered[2] is scratch
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows], initial)
     token_rows = req * stride + 1 + col
     assert torch.equal(scratch[token_rows], packed[2])
     untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
     untouched[token_rows] = False
     assert not scratch[untouched].any()
 

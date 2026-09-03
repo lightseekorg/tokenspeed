@@ -1467,7 +1467,8 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode=None,
-            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
+            # Native gfx950 accepts bf16 model activations; the selected kernel
+            # may quantize them internally. Hopper Marlin runs A16W4.
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
             # runs w4a4 with the kernel wrapper quantizing the bf16 input
@@ -1602,6 +1603,7 @@ class KimiLinearMoE(nn.Module):
                 self.experts.w2_weight_scale,
                 self.experts.plan,
                 topk=self.top_k,
+                linear_clamp=self.experts.activation_situ_linear_beta,
             )
         )
 

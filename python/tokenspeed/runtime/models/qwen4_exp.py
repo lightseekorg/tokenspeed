@@ -55,6 +55,11 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.qwen4_exp_ple import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLELayer,
+    quantize_ple_embedding_rows,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -72,11 +77,6 @@ from tokenspeed.runtime.models.qwen3_5 import (
 from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
-)
-from tokenspeed.runtime.models.qwen4_exp_ple import (
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
-    quantize_ple_embedding_rows,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.distribution_recorder import (
