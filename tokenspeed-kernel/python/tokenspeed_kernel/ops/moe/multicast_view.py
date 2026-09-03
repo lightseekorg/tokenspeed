@@ -77,12 +77,6 @@ _DLManaged._fields_ = [
 ]
 
 
-@_DELETER
-def _release_nothing(_) -> None:
-    """Freeing is the mailbox owner's job; the view only borrows the address."""
-    return None
-
-
 _new_capsule = ctypes.pythonapi.PyCapsule_New
 _new_capsule.restype = ctypes.py_object
 _new_capsule.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
@@ -124,7 +118,11 @@ def bf16_tensor_on_pointer(
     managed.dl_tensor.strides = steps
     managed.dl_tensor.byte_offset = 0
     managed.manager_ctx = None
-    managed.deleter = _release_nothing
+    # NULL, not a no-op callback: freeing is the mailbox owner's job either way,
+    # but a ctypes callback is no longer callable once Py_FinalizeEx has begun
+    # clearing module dicts, and a view held to exit is deallocated exactly
+    # there. DLPack permits a null deleter; a no-op one segfaults on shutdown.
+    managed.deleter = ctypes.cast(None, _DELETER)
     # The consumer keeps the capsule, not the structures it points into.
     _KEEPALIVE.extend((managed, sizes, steps))
     return from_dlpack(_new_capsule(ctypes.byref(managed), b"dltensor", None))

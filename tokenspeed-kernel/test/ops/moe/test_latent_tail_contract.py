@@ -147,3 +147,113 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
 
     tail = (package / "ops/moe/latent_tail.py").read_text()
     assert "sentinel=" not in tail
+
+
+@pytest.mark.parametrize(
+    "ranks,per_host,probed",
+    [
+        # Whole group inside one host-sized window: no probe needed, and a
+        # probe would decline it on a machine that has no fabric at all.
+        ([0, 1, 2, 3], 4, False),
+        ([4, 5, 6, 7], 4, False),
+        ([1, 2], 8, False),
+        ([0, 2], 4, False),
+        # Spanning the window, in the four shapes that reach this differently:
+        # strided, contiguous-but-unaligned, self-aligned, and simply too wide.
+        ([0, 8], 4, True),
+        ([3, 4, 5], 4, True),
+        ([6, 7, 8], 8, True),
+        ([7, 8, 9, 10, 11, 12, 13], 8, True),
+        (list(range(8)), 4, True),
+        # The same eight ranks on either side of the divisor: node-local at
+        # eight a host, spanning at four. An implementation that ignored the
+        # divisor would pass every row above and fail this one.
+        (list(range(8)), 8, False),
+    ],
+)
+def test_the_probe_is_skipped_only_within_one_host_window(
+    ranks, per_host, probed
+) -> None:
+    """Neither size nor self-alignment establishes node-locality.
+
+    ``[6, 7, 8]`` at eight devices a host is contiguous and starts on a
+    multiple of its own width while still living on two hosts. What decides it
+    is whether every rank falls in the same host-sized window. Skipping the
+    probe on a spanning group admits one the fabric may not map, and such a
+    group hangs inside the rendezvous rather than falling back; probing a
+    node-local one declines a group that works over plain NVLink.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.moe.latent_tail as tail
+
+    seen: list[int] = []
+    asked = mock.Mock()
+
+    def only_this_group(group):
+        # An implementation that ignored its argument and always tested the
+        # world would otherwise pass every row here while declining a
+        # node-local subgroup that works over plain NVLink.
+        assert group is asked, f"queried {group!r} instead of the caller's group"
+        return ranks
+
+    with (
+        mock.patch.object(tail.dist, "is_initialized", return_value=True),
+        mock.patch.object(
+            tail.dist, "get_process_group_ranks", side_effect=only_this_group
+        ),
+        mock.patch.object(torch.cuda, "device_count", return_value=per_host),
+        mock.patch.object(torch.cuda, "current_device", return_value=0),
+        mock.patch.object(
+            fabric,
+            "fabric_allocation_supported",
+            side_effect=lambda i: seen.append(i) or False,
+        ),
+    ):
+        assert tail.multicast_reachable(asked) is not probed
+    assert bool(seen) is probed
+
+
+@pytest.mark.parametrize("per_host,probed", [(4, True), (8, False)])
+def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
+    """``None`` means the world group, not "assume reachable".
+
+    Short-circuiting it drops the only size term the test has, so a world that
+    spans hosts is admitted with no probe -- and the reachability vote its
+    callers take cannot catch that, because every rank agrees.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.moe.latent_tail as tail
+
+    seen: list[int] = []
+    with (
+        mock.patch.object(tail.dist, "is_initialized", return_value=True),
+        mock.patch.object(
+            tail.dist, "get_process_group_ranks", return_value=list(range(8))
+        ),
+        mock.patch.object(torch.cuda, "device_count", return_value=per_host),
+        mock.patch.object(torch.cuda, "current_device", return_value=0),
+        mock.patch.object(
+            fabric,
+            "fabric_allocation_supported",
+            side_effect=lambda i: seen.append(i) or False,
+        ),
+    ):
+        assert tail.multicast_reachable() is not probed
+    assert bool(seen) is probed
+
+
+def test_no_visible_device_declines_rather_than_dividing_by_zero() -> None:
+    """Both directions matter: the permissive answer also passed before."""
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.moe.latent_tail as tail
+
+    with (
+        mock.patch.object(tail.dist, "is_initialized", return_value=True),
+        mock.patch.object(torch.cuda, "device_count", return_value=0),
+    ):
+        assert tail.multicast_reachable(mock.Mock()) is False

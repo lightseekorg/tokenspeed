@@ -198,6 +198,7 @@ class LogitsProcessor(nn.Module):
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
     _LOGITS_AG_STATES = {}
+    _LOGITS_MC_REACHABLE = {}
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
@@ -301,10 +302,17 @@ class LogitsProcessor(nn.Module):
     def _tp_group_multicast_reachable(self) -> bool:
         """Whether the gather's symmetric buffer can map multicast here.
 
-        Asks the fabric rather than the process topology: an NVLink domain can
-        span hosts, and a host-spread group is only disqualified when the
-        driver cannot serve fabric memory. Without fabric the rendezvous hangs
-        rather than failing over, so probe before committing.
+        Topology now only admits: an NVLink domain can span hosts, so a
+        host-spread group is asked of the fabric rather than refused outright,
+        and without fabric the rendezvous hangs rather than failing over. The
+        rank count cannot stand in for the topology test -- a strided group can
+        be smaller than one host's device count while living on two.
+
+        The fabric answer is reduced across the group. Every other term here is
+        derived from config or topology and so is rank-uniform, but the probe
+        allocates on this device alone: one node with no IMEX channels answers
+        no while its peers answer yes, and the yes-ranks then block in a
+        rendezvous the no-ranks never enter.
         """
         if self.tp_group is None:
             return False
@@ -313,9 +321,22 @@ class LogitsProcessor(nn.Module):
             fabric_allocation_supported,
         )
 
-        if len(self.tp_group) <= torch.cuda.device_count():
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        mapping = global_server_args_dict.get("mapping")
+        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
+        spans_hosts = bool(nprocs_per_node) and (
+            len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        )
+        if not spans_hosts:
             return True
-        return fabric_allocation_supported(torch.cuda.current_device())
+        if self.tp_group not in self._LOGITS_MC_REACHABLE:
+            self._LOGITS_MC_REACHABLE[self.tp_group] = self._agree_across_tp(
+                fabric_allocation_supported(torch.cuda.current_device()),
+                pg_manager.get_process_group("nccl", self.tp_group),
+                torch.device(f"cuda:{torch.cuda.current_device()}"),
+            )
+        return self._LOGITS_MC_REACHABLE[self.tp_group]
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
@@ -681,16 +702,21 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
-            if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
-                self._all_gather_state = self._init_all_gather_state(lm_head)
+            state = self._all_gather_state
+            if state is self._LOGITS_AG_STATE_UNINITIALIZED:
+                # The gate reduces across the group, so leave it for an eager
+                # call; the plain path below is correct meanwhile.
+                if torch.cuda.is_current_stream_capturing():
+                    state = None
+                else:
+                    state = self._all_gather_state = self._init_all_gather_state(
+                        lm_head
+                    )
 
-            if (
-                self._all_gather_state is not None
-                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
-            ):
+            if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
                 # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
                 logits = all_gather_inner(
-                    self._all_gather_state,
+                    state,
                     logits,
                     tp_hidden_dim=logits.size(-1) * self.tp_size,
                     skip_entry_sync=True,

@@ -47,6 +47,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
+    _REACHABLE: dict[Group, bool] = {}
+
     def __init__(self):
         self._nccl = NcclBackend()
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
@@ -81,21 +83,50 @@ class AutoBackend(CommBackend):
         """Whether symmetric-memory multicast can map across ``group``.
 
         The rsag paths rendezvous a symmetric buffer and store through its
-        multicast pointer, so the question is what the fabric can map, not how
-        the ranks are spread over hosts: a rack's NVLink domain can span hosts,
-        and inferring from process topology gives those groups NCCL forever.
-        A group without fabric hangs inside the rendezvous instead of falling
-        back, so probe before committing. Same predicate the latent tail uses
-        to run its multicast path, and same residual assumption: the probe
-        answers for this device, not for the peers' reachability.
+        multicast pointer, so a group the fabric cannot map hangs inside the
+        rendezvous instead of falling back. Topology alone was too strict --
+        a rack's NVLink domain can span hosts, and vetoing on spread gives
+        those groups NCCL forever -- so it now only admits, and anything
+        crossing a host is probed rather than refused.
+
+        The rank count is not a substitute for the topology test. ``Mapping``
+        builds strided groups: an attention DP group is ``(0, 8)`` at
+        ``attn_tp_size=8``, which is smaller than one host's device count while
+        living on two hosts, so counting would admit it with no probe at all.
+
+        The fabric answer is reduced across the group. Topology is rank-uniform
+        by construction, but the probe allocates on this device alone: one node
+        with no IMEX channels answers no while its peers answer yes, and the
+        yes-ranks then block in a rendezvous the no-ranks never enter.
         """
         from tokenspeed_kernel.ops.communication.fabric import (
             fabric_allocation_supported,
         )
 
-        if len(group) <= torch.cuda.device_count():
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        if not AutoBackend._group_spans_nodes(group):
             return True
-        return fabric_allocation_supported(torch.cuda.current_device())
+        if group in AutoBackend._REACHABLE:
+            return AutoBackend._REACHABLE[group]
+        # nccl is always safe, so decline rather than reduce inside a capture.
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        vote = torch.tensor(
+            [int(fabric_allocation_supported(device.index))],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.distributed.all_reduce(
+            vote,
+            op=torch.distributed.ReduceOp.MIN,
+            group=pg_manager.get_process_group("nccl", group),
+        )
+        AutoBackend._REACHABLE[group] = bool(vote.item())
+        return AutoBackend._REACHABLE[group]
 
     # ---- Token-aware ops ----
 

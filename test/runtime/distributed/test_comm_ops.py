@@ -46,9 +46,19 @@ class TestAutoBackendTopology:
     def _set_fabric(monkeypatch, supported: bool) -> None:
         import tokenspeed_kernel.ops.communication.fabric as fabric
 
+        import tokenspeed.runtime.distributed.process_group_manager as pg_module
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
         monkeypatch.setattr(
             fabric, "fabric_allocation_supported", lambda device_index: supported
+        )
+        # The gate votes; stand in for the collective so the local answer survives.
+        AutoBackend._REACHABLE.clear()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(pg_module, "process_group_manager", Mock())
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
         )
 
     def test_group_spans_nodes(self, backend):
@@ -87,6 +97,34 @@ class TestAutoBackendTopology:
 
         assert result == "rsag-result"
         getattr(backend._nccl, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_a_strided_group_smaller_than_one_host_is_still_probed(
+        self, backend, monkeypatch, method
+    ):
+        """``Mapping`` groups are strided, so rank count does not locate them.
+
+        An attention DP group is ``(0, 8)`` at ``attn_tp_size=8``: two ranks,
+        fewer than one host holds, living on two hosts. Sizing it against the
+        local device count would admit it with no probe, and a group the fabric
+        cannot map hangs inside the rendezvous rather than falling back.
+        """
+        probed: list[int] = []
+        self._set_fabric(monkeypatch, False)
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(
+            fabric,
+            "fabric_allocation_supported",
+            lambda device_index: probed.append(device_index) or False,
+        )
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(Mock(), (0, 8), [1, 1])
+
+        assert probed == [0]
+        assert result == "nccl-result"
+        getattr(backend._rsag, method).assert_not_called()
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_node_local_token_ops_use_rsag(self, backend, method):

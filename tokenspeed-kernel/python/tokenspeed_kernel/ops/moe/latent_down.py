@@ -260,7 +260,7 @@ class KimiK3LatentDownOp:
     _pools: dict[tuple, _MailboxSlot] = {}
     _verdicts: dict[tuple, bool] = {}
     _ceilings: dict[tuple, bool] = {}
-    _reasons: dict[str, str] = {}
+    _reasons: dict[tuple, str] = {}
 
     def __init__(
         self, slot: _MailboxSlot, shard_dim: int, rank: int, max_m: int
@@ -364,10 +364,12 @@ class KimiK3LatentDownOp:
             layer_count: MoE blocks this stage runs; a whole number of rotations.
             model_scope: Separates concurrently executing models.
             max_m: Widest batch this op claims, and the mailbox's row capacity.
-                The caller sets it from the decode graph's widest capture, since
-                a width the op declines pays the replicated projection instead.
-                Raised to the fused kernel's ceiling when smaller: those widths
-                are compiled either way and cost eight mailbox rows.
+                It is the gate itself, not a property of the capture ladder: a
+                width above it takes the column gather, never the replicated
+                projection, because a caller that has a mailbox necessarily has
+                the column group too -- both need the latent width to divide the
+                group. Raised to the fused kernel's ceiling when smaller: those
+                widths are compiled either way and cost eight mailbox rows.
 
         Returns:
             The op, or None when the platform or shapes cannot support it.
@@ -390,7 +392,10 @@ class KimiK3LatentDownOp:
             device,
         )
         if not verdict:
-            return _decline(cls._reasons.get(group.group_name, "the group declined"))
+            key = cls._verdict_key(
+                group, hidden_size, latent_size, tp_size, layer_count, pool_depth, max_m
+            )
+            return _decline(cls._reasons.get(key, "the group declined"))
         cls._agree_on_ceiling(group, max_m, tp_size, device)
         shard_dim = latent_size // tp_size
         key = (
@@ -418,6 +423,32 @@ class KimiK3LatentDownOp:
         arm_mailbox(slot.mailbox)
         return cls(slot, shard_dim, rank, max_m)
 
+    @staticmethod
+    def _verdict_key(
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        latent_size: int,
+        tp_size: int,
+        layer_count: int,
+        pool_depth: int,
+        max_m: int,
+    ) -> tuple:
+        """The identity a verdict and its reason are both cached under.
+
+        Built in one place so the two cannot drift: keyed on the group alone,
+        a second model on the same group would overwrite the first's reason
+        and a later decline would name an unrelated one.
+        """
+        return (
+            group.group_name,
+            hidden_size,
+            latent_size,
+            tp_size,
+            layer_count,
+            pool_depth,
+            max_m,
+        )
+
     @classmethod
     def _agreed(
         cls,
@@ -437,21 +468,15 @@ class KimiK3LatentDownOp:
         in the rendezvous while the ones that say no walk away. The vote is the
         agreement point, and every rank reaches it unconditionally.
         """
-        key = (
-            group.group_name,
-            hidden_size,
-            latent_size,
-            tp_size,
-            layer_count,
-            pool_depth,
-            max_m,
+        key = cls._verdict_key(
+            group, hidden_size, latent_size, tp_size, layer_count, pool_depth, max_m
         )
         if key not in cls._verdicts:
             reason = cls._unavailable_reason(
                 hidden_size, latent_size, tp_size, layer_count, group, pool_depth
             )
             # A peer's reason is not knowable here, only that it voted no.
-            cls._reasons[group.group_name] = reason or "a peer declined"
+            cls._reasons[key] = reason or "a peer declined"
             vote = torch.tensor([int(reason is None)], dtype=torch.int32, device=device)
             dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
             cls._verdicts[key] = bool(vote.item())
@@ -599,10 +624,12 @@ class KimiK3LatentDownOp:
         slot = self._slot
         # Every aligned 32-bit word must transition exactly once a round, not in halves.
         # The publishing GEMM's beta must be 0, never accumulating into the mailbox.
+        # Full mailbox, not a slice: the capacity guard bounds a raw-pointer
+        # write and cannot see what it protects if handed only the batch.
         slot.gemm_by_m[tokens](
             hidden_states,
             weight,
-            slot.mailbox[:, :tokens, :],
+            slot.mailbox,
             slot.multicast_ptr,
         )
         return slot.gather_by_m[tokens](slot.mailbox, m=tokens)[0]

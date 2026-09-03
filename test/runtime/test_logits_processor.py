@@ -126,10 +126,23 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
 def _set_fabric(monkeypatch, supported: bool) -> None:
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
+    # The topology is what makes these groups host-spread; without it the tests
+    # would name a property their own setup never established.
+    monkeypatch.setitem(
+        global_server_args_dict, "mapping", SimpleNamespace(nprocs_per_node=4)
+    )
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         fabric, "fabric_allocation_supported", lambda device_index: supported
+    )
+    # The gate votes; stand in for the collective so the local answer survives.
+    logits_processor_module.LogitsProcessor._LOGITS_MC_REACHABLE.clear()
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager, "get_process_group", lambda *a: "pg"
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
     )
 
 
@@ -163,6 +176,43 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
 
     assert processor._init_all_gather_state(lm_head) is None
     assert processor._init_dist_argmax_state(lm_head) is None
+
+
+def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
+    """Two ranks on two hosts is fewer ranks than one host holds.
+
+    Sizing the group against the local device count would admit it with no
+    probe, and a group the fabric cannot map hangs in the rendezvous.
+    """
+    _set_fabric(monkeypatch, False)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 4),
+    )
+    assert not processor._tp_group_multicast_reachable()
+
+
+def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch):
+    """The probe allocates on this device alone, so a lone no must carry.
+
+    One node with no IMEX channels answers no while its peers answer yes; the
+    yes-ranks would then block in a rendezvous the no-ranks never enter.
+    """
+    _set_fabric(monkeypatch, True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: tensor.zero_(),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    assert not processor._tp_group_multicast_reachable()
 
 
 def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkeypatch):
@@ -340,6 +390,48 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
     out = proc._get_logits(hidden, lm_head, md)
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
+
+
+def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatch):
+    """The uninitialised sentinel must not be mistaken for a built state.
+
+    The gate reduces across the group, so it is skipped inside a capture. The
+    sentinel is an ``object()`` and so passes ``is not None``: leaving it in
+    place would hand it to ``all_gather_inner`` as if it were a state. It must
+    also survive, or an eager call afterwards would never build the real one.
+    """
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    monkeypatch.setattr(
+        proc,
+        "_init_all_gather_state",
+        lambda lm_head: pytest.fail("the gate must not run inside a capture"),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_inner",
+        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_into_tensor",
+        lambda out, inp, group: None,
+    )
+
+    hidden = torch.randn(4, 2, dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    out = proc._get_logits(hidden, lm_head, md)
+
+    assert out.shape == (4, 8)
+    assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
 
 
 def test_get_logits_softcap_disables_fused_argmax(monkeypatch):

@@ -92,14 +92,37 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     IMEX still reports multicast support locally and then hangs inside the
     rendezvous instead of letting the caller fall back. The host-span test is
     at group granularity: a node-local subgroup of a multi-host job never
-    needs fabric.
+    needs fabric, and probing one would decline a group that works over plain
+    NVLink on a machine with no fabric at all.
+
+    Size alone does not establish node-locality, and neither does alignment to
+    the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
+    and starts on a multiple of three while still living on two hosts. What
+    decides it is whether every rank falls in the same host-sized window, which
+    is the test the other two reachability gates already use -- only the divisor
+    differs, since this package sees the device count rather than the launcher's
+    placement.
+
+    Residual: those two agree unless engines are colocated or a node is
+    under-subscribed, and with more devices visible than the job places per
+    host a spanning group is admitted unprobed. The reachability vote its
+    callers take does not catch that -- a uniformly permissive divisor makes
+    every rank agree -- so callers holding the launch topology should pass it
+    down rather than rely on the reduction.
     """
     import torch.distributed as dist
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 
     if not dist.is_initialized():
         return False
-    if dist.get_world_size(group) <= torch.cuda.device_count():
+    per_host = torch.cuda.device_count()
+    if per_host <= 0:
+        return False
+    # ``None`` is the default group and has to be tested like any other.
+    ranks = dist.get_process_group_ranks(
+        group if group is not None else dist.group.WORLD
+    )
+    if len({rank // per_host for rank in ranks}) <= 1:
         return True
     return fabric_allocation_supported(torch.cuda.current_device())
 

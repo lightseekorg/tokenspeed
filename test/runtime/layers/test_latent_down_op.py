@@ -317,9 +317,9 @@ def test_call_publishes_the_block_it_was_handed(rank: int) -> None:
     assert seen["tokens"] == 4
     assert seen["weight"] is block_in
     assert seen["ptr"] == 1234
-    # The kernel's capacity guard only protects a peer's heap if it is handed
-    # rows for the batch; a narrower slice raises on every batch past the first.
-    assert seen["out"].shape[1] == 4
+    # The kernel's capacity guard bounds a raw-pointer write, so it has to see
+    # the whole mailbox; a slice sized to the batch makes it always hold.
+    assert seen["out"].shape[1] == 8
     assert seen["out"].untyped_storage().data_ptr() == (
         seen["mailbox"].untyped_storage().data_ptr()
     )
@@ -1251,6 +1251,36 @@ def test_the_reason_predicate_still_backs_availability() -> None:
     with _eligible(reachable=False):
         assert not latent_down.KimiK3LatentDownOp.available(**args)
         assert "fabric" in latent_down.KimiK3LatentDownOp._unavailable_reason(**args)
+
+
+def test_two_configurations_on_one_group_keep_their_own_reasons(caplog) -> None:
+    """The verdict and its reason must be cached under the same identity.
+
+    Keyed on the group alone, a second configuration overwrites the first's
+    reason, and a later decline names an unrelated condition -- which is worse
+    than no reason at all, because it sends the reader somewhere true-looking.
+    """
+    built: list[int] = []
+    with (
+        _eligible(),
+        _voting_ranks(built),
+        caplog.at_level("INFO", logger=latent_down.logger.name),
+    ):
+        assert _initialize(latent_size=3580) is None
+        assert _initialize(layer_count=91) is None
+        # This third call hits the verdict cache, so it can only answer from
+        # the stored reason; the once-per-reason dedup would hide that.
+        latent_down._DECLINED.clear()
+        assert _initialize(latent_size=3580) is None
+    said = [
+        r.getMessage()
+        for r in caplog.records
+        if "down mailbox unavailable" in r.message
+    ]
+    assert len(said) == 3
+    assert "does not split" in said[0]
+    assert "rotations" in said[1]
+    assert "does not split" in said[2]
 
 
 def test_a_decline_is_reported_once_not_once_per_block(caplog) -> None:
