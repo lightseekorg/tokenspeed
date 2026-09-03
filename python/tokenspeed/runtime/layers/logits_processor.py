@@ -298,23 +298,34 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
-    def _tp_group_spans_nodes(self) -> bool:
+    def _tp_group_multicast_reachable(self) -> bool:
+        """Whether the gather's symmetric buffer can map multicast here.
+
+        Asks the fabric rather than the process topology: an NVLink domain can
+        span hosts, and a host-spread group is only disqualified when the
+        driver cannot serve fabric memory. Without fabric the rendezvous hangs
+        rather than failing over, so probe before committing.
+        """
         if self.tp_group is None:
             return False
 
-        from tokenspeed.runtime.utils.env import global_server_args_dict
+        from tokenspeed_kernel.ops.communication.fabric import (
+            fabric_allocation_supported,
+        )
 
-        mapping = global_server_args_dict.get("mapping")
-        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        if not nprocs_per_node:
-            return False
-        return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        if len(self.tp_group) <= torch.cuda.device_count():
+            return True
+        return fabric_allocation_supported(torch.cuda.current_device())
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
+        if (
+            self.tp_size == 1
+            or self.skip_all_gather
+            or not self._tp_group_multicast_reachable()
+        ):
             return None
 
         vocab_padded = lm_head.weight.size(0) * self.tp_size

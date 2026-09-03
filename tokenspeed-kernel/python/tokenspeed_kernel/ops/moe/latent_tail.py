@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import (
@@ -84,7 +85,7 @@ def _allocator_identity(allocator: _ScratchAllocator | None) -> object:
     return getattr(allocator, "__self__", allocator)
 
 
-def _multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
+def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     """Whether NVLS multicast can actually map across ``group``'s ranks.
 
     ``symm_mem`` importing is not enough: a cross-host group without fabric or
@@ -101,6 +102,45 @@ def _multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     if dist.get_world_size(group) <= torch.cuda.device_count():
         return True
     return fabric_allocation_supported(torch.cuda.current_device())
+
+
+def multicast_backend_unavailable_reason(
+    group: dist.ProcessGroup | None = None,
+) -> str | None:
+    """Which term of the backend's eligibility fails here, or None.
+
+    Callers that only branch want ``multicast_backend_available``. Callers that
+    have to tell a machine which cannot host this from one which should have
+    and did not need the term: capability and the optional imports say the
+    former, an unreachable fabric says the latter, and only that last one is a
+    fault rather than a configuration.
+    """
+    if not torch.cuda.is_available():
+        return "no CUDA device"
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return f"{platform.vendor} does not carry the NVLS multicast path"
+    # Only sm100 is measured; sm90 lacks the fabric handles this mailbox needs.
+    if platform.arch_version.major < 10:
+        return f"compute capability {platform.arch_version.major}, below 10"
+    try:
+        import cutlass  # noqa: F401
+        import cutlass.cute  # noqa: F401
+        from torch.distributed import _symmetric_memory  # noqa: F401
+    except ImportError:
+        return "cutlass or symmetric memory is not importable"
+    if not multicast_reachable(group):
+        return "fabric unreachable"
+    return None
+
+
+def multicast_backend_available(group: dist.ProcessGroup | None = None) -> bool:
+    """Whether the CuteDSL multicast backend can run here at all.
+
+    Separate from any one op's shapes: capability, the optional imports, and
+    fabric reachability. All three must hold before a collective rendezvous.
+    """
+    return multicast_backend_unavailable_reason(group) is None
 
 
 def latent_tail_supported(
@@ -120,17 +160,7 @@ def latent_tail_supported(
         return False
     if (hidden_size, latent_size) != (7168, 3584) or dtype != torch.bfloat16:
         return False
-    if not torch.cuda.is_available():
-        return False
-    if torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        import cutlass  # noqa: F401
-        import cutlass.cute  # noqa: F401
-        from torch.distributed import _symmetric_memory  # noqa: F401
-    except ImportError:
-        return False
-    return _multicast_reachable(group)
+    return multicast_backend_available(group)
 
 
 @dataclass

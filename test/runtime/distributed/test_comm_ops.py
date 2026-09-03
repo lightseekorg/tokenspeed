@@ -37,7 +37,19 @@ class TestAutoBackendTopology:
         backend._triton_ar = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
+        # A host-spread group's rsag routing keys on the fabric probe, so pin
+        # both the probe and the local device count the tests assume.
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
         return backend
+
+    @staticmethod
+    def _set_fabric(monkeypatch, supported: bool) -> None:
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            fabric, "fabric_allocation_supported", lambda device_index: supported
+        )
 
     def test_group_spans_nodes(self, backend):
         assert not backend._group_spans_nodes((0, 1, 2, 3))
@@ -45,7 +57,10 @@ class TestAutoBackendTopology:
         assert backend._group_spans_nodes((0, 1, 4, 5))
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
-    def test_cross_node_token_ops_fall_back_to_nccl(self, backend, method):
+    def test_host_spread_token_ops_without_fabric_use_nccl(
+        self, backend, monkeypatch, method
+    ):
+        self._set_fabric(monkeypatch, False)
         tensor = Mock()
         scattered = [1] * 8
         getattr(backend._nccl, method).return_value = "nccl-result"
@@ -57,6 +72,21 @@ class TestAutoBackendTopology:
             tensor, tuple(range(8)), scattered
         )
         getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_host_spread_token_ops_with_fabric_use_rsag(
+        self, backend, monkeypatch, method
+    ):
+        """An NVLink domain can span hosts; the fabric decides, not the count."""
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        scattered = [1] * 8
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, tuple(range(8)), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._nccl, method).assert_not_called()
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_node_local_token_ops_use_rsag(self, backend, method):
@@ -100,7 +130,10 @@ class TestAutoBackendTopology:
         assert result == "trtllm-result"
         backend._nccl.all_reduce.assert_not_called()
 
-    def test_cross_node_last_dim_all_gather_falls_back_to_nccl(self, backend):
+    def test_host_spread_last_dim_all_gather_without_fabric_uses_nccl(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, False)
         tensor = Mock()
         tensor.dim.return_value = 2
         backend._nccl.all_gather.return_value = "nccl-result"
@@ -110,6 +143,29 @@ class TestAutoBackendTopology:
         assert result == "nccl-result"
         backend._nccl.all_gather.assert_called_once_with(tensor, tuple(range(8)), -1)
         backend._rsag.all_gather.assert_not_called()
+
+    def test_host_spread_last_dim_all_gather_with_fabric_uses_rsag(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        tensor.dim.return_value = 2
+        backend._rsag.all_gather.return_value = "rsag-result"
+
+        result = backend.all_gather(tensor, tuple(range(8)), dim=-1)
+
+        assert result == "rsag-result"
+        backend._nccl.all_gather.assert_not_called()
+
+    def test_host_spread_all_reduce_still_keys_on_topology(self, backend, monkeypatch):
+        """Fabric governs the rsag paths only: triton_ar stays node-local."""
+        self._set_fabric(monkeypatch, True)
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
+        tensor = torch.empty(1)
+        backend._nccl.all_reduce.return_value = "nccl-result"
+
+        assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
+        backend._triton_ar.can_run.assert_not_called()
 
 
 def get_open_port() -> int:

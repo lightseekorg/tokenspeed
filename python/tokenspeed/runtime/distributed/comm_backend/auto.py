@@ -76,6 +76,27 @@ class AutoBackend(CommBackend):
             return False
         return len({rank // nprocs_per_node for rank in group}) > 1
 
+    @staticmethod
+    def _multicast_reachable(group: Group) -> bool:
+        """Whether symmetric-memory multicast can map across ``group``.
+
+        The rsag paths rendezvous a symmetric buffer and store through its
+        multicast pointer, so the question is what the fabric can map, not how
+        the ranks are spread over hosts: a rack's NVLink domain can span hosts,
+        and inferring from process topology gives those groups NCCL forever.
+        A group without fabric hangs inside the rendezvous instead of falling
+        back, so probe before committing. Same predicate the latent tail uses
+        to run its multicast path, and same residual assumption: the probe
+        answers for this device, not for the peers' reachability.
+        """
+        from tokenspeed_kernel.ops.communication.fabric import (
+            fabric_allocation_supported,
+        )
+
+        if len(group) <= torch.cuda.device_count():
+            return True
+        return fabric_allocation_supported(torch.cuda.current_device())
+
     # ---- Token-aware ops ----
 
     def token_all_gather(
@@ -84,7 +105,7 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
+        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
             return self._nccl.token_all_gather(tensor, group, scattered_num_tokens)
         return self._rsag.token_all_gather(tensor, group, scattered_num_tokens)
 
@@ -94,7 +115,7 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
+        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
             return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
         return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
 
@@ -192,7 +213,7 @@ class AutoBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
+        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
             return self._nccl.all_gather(tensor, group, dim)
         if tensor.dim() == 2 and dim in (-1, tensor.dim() - 1):
             return self._rsag.all_gather(tensor, group, dim)

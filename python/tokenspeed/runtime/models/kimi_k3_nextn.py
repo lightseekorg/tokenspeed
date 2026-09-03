@@ -151,6 +151,8 @@ class KimiK3DraftDecoderLayer(nn.Module):
             mapping=mapping,
             layer_index=0,
             model_scope=model_scope,
+            # One block, re-entered every draft step: nothing rotates.
+            moe_block_count=1,
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,

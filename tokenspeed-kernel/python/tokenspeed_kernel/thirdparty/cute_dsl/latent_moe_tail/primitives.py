@@ -270,11 +270,24 @@ def store_global_u32(
 
 
 @dsl_user_op
-def store_lamport_sentinel_128(pointer: cute.Pointer, *, loc=None, ip=None) -> None:
-    """Reset one Lamport fragment to four FP32 negative-zero bit patterns."""
+def store_lamport_sentinel_128(
+    pointer: cute.Pointer,
+    *,
+    sentinel: cutlass.Constexpr[int] = NEG_ZERO_F32_BITS,
+    loc=None,
+    ip=None,
+) -> None:
+    """Reset one Lamport fragment to four copies of its mailbox's sentinel.
+
+    Args:
+        pointer: Start of the 16-byte fragment to re-arm.
+        sentinel: The empty word this mailbox spins on. Defaults to the FP32
+            negative zero shared by every mailbox but the down projection's,
+            which owns a different word and passes it in.
+    """
 
     address = pointer.toint(loc=loc, ip=ip)
-    value = Uint32(NEG_ZERO_F32_BITS).ir_value(loc=loc, ip=ip)
+    value = Uint32(sentinel).ir_value(loc=loc, ip=ip)
     llvm.inline_asm(
         None,
         [address.ir_value(loc=loc, ip=ip), value, value, value, value],
@@ -507,12 +520,21 @@ def sanitize_negative_zero(packed):
 
 
 @cute.jit
-def fragment_is_dirty(packed):
-    """Bit-exact upstream sentinel check: one comparison per 32-bit word."""
+def fragment_is_dirty(packed, sentinel: cutlass.Constexpr[int] = NEG_ZERO_F32_BITS):
+    """Bit-exact upstream sentinel check: one comparison per 32-bit word.
 
-    dirty = packed[0] == Uint32(NEG_ZERO_F32_BITS)
+    Args:
+        packed: The four words of one 128-bit fragment.
+        sentinel: The empty word this mailbox was armed with, which must also
+            be the one its re-arm stores.
+
+    Returns:
+        Whether any word of the fragment has still to be written.
+    """
+
+    dirty = packed[0] == Uint32(sentinel)
     for i in cutlass.range_constexpr(1, 4):
-        dirty = dirty | (packed[i] == Uint32(NEG_ZERO_F32_BITS))
+        dirty = dirty | (packed[i] == Uint32(sentinel))
     return dirty
 
 

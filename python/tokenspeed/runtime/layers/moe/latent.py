@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
 )
+from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -42,6 +43,7 @@ from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
+    all_gather,
     all_gather_into_tensor,
     all_reduce,
     all_reduce_latent_norm,
@@ -60,6 +62,8 @@ InputProjector = Callable[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
+# Narrowest batch whose column shard plus its gather beats the replicated projection.
+COLUMN_GATHER_MIN_TOKENS = 1280
 
 
 def _marlin_moe_available() -> bool:
@@ -310,6 +314,56 @@ class Kimi3LatentProjection(ReplicatedLinear):
     the other tiers inject each rank's column block into a reduction they
     already run. Thus every tail retains ``(tp-1)/tp`` of the weight's memory
     savings without adding collective wire bytes.
+
+    With ``multicast_down`` the projection instead takes a column shard that
+    publishes each rank's block into every peer's mailbox, which keeps each
+    output element computed on one rank and so leaves the numerics untouched.
+    It covers the widths the op claims -- the decode graph's captures.
+
+    With ``column_group`` the projection splits the same output columns over
+    the group *without* narrowing what it stores: this rank's rows are a view
+    of the full-width weight, and one all-gather concatenates the blocks. That
+    is the difference from ``shard_group``, which also narrows storage and so
+    cannot coexist with a multicast op that needs the full weight to slice.
+    Storage costs a replica either way, and past a measured width the
+    ``(tp-1)/tp`` of the GEMM each rank drops more than pays for the gather;
+    below it the projection stays replicated and no collective runs at all.
+    Measured on GB300 TP8 under graph replay with cold weights: replicated
+    wins through 896 tokens, the two are inside their own spread at 1024 and
+    1152, and the shard wins from 1280 (-7 to -9 percent) out to -40 percent
+    at a full 8152-token prefill chunk. The gate sits at the first width that
+    wins reproducibly rather than the first that wins once.
+
+    Replay is the regime that decides it, because the gather costs a flat
+    ~70us of host submission that a capture pays once and a replay never
+    pays again. That couples this width to ``prefill_graph_max_tokens``:
+    it is unconditionally right only while every chunk at or above it is
+    captured. A chunk past that bucket ceiling runs eager, pays the
+    submission on every call, and does not clear it until somewhere past
+    4096 -- so lowering the ceiling below the widest chunk moves those
+    chunks onto the losing side of this gate without touching it, and a
+    deployment whose chunks exceed the ceiling wants
+    ``--prefill-graph-max-tokens`` raised to its chunked-prefill size. The
+    bucket is the thing to move there, not this width.
+
+    1280 is itself a capture bucket in that ladder, so the gate cannot
+    bisect one: a captured chunk is wholly below it or wholly at or above
+    it, and 1153..1280 pads up onto the gate, into the arm that wins.
+
+    This width is a floor, not the boundary. The mailbox is asked first and
+    claims everything up to its own ceiling, which the caller sizes to at
+    least this width but which grows with ``max_num_seqs``, the capture
+    sizes and the verify width. So on a wider shape the mailbox, not the
+    gather, serves the buckets just above here -- a claim the sweep behind
+    this number did not cover, since it measured the gather there.
+
+    ``get_is_cuda_graph_phase`` cannot decide the two regimes apart, which
+    is worth knowing because it reads as though it could. Its only setters
+    are the decode wrapper's capture and its comm prewarm, and the executor
+    runs prefill capture as a later statement, after that capture has
+    already restored the flag -- so it is False throughout prefill capture.
+    A gate keyed on it would bake the eager threshold into every prefill
+    bucket and lose exactly the replayed band it was meant to protect.
     """
 
     def __init__(
@@ -321,21 +375,54 @@ class Kimi3LatentProjection(ReplicatedLinear):
         prefix: str = "",
         solution: str = "auto",
         shard_group: Group | None = None,
+        column_group: Group | None = None,
         shard_rank: int = 0,
         shard_size: int = 1,
+        multicast_down: KimiK3LatentDownOp | None = None,
     ) -> None:
-        if shard_group is not None and output_size % shard_size:
+        if shard_group is not None and column_group is not None:
+            raise ValueError("a column shard already gathers over its own group")
+        group = shard_group if shard_group is not None else column_group
+        if group is not None and output_size % shard_size:
             raise ValueError(
                 f"output_size {output_size} is not divisible by the shard size "
                 f"{shard_size}"
             )
+        if group is not None and len(group) != shard_size:
+            raise ValueError(
+                f"group of {len(group)} ranks does not match the shard "
+                f"size {shard_size}"
+            )
+        if multicast_down is not None:
+            if shard_group is not None:
+                raise ValueError("a column shard cannot also multicast")
+            if multicast_down.rank != shard_rank:
+                raise ValueError(
+                    f"multicast rank {multicast_down.rank} does not match the "
+                    f"projection's {shard_rank}"
+                )
+            if multicast_down.shard_dim * shard_size != output_size:
+                raise ValueError(
+                    f"multicast block {multicast_down.shard_dim} x {shard_size} "
+                    f"does not cover the {output_size} outputs"
+                )
+        if not 0 <= shard_rank < shard_size:
+            raise ValueError(
+                f"shard_rank {shard_rank} is outside the shard size {shard_size}"
+            )
+        self.multicast_down = multicast_down
         self.shard_group = shard_group
+        self.column_group = column_group
         self.shard_rank = shard_rank
-        self.shard_size = shard_size if shard_group is not None else 1
+        self.shard_size = shard_size if group is not None else 1
         self.output_size_full = output_size
+        # Narrow only where the replica is unreachable: where a mailbox exists.
+        self.narrowed = shard_group is not None or (
+            column_group is not None and multicast_down is not None
+        )
         super().__init__(
             input_size=input_size,
-            output_size=output_size // self.shard_size,
+            output_size=(output_size // shard_size if self.narrowed else output_size),
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
@@ -344,15 +431,13 @@ class Kimi3LatentProjection(ReplicatedLinear):
         self.solution = solution
 
     def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
-        """Take this rank's contiguous row block of the full weight."""
-        if self.shard_group is not None and (
-            shard_id is not None or begin_size is not None
-        ):
+        """Take this rank's column block; replicated instances load full width."""
+        if self.narrowed and (shard_id is not None or begin_size is not None):
             # Chunked loads use full-weight row offsets, which sharded params cannot honor.
             raise ValueError(
                 "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
             )
-        if self.shard_group is not None:
+        if self.narrowed:
             rows = self.output_size_full // self.shard_size
             loaded_weight = loaded_weight.narrow(0, self.shard_rank * rows, rows)
         return super().weight_loader(
@@ -360,7 +445,13 @@ class Kimi3LatentProjection(ReplicatedLinear):
         )
 
     def _gather_shards(self, local: torch.Tensor) -> torch.Tensor:
-        """Concatenate every rank's column block into the full width."""
+        """Concatenate every rank's column block into the full width.
+
+        Deliberately not the backend's own last-dim gather, which the column
+        band below uses: that would move this projection onto a symmetric
+        memory path it has never been measured on, and would rendezvous a
+        second workspace sized to the full hidden width.
+        """
         if self.shard_group is None:
             return local
         num_tokens, shard = local.shape
@@ -372,6 +463,36 @@ class Kimi3LatentProjection(ReplicatedLinear):
         all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
         return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
 
+    def _gather_columns(self, local: torch.Tensor) -> torch.Tensor:
+        """Concatenate the column blocks by asking the backend for that layout.
+
+        The NCCL backend gathers into a ``[tp, tokens, shard]`` buffer and
+        permutes it, which is what ``_gather_shards`` does by hand, so nothing
+        is lost where the fabric has no symmetric memory. Where it does, the
+        fused NVLink gather writes the final layout and skips the copy: at
+        8152 tokens the gathered projection is 135us this way against 239us
+        through the buffer, either side of the 224us it replaces.
+
+        The backend hands back its own workspace, so the result aliases the
+        next call's: measured same-address across consecutive calls. Every
+        consumer here reads it on the issuing stream before the next gather,
+        which is what makes that safe.
+        """
+        return all_gather(local.contiguous(), self.column_group, dim=-1)
+
+    @property
+    def weight_block(self) -> torch.Tensor:
+        """This rank's weight rows: the stored tensor, or a view of it.
+
+        ``shard_group`` already narrowed storage to them; ``column_group``
+        keeps the full width, so the block is a row view the same way the
+        multicast producer takes one.
+        """
+        if self.narrowed:
+            return self.weight
+        start, width = self.shard_slice
+        return self.weight[start : start + width]
+
     def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's ``output_size/tp`` columns, ungathered.
 
@@ -379,27 +500,47 @@ class Kimi3LatentProjection(ReplicatedLinear):
         the column blocks are disjoint, so placing each rank's block into a
         buffer that is about to be summed makes the sum concatenate them.
         """
-        if self.shard_group is None:
+        if self.shard_group is None and self.column_group is None:
             raise ValueError("project_shard requires a column-parallel projection")
         return tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
-            self.weight,
+            self.weight_block,
             solution=self.solution,
         )
 
     @property
     def shard_slice(self) -> tuple[int, int]:
         """``(start, width)`` of this rank's column block in the full width."""
+        if self.shard_group is None and self.column_group is None:
+            raise ValueError("shard_slice requires a column-parallel projection")
         width = self.output_size_full // self.shard_size
         return self.shard_rank * width, width
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
-        output = tokenspeed_kernel.kimi3_latent_projection(
+    def _project_replicated(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project through whatever this rank stores, gathering nothing."""
+        return tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
         )
-        return self._gather_shards(output), None
+
+    def _multicast_block(self) -> torch.Tensor:
+        """This rank's rows for the mailbox, whatever the storage layout."""
+        if self.narrowed:
+            return self.weight
+        rows = self.multicast_down.shard_dim
+        return self.weight[self.shard_rank * rows : (self.shard_rank + 1) * rows]
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        num_tokens = hidden_states.shape[0]
+        if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
+            return self.multicast_down(hidden_states, self._multicast_block()), None
+        if self.column_group is not None:
+            # Narrowed storage has no full width to fall back on, so zero comes here.
+            if num_tokens >= COLUMN_GATHER_MIN_TOKENS or self.narrowed:
+                return self._gather_columns(self.project_shard(hidden_states)), None
+            return self._project_replicated(hidden_states), None
+        return self._gather_shards(self._project_replicated(hidden_states)), None
 
     def forward_add3(
         self,
@@ -418,7 +559,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             hidden_states: Routed latent ``[m, input_size]``; with
                 ``norm_weight`` the projection fuses its RMSNorm.
             addend_a: Full-width addend ``[m, output_size]`` (the residual
-                prefix); column-parallel instances consume only this rank's
+                prefix); ``shard_group`` instances consume only this rank's
                 column block.
             addend_c: Second full-width addend (the reduced shared output),
                 consumed the same way.
@@ -426,10 +567,17 @@ class Kimi3LatentProjection(ReplicatedLinear):
             eps: Epsilon for the fused norm; required with ``norm_weight``.
 
         Returns:
-            The accumulated projection at full width; column-parallel
-            instances gather their blocks before returning.
+            The accumulated projection at full width; instances that narrowed
+            their storage project their block and gather it.
+
+        The branch keys on ``narrowed`` rather than on ``shard_group``, which
+        used to be the same question. It stopped being so when the column path
+        gained its own way to narrow: the proxy quietly lost its meaning, and
+        the full-width branch would have projected a block while calling it the
+        whole width. Anyone adding a third narrowing path should re-run that
+        enumeration over every ``shard_group is None`` left in this class.
         """
-        if self.shard_group is None:
+        if not self.narrowed:
             return tokenspeed_kernel.kimi3_latent_projection_add3(
                 hidden_states,
                 self.weight,
@@ -448,7 +596,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
             norm_weight=norm_weight,
             eps=eps,
         )
-        return self._gather_shards(local)
+        if self.shard_group is not None:
+            return self._gather_shards(local)
+        return self._gather_columns(local)
 
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:

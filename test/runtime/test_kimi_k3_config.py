@@ -144,7 +144,412 @@ class KimiK3ConfigTests(unittest.TestCase):
         )
 
 
+def _linear_calls_by_prefix(linear_calls):
+    """Index recorded projection kwargs by the last segment of their prefix."""
+    return {c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c}
+
+
 class KimiK3RegistrationTests(unittest.TestCase):
+    def _build_moe_block(
+        self, plan, *, moe_layer_freq=1, layer_index=1, routed_hidden=64
+    ):
+        """Construct one MoE block on a chosen plan; report what it wired."""
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+        from tokenspeed.runtime.models import kimi_k3
+        from tokenspeed.runtime.models.kimi_k3_comm import K3MoeTailCommState
+
+        linear_calls: list[dict] = []
+        multicast_calls: list[dict] = []
+
+        class FakeLinear(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                linear_calls.append(kwargs)
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        class FakeExperts(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.support_routing = False
+                self.supports_precomputed_topk = True
+                self.topk_output_format = TopKOutputFormat.STANDARD
+                self.w13_weight = torch.empty(0)
+                self.w13_weight_scale = torch.empty(0)
+                self.w2_weight = torch.empty(0)
+                self.w2_weight_scale = torch.empty(0)
+                self.plan = {}
+                self.supports_deferred_finalize = False
+
+        class FakeSharedExperts(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.gate_up_proj = FakeLinear()
+                self.down_proj = FakeLinear()
+
+        class FakeLatentMoE(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.components = kwargs
+
+        config = KimiLinearConfig(
+            # Distinct widths: the MoE tail comm state is negotiated once per
+            # process, and another test already claimed 64/32.
+            hidden_size=128,
+            routed_expert_hidden_size=routed_hidden,
+            moe_intermediate_size=64,
+            moe_layer_freq=moe_layer_freq,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+        )
+        ep_group = tuple(range(8))
+        mapping = SimpleNamespace(
+            world_size=8,
+            pp_size=1,
+            pp_rank=0,
+            attn=SimpleNamespace(
+                tp_size=8, cp_size=1, dp_size=1, dp_rank=0, dp_group=(0,)
+            ),
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=1,
+                tp_group=(0,),
+                ep_rank=0,
+                ep_size=8,
+                ep_group=ep_group,
+                tp_ep_size=8,
+                has_tp_ep=True,
+                tp_ep_rank=3,
+                tp_ep_group=ep_group,
+            ),
+        )
+        with (
+            # Negotiated once per process; another test already claimed it.
+            mock.patch.object(K3MoeTailCommState, "_instance", None),
+            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
+            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
+            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
+            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
+            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
+            mock.patch.object(
+                kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
+            ),
+            mock.patch.object(
+                kimi_k3, "situ_moe_unavailable_reason", return_value=None
+            ),
+            mock.patch.object(
+                kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
+            ),
+            mock.patch.object(
+                kimi_k3.KimiK3LatentDownOp,
+                "initialize",
+                staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),
+            ),
+            mock.patch(
+                "tokenspeed.runtime.distributed.process_group_manager"
+                ".process_group_manager.get_process_group",
+                return_value="pg",
+            ) as get_pg,
+            mock.patch.dict(kimi_k3.global_server_args_dict, {"enforce_eager": False}),
+        ):
+            layer = kimi_k3.KimiLinearMoE(
+                config,
+                mapping,
+                layer_index=layer_index,
+                # Values chosen not to coincide with the model total, the
+                # production scope literal, or the other case's ordinal.
+                model_scope="scope-under-test",
+                moe_block_count=46,
+                quant_config=None,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+
+        return SimpleNamespace(
+            linear_calls=linear_calls,
+            multicast_calls=multicast_calls,
+            layer=layer,
+            get_pg=get_pg,
+            mapping=mapping,
+            config=config,
+        )
+
+    def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
+        """The gate has an on direction, and the deployment plan is it."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_native=False,
+                use_trtllm=True,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+            )
+        )
+        config, mapping = built.config, built.mapping
+        linear_calls, multicast_calls = built.linear_calls, built.multicast_calls
+        layer, get_pg = built.layer, built.get_pg
+        self._assert_latent_projection_sharding(linear_calls, mapping, trtllm=True)
+        # The native plan cannot reach this shard at all (it is AMD-only), so the
+        # multicast wiring has to be asserted here or nowhere.
+        down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
+        self.assertEqual(down["multicast_down"], "mc-op")
+        self.assertEqual(len(multicast_calls), 1)
+        wired = multicast_calls[0]
+        self.assertEqual(wired["group"], "pg")
+        self.assertEqual(wired["hidden_size"], config.hidden_size)
+        self.assertEqual(wired["latent_size"], config.routed_expert_hidden_size)
+        self.assertEqual(wired["layer_count"], 46)
+        self.assertEqual(wired["block_index"], 1)
+        self.assertEqual(wired["model_scope"], "scope-under-test")
+        # The mailbox is sized to the gate itself, so the two meet by
+        # construction and no width falls back to the replica between them.
+        from tokenspeed.runtime.layers.moe.latent import COLUMN_GATHER_MIN_TOKENS
+
+        self.assertEqual(wired["max_m"], COLUMN_GATHER_MIN_TOKENS)
+        get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
+        self.assertFalse(layer.execution_plan.join_moe_reduce)
+
+    def test_the_column_group_needs_a_divisible_latent(self):
+        """The group would otherwise raise at construction and kill the boot.
+
+        The multicast op declines an indivisible latent by returning None, but
+        the column split has no such vote: it is wired straight from the
+        mapping, so the width has to be checked where it is wired.
+        """
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_native=False,
+                use_trtllm=True,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+            ),
+            routed_hidden=60,
+        )
+        down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
+        self.assertIsNone(down.get("column_group"))
+
+    def test_the_shard_stays_off_the_plan_that_cannot_absorb_it(self):
+        """Marlin keeps the latent in bf16, so it keeps the replicated projection."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_native=False,
+                use_trtllm=False,
+                use_marlin=True,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+            )
+        )
+        self._assert_latent_projection_sharding(
+            built.linear_calls, built.mapping, trtllm=False
+        )
+        # The multicast split adds no cross-rank sum, so no plan excludes it.
+        self.assertEqual(len(built.multicast_calls), 1)
+        down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
+        self.assertEqual(down["multicast_down"], "mc-op")
+
+    def test_the_rotation_ordinal_counts_moe_blocks_not_layers(self):
+        """At a frequency above one the two are different numbers."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_native=False,
+                use_trtllm=True,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+            ),
+            moe_layer_freq=2,
+            layer_index=4,
+        )
+        self.assertEqual(built.multicast_calls[0]["block_index"], 2)
+        # The count is a count of blocks, so the frequency must not divide it.
+        self.assertEqual(built.multicast_calls[0]["layer_count"], 46)
+
+    def test_local_moe_blocks_counts_what_this_stage_runs(self):
+        """The dense prefix is not a block, and only this stage's are counted."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        config = SimpleNamespace(
+            num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
+        )
+        one = SimpleNamespace(pp_size=1, pp_rank=0)
+        self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)
+        # 93 over three stages is 31 apiece; the first loses its dense layer.
+        counts = [
+            kimi_k3._k3_local_moe_blocks(
+                config, SimpleNamespace(pp_size=3, pp_rank=rank)
+            )
+            for rank in range(3)
+        ]
+        self.assertEqual(counts, [30, 31, 31])
+
+    def test_the_base_model_states_the_blocks_its_stage_runs(self):
+        """The rotation count must come from the stage, not a literal."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        recorded: list[dict] = []
+        config = KimiLinearConfig(
+            hidden_size=64,
+            routed_expert_hidden_size=32,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+        )
+        mapping = SimpleNamespace(
+            pp_size=1,
+            pp_rank=0,
+            moe=SimpleNamespace(
+                tp_ep_size=8, tp_ep_rank=0, tp_ep_group=tuple(range(8))
+            ),
+        )
+        with (
+            mock.patch.object(
+                kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
+            ),
+            mock.patch.object(
+                kimi_k3, "KimiLinearMLAAttention", lambda *a, **kw: torch.nn.Module()
+            ),
+            mock.patch.object(
+                kimi_k3,
+                "KimiLinearMoE",
+                lambda *a, **kw: recorded.append(kw) or torch.nn.Module(),
+            ),
+            mock.patch.object(
+                kimi_k3, "CommManager", lambda *a, **kw: SimpleNamespace()
+            ),
+        ):
+            kimi_k3.KimiLinearDecoderLayer(
+                config=config,
+                mapping=mapping,
+                layer_id=1,
+                model_scope="model.layers",
+            )
+
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(
+            recorded[0]["moe_block_count"],
+            kimi_k3._k3_local_moe_blocks(config, mapping),
+        )
+
+        # At PP1 the stage's blocks and the model's happen to be the same number,
+        # so the handoff has to be pinned where they differ.
+        recorded.clear()
+        staged = SimpleNamespace(pp_size=3, pp_rank=1, moe=mapping.moe)
+        with (
+            mock.patch.object(
+                kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
+            ),
+            mock.patch.object(
+                kimi_k3, "KimiLinearMLAAttention", lambda *a, **kw: torch.nn.Module()
+            ),
+            mock.patch.object(
+                kimi_k3,
+                "KimiLinearMoE",
+                lambda *a, **kw: recorded.append(kw) or torch.nn.Module(),
+            ),
+            mock.patch.object(
+                kimi_k3, "CommManager", lambda *a, **kw: SimpleNamespace()
+            ),
+        ):
+            kimi_k3.KimiLinearDecoderLayer(
+                config=config,
+                mapping=staged,
+                layer_id=31,
+                model_scope="model.layers",
+            )
+        self.assertEqual(recorded[0]["moe_block_count"], 31)
+        self.assertNotEqual(31, kimi_k3._k3_local_moe_blocks(config, mapping))
+
+    def test_the_draft_states_a_rotation_of_one(self):
+        """The draft runs its one block every step, so nothing rotates."""
+        from tokenspeed.runtime.models import kimi_k3, kimi_k3_nextn
+
+        recorded: list[dict] = []
+        config = KimiLinearConfig(
+            hidden_size=64,
+            routed_expert_hidden_size=32,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+        )
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_ep_size=8,
+                tp_ep_rank=0,
+                tp_ep_group=tuple(range(8)),
+            ),
+        )
+        with (
+            mock.patch.object(
+                kimi_k3_nextn, "KimiK3DraftAttentionMLA", lambda **kw: torch.nn.Module()
+            ),
+            mock.patch.object(
+                kimi_k3_nextn,
+                "KimiLinearMoE",
+                lambda **kw: recorded.append(kw) or torch.nn.Module(),
+            ),
+            mock.patch.object(
+                kimi_k3_nextn, "CommManager", lambda *a, **kw: SimpleNamespace()
+            ),
+            mock.patch(
+                "tokenspeed.runtime.layers.linear.ReplicatedLinear",
+                lambda *a, **kw: torch.nn.Module(),
+            ),
+        ):
+            kimi_k3_nextn.KimiK3DraftDecoderLayer(
+                config=config, mapping=mapping, model_scope="draft"
+            )
+
+        self.assertEqual(len(recorded), 1)
+        # One block is a count the pool refuses; that refusal is pinned on the
+        # op itself, in test_availability_needs_a_whole_number_of_rotations.
+        self.assertEqual(recorded[0]["moe_block_count"], 1)
+
+    def test_shard_predicate_requires_a_divisible_multi_rank_nvidia_group(self):
+        """Each term of the shard predicate has to be visible on its own."""
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.models import kimi_k3
+
+        def mapping_for(tp_ep_size):
+            return SimpleNamespace(moe=SimpleNamespace(tp_ep_size=tp_ep_size))
+
+        on_nvidia = torch.version.hip is None
+        self.assertEqual(
+            kimi_k3._shard_k3_latent_projection(mapping_for(8), 7168), on_nvidia
+        )
+        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(1), 7168))
+        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(3), 7168))
+        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(5), 7168))
+
+    def _assert_latent_projection_sharding(self, linear_calls, mapping, trtllm=False):
+        """Both projections split columns; only the up one narrows storage."""
+        by_prefix = _linear_calls_by_prefix(linear_calls)
+        down = by_prefix["routed_expert_down_proj"]
+        up = by_prefix["routed_expert_up_proj"]
+        sharded = mapping.moe.tp_ep_size > 1 and torch.version.hip is None
+        self.assertEqual(up.get("shard_group") is not None, sharded)
+        self.assertIsNone(down.get("reduce_group"))
+        if sharded:
+            self.assertIs(up["shard_group"], mapping.moe.tp_ep_group)
+            self.assertIs(down["column_group"], mapping.moe.tp_ep_group)
+        else:
+            self.assertIsNone(up.get("shard_group"))
+            self.assertIsNone(down.get("column_group"))
+        # Narrowed storage would take the full weight the multicast op slices.
+        self.assertIsNone(down.get("shard_group"))
+        for call in (down, up):
+            self.assertEqual(call["shard_rank"], mapping.moe.tp_ep_rank)
+            self.assertEqual(call["shard_size"], mapping.moe.tp_ep_size)
+
     def test_hybrid_moe_precomputes_routing_only_for_decode(self):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
@@ -422,11 +827,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
         shared_calls = []
         expert_calls = []
 
+        linear_calls: list[dict] = []
+        multicast_calls: list[dict] = []
+
         class FakeLinear(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
                 self.weight = torch.empty(0)
                 self.shard_group = kwargs.get("shard_group")
+                linear_calls.append(kwargs)
 
         class FakeExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -478,7 +887,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 ep_group=ep_group,
                 tp_ep_size=8,
                 has_tp_ep=True,
-                tp_ep_rank=0,
+                tp_ep_rank=3,
                 tp_ep_group=ep_group,
             ),
         )
@@ -507,6 +916,16 @@ class KimiK3RegistrationTests(unittest.TestCase):
                     joint_moe_reduce=True,
                 ),
             ),
+            mock.patch.object(
+                kimi_k3.KimiK3LatentDownOp,
+                "initialize",
+                staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),
+            ),
+            mock.patch(
+                "tokenspeed.runtime.distributed.process_group_manager"
+                ".process_group_manager.get_process_group",
+                return_value="pg",
+            ) as get_pg,
             mock.patch.dict(
                 kimi_k3.global_server_args_dict,
                 {"enforce_eager": False},
@@ -517,6 +936,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mapping,
                 layer_index=1,
                 model_scope="model.layers",
+                moe_block_count=92,
                 quant_config=None,
                 prefix="model.layers.1.block_sparse_moe",
             )
@@ -528,6 +948,19 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
         )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self._assert_latent_projection_sharding(linear_calls, mapping)
+        self.assertEqual(len(multicast_calls), 1)
+        wired = multicast_calls[0]
+        self.assertEqual(wired["group"], "pg")
+        self.assertEqual(wired["hidden_size"], config.hidden_size)
+        self.assertEqual(wired["latent_size"], config.routed_expert_hidden_size)
+        self.assertEqual(wired["model_scope"], "model.layers")
+        self.assertEqual(wired["layer_count"], 92)
+        # The pool rotates over block ordinals, so this layer must key its own.
+        self.assertEqual(wired["block_index"], 1)
+        get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
+        down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
+        self.assertEqual(down["multicast_down"], "mc-op")
         self.assertEqual(
             layer.native_latent_moe.components["expert_parallel_group"], ep_group
         )
@@ -554,6 +987,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
         with (
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
             mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
+            mock.patch(
+                "tokenspeed.runtime.distributed.process_group_manager"
+                ".process_group_manager.get_process_group",
+                return_value="pg",
+            ),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
             mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
             mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
@@ -577,9 +1015,56 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 tp_mapping,
                 layer_index=1,
                 model_scope="model.layers",
+                moe_block_count=92,
                 quant_config=None,
                 prefix="model.layers.1.block_sparse_moe",
             )
+
+        linear_calls.clear()
+        with (
+            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
+            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
+            mock.patch(
+                "tokenspeed.runtime.distributed.process_group_manager"
+                ".process_group_manager.get_process_group",
+                return_value="pg",
+            ),
+            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
+            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
+            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
+            mock.patch.object(
+                kimi_k3, "_shard_k3_latent_projection", return_value=False
+            ),
+            mock.patch.object(
+                kimi_k3.Kimi3MoEExecutionPlan,
+                "build",
+                return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_native=True,
+                    use_trtllm=False,
+                    overlap_shared_experts=False,
+                    joint_moe_reduce=True,
+                ),
+            ),
+            mock.patch.dict(
+                kimi_k3.global_server_args_dict,
+                {"enforce_eager": False},
+            ),
+        ):
+            kimi_k3.KimiLinearMoE(
+                config,
+                mapping,
+                layer_index=1,
+                model_scope="model.layers",
+                moe_block_count=92,
+                quant_config=None,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+        unsharded = {
+            c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c
+        }
+        self.assertIsNone(unsharded["routed_expert_down_proj"].get("multicast_down"))
+        self.assertIsNone(unsharded["routed_expert_down_proj"].get("column_group"))
+        self.assertIsNone(unsharded["routed_expert_up_proj"].get("shard_group"))
 
         self.assertIsNone(tp_layer.native_latent_moe)
         self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
