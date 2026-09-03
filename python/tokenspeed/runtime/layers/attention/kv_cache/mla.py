@@ -32,11 +32,6 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
-
-GB = 1024 * 1024 * 1024
 
 
 def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
@@ -89,7 +84,6 @@ class MLATokenToKVPool(CachePool):
 
     def _bind_layer_planes(self) -> None:
         super()._bind_layer_planes()
-        # The padded page 0 is used for writing dummy outputs from padded tokens.
         if self.quant_method == "per_token_head":
             self.kv_buffer = list(
                 zip(self._latent_kv, self._latent_scale, self._rope_k, strict=True)
@@ -139,8 +133,6 @@ class MLATokenToKVPool(CachePool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float | None = None,
-        v_scale: float | None = None,
     ):
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":

@@ -75,7 +75,7 @@ class OrdinaryRecipe(CacheRecipe):
         if self.draft_attn_config is None:
             return ids
         if self.draft_attn_config.prefix_granularity != self.prefix_granularity:
-            raise ValueError("target and draft cache page sizes must match")
+            raise ValueError("target and draft prefix granularities must match")
         return ids + _config_group_ids(self.draft_attn_config, self.num_draft_layers)
 
     @cached_property
@@ -93,11 +93,7 @@ class OrdinaryRecipe(CacheRecipe):
             target = (FULL_ATTENTION,) * self.num_target_layers
         if self.draft_attn_config is None:
             return target
-        draft = tuple(
-            getattr(
-                self.draft_attn_config.component(SoftmaxAttnConfig), "layer_types", ()
-            )
-        )
+        draft = tuple(self.draft_attn_config.component(SoftmaxAttnConfig).layer_types)
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
@@ -155,17 +151,19 @@ class OrdinaryRecipe(CacheRecipe):
             )
         # Every group packs one CacheBlock per parent, so a parent spans the
         # identity grain and profiled bytes/token size it directly.
-        page_size = self.prefix_granularity
+        parent_tokens = self.prefix_granularity
         return self._capped_parents(
-            self.cache_budget_bytes // (bytes_per_token * page_size) - 1,
-            parent_tokens=page_size,
+            self._budgeted_parents(
+                self.cache_budget_bytes, bytes_per_token * parent_tokens
+            ),
+            parent_tokens=parent_tokens,
         )
 
 
 def _storage_layers(config, num_layers: int) -> int:
     spec = config.component(SoftmaxAttnConfig)
     group_size = hybrid_slab_group_size(
-        getattr(spec, "layer_types", None),
+        spec.layer_types,
         sliding_window_tokens=spec.sliding_window_tokens,
     )
     return group_size if group_size is not None else num_layers

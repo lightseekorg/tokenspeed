@@ -99,7 +99,7 @@ def group_specs_from_layer_types(**kwargs):
     return _group_specs(_pcs, **kwargs)
 
 
-DUMMY = _pcs._CACHE_GROUP_DUMMY_PAGES
+NULL_PAGE = _pcs.NULL_PAGES
 
 
 def _spec(group_id, retention, window=None, rows_per_page=64):
@@ -134,26 +134,26 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             ]
         )
         # full: ceil(4096/64) + live + dummy
-        self.assertEqual(counts["full_attention"], 64 + 4 + DUMMY)
+        self.assertEqual(counts["full_attention"], 64 + 4 + NULL_PAGE)
         # W=128: resident ceil(127/64)=2 per request; scheduled ceil(512/64)=8
-        self.assertEqual(counts["sliding_attention_128"], 4 * 2 + 8 + 4 + DUMMY)
+        self.assertEqual(counts["sliding_attention_128"], 4 * 2 + 8 + 4 + NULL_PAGE)
         # W=4: resident ceil(3/64)=1 per request -- a sub-page window still
         # holds one page while its partial tail is live
-        self.assertEqual(counts["sliding_attention_4"], 4 * 1 + 8 + 4 + DUMMY)
+        self.assertEqual(counts["sliding_attention_4"], 4 * 1 + 8 + 4 + NULL_PAGE)
         self.assertGreater(
             counts["sliding_attention_128"], counts["sliding_attention_4"]
         )
 
     def test_window_one_holds_no_resident_pages(self):
         counts = self.counts([_spec("s", "sliding_window", window=1)])
-        self.assertEqual(counts["s"], 0 + 8 + 4 + DUMMY)
+        self.assertEqual(counts["s"], 0 + 8 + 4 + NULL_PAGE)
 
     def test_resident_window_clamped_by_context_len(self):
         wide = self.counts(
             [_spec("s", "sliding_window", window=128)], max_context_len=32
         )
         # min(127, 32) = 32 -> 1 resident page per request instead of 2
-        self.assertEqual(wide["s"], 4 * 1 + 8 + 4 + DUMMY)
+        self.assertEqual(wide["s"], 4 * 1 + 8 + 4 + NULL_PAGE)
 
     def test_scheduled_tokens_capped_by_total(self):
         counts = self.counts(
@@ -161,12 +161,7 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             max_scheduled_tokens=10_000,
             max_total_tokens=4096,
         )
-        self.assertEqual(counts["s"], 4 * 2 + math.ceil(4096 / 64) + 4 + DUMMY)
-
-    def test_safety_margin_added_per_group(self):
-        base = self.counts([_spec("full_attention", "full_history")])
-        padded = self.counts([_spec("full_attention", "full_history")], safety_margin=7)
-        self.assertEqual(padded["full_attention"], base["full_attention"] + 7)
+        self.assertEqual(counts["s"], 4 * 2 + math.ceil(4096 / 64) + 4 + NULL_PAGE)
 
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):

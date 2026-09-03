@@ -17,7 +17,7 @@
 
 """MXFP8 KV pool: quantize -> store -> verify layout and roundtrip error.
 
-Covers both scale layouts (interleaved for page 128, flat otherwise), the
+Covers the interleaved scale layout (uniform and per-layer head counts), the
 size accounting, and an end-to-end quantize_mxfp8 -> set_kv_buffer ->
 manual dequant roundtrip against the original bf16 K/V.
 """
@@ -144,6 +144,56 @@ def test_size_accounting_includes_scales():
     expect_sf = slots * HEADS * SF_DIM * LAYERS
     assert k_size == expect_data + expect_sf
     assert v_size == expect_data + expect_sf
+
+
+def test_rejects_scale_planes_outside_the_interleaved_layout():
+    """The pool has one scale layout; a plan declaring any other shape for a
+    scale field fails when the planes are bound, not at the first store."""
+    from cache_pool_test_utils import make_arena, plan_fields
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+        MHATokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+    )
+
+    kv_shape = (128, HEADS, HEAD_DIM)
+    per_token_scales = (128, HEADS, SF_DIM)
+    plan = plan_fields(
+        {
+            "full_attention": (
+                CacheFieldSpec("layer.0.k", "unit.0.k", kv_shape, "float8_e4m3fn"),
+                CacheFieldSpec("layer.0.v", "unit.0.v", kv_shape, "float8_e4m3fn"),
+                CacheFieldSpec(
+                    "layer.0.k_scale",
+                    "unit.0.k_scale",
+                    per_token_scales,
+                    "float8_e8m0fnu",
+                ),
+                CacheFieldSpec(
+                    "layer.0.v_scale",
+                    "unit.0.v_scale",
+                    per_token_scales,
+                    "float8_e8m0fnu",
+                ),
+            )
+        },
+        prefix_granularity=128,
+        num_lcm_blocks=2,
+        cache_blocks_per_lcm_block={"full_attention": 1},
+        alignment=1,
+        max_padding_fraction=1.0,
+    )
+    with pytest.raises(ValueError, match="interleaved"):
+        MHATokenToKVPoolMXFP8(
+            make_arena(plan),
+            dtype=torch.bfloat16,
+            head_num=HEADS,
+            head_dim=HEAD_DIM,
+            layer_num=1,
+            rank=0,
+        )
 
 
 # -----------------------------------------------------------------------------

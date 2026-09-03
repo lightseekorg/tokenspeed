@@ -97,7 +97,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         try:
             buffer = self._index_k[layer_id]
-        except (AttributeError, IndexError) as exc:
+        except IndexError as exc:
             raise ValueError(f"layer {layer_id} has no DSA index cache") from exc
         if buffer is None:
             raise ValueError(f"layer {layer_id} has no DSA index cache")
@@ -125,20 +125,20 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
     def index_k_block_views(
         self, buf: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        page_size = buf.shape[1]
+        rows_per_page = buf.shape[1]
         num_groups = self.index_head_dim // 128
         scale_bytes = torch._utils._element_size(torch.float32)
         page_stride = buf.stride(0)
         values = torch.as_strided(
             buf,
-            (buf.shape[0], page_size, self.index_head_dim),
+            (buf.shape[0], rows_per_page, self.index_head_dim),
             (page_stride, self.index_head_dim, 1),
         ).view(torch.float8_e4m3fn)
         scales = torch.as_strided(
             buf,
-            (buf.shape[0], page_size, num_groups * scale_bytes),
+            (buf.shape[0], rows_per_page, num_groups * scale_bytes),
             (page_stride, num_groups * scale_bytes, 1),
-            buf.storage_offset() + page_size * self.index_head_dim,
+            buf.storage_offset() + rows_per_page * self.index_head_dim,
         ).view(torch.float32)
         return values, scales
 

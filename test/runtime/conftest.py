@@ -114,9 +114,7 @@ def kimi_recipe(
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(text_config=text_config)
-        ),
+        model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,
         draft_model_config=(
             SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None

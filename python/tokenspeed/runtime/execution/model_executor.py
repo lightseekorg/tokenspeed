@@ -325,9 +325,8 @@ class ModelExecutor:
         # Every pool runs on the shared cache arena and publishes a runtime
         # contract; the per-group tables travel as CacheBatchMetadata. Fail
         # fast here rather than at the first forward or, worse, a CUDA-graph
-        # capture-path assert: a missing contract means the model family has
-        # no cache recipe yet, and an uncovered family means a backend that
-        # never reads that group's tables.
+        # capture-path assert: an uncovered contract family means a backend
+        # that never reads that group's tables.
         validate_scheduler_config(
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,

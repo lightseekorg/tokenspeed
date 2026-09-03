@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
@@ -28,6 +27,10 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+    cache_field_plane,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -36,25 +39,18 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_LAYER_FIELD = re.compile(r"^layer\.(\d+)\.(.+)$")
-
 
 def _layer_plane(
     field_id: str, first_layer: int, num_layers: int
 ) -> tuple[int, str] | None:
     """Split a planned field id into this view's local layer id and plane.
 
-    Returns None for fields outside the view's layer window, and for fields
-    that are not per-layer at all.
+    Returns None for fields outside the view's layer window.
     """
-    match = _LAYER_FIELD.match(field_id)
-    if match is None:
-        return None
-    global_layer = int(match.group(1))
-    local_layer = global_layer - first_layer
+    local_layer = cache_field_layer_id(field_id) - first_layer
     if not 0 <= local_layer < num_layers:
         return None
-    return local_layer, match.group(2)
+    return local_layer, cache_field_plane(field_id)
 
 
 def derive_state_groups_by_layer(

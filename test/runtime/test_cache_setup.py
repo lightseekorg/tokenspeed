@@ -142,6 +142,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
+                pd_disaggregation_enabled=False,
                 spec=SimpleNamespace(sliding_window_tokens=windows),
             ),
             draft_model_config=None,

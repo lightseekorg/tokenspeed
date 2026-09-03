@@ -157,10 +157,6 @@ def create_cache_pool(
             head_dim=softmax_attn.head_dim,
             layer_num=num_layers,
             rank=rank,
-            index_head_dim=softmax_attn.index_head_dim,
-            index_dtype=config.dtype,
-            indexed_layer_ids=softmax_attn.sparse_layer_ids,
-            layer_types=spec.layer_types,
             field_layer_offset=field_layer_offset,
         )
     if isinstance(softmax_attn, MHAConfig):

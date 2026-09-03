@@ -88,10 +88,9 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- layer vocabulary ----
 
-    @cached_property
+    @property
     def _text_config(self):
-        hf_config = self.model_config.hf_config
-        return getattr(hf_config, "text_config", hf_config)
+        return self.model_config.hf_text_config
 
     @cached_property
     def target_group_ids(self) -> tuple[str, ...]:
@@ -381,14 +380,6 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
-
-    @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
-        token_limit = self.token_limit
-        if token_limit is None:
-            return num_lcm_blocks
-        return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

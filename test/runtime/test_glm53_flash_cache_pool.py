@@ -170,7 +170,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         field_layer_offset=4,
     )
 
-    assert pool.num_lcm_blocks == num_lcm_blocks
+    assert pool.arena.plan.num_lcm_blocks == num_lcm_blocks
     assert pool.arena.runtime_contract is not None
     assert pool.arena.runtime_contract.token_capacity == 1024
     assert {

@@ -20,7 +20,6 @@ def specs_for_layers(
     group_ids,
     prefix_granularity,
     sliding_window_tokens=None,
-    page_sizes=None,
     pd_disaggregation_enabled=False,
 ):
     """The group specs a layer vocabulary produces.
@@ -36,7 +35,6 @@ def specs_for_layers(
             group_ids=group_ids,
             sliding_window_tokens=sliding_window_tokens,
             prefix_granularity=prefix_granularity,
-            page_sizes=page_sizes,
             pd_disaggregation_enabled=pd_disaggregation_enabled,
             fields_for_layer=lambda layer_id, group_id, occurrence: (
                 CacheFieldSpec(
