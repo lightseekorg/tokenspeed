@@ -190,6 +190,12 @@ def gather_fabric_map() -> list[bool]:
     that skipped this on the wrong platform would otherwise trigger the gather
     from a gate, which is the dispatch-time collective this map exists to
     remove.
+
+    That branch is the one thing here the ranks do not agree on by
+    construction. ``is_nvidia`` is detected locally, so a job mixing CUDA and
+    non-CUDA ranks would have some enter the all_gather and others return, and
+    the ones that entered would wait out the NCCL timeout. The caller it
+    replaced read a server argument, which was uniform; this reads the machine.
     """
     global _fabric_map
 

@@ -249,7 +249,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
             mock.patch(
                 "tokenspeed.runtime.distributed.process_group_manager"
-                ".process_group_manager.get_process_group",
+                ".process_group_manager.get_device_process_group",
                 return_value="pg",
             ) as get_pg,
             mock.patch.dict(kimi_k3.global_server_args_dict, {"enforce_eager": False}),
@@ -308,7 +308,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.layers.moe.latent import DOWN_MAILBOX_MAX_TOKENS
 
         self.assertEqual(wired["max_m"], DOWN_MAILBOX_MAX_TOKENS)
-        get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
+        # Not get_process_group("nccl", ...): that spelling passes either way,
+        # since the manager's device backend defaults to "nccl" in a test.
+        get_pg.assert_called_with(mapping.moe.tp_ep_group)
         self.assertFalse(layer.execution_plan.join_moe_reduce)
 
     def test_the_column_group_needs_a_divisible_latent(self):
