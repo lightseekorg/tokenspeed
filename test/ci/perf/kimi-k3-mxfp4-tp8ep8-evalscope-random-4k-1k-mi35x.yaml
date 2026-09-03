@@ -1,9 +1,10 @@
 api_version: ci.tokenspeed.io/v1
+# Keep the pure target as a manual control; the matching EAGLE3 configuration
+# is the per-commit Kimi-K3 performance gate.
 name: perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
