@@ -80,6 +80,11 @@ class PagedAttentionBackend(ABC):
     # (kernel_page_sizes.py). None means the kernel is page-size flexible and
     # views the cache at its group's own block granularity (no expansion).
     default_kernel_page_size: int | None = None
+    # This leaf forwards each layer's ``sliding_window_size`` to its kernels.
+    # Left False, a declared window silently widens to full-history attention.
+    # Declared here as well as on AttentionBackend: the refactor made the two
+    # separate roots, so a paged leaf inherits only this one.
+    supports_layer_sliding_window: bool = False
 
     @classmethod
     def resolve_kernel_page_size(

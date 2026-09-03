@@ -209,16 +209,19 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
   --port 8000
 ```
 
-Known limitation: native TokenSpeed DFlash currently uses full-history draft
-attention. It does not yet expose an equivalent of SGLang's
-`--speculative-dflash-draft-window-size`; add such a flag before relying on
-bounded draft attention for long-context deployments.
+Known limitation: native TokenSpeed DFlash bounds draft attention only where the
+draft checkpoint's `layer_types` declare `sliding_attention`; every other layer
+reads the full history. It does not yet expose an equivalent of SGLang's
+`--speculative-dflash-draft-window-size`, so a checkpoint that declares no
+window cannot be bounded at launch for long-context deployments.
 
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
 `--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
 candidate selector are enabled automatically from the draft architecture.
-Draft proposals greedily follow the selector's transition-conditioned path,
-independent of the target sampling backend.
+Draft proposals greedily follow the selector's transition-conditioned path.
+A request's `temperature`, `top_k` and `top_p` are applied by the target's
+verification step, never by the proposal, so the served distribution is the
+target's whatever the drafter proposed.
 
 ## Kimi K3
 
@@ -253,6 +256,11 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
+- A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
+  backend that applies per-layer sliding windows: `--drafter-attention-backend
+  mla`. `tokenspeed_mla`, which K3 auto-selects for the target, does not
+  implement that mask, so pairing it with such a draft is rejected at startup
+  instead of silently serving those layers full-history attention.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head;
   it must not be padded with an eighth, unused mask row.

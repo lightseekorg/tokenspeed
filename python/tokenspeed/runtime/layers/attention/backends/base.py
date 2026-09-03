@@ -124,6 +124,9 @@ class AttentionBackend(ABC):
     # Static CUDA-graph capability of this class; the executor AND-composes
     # it over the target+draft trees (resolve_cuda_graph_support).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
+    # This backend forwards each layer's ``sliding_window_size`` to its kernels.
+    # Left False, a declared window silently widens to full-history attention.
+    supports_layer_sliding_window: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         self.device = config.device

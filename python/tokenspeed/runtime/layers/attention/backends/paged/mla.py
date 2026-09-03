@@ -93,6 +93,8 @@ class MLAAttnBackend(PagedAttentionBackend):
 
     supports_mla_projected_value_decode = True
     default_kernel_page_size = MLA_PAGE_SIZE
+    # Decode forwards layer.sliding_window_size as window_left.
+    supports_layer_sliding_window: bool = True
 
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
