@@ -94,9 +94,6 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         return False
 
     if method_name == "Nvfp4W4A16LinearMethod":
-        # Packed NVFP4 head: uint8 weight plus the attributes set by
-        # process_weights_after_loading. Guard the layout so a head that never
-        # ran that hook is not fed to the kernel.
         return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
             lm_head,
             (
@@ -680,8 +677,6 @@ class LogitsProcessor(nn.Module):
 
         quant_method = getattr(lm_head, "quant_method", None)
         if should_apply_lm_head_quant_method(lm_head, quant_method):
-            # Packed quantized head (e.g. W4A16 NVFP4): the quant method runs
-            # the GEMM; lm_head.weight is packed and cannot be matmul'd.
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:

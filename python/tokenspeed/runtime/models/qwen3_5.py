@@ -224,10 +224,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        qkvz_shards = ("in_proj_qkv", "in_proj_z")
-        ba_shards = ("in_proj_b", "in_proj_a")
-        qkvz_unquant = _gdn_group_unquantized(prefix, qkvz_shards, quant_config)
-        ba_unquant = _gdn_group_unquantized(prefix, ba_shards, quant_config)
+        qkvz_unquant = _gdn_group_unquantized(
+            prefix, ("in_proj_qkv", "in_proj_z"), quant_config
+        )
+        ba_unquant = _gdn_group_unquantized(
+            prefix, ("in_proj_b", "in_proj_a"), quant_config
+        )
         self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
         if self._split_in_proj:
             self.in_proj_qkvz = MergedColumnParallelLinear(

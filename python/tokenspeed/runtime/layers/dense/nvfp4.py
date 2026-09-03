@@ -207,9 +207,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
 class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
     """Linear method for BF16 activations and packed NVFP4 weights."""
 
-    # Checkpoint tensors this method never consumes. W4A16 keeps activations in
-    # bf16, so any exported per-tensor activation ``input_scale`` is residual and
-    # is dropped at load time.
     ignored_checkpoint_params = frozenset({"input_scale"})
 
     def __init__(self, quant_config):
