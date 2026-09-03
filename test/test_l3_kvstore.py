@@ -21,16 +21,25 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.cache.l3.backend import (
     MemoryKvStore,
+    cache_layout_signature,
     storage_key_prefix,
     storage_object_key,
 )
 from tokenspeed.runtime.cache.l3.executor import L3HostStore
 from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
-from tokenspeed.runtime.cache.l3.mooncake import MooncakeStoreConfig, parse_extra_config
+from tokenspeed.runtime.cache.l3.mooncake import (
+    MooncakeKvStore,
+    MooncakeStoreConfig,
+    parse_extra_config,
+)
 
 
 class _FakeHost:
@@ -52,7 +61,72 @@ class StorageKeyTest(unittest.TestCase):
             "model_abc|g1|o2|r3",
         )
         self.assertEqual(storage_object_key("abc", 0, 0), "abc|g0|o0|r0")
-        self.assertEqual(storage_key_prefix("org/model"), "org_model")
+
+    def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
+        base = storage_key_prefix(
+            "org/model", weight_version="v1", cache_signature="layout", pipeline_rank=0
+        )
+        self.assertEqual(
+            base,
+            storage_key_prefix(
+                "org/model",
+                weight_version="v1",
+                cache_signature="layout",
+                pipeline_rank=0,
+            ),
+        )
+        self.assertNotEqual(base, storage_key_prefix("org_model"))
+        self.assertNotEqual(
+            base,
+            storage_key_prefix(
+                "org/model",
+                weight_version="v2",
+                cache_signature="layout",
+                pipeline_rank=0,
+            ),
+        )
+        self.assertNotEqual(
+            base,
+            storage_key_prefix(
+                "org/model",
+                weight_version="v1",
+                cache_signature="layout",
+                pipeline_rank=1,
+            ),
+        )
+
+    def test_layout_signature_includes_dtype_and_byte_geometry(self):
+        field = SimpleNamespace(
+            field_id="k0",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=16,
+            block_stride_bytes=32,
+            payload_bytes=24,
+        )
+        layout = SimpleNamespace(
+            groups=(
+                SimpleNamespace(
+                    group_id="full", cache_blocks_per_lcm_block=1, fields=(field,)
+                ),
+            )
+        )
+        fp16 = cache_layout_signature(layout, cache_dtype="float16")
+        self.assertEqual(fp16, cache_layout_signature(layout, cache_dtype="float16"))
+        self.assertNotEqual(
+            fp16, cache_layout_signature(layout, cache_dtype="bfloat16")
+        )
+        changed = SimpleNamespace(
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=1,
+                    fields=(SimpleNamespace(**{**vars(field), "payload_bytes": 20}),),
+                ),
+            )
+        )
+        self.assertNotEqual(
+            fp16, cache_layout_signature(changed, cache_dtype="float16")
+        )
 
 
 class MemoryKvStoreTest(unittest.TestCase):
@@ -94,6 +168,30 @@ class L3HostStoreTest(unittest.TestCase):
         )
         l3.close()
 
+    def test_namespace_rotation_hides_objects_published_before_clear(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh")
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        pages = [(0, 1, "h0", 0)]
+        self.assertEqual(l3.backup(pages), [True])
+        old_key = l3.object_key("h0", 0, 0)
+        l3.rotate_namespace()
+        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
+        self.assertEqual(l3.exists(pages), [False])
+        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
+        self.assertEqual(restarted.exists(pages), [False])
+
+    def test_namespace_rotates_locally_even_when_remote_delete_fails(self):
+        backend = mock.Mock()
+        backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
+        l3 = L3HostStore(backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1)
+        old_key = l3.object_key("h0", 0, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "delete failed"):
+            l3.rotate_namespace()
+
+        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
+
 
 class FactoryTest(unittest.TestCase):
     def test_memory_and_unknown_backend(self):
@@ -134,6 +232,81 @@ class MooncakeConfigTest(unittest.TestCase):
                 parse_extra_config("[]")
         finally:
             os.environ.update(saved)
+
+    def test_default_global_segment_matches_runtime_flag_default(self):
+        saved = os.environ.pop("MOONCAKE_GLOBAL_SEGMENT_SIZE", None)
+        try:
+            config = MooncakeStoreConfig.from_mapping(
+                {"master_server_address": "127.0.0.1:50051"}
+            )
+            self.assertEqual(config.global_segment_size, 4 * 1024**3)
+        finally:
+            if saved is not None:
+                os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = saved
+
+
+class MooncakeKvStoreTest(unittest.TestCase):
+    def test_non_default_tenant_is_never_silently_dropped(self):
+        class _Store:
+            def setup(self, *args, **kwargs):
+                del args
+                if "tenant_id" in kwargs:
+                    raise TypeError("old Mooncake")
+                raise AssertionError("must not retry without the requested tenant")
+
+        store_module = types.ModuleType("mooncake.store")
+        store_module.MooncakeDistributedStore = _Store
+        package = types.ModuleType("mooncake")
+        package.store = store_module
+        host = SimpleNamespace(
+            data_ptr=lambda: 1, numel=lambda: 8, element_size=lambda: 1
+        )
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not support tenant_id"):
+                MooncakeKvStore(
+                    {
+                        "master_server_address": "127.0.0.1:50051",
+                        "tenant_id": "tenant-a",
+                    },
+                    host_buffer=host,
+                )
+
+    def test_concurrent_create_is_treated_as_idempotent_success(self):
+        class _Store:
+            def __init__(self):
+                self.exists_calls = 0
+
+            def batch_is_exist(self, keys):
+                self.exists_calls += 1
+                return [0] * len(keys) if self.exists_calls == 1 else [1] * len(keys)
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                del ptrs, sizes
+                return [-1] * len(keys)
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = _Store()
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        self.assertEqual(adapter.batch_put_from(["k"], host, [0], [8]), [True])
+
+    def test_namespace_clear_uses_anchored_escaped_regex(self):
+        adapter = object.__new__(MooncakeKvStore)
+        store = mock.Mock()
+        adapter.store = store
+        store.remove_by_regex.return_value = 0
+
+        adapter.remove_by_prefix("model.v1_")
+
+        store.remove_by_regex.assert_called_once_with(r"^model\.v1_.*", True)
+
+    def test_namespace_clear_failure_is_not_reported_as_success(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = mock.Mock()
+        adapter.store.remove_by_regex.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "Failed to clear"):
+            adapter.remove_by_prefix("model_")
 
 
 if __name__ == "__main__":

@@ -48,8 +48,22 @@ class L3HostStore:
     ):
         self.backend = backend
         self.host_storage = host_storage
-        self.key_prefix = key_prefix
+        self._base_key_prefix = key_prefix
+        self._namespace_generation = 0
         self.rank = int(rank)
+
+    @property
+    def key_prefix(self) -> str:
+        if self._namespace_generation == 0:
+            return self._base_key_prefix
+        return f"{self._base_key_prefix}.e{self._namespace_generation}"
+
+    def rotate_namespace(self) -> None:
+        """Delete this namespace and stop reusing any concurrently stale view."""
+
+        previous_prefix = self.key_prefix
+        self._namespace_generation += 1
+        self.backend.remove_by_prefix(f"{previous_prefix}_")
 
     def object_key(self, content_hash: str, group_id: int, page_offset: int) -> str:
         return storage_object_key(

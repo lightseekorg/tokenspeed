@@ -432,6 +432,26 @@ class DeviceHandle:
         )
         return l2.poll_results()
 
+    def query_l3_storage(self, pages) -> list[bool] | None:
+        """Probe immutable L3 objects without exposing the Host-cache tier."""
+
+        l2 = self._l2
+        if l2 is None:
+            return None
+        return l2.l3_exists(pages)
+
+    def rotate_l3_namespace(self) -> None:
+        """Invalidate this process's view of objects published before clear."""
+
+        if self._l2 is not None:
+            self._l2.rotate_l3_namespace()
+
+    def shutdown_cache(self) -> None:
+        """Drain and close the Host-cache tier, when configured."""
+
+        if self._l2 is not None:
+            self._l2.shutdown()
+
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
 
@@ -752,7 +772,10 @@ def build_device_side(
             attn_tp_rank=attn_tp_rank,
         )
         if server_args.kvstore_storage_backend is not None:
-            from tokenspeed.runtime.cache.l3.backend import storage_key_prefix
+            from tokenspeed.runtime.cache.l3.backend import (
+                cache_layout_signature,
+                storage_key_prefix,
+            )
             from tokenspeed.runtime.cache.l3.factory import (
                 create_kvstore_storage_backend,
             )
@@ -766,7 +789,17 @@ def build_device_side(
             l2_cache_executor.attach_l3_storage(
                 storage_backend,
                 key_prefix=storage_key_prefix(
-                    server_args.served_model_name or server_args.model
+                    server_args.model,
+                    weight_version=server_args.weight_version,
+                    cache_signature=cache_layout_signature(
+                        l2_cache_executor.layout,
+                        cache_dtype=(
+                            f"{server_args.kv_cache_dtype}:{model_config.dtype}"
+                        ),
+                    ),
+                    pipeline_rank=(
+                        server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
+                    ),
                 ),
                 rank=attn_tp_rank,
             )

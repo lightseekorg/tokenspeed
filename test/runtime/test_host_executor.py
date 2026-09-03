@@ -491,6 +491,31 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "L3 prefetch failed"):
             executor._prefetch_from_storage([(0, 1, "h0", 0), (0, 2, "h1", 0)])
 
+    def test_shutdown_persists_completed_d2h_before_closing_l3(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = [_Ack(Mock(), [7], [(0, 1, "h0", 0)])]
+        executor.load_stream = Mock()
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [True]
+        default_stream = Mock()
+        with patch.object(
+            executor_module.torch.cuda, "current_stream", return_value=default_stream
+        ):
+            executor.shutdown()
+
+        default_stream.synchronize.assert_called_once_with()
+        executor.load_stream.synchronize.assert_called_once_with()
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        executor.l3_store.close.assert_called_once_with()
+        self.assertEqual(executor._write_acks, [])
+
 
 class CompactLayoutRoundTripTest(unittest.TestCase):
     def setUp(self):

@@ -215,6 +215,7 @@ public:
     // no local Host block. Probe treats them as Host hits that require prefetch.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
+    void UnregisterStorageKeys(std::span<const CacheKey> keys);
     bool ContainsStorageKey(const CacheKey& key) const { return storage_keys_.contains(key); }
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const;
     std::int32_t NumStorageKeys() const { return static_cast<std::int32_t>(storage_keys_.size()); }

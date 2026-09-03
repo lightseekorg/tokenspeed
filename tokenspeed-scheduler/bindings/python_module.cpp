@@ -388,5 +388,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 }
                 scheduler.RegisterStorageKeys(keys);
             },
+            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"))
+        .def(
+            "unregister_storage_keys",
+            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
+               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
+                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
+                    throw std::invalid_argument("unregister_storage_keys requires aligned group/hash/offset lists");
+                }
+                std::vector<tokenspeed::CacheKey> keys;
+                keys.reserve(group_ids.size());
+                for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                    keys.push_back(tokenspeed::CacheKey{
+                        .group_id = group_ids[i],
+                        .content_hash = content_hashes[i],
+                        .page_offset = page_offsets[i],
+                    });
+                }
+                scheduler.UnregisterStorageKeys(keys);
+            },
             nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"));
 }

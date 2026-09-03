@@ -270,6 +270,8 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         )
         self.assertEqual(l3.prefetch(pages), [True])
         self.assertEqual(bytes(host.host_buffer[0 : len(payload)]), payload)
+        l3.rotate_namespace()
+        self.assertEqual(l3.exists(pages), [False])
         l3.close()
 
 

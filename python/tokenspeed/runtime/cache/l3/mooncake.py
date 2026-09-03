@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,7 @@ from tokenspeed.runtime.cache.l3.backend import host_buffer_ptr
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024
+_DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024
 _DEFAULT_TENANT_ID = "default"
 
 
@@ -112,7 +114,9 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 extra_config.get(
                     "global_segment_size",
-                    os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 16 * 1024 * 1024),
+                    os.environ.get(
+                        "MOONCAKE_GLOBAL_SEGMENT_SIZE", _DEFAULT_GLOBAL_SEGMENT_SIZE
+                    ),
                 )
             ),
             protocol=str(
@@ -164,7 +168,12 @@ class MooncakeKvStore:
                 self.config.master_server_address,
                 **setup_kwargs,
             )
-        except TypeError:
+        except TypeError as exc:
+            if setup_kwargs:
+                raise RuntimeError(
+                    "Installed Mooncake does not support tenant_id; refusing to "
+                    f"connect tenant {self.config.tenant_id!r} as the default tenant"
+                ) from exc
             ret = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
@@ -255,7 +264,34 @@ class MooncakeKvStore:
             )
             for index, ret in zip(missing_index, put_results):
                 results[index] = int(ret) == 0
+            failed_positions = [
+                position for position, ret in enumerate(put_results) if int(ret) != 0
+            ]
+            if failed_positions:
+                # Mooncake puts are create-only. A concurrent writer may win
+                # after our existence probe, which is still a successful,
+                # idempotent publication of the immutable cache object.
+                raced_keys = [missing_keys[position] for position in failed_positions]
+                raced_exists = self.batch_exists(raced_keys)
+                for position, present in zip(failed_positions, raced_exists):
+                    if present:
+                        results[missing_index[position]] = True
         return results
+
+    def remove_by_prefix(self, prefix: str) -> None:
+        remover = getattr(self.store, "remove_by_regex", None)
+        if not callable(remover):
+            raise RuntimeError(
+                "Installed Mooncake does not support remove_by_regex; refusing "
+                "to report a successful L3 cache clear"
+            )
+        ret = remover(f"^{re.escape(prefix)}.*", True)
+        # Mooncake returns the number of removed objects; negative values are
+        # error codes.
+        if ret < 0:
+            raise RuntimeError(
+                f"Failed to clear Mooncake L3 namespace, error code: {ret}"
+            )
 
     def close(self) -> None:
         store = self.store

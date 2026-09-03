@@ -357,6 +357,17 @@ class L2CacheExecutor:
             missed = [page for page, ok in zip(pages, results) if not ok]
             raise RuntimeError(f"L3 prefetch failed for {len(missed)} Host page(s)")
 
+    def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is None:
+            return None
+        return l3_store.exists(pages)
+
+    def rotate_l3_namespace(self) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is not None:
+            l3_store.rotate_namespace()
+
     def _transfer_ranges(
         self,
         transfers: Sequence[tuple[int, int, int]],
@@ -600,6 +611,14 @@ class L2CacheExecutor:
         # thread's handle reaches them); only loads have their own stream.
         torch.cuda.current_stream().synchronize()
         self.load_stream.synchronize()
+        with self._ack_lock:
+            pending_writes = list(self._write_acks)
+            self._write_acks.clear()
+        # Synchronization above makes every D2H snapshot complete. Persist the
+        # final batch before closing L3; otherwise a clean process shutdown can
+        # acknowledge work in memory and silently lose the remote object.
+        for ack in pending_writes:
+            self._backup_to_storage(ack.backup_pages)
         if getattr(self, "l3_store", None) is not None:
             self.l3_store.close()
 

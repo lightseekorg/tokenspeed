@@ -285,9 +285,11 @@ CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vect
         const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
         const GroupPrefixProbe& group_probe = probe.per_group[i];
         PrefixMatch& match = out.per_group[i];
-        match.blocks.resize(group_probe.hits.size());
+        const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+        const std::size_t covered_pages = static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+        match.blocks.resize(std::min(group_probe.hits.size(), covered_pages));
         PrefixCacheIndex& index = groups_[i].Index();
-        for (std::size_t hit_index = 0; hit_index < group_probe.hits.size(); ++hit_index) {
+        for (std::size_t hit_index = 0; hit_index < match.blocks.size(); ++hit_index) {
             if (group_probe.hits[hit_index] == 0) {
                 continue;
             }
@@ -312,6 +314,17 @@ CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vect
                 break;
             }
             match.blocks[hit_index] = std::move(host_block_ref);
+        }
+    }
+    // A later group can lower the shared boundary after earlier groups have
+    // already pinned pages. Trim every group to the final boundary so those
+    // excess pins are released and no stale KV is admitted past the common
+    // prefix.
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+        const std::size_t covered_pages = static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+        if (out.per_group[i].blocks.size() > covered_pages) {
+            out.per_group[i].blocks.resize(covered_pages);
         }
     }
     return out;
@@ -862,6 +875,12 @@ void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
         _assert(key.group_id < groups_.size(), "storage key group id out of range");
         storage_keys_.insert(key);
+    }
+}
+
+void CacheCoordinator::UnregisterStorageKeys(std::span<const CacheKey> keys) {
+    for (const CacheKey& key : keys) {
+        storage_keys_.erase(key);
     }
 }
 

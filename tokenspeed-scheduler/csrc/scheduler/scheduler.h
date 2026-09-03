@@ -91,6 +91,7 @@ public:
         return coordinator_.ExpandPrefixKeys(content_hashes);
     }
     void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
+    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
 
 private:
     bool clearCache(bool include_host);

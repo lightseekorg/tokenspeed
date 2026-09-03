@@ -70,8 +70,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
-            .content_hash = candidate.key.content_hash,
-            .page_offset = candidate.key.page_offset,
+            .content_hash = keys[i].content_hash,
+            .page_offset = keys[i].page_offset,
         });
         tickets.push_back(StoreTicket{
             std::move(keys[i]),

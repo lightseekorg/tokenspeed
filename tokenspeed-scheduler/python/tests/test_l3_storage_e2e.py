@@ -154,6 +154,19 @@ def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
     _ack_load_back(scheduler, load.op_ids[0])
 
 
+def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
+    scheduler = ts.Scheduler(_l3_config())
+    tokens = list(range(1, 9))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)
+    scheduler.unregister_storage_keys(group_ids, expanded, offsets)
+
+    scheduler.submit_requests([_spec("r1", tokens)])
+    plan = scheduler.next_execution_plan()
+    assert _find_load_back(plan) is None
+
+
 def test_l3_writeback_carries_object_keys() -> None:
     scheduler = ts.Scheduler(_l3_config(with_swa=True))
     spec = _spec("r1", list(range(1, 9)))

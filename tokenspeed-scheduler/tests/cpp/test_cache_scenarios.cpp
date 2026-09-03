@@ -4395,13 +4395,13 @@ protected:
 
 TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
     auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
-    ASSERT_TRUE(wb1.has_value());
-    SendWriteBackDone(wb1->op_ids.at(0));
+    ASSERT_FALSE(wb1.empty());
+    SendWriteBackDone(wb1.front().op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 
     auto wb2 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
-    ASSERT_TRUE(wb2.has_value()) << "committed Host entries must be replaceable so r1 leaves L2";
-    SendWriteBackDone(wb2->op_ids.at(0));
+    ASSERT_FALSE(wb2.empty()) << "committed Host entries must be replaceable so r1 leaves L2";
+    SendWriteBackDone(wb2.front().op_ids.at(0));
     EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0);
 
     // Same tokens as r1 plus one extra page: Device miss, Host miss, L3 hit.

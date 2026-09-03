@@ -42,33 +42,12 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 
 
-class _L3Store:
-    def __init__(self, exists_flags: list[bool]) -> None:
-        self.exists_flags = exists_flags
-        self.pages = None
-
-    def exists(self, pages):
-        self.pages = list(pages)
-        return list(self.exists_flags)
-
-    def present_keys(self, group_ids, content_hashes, page_offsets, exists):
-        hits = [
-            (group_id, content_hash, page_offset)
-            for group_id, content_hash, page_offset, present in zip(
-                group_ids, content_hashes, page_offsets, exists
-            )
-            if present
-        ]
-        if not hits:
-            return [], [], []
-        groups, hashes, offsets = zip(*hits)
-        return list(groups), list(hashes), list(offsets)
-
-
 class _Scheduler:
     def __init__(self) -> None:
         self.submitted: list[list] = []
         self.registered = None
+        self.unregistered = None
+        self.clear_result = True
 
     def submit_requests(self, specs) -> None:
         self.submitted.append(list(specs))
@@ -82,17 +61,36 @@ class _Scheduler:
     def register_storage_keys(self, groups, hashes, offsets) -> None:
         self.registered = (list(groups), list(hashes), list(offsets))
 
+    def unregister_storage_keys(self, groups, hashes, offsets) -> None:
+        self.unregistered = (list(groups), list(hashes), list(offsets))
+
+    def clear_cache(self) -> bool:
+        return self.clear_result
+
+
+class _Device:
+    def __init__(self, exists_flags: list[bool] | None) -> None:
+        self.exists_flags = exists_flags
+        self.pages = None
+        self.rotations = 0
+
+    def query_l3_storage(self, pages):
+        self.pages = list(pages)
+        return None if self.exists_flags is None else list(self.exists_flags)
+
+    def rotate_l3_namespace(self) -> None:
+        self.rotations += 1
+
 
 class _Loop:
     """Only the EventLoop methods under test plus the state they read."""
 
     _submit_scheduler_requests = EventLoop._submit_scheduler_requests
     _register_l3_storage_hits = EventLoop._register_l3_storage_hits
+    _clear_cache = EventLoop._clear_cache
 
-    def __init__(self, l3=None) -> None:
-        self.l2_cache_executor = (
-            SimpleNamespace(l3_store=l3) if l3 is not None else None
-        )
+    def __init__(self, exists_flags=None) -> None:
+        self._device = _Device(exists_flags)
         self.scheduler = _Scheduler()
         self.attn_tp_size = 1
         self.attn_tp_cpu_group = None
@@ -103,7 +101,7 @@ def _spec(rid: str, tokens: list[int]):
 
 
 def test_submit_without_l3_still_admits() -> None:
-    loop = _Loop(l3=None)
+    loop = _Loop(exists_flags=None)
     spec = _spec("r0", [1, 2, 3, 4])
 
     loop._submit_scheduler_requests([spec])
@@ -113,26 +111,35 @@ def test_submit_without_l3_still_admits() -> None:
 
 
 def test_submit_registers_only_keys_l3_reports_present() -> None:
-    store = _L3Store(exists_flags=[True])
-    loop = _Loop(l3=store)
+    loop = _Loop(exists_flags=[True])
     spec = _spec("r0", [1, 2, 3, 4])
 
     loop._submit_scheduler_requests([spec])
 
     assert loop.scheduler.submitted == [[spec]]
-    assert store.pages == [(0, 0, "h4", 0)]
+    assert loop._device.pages == [(0, 0, "h4", 0)]
     assert loop.scheduler.registered == ([0], ["h4"], [0])
 
 
 def test_submit_skips_register_when_l3_misses() -> None:
-    store = _L3Store(exists_flags=[False])
-    loop = _Loop(l3=store)
+    loop = _Loop(exists_flags=[False])
     spec = _spec("r0", [1, 2, 3, 4])
 
     loop._submit_scheduler_requests([spec])
 
     assert loop.scheduler.submitted == [[spec]]
     assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
+def test_successful_clear_rotates_l3_namespace() -> None:
+    loop = _Loop(exists_flags=[True])
+    assert loop._clear_cache()
+    assert loop._device.rotations == 1
+
+    loop.scheduler.clear_result = False
+    assert not loop._clear_cache()
+    assert loop._device.rotations == 1
 
 
 if __name__ == "__main__":

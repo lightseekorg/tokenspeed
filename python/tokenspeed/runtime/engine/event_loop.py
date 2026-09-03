@@ -239,7 +239,6 @@ class EventLoop:
             )
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
-        self.l2_cache_executor = self._device._l2
         num_host_pages = specs.num_host_pages
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
@@ -436,7 +435,7 @@ class EventLoop:
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
-            clear_cache_fn=self.scheduler.clear_cache,
+            clear_cache_fn=self._clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -521,6 +520,12 @@ class EventLoop:
         self._register_l3_storage_hits(specs)
         self.scheduler.submit_requests(specs)
 
+    def _clear_cache(self) -> bool:
+        cleared = self.scheduler.clear_cache()
+        if cleared:
+            self._device.rotate_l3_namespace()
+        return cleared
+
     def _register_l3_storage_hits(self, specs) -> None:
         """Tell the scheduler which prefix pages already live in L3.
 
@@ -529,9 +534,7 @@ class EventLoop:
         use, then register only keys every TP rank agrees exist.
         """
 
-        l2 = self.l2_cache_executor
-        l3_store = getattr(l2, "l3_store", None) if l2 is not None else None
-        if l3_store is None or not specs:
+        if not specs:
             return
         hashes = []
         seen: set[str] = set()
@@ -554,19 +557,38 @@ class EventLoop:
                 group_ids, content_hashes, page_offsets
             )
         ]
-        exists = l3_store.exists(pages)
+        exists = self._device.query_l3_storage(pages)
+        if exists is None:
+            return
+        if len(exists) != len(group_ids):
+            raise RuntimeError("L3 existence result is not aligned with cache keys")
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None and exists:
             flags = torch.tensor(
                 [1 if present else 0 for present in exists], dtype=torch.int32
             )
             dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
             exists = [bool(flag) for flag in flags.tolist()]
-        hit_groups, hit_hashes, hit_offsets = l3_store.present_keys(
-            group_ids,
-            content_hashes,
-            page_offsets,
-            exists=exists,
-        )
+        hit_groups = []
+        hit_hashes = []
+        hit_offsets = []
+        miss_groups = []
+        miss_hashes = []
+        miss_offsets = []
+        for group_id, content_hash, page_offset, present in zip(
+            group_ids, content_hashes, page_offsets, exists
+        ):
+            target = (
+                (hit_groups, hit_hashes, hit_offsets)
+                if present
+                else (miss_groups, miss_hashes, miss_offsets)
+            )
+            target[0].append(int(group_id))
+            target[1].append(content_hash)
+            target[2].append(int(page_offset))
+        if miss_groups:
+            self.scheduler.unregister_storage_keys(
+                miss_groups, miss_hashes, miss_offsets
+            )
         if hit_groups:
             self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
 
@@ -1197,10 +1219,7 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
-        l2 = getattr(self, "l2_cache_executor", None)
-        shutdown_l2 = getattr(l2, "shutdown", None)
-        if callable(shutdown_l2):
-            shutdown_l2()
+        self._device.shutdown_cache()
 
 
 def run_event_loop(

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -49,12 +51,56 @@ def storage_object_key(
     return f"{tagged}|g{int(group_id)}|o{int(page_offset)}|r{int(rank)}"
 
 
-def storage_key_prefix(model_name: str | None) -> str:
-    """Sanitize a model name into an L3 object-key prefix (SGLang-style)."""
+def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
+    """Return a stable fingerprint of the bytes stored in one L3 page."""
 
-    if not model_name:
-        return ""
-    return str(model_name).replace("/", "_")
+    groups = []
+    for group in layout.groups:
+        fields = [
+            {
+                "id": field.field_id,
+                "buffer": int(field.device_buffer_index),
+                "zero": int(field.device_block_zero_offset_bytes),
+                "stride": int(field.block_stride_bytes),
+                "payload": int(field.payload_bytes),
+            }
+            for field in group.fields
+        ]
+        groups.append(
+            {
+                "id": group.group_id,
+                "blocks_per_lcm": int(group.cache_blocks_per_lcm_block),
+                "fields": fields,
+            }
+        )
+    payload = json.dumps(
+        {"cache_dtype": str(cache_dtype), "groups": groups},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def storage_key_prefix(
+    model_name: str | None,
+    *,
+    weight_version: str = "default",
+    cache_signature: str = "",
+    pipeline_rank: int = 0,
+) -> str:
+    """Return a collision-resistant namespace for compatible L3 objects."""
+
+    payload = json.dumps(
+        {
+            "model": str(model_name or ""),
+            "weight_version": str(weight_version),
+            "cache_signature": str(cache_signature),
+            "pipeline_rank": int(pipeline_rank),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "tsl3v1-" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def host_buffer_ptr(host_buffer: Any) -> int:
@@ -116,6 +162,9 @@ class KvStoreStorage(Protocol):
     ) -> list[bool]:
         """Write Host buffer slices into the store. True means the put succeeded."""
 
+    def remove_by_prefix(self, prefix: str) -> None:
+        """Remove every object whose key starts with ``prefix``."""
+
     def close(self) -> None:
         """Release backend resources. Idempotent."""
 
@@ -165,6 +214,13 @@ class MemoryKvStore:
             self._objects[key] = copy_host_bytes(host_buffer, int(offset), int(size))
             results.append(True)
         return results
+
+    def remove_by_prefix(self, prefix: str) -> None:
+        self._objects = {
+            key: payload
+            for key, payload in self._objects.items()
+            if not key.startswith(prefix)
+        }
 
     def close(self) -> None:
         self._objects.clear()
