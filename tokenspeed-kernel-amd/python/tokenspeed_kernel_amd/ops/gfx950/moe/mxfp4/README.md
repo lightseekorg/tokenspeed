@@ -32,7 +32,7 @@ accumulation because each rank owns only a sparse subset of the routed experts.
 | `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
-| `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths that read the unshuffled MXFP4 weights directly: route-direct warp decode and a contiguous-EP grouped GEMM. |
+| `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
 | `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |

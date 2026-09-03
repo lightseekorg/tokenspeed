@@ -175,6 +175,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
     shared_out: torch.Tensor | None = None,
     expert_start: int = 0,
     global_num_experts: int | None = None,
+    prefill_activation_format: str = "e2m1",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Run route-direct SiTU decode or block-ragged SiTU prefill.
 
@@ -244,7 +245,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             expert_start=expert_start,
             global_num_experts=global_num_experts,
             out=out,
-            activation_format="e4m3",
+            activation_format=prefill_activation_format,
         )
         return result
 
