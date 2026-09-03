@@ -35,12 +35,14 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.paged import (
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+    TRTLLMMLABackend,
+)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
-from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (

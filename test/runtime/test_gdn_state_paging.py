@@ -121,7 +121,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -182,7 +182,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
 
     def test_index_plan_preserves_int32_inputs(self):
         torch = self.torch
-        from tokenspeed.runtime.layers.attention.backends.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _compute_state_block_index_plan,
         )
 
@@ -258,7 +258,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -411,7 +411,7 @@ class VerifyMetadataTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -503,7 +503,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
             )
-            from tokenspeed.runtime.layers.attention.backends.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:

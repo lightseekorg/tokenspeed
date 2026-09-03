@@ -17,30 +17,3 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-# ruff: noqa: E402,F401
-# Import all backend modules to trigger register_backend() calls.
-from tokenspeed_kernel.platform import current_platform
-
-platform = current_platform()
-
-from tokenspeed.runtime.layers.attention.backends.specific import (  # noqa: F401
-    deepseek_v4,
-)
-
-if platform.is_nvidia:
-    from tokenspeed.runtime.layers.attention.backends.paged import (
-        flashmla,
-    )  # noqa: F401
-    from tokenspeed.runtime.layers.attention.backends.paged import trtllm  # noqa: F401
-    from tokenspeed.runtime.layers.attention.backends.paged import (
-        trtllm_mla,
-    )  # noqa: F401
-    from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
-        tokenspeed_mla,
-    )
-
-from tokenspeed.runtime.layers.attention.backends.paged import dsa  # noqa: F401
-from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
-from tokenspeed.runtime.layers.attention.backends.paged import mla  # noqa: F401
-from tokenspeed.runtime.layers.attention.backends.paged import msa  # noqa: F401

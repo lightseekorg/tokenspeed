@@ -23,7 +23,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.group_tables import (
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )

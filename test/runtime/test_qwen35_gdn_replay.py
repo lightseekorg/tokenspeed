@@ -50,7 +50,7 @@ from test.runtime.test_gdn_state_paging import (
 from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
 
@@ -374,7 +374,7 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
     _prepare_verify(scratch_backend, scratch_pool, inputs[0])
     _forward_verify(scratch_backend, scratch_pool, inputs[1], layer_id=1)
 
-    from tokenspeed.runtime.layers.attention.backends import mamba as backend_ops
+    from tokenspeed.runtime.layers.attention.backends.state import mamba as backend_ops
 
     original = backend_ops.gdn_replay_commit
     launch_calls = 0

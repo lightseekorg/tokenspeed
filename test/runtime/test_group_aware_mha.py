@@ -39,7 +39,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.mha import (
+            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -71,10 +71,10 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
     def _router(self, group_ids=(FULL, SWA)):
-        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+        from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
             CacheGroupGeometry,
         )
-        from tokenspeed.runtime.layers.attention.backends.router import (
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
 

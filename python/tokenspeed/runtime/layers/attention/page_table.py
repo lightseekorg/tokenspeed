@@ -137,7 +137,7 @@ def group_slot_mapping_from_raw(
 ) -> torch.Tensor:
     """Per-token write slots over one group's raw table — the same
     ``table[req, pos // P] * P + pos % P`` invariant as the router's stacked
-    math (``backends/write_locations.py``), generalized for arbitrary
+    math (``backends/paged/write_locations.py``), generalized for arbitrary
     positions and entry strides (one entry per ``entry_stride_tokens``,
     compressed groups). Invalid coordinates yield the ``-1`` sentinel — the
     masked-scatter cache-insert kernels skip them — rather than slot 0,

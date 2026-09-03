@@ -67,7 +67,7 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.router import (
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
 

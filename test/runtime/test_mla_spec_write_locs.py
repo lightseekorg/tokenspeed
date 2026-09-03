@@ -20,7 +20,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.backends.mla import (
+from tokenspeed.runtime.layers.attention.backends.paged.mla import (
     MLAAttnBackend,
 )
 

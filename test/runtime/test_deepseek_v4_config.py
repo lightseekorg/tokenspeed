@@ -54,10 +54,10 @@ from tokenspeed.runtime.execution.forward_step import (
     ForwardStepRunner,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.layers.attention.backends import (
+from tokenspeed.runtime.layers.attention.backends.specific import (
     deepseek_v4 as deepseek_v4_backend,
 )
-from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
     DeepseekV4AttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (

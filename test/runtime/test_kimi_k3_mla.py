@@ -93,7 +93,7 @@ def _kernel_page_table(
 def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
     """Router-side expansion stage: raw scheduler blocks -> the leaf's
     ``[bs, max_num_pages]`` kernel-page table (GroupTableStacks.fill)."""
-    from tokenspeed.runtime.layers.attention.backends.group_tables import (
+    from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
         GroupTableSpec,
         GroupTableStacks,
     )
@@ -254,14 +254,16 @@ def backend_factory(cuda_env, gpu_pool):
             and torch.cuda.get_device_capability()[0] >= 10
         )
         if is_blackwell:
-            from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
+            from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
                 CuteDSLMLABackend,
             )
 
             backend_cls = CuteDSLMLABackend
             backend_name = "tokenspeed_mla"
         else:
-            from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+            from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+                MLAAttnBackend,
+            )
 
             backend_cls = MLAAttnBackend
             backend_name = "mla"

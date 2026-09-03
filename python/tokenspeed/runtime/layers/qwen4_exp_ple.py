@@ -43,7 +43,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     qwen4_exp_linear_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (

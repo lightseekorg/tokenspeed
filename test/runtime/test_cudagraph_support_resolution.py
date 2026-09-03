@@ -100,7 +100,7 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
 
     def test_dsa_declares_no_prefill_graph(self):
         try:
-            from tokenspeed.runtime.layers.attention.backends.dsa import (
+            from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
                 DSABackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -110,7 +110,7 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
 
     def test_qwen4_exp_declares_no_prefill_graph(self):
         try:
-            from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+            from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
                 Qwen4ExpMambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -124,9 +124,9 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
         import importlib
 
         for module_name, cls_name in (
-            ("tokenspeed.runtime.layers.attention.backends.dsa", "DSABackend"),
+            ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
             (
-                "tokenspeed.runtime.layers.attention.backends.qwen4_exp",
+                "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
                 "Qwen4ExpMambaAttnBackend",
             ),
         ):

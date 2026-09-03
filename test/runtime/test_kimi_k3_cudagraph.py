@@ -32,15 +32,15 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-from tokenspeed.runtime.layers.attention.backends import (
+from tokenspeed.runtime.layers.attention.backends.paged import (
     tokenspeed_mla as tokenspeed_mla_module,
 )
-from tokenspeed.runtime.layers.attention.backends.group_tables import (
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )
-from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
+from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
     CuteDSLMLABackend,
 )
 

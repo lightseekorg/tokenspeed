@@ -48,7 +48,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.backends.group_tables import (
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )
@@ -78,7 +78,9 @@ def _flashmla_spec():
 def _make_flashmla_backend(
     pool, speculative_num_draft_tokens: int = 1, *, is_draft: bool = False
 ):
-    from tokenspeed.runtime.layers.attention.backends.flashmla import FlashMLABackend
+    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+        FlashMLABackend,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 
     spec = _flashmla_spec()
@@ -162,7 +164,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     flashinfer paged-prefill READ (wrapper.plan) needs a live serving wrapper
     state and is validated end-to-end on a real model, not here.
     """
-    from tokenspeed.runtime.layers.attention.backends.flashmla import (
+    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
         _per_token_slot_table,
     )
 

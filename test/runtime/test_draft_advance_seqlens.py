@@ -15,12 +15,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.msa import (
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.msa import (
     MSAAttnBackend,
     MSAHybridAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.trtllm import (
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
     TRTLLMMHAAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (
@@ -196,10 +196,10 @@ def test_capture_seeds_owned_seqlens(backend_cls):
 
 def test_router_fans_advance_out_to_every_leaf():
     """The runner-facing router owns no buffer; it must fan out to leaves."""
-    from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
         CacheGroupGeometry,
     )
-    from tokenspeed.runtime.layers.attention.backends.router import (
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
 
@@ -222,7 +222,7 @@ def test_router_fans_advance_out_to_every_leaf():
 
 def test_hybrid_composite_forwards_advance_to_full_attn_child():
     """Composite backends own no buffer; they must forward to the child."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid import (
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
 

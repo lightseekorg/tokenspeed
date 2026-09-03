@@ -41,8 +41,8 @@ DECODE call raises. There is deliberately no fresh-allocation decode arm
 anywhere. `init_forward_metadata_replay_cuda_graph` no longer exists.
 
 Its extend inputs are one required, keyword-only bundle on every node —
-runner-facing (`base.py`: router, V4, Mamba/KDA, composites) and leaf
-(`paged.py`) alike: `extend_seq_lens`, `extend_seq_lens_cpu`,
+runner-facing (`backends/base.py`: router, V4, Mamba/KDA, composites) and
+leaf (`backends/paged/base.py`) alike: `extend_seq_lens`, `extend_seq_lens_cpu`,
 `extend_prefix_lens`, `extend_prefix_lens_cpu` are plain `torch.Tensor`
 (`[>= num_extends]` entries; empty, never `None`, when there are no
 extend requests) and `extend_with_prefix` is a plain `bool`. No default
@@ -304,6 +304,24 @@ none of this. What unification still can NOT test: mempool reuse and
 hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
 configurations for this reason.
 
+## Backend package layout
+
+`layers/attention/backends/` is organized by the role a node plays in the
+tree, not by model: `base.py` (the runner-facing `AttentionBackend` contract
+and the per-forward `SparseTopKShare`), `support.py` (graded CUDA-graph
+support) and `cache_metadata.py` (the runner's block-table bridge) stay at
+the root; `paged/` holds the block-table route — the `CacheGroupRouter`, its
+geometry / table-stack / write-location helpers, and every kernel-facing
+paged leaf (`base.py` is `PagedAttentionBackend`; MHA, MLA, FlashMLA, TRT-LLM,
+TRT-LLM MLA, TokenSpeed MLA, DSA, MSA); `state/` holds the recurrent and
+side-state consumers (Mamba/GDN, KDA, the QSA verify-commit lifecycle);
+`hybrid/` the layer-routing composite (`linear.py` is
+`HybridLinearAttnBackend`); and `specific/` the bespoke single-model backends
+(DeepSeek V4, Qwen4-Exp's GDN extension, Inkling's dense + conv-state
+wrapper). A new leaf goes under `paged/`, a new state family under
+`state/`; a model-shaped backend earns `specific/` only when it cannot be a
+router with one leaf.
+
 ## One block-table route: router + leaves
 
 The layering between the scheduler's block vocabulary and the kernels' page
@@ -344,7 +362,7 @@ padding requests (`[actual_bs, bs)`) and each group's column tail resolve to
 null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 depend on the views sharing one storage. The slot math lives in
-`write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
+`paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
 raw-table locations bit for bit.
 
@@ -454,7 +472,7 @@ in which tap order — and carries no per-round state.
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
-The write-location kernels stay pure functions (`write_locations.py`);
+The write-location kernels stay pure functions (`paged/write_locations.py`);
 unifying that math with V4's bespoke slot mapping remains the final
 mapping-owner milestone (`cache-concepts.md` Principle 5 — owners are now
 down to the router and V4).
@@ -518,7 +536,8 @@ down to the router and V4).
   graph restrictions are `cuda_graph_support` declarations
   (`test/runtime/test_cudagraph_support_resolution.py`).
 * `grep -rn "def init_forward_metadata_capture_cuda_graph" python/` matches
-  only the defaults (`base.py`, `paged.py`, `router.py`) and the sanctioned
+  only the defaults (`backends/base.py`, `paged/base.py`, `paged/router.py`)
+  and the sanctioned
   overrides listed in "Capture is inherited".
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a

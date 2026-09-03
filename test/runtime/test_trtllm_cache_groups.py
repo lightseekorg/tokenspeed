@@ -24,7 +24,7 @@ register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
 def _import_backend():
-    from tokenspeed.runtime.layers.attention.backends.trtllm import (
+    from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
         TRTLLMMHAAttnBackend,
     )
 

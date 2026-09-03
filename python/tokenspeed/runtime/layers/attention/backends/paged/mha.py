@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.paged import (
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig

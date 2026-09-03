@@ -44,10 +44,10 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged import (
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
+from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,

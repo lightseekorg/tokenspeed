@@ -51,14 +51,14 @@ import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.paged import (
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
     learn_cache_group_geometry,
 )
-from tokenspeed.runtime.layers.attention.backends.group_tables import (
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )

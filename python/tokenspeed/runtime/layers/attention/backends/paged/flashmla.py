@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.paged import (
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.chunk import (

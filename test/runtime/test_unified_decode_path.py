@@ -46,7 +46,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
 
@@ -73,12 +73,12 @@ class _RouterCase(_TorchCase):
     def setUp(self):
         super().setUp()
         try:
-            from tokenspeed.runtime.layers.attention.backends.mha import (
+            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        from tokenspeed.runtime.layers.attention.backends.router import (
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
 
@@ -175,7 +175,7 @@ class FlashMLATileScheduleTest(_TorchCase):
     def setUp(self):
         super().setUp()
         try:
-            from tokenspeed.runtime.layers.attention.backends import flashmla
+            from tokenspeed.runtime.layers.attention.backends.paged import flashmla
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
         from unittest import mock
@@ -353,17 +353,26 @@ class LeafSignatureConformanceTest(_TorchCase):
     """
 
     _LEAF_CLASSES = (
-        ("tokenspeed.runtime.layers.attention.backends.mha", "MHAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.trtllm", "TRTLLMMHAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.mla", "MLAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.trtllm_mla", "TRTLLMMLABackend"),
+        ("tokenspeed.runtime.layers.attention.backends.paged.mha", "MHAAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.paged.msa", "MSAAttnBackend"),
         (
-            "tokenspeed.runtime.layers.attention.backends.tokenspeed_mla",
+            "tokenspeed.runtime.layers.attention.backends.paged.trtllm",
+            "TRTLLMMHAAttnBackend",
+        ),
+        ("tokenspeed.runtime.layers.attention.backends.paged.mla", "MLAAttnBackend"),
+        (
+            "tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla",
+            "TRTLLMMLABackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla",
             "CuteDSLMLABackend",
         ),
-        ("tokenspeed.runtime.layers.attention.backends.flashmla", "FlashMLABackend"),
-        ("tokenspeed.runtime.layers.attention.backends.dsa", "DSABackend"),
+        (
+            "tokenspeed.runtime.layers.attention.backends.paged.flashmla",
+            "FlashMLABackend",
+        ),
+        ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
     )
 
     def _classes(self):
@@ -376,7 +385,7 @@ class LeafSignatureConformanceTest(_TorchCase):
                 self.skipTest(f"needs optional deps for {cls_name}: {exc}")
 
     def test_every_leaf_is_a_paged_attention_backend(self):
-        from tokenspeed.runtime.layers.attention.backends.paged import (
+        from tokenspeed.runtime.layers.attention.backends.paged.base import (
             PagedAttentionBackend,
         )
 
@@ -437,24 +446,33 @@ class RunnerSignatureConformanceTest(_TorchCase):
     """Every runner-facing node accepts the runner's kwarg set."""
 
     _RUNNER_CLASSES = (
-        ("tokenspeed.runtime.layers.attention.backends.router", "CacheGroupRouter"),
-        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAHybridAttnBackend"),
         (
-            "tokenspeed.runtime.layers.attention.backends.deepseek_v4",
+            "tokenspeed.runtime.layers.attention.backends.paged.router",
+            "CacheGroupRouter",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.paged.msa",
+            "MSAHybridAttnBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4",
             "DeepseekV4AttentionBackend",
         ),
         (
-            "tokenspeed.runtime.layers.attention.backends.mamba",
+            "tokenspeed.runtime.layers.attention.backends.state.mamba",
             "MambaAttnBackend",
         ),
         (
-            "tokenspeed.runtime.layers.attention.backends.hybrid",
+            "tokenspeed.runtime.layers.attention.backends.hybrid.linear",
             "HybridLinearAttnBackend",
         ),
-        ("tokenspeed.runtime.layers.attention.backends.kda", "KdaAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.inkling", "InklingAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.state.kda", "KdaAttnBackend"),
         (
-            "tokenspeed.runtime.layers.attention.backends.qwen4_exp",
+            "tokenspeed.runtime.layers.attention.backends.specific.inkling",
+            "InklingAttnBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
             "Qwen4ExpMambaAttnBackend",
         ),
     )

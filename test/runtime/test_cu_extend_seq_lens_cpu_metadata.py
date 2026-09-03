@@ -43,7 +43,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     _build_cu_extend_seq_lens_cpu,
 )
 

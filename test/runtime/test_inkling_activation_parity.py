@@ -170,16 +170,18 @@ class _Harness:
 
     def __init__(self, model, text, device="cuda"):
         from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+        from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
             CacheGroupGeometry,
         )
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvStatePool,
-        )
-        from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
-        from tokenspeed.runtime.layers.attention.backends.router import (
-            CacheGroupRouter,
         )
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig

@@ -122,7 +122,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
 
     def test_mha_kernel_solution_backends_use_mha_backend(self):
-        from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
 
         for backend in ("mha", "fa3", "fa4", "triton", "flashinfer"):
             self.assertIs(
@@ -131,7 +133,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
 
     def test_mla_backend_registered_for_mla(self):
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
 
         self.assertIs(
             registry._get_backend_cls("mla", AttentionArch.MLA),
@@ -139,7 +143,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
 
     def test_gluon_backend_registered_for_mla(self):
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
 
         self.assertIs(
             registry._get_backend_cls("gluon", AttentionArch.MLA),
@@ -149,7 +155,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_gluon_mla_backend_forces_gluon_kernel_solution(self):
         import torch
 
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
@@ -188,7 +196,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_dsa_routes_dense_attention_by_platform(self):
         import dataclasses
 
-        from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+        from tokenspeed.runtime.layers.attention.backends.paged import (
+            dsa as dsa_backend,
+        )
         from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
         config = object()

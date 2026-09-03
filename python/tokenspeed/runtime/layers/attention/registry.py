@@ -433,7 +433,7 @@ def create_paged_router(
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
     """
-    from tokenspeed.runtime.layers.attention.backends.router import (
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
 
@@ -549,7 +549,7 @@ def _create_attn_backend_with_name(
     arch: AttentionArch,
     config: AttnConfig,
 ) -> AttentionBackend:
-    from tokenspeed.runtime.layers.attention.backends.paged import (
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
         PagedAttentionBackend,
     )
 
@@ -638,13 +638,13 @@ def _create_hybrid_linear_attn_backend(
     view over the one shared cache pool; both sub-backends consume its
     per-group tables.
     """
-    from tokenspeed.runtime.layers.attention.backends.hybrid import (
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.kda import (
+    from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
     )
-    from tokenspeed.runtime.layers.attention.backends.mamba import (
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         MambaAttnBackend,
     )
 
@@ -689,7 +689,7 @@ def _create_hybrid_linear_attn_backend(
             config, config.component(SoftmaxAttnConfig), kda_backend=kda_backend
         )
     elif is_qwen4_exp(hf_config):
-        from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+        from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
             Qwen4ExpMambaAttnBackend,
         )
 
@@ -732,7 +732,7 @@ def _wrap_inkling_backend(
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
     """
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-    from tokenspeed.runtime.layers.attention.backends.inkling import (
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
         InklingAttnBackend,
         InklingConvStatePool,
     )

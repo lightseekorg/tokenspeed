@@ -29,7 +29,7 @@ from tokenspeed.runtime.layers import layernorm as layernorm_module
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
-from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )

@@ -5,8 +5,8 @@ from unittest import mock
 
 import torch
 
-from tokenspeed.runtime.layers.attention.backends import trtllm_mla
-from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
+from tokenspeed.runtime.layers.attention.backends.paged import trtllm_mla
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
     calc_padded_blocks,

@@ -81,7 +81,7 @@ class SliceMhaExtendInputsTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends import mha
+            from tokenspeed.runtime.layers.attention.backends.paged import mha
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
@@ -113,7 +113,7 @@ class TrimKvToLocsTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.mha import (
+            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
                 trim_kv_to_locs,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -287,7 +287,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         even with the prefill graph disabled."""
         import torch
 
-        from tokenspeed.runtime.layers.attention.backends.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             compute_state_block_indices,
         )
 
@@ -329,7 +329,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         mapping point: the router's ``GroupTableStacks`` expands the raw row
         to the leaf's ``max_num_pages``. Pin that, or the contract the
         deleted width flag protected has no test."""
-        from tokenspeed.runtime.layers.attention.backends.group_tables import (
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
             GroupTableSpec,
             GroupTableStacks,
         )
@@ -700,7 +700,7 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends import trtllm
+            from tokenspeed.runtime.layers.attention.backends.paged import trtllm
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
@@ -725,7 +725,7 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         # The family claim moved off the leaves: the runner-facing node in
         # front of every trtllm leaf is the CacheGroupRouter, whose base
         # declaration is the history family.
-        from tokenspeed.runtime.layers.attention.backends.router import (
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
 

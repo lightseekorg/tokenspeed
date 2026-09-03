@@ -51,7 +51,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tokenspeed.runtime.layers.attention.backends.write_locations import (
+from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
     extend_write_locations,
 )

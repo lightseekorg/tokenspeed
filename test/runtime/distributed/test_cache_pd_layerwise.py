@@ -656,7 +656,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
 ) -> None:
     import torch
 
-    from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_backend
 
     events = []
     backend = object.__new__(dsa_backend.DSABackend)

@@ -26,10 +26,10 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.types import DpForwardMetadata
-from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
-from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 
 FULL = "full_attention"
 

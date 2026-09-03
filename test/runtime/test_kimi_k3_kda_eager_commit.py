@@ -14,8 +14,8 @@ from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from types import SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace

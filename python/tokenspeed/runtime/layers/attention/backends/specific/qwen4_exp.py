@@ -28,10 +28,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.qsa import bind_qsa_indexers
+from tokenspeed.runtime.layers.attention.backends.state.qsa import bind_qsa_indexers
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     qwen4_exp_ple_conv_field,

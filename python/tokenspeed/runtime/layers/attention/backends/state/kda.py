@@ -50,7 +50,7 @@ from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
 )
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
 )

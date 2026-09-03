@@ -29,7 +29,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.trtllm import (
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
     TRTLLMMHAAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig

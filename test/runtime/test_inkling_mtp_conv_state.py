@@ -29,7 +29,7 @@ def _inert_publish(bs, dim, rows=3):
 
 class TestInklingCacheContract(unittest.TestCase):
     def test_wrapper_consumes_history_and_checkpoint_state(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
         )
 
@@ -45,7 +45,7 @@ class TestInklingCacheContract(unittest.TestCase):
         )
 
     def test_remote_restore_pending_is_consumed_once_and_cleared_on_reuse(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvStatePool,
         )
@@ -79,7 +79,7 @@ class TestInklingCacheContract(unittest.TestCase):
         )
 
     def test_non_aligned_endpoint_checkpoint_round_trip(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvMetadata,
         )
@@ -141,7 +141,7 @@ class TestInklingConvRingState(unittest.TestCase):
     LAYERS = 3
 
     def _make_pool(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingConvStatePool,
         )
 
@@ -169,7 +169,7 @@ class TestInklingConvRingState(unittest.TestCase):
         """Instance-level registration API: idempotent re-register with the
         same buffers, error on changed storage. (Regression: an orphaned
         @staticmethod once unbound this method and broke server startup.)"""
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
         )
 
@@ -706,7 +706,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         same frontier for its seq_lens/write-loc re-anchor."""
         from types import SimpleNamespace
 
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvMetadata,
         )
@@ -742,7 +742,7 @@ class TestCheckpointMetadata(unittest.TestCase):
     def test_update_draft_forward_metadata_reanchors_seq_lens(self):
         """The MTP re-anchor must replace the leaf's decode seq_lens with the
         committed frontier (the drafter supplies its own write locations)."""
-        from tokenspeed.runtime.layers.attention.backends.mha import (
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
             MHAAttnBackend,
             MHADecodeMetadata,
         )

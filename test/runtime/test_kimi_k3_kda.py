@@ -54,9 +54,9 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends import kda, mamba
-from tokenspeed.runtime.layers.attention.backends.kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state import kda, mamba
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     compute_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -956,7 +956,7 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
     """Fresh sequences must not inherit a recycled page's stale bytes as
     their initial recurrent state: only the row that resumes real history
     keeps the gathered snapshot, and no row reads physical page 0."""
-    from tokenspeed.runtime.layers.attention.backends.mamba import (
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         _prepare_cache_prefill_state_inputs,
     )
 
