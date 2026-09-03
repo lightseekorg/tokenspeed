@@ -87,6 +87,19 @@ class BaseDrafter:
                 speculates for.
         """
 
+    def prepare_target_forward(self, ctx: ForwardContext) -> None:
+        """Hook before the round's target forward.
+
+        Called by ``ModelExecutor`` with the context the target is about to
+        run under. A drafter that wants work done while the target runs
+        attaches it to ``ctx`` here (DFLASH attaches its incremental capture
+        sink, ``ctx.target_capture_sink``); the context is per forward, so
+        nothing attached outlives the round. The default needs nothing.
+
+        Args:
+            ctx: The target forward's context.
+        """
+
     @abstractmethod
     def run(
         self,

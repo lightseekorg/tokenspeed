@@ -27,7 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import ForwardContext, TargetCaptureSink
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -71,12 +71,9 @@ class BaseTransformerModel(nn.Module):
         self.layers = self.resolve_layers(config, quant_config, prefix)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: list[int] = []
-        # DFLASH incremental projection, populated by
-        # set_dflash_layers_to_capture().
+        # DFLASH: each capture layer's positional tap index (the draft
+        # concatenates taps in this order); set_dflash_layers_to_capture().
         self._dflash_capture_idx_map: dict[int, int] = {}
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs: list[torch.Tensor] | None = None
-        self._dflash_incr_active = False
 
         self._compile_decoder_stack()
 
@@ -161,23 +158,20 @@ class BaseTransformerModel(nn.Module):
         )
 
     def _notify_dflash_capture(
-        self, layer_idx: int, aux_hidden_states: list[torch.Tensor]
+        self,
+        sink: TargetCaptureSink,
+        layer_idx: int,
+        aux_hidden_states: list[torch.Tensor],
     ) -> None:
-        """Hand the capture layer ``layer_idx`` just appended to the drafter.
+        """Hand the tap capture layer ``layer_idx`` just appended to the
+        forward's sink.
 
         An idle forward skips the attention block, so nothing was appended.
         """
-        callback = self._dflash_incremental_callback
-        slot_bufs = self._dflash_slot_bufs
         capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-        if callback is None or slot_bufs is None or capture_idx is None:
+        if capture_idx is None or len(aux_hidden_states) != capture_idx + 1:
             return
-        if len(aux_hidden_states) != capture_idx + 1:
-            return
-        captured = aux_hidden_states[capture_idx]
-        num_tokens = captured.shape[0]
-        slot_bufs[capture_idx][:num_tokens].copy_(captured)
-        callback(capture_idx, num_tokens)
+        sink.on_target_capture(capture_idx, aux_hidden_states[capture_idx])
 
     def forward(
         self,
@@ -229,8 +223,10 @@ class BaseTransformerModel(nn.Module):
                     aux_hidden_states=aux_hidden_states if capture else None,
                 )
 
-            if capture and self._dflash_incr_active:
-                self._notify_dflash_capture(i, aux_hidden_states)
+            if capture and ctx.target_capture_sink is not None:
+                self._notify_dflash_capture(
+                    ctx.target_capture_sink, i, aux_hidden_states
+                )
 
         if not ctx.forward_mode.is_idle():
 

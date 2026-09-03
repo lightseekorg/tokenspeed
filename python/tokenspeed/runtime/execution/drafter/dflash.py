@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -40,6 +41,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
     _force_deterministic_rsag,
@@ -248,16 +250,7 @@ class DFlash(BaseDrafter):
                 "DFLASH requires the target model to support "
                 "set_dflash_layers_to_capture."
             )
-        incr_callback = None
-        incr_slot_bufs = None
-        if self._incremental_proj_enabled:
-            incr_callback = self._on_capture_slot_ready
-            incr_slot_bufs = self._incr_slot_bufs
-        target_model.set_dflash_layers_to_capture(
-            self.target_layer_ids,
-            incremental_callback=incr_callback,
-            slot_bufs=incr_slot_bufs,
-        )
+        target_model.set_dflash_layers_to_capture(self.target_layer_ids)
         self._wire_aux_hidden_stream(target_model)
 
     def _wire_aux_hidden_stream(self, target_model) -> None:
@@ -814,27 +807,64 @@ class DFlash(BaseDrafter):
             logger.warning("DFLASH incremental projection init failed: %s", e)
             self._incremental_proj_enabled = False
 
-    def _prepare_incremental_proj(
-        self, num_tokens: int, positions: torch.Tensor, cache_locs: torch.Tensor
-    ) -> None:
-        self._incr_num_tokens = num_tokens
-        self._incr_positions = positions
-        self._incr_cache_locs = cache_locs
-        self._incremental_kv_write_done = False
-        self._incr_acc_buf[:num_tokens].zero_()
-        self.target_language_model.model._dflash_incr_active = True
+    def _overlap_allowed(self, ctx: ForwardContext) -> bool:
+        """Whether this round's draft KV write may run on the aux stream
+        alongside the target / the draft: decode-only rows (the target's
+        verify window is the round's full write vector), the fused writer,
+        and not the graph warmup phase — capture-only auxiliary branches warm
+        serially there and are recorded only under capture."""
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        return (
+            ctx.num_extends == 0
+            and self._fused_kv_enabled
+            and self._kv_aux_stream is not None
+            and (capturing or not get_is_cuda_graph_phase())
+        )
 
-    def _on_capture_slot_ready(self, capture_idx: int, num_tokens: int) -> None:
+    @override
+    def prepare_target_forward(self, ctx: ForwardContext) -> None:
+        """Arm the incremental projection for a round the draft will overlap
+        with the target: the target hands each captured tap to
+        :meth:`on_target_capture` as it is produced, so the draft's KV is
+        written under the target's remaining layers and ``run`` finds it done.
+        Everything the sink needs is fixed here, for this forward only.
+        """
+        self._incremental_kv_write_done = False
+        if not (self._incremental_proj_enabled and self._overlap_allowed(ctx)):
+            return
+        num_tokens = ctx.input_num_tokens
+        self._incr_num_tokens = num_tokens
+        self._incr_positions = self.input_buffers.positions_buf[:num_tokens]
+        self._incr_cache_locs = ctx.attn_backend.decode_window_locations()[:num_tokens]
+        self._incr_acc_buf[:num_tokens].zero_()
+        ctx.target_capture_sink = self
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        """Fold tap ``capture_idx`` into the draft's projection on the aux
+        stream (``fc`` over the concatenated taps is the sum of per-tap
+        GEMMs); the last tap completes the KV write and records the join
+        event the draft forward waits on."""
+        num_tokens = hidden.shape[0]
+        if num_tokens != self._incr_num_tokens:
+            raise RuntimeError(
+                f"DFLASH target capture {capture_idx} carries {num_tokens} rows, "
+                f"but this forward was armed for {self._incr_num_tokens}"
+            )
+        # Own the rows before the aux stream reads them: the target frees or
+        # rewrites its activation as its layers proceed.
+        slot = self._incr_slot_bufs[capture_idx][:num_tokens]
+        slot.copy_(hidden)
         event = self._incr_capture_events[capture_idx]
         event.record(torch.cuda.current_stream())
 
         with torch.cuda.stream(self._kv_aux_stream):
             self._kv_aux_stream.wait_event(event)
-            hidden = self._incr_slot_bufs[capture_idx][:num_tokens]
             acc = self._incr_acc_buf[:num_tokens]
             torch.addmm(
                 acc,
-                hidden,
+                slot,
                 self._incr_sub_weights_t[capture_idx],
                 beta=1.0,
                 alpha=1.0,
@@ -1070,21 +1100,10 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.forward_step import (
-            get_is_cuda_graph_phase,
-        )
-
-        decode_only = base_ctx.num_extends == 0
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        can_overlap = (
-            decode_only
-            and self._fused_kv_enabled
-            and self._kv_aux_stream is not None
-            and (capturing or not get_is_cuda_graph_phase())
-        )
-        if can_overlap:
+        # The same gate prepare_target_forward armed the incremental
+        # projection under, so _run_overlap's "already written" check can
+        # only ever see this round's result.
+        if self._overlap_allowed(base_ctx):
             return self._run_overlap(
                 base_ctx, logits_output, output_tokens, accept_lengths
             )

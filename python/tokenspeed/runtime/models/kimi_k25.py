@@ -280,23 +280,14 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
             )
         self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Set the layers to capture for DFLASH draft model training."""
         if not hasattr(self.language_model, "set_dflash_layers_to_capture"):
             raise AttributeError(
                 "language_model does not support DFLASH layer capture."
             )
 
-        self.language_model.set_dflash_layers_to_capture(
-            layer_ids,
-            incremental_callback=incremental_callback,
-            slot_bufs=slot_bufs,
-        )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
 
     def get_input_embeddings(self):
         if hasattr(self.language_model, "get_input_embeddings"):

@@ -879,18 +879,8 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
-        if (
-            self.drafter is not None
-            and getattr(self.drafter, "_incremental_proj_enabled", False)
-            and ctx.num_extends == 0
-        ):
-            self.drafter._prepare_incremental_proj(
-                ctx.input_num_tokens,
-                self.input_buffers.positions_buf[: ctx.input_num_tokens],
-                # Decode-only rounds (the num_extends == 0 gate above): the
-                # target's verify window is the round's full write vector.
-                self.attn_backend.decode_window_locations()[: ctx.input_num_tokens],
-            )
+        if self.drafter is not None:
+            self.drafter.prepare_target_forward(ctx)
 
         logits_output = self._run_target_forward(ctx)
 
@@ -902,11 +892,6 @@ class ModelExecutor:
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
             return output_tokens, accept_lengths, None
-
-        if self.drafter is not None and getattr(
-            self.drafter, "_incremental_proj_enabled", False
-        ):
-            self.drafter.target_language_model.model._dflash_incr_active = False
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)

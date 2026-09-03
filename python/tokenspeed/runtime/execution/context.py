@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -34,6 +34,20 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
+
+class TargetCaptureSink(Protocol):
+    """A drafter's per-forward consumer of the target's captured taps.
+
+    The target model calls it from inside its layer loop, once per capture
+    layer in ascending layer order, as soon as that tap exists — so the
+    drafter can start work on it under the target's remaining layers.
+    """
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        """Consume capture ``capture_idx`` (the draft's positional tap index)
+        for the forward's ``[num_tokens, hidden]`` rows, gathered across
+        attention TP."""
 
 
 @dataclass
@@ -73,6 +87,10 @@ class ForwardContext:
     draft_seq_lens_buf: torch.Tensor | None = None
     # accept_lengths: per-request accepted verify width for cache_seqlens correction.
     accept_lengths: torch.Tensor | None = None
+    # The drafter's consumer of this target forward's captured taps, attached
+    # by the drafter (prepare_target_forward) for the rounds it overlaps with
+    # the target; None means the taps are only collected in aux_hidden_states.
+    target_capture_sink: TargetCaptureSink | None = None
 
     # Sparse-attention top-k shared across layers and draft steps (DSA/QSA).
     dsa_prefill_topk: Any | None = None

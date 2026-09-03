@@ -388,6 +388,25 @@ buffer; `fill_input_buffers` takes no table.
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
 
+## Per-forward drafter work rides on the context
+
+What a drafter wants done *during* the target forward is a property of that
+forward, so it travels on `ForwardContext` — never as mutable state on the
+target model that someone must remember to reset. The executor's only
+seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
+target runs: the drafter decides under its own gate whether this round
+qualifies and attaches what it needs; a fresh context per round means
+nothing outlives it, and a model that sees no attachment does nothing.
+DFLASH is the one user: its incremental projection attaches
+`ctx.target_capture_sink`, the target hands each captured tap to
+`on_target_capture` as it is produced, and the sink accumulates the
+draft's `fc` projection on the aux stream so the draft KV is written under
+the target's remaining layers. The arming gate is the same
+`_overlap_allowed` the drafter's `run` decides the overlap path by, so a
+round can never be armed on one side and drained on the other. Model-side
+capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
+in which tap order — and carries no per-round state.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
@@ -411,6 +430,13 @@ down to the router and V4).
   every address the capture recorded in place under the guard, the `cache`
   slot's group tables included, for the target's packed views and the
   draft's borrowed step views.
+* `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
+  target-forward hook: DFLASH arms its capture sink on the context only
+  under its overlap gate (not on mixed rounds, not in graph warmup), the
+  sink folds the taps into the projection and writes the KV once; the
+  executor calls the hook before the target forward
+  (`test_model_executor_cache_state.py`); the target hands taps to the
+  forward's sink in concat order (`test_dspark_config.py`).
 * `test/runtime/test_cache_group_router.py` — router slot math, expansion,
   padding, placeholder delivery, per-group dispatch, draft window
   publication and address stability.

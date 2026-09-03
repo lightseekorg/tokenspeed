@@ -109,7 +109,9 @@ def test_draft_final_step_follows_the_complete_drafter_run():
 
     class _Drafter:
         supports_pd_layerwise_finalization = True
-        _incremental_proj_enabled = False
+
+        def prepare_target_forward(self, ctx):
+            events.append("prepare-target")
 
         def run(self, **_kwargs):
             events.extend(("draft-write-0", "draft-write-1", "draft-return"))
@@ -150,6 +152,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
 
     assert events == [
+        "prepare-target",
         "draft-write-0",
         "draft-write-1",
         "draft-return",
