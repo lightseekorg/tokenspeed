@@ -35,6 +35,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -112,16 +113,9 @@ class DeepseekV4DSpark(BaseDrafter):
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
         self.block_size = int(self.model.block_size)
-        if int(spec_num_tokens) != self.block_size + 1:
-            raise ValueError(
-                "DSPARK verify width must equal checkpoint block_size + 1; "
-                f"got verify_width={spec_num_tokens}, block_size={self.block_size}."
-            )
-        if int(spec_num_steps) != self.block_size:
-            raise ValueError(
-                "DSPARK speculative steps must equal checkpoint block_size; "
-                f"got steps={spec_num_steps}, block_size={self.block_size}."
-            )
+        validate_block_widths(
+            "DSPARK", self.block_size, spec_num_steps, spec_num_tokens
+        )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
         self.idle_forward_steps = 1

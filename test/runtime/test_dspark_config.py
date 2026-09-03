@@ -15,12 +15,14 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.model_config import _apply_block_spec_widths
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
     _resolve_block_geometry,
     _resolve_draft_query_width,
 )
+from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
@@ -33,18 +35,16 @@ from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_RULES,
+    read_checkpoint_block_size,
+    resolve_block_widths,
+    validate_block_widths,
+)
 
 # --------------------------------------------------------------------------
-# Block geometry: verify width vs draft block size
+# Draft query width and cache dtype
 # --------------------------------------------------------------------------
-
-
-def test_geometry_splits_verify_width_from_draft_count() -> None:
-    """spec_num_tokens is the verify width; drafts are one fewer."""
-    verify_width, draft_block_size = _resolve_block_geometry(
-        SimpleNamespace(), spec_num_tokens=8
-    )
-    assert (verify_width, draft_block_size) == (8, 7)
 
 
 def test_dspark_queries_one_row_per_draft_token() -> None:
@@ -86,38 +86,147 @@ def test_other_mla_drafts_keep_the_requested_cache_dtype() -> None:
     )
 
 
-def test_geometry_accepts_torchspec_draft_count_convention() -> None:
-    """DSpark/TorchSpec checkpoints store the draft count (7 for K3)."""
-    cfg = SimpleNamespace(block_size=7)
-    assert _resolve_block_geometry(cfg, spec_num_tokens=8) == (8, 7)
+# --------------------------------------------------------------------------
+# The one rule: checkpoint block size -> launch widths
+# --------------------------------------------------------------------------
 
 
-def test_geometry_accepts_legacy_dflash_verify_width_convention() -> None:
-    """Older DFlash checkpoints store the verify width instead."""
-    cfg = SimpleNamespace(block_size=8)
-    assert _resolve_block_geometry(cfg, spec_num_tokens=8) == (8, 7)
+@pytest.mark.parametrize(
+    ("algorithm", "block_size", "expected"),
+    (
+        ("DSPARK", 5, (5, 6)),
+        ("DSPARK", 7, (7, 8)),
+        ("DFLASH", 8, (7, 8)),
+        ("DFLASH", 16, (15, 16)),
+    ),
+)
+def test_block_widths_follow_the_family_convention(
+    algorithm: str, block_size: int, expected: tuple[int, int]
+) -> None:
+    """DSpark stores the draft count; DFlash stores the verify width."""
+    assert resolve_block_widths(algorithm, block_size) == expected
 
 
-def test_geometry_reads_nested_dflash_config() -> None:
-    cfg = SimpleNamespace(dflash_config={"block_size": 7})
-    assert _resolve_block_geometry(cfg, spec_num_tokens=8) == (8, 7)
+def test_block_widths_reject_a_block_that_drafts_nothing() -> None:
+    with pytest.raises(ValueError, match=r"drafts nothing"):
+        resolve_block_widths("DFLASH", 1)
 
 
-def test_geometry_rejects_true_mismatch_with_actionable_message() -> None:
-    """A block_size matching neither convention is a launch error, not a warning."""
-    cfg = SimpleNamespace(block_size=5)
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    (
+        (SimpleNamespace(dspark_block_size=5), 5),
+        (SimpleNamespace(block_size=5), 5),
+        (SimpleNamespace(dflash_config={"block_size": 5}), 5),
+        (SimpleNamespace(dspark_config={"block_size": 5}), 5),
+        # A nested block size wins over a top-level one.
+        (SimpleNamespace(dflash_config={"block_size": 5}, block_size=9), 5),
+        # A checkpoint that declares none.
+        (SimpleNamespace(), None),
+    ),
+)
+def test_checkpoint_block_size_is_read_from_every_spelling(cfg, expected) -> None:
+    assert read_checkpoint_block_size(cfg) == expected
+
+
+def test_validate_holds_each_family_to_its_own_convention() -> None:
+    """The same block_size means different widths per family, and only one."""
+    validate_block_widths("DSPARK", 7, num_steps=7, num_draft_tokens=8)
+    validate_block_widths("DFLASH", 8, num_steps=7, num_draft_tokens=8)
+
     with pytest.raises(ValueError) as excinfo:
-        _resolve_block_geometry(cfg, spec_num_tokens=8)
+        validate_block_widths("DSPARK", 8, num_steps=7, num_draft_tokens=8)
     message = str(excinfo.value)
-    assert "block_size=5" in message
-    # The remedy names the flag and the value that would work.
-    assert "--speculative-num-draft-tokens 6" in message
+    # The remedy names both flags, their working values, and the rule.
+    assert "block_size=8" in message
+    assert "--speculative-num-steps 8" in message
+    assert "--speculative-num-draft-tokens 9" in message
+    assert BLOCK_SPEC_RULES in message
+
+
+# --------------------------------------------------------------------------
+# The drafter resolves its geometry through that rule
+# --------------------------------------------------------------------------
+
+
+def test_geometry_applies_the_family_convention() -> None:
+    """spec_num_tokens is the verify width; drafts are one fewer."""
+    assert _resolve_block_geometry(SimpleNamespace(), spec_num_tokens=8) == (8, 7)
+    assert _resolve_block_geometry(
+        SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DSPARK"
+    ) == (8, 7)
+    assert _resolve_block_geometry(SimpleNamespace(block_size=8), 8) == (8, 7)
+    assert _resolve_block_geometry(
+        SimpleNamespace(dflash_config={"block_size": 8}), 8
+    ) == (8, 7)
+
+    with pytest.raises(ValueError, match=r"--speculative-num-steps 6"):
+        _resolve_block_geometry(SimpleNamespace(block_size=7), spec_num_tokens=8)
 
 
 def test_geometry_rejects_degenerate_verify_width() -> None:
     """A verify window with no room for a draft is not block decoding."""
     with pytest.raises(ValueError, match=r">= 2"):
         _resolve_block_geometry(SimpleNamespace(), spec_num_tokens=1)
+
+
+def test_drafters_declare_their_checkpoint_convention() -> None:
+    """DFlash2 launches as DFLASH, so it inherits the DFlash convention."""
+    assert DFlash.spec_algorithm == "DFLASH"
+    assert DFlash2.spec_algorithm == "DFLASH"
+    assert DSpark.spec_algorithm == "DSPARK"
+
+
+# --------------------------------------------------------------------------
+# ModelConfig applies that rule to the launch flags
+# --------------------------------------------------------------------------
+
+
+def _spec_args(algorithm: str, *, steps: int, draft_tokens: int, explicit: bool):
+    return SimpleNamespace(
+        speculative_algorithm=algorithm,
+        speculative_num_steps=steps,
+        speculative_num_draft_tokens=draft_tokens,
+        _speculative_widths_explicit=explicit,
+    )
+
+
+def test_model_config_sets_defaulted_widths_from_the_checkpoint() -> None:
+    args = _spec_args("DSPARK", steps=3, draft_tokens=4, explicit=False)
+    cfg = SimpleNamespace(block_size=7)
+
+    assert _apply_block_spec_widths(args, cfg, cfg) == 7
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (7, 8)
+
+
+def test_model_config_checks_explicit_widths_against_the_checkpoint() -> None:
+    """A DFlash block_size of 8 is 7 steps; 8 steps is the DSpark reading."""
+    cfg = SimpleNamespace(dflash_config={"block_size": 8})
+
+    args = _spec_args("DFLASH", steps=7, draft_tokens=8, explicit=True)
+    assert _apply_block_spec_widths(args, cfg, cfg) == 8
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (7, 8)
+
+    with pytest.raises(ValueError, match=r"--speculative-num-steps 7"):
+        _apply_block_spec_widths(
+            _spec_args("DFLASH", steps=8, draft_tokens=9, explicit=True), cfg, cfg
+        )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "cfg"),
+    (
+        # Nothing to check against.
+        ("DSPARK", SimpleNamespace()),
+        # Not a block drafter.
+        ("EAGLE3", SimpleNamespace(block_size=8)),
+    ),
+)
+def test_model_config_leaves_widths_alone(algorithm: str, cfg) -> None:
+    args = _spec_args(algorithm, steps=7, draft_tokens=8, explicit=True)
+
+    assert _apply_block_spec_widths(args, cfg, cfg) is None
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (7, 8)
 
 
 # --------------------------------------------------------------------------

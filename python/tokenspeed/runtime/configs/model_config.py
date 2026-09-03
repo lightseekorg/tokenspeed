@@ -45,6 +45,12 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    read_checkpoint_block_size,
+    resolve_block_widths,
+    validate_block_widths,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -316,6 +322,41 @@ def _is_dflash2_mla(
     )
 
 
+def _apply_block_spec_widths(
+    server_args: ServerArgs,
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> int | None:
+    """Reconcile the block-drafter launch widths with the draft checkpoint.
+
+    Args:
+        server_args: Server args whose speculative widths are checked, or set
+            when they were left at their defaults.
+        hf_config: The draft checkpoint's config.
+        hf_text_config: Its text config, searched first.
+
+    Returns:
+        The checkpoint's block size, or None when it declares none.
+    """
+    algorithm = getattr(server_args, "speculative_algorithm", None)
+    if algorithm not in BLOCK_SPEC_ALGORITHMS:
+        return None
+    block_size = read_checkpoint_block_size(hf_text_config, hf_config)
+    if block_size is None:
+        return None
+    if getattr(server_args, "_speculative_widths_explicit", True):
+        validate_block_widths(
+            algorithm,
+            block_size,
+            server_args.speculative_num_steps,
+            server_args.speculative_num_draft_tokens,
+        )
+    num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
+    server_args.speculative_num_steps = num_steps
+    server_args.speculative_num_draft_tokens = num_draft_tokens
+    return block_size
+
+
 def _apply_attention_family_defaults(
     server_args: ServerArgs,
     spec: _AttentionFamilySpec,
@@ -396,6 +437,11 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.spec_block_size: int | None = None
+        if is_draft_worker:
+            self.spec_block_size = _apply_block_spec_widths(
+                server_args, self.hf_config, self.hf_text_config
+            )
         self.dspark_prefix_replay_tokens: int | None = None
         if (
             is_draft_worker
@@ -407,6 +453,11 @@ class ModelConfig:
                 count_dspark_stages,
             )
 
+            if self.spec_block_size is None:
+                raise ValueError(
+                    "DSPARK same-checkpoint decoding requires the checkpoint to "
+                    "declare dspark_block_size."
+                )
             dspark_window_size = int(
                 getattr(
                     self.hf_text_config,
@@ -431,15 +482,6 @@ class ModelConfig:
             self.hf_text_config.dspark_num_stages = dspark_num_stages
             if self.hf_config is not self.hf_text_config:
                 self.hf_config.dspark_num_stages = dspark_num_stages
-            trained_verify_width = int(self.hf_text_config.dspark_block_size) + 1
-            requested_verify_width = int(server_args.speculative_num_draft_tokens)
-            if requested_verify_width != trained_verify_width:
-                raise ValueError(
-                    "DSPARK target verify width must equal checkpoint block_size + 1; "
-                    f"expected {trained_verify_width}, got {requested_verify_width}."
-                )
-            server_args.speculative_num_steps = trained_verify_width - 1
-            server_args.speculative_num_draft_tokens = trained_verify_width
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)

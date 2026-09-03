@@ -1446,6 +1446,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             mapping=None,
             speculative_algorithm="DSPARK",
             enable_prefix_caching=True,
+            speculative_num_steps=5,
             speculative_num_draft_tokens=6,
             prefix_granularity=256,
             load_format="auto",
