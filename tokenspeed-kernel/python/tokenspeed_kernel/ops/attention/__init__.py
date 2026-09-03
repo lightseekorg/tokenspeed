@@ -5507,6 +5507,89 @@ def kda_replay_commit_supported(
 
 
 # ===-----------------------------------------------------------------------===#
+# QSA Sparse Attention
+# ===-----------------------------------------------------------------------===#
+
+
+def qsa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int = 1,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Attend to a per-query list of physical QSA KV-cache slots.
+
+    Args:
+        q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
+        k_cache: Flattened key cache shaped
+            ``[cache_slots, kv_heads, head_dim]``.
+        v_cache: Flattened value cache shaped
+            ``[cache_slots, kv_heads, value_head_dim]``.
+        selected_slots: Physical cache slots shaped ``[tokens, budget]``;
+            non-positive values are ignored.
+        scale: Softmax scale applied to query-key scores.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and ``spec_num_tokens`` for compact
+            speculative decode.
+        k_scale: Optional scalar FP8 key descale.
+        v_scale: Optional scalar FP8 value descale.
+        override: Optional registered kernel name or solution override.
+        solution: Optional kernel solution selected through normal capability
+            and shape filtering.
+
+    Returns:
+        Attention output shaped
+        ``[tokens, query_heads, value_head_dim]`` with the query dtype.
+    """
+
+    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
+        raise ValueError("QSA sparse attention expects rank-three Q/K/V tensors")
+    if selected_slots.ndim != 2 or selected_slots.shape[0] != q.shape[0]:
+        raise ValueError("QSA selected slots must have one row per query token")
+    if max_seqlen_q < 1:
+        raise ValueError("QSA max_seqlen_q must be positive")
+    if q.shape[0] % max_seqlen_q:
+        raise ValueError("QSA query rows must be divisible by max_seqlen_q")
+    if q.shape[0] == 0:
+        return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
+    traits = {
+        "batch_size": q.shape[0] // max_seqlen_q,
+        "q_len": max_seqlen_q,
+        "head_dim": q.shape[-1],
+        "value_head_dim": v_cache.shape[-1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "selected_width": selected_slots.shape[1],
+    }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    kernel = select_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        scale=scale,
+        max_seqlen_q=max_seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
 # Attention Utilities
 # ===-----------------------------------------------------------------------===#
 
@@ -5585,6 +5668,7 @@ def attn_merge_state(
 # isort: off
 import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: E402,F401
@@ -5648,5 +5732,6 @@ __all__ = [
     "resolve_kda_batched_replay_commit",
     "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
+    "qsa_sparse_attention",
     "attn_merge_state",
 ]
