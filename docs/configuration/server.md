@@ -191,9 +191,18 @@ block instead of one token per step, so their two token counts are coupled.
 `--speculative-num-draft-tokens` is the verify width -- one anchor row plus one
 row per drafted token -- and `--speculative-num-steps` must be one less. The
 draft checkpoint's `block_size` fixes both, and a mismatch is rejected at
-startup rather than silently drafting a wrong-width block. A checkpoint with
-`block_size: 8` therefore wants `--speculative-num-draft-tokens 8
---speculative-num-steps 7`.
+startup rather than silently drafting a wrong-width block. The two families
+spell that `block_size` differently:
+
+- DSpark checkpoints store the drafted token count, so `block_size`
+  (`dspark_block_size` on same-checkpoint DSpark) equals
+  `--speculative-num-steps`. `block_size: 8` wants `--speculative-num-steps 8
+  --speculative-num-draft-tokens 9`.
+- DFlash and DFlash2 checkpoints store the verify width, so `block_size` equals
+  `--speculative-num-steps + 1`. `block_size: 8` wants
+  `--speculative-num-steps 7 --speculative-num-draft-tokens 8`.
+
+A checkpoint that declares no `block_size` leaves both flags as given.
 
 A checkpoint whose architecture is `DFlash2DraftModel` uses the same `DFLASH`
 launch method. TokenSpeed selects its grouped-convolution and candidate-selector

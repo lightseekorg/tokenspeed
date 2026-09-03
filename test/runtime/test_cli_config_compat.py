@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import BLOCK_SPEC_RULES
 
 
 class TestCLIConfigCompat(unittest.TestCase):
@@ -623,6 +624,50 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(server_args.speculative_draft_model_path, "draft-checkpoint")
         self.assertEqual(server_args.speculative_num_steps, 5)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_block_spec_widths_record_whether_they_were_asked_for(self):
+        """ModelConfig only overwrites the widths the user left defaulted."""
+        for extra, explicit in (
+            ([], False),
+            (["--speculative-num-steps", "7"], True),
+            (["--speculative-num-draft-tokens", "8"], True),
+            (
+                [
+                    "--speculative-config",
+                    '{"method":"dflash","num_speculative_tokens":8}',
+                ],
+                True,
+            ),
+        ):
+            with self.subTest(extra=extra):
+                args = self._parse_args(
+                    ["--model", "test/model", "--speculative-algorithm", "DFLASH"]
+                    + extra
+                )
+                sa = self._from_cli_args_no_init(args)
+                sa.resolve_basic_defaults()
+
+                self.assertEqual(sa._speculative_widths_explicit, explicit)
+
+    def test_block_spec_step_mismatch_states_the_family_rules(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--speculative-num-steps",
+                "7",
+                "--speculative-num-draft-tokens",
+                "7",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+
+        with self.assertRaises(ValueError) as ctx:
+            sa.resolve_speculative_decoding()
+        self.assertIn(BLOCK_SPEC_RULES, str(ctx.exception))
 
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])

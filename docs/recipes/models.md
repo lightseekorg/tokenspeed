@@ -117,9 +117,9 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --moe-backend flashinfer_trtllm \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path nvidia/MiniMax-M3-DSpark \
-    --speculative-num-steps 7 \
+    --speculative-num-steps 8 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 8 \
+    --speculative-num-draft-tokens 9 \
     --disable-kvstore \
     --block-size 128 \
     --trust-remote-code \
@@ -129,11 +129,13 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
 
 Notes:
 
-- Launch this checkpoint with `--speculative-num-draft-tokens 8` and
-  `--speculative-num-steps 7`: the verify window is one anchor row plus seven
-  draft queries, and the step count is always the verify width minus one. The
-  width is checked against the checkpoint's `block_size` at startup, so a
-  mismatched launch fails fast instead of drafting a wrong-width block.
+- This checkpoint's `block_size` is 8, and a DSpark `block_size` is the drafted
+  token count, so launch it with `--speculative-num-steps 8` and
+  `--speculative-num-draft-tokens 9`: the verify window is one anchor row plus
+  eight draft queries. Both widths are checked against the checkpoint at
+  startup, so a mismatched launch fails fast instead of drafting a wrong-width
+  block. See [Speculative Decoding](../configuration/server.md#speculative-decoding)
+  for the DSpark and DFlash conventions.
 - `--block-size 128` is the target's MSA page size. The draft writes its KV at
   the target's cache locations and shares the target's page table, so it
   inherits that page size; do not set a separate draft block size.
@@ -146,10 +148,12 @@ Notes:
 - The draft checkpoint stores fp32 master weights. It is loaded in the target's
   dtype rather than the standalone fp32-to-fp16 default, because the two
   exchange hidden states and share the target's embedding and LM head.
-- Measured on 4x GB200 with the launch above: gsm8k `mean_acc` 0.9727 versus
-  0.9773 without speculative decoding (paired disagreement 3 vs 9, McNemar
-  p ~ 0.15 -- within run-to-run noise), at a mean accepted length of 4.99 of 8
-  and about 1.7x decode throughput at 16 concurrent requests.
+- Measured on 4x GB200 at an 8-wide verify window (`--speculative-num-steps 7
+  --speculative-num-draft-tokens 8`, one row narrower than this checkpoint
+  calls for): gsm8k `mean_acc` 0.9727 versus 0.9773 without speculative
+  decoding (paired disagreement 3 vs 9, McNemar p ~ 0.15 -- within run-to-run
+  noise), at a mean accepted length of 4.99 of 8 and about 1.7x decode
+  throughput at 16 concurrent requests.
 
 ## Kimi K2.5 / K2.6
 
