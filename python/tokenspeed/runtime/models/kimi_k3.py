@@ -790,7 +790,7 @@ def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
     every step, so it states its own count rather than deriving one from the
     target checkpoint's layers.
     """
-    if getattr(mapping, "pp_size", 1) > 1:
+    if mapping.pp_size > 1:
         start, end = pp_layer_window(config.num_hidden_layers, mapping)
     else:
         start, end = 0, config.num_hidden_layers
@@ -1550,7 +1550,7 @@ class KimiLinearMoE(nn.Module):
 
         multicast_down = (
             KimiK3LatentDownOp.initialize(
-                group=pg_manager.get_process_group("nccl", mapping.moe.tp_ep_group),
+                group=pg_manager.get_device_process_group(mapping.moe.tp_ep_group),
                 hidden_size=config.hidden_size,
                 latent_size=self.routed_hidden,
                 device=torch.device("cuda", torch.cuda.current_device()),

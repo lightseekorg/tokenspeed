@@ -259,3 +259,38 @@ def test_no_visible_device_declines_rather_than_dividing_by_zero() -> None:
         mock.patch.object(torch.cuda, "device_count", return_value=0),
     ):
         assert tail.multicast_reachable(mock.Mock()) is False
+
+
+def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
+    """Fabric handles are NVIDIA-only, so the answer needs no exchange.
+
+    The device type does not settle it: ROCm reports "cuda" too. Gathering
+    anyway would cost a collective whose answer is known, and skipping the
+    gather at the call site instead would leave the map empty for a gate to
+    fill in lazily -- putting the collective back in the dispatch path.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    fabric._fabric_map = None
+    try:
+        with (
+            mock.patch.object(
+                fabric,
+                "current_platform",
+                return_value=mock.Mock(is_nvidia=False),
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "get_world_size", return_value=8
+            ),
+            mock.patch.object(
+                fabric.torch.distributed,
+                "all_gather",
+                side_effect=AssertionError("no collective off NVIDIA"),
+            ),
+        ):
+            assert fabric.gather_fabric_map() == [False] * 8
+            assert fabric.group_has_fabric([0, 1]) is False
+    finally:
+        fabric._fabric_map = None

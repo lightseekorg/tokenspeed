@@ -36,6 +36,7 @@ import logging
 from collections.abc import Sequence
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "fabric_allocation_supported",
@@ -181,10 +182,22 @@ def fabric_allocation_supported(device_index: int) -> bool:
 
 
 def gather_fabric_map() -> list[bool]:
-    """Gather and cache every world rank's fabric-allocation verdict."""
+    """Gather and cache every world rank's fabric-allocation verdict.
+
+    Fabric handles are an NVIDIA concept, so off NVIDIA the answer is no for
+    every rank and is filled in without a collective. Deciding that here rather
+    than at the call site keeps the collective out of a lazy path: a caller
+    that skipped this on the wrong platform would otherwise trigger the gather
+    from a gate, which is the dispatch-time collective this map exists to
+    remove.
+    """
     global _fabric_map
 
     if _fabric_map is not None:
+        return _fabric_map
+
+    if not current_platform().is_nvidia:
+        _fabric_map = [False] * torch.distributed.get_world_size()
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
