@@ -31,7 +31,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 def cache_debug_enabled() -> bool:
-    """Whether expensive, GPU-synchronizing Paged cache validation is enabled."""
+    """Whether expensive, GPU-synchronizing cache validation is enabled."""
     return os.environ.get("TOKENSPEED_CACHE_DEBUG") == "1"
 
 

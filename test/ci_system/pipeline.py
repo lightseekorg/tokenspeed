@@ -70,7 +70,7 @@ RUNNER_SM_PREFIXES = (
     (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
-AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
+AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-", "amd-mi450-")
 NVIDIA_ARM_RUNNER_PREFIXES = (
     "gb200",
     "gb300",
@@ -271,12 +271,13 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                     f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
                 )
             if len(data["triggers"]) != 1 or data["triggers"][0] not in {
+                "nightly",
                 "per-commit",
                 "slurm",
             }:
                 raise ValueError(
                     f"{path}: multi-node Slurm tasks must use exactly one of the "
-                    "'per-commit' or 'slurm' triggers"
+                    "'nightly', 'per-commit', or 'slurm' triggers"
                 )
             if not all(label.startswith("slurm-") for label in labels):
                 raise ValueError(
@@ -488,6 +489,59 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
             return dict(runner_env.get(label, {}))
 
     return {}
+
+
+def validate_gb300_runner_alias(declared_runner: str, effective_runner: str) -> str:
+    """Validate a B200/GB200-to-GB300 alias with an unchanged topology."""
+    declared_slurm = declared_runner.startswith("slurm-")
+    effective_slurm = effective_runner.startswith("slurm-")
+    declared_base = declared_runner.removeprefix("slurm-")
+    effective_base = effective_runner.removeprefix("slurm-")
+
+    if declared_runner == effective_runner and effective_base.startswith("gb300-"):
+        return effective_runner
+    if declared_slurm != effective_slurm:
+        raise ValueError("runner alias must preserve the slurm- prefix")
+
+    declared_family = next(
+        (
+            family
+            for family in ("b200", "gb200")
+            if declared_base.startswith(f"{family}-")
+        ),
+        None,
+    )
+    if declared_family is None or not effective_base.startswith("gb300-"):
+        raise ValueError(
+            "runner alias must map [slurm-]b200-* or [slurm-]gb200-* "
+            "to [slurm-]gb300-*"
+        )
+
+    declared_suffix = declared_base.removeprefix(f"{declared_family}-")
+    effective_suffix = effective_base.removeprefix("gb300-")
+    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
+    declared_gpus = gpu_pattern.findall(declared_suffix)
+    effective_gpus = gpu_pattern.findall(effective_suffix)
+    if len(declared_gpus) != 1 or declared_gpus != effective_gpus:
+        raise ValueError("runner alias GPU counts must match")
+    if declared_suffix != effective_suffix:
+        raise ValueError("runner alias suffixes must match")
+    return effective_runner
+
+
+def apply_slurm_runner_override(
+    declared_runner: str,
+    runner_override: str | None,
+    setup_mode: str,
+) -> str:
+    if runner_override is None:
+        return declared_runner
+    if setup_mode != "slurm":
+        raise ValueError("--runner-override requires --setup-mode=slurm")
+    try:
+        return validate_gb300_runner_alias(declared_runner, runner_override)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("runner alias", "runner override")) from exc
 
 
 def create_ci_venv_name(runner_name: str | None = None) -> str:
@@ -783,19 +837,20 @@ def setup_runner(
         )
 
     if is_amd_runner(runner):
-        # Best-effort: kill any GPU-holding processes left over by a
-        # previous pod scheduled on the same node. Cluster admins flagged
-        # a known race where the device plugin releases a GPU back to the
-        # pool before the previous pod's processes have actually
-        # relinquished VRAM, so we can land in a pod with ~0 GiB free
-        # VRAM. Cleanup script never fails the task.
-        shell_run(
-            "bash test/ci_system/cleanup_amd_gpu_state.sh",
-            env=local_env,
-            cwd=cwd,
-            dry_run=dry_run,
-            check=False,
-        )
+        if runner != "amd-mi450-sim":
+            # Best-effort: kill any GPU-holding processes left over by a
+            # previous pod scheduled on the same node. Cluster admins flagged
+            # a known race where the device plugin releases a GPU back to the
+            # pool before the previous pod's processes have actually
+            # relinquished VRAM, so we can land in a pod with ~0 GiB free
+            # VRAM. Cleanup script never fails the task.
+            shell_run(
+                "bash test/ci_system/cleanup_amd_gpu_state.sh",
+                env=local_env,
+                cwd=cwd,
+                dry_run=dry_run,
+                check=False,
+            )
         return local_env, pgm
     if dry_run:
         return local_env, pgm
@@ -1686,6 +1741,7 @@ def execute_task(
     *,
     config: str,
     runner: str,
+    runner_override: str | None = None,
     work_dir: str,
     dry_run: bool,
     print_plan: bool,
@@ -1718,6 +1774,8 @@ def execute_task(
         raise ValueError(
             f"{config}: runner {runner!r} is not declared in runner.labels"
         )
+    declared_runner = runner
+    runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1725,7 +1783,7 @@ def execute_task(
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
-    env.update(get_runner_specific_env(task, runner))
+    env.update(get_runner_specific_env(task, declared_runner))
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -1912,7 +1970,7 @@ def execute_task(
             task, command_results, stages_run, server_log_path
         )
         eval_score_check = check_eval_score_threshold(
-            task, command_results, stages_run, runner
+            task, command_results, stages_run, declared_runner
         )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
@@ -2040,6 +2098,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--runner", required=True, help="Runner label selected by the matrix"
     )
     execute_parser.add_argument(
+        "--runner-override",
+        help="Slurm-only effective GB300 runner for a declared B200/GB200 runner.",
+    )
+    execute_parser.add_argument(
         "--work-dir", default=".", help="Repository work directory"
     )
     execute_parser.add_argument(
@@ -2112,6 +2174,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return execute_task(
             config=args.config,
             runner=args.runner,
+            runner_override=args.runner_override,
             work_dir=args.work_dir,
             dry_run=args.dry_run,
             print_plan=args.print_plan,

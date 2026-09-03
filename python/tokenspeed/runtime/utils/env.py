@@ -23,7 +23,8 @@ import warnings
 from contextlib import contextmanager
 from typing import Any
 
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
+
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
@@ -48,6 +49,7 @@ global_server_args_dict: dict = {
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "mla_chunk_multiplier": ServerArgs.mla_chunk_multiplier,
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
+    "init_expert_location": ServerArgs.init_expert_location,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "enable_eplb": ServerArgs.enable_eplb,
     "mm_attention_backend": ServerArgs.mm_attention_backend,
@@ -68,10 +70,7 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
-
-    # Export the PDL kill-switch: tokenspeed_kernel cannot import runtime modules.
-    if server_args.disable_pdl:
-        os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
+    pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
@@ -97,6 +96,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "mla_chunk_multiplier": server_args.mla_chunk_multiplier,
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
+            "init_expert_location": server_args.init_expert_location,
             "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
             "enable_eplb": server_args.enable_eplb,
             "mm_attention_backend": server_args.mm_attention_backend,
@@ -115,7 +115,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "deepep_mode": server_args.deepep_mode,
         }
     )
-    pdl_enabled.cache_clear()
 
 
 class EnvField:
@@ -239,6 +238,7 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
+    TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
@@ -278,7 +278,6 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
-    TOKENSPEED_MINIMAX_AR_USE_TRITON = EnvBool(False)
 
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
@@ -310,6 +309,10 @@ class Envs:
     # scheduler ZMQ hops) from msgpack back to pickle. Read once at import of
     # engine.io_struct.
     TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
+
+    # Qwen4-Exp QSA
+    TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
+    TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(256)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)

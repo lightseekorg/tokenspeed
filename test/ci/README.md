@@ -9,6 +9,7 @@ Current trigger values:
 - `manual`
 - `nightly`
 - `debug`
+- `slurm`
 
 Supported task types:
 
@@ -43,6 +44,11 @@ attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
 a score of at least 0.90.
+
+The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
+tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
+bounded non-thinking chat template for CI stability. The task requires a score
+of at least 0.90.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -152,9 +158,10 @@ slurm:
   gpus_per_node: 4
 ```
 
-Multi-node tasks must use only the `slurm` trigger and a `slurm-*` runner label,
-so GitHub runner matrices cannot select them accidentally. The GPU count in the
-label must equal `slurm.gpus_per_node`.
+Multi-node tasks must use exactly one of the `nightly`, `per-commit`, or `slurm`
+triggers and a `slurm-*` runner label, so only their dedicated workflow or the
+manual Slurm dispatcher can select them. The GPU count in the label must equal
+`slurm.gpus_per_node`.
 
 For a multi-node task, the generated batch script extracts the committed source
 snapshot into a server workspace on every node and a separate client workspace
@@ -258,14 +265,37 @@ nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
 Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
 ```
 
+### B300 DeepSWE
+
+`B300 DeepSWE` is a manual, single-node 8-GPU workflow for Kimi K3. It starts
+the local `/raid/cache/jue/kimi-k3-flat2` checkpoint, then runs Kimi Code
+0.23.6 inside the pinned DeepSWE v1.1 Docker tasks through Pier 0.3.1. The
+default smoke run selects the same deterministic 10-task subset (`seed=0`);
+the workflow also exposes one-task bring-up and the full 113-task corpus.
+
+The repository-scoped `b300deepswe-8gpu` runner is isolated from the normal
+B300 pools and mounts the host Docker socket. The workflow definition is loaded
+only from `main` and rejects fork pull requests. An optional pull request input
+may select code only from a branch in this repository. Keep the workflow manual
+unless the runner is moved behind an approval environment.
+The preflight fails if an out-of-cluster Docker workload is already using the
+GPUs, because Kubernetes cannot account for those allocations.
+
+Pier's restricted egress proxy permits the agent to reach only the runner Pod
+IP on HTTP port 80. Kimi Code receives the local Tokenspeed endpoint through
+`KIMI_MODEL_*`; task containers retain DeepSWE's `no-network` policy. The
+workflow fails on incomplete/error trials and optionally on a binary-reward
+minimum. The default minimum is zero because a 10-task sample is not a stable
+regression threshold.
+
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
-existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
-explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
-`slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
-validates any explicit runner selection against it. Five
-`slurm-dispatch-gb300` coordinators form one shared pool for manual and
-per-commit submissions. GB300 perf tasks are disabled until GB300-specific
-reference values are measured.
+existing `slurm-dispatch` coordinator and runner defaults. Selecting `gb300`
+with every other input left at its default keeps the same logical B200/GB200
+tasks and filters, but maps their runner labels to the matching `gb300-Ngpu`
+hardware. A selected YAML follows the same rule; YAMLs that already declare a
+`gb300-Ngpu` or `slurm-gb300-Ngpu` label pass it through unchanged. Five
+`slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
+and per-commit submissions.
 
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
@@ -285,14 +315,22 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
+The `GB300 Slurm Nightly` workflow runs every day at 18:17 UTC and can also be
+started manually from `main`. It selects only multi-node model tests with the
+`nightly` trigger, then restricts the generated matrix to `slurm-gb300-*`
+runners before submitting through the GB300 coordinator pool. The runner filter
+keeps future GB200 nightly tasks out of the GB300 workflow. Submission is
+fail-closed until `TOKENSPEED_CI_GB300_SLURM_NIGHTLY_ENABLED` is set to `true`;
+this switch is independent of the per-commit workflow's enable variable.
+
 The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
 `slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
 Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
 pinned `nvidia/Kimi-K3-NVFP4` target with `Inferact/Kimi-K3-DSpark` and
 preserves the draft checkpoint's required `attn_res` auxiliary stream.
-The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines
-that use a pinned Kimi Vendor Verifier revision; select either YAML through
-`Slurm Dispatch` with the `gb300` cluster.
+The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are nightly baselines that
+use a pinned Kimi Vendor Verifier revision. Either YAML can still be rerun
+explicitly through `Slurm Dispatch` with the `gb300` cluster.
 
 GB200 examples:
 
@@ -368,10 +406,16 @@ collected report directory as an artifact. It excludes long-running MMLU tasks
 by default; explicitly enable `include_mmlu` in the manual workflow inputs when
 that coverage is required.
 
-The `yaml` input is `off` by default. Select one listed B200/GB200 CI YAML to
-run that YAML independently of the bulk runner, type, match, trigger, and MMLU
-filters. Every B200 or GB200 runner label declared by the selected YAML is
-submitted as its own Slurm job.
+The optional `container_image` input overrides the trusted dispatcher's default
+for validating a new runner image before it becomes the default. It accepts
+only digest-pinned `ghcr.io/lightseekorg/tokenspeed-runner` images; mutable tags
+and images from other registries or organizations are rejected.
+
+The `yaml` input is `off` by default. Select one listed CI YAML to run that YAML
+independently of the bulk runner, type, match, trigger, and MMLU filters. On
+GB200, every B200 or GB200 runner label declared by the selected YAML is
+submitted as its own Slurm job. On GB300, those logical labels are submitted on
+the corresponding GB300 runner; native GB300 labels are submitted unchanged.
 
 The manual workflow keeps the dispatcher checkout on trusted `main` and merges
 the requested PR only in the submitter's temporary worktree. The per-commit

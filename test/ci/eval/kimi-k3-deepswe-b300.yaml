@@ -1,0 +1,63 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-deepswe-b300
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - b300deepswe-8gpu
+env:
+  CI: "true"
+  HF_HUB_CACHE: /raid/cache/huggingface/hub
+  HF_HUB_OFFLINE: "1"
+  HF_MODULES_CACHE: /tmp/huggingface/modules
+  KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
+  KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
+  PIER_KIMI_CODE_BINARY: /cache/kimi-code/0.29.0/bin/kimi
+install:
+  - bash test/ci_system/install_deps.sh
+  - bash test/ci/deepswe/install_kimi_code.sh
+server:
+  command: >-
+    ts serve ${KIMI_K3_MODEL_ROOT}/snapshots/${KIMI_K3_MODEL_REVISION}
+    --served-model-name kimi-k3
+    --tokenizer moonshotai/Kimi-K3
+    --revision ${KIMI_K3_MODEL_REVISION}
+    --trust-remote-code
+    --attn-tp-size 8
+    --ep-size 8
+    --attention-backend tokenspeed_mla
+    --kda-backend cutedsl_kda
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 1048576
+    --max-num-seqs 4
+    --max-cudagraph-capture-size 4
+    --cudagraph-capture-sizes 1 2 4
+    --max-prefill-tokens 32768
+    --chunked-prefill-size 32768
+    --gpu-memory-utilization 0.90
+    --disable-kvstore
+    --disable-autotune
+    --enable-allreduce-fusion
+    --enable-cache-report
+    --enable-log-request-stats
+    --enable-metrics
+    --reasoning-parser kimi_k3
+    --host 0.0.0.0
+    --port 80
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:80/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m pip install 'datacurve-pier==0.3.1'
+  command: bash test/ci/deepswe/run_deepswe.sh
+report:
+  github_step_summary: true

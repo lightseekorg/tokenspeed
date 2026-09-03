@@ -216,6 +216,7 @@ class CudaGraphWrapper:
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
+        self.device_module = torch.get_device_module(self.device)
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
         # Physical extent: capture tables must cover the spec-verify overshoot
@@ -287,7 +288,7 @@ class CudaGraphWrapper:
             if sampling_backend is not None
             else (CUDA_GRAPH_VARIANT_DEFAULT,)
         )
-        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
@@ -306,7 +307,7 @@ class CudaGraphWrapper:
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
-            self.stream = torch.cuda.Stream()
+            self.stream = self.device_module.Stream()
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)
@@ -380,7 +381,12 @@ class CudaGraphWrapper:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
     def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
-        graph = torch.cuda.CUDAGraph()
+        graph_cls = (
+            self.device_module.NPUGraph
+            if self.device == "npu"
+            else self.device_module.CUDAGraph
+        )
+        graph = graph_cls()
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -469,9 +475,9 @@ class CudaGraphWrapper:
 
         # Warm the same primary stream used by capture. Capture-only auxiliary
         # branches use this graph phase to warm their own streams serially.
-        with torch.cuda.stream(self.stream):
+        with self.device_module.stream(self.stream):
             for _ in range(4):
-                torch.cuda.synchronize()
+                self.device_module.synchronize()
                 dist.barrier()
                 self._prepare_sampling_capture(bs=bs, variant=variant)
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
@@ -480,14 +486,14 @@ class CudaGraphWrapper:
                 self._init_capture_metadata(bs)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
-            torch.cuda.synchronize()
+            self.device_module.synchronize()
 
         # Clear any per-pool state that warm-up dirtied at pool row 0,
         # so the graph captures reads against a clean baseline.
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
 
-        torch.cuda.synchronize()
+        self.device_module.synchronize()
         dist.barrier()
 
         # Warmups can switch a backend back to eager metadata objects. Restore
@@ -506,10 +512,16 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
+        graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
+        with self.device_module.graph(
+            graph,
+            pool=global_graph_memory_pool,
+            stream=self.stream,
+            **graph_kwargs,
+        ):
             out = run_once()
 
-        torch.cuda.synchronize()
+        self.device_module.synchronize()
         dist.barrier()
         _is_capture_mode = False
         _is_cuda_graph_phase = False
@@ -587,7 +599,7 @@ class CudaGraphWrapper:
                     grammar_backend=self.grammar_backend,
                 )
 
-                torch.cuda.synchronize()
+                self.device_module.synchronize()
                 dist.barrier()
                 self._prepare_sampling_capture(
                     bs=bs,
@@ -596,7 +608,7 @@ class CudaGraphWrapper:
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
-                torch.cuda.synchronize()
+                self.device_module.synchronize()
                 dist.barrier()
 
                 if self.sampling_backend is not None:
@@ -1221,8 +1233,15 @@ class CudaGraphWrapper:
             self.deepep_adapter.replay()
 
             graph_key = self._cuda_graph_key(padded_bs)
+            graph = self.graphs[graph_key]
+            if self.device == "npu":
+                graph.update(
+                    cpu_update_input=[
+                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                    ]
+                )
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[graph_key].replay()
+                graph.replay()
 
             (
                 output_tokens,
@@ -1305,5 +1324,12 @@ class CudaGraphWrapper:
         ):
             accept_lengths = result[1]
             self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
+        if self.drafter is not None and (
+            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
+        ):
+            self.attn_backend.commit_speculative_state_after_verify(
+                result[1],
+                num_extends=ctx.num_extends,
+            )
 
         return result

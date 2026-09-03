@@ -1,4 +1,4 @@
-"""Kimi-K3 MLA attention on the paged-cache full-attention table.
+"""Kimi-K3 MLA attention on the cache-group full-attention table.
 
 Coverage:
 
@@ -209,6 +209,7 @@ def gpu_pool(cuda_env):
 
 @pytest.fixture(scope="module")
 def backend_factory(cuda_env, gpu_pool):
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
     def make():
@@ -224,13 +225,21 @@ def backend_factory(cuda_env, gpu_pool):
 
             backend_cls = CuteDSLMLABackend
             backend_name = "tokenspeed_mla"
-        config = MLAConfig(
-            device="cuda",
+        spec = MLAConfig(
             backend_name=backend_name,
             num_attention_heads=_HEADS,
             num_kv_heads=1,
             head_dim=_LATENT_DIM,
             attn_tp_size=1,
+            kv_lora_rank=_KV_LORA_RANK,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=_QK_ROPE_DIM,
+            v_head_dim=128,
+            scaling=192**-0.5,
+            kv_cache_dim=_LATENT_DIM,
+        )
+        config = AttnConfig(
+            device="cuda",
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.float8_e4m3fn,
             prefix_granularity=_KERNEL_PAGE,
@@ -239,14 +248,9 @@ def backend_factory(cuda_env, gpu_pool):
             max_bs=8,
             max_graph_bs=8,
             kv_cache_quant_method="",
-            kv_lora_rank=_KV_LORA_RANK,
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=_QK_ROPE_DIM,
-            v_head_dim=128,
-            scaling=192**-0.5,
-            kv_cache_dim=_LATENT_DIM,
+            components=(spec,),
         )
-        backend = backend_cls(config)
+        backend = backend_cls(config, spec)
         backend.set_cache_pool(gpu_pool)
         return backend
 
@@ -434,8 +438,6 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
 ) -> None:
     from tokenspeed_kernel.ops.attention import attn_merge_state
 
-    from tokenspeed.runtime.utils.pdl import pdl_enabled
-
     pool = gpu_pool
     page_size = pool.arena.prefix_granularity
     layer = _fake_layer(_mla_layer_id(pool), scaling=192**-0.5)
@@ -451,6 +453,12 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     _init_prefill(grouped_backend, pool, logical_rows, prefix, extend, grouped=True)
     _init_prefill(
         single_table_backend, pool, logical_rows, prefix, extend, grouped=False
+    )
+    assert grouped_backend.chunked_prefill_metadata.extend_prefix_lens_cpu.tolist() == (
+        prefix
+    )
+    assert (
+        grouped_backend.chunked_prefill_metadata.extend_seq_lens_cpu.tolist() == extend
     )
 
     # Write-location oracle: positions [prefix, seq) at page_id*P+offset.
@@ -526,9 +534,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
                 batch_size=bs,
                 causal=False,
             )
-            attn_merge_state(
-                out, lse, chunk_out, chunk_lse, inplace=True, enable_pdl=pdl_enabled()
-            )
+            attn_merge_state(out, lse, chunk_out, chunk_lse, inplace=True)
         return out
 
     out_grouped = run(grouped_backend)

@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.conv.triton import (
     _inkling_ring_sconv_prefill_kernel,
     select_prefill_config,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 PAD_SLOT_ID = -1
 
@@ -101,7 +102,6 @@ def inkling_ring_sconv(
     page_size: int,
     activation: str | None = None,
     use_residual: bool = True,
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Causal conv over ``[state ++ chunk]``, dispatched on ``num_extends``.
 
@@ -149,8 +149,6 @@ def inkling_ring_sconv(
         activation: Optional activation before the residual: ``None``,
             ``"silu"`` or ``"swish"``.
         use_residual: Add the residual connection ``y = x + conv(...)``.
-        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
-
     Returns:
         Output tensor ``[T, D]`` with the same dtype as ``x``.
     """
@@ -186,6 +184,7 @@ def inkling_ring_sconv(
         ), "checkpoint fields must cover the stream's channels"
         b_strides = (ckpt_b.stride(0), ckpt_b.stride(1), ckpt_b.stride(2))
 
+    enable_pdl = pdl_enabled()
     use_silu = activation in ("silu", "swish")
     block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
     grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))

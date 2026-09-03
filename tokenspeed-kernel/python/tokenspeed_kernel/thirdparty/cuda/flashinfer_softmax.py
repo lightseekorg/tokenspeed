@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 _WORKSPACE_BYTES = 1 * 1024 * 1024
 
@@ -54,9 +55,10 @@ def _get_workspace(device: torch.device) -> torch.Tensor:
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[float, torch.Tensor]] = None,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """softmax(logits / temperature). Returns fp32 probs."""
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     assert logits.is_contiguous(), "softmax expects contiguous logits"
     assert logits.is_cuda, "softmax requires CUDA tensors"
     assert logits.dim() == 2
@@ -82,6 +84,6 @@ def softmax(
         output,
         temp_arr,
         float(temp_val),
-        bool(enable_pdl),
+        enable_pdl,
     )
     return output

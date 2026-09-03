@@ -33,18 +33,23 @@ class _Harness:
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(DEV, usable_pages=24)
         self.contract = self.pool.arena.runtime_contract
-        config = SimpleNamespace(
-            device=DEV,
+        spec = SimpleNamespace(
             num_attention_heads=H,
             num_kv_heads=H,
             attn_tp_size=1,
-            dtype=torch.bfloat16,
             head_dim=D,
+        )
+        config = SimpleNamespace(
+            device=DEV,
+            dtype=torch.bfloat16,
             is_draft=False,
             speculative_num_draft_tokens=T,
             max_bs=8,
+            components=(spec,),
+            # Stub component(): this backend construction never queries components.
+            component=lambda cls: None,
         )
-        self.backend = KdaAttnBackend(config)
+        self.backend = KdaAttnBackend(config, spec)
         self.backend.set_kv_pool(self.pool)
         if eager_replay and not self.backend._replay_active:
             pytest.skip("KDA replay commit kernel unavailable")
@@ -299,12 +304,10 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         speculative_num_draft_tokens=T,
     )
     planned_bytes = recipe.setup().fixed_workspace_bytes
-    harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
-    conv_bytes = sum(
-        pair[0].nbytes for pair in harness.backend._verify_scratch.values()
+    allocated_bytes = harness.backend.preallocate_verify_workspace(
+        harness.backend.max_bs, T
     )
-    payload_bytes = sum(payload.nbytes for payload in harness.backend._replay_payloads)
-    assert planned_bytes == conv_bytes + payload_bytes
+    assert planned_bytes == allocated_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
     config = SimpleNamespace(max_bs=8)
     backend = SimpleNamespace(linear_attn_backend=harness.backend)
@@ -357,6 +360,31 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     harness.prepare_metadata([0], pages, [8 + T])
     harness.forward(harness.inputs(1, 712), 1)
     assert harness.backend._batched_replay_ready
+
+
+def test_uneven_state_groups_bind_batched_replay():
+    """Replay uses each layer's cache group instead of equal-size partitions."""
+    harness = _Harness(eager_replay=True)
+    first_group, second_group = _STATE_GROUPS[:2]
+    moved_layer = next(
+        layer_id
+        for layer_id in harness.layer_ids
+        if harness.pool.state_group_by_layer[layer_id] == second_group
+    )
+    harness.pool.state_group_by_layer[moved_layer] = first_group
+    harness.backend.set_kv_pool(harness.pool)
+
+    pages = {group: [2] for group in _STATE_GROUPS}
+    harness.prepare_metadata([0], pages, [8 + T])
+    harness.forward(harness.inputs(1, 713), 1)
+
+    expected = [
+        harness.backend._replay_group_rows[harness.pool.state_group_by_layer[layer_id]]
+        for layer_id in harness.layer_ids
+    ]
+    assert harness.backend._batched_replay_ready
+    assert harness.backend._replay_group_indices.tolist() == expected
+    assert expected.count(0) != expected.count(1)
 
 
 def test_verify_scratch_cannot_grow_after_preallocation():

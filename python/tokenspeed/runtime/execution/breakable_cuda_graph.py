@@ -67,6 +67,7 @@ __all__ = [
     "break_here",
     "break_point",
     "current_forward_ctx",
+    "current_valid_rows",
     "is_breakable_capture_active",
     "scrub_padding_tail",
     "slice_to_real_tokens",
@@ -76,6 +77,8 @@ __all__ = [
 
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
 _ambient_ctx: Any = None
+# Real leading rows of the replay in progress; see current_valid_rows.
+_replay_valid_rows: int | None = None
 
 
 @contextmanager
@@ -103,6 +106,23 @@ def active_forward(ctx: Any) -> Generator[None]:
 def current_forward_ctx() -> Any:
     """The ambient forward context, or ``None`` outside an :func:`active_forward`."""
     return _ambient_ctx
+
+
+def current_valid_rows() -> int | None:
+    """Real leading row count of the replay in progress, or ``None`` when unpadded.
+
+    A padded-bucket replay hands every break ``bucket`` rows whose tail is filler.
+    Breaks whose kernels are indexed by the live metadata's token count -- and so
+    would read past the real batch -- narrow their token-shaped inputs to this
+    prefix via :func:`slice_to_real_tokens`. ``None`` during capture and on the
+    eager path, where the rows already are exactly the real ones.
+    """
+    return _replay_valid_rows
+
+
+def _set_replay_valid_rows(valid_rows: int | None) -> None:
+    global _replay_valid_rows
+    _replay_valid_rows = valid_rows
 
 
 def weak_ref_tensor(t: Any) -> Any:
@@ -168,7 +188,6 @@ class BreakableCapture:
         self._stream_ctx: Any | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[Any, torch.Tensor] = {}
-        self._valid_rows: int | None = None
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -258,12 +277,12 @@ class BreakableCapture:
                 before the following graph segment consumes them. ``None``
                 leaves handoff buffers unchanged.
         """
-        previous_valid_rows = self._valid_rows
-        self._valid_rows = valid_rows
+        previous_valid_rows = _replay_valid_rows
+        _set_replay_valid_rows(valid_rows)
         try:
             deque((run() for run in self.segments), maxlen=0)
         finally:
-            self._valid_rows = previous_valid_rows
+            _set_replay_valid_rows(previous_valid_rows)
 
     @property
     def num_segments(self) -> int:
@@ -321,8 +340,8 @@ def _record_break(
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
         _land_in(dst, result)
-        if cap._valid_rows is not None:
-            scrub_padding_tail(cap._valid_rows, dst)
+        if _replay_valid_rows is not None:
+            scrub_padding_tail(_replay_valid_rows, dst)
         return dst
 
     return cap.add_eager(replay_fn)

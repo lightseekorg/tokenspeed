@@ -33,6 +33,9 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -83,12 +86,16 @@ class OrdinaryRecipe(CacheRecipe):
         draft layer against 61 target labels), so misaligned labels degrade to
         full-history rather than mislabeling a group.
         """
-        target = tuple(getattr(self.attn_config, "layer_types", ()))
+        target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
         if len(target) != self.num_target_layers:
             target = ()
         if self.draft_attn_config is None:
             return target if target else ()
-        draft = tuple(getattr(self.draft_attn_config, "layer_types", ()))
+        draft = tuple(
+            getattr(
+                self.draft_attn_config.component(SoftmaxAttnConfig), "layer_types", ()
+            )
+        )
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         merged = target + draft
@@ -155,9 +162,10 @@ class OrdinaryRecipe(CacheRecipe):
 
 
 def _storage_layers(config, num_layers: int) -> int:
+    spec = config.component(SoftmaxAttnConfig)
     group_size = hybrid_slab_group_size(
-        getattr(config, "layer_types", None),
-        sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
+        getattr(spec, "layer_types", None),
+        sliding_window_tokens=spec.sliding_window_tokens,
     )
     return group_size if group_size is not None else num_layers
 
@@ -167,13 +175,14 @@ def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
-    if isinstance(config, MHAConfig | MSAConfig):
-        layer_types = tuple(config.layer_types)
+    spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, MHAConfig | MSAConfig):
+        layer_types = tuple(spec.layer_types)
         if layer_types:
             ids = tuple(
                 layer_group_ids(
                     layer_types=layer_types,
-                    sliding_window_tokens=config.sliding_window_tokens,
+                    sliding_window_tokens=spec.sliding_window_tokens,
                 )
             )
             if len(ids) != num_layers:
@@ -191,24 +200,26 @@ def _config_layer_fields(
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
-    if isinstance(config, DSAConfig):
+    spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, DSAConfig):
         return _mla_layer_fields(config, layer_id, occurrence) + (
             _index_k_field(config, layer_id),
         )
-    if isinstance(config, MSAConfig):
+    if isinstance(spec, MSAConfig):
         fields = _mha_layer_fields(config, layer_id, occurrence)
-        if local_layer_id in config.sparse_layer_ids:
+        if local_layer_id in spec.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
-    if isinstance(config, MLAConfig):
+    if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, layer_id, occurrence)
-    if isinstance(config, MHAConfig):
+    if isinstance(spec, MHAConfig):
         return _mha_layer_fields(config, layer_id, occurrence)
-    raise TypeError(f"no ordinary cache recipe for {type(config).__name__}")
+    raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
 def _mha_layer_fields(config, layer_id: int, occurrence: int):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
+    spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
     if mxfp8 and config.prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
         raise AssertionError(
@@ -216,8 +227,8 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
             f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
             "the interleaved paged scale layout)"
         )
-    kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
-    head_dim = config.head_dim
+    kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
+    head_dim = spec.head_dim
     if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
     shape = (config.prefix_granularity, kv_heads, head_dim)
@@ -245,10 +256,11 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
 
 def _mla_layer_fields(config, layer_id: int, occurrence: int):
     """One MLA layer's latent page, split into planes when quantized."""
+    spec = config.component(SoftmaxAttnConfig)
     if config.prefix_granularity <= 0:
         raise ValueError("MLA full-attention geometry must be positive")
     if config.kv_cache_quant_method != "per_token_head":
-        latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+        latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
         return (
             CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",
@@ -267,7 +279,7 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
         for name, shape, dtype in (
             (
                 "latent_kv",
-                (config.prefix_granularity, 1, config.kv_lora_rank),
+                (config.prefix_granularity, 1, spec.kv_lora_rank),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             ),
             (
@@ -277,7 +289,7 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
             ),
             (
                 "rope_k",
-                (config.prefix_granularity, 1, config.qk_rope_head_dim),
+                (config.prefix_granularity, 1, spec.qk_rope_head_dim),
                 cache_dtype_name(config.dtype),
             ),
         )
@@ -291,16 +303,17 @@ def _index_k_field(config, layer_id: int) -> CacheFieldSpec:
         dsa_index_k_row_bytes,
     )
 
-    if isinstance(config, DSAConfig):
+    spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, DSAConfig):
         return CacheFieldSpec(
             f"layer.{layer_id}.index_k",
             f"layer.{layer_id}.index_k",
-            (config.prefix_granularity, dsa_index_k_row_bytes(config.index_head_dim)),
+            (config.prefix_granularity, dsa_index_k_row_bytes(spec.index_head_dim)),
             "uint8",
         )
     return CacheFieldSpec(
         f"layer.{layer_id}.index_k",
         f"layer.{layer_id}.index_k",
-        (config.prefix_granularity, config.index_head_dim),
+        (config.prefix_granularity, spec.index_head_dim),
         cache_dtype_name(config.dtype),
     )

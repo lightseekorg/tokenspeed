@@ -195,6 +195,15 @@ window, state checkpoints) are the norm, not the exception. A backend's
 override, never from `prefix_granularity` as a fallback. The CLI flag is
 `--prefix-granularity` (`--block-size` remains a deprecated alias).
 
+Layerwise L2 load fences guard the first access to every field owned by a
+layer, not just the conventional paged-KV buffers. Model-owned side caches
+(for example QSA raw/compressed keys and positions, or PLE state) must wait on
+the pool's layerwise load tracker before their first read or write. A wait in a
+later attention-buffer accessor is too late: the side-cache kernels would
+already be racing the asynchronous H2D restore. Place the fence immediately
+before the first cache-field access so independent projections can still
+overlap the load.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under
@@ -322,9 +331,10 @@ Its responsibilities:
   prefix hits per group on both tiers, converged to the common prefix length
   across groups; `Admit` then allocates, pins the hit prefix, and produces
   host→device `load_pairs` plus each group's fresh pages. Probe and admit are
-  deliberately split so that a failed admission can be retried under a
-  hypothetical release (`CanAdmitAfterReleasing`) without mutating cache
-  state. `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
+  deliberately split so the probe can be taken once and the admission retried
+  against it — the scheduler's same-round retract-and-grant re-runs a failed
+  admission after freeing a victim (see `scheduler.md`) without re-probing.
+  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
@@ -334,7 +344,16 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries.
+  acquire/contains/pin queries. During prefill, each completed scheduling
+  boundary queues all newly published full-attention pages and one checkpoint
+  per snapshot-state group; the pending candidates are merged into a batched
+  writeback. The first decode admission from `PrefillDone` applies the same
+  policy to the final prompt boundary. Ordinary decode still publishes Device
+  entries but does not stream full-attention or snapshot-state entries to
+  Host. At finish or retraction, all eligible Device-resident non-state pages
+  and only the newest Device-resident checkpoint per state group are queued
+  before request ownership is released. Ordinary sliding-window entries
+  always stream when published.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
@@ -439,16 +458,13 @@ still fit the recipe's reported token capacity. When that dynamic pool is
 overcommitted, admission can fail even though the batch still has a free
 sequence slot.
 
-For a fused scheduler without Host L2, such a failure may directly retract a
-resident request and release its Device pages. Direct retraction enters a
-capacity-drain phase: already-resident `Prefilling`, `PrefillDone`, and
-`Decoding` requests continue, while `Submitted` requests (including the
-requeued victim) cannot consume the released pages. Admission resumes
-automatically after that resident cohort finishes. This prevents an
-overcommitted workload from repeatedly rebuilding a prompt, decoding briefly,
-and retracting it again. Best-effort L2 writeback, PD Decode recovery, and
-ordinary capacity-fit continuous batching do not use this fused direct-drain
-path.
+When admission fails for capacity and no prefill can progress, the scheduler
+retracts a resident victim and grants the freed pages to the blocked request
+within the same plan build; what stops an overcommitted workload from
+repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
+the escalating admission headroom each retraction adds to the victim's next
+admission. The protocol — victim choice, readmission order, why the release
+is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
 ## Code placement
 

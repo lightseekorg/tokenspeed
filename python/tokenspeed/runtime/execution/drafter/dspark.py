@@ -55,6 +55,8 @@ class DSpark(DFlash):
     ) -> torch.Tensor:
         """Semi-autoregressive greedy proposal over the block positions."""
         next_tokens[:, 0] = block_ids[:, 0]
+        # Only the bias follows the previous token; the projection does not.
+        block_logits = self._block_base_logits(draft_hidden)
         for k in range(1, self.spec_num_tokens):
             # The Markov head embeds the previous token, so it must be in range
             # before this step, not after the loop: the anchor comes from the
@@ -62,13 +64,46 @@ class DSpark(DFlash):
             # from a vocab-parallel argmax that can lose every shard. An
             # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
-            self._greedy_argmax_vocab_parallel(
-                draft_hidden[:, k - 1, :],
-                out=next_tokens[:, k],
-                bias_fn=bias_fn,
-            )
+            if block_logits is None:
+                self._greedy_argmax_vocab_parallel(
+                    draft_hidden[:, k - 1, :],
+                    out=next_tokens[:, k],
+                    bias_fn=bias_fn,
+                )
+            else:
+                self._greedy_argmax_vocab_parallel(
+                    draft_hidden[:, k - 1, :],
+                    out=next_tokens[:, k],
+                    bias_fn=bias_fn,
+                    base_logits=block_logits[k - 1],
+                )
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    def _block_base_logits(self, draft_hidden: torch.Tensor):
+        """Project every block position's hidden state in one GEMM.
+
+        Returns ``[positions, rows, org_vocab_shard]``, or None when the head
+        has no shard metadata and the caller must take its own path.
+        """
+        head = getattr(self, "lm_head", None)
+        if head is None:
+            return None
+        if not hasattr(head, "weight") or not hasattr(head, "shard_indices"):
+            return None
+        num_org = int(head.shard_indices.num_org_elements)
+        if num_org <= 0:
+            return None
+        positions = int(draft_hidden.shape[1])
+        rows = int(draft_hidden.shape[0])
+        weight = head.weight
+        flat = draft_hidden.reshape(rows * positions, -1).to(weight.dtype)
+        logits = torch.matmul(flat, weight[:num_org].T)
+        # draft_hidden is [rows, positions, H]; the walk indexes by position.
+        # The walk slices one position at a time; transpose alone would hand
+        # each slice a positions-strided row layout, which the distributed
+        # argmax's compact-row kernel must not see.
+        return logits.view(rows, positions, num_org).transpose(0, 1).contiguous()
 
     def _make_step_bias_fn(self, prev_tokens: torch.Tensor):
         """Build the per-position additive-bias hook for the Markov head.

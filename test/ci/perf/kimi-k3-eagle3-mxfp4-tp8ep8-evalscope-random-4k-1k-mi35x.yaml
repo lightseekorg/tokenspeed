@@ -1,0 +1,116 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3 + EAGLE3 speculative decoding. Deliberately a separate job from
+# perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x, which tracks pure-target K3
+# performance and must stay speculator-free (Issue #879).
+name: perf-kimi-k3-eagle3-mxfp4-tp8ep8-random-4k-1k-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-8gpu-bench
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+# --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
+# one and OOM at this memory fraction. Decode graphs are what speculative
+# decoding rides on, and the batch-1 bucket captures cleanly.
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+    --eagle3-layers-to-capture 2,46,90
+    --tp 8
+    --ep-size 8
+    --attention-backend mla
+    --drafter-attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 8192
+    --max-num-seqs 1
+    --max-cudagraph-capture-size 1
+    --cudagraph-capture-sizes 1
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  # EvalScope loads remote tokenizer paths through ModelScope even when the
+  # dataset source is Hugging Face, so materialize the HF tokenizer locally.
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=kimi-k3 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-eagle3-mi35x-perf &&
+    TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
+    set +e &&
+    echo "==================================================" &&
+    echo ">>> EAGLE3 input=4k output=1k conc=1" &&
+    echo "==================================================" &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --data-source huggingface
+    --tokenizer-path "$TOKENIZER_PATH"
+    --min-prompt-length 4096
+    --max-prompt-length 4096
+    --prefix-length 0
+    --min-tokens 1024
+    --max-tokens 1024
+    --parallel 1
+    --number 1
+    --warmup-num 0
+    --rate -1
+    --seed 1
+    --temperature 0
+    --stream
+    --outputs-dir "$OUTPUTS_DIR/input_4k"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    PERF_STATUS=$?;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    PARSE_STATUS=$?;
+    echo "=== EAGLE3 speculative decoding metrics ===";
+    curl -s http://127.0.0.1:21000/metrics | grep -E 'spec_|accept|draft' || true;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from three
+# consecutive 8x MI350X runs, which measured 161.29 / 18.80-18.82. This tracks
+# EAGLE3 independently from the pure-target control and is about 6x the prior
+# DSpark reference (25.4 / 3.1).
+perf_reference:
+  1: [161, 18.8]

@@ -3,7 +3,7 @@ name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-ocr-bench-gb300-slurm
 type: eval
 workflow_stage: model-test
 triggers:
-  - slurm
+  - nightly
 runner:
   labels:
     - slurm-gb300-4gpu

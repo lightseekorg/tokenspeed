@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import mm
+from tokenspeed_kernel import fp8_linear, mm, prepare_fp8_linear
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
     prepare_flashinfer_fp8_blockscale_weight_scales,
+    use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     flashinfer_fp8_blockscale_quantize_prepacked,
@@ -147,3 +148,99 @@ def test_prepacked_gemm_is_cuda_graph_safe(device: str) -> None:
     graph.replay()
     expected = run()
     torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, expected",
+    [
+        (1, True),
+        (3, True),
+        (4, True),
+        (64, True),
+        (256, True),
+        (257, False),
+        (260, True),
+        (4097, False),
+    ],
+)
+def test_prepacked_selection_threshold(num_tokens: int, expected: bool) -> None:
+    assert use_flashinfer_fp8_blockscale_prepacked(num_tokens) is expected
+
+
+@pytest.mark.parametrize("m", [1, 4, 8, 64])
+def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
+    torch.manual_seed(3)
+    n, k = 256, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) * 0.02).to(torch.float8_e4m3fn)
+    weight_scales = (
+        torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) * 0.02
+        + 0.001
+    )
+
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+    prepacked = mm(
+        x,
+        weight,
+        B_scales=prepare_flashinfer_fp8_blockscale_weight_scales(weight_scales),
+        out_dtype=torch.bfloat16,
+        quant="mxfp8",
+        block_size=[128, 128],
+        override="flashinfer_mm_fp8_blockscale",
+        prepacked_scales=True,
+    )
+    torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
+
+
+def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> None:
+    torch.manual_seed(4)
+    m, n, k = 257, 256, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) * 0.02).to(torch.float8_e4m3fn)
+    weight_scales = (
+        torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) * 0.02
+        + 0.001
+    )
+
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+    canonical = mm(
+        x,
+        weight,
+        B_scales=weight_scales,
+        out_dtype=torch.bfloat16,
+        quant="mxfp8",
+        block_size=[128, 128],
+        override="flashinfer_mm_fp8_blockscale",
+    )
+    torch.testing.assert_close(planned, canonical, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m", [16, 17, 24, 31, 32, 33])
+def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> None:
+    """FlashInfer's K-major scale mode mis-reads activation scales for
+    17 <= M <= 32 on SM10x; a prepared layer must not route through it."""
+    torch.manual_seed(5)
+    n, k = 2048, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) / 8).to(torch.float8_e4m3fn)
+    weight_scales = (
+        torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) + 0.5
+    )
+
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    got = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+
+    # Compare against the exact product of the quantized operands.
+    quantized_x, activation_scales = flashinfer_fp8_blockscale_quantize_prepacked(x)
+    activation = quantized_x[:m].float() * activation_scales[:, :m].transpose(
+        0, 1
+    ).repeat_interleave(128, dim=1)
+    dequantized = weight.float() * weight_scales.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    reference = activation @ dequantized.t()
+
+    error = (got.float() - reference).abs().max()
+    assert error < 0.01 * reference.abs().max()

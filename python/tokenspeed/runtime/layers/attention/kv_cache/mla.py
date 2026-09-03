@@ -24,16 +24,15 @@ from typing import ClassVar
 
 import numpy as np
 import torch
-
-from tokenspeed.runtime.cache.utils import (
+from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -182,21 +181,17 @@ class MLATokenToKVPool(CachePool):
             self.kv_buffer[layer_id][1][loc] = scale
             self.kv_buffer[layer_id][2][loc] = k_rope
         else:
+            kv_buffer = self.kv_buffer[layer_id]
             if self.store_dtype != self.dtype:
-                # Bitwise-viewed pool: pre-cast and re-view for the raw word copy.
-                if cache_k_nope.dtype != self.dtype:
-                    cache_k_nope = cache_k_nope.to(self.dtype)
-                    cache_k_rope = cache_k_rope.to(self.dtype)
-                cache_k_nope = cache_k_nope.view(self.store_dtype)
-                cache_k_rope = cache_k_rope.view(self.store_dtype)
-            # else: the write kernel casts to the buffer dtype on store.
+                # The arena stores FP8 rows as bytes. Give the scatter kernel an
+                # FP8 view so its stores quantize mixed-dtype sources in place.
+                kv_buffer = kv_buffer.view(self.dtype)
 
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id],
+                kv_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                enable_pdl=pdl_enabled(),
                 sanitize=sanitize,
             )
 
@@ -229,7 +224,5 @@ class MLATokenToKVPool(CachePool):
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
-        get_mla_kv_buffer_triton(
-            kv_buffer, loc, cache_k_nope, cache_k_rope, enable_pdl=pdl_enabled()
-        )
+        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope

@@ -29,6 +29,8 @@ namespace tokenspeed {
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
+      submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
+      max_new_tokens_{spec.max_new_tokens},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
@@ -37,10 +39,13 @@ PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{
             [](const fsm::Prefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::RemotePrefilling& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillAwaitingResult& state) { return state.CurrentPrefillInfo(); },
             [this](const auto&) -> PrefillInfo {
-                throw std::logic_error("Request::CurrentPrefillInfo: expected Prefilling or PrefillDone; got " +
-                                       StateName());
+                throw std::logic_error(
+                    "Request::CurrentPrefillInfo: expected Prefilling, RemotePrefilling or PrefillDone; got " +
+                    StateName());
             },
         },
         state_);

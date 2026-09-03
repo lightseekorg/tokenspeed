@@ -23,8 +23,8 @@
 Covers the pieces added for running V4-Flash on SM90 without FP4 tensor
 cores: the FP8 indexer query prep + paged gather, the BF16->block-FP8
 weight quantization used when a checkpoint ships ``attn.wo_a`` unquantized,
-and the Lamport all-reduce dtype gate that keeps fp32 payloads off a
-bf16-armed one-shot workspace.
+and the shared-workspace plain all-reduce admission gates (lamport dtype
+sentinel, integer dtypes, hidden alignment, device, and empty inputs).
 """
 
 from __future__ import annotations
@@ -244,38 +244,78 @@ class TestBlockQuantFp8Weight(unittest.TestCase):
         self.assertEqual(scale_inv.shape, (2, 2))
 
 
-class TestLamportAllreduceDtypeGate(unittest.TestCase):
-    def _backend_with_resources(self, use_fp32_lamport: bool):
-        from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
-            TrtllmAllReduceBackend,
-        )
+def _nvidia_cuda_available() -> bool:
+    from tokenspeed_kernel.platform import current_platform
 
-        backend = TrtllmAllReduceBackend(fallback=None)
-        resources = {
-            "workspace": object(),
-            "mnnvl": None,
-            "rank": 0,
-            "world_size": 8,
-            "max_token_num": 64,
-            "hidden_dim": 4096,
-            "use_fp32_lamport": use_fp32_lamport,
-        }
-        return backend, resources
+    return torch.cuda.is_available() and current_platform().is_nvidia
+
+
+@unittest.skipUnless(_nvidia_cuda_available(), "requires NVIDIA CUDA")
+class TestWorkspaceAllreduceGates(unittest.TestCase):
+    """Admission gates of trtllm_workspace_allreduce + manager failure state."""
+
+    def _reduce(self, tensor, use_fp32_lamport: bool):
+        from unittest import mock
+
+        from tokenspeed_kernel.ops.communication import trtllm as comm
+
+        manager = mock.Mock()
+        manager.initialized = True
+        manager.use_fp32_lamport = use_fp32_lamport
+        manager.max_token_num = 64
+        manager.hidden_dim = 4096
+        manager.world_size = 8
+        with mock.patch.object(
+            comm.dist, "get_process_group_ranks", return_value=[0, 1]
+        ), mock.patch.dict(comm._workspace_managers, {(0, 1): manager}, clear=True):
+            return comm.trtllm_workspace_allreduce(tensor, mock.Mock())
 
     def test_fp32_payload_on_bf16_workspace_falls_back(self):
-        backend, resources = self._backend_with_resources(use_fp32_lamport=False)
-        tensor = torch.zeros(2, 256, dtype=torch.float32)
-        self.assertIsNone(backend._lamport_allreduce(tensor, resources))
+        tensor = torch.zeros(2, 256, dtype=torch.float32, device="cuda")
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=False))
 
     def test_bf16_payload_on_fp32_workspace_falls_back(self):
-        backend, resources = self._backend_with_resources(use_fp32_lamport=True)
-        tensor = torch.zeros(2, 256, dtype=torch.bfloat16)
-        self.assertIsNone(backend._lamport_allreduce(tensor, resources))
+        tensor = torch.zeros(2, 256, dtype=torch.bfloat16, device="cuda")
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=True))
 
-    def test_zero_token_short_circuits_before_gate(self):
-        backend, resources = self._backend_with_resources(use_fp32_lamport=False)
-        tensor = torch.zeros(0, 256, dtype=torch.float32)
-        self.assertIs(backend._lamport_allreduce(tensor, resources), tensor)
+    def test_zero_token_falls_back(self):
+        tensor = torch.zeros(0, 256, dtype=torch.bfloat16, device="cuda")
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=False))
+
+    def test_integer_payload_falls_back(self):
+        tensor = torch.zeros(2, 256, dtype=torch.int64, device="cuda")
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=False))
+
+    def test_misaligned_hidden_falls_back(self):
+        tensor = torch.zeros(2, 100, dtype=torch.bfloat16, device="cuda")
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=False))
+
+    def test_cpu_payload_falls_back(self):
+        tensor = torch.zeros(2, 256, dtype=torch.bfloat16)
+        self.assertIsNone(self._reduce(tensor, use_fp32_lamport=False))
+
+    def test_group_recorded_before_creation_failure(self):
+        from unittest import mock
+
+        from tokenspeed_kernel.ops.communication import trtllm as comm
+
+        manager = comm.TrtllmFusionWorkspaceManager()
+        sentinel = mock.Mock()
+        with mock.patch.object(
+            comm, "_skip_ipc_workspace", return_value=False
+        ), mock.patch.object(
+            comm,
+            "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+            return_value=(mock.Mock(), mock.Mock()),
+        ), mock.patch.object(
+            comm, "_try_create_mnnvl_workspace", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                manager.initialize(2, 0, 64, 2048, sentinel)
+        # Cleanup must target this group, not default to WORLD, on the next arm.
+        self.assertIs(manager.group, sentinel)
+        self.assertIsNotNone(manager.ipc_handles)
+        self.assertFalse(manager.initialized)
 
 
 if __name__ == "__main__":

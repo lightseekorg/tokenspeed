@@ -17,6 +17,12 @@ from collections.abc import Mapping
 
 import torch
 from tokenspeed_kernel import (
+    dsv4_decode,
+    dsv4_plan,
+    dsv4_prefill,
+    dsv4_reset_attention_state,
+)
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_build_dense_prefill_local_compressed_indices,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
@@ -24,15 +30,13 @@ from tokenspeed_kernel import (
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
     dsv4_indexer_decode_metadata_compute,
-    dsv4_paged_selected_attention,
-    dsv4_plan,
-    dsv4_reset_attention_state,
-    dsv4_selected_attention,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
@@ -226,12 +230,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     needs_group_block_tables = True
     uses_cache_groups = True
     cache_group_tables_replace_draft_page_table = True
-    cache_active_pages_must_be_real = True
     cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 
-    def __init__(self, config) -> None:
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig) -> None:
+        super().__init__(config, spec)
         self.kernel_page_size = (
             config.kernel_page_size
             if config.kernel_page_size is not None
@@ -250,7 +253,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"({self.kernel_page_size}), got {config.prefix_granularity}"
             )
         self.swa_storage_rows = int(
-            getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
+            spec.sliding_window_tokens
+            if spec.sliding_window_tokens is not None
+            else V4_KERNEL_BLOCK_ROWS * 2
         )
         self.context_len = config.context_len
         prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
@@ -1421,7 +1426,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             compressed_cache_2d = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
 
-        out = dsv4_paged_selected_attention(
+        out = dsv4_decode(
             q=q_padded,
             swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
             swa_slots=swa_indices,
@@ -1908,7 +1913,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
         with nvtx_range(f"attn_{kind}_prefill_selected_attention"):
-            out = dsv4_selected_attention(
+            out = dsv4_prefill(
                 q=q_padded,
                 kv=kv_workspace,
                 indices=indices,

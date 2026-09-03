@@ -25,7 +25,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-_HIDDEN = gl.constexpr(7168)
 _LATENT = gl.constexpr(3584)
 _BLOCK_N = gl.constexpr(32)
 _BLOCK_K = gl.constexpr(512)
@@ -41,9 +40,14 @@ def _rmsnorm_linear_add_kernel(
     residual_ptr,
     shared_ptr,
     output_ptr,
+    latent_stride_m,
+    residual_stride_m,
+    shared_stride_m,
+    output_stride_m,
     eps,
 ):
-    pid_n = gl.program_id(0)
+    pid_m = gl.program_id(0)
+    pid_n = gl.program_id(1)
     layout: gl.constexpr = gl.BlockedLayout(
         [1, _BLOCK_K // _LANES],
         [1, _LANES],
@@ -60,7 +64,7 @@ def _rmsnorm_linear_add_kernel(
         k_mask = offs_k < _LATENT
         latent = gl.amd.cdna4.buffer_load(
             latent_ptr,
-            offs_k.to(gl.int32),
+            (pid_m * latent_stride_m + offs_k).to(gl.int32),
             mask=k_mask,
             other=0.0,
         ).to(gl.float32)
@@ -73,7 +77,7 @@ def _rmsnorm_linear_add_kernel(
         k_mask = offs_k < _LATENT
         latent = gl.amd.cdna4.buffer_load(
             latent_ptr,
-            offs_k.to(gl.int32),
+            (pid_m * latent_stride_m + offs_k).to(gl.int32),
             mask=k_mask,
             other=0.0,
         ).to(gl.float32)
@@ -101,9 +105,16 @@ def _rmsnorm_linear_add_kernel(
 
     # Match the materialized BF16 projection before the residual additions.
     acc = acc.to(gl.bfloat16).to(gl.float32)
-    acc += gl.amd.cdna4.buffer_load(residual_ptr, offs_n.to(gl.int32)).to(gl.float32)
-    acc += gl.amd.cdna4.buffer_load(shared_ptr, offs_n.to(gl.int32)).to(gl.float32)
-    gl.store(output_ptr + offs_n, acc)
+    residual_offset = pid_m * residual_stride_m + offs_n
+    shared_offset = pid_m * shared_stride_m + offs_n
+    output_offset = pid_m * output_stride_m + offs_n
+    acc += gl.amd.cdna4.buffer_load(residual_ptr, residual_offset.to(gl.int32)).to(
+        gl.float32
+    )
+    acc += gl.amd.cdna4.buffer_load(shared_ptr, shared_offset.to(gl.int32)).to(
+        gl.float32
+    )
+    gl.store(output_ptr + output_offset, acc)
 
 
 def gluon_rmsnorm_linear_add_gfx950(
@@ -118,13 +129,18 @@ def gluon_rmsnorm_linear_add_gfx950(
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(residual)
-    _rmsnorm_linear_add_kernel[(_HIDDEN // _BLOCK_N,)](
+    m = latent.shape[0]
+    _rmsnorm_linear_add_kernel[(m, projection_weight.shape[0] // _BLOCK_N)](
         latent,
         norm_weight,
         projection_weight,
         residual,
         shared,
         out,
+        latent.stride(0),
+        residual.stride(0),
+        shared.stride(0),
+        out.stride(0),
         float(eps),
         num_warps=8,
         num_stages=1,

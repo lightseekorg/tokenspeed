@@ -163,7 +163,7 @@ def test_generate_request_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(req))
     assert isinstance(raw, list)
     assert raw[0] == "TokenizedGenerateReqInput"
-    assert len(raw) == 24  # tag + 23 fields
+    assert len(raw) == 25  # tag + 24 fields (data_parallel_rank appended last)
     assert raw[1] == "x"  # rid
     assert raw[2] is None  # http_worker_ipc
     assert raw[3] is None  # input_text

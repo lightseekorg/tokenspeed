@@ -127,7 +127,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
             backup_pages,
         )
-        executor.write_stream.synchronize()
+        torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in write_results], [7])
         self.assertEqual(executor.l3_store.exists(backup_pages), [True, True, True])

@@ -75,11 +75,30 @@ def _marlin_moe_available() -> bool:
     )
 
 
+def _produced_into(
+    partials: tuple[torch.Tensor, ...],
+    destinations: tuple[torch.Tensor, ...],
+) -> bool:
+    """Whether every partial really landed in its requested destination.
+
+    The producer-direct destinations are a request, not a guarantee: a producer
+    that cannot write in place returns its own tensor instead. Comparing
+    storage addresses is what distinguishes the two, and it has to hold for
+    *both* partials -- reducing a pair where only one side was produced in
+    place would silently drop the other one's contribution.
+    """
+    return all(
+        p.data_ptr() == d.data_ptr() and p.shape == d.shape
+        for p, d in zip(partials, destinations, strict=True)
+    )
+
+
 def kimi3_join_reduce_moe(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
     *,
     lane: torch.Tensor | None,
+    symm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
     routed_hidden: int,
     routed_norm: nn.Module | None,
     group: tuple[int, ...],
@@ -88,11 +107,16 @@ def kimi3_join_reduce_moe(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Join the routed/shared partials and reduce them, owning the strategy.
 
-    Three regimes, all element-wise identical:
+    Four regimes, all element-wise identical:
 
+    * Symmetric hit: the partials were produced straight into the collective's
+      symmetric heap, so the pair reduces in place with no staging copy at all.
+      This is the only regime that reaches the symmetric kernel -- the backend
+      decides on the tuple operand, so a single concatenated tensor cannot get
+      there however its memory was allocated.
     * Lane hit (decode batch=1): the partials were produced straight into the
       persistent fused lane, one one-shot reduce with an eligible norm
-      epilogue and zero copies.
+      epilogue and zero copies, but the collective stages them first.
     * Small partials: cat into one contiguous operand and take a single
       one-shot reduce; the copy is a couple of microseconds there.
     * Partials past the one-shot window (prefill-sized chunks): the cat would
@@ -100,6 +124,14 @@ def kimi3_join_reduce_moe(
       grouped NCCL launch reduces both tensors in place with the same
       single-launch latency -- so skip the join entirely.
     """
+
+    if symm_outputs is not None and _produced_into(
+        (routed_partial, shared_partial), symm_outputs
+    ):
+        routed_out, shared_out = all_reduce(symm_outputs, group=group)
+        if routed_norm is not None:
+            routed_out = routed_norm(routed_out)
+        return routed_out, shared_out
 
     if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
         fused = lane
@@ -198,12 +230,14 @@ class Kimi3MoEExecutionPlan:
     joint_moe_reduce: bool
     use_marlin: bool = False
     fused_moe_ar: bool = False
+    # Whether the routed and shared partials can be reduced together at all,
+    # independent of whether a backend-owned lane is available to avoid the
+    # concatenation. ``fused_moe_ar`` implies a lane and is TRT-LLM only;
+    # ``join_moe_reduce`` only needs a grouped or concatenated all-reduce,
+    # which every backend provides, so the join is available on AMD too.
+    join_moe_reduce: bool = False
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
-
-    @property
-    def use_precomputed_topk(self) -> bool:
-        return self.use_native or self.use_trtllm or self.use_marlin
 
     @classmethod
     def build(
@@ -256,6 +290,7 @@ class Kimi3MoEExecutionPlan:
         lane_width: int,
         has_latent_norm: bool,
         max_token_num: int,
+        shard_up_projection: bool = False,
     ) -> "Kimi3MoEExecutionPlan":
         """Prepare optional communication fusions before graph capture."""
 
@@ -273,9 +308,22 @@ class Kimi3MoEExecutionPlan:
                 max_token_num,
             )
         )
+        # The join itself needs no backend-owned lane: kimi3_join_reduce_moe
+        # falls back to a concatenated one-shot, or a grouped all-reduce when
+        # the payload exceeds COMM_ONESHOT_MAX_BYTES. Both are portable, so the
+        # tail can issue one collective per MoE layer instead of two wherever a
+        # TP x EP group exists -- not only where TRT-LLM can arm a lane.
+        #
+        # Excluded when the up projection is sharded: that tail folds the
+        # projection between two sequential all-reduces
+        # (_tail_fused_lane_ar_sharded) rather than calling the join, so the
+        # collective count is unchanged, while leaving SEPARATE_REDUCE would
+        # also give up the routed_in_fork overlap with the shared branch.
+        join_moe_reduce = mapping.moe.has_tp_ep and not shard_up_projection
         return replace(
             self,
             fused_moe_ar=fused_moe_ar,
+            join_moe_reduce=join_moe_reduce,
             lane_latent_norm_ar=lane_latent_norm_ar,
             comm_fusion_max_num_tokens=max_token_num,
         )
@@ -334,8 +382,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         ):
             # Chunked loads use full-weight row offsets, which sharded params cannot honor.
             raise ValueError(
-                "column-parallel Kimi3LatentProjection only supports whole-"
-                "tensor loads"
+                "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
             )
         if self.shard_group is not None:
             rows = self.output_size_full // self.shard_size

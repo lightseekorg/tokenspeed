@@ -43,6 +43,45 @@ public:
 
     const std::string& Id() const { return id_; }
 
+    // Decode headroom an admission must secure before the prefill starts:
+    // one safe-step window up front, plus one more per retraction suffered
+    // -- being retracted means the previous admission was still too
+    // optimistic. Capped by the generation budget the request can STILL
+    // use, which makes the escalation terminate. Remaining, not declared:
+    // retraction rebases generated tokens into the prompt, so a readmission
+    // that reserved the full declared budget on top of them would demand
+    // prompt + generated + max_new -- more than the request can ever write,
+    // and possibly more than the pool holds, leaving it Retracted forever.
+    //
+    // A request with no declared budget (max_new_tokens == 0) demands none,
+    // and keeps demanding none however often it is retracted. That looks
+    // like an omission but is the only safe reading: the declared budget is
+    // what bounds the escalation, and without one there is nothing to stop
+    // it from demanding more than the pool can ever hold -- at which point
+    // the request could not be readmitted at all. An undeclared budget
+    // stays optimistic and relies on the victim policy to make progress.
+    std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
+        return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
+    }
+    void NoteRetracted() { ++retraction_count_; }
+
+    // True when the last admission's headroom already covers every token
+    // this request could still generate. Retracting such a request is pure
+    // thrash -- its readmission must take back exactly what the retraction
+    // freed -- so the victim policy skips it. (An undeclared budget is
+    // never covered: nothing was reserved for it.)
+    bool ReserveCoversGeneration(std::int32_t safe_steps) const {
+        return max_new_tokens_ > 0 && AdmissionHeadroom(safe_steps) >= RemainingNewTokens();
+    }
+
+    // Tokens generated so far / still permitted. Both survive retraction's
+    // RebasePrefill (which folds generated tokens into the prefill window):
+    // the comparison is against the SUBMITTED prompt, which rebasing cannot
+    // change.
+    std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
+    std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
+    bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -55,12 +94,48 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
+    template <typename State>
+    const State* GetIf() const {
+        return std::get_if<State>(&state_);
+    }
+
+    // Forwards scheduled for this request whose results have not come back.
+    // Every state that holds pages answers this; the page-less ones
+    // (Submitted, Retracted, Finished) owe nothing by construction.
+    std::int32_t ResultsInFlight() const {
+        return std::visit(Overloaded{
+                              [](const std::derived_from<fsm::ForwardState> auto& s) { return s.ResultsInFlight(); },
+                              [](const auto&) { return 0; },
+                          },
+                          state_);
+    }
+
+    void TrackScheduledForward() {
+        std::visit(Overloaded{
+                       [](std::derived_from<fsm::ForwardState> auto& s) { s.TrackScheduledForward(); },
+                       [](auto&) {},
+                   },
+                   state_);
+    }
+
+    void NoteResultLanded() {
+        std::visit(Overloaded{
+                       [](std::derived_from<fsm::ForwardState> auto& s) { s.ResultLanded(); },
+                       [](auto&) {},
+                   },
+                   state_);
+    }
+
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
+    // P role: the drafter candidates that arrived with the final chunk's
+    // ExtendResult, held until the remote-decode operation carries them out.
+    void StoreSpecCandidates(std::vector<std::int32_t> ids) { spec_candidate_ids_ = std::move(ids); }
+    std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     PrefillInfo CurrentPrefillInfo() const;
 
@@ -83,17 +158,11 @@ public:
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
-    fsm::PrefillSource PrefillSource() const {
-        if (const auto* state = std::get_if<fsm::Prefilling>(&state_)) {
-            return state->Source();
-        }
-        throw std::logic_error("Request::PrefillSource: expected Prefilling; got " + StateName());
-    }
-
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -109,6 +178,8 @@ public:
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
@@ -123,6 +194,10 @@ private:
 
     std::string id_;
     TokenContainer token_container_;
+    std::int32_t submitted_prompt_size_{0};
+    std::int32_t max_new_tokens_{0};
+    std::int32_t retraction_count_{0};
+    std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;
 };

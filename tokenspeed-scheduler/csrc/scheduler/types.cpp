@@ -33,7 +33,7 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
     if (config.prefix_granularity % group.BlockGranularity() != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
-    if (!config.enable_pd_cache) {
+    if (config.role == Role::kFused) {
         return;
     }
     // A group's transfer policy is dictated by the destination layout the

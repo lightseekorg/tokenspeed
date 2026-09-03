@@ -169,6 +169,8 @@ def _decode_sigmoid_bias_topk(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures("router_logits", "dense", {torch.float32}),
+    # The broader gfx950 Gluon kernel declares no shape traits, so the caller's
+    # single-token traits cannot filter it out. Prefer this decode specialization.
     priority=Priority.SPECIALIZED + 1,
     traits={
         "tokens": frozenset({1}),
@@ -203,7 +205,7 @@ def triton_decode_sigmoid_bias_topk(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures("router_logits", "dense", {torch.float32}),
-    priority=Priority.SPECIALIZED + 1,
+    priority=Priority.SPECIALIZED,
     traits={
         "tokens": frozenset({1}),
         "experts": frozenset(range(1, 1025)),

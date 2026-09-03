@@ -1,4 +1,4 @@
-"""Qwen3.5 cache recipe: full-attention KV plus GDN recurrent checkpoints."""
+"""Qwen3.5 GDN cache recipe: attention KV and recurrent state."""
 
 from __future__ import annotations
 
@@ -7,6 +7,12 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -19,12 +25,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     split_recurrent_state_groups,
 )
+from tokenspeed.runtime.utils.env import envs
 
 _QWEN_GDN_PREFIX_GRANULARITY = 128
 
 
 class QwenGDNRecipe(CacheRecipe):
-    """Qwen3.5: MHA full-attention layers interleaved with GDN state layers.
+    """Qwen3.5 full attention interleaved with GDN state.
 
     Draft (MTP) layers are full-attention continuation layers of the one big
     model, so they join the target's full-attention group.
@@ -39,15 +46,18 @@ class QwenGDNRecipe(CacheRecipe):
                 "Qwen cache buffer does not yet support the MXFP8 interleaved "
                 "scale layout"
             )
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        if linear_attn is None:
+            raise ValueError("Qwen GDN cache requires a linear-attention component")
         # The GDN backend reads the same decision, so publish it once here
         # rather than as a side effect of sizing the workspace.
-        self.attn_config.replay_ssm = self.replay_ssm
+        linear_attn.replay_ssm = self.replay_ssm
 
     # ---- layer vocabulary ----
 
     @cached_property
     def target_layer_types(self) -> tuple[str, ...]:
-        return tuple(self.attn_config.layer_types)
+        return tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
@@ -62,7 +72,25 @@ class QwenGDNRecipe(CacheRecipe):
             + (FULL_ATTENTION,) * self.num_draft_layers
         )
 
-    # ---- geometry ----
+    # ---- model geometry ----
+
+    @cached_property
+    def _text_config(self):
+        return getattr(
+            self.model_config.hf_config,
+            "text_config",
+            self.model_config.hf_config,
+        )
+
+    @cached_property
+    def _draft_text_config(self):
+        if self.draft_model_config is None:
+            return None
+        return getattr(
+            self.draft_model_config.hf_config,
+            "text_config",
+            self.draft_model_config.hf_config,
+        )
 
     @property
     @override
@@ -72,16 +100,7 @@ class QwenGDNRecipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        """Allow the structural K/V planes added by a Qwen MTP draft.
-
-        If target-only recurrent padding is p <= 1, each mirrored draft
-        layer's K/V planes increase it by (1 + p) / num_full_attention_layers.
-        Bound that increase by 2 without relaxing the original limit when no
-        draft is present. The derivation margin is intentionally the only
-        headroom: if future cache geometry trips the guard, re-derive this
-        bound rather than adding an epsilon or silently accepting an unbounded
-        binding hole.
-        """
+        """Allow the extra full-attention planes used by Qwen MTP drafts."""
         num_full_attention = sum(
             layer_type == FULL_ATTENTION for layer_type in self.target_layer_types
         )
@@ -89,38 +108,42 @@ class QwenGDNRecipe(CacheRecipe):
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
         return 1.0 + 2.0 * self.num_draft_layers / num_full_attention
 
-    # ---- fields ----
+    # ---- decoder-layer fields ----
 
     @cached_property
     def _state_shapes(self):
-        text_config = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
-        conv_shape, ssm_shape, conv_dtype, ssm_dtype, _ = (
-            text_config.mamba2_cache_params
-        )
+        """Per-rank GDN state shapes from the linear component.
+
+        Dtypes are the recipe's contract: conv bf16, SSM per the engine env.
+        """
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        ssm_dtype = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[envs.TOKENSPEED_MAMBA_SSM_DTYPE.get()]
         return (
-            tuple(conv_shape),
-            cache_dtype_name(conv_dtype),
-            tuple(ssm_shape),
+            linear_attn.conv_state_shape,
+            cache_dtype_name(torch.bfloat16),
+            linear_attn.temporal_state_shape,
             cache_dtype_name(ssm_dtype),
         )
 
     @cached_property
     def _kv_shape(self) -> tuple[int, ...]:
+        spec = self.attn_config.component(SoftmaxAttnConfig)
         return (
             self.prefix_granularity,
-            max(self.attn_config.num_kv_heads // self.attn_config.attn_tp_size, 1),
-            self.attn_config.head_dim,
+            max(spec.num_kv_heads // spec.attn_tp_size, 1),
+            spec.head_dim,
         )
 
     @cached_property
     def _draft_kv_shape(self) -> tuple[int, ...]:
-        config = self.draft_attn_config
+        spec = self.draft_attn_config.component(SoftmaxAttnConfig)
         return (
             self.prefix_granularity,
-            max(config.num_kv_heads // config.attn_tp_size, 1),
-            config.head_dim,
+            max(spec.num_kv_heads // spec.attn_tp_size, 1),
+            spec.head_dim,
         )
 
     @override
@@ -187,20 +210,15 @@ class QwenGDNRecipe(CacheRecipe):
             layer_id=layer_id,
             occurrence=occurrence,
             kv_heads=self._draft_kv_shape[1],
-            head_dim=config.head_dim,
+            head_dim=config.component(SoftmaxAttnConfig).head_dim,
             prefix_granularity=self.prefix_granularity,
         )
 
-    # ---- extras ----
+    # ---- speculative verify workspace ----
 
     @cached_property
     def replay_ssm(self) -> bool:
-        """Whether the GDN backend replays the SSM state instead of staging it.
-
-        Replay recomputes the recurrent state from the conv checkpoint, so the
-        verify window needs no ssm staging -- which is what makes this a cache
-        fact and not just a backend flag.
-        """
+        """Whether the GDN backend replays the SSM state instead of staging it."""
         if not self.num_draft_layers:
             return False
         if not (
@@ -215,24 +233,27 @@ class QwenGDNRecipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """Verify-window staging for the recurrent state, when drafting."""
+        """Return bytes needed to stage the GDN verify window."""
         if not self.num_draft_layers:
             return 0
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
         )
         # Replay reconstructs the ssm state, so only the conv checkpoint is
-        # staged; the backend reads the same decision off attn_config.
-        suffixes = (".conv",) if self.replay_ssm else (".conv", ".ssm")
+        # staged; the backend reads the same decision off the linear component.
         staged = verify_rows * sum(
             field.payload_bytes
             for _, fields in self.groups()
             for field in fields
-            if field.field_id.endswith(suffixes)
+            if field.field_id.endswith(self._verify_workspace_field_suffixes())
         )
         if self.replay_ssm:
             return staged + self._replay_payload_bytes()
         return staged
+
+    def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:
+        """Return cache-field suffixes staged during target verification."""
+        return (".conv",) if self.replay_ssm else (".conv", ".ssm")
 
     def _replay_payload_bytes(self) -> int:
         """Captured verify projections, stacked per GDN layer.

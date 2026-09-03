@@ -148,7 +148,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
-        .def_rw("enable_pd_cache", &tokenspeed::SchedulerConfig::enable_pd_cache)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.device_allocator.total_pages = v; })
@@ -173,7 +172,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::ExtendResult::request_id)
-        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens);
+        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
+        .def_rw("spec_candidate_ids", &tokenspeed::forward::ExtendResult::spec_candidate_ids);
 
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")
         .def(nb::init<>())
@@ -240,7 +240,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
-        .def("is_local_prefill", &tokenspeed::ForwardBatch::IsLocalPrefill)
+        .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
         .def_prop_ro(
             "block_tables",
             [](const tokenspeed::ForwardBatch& op)
@@ -306,6 +306,20 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
+        .def_prop_ro("remote_decode",
+                     [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
+                         if (!plan.remote_decode) {
+                             return nb::none();
+                         }
+                         return nb::cast(*plan.remote_decode, nb::rv_policy::copy);
+                     })
+        .def_prop_ro("remote_prefill",
+                     [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
+                         if (!plan.remote_prefill) {
+                             return nb::none();
+                         }
+                         return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
+                     })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
@@ -313,7 +327,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
-        .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
+        .def(
+            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
+            nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {

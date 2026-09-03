@@ -114,9 +114,12 @@ class _FakeLoop:
         self.scheduler.submit_requests(specs)
 
 
-def _hooks(rid_to_state: dict | None = None) -> tuple[PauseHooks, _FakeLoop]:
+def _hooks(
+    rid_to_state: dict | None = None, device=None
+) -> tuple[PauseHooks, _FakeLoop]:
     loop = _FakeLoop(rid_to_state)
-    return PauseHooks(loop, PauseController(NullSender())), loop
+    hooks = PauseHooks(loop, PauseController(NullSender()), device)
+    return hooks, loop
 
 
 def _spec(rid: str):
@@ -248,21 +251,17 @@ def test_reset_caches_for_release_uses_scheduler_clear_when_present() -> None:
     assert hooks.reset_caches_for_release()
 
 
-def test_kv_repair_after_wake_clears_target_and_draft_pools() -> None:
-    hooks, loop = _hooks()
+def test_kv_repair_after_wake_delegates_to_the_injected_device() -> None:
     cleared: list[str] = []
-    loop.model_executor = SimpleNamespace(
-        token_to_kv_pool=SimpleNamespace(
-            clear_kv_buffers=lambda: cleared.append("target")
-        ),
-        draft_token_to_kv_pool=SimpleNamespace(
-            clear_kv_buffers=lambda: cleared.append("draft")
-        ),
+    hooks, _ = _hooks(
+        device=SimpleNamespace(run_kv_repair=lambda: cleared.append("repair"))
     )
 
     hooks.kv_repair_after_wake()
 
-    assert cleared == ["target", "draft"]
+    # Which pools get walked is the data plane's business; this side only
+    # says when, and cannot reach a pool to walk it itself.
+    assert cleared == ["repair"]
 
 
 if __name__ == "__main__":

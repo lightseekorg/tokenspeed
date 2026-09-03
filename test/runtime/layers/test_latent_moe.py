@@ -314,7 +314,6 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
 
     assert plan.use_native
     assert not plan.use_trtllm
-    assert plan.use_precomputed_topk
     assert plan.joint_moe_reduce
 
 
@@ -358,7 +357,6 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
 
     assert not plan.use_native
     assert plan.use_trtllm
-    assert plan.use_precomputed_topk
     assert not plan.overlap_shared_experts
     assert not plan.joint_moe_reduce
 
@@ -389,10 +387,9 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     monkeypatch.setattr(
         latent_module,
         "prepare_all_reduce_fusion",
-        lambda actual_group, width, tokens: norm_calls.append(
-            (actual_group, width, tokens)
-        )
-        or True,
+        lambda actual_group, width, tokens: (
+            norm_calls.append((actual_group, width, tokens)) or True
+        ),
     )
 
     prepared = plan.prepare_latent_fusion(
@@ -770,3 +767,48 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
         proj.weight_loader(proj.weight, full)
         got = proj.forward_add3(x, a, c)
         torch.testing.assert_close(got, expected)
+
+
+def _plan_for_join(shard_up_projection: bool) -> Kimi3MoEExecutionPlan:
+    """prepare_latent_fusion on a native (lane-less) TP x EP layout."""
+    mapping = SimpleNamespace(
+        moe=SimpleNamespace(has_tp_ep=True, tp_ep_group=(0, 1)),
+    )
+    plan = Kimi3MoEExecutionPlan(
+        use_native=True,
+        use_trtllm=False,
+        overlap_shared_experts=False,
+        joint_moe_reduce=False,
+    )
+    return plan.prepare_latent_fusion(
+        mapping,
+        lane_width=10752,
+        has_latent_norm=False,
+        max_token_num=8,
+        shard_up_projection=shard_up_projection,
+    )
+
+
+def test_join_is_available_without_a_trtllm_lane() -> None:
+    """No lane, but the partials can still be reduced together.
+
+    prepare_all_reduce_lane is only implemented by the TRT-LLM backend, so a
+    native layout never arms fused_moe_ar. kimi3_join_reduce_moe handles
+    lane=None with a concatenated one-shot or a grouped all-reduce, so the
+    join is still available and the tail issues one collective instead of two.
+    """
+    prepared = _plan_for_join(shard_up_projection=False)
+    assert not prepared.fused_moe_ar
+    assert prepared.join_moe_reduce
+
+
+def test_sharded_up_projection_does_not_advertise_the_join() -> None:
+    """A sharded up projection cannot use the join, so it must not claim it.
+
+    _tail_fused_lane_ar_sharded folds the projection between two sequential
+    all-reduces rather than calling kimi3_join_reduce_moe: selecting the join
+    tier there would save no collective while also dropping routed_in_fork,
+    which overlaps the routed reduction with the shared branch.
+    """
+    prepared = _plan_for_join(shard_up_projection=True)
+    assert not prepared.join_moe_reduce

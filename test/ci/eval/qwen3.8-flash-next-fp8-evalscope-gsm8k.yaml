@@ -1,0 +1,52 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.8-flash-next-fp8-gsm8k
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - gb200-2gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model Qwen/Qwen3.8-Flash-Next-FP8
+    --trust-remote-code
+    --tensor-parallel-size 2
+    --quantization fp8
+    --moe-backend flashinfer_trtllm
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --max-model-len 8192
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --sampling-backend greedy
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model Qwen/Qwen3.8-Flash-Next-FP8
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":1024,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

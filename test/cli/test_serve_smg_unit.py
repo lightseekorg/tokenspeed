@@ -48,6 +48,7 @@ from tokenspeed.cli.serve_smg import (
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
+    _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -212,6 +213,60 @@ def test_gateway_args_preserve_user_prometheus_port():
     assert gateway_args == ["--prometheus-port", "29000"]
 
 
+def test_free_port_returns_first_sample_outside_ephemeral_range(monkeypatch):
+    """No retry needed when the first sample already clears the range."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    calls = iter([8413])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 8413
+
+
+def test_free_port_retries_out_of_ephemeral_range(monkeypatch):
+    """A sample landing inside the ephemeral range is resampled."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    # First two samples land inside the ephemeral range; the third clears it.
+    calls = iter([40000, 41000, 9000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 9000
+
+
+def test_free_port_gives_up_after_max_attempts(monkeypatch):
+    """Never loops forever: after a bounded number of attempts, return
+    whatever the last sample was rather than retrying indefinitely."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    always_ephemeral = iter([40000, 41000, 42000, 43000, 44000, 45000, 46000])
+    call_count = {"n": 0}
+
+    def fake_get_free_port():
+        call_count["n"] += 1
+        return next(always_ephemeral)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", fake_get_free_port)
+
+    port = _free_port_avoiding_ephemeral_range()
+
+    assert port == 44000  # 5th and last attempt
+    assert call_count["n"] == 5
+
+
+def test_free_port_skips_ephemeral_check_when_range_unknown(monkeypatch):
+    """Non-Linux hosts (no /proc/sys/net/ipv4/ip_local_port_range) degrade
+    to a plain get_free_port() call -- no retries, no crash."""
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: None)
+    calls = iter([40000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 40000
+
+
 def test_smg_disable_flags_appended_when_absent():
     gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
 
@@ -249,6 +304,73 @@ def test_smg_disable_flag_set_covers_all_three():
         "--disable-retries",
         "--disable-load-monitoring",
     )
+
+
+def test_cache_aware_policy_keeps_load_monitoring():
+    # cache_aware's imbalance/overload triggers feed on the worker load
+    # monitor; injecting the disable flag would leave them silently dead.
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy", "cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+
+
+def test_cache_aware_policy_equals_form_keeps_load_monitoring():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy=cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+
+
+def test_operator_policy_is_last_wins():
+    # clap/argparse are last-wins on duplicated flags; the cache_aware
+    # detection must key off the value the gateway will actually use.
+    from tokenspeed.cli.serve_smg import _operator_policy
+
+    assert (
+        _operator_policy(["--policy", "cache_aware", "--policy", "round_robin"])
+        == "round_robin"
+    )
+    assert (
+        _operator_policy(["--policy", "round_robin", "--policy=cache_aware"])
+        == "cache_aware"
+    )
+
+
+def test_gateway_defaults_pipeline_for_cache_aware():
+    # Pipeline-level guarantee: explicit cache_aware keeps load monitoring,
+    # keeps the other disable defaults, does not duplicate --policy, and does
+    # NOT auto-inject --dp-aware (wheel-pin lockstep is the operator's call).
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy", "cache_aware"]
+    )
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+    assert "--dp-aware" not in gateway_args
+    assert gateway_args.count("--policy") == 1
+    idx = gateway_args.index("--policy")
+    assert gateway_args[idx + 1] == "cache_aware"
+
+
+def test_gateway_defaults_pipeline_for_cache_aware_equals_form():
+    # --policy=cache_aware must suppress the passthrough default too: the
+    # default-policy injection and the cache_aware detection have to agree on
+    # flag spelling, or clap's last-wins silently reverts the operator's
+    # policy to passthrough while load monitoring stays on.
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy=cache_aware"]
+    )
+
+    # No bare "--policy <value>" pair may be appended; the operator's
+    # equals-form token must stay the only policy on the line. (A bare
+    # "passthrough" value may legitimately appear as the reasoning parser.)
+    assert "--policy" not in gateway_args
+    assert "--policy=passthrough" not in gateway_args
+    assert gateway_args.count("--policy=cache_aware") == 1
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
 
 
 def test_get_from_args_extracts_value():

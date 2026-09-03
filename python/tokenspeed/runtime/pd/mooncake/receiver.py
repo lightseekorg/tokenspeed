@@ -136,7 +136,9 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
     prefill_cache_layout = prefill_parallel_info.cache_layout
 
     if prefill_cache_layout is None:
-        raise RuntimeError("Paged cache decode connected to a non-Paged cache prefill")
+        raise RuntimeError(
+            "Cache-transfer decode connected to a non-cache-transfer prefill"
+        )
     decode_tp_rank = kv_mgr.topology.tp_rank
 
     pp_size = prefill_parallel_info.pp_size

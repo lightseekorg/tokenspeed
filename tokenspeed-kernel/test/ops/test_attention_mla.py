@@ -419,6 +419,86 @@ def test_mla_decode_with_kvcache(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
+def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_captures(
+    device: str,
+) -> None:
+    torch.manual_seed(91)
+    block_size = 8
+    context_len = 177
+    cache_len = context_len + block_size
+    window_left = 129
+    page_size = 64
+    num_heads = 2
+    kv_lora_rank = 8
+    qk_rope_head_dim = 4
+    qk_nope_head_dim = 4
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    max_pages = math.ceil(cache_len / page_size)
+
+    q = torch.randn(
+        block_size,
+        1,
+        num_heads,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        max_pages,
+        page_size,
+        1,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(max_pages, device=device, dtype=torch.int32).repeat(
+        block_size, 1
+    )
+    cache_seqlens = torch.full(
+        (block_size,), cache_len, device=device, dtype=torch.int32
+    )
+    softmax_scale = 1.0 / math.sqrt(qk_head_dim)
+
+    def run(query: torch.Tensor) -> torch.Tensor:
+        return mla_decode_with_kvcache(
+            q=query,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=cache_len,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            window_left=window_left,
+            noncausal_block_size=block_size,
+        )
+
+    output = run(q)
+    dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
+    expected = []
+    for block_position in range(block_size):
+        start = max(
+            0,
+            context_len - window_left + block_position,
+        )
+        visible = dense_kv[start:cache_len]
+        scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        expected.append(torch.matmul(probs, visible[:, :kv_lora_rank]))
+    expected_output = torch.stack(expected).unsqueeze(1)
+    torch.testing.assert_close(output.float(), expected_output, rtol=8e-2, atol=8e-2)
+
+    graph_output = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output.copy_(run(q))
+    eager_output = output.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -1067,7 +1147,7 @@ def test_mla_normalize_project_query_cuda_fallback(
     ).to(torch.bfloat16)
     expected_output = expected_query @ projection_weight.t()
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1079,9 +1159,9 @@ def test_mla_normalize_project_query_cuda_fallback(
         qk_rope_head_dim=4,
     )
 
-    assert returned.absorbed_query is None
+    assert absorbed_query is None
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
-    torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(returned_query, expected_output, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("heads", [12, 16])
@@ -1109,7 +1189,7 @@ def test_mla_normalize_project_query_split_output(
     expected_kv = kv.clone()
     eps = 1e-6
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1139,12 +1219,12 @@ def test_mla_normalize_project_query_split_output(
         * kv_weight.float()
     ).to(torch.bfloat16)
 
-    assert returned.absorbed_query is not None
+    assert absorbed_query is not None
     torch.testing.assert_close(
-        returned.query, projected[..., :128], atol=2e-2, rtol=2e-2
+        returned_query, projected[..., :128], atol=2e-2, rtol=2e-2
     )
     torch.testing.assert_close(
-        returned.absorbed_query[..., 512:],
+        absorbed_query[..., 512:],
         projected[..., 128:],
         atol=2e-2,
         rtol=2e-2,

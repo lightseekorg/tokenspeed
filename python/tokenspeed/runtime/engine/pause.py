@@ -344,9 +344,13 @@ class PauseHooks:
     before the loop's collaborators exist.
     """
 
-    def __init__(self, loop, controller: PauseController) -> None:
+    def __init__(self, loop, controller: PauseController, device) -> None:
         self._loop = loop
         self._pause = controller
+        # Injected, not reached through the loop: a hook that has to walk
+        # ``loop.<something>.<something>`` to get at the GPU is one traversal
+        # away from walking one step further.
+        self._device = device
 
     # -- admission-path hooks (called from _process_new_requests) -------------
 
@@ -466,9 +470,7 @@ class PauseHooks:
             # release together, so skipping the idle forward stays consistent
             # across ranks (the small DP sync above still runs to keep lockstep).
             if dp_metadata.need_idle_forward and not self._pause.released:
-                loop.model_executor.forward_thread.run(
-                    lambda: loop.model_executor.execute_idle_forward(dp_metadata)
-                )
+                self._device.run_idle_forward(dp_metadata)
 
         time.sleep(_PAUSED_IDLE_SLEEP_S)
 
@@ -488,23 +490,11 @@ class PauseHooks:
         clear = getattr(self._loop.scheduler, "clear_l1_cache", None)
         return not callable(clear) or clear()
 
-    def _kv_pools(self) -> list:
-        """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
-        the draft pool in speculative-decoding runs. Release/repair must walk the
-        SAME set, so both derive it here rather than enumerating pools by hand."""
-        pools = []
-        for attr in ("token_to_kv_pool", "draft_token_to_kv_pool"):
-            pool = getattr(self._loop.model_executor, attr, None)
-            if pool is not None:
-                pools.append(pool)
-        return pools
-
     def kv_repair_after_wake(self) -> None:
-        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool,
-        including the draft pool in spec-decode runs — its allocations are tagged
-        ``kv_cache`` too, so a wake that skipped it would feed the draft model
-        stale KV. FP8 KV scales ride with the weights region, so no scale reset
-        is needed here."""
-        for pool in self._kv_pools():
-            if hasattr(pool, "clear_kv_buffers"):
-                pool.clear_kv_buffers()
+        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool.
+
+        The pools live behind the data plane and the zeroing is device work,
+        so the handle owns which pools are walked and does the walking; this
+        side only says when.
+        """
+        self._device.run_kv_repair()

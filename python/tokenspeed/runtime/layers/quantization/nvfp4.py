@@ -113,3 +113,12 @@ class Nvfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+
+class Nvfp4W4A16Config(Nvfp4Config):
+    """Per-layer config for weight-only ModelOpt NVFP4 projections."""
+
+    def get_quant_method(self):
+        from tokenspeed.runtime.layers.dense import Nvfp4W4A16LinearMethod
+
+        return Nvfp4W4A16LinearMethod(self)

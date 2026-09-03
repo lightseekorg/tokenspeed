@@ -42,9 +42,12 @@ from tokenspeed_kernel.ops.gemm.deep_gemm import (
     transform_sf_into_required_layout,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
     prepare_flashinfer_fp8_blockscale_weight_scales,
+    prepare_nvfp4_a16_weights,
+    use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 from tokenspeed_kernel.ops.gemm.kimi3 import (
@@ -60,7 +63,12 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    Platform,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
@@ -82,6 +90,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -93,6 +102,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
 
@@ -154,6 +164,7 @@ def prepare_fp8_linear(
     block_n, block_k = int(block_size[0]), int(block_size[1])
     n, k = weight.shape
     platform = current_platform()
+    enable_pdl = pdl_enabled()
     deep_gemm_spec = KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale")
     scale_requires_transform = (
         scale_format == "ue8m0" and weight_scales.dtype.is_floating_point
@@ -190,19 +201,24 @@ def prepare_fp8_linear(
         )
 
     if (
-        has_flashinfer_mxfp8()
-        and (block_n, block_k) == (1, 32)
+        (block_n, block_k) == (1, 32)
         and weight_scales.dtype == torch.uint8
         and weight_scales.ndim == 2
         and n >= 128
         and k >= 128
         and k % 32 == 0
     ):
-        return _PreparedFp8Linear(
-            override="flashinfer_mm_mxfp8",
-            block_size=(block_n, block_k),
-            prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
-        )
+        if has_flashinfer_mxfp8() and enable_pdl:
+            return _PreparedFp8Linear(
+                override="flashinfer_mm_mxfp8",
+                block_size=(block_n, block_k),
+                prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
+            )
+        if not enable_pdl:
+            return _PreparedFp8Linear(
+                override="triton_mm_fp8_blockscale",
+                block_size=(block_n, block_k),
+            )
 
     if (
         has_flashinfer_fp8_blockscale()
@@ -242,7 +258,6 @@ def fp8_linear(
     input_scales: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Execute a block-FP8 linear operation through a prepared plan.
 
@@ -255,14 +270,16 @@ def fp8_linear(
         input_scales: Optional pre-quantized activation block scales.
         bias: Optional output bias.
         out_dtype: Requested output dtype.
-        enable_pdl: Request Programmatic Dependent Launch when supported.
-
     Returns:
         The linear output matrix ``[M, N]``.
     """
     typed_plan = _require_fp8_linear_plan(plan)
     override = typed_plan.override
-    prepacked_scales = typed_plan.prepacked_scales and input_scales is None
+    prepacked_scales = (
+        typed_plan.prepacked_scales
+        and input_scales is None
+        and use_flashinfer_fp8_blockscale_prepacked(x.shape[0])
+    )
     if typed_plan.prepacked_scales and not prepacked_scales:
         override = None
     selected_weight_scales = (
@@ -281,7 +298,6 @@ def fp8_linear(
         quant="mxfp8",
         block_size=list(typed_plan.block_size),
         override=override,
-        enable_pdl=enable_pdl,
         prepacked_scales=prepacked_scales,
     )
 
@@ -664,7 +680,6 @@ def dsv4_grouped_output_projection_warmup_model(
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -673,7 +688,6 @@ def dsv4_linear_fp32(
     Args:
         hidden_states: Floating-point activations with trailing dimension K.
         weight: Floating-point row-major weight shaped [N, K].
-        enable_pdl: Request Programmatic Dependent Launch when supported.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
@@ -692,6 +706,7 @@ def dsv4_linear_fp32(
     if not hidden_states.is_floating_point() or not weight.is_floating_point():
         raise ValueError("hidden_states and weight must be floating-point tensors")
 
+    enable_pdl = pdl_enabled()
     traits = {
         "hidden_rank": hidden_states.ndim,
         "weight_rank": weight.ndim,
@@ -749,6 +764,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
         "deep_gemm_mm_fp8_blockscale",
+        "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
 )
@@ -811,6 +827,20 @@ def _gemm_format_signature(
         return format_signature(
             a=tensor_format("scaled-fp8", A.dtype, scale=scale),
             b=tensor_format("scaled-fp8", B.dtype, scale=scale),
+        )
+    if quant == "nvfp4_a16":
+        if A_scales is not None:
+            raise ValueError("nvfp4_a16 requires A_scales=None for dense activations")
+        if B_scales is None:
+            raise ValueError("nvfp4_a16 format selection requires B_scales")
+        b_scale = ScaleFormat(
+            storage_dtype=B_scales.dtype,
+            granularity="block",
+            block_shape=(16,),
+        )
+        return format_signature(
+            a=dense_tensor_format(A.dtype),
+            b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
     if quant == "nvfp4":
         a_scale = ScaleFormat(
@@ -998,7 +1028,6 @@ def mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     quant: str | None = None,
-    enable_pdl: bool = False,
     override: str | None = None,
     prepacked_scales: bool = False,
 ) -> torch.Tensor:
@@ -1021,25 +1050,28 @@ def mm(
         out: Optional output buffer. The output may be a strided view
             but must have contiguous rows (``stride(-1) == 1``).
         out_dtype: Output dtype (defaults to ``A.dtype``).
-        alpha: Global scaling factor (nvfp4 only).
+        alpha: Global scaling factor (nvfp4 modes only).
         block_size: Block size for block-wise quantization, e.g.
             ``[128, 128]``
-        quant: Explicit quant type override.  One of ``"mxfp8"``,
-            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
-            If ``None``, inferred from input dtypes and scales.
-        enable_pdl: Whether to request Programmatic Dependent Launch support
-            from kernels that accept it.
+        quant: Explicit quant type override. One of ``"mxfp8"``, ``"fp8"``,
+            ``"nvfp4"``, ``"nvfp4_a16"``, ``"mxfp4"``, ``"none"``.
+            ``"nvfp4_a16"`` uses dense BF16 activations and prepared packed
+            NVFP4 weights. If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         prepacked_scales: Whether the FP8 block scales already use the selected
             kernel's prepared layout. This is supported only by FlashInfer's
             FP8 ``[128, 128]`` block-scale GEMM.
     """
+    enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
     M = A.shape[0]
     if quant == "mxfp4":
         K = A.shape[-1] * 2
+        N = B.shape[0]
+    elif quant == "nvfp4_a16":
+        K = A.shape[-1]
         N = B.shape[0]
     else:
         K = A.shape[-1]
@@ -1071,6 +1103,7 @@ def mm(
         "n_min_128": N >= 128,
         "k_min_128": K >= 128,
         "block_scale_layout": block_scale_layout,
+        "pdl_enabled": pdl_enabled(),
     }
 
     signature = _gemm_format_signature(

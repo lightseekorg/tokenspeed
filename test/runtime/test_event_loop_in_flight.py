@@ -41,30 +41,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
-from tokenspeed.runtime.engine.forward_dispatch import (  # noqa: E402
-    ForwardDispatcher,
-    PrefillDispatcher,
-)
 
 
-def _predicate_loop(*, dispatcher=None, eager_grammar_buffers=None):
-    return SimpleNamespace(
-        _forward_dispatcher=dispatcher or ForwardDispatcher(executor=None),
-        model_executor=SimpleNamespace(eager_grammar_buffers=eager_grammar_buffers),
-    )
-
-
-def test_the_roles_own_rule_reaches_the_registry() -> None:
-    # The P-side handoff batch needs the final chunk's bootstrap token, which
-    # only lands at commit. The rule lives on the role; the registry folds it
-    # in with the role-independent ones.
-    prefill = PrefillDispatcher(None, None, epd_hooks=None)
-    loop = _predicate_loop(dispatcher=prefill)
-    handoff_op = SimpleNamespace(num_extends=lambda: 0)
-    extend_op = SimpleNamespace(num_extends=lambda: 1)
-
-    assert EventLoop._dispatch_depends_on_pending_commit(loop, handoff_op, None)
-    assert not EventLoop._dispatch_depends_on_pending_commit(loop, extend_op, None)
+def _predicate_loop(*, eager_grammar_buffers=None):
+    return SimpleNamespace(_uses_eager_grammar=eager_grammar_buffers is not None)
 
 
 def test_handoff_shaped_batch_without_pd_keeps_overlap() -> None:
@@ -96,14 +76,14 @@ class _DrainHarness:
     def __init__(self) -> None:
         self.committed: list[object] = []
 
-    def _commit_forward_results(self, forward_op, results, on_first_token):
+    def _commit_forward_results(self, forward_op, results):
         self.committed.append(forward_op)
         return [f"change-{forward_op}"]
 
 
 def test_drain_in_flight_commits_oldest_first() -> None:
     loop = _DrainHarness()
-    in_flight = deque([("op0", None, None), ("op1", None, None)])
+    in_flight = deque([("op0", None), ("op1", None)])
 
     request_changes = EventLoop._drain_in_flight(loop, in_flight)
 

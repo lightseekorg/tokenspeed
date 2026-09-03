@@ -31,21 +31,26 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
+// The D and P role grammars schedule INTO the PD parking states
+// (RemotePrefilling, PrefillAwaitingResult), so the forward events name them
+// in their transition signatures.
+#include "fsm/pd_states.h"
 #include "utils.h"
 
 namespace tokenspeed::fsm {
 
-struct Bootstrapping;
-
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();
 
+    // `awaits_result`: a completed prefill parks in PrefillAwaitingResult
+    // until its final chunk's result lands (the P role, whose remote decode
+    // needs the bootstrap token that arrives with it).
     SchedulePrefillFirstChunkEvent(std::int32_t tokens_this_round,
                                    std::int32_t reserve_num_tokens_in_next_schedule_event,
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
                                    CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
-                                   std::vector<BlockTransfer> load_pairs)
+                                   std::vector<BlockTransfer> load_pairs, bool awaits_result = false)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           req_pool_allocator_{req_pool_allocator},
@@ -54,16 +59,16 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           block_tables_{std::move(block_tables)},
           hit_tokens_{hit_tokens},
           cache_progress_{std::move(cache_progress)},
-          load_pairs_{std::move(load_pairs)} {}
+          load_pairs_{std::move(load_pairs)},
+          awaits_result_{awaits_result} {}
 
-    std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
-    std::variant<PrefillDone, Prefilling> operator()(Retracted&& state);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Submitted&& state);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Retracted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
-    PrefillSource Source() const { return source_; }
 
 private:
-    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(TokenContainer* token_container,
-                                                             std::int32_t prefix_granularity);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> scheduleFirstChunk(
+        TokenContainer* token_container, std::int32_t prefix_granularity);
 
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
@@ -74,23 +79,26 @@ private:
     std::int32_t hit_tokens_{0};
     CacheProgress cache_progress_;
     std::vector<BlockTransfer> load_pairs_;
+    bool awaits_result_{false};
 };
 
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
 
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         CacheProgress cache_progress)
+                         CacheProgress cache_progress, bool awaits_result = false)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
-          cache_progress_{std::move(cache_progress)} {}
+          cache_progress_{std::move(cache_progress)},
+          awaits_result_{awaits_result} {}
 
-    std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling> operator()(Prefilling&& state);
 
 private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     CacheProgress cache_progress_;
+    bool awaits_result_{false};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
@@ -100,6 +108,7 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
         : decode_input_tokens_{decode_input_tokens}, cache_progress_{std::move(cache_progress)} {}
 
     Decoding operator()(PrefillDone&& state);
+    Decoding operator()(PrefillAwaitingResult&& state);
     Decoding operator()(Decoding&& state);
 
 private:
@@ -116,6 +125,7 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     explicit FinishEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Finished operator()(PrefillDone&& state);
+    Finished operator()(PrefillAwaitingResult&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
@@ -135,7 +145,9 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
     Finished operator()(Prefilling&& state);
+    Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
+    Finished operator()(PrefillAwaitingResult&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
@@ -147,33 +159,40 @@ private:
     CacheCoordinator* coordinator_{};
 };
 
-// Decode Retraction releases Device ownership immediately. Cached blocks may
-// remain in L1 or be pinned by an already-created best-effort Store ticket.
-struct RetractionEvent : InvalidTransitionHandler<RetractionEvent> {
-    using InvalidTransitionHandler<RetractionEvent>::operator();
-
-    explicit RetractionEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
-
-    Retracted operator()(Decoding&& state);
-
-private:
-    CacheCoordinator* coordinator_{};
-};
-
-// Release every request-owned page and requeue all accepted tokens as prefill.
+// Capacity retraction: release every request-owned page and requeue all
+// accepted tokens as prefill. With a host cache the caller stores the KV
+// first (`has_recoverable_snapshot`) and the readmission loads it back;
+// without one the readmission recomputes from whatever the prefix cache
+// still holds. Either way the request lands in Retracted, not Submitted:
+// "was retracted" and "never ran" are different situations, and only the
+// first escalates its readmission headroom (Request::AdmissionHeadroom).
+//
+// `resumes_generation` is Request::HasGeneratedOutput() at retraction time:
+// a victim with generated tokens a client is reading resumes ahead of one
+// that had produced nothing -- including a victim taken mid-RECOVERY, whose
+// generated tokens were rebased into its prefill by an earlier retraction.
 struct RetractEvent : InvalidTransitionHandler<RetractEvent> {
     using InvalidTransitionHandler<RetractEvent>::operator();
 
-    explicit RetractEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    RetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool has_recoverable_snapshot,
+                 bool resumes_generation)
+        : coordinator_{coordinator},
+          epoch_{epoch},
+          has_recoverable_snapshot_{has_recoverable_snapshot},
+          resumes_generation_{resumes_generation} {}
 
-    Submitted operator()(PrefillDone&& state);
-    Submitted operator()(Decoding&& state);
+    Retracted operator()(Prefilling&& state);
+    Retracted operator()(PrefillDone&& state);
+    Retracted operator()(Decoding&& state);
 
 private:
     template <typename State>
-    Submitted retract(State&& state);
+    Retracted retract(State&& state);
 
     CacheCoordinator* coordinator_{};
+    std::int64_t epoch_{0};
+    bool has_recoverable_snapshot_{true};
+    bool resumes_generation_{false};
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {
@@ -202,6 +221,40 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
         state.ExtendResultTokens(result_tokens_);
         return std::move(state);
     }
+
+    // Only the FINAL chunk's result carries a token (an intermediate chunk
+    // reports back empty -- see the Prefilling overload below), and under
+    // the PP chunk pipeline older intermediate results may still be landing
+    // after the final chunk was scheduled. So an empty arrival keeps
+    // waiting, and the token-bearing one is the result this state was
+    // waiting FOR: the prompt's last token is now real, so the request
+    // becomes schedulable (P: its remote decode can carry the bootstrap
+    // token).
+    std::variant<PrefillDone, PrefillAwaitingResult> operator()(PrefillAwaitingResult&& state) {
+        if (result_tokens_.empty()) {
+            return std::move(state);
+        }
+        state.ExtendResultTokens(result_tokens_);
+        TokenContainer* token_container = state.TokenContainerPtr();
+        const std::int32_t prefix_granularity = state.PrefixGranularity();
+        const TokenContainer::Window window = state.window;
+        const std::int32_t reserve = state.ReserveNumTokensInNextScheduleEvent();
+        auto req_pool_index = std::move(state).TakeRequestPoolIndex();
+        auto block_tables = std::move(state).TakeBlockTables();
+        auto cache_progress = std::move(state).TakeCacheProgress();
+        return PrefillDone{token_container, prefix_granularity,      std::move(req_pool_index), window,
+                           reserve,         std::move(block_tables), std::move(cache_progress)};
+    }
+
+    // An intermediate chunk produces no token -- its result is KV written
+    // into pages this request owns. The event still arrives (empty), because
+    // the arrival is the point: it is what clears the in-flight count that
+    // keeps the chunk's pages safe from retraction.
+    Prefilling operator()(Prefilling&& state) {
+        _assert(result_tokens_.empty(), "ExtendResultEvent: an intermediate prefill chunk produces no tokens");
+        return std::move(state);
+    }
+    RemotePrefilling operator()(RemotePrefilling&& state) { return std::move(state); }
 
     Finished operator()(Finished&& state) { return std::move(state); }
 

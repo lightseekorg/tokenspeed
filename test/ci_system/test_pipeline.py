@@ -101,8 +101,45 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert is_amd_runner("amd-mi355-1gpu-bench")
     assert is_amd_runner("amd-mi350-1gpu-bench")
     assert is_amd_runner("amd-mi350-4gpu-bench")
+    assert is_amd_runner("amd-mi450-sim")
     assert not is_amd_runner("b200-1gpu")
     assert not is_amd_runner("gb200-4gpu-perf")
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective"),
+    [
+        ("b200-1gpu", "gb300-1gpu"),
+        ("gb200-4gpu-perf", "gb300-4gpu-perf"),
+        ("slurm-gb200-4node-4gpu", "slurm-gb300-4node-4gpu"),
+        ("gb300-4gpu", "gb300-4gpu"),
+    ],
+)
+def test_gb300_runner_alias_preserves_logical_topology(declared, effective):
+    assert pipeline.validate_gb300_runner_alias(declared, effective) == effective
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective", "message"),
+    [
+        ("b200-4gpu", "gb300-1gpu", "GPU counts"),
+        ("gb200-4gpu-perf", "gb300-4gpu", "suffixes"),
+        ("slurm-gb200-4gpu", "gb300-4gpu", "slurm- prefix"),
+        ("h200-4gpu", "gb300-4gpu", "b200"),
+    ],
+)
+def test_gb300_runner_alias_rejects_semantic_changes(declared, effective, message):
+    with pytest.raises(ValueError, match=message):
+        pipeline.validate_gb300_runner_alias(declared, effective)
+
+
+def test_runner_override_is_slurm_only():
+    assert (
+        pipeline.apply_slurm_runner_override("b200-4gpu", "gb300-4gpu", "slurm")
+        == "gb300-4gpu"
+    )
+    with pytest.raises(ValueError, match="setup-mode"):
+        pipeline.apply_slurm_runner_override("b200-4gpu", "gb300-4gpu", "ci")
 
 
 def test_nvidia_runner_groups_split_arm_from_x86():
@@ -195,6 +232,25 @@ def test_execute_cli_accepts_slurm_setup_mode():
     assert args.setup_mode == "slurm"
 
 
+def test_execute_cli_accepts_gb300_runner_override():
+    args = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "b200-4gpu",
+            "--runner-override",
+            "gb300-4gpu",
+            "--setup-mode",
+            "slurm",
+        ]
+    )
+
+    assert args.runner == "b200-4gpu"
+    assert args.runner_override == "gb300-4gpu"
+
+
 def test_execute_cli_accepts_slurm_server_modes():
     serve = parse_args(
         [
@@ -246,6 +302,9 @@ def test_multi_node_slurm_task_validation():
     validate_task(task, Path("task.yaml"))
 
     task["triggers"] = ["per-commit"]
+    validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["nightly"]
     validate_task(task, Path("task.yaml"))
 
     task["triggers"] = ["manual"]
@@ -513,6 +572,53 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     assert return_code == 0
     assert manager.terminated is True
     assert result_json.exists()
+
+
+def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
+    monkeypatch, tmp_path
+):
+    task = {
+        "name": "aliased-unit-test",
+        "type": "ut",
+        "runner": {
+            "labels": ["b200-1gpu"],
+            "env": {"b200-1gpu": {"LOGICAL_RUNNER_ENV": "preserved"}},
+        },
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(runner=runner, env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="b200-1gpu",
+            runner_override="gb300-1gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+        )
+        == 0
+    )
+    assert captured["runner"] == "gb300-1gpu"
+    assert captured["env"]["CI_RUNNER_LABEL"] == "gb300-1gpu"
+    assert captured["env"]["SM"] == "sm103"
+    assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -1002,6 +1108,7 @@ def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
     server_starts = {"n": 0}
 
     monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "summarize_task_targets", lambda *_: {})
     monkeypatch.setattr(
         pipeline,
         "setup_runner",

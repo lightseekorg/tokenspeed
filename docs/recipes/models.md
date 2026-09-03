@@ -210,6 +210,12 @@ attention. It does not yet expose an equivalent of SGLang's
 `--speculative-dflash-draft-window-size`; add such a flag before relying on
 bounded draft attention for long-context deployments.
 
+Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
+`--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
+candidate selector are enabled automatically from the draft architecture.
+Draft proposals greedily follow the selector's transition-conditioned path,
+independent of the target sampling backend.
+
 ## Kimi K3
 
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
@@ -223,7 +229,7 @@ pip install flash-linear-attention
 
 Notes:
 
-- K3 uses the grouped paged-cache scheduler and KDA state groups.
+- K3 uses the cache-group scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
@@ -301,7 +307,9 @@ Blackwell GPU (B200/B300); on other NVIDIA platforms use
 
 ### AMD
 
-The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
+The standard AMD path on 8x gfx950 uses the `mla` backend, which selects MLA
+kernels automatically. Use `gluon` to require Gluon MLA kernels for both the
+target and, when speculative decoding is enabled, its MLA drafter. For TP8/EP8,
 automatic MoE selection uses the specialized Gluon SiTU kernels:
 
 ```bash
@@ -322,6 +330,17 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
+To force Gluon attention for an Eagle3 launch, replace the attention option
+above and add the drafter option:
+
+```bash
+  --attention-backend gluon \
+  --drafter-attention-backend gluon
+```
+
+The explicit policy fails fast when the current GPU, dtype, or attention shape
+has no registered Gluon kernel instead of silently selecting another solution.
+
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
 to the current token count. At TP8/EP8, eligible one-token decode also combines
@@ -335,7 +354,10 @@ sigmoid-bias top-k route supports the full scheduled token count.
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
-pass an explicit parser flag to override it.
+pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses the
+host-side request lengths and the packed page/row plan across full-indexer layers;
+keep the scheduler-provided CPU length mirrors populated when integrating a custom
+attention backend to avoid device synchronization in this path.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
@@ -352,11 +374,149 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --port 8000
 ```
 
+## GLM 5.3
+
+GLM-5.3 follows the GLM-5.2 DSA serving path. Its base checkpoint includes the
+NextN draft layer, so MTP does not require a separate draft checkpoint.
+
+```bash
+ts serve zai-org/GLM-5.3 \
+  --served-model-name glm-5.3 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8 \
+  --max-model-len 262144 \
+  --max-num-seqs 128 \
+  --draft-model-path-use-base \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3
+```
+
+## GLM 5.3 Flash
+
+GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from
+the base checkpoint.
+
+Install `ffmpeg` before serving multimodal requests:
+
+```bash
+apt-get update && apt-get install -y ffmpeg
+```
+
+On MI350X, use tensor parallel size 4 with expert parallelism disabled for the
+BF16 or block-FP8 checkpoints. The block-FP8 path retains compact expert
+weights for its decode-specialized Gluon kernel and materializes BF16 expert
+copies once at load time for prefill.
+
+On platforms without DeepGEMM, four-stream mHC uses a portable Triton path and
+switches to its tiled prefill projection above 256 tokens.
+
+```bash
+ts serve zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8 \
+  --draft-model-path-use-base \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3
+```
+
 ## Qwen3 Dense / Qwen3 30B-A3B
 
 Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
 For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 `Qwen3MoeForCausalLM`, so launch it as a MoE model.
+
+### Qwen3-0.6B on Ascend NPU
+
+The Ascend path supports unquantized Qwen3-0.6B on one or more NPUs. It uses
+the normal TokenSpeed scheduler and paged KV cache: prefill runs eagerly, while
+fixed-shape decode batches are captured as ACL Graphs. Aggregate serving can
+schedule prefill and decode work in the same deployment.
+
+The validated environment is CANN 9.0.0, PyTorch 2.9.0, `torch_npu`
+2.9.0.post2, Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1.
+During validation, upgrading Transformers from 4.51.0 to 5.12.0 also changed
+`huggingface-hub` from 0.36.2 to 1.28.0, `tokenizers` from 0.21.4 to 0.22.2,
+and `hf-xet` from 1.5.1 to 1.6.0. It newly installed `typer==0.27.1`,
+`shellingham==1.5.4`, and `annotated-doc==0.0.5`. The setup also newly installs
+`apache-tvm-ffi==0.1.13` and editable `tokenspeed-kernel-npu==0.1.0`. These are
+all Python-environment mutations made during this validation. Use matching
+PyTorch and `torch_npu` builds. From the repository root, install the Ascend
+dependencies, source CANN, and expose the three source packages:
+
+```bash
+test/ci_system/install_triton_ascend.sh
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+
+python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
+  --served-model-name qwen3-0.6b \
+  --device npu \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
+  --attention-backend mha \
+  --sampling-backend greedy \
+  --disable-prefill-graph \
+  --disable-pdl \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --max-total-tokens 16384 \
+  --chunked-prefill-size 4096 \
+  --prefix-granularity 128 \
+  --max-cudagraph-capture-size 4 \
+  --cudagraph-capture-sizes 1 2 4 \
+  --disable-autotune \
+  --host 0.0.0.0 \
+  --port 31889
+```
+
+The setup script installs Transformers 5.12.0 and Triton-Ascend 3.2.1, installs
+`tokenspeed-kernel-npu` from this checkout in editable mode, and compiles and
+executes both a vector-add kernel and a TokenSpeed KV-cache kernel on the
+visible NPU. Set `TOKENSPEED_CANN_ROOT` when CANN is installed outside the
+default path.
+
+The standard `mha` runtime backend selects the registered Ascend kernels on an
+NPU. It requires eager prefill and disabled PDL, so pass
+`--disable-prefill-graph` and `--disable-pdl` explicitly. Do not pass
+`--enforce-eager`, because that also disables the decode ACL Graph. Although the
+graph flags retain their CUDA-oriented names for CLI compatibility, they control
+ACL Graph capture on an NPU. The command above captures decode batches 1, 2,
+and 4 and was validated with a 16,384-token KV pool. Increase
+`--max-model-len`, `--max-num-seqs`, `--max-total-tokens`, and the capture sizes
+together when scaling the deployment. `--disable-autotune` shortens bring-up;
+remove it after validation when startup tuning is desired.
+
+The current Ascend sampling path is validated with greedy decoding. Because
+`--sampling-backend greedy` always performs argmax, send `temperature=0` and do
+not expect request-level `top_p` or `top_k` to take effect.
+
+Multi-card deployments use tensor parallelism; the world size must satisfy the
+model's standard divisibility constraints. Context, pipeline, and data parallel
+sizes must remain 1. Set `--world-size N` and expose `N` NPUs, for example
+`ASCEND_RT_VISIBLE_DEVICES=0,1` with `--world-size 2`.
+
+Verify the OpenAI-compatible endpoint with the served model name rather than
+the checkpoint path:
+
+```bash
+curl http://127.0.0.1:31889/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-0.6b",
+    "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
+    "temperature": 0,
+    "max_tokens": 64,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
 
 ```bash
 tokenspeed serve Qwen/Qwen3-30B-A3B \
@@ -408,7 +568,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -425,7 +584,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -451,7 +609,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -470,7 +627,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -513,12 +669,54 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --kv-cache-dtype fp8_e4m3 \
   --speculative-algorithm MTP \
   --speculative-draft-model-path Qwen/Qwen3.8-27B-FP8 \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --disable-kvstore \
-  --host 0.0.0.0 --port 8000
+  --speculative-num-steps 3
 ```
+
+## Qwen3.8 Flash Next
+
+Qwen3.8-Flash-Next is a multimodal MoE model and an early preview of the
+Qwen4 architecture, playing for Qwen4 the role Qwen3-Next played for Qwen3.5.
+It pairs a 125B-parameter main model with 51B of N-gram embeddings (6B
+activated per token), supports 262,144 tokens of context natively and 1M with
+YaRN, and upgrades four axes of the hybrid design:
+
+- GDN + QSA hybrid attention
+- 4-branch Gated Residual
+- N-gram (predictive latent) embeddings
+- Muon optimization
+
+In TokenSpeed it runs as a hybrid linear-attention (GDN) / full-attention model
+with optional predictive latent embeddings (PLE), optional QSA sparse
+attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
+launch command.
+
+```bash
+ts serve \
+    --model Qwen/Qwen3.8-Flash-Next-FP8 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --quantization fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3
+```
+
+### Optional `--hf-overrides`
+
+Both keys are optional and can be combined in a single `--hf-overrides` JSON
+object:
+
+```bash
+--hf-overrides \
+  '{"ple_embed_dtype":"float8_e4m3fn","index_share_for_mtp_iteration":true}'
+```
+
+- `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
+  FP8 to save memory. Omit it to store the table in the model's compute
+  dtype.
+- `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
+  MTP steps. Checkpoints that already set
+  `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
 ## GPT-OSS 20B / 120B
 

@@ -1,12 +1,11 @@
 tokenspeed-deepep==2.1.0.post20260810
-tokenspeed-deepgemm==2.5.0.post20260810
+tokenspeed-deepgemm==2.6.1.post20260827
 tokenspeed-flashmla==1.0.0.post20260810
-tokenspeed-mla==0.2.5
+tokenspeed-mla==0.2.6
 tokenspeed-fast-hadamard-transform==1.1.0.post20260810
 tokenspeed-fa3==3.0.0.post20260810
-tokenspeed-fa4==4.0.0.post20260710
-nvidia-cutlass-dsl[cu13]==4.6.0
-quack-kernels==0.6.1
+tokenspeed-fa4==4.0.0.post20260829
+nvidia-cutlass-dsl[cu13]==4.7.1
 tokenspeed-trtllm-kernel==1.3.0.post20260817
 tokenspeed-flashkda==0.0.1.post20260810
-tokenspeed-cutedsl-kda==0.1.0.post20260817
+tokenspeed-cutedsl-kda==0.1.0.post20260830

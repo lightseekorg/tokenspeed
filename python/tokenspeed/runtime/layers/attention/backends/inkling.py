@@ -66,7 +66,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -233,6 +232,11 @@ class InklingAttnBackend(AttentionBackend):
     @property
     def uses_cache_groups(self):
         return self.inner.uses_cache_groups
+
+    @property
+    def consumes_cache_metadata(self) -> bool:
+        # Inherited would also work today, but only via a __getattr__ fallthrough.
+        return self.inner.consumes_cache_metadata
 
     @property
     def cache_consumer_families(self):
@@ -697,7 +701,6 @@ class InklingAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
             tau=tau,
-            enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,
         )
@@ -763,7 +766,6 @@ class InklingAttnBackend(AttentionBackend):
                 window_left=layer.sliding_window_size,
                 softmax_scale=layer.scaling,
                 tau=tau,
-                enable_pdl=pdl_enabled(),
                 solution=inner.kernel_solution,
             )
             output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -796,7 +798,6 @@ class InklingAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
             tau=tau,
-            enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,
         )

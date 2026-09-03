@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     indexer_topk_prefill,
     persistent_topk,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
@@ -270,7 +270,7 @@ def _decode_topk(
     return out
 
 
-def _dsv4_indexer_prefill_topk(
+def _dsv4_prefill_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -295,6 +295,8 @@ def _dsv4_indexer_prefill_topk(
     result.fill_(-1)
     if q_values.shape[0] == 0 or max_seqlen_k <= 0:
         return result, gathered_k
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
 
     if index_k_format == "mxfp4":
         if gathered_k is None:
@@ -333,7 +335,7 @@ def _dsv4_indexer_prefill_topk(
     return _prefill_topk(logits, seq_lens, topk, result), gathered_k
 
 
-def _dsv4_indexer_decode_topk(
+def _dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -348,6 +350,8 @@ def _dsv4_indexer_decode_topk(
     out: torch.Tensor | None = None,
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
     q_values, q_scales = index_q
     result = _allocate_topk(
         out, tokens=q_values.shape[0], topk=topk, device=q_values.device
@@ -423,14 +427,14 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
     )
     register_kernel(
         "attention",
-        "dsv4_indexer_prefill_topk",
-        name=f"deep_gemm_dsv4_{format_name}_indexer_prefill_topk",
+        "dsv4_prefill_topk",
+        name=f"deep_gemm_dsv4_{format_name}_prefill_topk",
         **common,
-    )(_dsv4_indexer_prefill_topk)
+    )(_dsv4_prefill_topk)
     register_kernel(
         "attention",
-        "dsv4_indexer_decode_topk",
-        name=f"deep_gemm_dsv4_{format_name}_indexer_decode_topk",
+        "dsv4_decode_topk",
+        name=f"deep_gemm_dsv4_{format_name}_decode_topk",
         **{
             **common,
             "traits": {
@@ -438,7 +442,7 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
                 "topk": frozenset({512, 1024, 2048}),
             },
         },
-    )(_dsv4_indexer_decode_topk)
+    )(_dsv4_decode_topk)
 
 
 _register("fp8_scaled", ArchVersion(9, 0))
@@ -459,4 +463,6 @@ _register("mxfp4", ArchVersion(10, 0))
     priority=Priority.SPECIALIZED,
 )
 def deep_gemm_dsv4_warmup(**kwargs) -> None:
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
     warmup_prefill_jit(**kwargs)

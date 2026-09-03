@@ -91,11 +91,9 @@ public:
                                      bool count_uncached) const {
         return allocator_.BlocksReclaimableAt(index_, table, expiredBlocksAt(num_computed_tokens), count_uncached);
     }
-    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
-        const BlockTable& table, std::int32_t num_computed_tokens,
-        std::span<const CacheBlockLocation> released_locations) const {
-        return allocator_.ReclaimableBlockLocationsAt(index_, table, expiredBlocksAt(num_computed_tokens),
-                                                      released_locations);
+    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& table,
+                                                                std::int32_t num_computed_tokens) const {
+        return allocator_.ReclaimableBlockLocationsAt(index_, table, expiredBlocksAt(num_computed_tokens));
     }
 
     // --- prefix matching / index (pre-split convenience API) ---
@@ -143,10 +141,6 @@ public:
     std::int32_t NumCachedBlocks(const BlockPool& pool) const { return index_.NumEntries(pool); }
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
         return index_.EvictableLocations(pool);
-    }
-    std::vector<CacheBlockLocation> EvictableBlockLocationsAfterReleasing(
-        const BlockPool& pool, std::span<const CacheBlockLocation> released) const {
-        return index_.EvictableLocationsAfterReleasing(pool, released);
     }
     std::optional<PrefixCacheIndex::CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
                                                                                 CacheBlockLocation location) const {

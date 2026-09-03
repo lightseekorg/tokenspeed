@@ -111,24 +111,37 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
     assert final_state is final
 
 
-def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
-        device=device,
+def _backend_config(device: str, *, spec_tokens: int = 1):
+    """(AttnConfig, softmax spec): model-wide facts + softmax geometry."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = MHAConfig(
         num_attention_heads=4,
         num_kv_heads=4,
-        attn_tp_size=1,
-        dtype=torch.bfloat16,
         head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        context_len=4096,
+        max_bs=8,
+        max_graph_bs=8,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
-        max_bs=8,
+        components=(spec,),
     )
+    return config, spec
 
 
 def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = KdaAttnBackend(
-        _backend_config(device, spec_tokens=spec_tokens),
+        *_backend_config(device, spec_tokens=spec_tokens),
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
@@ -237,12 +250,25 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
 # ---------------------------------------------------------------------------
 
 
-def test_set_kv_pool_binds_contract_state_groups() -> None:
+def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
+    replay_probe = {}
+
+    def probe_replay(_dtype, **kwargs):
+        replay_probe.update(kwargs)
+        return False
+
+    monkeypatch.setattr(hybrid_kda, "kda_replay_commit_supported", probe_replay)
     pool = _make_kimi_pool("cpu")
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
     assert backend._checkpoint_granularity == pool.arena.prefix_granularity
+    _, state = backend._state_components(backend._state_layer_ids()[0])
+    assert replay_probe == {
+        "recurrent_layout": backend.kda_recurrent_layout,
+        "num_heads": state.shape[1],
+        "head_dim": state.shape[2],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +865,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 @requires_fla
 @pytest.mark.skipif(
     not current_platform().is_amd,
-    reason="indexed paged cache KDA decode is an AMD-specific contract",
+    reason="indexed cache-group KDA decode is an AMD-specific contract",
 )
 def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
@@ -875,7 +901,7 @@ def test_kda_cache_pool_component_views_end_to_end(
     from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
-        raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
+        raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
     indexed_decode = hybrid_kda.kda_paged_decode

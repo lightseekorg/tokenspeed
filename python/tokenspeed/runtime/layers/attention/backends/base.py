@@ -23,7 +23,7 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import torch
 
@@ -31,10 +31,29 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+class SpeculativeStateBackend(Protocol):
+    """Model side-state that consumes speculative verification results."""
+
+    def commit_after_mtp_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+    ) -> None: ...
+
+
+_SpeculativeStateBackendT = TypeVar(
+    "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
+)
 
 
 def init_backend_cuda_graph_state(
@@ -75,23 +94,25 @@ class AttentionBackend(ABC):
     # full-history draft table for this backend. Keep this separate from
     # uses_cache_groups: generic speculative backends still consume that table.
     cache_group_tables_replace_draft_page_table: bool = False
-    # Capture helpers use a real writable page for every active group when
-    # the backend rejects the reserved null page for live sequence metadata.
-    cache_active_pages_must_be_real: bool = False
+    # Latched by mark_cache_contract on the backends the registry binds.
+    _cache_contract_bound: bool = False
     uses_padded_decode_token_mask: bool = False
     supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 
-    def __init__(self, config: BaseAttnConfig) -> None:
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        # ``spec`` is the component this backend serves; hybrid sub-backends
+        # built over the softmax component's plumbing receive that spec.
         self.device = config.device
-        self.num_qo_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
+        self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.dtype = config.dtype
-        self.head_dim = config.head_dim
+        self.head_dim = spec.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
         self.cache_pool: CachePool | None = None
+        self._speculative_state_backends: list[SpeculativeStateBackend] = []
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
@@ -99,6 +120,18 @@ class AttentionBackend(ABC):
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         self.cache_pool = cache_pool
+
+    @property
+    def consumes_cache_metadata(self) -> bool:
+        """Whether this backend takes paged cache metadata when it is offered.
+
+        Distinct from uses_cache_groups, which MLA answers oppositely: that flag
+        marks a backend that reads the wrapper's per-group block_tables, and an
+        MLA target deliberately does not -- it reads the richer cache_metadata,
+        so its flag stays False while it is exactly the backend that must be
+        handed metadata by anything synthesizing a batch.
+        """
+        return self.uses_cache_groups or self._cache_contract_bound
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
@@ -118,7 +151,7 @@ class AttentionBackend(ABC):
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         """Per-group write-location hook for out-of-backend KV writers
-        (fused RoPE prewrite); identity for backends without paged cache
+        (fused RoPE prewrite); identity for backends without cache
         groups (see uses_cache_groups). ``forward_mode`` picks the
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
@@ -215,6 +248,71 @@ class AttentionBackend(ABC):
 
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
+
+    def register_speculative_state_backend(
+        self, backend: SpeculativeStateBackend
+    ) -> None:
+        """Register a model side-state consumer of MTP verification results.
+
+        Args:
+            backend: Side backend implementing ``commit_after_mtp_verify``.
+
+        Returns:
+            None.
+        """
+
+        # Some composite backends predate this registry and intentionally do
+        # not call ``AttentionBackend.__init__``.  Initialize lazily so model
+        # side-state remains usable through those wrappers as well.
+        backends = getattr(self, "_speculative_state_backends", None)
+        if backends is None:
+            backends = []
+            self._speculative_state_backends = backends
+        if backend not in backends:
+            backends.append(backend)
+
+    def find_speculative_state_backend(
+        self, backend_type: type[_SpeculativeStateBackendT]
+    ) -> _SpeculativeStateBackendT | None:
+        """Return the registered speculative side backend of ``backend_type``.
+
+        Args:
+            backend_type: Concrete side-backend type to locate.
+
+        Returns:
+            The first matching backend, or ``None`` when it is not registered.
+        """
+
+        return next(
+            (
+                backend
+                for backend in getattr(self, "_speculative_state_backends", ())
+                if isinstance(backend, backend_type)
+            ),
+            None,
+        )
+
+    def commit_speculative_state_after_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+    ) -> None:
+        """Publish MTP accept/reject results to registered model side-state.
+
+        Args:
+            accepted_lengths: Per-request accepted lengths from the sampler.
+            num_extends: Number of leading extend requests in a mixed batch.
+
+        Returns:
+            None.
+        """
+
+        for backend in getattr(self, "_speculative_state_backends", ()):
+            backend.commit_after_mtp_verify(
+                accepted_lengths,
+                num_extends=num_extends,
+            )
 
     @contextmanager
     def record_pd_cache_step(

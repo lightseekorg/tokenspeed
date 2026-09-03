@@ -33,20 +33,27 @@ import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
 from tokenspeed_kernel.ops.gemm.routed_gemv import MEASURED_ROUTE
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _is_routed_arch() -> bool:
     # Mirrors _CAPABILITY in routed_gemv: sm100 and up, not sm103 exactly.
-    return torch.cuda.get_device_capability() >= (10, 0)
+    return (
+        current_platform().vendor == "nvidia"
+        and torch.cuda.get_device_capability() >= (10, 0)
+    )
 
 
 def _is_add3_arch() -> bool:
     # ADD3_ROUTE stores sm103-tuned TILE CONFIGS, not just a backend choice, so
     # it stays gated where it was swept -- mirrors _is_measured_arch. Widening
     # it would run another architecture's tuning parameters unmeasured.
-    return torch.cuda.get_device_capability() >= (10, 3)
+    return (
+        current_platform().vendor == "nvidia"
+        and torch.cuda.get_device_capability() >= (10, 3)
+    )
 
 
 def _routed_cases():
@@ -91,7 +98,11 @@ def test_routed_backend_matches_torch(shape, backend):
     reason="route is registered for sm100 and up",
 )
 def test_non_bf16_inputs_fall_back_to_torch():
-    from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv, tgv_gemv
+    from tokenspeed_kernel.ops.gemm.routed_gemv import (
+        ll_bf16_gemv,
+        skinny_gemv,
+        tgv_gemv,
+    )
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
     w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
@@ -101,6 +112,11 @@ def test_non_bf16_inputs_fall_back_to_torch():
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
     got = tgv_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+
+    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
+    w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
+    got = ll_bf16_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 
@@ -245,10 +261,25 @@ def test_unlisted_shapes_keep_the_generic_selection():
     assert "rowcta" in getattr(impl, "__name__", "")
     impl = _select(4, 3216, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(3, 6288, 7168, True)
+    # A width no call site produces.
+    impl = _select(3, 6289, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
     impl = _select(1, 2304, 1536, True)
     assert "rowcta" in getattr(impl, "__name__", "")
+
+
+def test_qwen38_route_keeps_unstable_shapes_on_fallback():
+    assert MEASURED_ROUTE[(2, 12800, 2560)] == "skinny"
+    assert {m for m, n, k in MEASURED_ROUTE if (n, k) == (12800, 2560)} == {2, 4}
+    for shape in (
+        (2, 512, 2560),
+        (4, 640, 2560),
+        (17, 2560, 320),
+        (21, 2560, 320),
+        (23, 2560, 320),
+        (1, 6656, 2560),
+    ):
+        assert shape not in MEASURED_ROUTE
 
 
 @pytest.mark.parametrize("m", [1, 2, 4])
@@ -294,6 +325,9 @@ def test_forced_torch_solution_is_not_routed():
     ):
         kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
         kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+    # Drain the queued vendor-BLAS work here: under emulation it otherwise keeps
+    # executing into the next test and charges its runtime against that test.
+    torch.cuda.synchronize()
 
 
 def test_route_predicate_admits_the_registered_arch_floor():
@@ -308,8 +342,111 @@ def test_route_predicate_admits_the_registered_arch_floor():
     nvidia = type("P", (), {"vendor": "nvidia"})()
     for capability, expected in (((10, 0), True), ((9, 0), False)):
         routed_gemv._is_routed_arch.cache_clear()
-        with patch("torch.cuda.get_device_capability", return_value=capability), patch(
-            "tokenspeed_kernel.platform.current_platform", return_value=nvidia
+        with (
+            patch("torch.cuda.get_device_capability", return_value=capability),
+            patch("tokenspeed_kernel.platform.current_platform", return_value=nvidia),
         ):
             assert routed_gemv.decode_gemv_routed(x, w) is expected
     routed_gemv._is_routed_arch.cache_clear()
+    torch.cuda.synchronize()
+
+
+def test_measured_route_source_has_no_duplicate_keys():
+    """A dict literal silently resolves duplicate keys last-wins, so a re-added
+    entry would shadow an existing one with no error anywhere. Count key
+    occurrences in the SOURCE text, where duplicates are still visible."""
+    import collections
+    import inspect
+    import re
+
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+
+    src = inspect.getsource(routed_gemv)
+    keys = re.findall(r'\((\d+), (\d+), (\d+)\): "\w+"', src)
+    dupes = [k for k, n in collections.Counter(keys).items() if n > 1]
+    assert not dupes, f"duplicate MEASURED_ROUTE keys in source: {dupes}"
+    # Parsed size must match source count, else a duplicate collapsed.
+    assert len(routed_gemv.MEASURED_ROUTE) == len(keys)
+    # Tuple-valued tables need their own pattern, scanned per table: the two
+    # config tables are independent key spaces, so a shared key is legal.
+    for name, table in (
+        ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
+        ("ADD3_ROUTE", routed_gemv.ADD3_ROUTE),
+    ):
+        start = src.index(f"{name}: MappingProxyType")
+        span = src[start : src.index(")", src.index("}", start))]
+        cfg_keys = re.findall(r"\((\d+), (\d+), (\d+)\): \(", span)
+        cfg_dupes = [k for k, n in collections.Counter(cfg_keys).items() if n > 1]
+        assert not cfg_dupes, f"duplicate {name} keys in source: {cfg_dupes}"
+        assert len(table) == len(cfg_keys), name
+    # Exact-M keying: entries may only exist in the gap-free swept range.
+    assert all(m <= 32 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+
+
+def test_skinny_config_route_entries_are_valid():
+    """Every tuned skinny config must target a shape the route actually sends
+    to skinny, and must satisfy the kernel's geometry contract; a typo here
+    would otherwise fall back (wrong M) or crash at compile time."""
+    from tokenspeed_kernel.ops.gemm.routed_gemv import SKINNY_CONFIG_ROUTE
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
+        shape_dynamic_skinny_gemm,
+    )
+
+    for (m, n, k), tuned in SKINNY_CONFIG_ROUTE.items():
+        assert MEASURED_ROUTE.get((m, n, k)) == "skinny", (m, n, k)
+        # supports() does not know the kernel's warp-multiple block rule.
+        assert tuned[0] % 32 == 0, (m, n, k)
+        config = SkinnyGemmConfig(m, *tuned)
+        assert shape_dynamic_skinny_gemm.supports(config, m, n, k), (m, n, k)
+
+
+def test_skinny_config_prefers_the_measured_table_over_the_heuristic():
+    """Measured entries serve; unmeasured shapes fall through to the heuristic."""
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    routed_gemv._skinny_config.cache_clear()
+    m, n, k = 2, 768, 1536
+    config = routed_gemv._skinny_config(m, n, k)
+    assert (
+        config.block_size,
+        config.outputs_per_block,
+        config.k_unroll,
+        config.vector_width,
+    ) == routed_gemv.SKINNY_CONFIG_ROUTE[(m, n, k)]
+
+    unmeasured = (7, 768, 1536)
+    assert unmeasured not in routed_gemv.SKINNY_CONFIG_ROUTE
+    assert routed_gemv._skinny_config(*unmeasured) == (
+        shape_dynamic_skinny_gemm.default_config(*unmeasured)
+    )
+    routed_gemv._skinny_config.cache_clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("misalign,offset", [("x", 4), ("weight", 4), ("x", 8)])
+def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset):
+    """vw-16 needs 32-byte pointers and supports() cannot see alignment, so the
+    guard falls back; offset 8 is the 16B case a vw-8 config would accept."""
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+    from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
+
+    m, n, k = 2, 768, 1536  # tuned entry (96, 2, 1, 16)
+    xbuf = torch.randn(m * k + offset, device="cuda", dtype=torch.bfloat16)
+    wbuf = torch.randn(n * k + offset, device="cuda", dtype=torch.bfloat16)
+    x = (xbuf[offset:] if misalign == "x" else xbuf[:-offset]).view(m, k)
+    w = (wbuf[offset:] if misalign == "weight" else wbuf[:-offset]).view(n, k)
+    assert (x if misalign == "x" else w).data_ptr() % 32
+    monkeypatch.setattr(
+        skinny_gemm.ShapeDynamicSkinnyGemm,
+        "__call__",
+        lambda *a, **kw: pytest.fail("under-aligned input must not launch vw-16"),
+    )
+    got = routed_gemv.skinny_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)

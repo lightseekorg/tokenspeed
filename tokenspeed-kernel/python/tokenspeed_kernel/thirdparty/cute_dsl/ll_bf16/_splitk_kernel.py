@@ -42,14 +42,15 @@ def st_shared_remote_f32(remote_addr, val, *, loc=None, ip=None):
 class LLBf16SplitK:
     """BF16 router GEMM kernel based on clustered split-K MMA.
 
-    This kernel computes C[M, N] = A[M, K] @ B[N, K]^T for bf16 inputs
-    and fp32 output. It partitions K across a CTA cluster, uses DMA warps to
-    stage A/B tiles with cp.async, uses MMA warps to accumulate fp32 partials,
-    and reduces split-K partials through DSMEM before storing C.
+    This kernel computes C[M, N] = A[M, K] @ B[N, K]^T (+ bias[N]) for bf16
+    inputs, accumulating in fp32 and converting to ``out_dtype`` on store. It
+    partitions K across a CTA cluster, uses DMA warps to stage A/B tiles with
+    cp.async, uses MMA warps to accumulate fp32 partials, and reduces split-K
+    partials through DSMEM before storing C.
 
     :param ab_dtype: Element type for A and B operands.
     :param acc_dtype: Accumulator type used by MMA and reductions.
-    :param out_dtype: Output element type. The public wrapper uses fp32.
+    :param out_dtype: Output element type; fp32 and bf16 are supported.
     :param tile_n: CTA tile size in N. M is fixed to 16 for router batches.
     :type tile_n: int
     :param tile_k: K tile size staged through shared memory.
@@ -62,18 +63,22 @@ class LLBf16SplitK:
     :type split_k: int
     :param use_pdl: Whether to launch with Programmatic Dependent Launch.
     :type use_pdl: bool
+    :param has_bias: Whether the epilogue adds a ``[N]`` bias before the
+        output conversion.
+    :type has_bias: bool
 
     :note: Supported A/B data types:
         - BFloat16/BFloat16
     :note: Supported accumulator data types:
         - Float32
     :note: Supported C data types:
-        - Float32
+        - Float32/BFloat16
     :note: Constraints:
         - K must preserve 16-byte row alignment for contiguous bf16 inputs.
 
-    :compile-key: ``(split_k, num_stages)`` selects the cluster split
-        count and cp.async pipeline depth specialization.
+    :compile-key: ``(split_k, num_stages, out_dtype, has_bias)`` selects the
+        cluster split count, cp.async pipeline depth, output element type, and
+        whether the epilogue folds in a bias.
     """
 
     def __init__(
@@ -87,6 +92,7 @@ class LLBf16SplitK:
         num_dma_warps: int = 4,
         split_k: int = 8,
         use_pdl: bool = False,
+        has_bias: bool = False,
     ):
         """Initialize the split-K kernel configuration.
 
@@ -109,10 +115,13 @@ class LLBf16SplitK:
         :type split_k: int
         :param use_pdl: Whether to launch with Programmatic Dependent Launch.
         :type use_pdl: bool
+        :param has_bias: Whether the epilogue adds a ``[N]`` bias.
+        :type has_bias: bool
         """
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
+        self.has_bias = has_bias
         self.tile_m = 16
         self.tile_n = tile_n
         self.tile_k = tile_k
@@ -190,6 +199,7 @@ class LLBf16SplitK:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
+        mBias: cute.Tensor,
         stream: CUstream,
         scale: float = 1.0,
     ):
@@ -210,6 +220,10 @@ class LLBf16SplitK:
         :type mB: cute.Tensor
         :param mC: Output tensor C with shape ``[M, N]``.
         :type mC: cute.Tensor
+        :param mBias: Bias tensor with shape ``[N]``, read only when the kernel
+            was built with ``has_bias``; otherwise a same-typed placeholder the
+            kernel never touches.
+        :type mBias: cute.Tensor
         :param stream: CUDA stream for asynchronous execution.
         :type stream: CUstream
         :param scale: Epilogue scale applied before storing C.
@@ -265,6 +279,7 @@ class LLBf16SplitK:
             mA,
             mB,
             mC,
+            mBias,
             scale,
             sA_layout,
             sB_layout,
@@ -294,6 +309,7 @@ class LLBf16SplitK:
         mA,
         mB,
         mC,
+        mBias,
         scale: cutlass.Float32,
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
@@ -573,7 +589,7 @@ class LLBf16SplitK:
                 local_coord = cute.select(epilogue_slot_coords[elem_idx], mode=[1, 0])
                 global_coord = cC[local_coord]
                 if cute.elem_less(global_coord, mC.shape):
-                    acc = (
+                    acc = cutlass.Float32(
                         partials[None, elem_idx]
                         .load()
                         .reduce(
@@ -582,6 +598,8 @@ class LLBf16SplitK:
                             reduction_profile=0,
                         )
                     )
-                    gC[local_coord] = acc
+                    if const_expr(self.has_bias):
+                        acc = acc + mBias[global_coord[1]].to(cutlass.Float32)
+                    gC[local_coord] = acc.to(self.out_dtype)
 
         cute.arch.sync_threads()

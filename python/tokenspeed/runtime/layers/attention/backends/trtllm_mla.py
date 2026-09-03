@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_DEFAULT_PAGE_SIZE,
@@ -57,7 +58,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -121,7 +121,7 @@ class TRTLLMMLADecodeMetadata:
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Paged cache only: absolute latent write locations, request-major, with
+    # Cache-group path only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
@@ -132,8 +132,8 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         self.max_context_len = config.context_len
         self.kernel_page_size = (
@@ -152,12 +152,12 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.draft_block_decode = config.draft_block_decode
@@ -171,7 +171,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 f"trtllm_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
             )
 
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
@@ -329,7 +329,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Group-derived latent write location on the paged-cache path.
+        """Group-derived latent write location on the cache-group path.
 
         Identity when not cache-group bound or idle. A draft owns its per-step
         locations (it passes ``num_extends == bs`` by its own convention), so it
@@ -470,7 +470,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if self._cache_contract_bound:
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "trtllm_mla Paged cache graph capture buffer was not "
+                    "trtllm_mla cache-group graph capture buffer was not "
                     "allocated; mark_cache_contract must run before "
                     "init_cuda_graph_state"
                 )
@@ -741,7 +741,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             window_left=-1,
             cum_seq_lens_q=cum_seq_lens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            enable_pdl=pdl_enabled(),
             is_causal=causal,
             return_lse=True,
             out=out,

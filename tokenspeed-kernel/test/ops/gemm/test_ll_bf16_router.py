@@ -18,17 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The vendored CuTe dot-product router GEMM against the paths it displaces."""
+"""The vendored CuTe router GEMM, and its dense-linear form, against the paths
+they displace."""
+
+from typing import Literal
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
+from tokenspeed_kernel.ops.gemm import ll_bf16 as ll_bf16_ops
+from tokenspeed_kernel.ops.gemm.flashinfer import _declares_cute_dsl_backend
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_ROUTER_SIZE,
     kimi3_router_projection,
 )
-from tokenspeed_kernel.ops.gemm.ll_bf16 import MAX_M, ll_bf16_router_supported
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+    MAX_M,
+    ll_bf16_mm,
+    ll_bf16_mm_supported,
+    ll_bf16_router_supported,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
 if not torch.cuda.is_available():
@@ -89,3 +100,141 @@ def test_declines_non_contiguous_and_odd_k() -> None:
         KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16
     )
     assert not ll_bf16_router_supported(odd, odd_w, 1)
+
+
+def test_compiled_cache_separates_pdl_policy() -> None:
+    a, b = _inputs(1, seed=23)
+    previous = pdl_enabled()
+    try:
+        pdl_enabled(False)
+        without_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        assert any(key[-1] is False for key in ll_bf16_router._dotprod)
+
+        assert pdl_enabled(True)
+        with_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        assert any(key[-1] is True for key in ll_bf16_router._dotprod)
+        torch.testing.assert_close(with_pdl, without_pdl)
+    finally:
+        pdl_enabled(previous)
+
+
+# Covers both backends: the dot product at M <= 4, split-K above it.
+_MM_MS = [1, 4, 8, 32]
+
+
+@pytest.mark.parametrize("m", _MM_MS)
+def test_bf16_epilogue_rounds_once(m: int) -> None:
+    """The epilogue converts from its FP32 accumulator, so no double rounding."""
+    a, b = _inputs(m, seed=5)
+    fp32 = ll_bf16_router(a, b)
+    assert torch.equal(
+        ll_bf16_router(a, b, out_dtype=torch.bfloat16), fp32.to(torch.bfloat16)
+    )
+    bias = torch.randn(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(
+        ll_bf16_router(a, b, bias=bias, out_dtype=torch.bfloat16),
+        (fp32 + bias.float()).to(torch.bfloat16),
+    )
+
+
+@pytest.mark.parametrize("m", _MM_MS)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_mm_matches_linear(m: int, with_bias: bool) -> None:
+    """Whichever path serves it: FlashInfer's backend or the vendored copy."""
+    a, b = _inputs(m, seed=7)
+    bias = (
+        torch.randn(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
+        if with_bias
+        else None
+    )
+    assert ll_bf16_mm_supported(a, b, bias)
+    got = ll_bf16_mm(a, b, bias)
+    assert got.dtype is torch.bfloat16
+    torch.testing.assert_close(
+        got.float(),
+        torch.nn.functional.linear(
+            a.float(), b.float(), None if bias is None else bias.float()
+        ),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+def test_flashinfer_probe_reads_the_declared_backends() -> None:
+    """0.6.18 declares the backend; earlier wheels name every other one."""
+
+    def upstreamed(backend: Literal["cudnn", "cute-dsl"] = "cudnn") -> None: ...
+
+    def earlier(backend: Literal["cudnn", "tgv", "tinygemm"] = "cudnn") -> None: ...
+
+    assert _declares_cute_dsl_backend(upstreamed)
+    assert not _declares_cute_dsl_backend(earlier)
+    assert not _declares_cute_dsl_backend(lambda: None)
+
+
+def test_flashinfer_branch_meets_its_documented_requirement(monkeypatch) -> None:
+    """Its guard wants row-major 2-D A, column-major B, and a contiguous [N] bias."""
+    a, b = _inputs(4, seed=19)
+    bias = torch.randn(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
+
+    def stub(a_arg, b_arg, *, bias, pdl, out, backend):
+        assert backend == "cute-dsl"
+        assert isinstance(pdl, bool)
+        assert a_arg.ndim == 2 and a_arg.is_contiguous()
+        assert tuple(b_arg.shape) == (KIMI3_HIDDEN_SIZE, KIMI3_ROUTER_SIZE)
+        assert b_arg.T.is_contiguous()
+        assert bias.shape == (KIMI3_ROUTER_SIZE,) and bias.is_contiguous()
+        assert out is None or (out.dtype is torch.bfloat16 and out.is_contiguous())
+        return ll_bf16_router(
+            a_arg, b_arg.t(), out, bias=bias, out_dtype=torch.bfloat16
+        )
+
+    monkeypatch.setattr(flashinfer_ops, "_mm_bf16", stub)
+    monkeypatch.setattr(ll_bf16_ops, "has_flashinfer_cute_dsl_bf16", lambda: True)
+    torch.testing.assert_close(
+        ll_bf16_mm(a, b, bias).float(),
+        torch.nn.functional.linear(a.float(), b.float(), bias.float()),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize(("lead", "m"), [((2, 2), 4), ((4, 8), 32)])
+def test_flattens_leading_dims_and_honours_out(lead, m: int) -> None:
+    a, b = _inputs(m, seed=11)
+    x = a.view(*lead, KIMI3_HIDDEN_SIZE)
+    out = torch.empty(*lead, KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
+    returned = ll_bf16_mm(x, b, out=out)
+    assert returned.shape == out.shape
+    assert returned.data_ptr() == out.data_ptr()
+    assert torch.equal(out.view(m, KIMI3_ROUTER_SIZE), ll_bf16_mm(a, b))
+
+
+def test_mm_guard_declines_what_the_kernels_cannot_serve() -> None:
+    a, b = _inputs(1, seed=13)
+    # K must be a multiple of 128: both backends step K in those units.
+    k_odd = KIMI3_HIDDEN_SIZE + 8
+    assert not ll_bf16_mm_supported(
+        torch.randn(1, k_odd, device="cuda", dtype=torch.bfloat16),
+        torch.randn(KIMI3_ROUTER_SIZE, k_odd, device="cuda", dtype=torch.bfloat16),
+    )
+    big, big_w = _inputs(MAX_M + 1, seed=13)
+    assert not ll_bf16_mm_supported(big, big_w)
+    # Contiguous but offset 8 bytes into its storage, so vector loads misalign.
+    buf = torch.randn(KIMI3_HIDDEN_SIZE + 16, device="cuda", dtype=torch.bfloat16)
+    assert not ll_bf16_mm_supported(buf[4 : 4 + KIMI3_HIDDEN_SIZE].view(1, -1), b)
+    assert not ll_bf16_mm_supported(a, b.unsqueeze(0))
+    # Declined on the original tensor: a reshape would copy into something
+    # contiguous and 32-byte aligned, voiding both checks.
+    wide, wide_w = _inputs(2, seed=17)
+    assert not ll_bf16_mm_supported(wide.t().contiguous().t(), wide_w)
+    # Degenerate weight must be declined, not divided by.
+    assert not ll_bf16_mm_supported(
+        a, torch.zeros(KIMI3_ROUTER_SIZE, 0, device="cuda", dtype=torch.bfloat16)
+    )
+    assert not ll_bf16_mm_supported(
+        a, b, torch.zeros(KIMI3_ROUTER_SIZE + 1, device="cuda", dtype=torch.bfloat16)
+    )
+    assert not ll_bf16_mm_supported(
+        a, b, torch.zeros(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.float32)
+    )

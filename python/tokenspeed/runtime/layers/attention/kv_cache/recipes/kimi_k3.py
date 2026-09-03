@@ -21,8 +21,9 @@
 """Kimi-K3 cache recipe: MLA latents plus KDA recurrent state groups.
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
-are dense and pin a 12:1 packing; the state groups pack to match the MLA
-plane's byte width so no parent is wasted.
+are dense and pin the smallest packing whose plane width covers one per-layer
+KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
+byte width so no parent is wasted.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -57,7 +62,6 @@ _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
 _KIMI_K3_PREFIX_GRANULARITY = 128
 _KIMI_K3_STATE_GROUPS = 3
-_KIMI_K3_MLA_PACKING = 12
 
 
 def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, ...]:
@@ -183,10 +187,12 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def _kda_shapes(self):
-        """(conv shape, recurrent shape) per rank, validated against tp size."""
-        tp_size = self.attn_config.attn_tp_size
-        if tp_size <= 0:
-            raise ValueError(f"tp_size must be positive, got {tp_size}")
+        """(conv shape, recurrent shape) per rank, from the linear component.
+
+        Geometry, TP width, and divisibility validation live on
+        ``LinearAttnConfig`` (sourced from ``mapping.linear_attn``); the
+        recipe only validates the cache-dtype contract around them.
+        """
         cache_dtype = self.attn_config.kv_cache_dtype
         if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
             raise ValueError(
@@ -197,18 +203,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
         if getattr(self._text_config, "mla_use_nope", None) is not True:
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
-        linear = self._text_config.linear_attn_config
-        num_heads = int(linear["num_heads"])
-        head_dim = int(linear["head_dim"])
-        kernel_size = int(linear["short_conv_kernel_size"])
-        if num_heads % tp_size:
-            raise ValueError(
-                f"KDA num_heads={num_heads} must be divisible by tp_size={tp_size}"
-            )
-        return (
-            (3 * num_heads * head_dim // tp_size, kernel_size - 1),
-            (num_heads // tp_size, head_dim, head_dim),
-        )
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        if linear_attn is None:
+            raise ValueError("Kimi-K3 cache requires a linear-attention component")
+        return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
     @override
     def fields_for_layer(
@@ -221,7 +219,8 @@ class KimiK3Recipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
-            latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+            spec = config.component(MLAConfig)
+            latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",
@@ -253,7 +252,7 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
+        mla_page_bytes = next(
             field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
         )
         first_state = f"{LINEAR_ATTENTION}_0"
@@ -262,12 +261,16 @@ class KimiK3Recipe(CacheRecipe):
             for field in fields_by_group[first_state]
             if field.plane_id == "slot.0"
         )
-        linear_packing = max(1, mla_plane_bytes // linear_plane_bytes)
+        # The smallest packing whose plane width covers one per-layer KDA
+        # state, so the state page rides inside the MLA plane at the least
+        # parent granularity. Attn tp=8 gives the historical 12; attention-DP
+        # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
+        # while larger tp shrinks the state and the parent with it.
+        mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
+        linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
         return {
             spec.group_id: (
-                _KIMI_K3_MLA_PACKING
-                if spec.group_id == FULL_ATTENTION
-                else linear_packing
+                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
             )
             for spec, _ in groups
         }
@@ -303,9 +306,14 @@ class KimiK3Recipe(CacheRecipe):
             kda_replay_commit_supported,
         )
 
+        _, recurrent_shape = self._kda_shapes
+        heads, head_dim, _ = recurrent_shape
         return bool(
             kda_replay_commit_supported(
-                self.attn_config.dtype, recurrent_layout=kda_recurrent_layout()
+                self.attn_config.dtype,
+                recurrent_layout=kda_recurrent_layout(),
+                num_heads=heads,
+                head_dim=head_dim,
             )
         )
 
@@ -315,18 +323,32 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:
-            # Replay starts from the committed convolution checkpoint and
-            # reconstructs the accepted recurrent state.  The backend keeps
-            # one such row per live request, not a state row per candidate.
-            conv_bytes = self.attn_config.max_bs * sum(
-                field.payload_bytes
-                for spec, fields in self.groups()
-                if spec.group_id != FULL_ATTENTION
-                for field in fields
-                if field.field_id.endswith(".conv_state")
-            )
             conv_shape, recurrent_shape = self._kda_shapes
             heads, head_dim, _ = recurrent_shape
+            # Replay starts from the committed convolution checkpoint and
+            # reconstructs the accepted recurrent state.
+            from tokenspeed_kernel.ops.attention import (
+                kda_batched_replay_uses_raw_gate,
+            )
+
+            replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
+                self.attn_config.dtype,
+                num_heads=heads,
+                head_dim=head_dim,
+            )
+            # Raw-g replay reuses the committed convolution pool as verify scratch.
+            conv_bytes = (
+                0
+                if replay_uses_raw_gate
+                else self.attn_config.max_bs
+                * sum(
+                    field.payload_bytes
+                    for spec, fields in self.groups()
+                    if spec.group_id != FULL_ATTENTION
+                    for field in fields
+                    if field.field_id.endswith(".conv_state")
+                )
+            )
             rows = self.attn_config.max_bs * int(
                 self.server_args.speculative_num_draft_tokens
             )
@@ -337,11 +359,15 @@ class KimiK3Recipe(CacheRecipe):
                 for field in fields
             )
             payload_bytes_per_row = (
-                conv_shape[0] * torch.bfloat16.itemsize
-                + head_dim * torch.bfloat16.itemsize
-                + heads * torch.bfloat16.itemsize
-                + heads * head_dim * torch.float32.itemsize
+                conv_shape[0] + head_dim + heads
+            ) * torch.bfloat16.itemsize
+            # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
+            gate_itemsize = (
+                torch.bfloat16.itemsize
+                if replay_uses_raw_gate
+                else torch.float32.itemsize
             )
+            payload_bytes_per_row += heads * head_dim * gate_itemsize
             return conv_bytes + layer_count * rows * payload_bytes_per_row
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1

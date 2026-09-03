@@ -23,42 +23,10 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
-import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
-import tokenspeed_kernel.ops.attention.msa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.attention.gdn_utils import (
-    GdnCheckpointLayout,
-    GdnChunkPrefillResult,
-)
-from tokenspeed_kernel.ops.attention.kda_utils import (
-    KdaFusedDecodeResult,
-    KdaPrefillResult,
-)
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
-    dsv4_build_dense_prefill_local_compressed_indices,
-    dsv4_combine_dense_swa_indices,
-    dsv4_combine_topk_swa_indices,
-    dsv4_compressed_slot_mapping,
-    dsv4_compute_global_topk_indices_and_lens,
-    dsv4_decode_swa_indices_and_lens,
-    dsv4_dequantize_and_gather_k_cache,
-    dsv4_fused_csa_indexer_mxfp4_cache_insert,
-    dsv4_fused_indexer_q_rope_hadamard_mxfp4,
-    dsv4_fused_inv_rope_fp8_quant,
-    dsv4_fused_sparse_compress_cache_insert,
-    dsv4_indexer_decode_metadata_compute,
-    dsv4_save_compressor_state,
-    write_dsv4_indexer_mxfp4_cache_cuda,
-)
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
@@ -68,26 +36,12 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
-    ScaleFormat,
     dense_tensor_format,
     format_signature,
     tensor_format,
 )
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
-
-
-@dataclass(frozen=True)
-class MLAQueryProjection:
-    """Projected MLA query and an optional prepared absorb destination.
-
-    When ``absorbed_query`` is present, ``query`` contains only the per-head
-    NoPE channels and the RoPE tail of ``absorbed_query`` is populated. The
-    absorb BMM owns the remaining latent prefix.
-    """
-
-    query: torch.Tensor
-    absorbed_query: torch.Tensor | None
 
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
@@ -136,161 +90,841 @@ def _blockscaled_signature_and_scales(
     return signature, dict(q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
 
 
-__all__ = [
-    "mha_prefill",
-    "mha_extend_with_kvcache",
-    "mha_decode_with_kvcache",
-    "rel_mha_prefill",
-    "rel_mha_extend_with_kvcache",
-    "rel_mha_decode_with_kvcache",
-    "rel_mha_plan",
-    "gdn_chunk_prefill",
-    "gdn_decode_step",
-    "gdn_decode_mtp",
-    "gdn_replay_commit",
-    "gdn_replay_commit_supported",
-    "kda_paged_prefill",
-    "kda_recurrent_layout",
-    "kda_paged_decode",
-    "try_kda_fused_paged_decode",
-    "try_kda_fused_paged_verify",
-    "KdaFusedDecodeResult",
-    "try_kda_replay_commit",
-    "resolve_kda_batched_replay_commit",
-    "kda_replay_commit_supported",
-    "KdaPrefillResult",
-    "GdnCheckpointLayout",
-    "GdnChunkPrefillResult",
-    "MLAQueryProjection",
-    "mla_prefill",
-    "mla_use_absorbed_extend",
-    "mla_extend_with_kvcache",
-    "mla_normalize_project_query",
-    "mla_project_value",
-    "mla_project_value_prefers_contiguous_weight",
-    "mla_decode_with_kvcache",
-    "dsa_prefill",
-    "dsa_decode",
-    "dsa_prefill_topk",
-    "dsa_decode_topk",
-    "dsa_plan",
-    "dsv4_plan",
-    "dsv4_csa_indexer_fp8_cache_insert",
-    "dsv4_build_dense_prefill_local_compressed_indices",
-    "dsv4_combine_dense_swa_indices",
-    "dsv4_combine_topk_swa_indices",
-    "dsv4_compressed_slot_mapping",
-    "dsv4_compute_global_topk_indices_and_lens",
-    "dsv4_decode_swa_indices_and_lens",
-    "dsv4_dequantize_and_gather_k_cache",
-    "dsv4_fused_csa_indexer_mxfp4_cache_insert",
-    "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
-    "dsv4_fused_inv_rope_fp8_quant",
-    "dsv4_fused_sparse_compress_cache_insert",
-    "dsv4_indexer_cache_format",
-    "dsv4_indexer_decode_metadata_compute",
-    "dsv4_indexer_decode_topk",
-    "dsv4_indexer_prefill_topk",
-    "dsv4_padded_heads",
-    "dsv4_paged_selected_attention",
-    "dsv4_reset_attention_state",
-    "dsv4_save_compressor_state",
-    "dsv4_selected_attention",
-    "dsv4_swa_cache_insert",
-    "dsv4_warmup",
-    "write_dsv4_indexer_mxfp4_cache_cuda",
-    "msa_decode_with_kvcache",
-    "msa_extend_with_kvcache",
-    "attn_merge_state",
-    "mha_plan",
-]
-
 LSE_LN = math.log2(math.e)
 
 
-def dsv4_indexer_cache_format(use_fp4: bool | None = None) -> str:
-    """Resolve the DeepSeek V4 indexer cache format for this kernel platform.
+# ===-----------------------------------------------------------------------===#
+# MHA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def mha_plan(
+    dtype: torch.dtype,
+    head_dim: int,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    solution: str | None = None,
+) -> dict:
+    """Build a dense MHA execution plan from registered kernel capabilities.
 
     Args:
-        use_fp4: Explicit format request. ``True`` selects MXFP4, ``False``
-            selects scaled FP8, and ``None`` selects the platform default.
+        dtype: Query/K/V dtype for prefill planning.
+        head_dim: Attention head dimension.
+        window_left: Exclusive left sliding-window size, or -1 for full-context
+            attention.
+        logit_cap: Logit soft-cap value, or 0.0 when disabled.
+        sinks: Attention sinks tensor when sinks are enabled.
+        return_lse: Whether the selected path must return LSE values.
+        solution: Optional kernel solution to restrict planning.
 
     Returns:
-        ``"mxfp4"`` or ``"fp8_scaled"``.
+        A dict containing:
+        - "extend_mode":
+          "postwrite" means run prefill before writing KV cache;
+          "prewrite" means write KV cache first and run cached extend.
     """
+    if dtype == torch.float8_e4m3fn:
+        return {"extend_mode": "prewrite"}
 
-    if use_fp4 is not None:
-        return "mxfp4" if use_fp4 else "fp8_scaled"
-    platform = current_platform()
-    return (
-        "mxfp4"
-        if platform.is_nvidia and platform.arch_version.major >= 10
-        else "fp8_scaled"
-    )
-
-
-def dsv4_padded_heads(num_local_heads: int) -> int:
-    """Return the local head extent required by DeepSeek V4 kernels.
-
-    Args:
-        num_local_heads: Number of attention heads assigned to this rank.
-
-    Returns:
-        A kernel-compatible local head extent. GFX950 accepts the native
-        16-head Pro TP8 and 32-head Pro TP4 shapes; other platform behavior
-        retains the 64/128-head padding policy.
-    """
-
-    if current_platform().is_cdna4 and num_local_heads in (16, 32):
-        return num_local_heads
-    if num_local_heads <= 64:
-        return 64
-    if num_local_heads <= 128:
-        return 128
-    raise ValueError(
-        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
-    )
-
-
-def dsv4_reset_attention_state() -> None:
-    """Reset backend-owned value-dependent state before a DSV4 forward."""
-    from tokenspeed_kernel.ops.attention.flash_mla import reset_dsv4_tile_metadata
-
-    reset_dsv4_tile_metadata()
-
-
-def _dsv4_indexer_selection(
-    index_q: torch.Tensor,
-    *,
-    index_k_format: str,
-    page_size: int,
-    topk: int,
-) -> tuple[object, dict[str, object]]:
-    if index_k_format not in ("mxfp4", "fp8_scaled"):
-        raise ValueError(
-            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
-        )
-    if index_q.ndim < 3:
-        raise ValueError(
-            "index_q values must have at least 3 dimensions, got "
-            f"{tuple(index_q.shape)}"
-        )
-    logical_head_dim = (
-        index_q.shape[-1] * 2 if index_k_format == "mxfp4" else index_q.shape[-1]
-    )
+    traits = {
+        "head_dim": head_dim,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
     signature = format_signature(
-        q=dense_tensor_format(index_q.dtype),
-        weights=dense_tensor_format(torch.float32),
-        index_k_cache=dense_tensor_format(torch.uint8),
+        q=dense_tensor_format(dtype),
+        k=dense_tensor_format(dtype),
+        v=dense_tensor_format(dtype),
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "mha_prefill",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
+    extend_mode = (
+        "postwrite"
+        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
+        else "prewrite"
+    )
+    return {"extend_mode": extend_mode}
+
+
+def mha_prefill(
+    # attention inputs
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
+    # attention options
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MHA prefill from uncached KV.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
+        v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
+        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
+        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
+            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        max_seqlen: Maximum sequence length.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        sinks: Optional attention sink tensor.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Standard full-sequence prefill assumes query and KV sequence boundaries match.
+    """
+    batch_size = cu_seqlens.shape[0] - 1
+
+    # Select kernel
+    traits = {
+        "head_dim": q.shape[-1],
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "mha_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    # Record shapes
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "head_dim": q.shape[-1],
+        "max_seqlen": max_seqlen,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mha_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    # Enter profiling scope
+    with kernel_scope(
+        "attention",
+        "mha_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+        )
+
+
+def mha_extend_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    # attention options
+    is_causal: bool = False,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MHA extend with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
+            lengths are independent and may be smaller than KV lengths.
+        max_seqlen_q: Maximum query length.
+        max_seqlen_k: Maximum KV length.
+        is_causal: Whether query tokens are a causal suffix of cached KV.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        sinks: Optional attention sink tensor.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
+            elements), shape [total_q, num_q_heads, head_dim // 32]. Providing
+            it selects the block-scaled path; q/k_cache/v_cache must then be
+            float8_e4m3fn.
+        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
+            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
+            page_size 128).
+        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Each request's query tokens attend all visible cached KV tokens.
+    """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+
+    # Select kernel
+    traits = {
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "is_causal": is_causal,
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
+    kernel = select_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    # Record shapes
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mha_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    # Enter profiling scope
+    with kernel_scope(
+        "attention",
+        "mha_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            is_causal=is_causal,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            enable_pdl=pdl_enabled(),
+            **scale_kwargs,
+        )
+
+
+def mha_decode_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    max_seqlen_q: int,
+    # attention options
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MHA decode with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
+        max_seqlen_k: Maximum KV length.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        logit_cap: Optional soft cap applied to attention logits.
+        sinks: Optional attention sink tensor.
+        return_lse: Whether to also return log-sum-exp values.
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
+            elements), shape [batch * max_seqlen_q, num_q_heads, head_dim // 32].
+            Providing it selects the block-scaled path; q/k_cache/v_cache must
+            then be float8_e4m3fn.
+        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
+            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
+            page_size 128).
+        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+    """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+
+    # Select kernel
+    traits = {
+        "q_len": max_seqlen_q,
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "sliding_window": window_left >= 0,
+        "support_logit_cap": logit_cap != 0.0,
+        "support_sinks": sinks is not None,
+        "return_lse": return_lse,
+    }
+    kernel = select_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    # Record shapes
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mha_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    # Enter profiling scope
+    with kernel_scope(
+        "attention",
+        "mha_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            enable_pdl=pdl_enabled(),
+            **scale_kwargs,
+        )
+
+
+# rel_mha: relative-distance-bias MHA; own family keeps model-specific args out of plain mha.
+
+
+def rel_mha_plan(
+    dtype: torch.dtype,
+    head_dim: int,
+    window_left: int = -1,
+    return_lse: bool = False,
+    solution: str | None = None,
+) -> dict:
+    """Build a relative-attention MHA execution plan.
+
+    Args:
+        dtype: Query/K/V dtype for prefill planning.
+        head_dim: Attention head dimension.
+        window_left: Exclusive left sliding-window size, or -1 for full-context
+            attention.
+        return_lse: Whether the selected path must return LSE values.
+        solution: Optional kernel solution to restrict planning.
+
+    Returns:
+        Same "extend_mode" dict as mha_plan, planned over the rel_mha_prefill
+        operator.
+    """
+    if dtype == torch.float8_e4m3fn:
+        return {"extend_mode": "prewrite"}
+
+    traits = {
+        "head_dim": head_dim,
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
+    }
+    signature = format_signature(
+        q=dense_tensor_format(dtype),
+        k=dense_tensor_format(dtype),
+        v=dense_tensor_format(dtype),
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "rel_mha_prefill",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
+    extend_mode = (
+        "postwrite"
+        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
+        else "prewrite"
+    )
+    return {"extend_mode": extend_mode}
+
+
+def rel_mha_prefill(
+    # attention inputs
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_logits: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
+    # attention options
+    window_left: int = -1,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA prefill from uncached KV.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
+        v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
+        rel_logits: Learned relative bias logits with shape
+            [total_q, num_q_heads, rel_extent]. rel_logits[t, h, d] is added
+            to the pre-softmax logit of query row t against the key d
+            positions behind it, for 0 <= d < rel_extent; other distances
+            contribute zero bias.
+        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
+        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
+            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        max_seqlen: Maximum sequence length.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Attention is always causal within each sequence.
+    """
+    batch_size = cu_seqlens.shape[0] - 1
+
+    traits = {
+        "head_dim": q.shape[-1],
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen": max_seqlen,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            rel_logits=rel_logits,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
+            window_left=window_left,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=pdl_enabled(),
+        )
+
+
+def rel_mha_extend_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    rel_logits: torch.Tensor,
+    # attention options
+    window_left: int = -1,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA extend with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
+            lengths are independent and may be smaller than KV lengths.
+        max_seqlen_q: Maximum query length.
+        max_seqlen_k: Maximum KV length.
+        rel_logits: Learned relative bias logits with shape
+            [total_q, num_q_heads, rel_extent]; rows are addressed by each
+            request's batch-flattened query positions (cu_seqlens_q). The
+            relative distance is computed against the query's absolute
+            position in the cached sequence.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Each request's query tokens attend all visible cached KV tokens causally.
+
+    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
+    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
+    UE8M0 [total_q, num_q_heads, head_dim // 32], k_scale/v_scale use the
+    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
+    32, 4, 4].
+    """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
     )
     traits = {
-        "index_heads": int(index_q.shape[-2]),
-        "head_dim": int(logical_head_dim),
-        "topk": int(topk),
-        "page_size": int(page_size),
-        "index_k_format": index_k_format,
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
     }
-    return signature, traits
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            rel_logits=rel_logits,
+            window_left=window_left,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=pdl_enabled(),
+            **scale_kwargs,
+        )
+
+
+def rel_mha_decode_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    rel_logits: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int = 1,
+    # attention options
+    window_left: int = -1,
+    softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA decode with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Total visible KV lengths after appending current decode
+            tokens, shape [batch].
+        max_seqlen_k: Maximum KV length.
+        rel_logits: Learned relative bias logits with shape
+            [batch * max_seqlen_q, num_q_heads, rel_extent], one row per
+            decode token.
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1]
+            (arange(batch + 1) * max_seqlen_q). Required: decode runs the
+            varlen path so each request's query rows map into rel_logits at
+            their batch-flattened positions.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
+    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
+    UE8M0 [batch, num_q_heads, head_dim // 32], k_scale/v_scale use the
+    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
+    32, 4, 4].
+
+    Uniform ``max_seqlen_q > 1`` (spec verify) rides v2's native prediction
+    dimension — unexpanded ``[batch]`` seqlens and ``[batch, W]`` table, one
+    KV load per request. Non-uniform multi-query takes the fork varlen path.
+    """
+    blockscaled = q_scale is not None
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+    traits = {
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "sliding_window": window_left >= 0,
+        "return_lse": False,
+    }
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            rel_logits=rel_logits,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            window_left=window_left,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=pdl_enabled(),
+            **scale_kwargs,
+        )
+
+
+# ===-----------------------------------------------------------------------===#
+# MLA Kernels
+# ===-----------------------------------------------------------------------===#
 
 
 def mla_project_value_prefers_contiguous_weight(
@@ -481,7 +1115,7 @@ def mla_normalize_project_query(
     qk_rope_head_dim: int | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> MLAQueryProjection:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize MLA query/KV latents and project the normalized query.
 
     The query normalization is materialized in its input dtype before the
@@ -506,10 +1140,12 @@ def mla_normalize_project_query(
         solution: Optional registered solution name.
 
     Returns:
-        The projected query and an optional absorbed-query destination. The
-        ordinary query is shaped ``[tokens, output_width]``. When an absorbed
-        destination is returned, the query is instead shaped
-        ``[tokens, heads, qk_nope_head_dim]``.
+        A ``(query, absorbed_query)`` pair. ``query`` normally has shape
+        ``[tokens, output_width]`` and ``absorbed_query`` is ``None``. When an
+        absorbed destination is prepared, ``query`` instead has shape
+        ``[tokens, heads, qk_nope_head_dim]`` and ``absorbed_query`` has shape
+        ``[tokens, heads, kv_width + qk_rope_head_dim]``; only its RoPE tail is
+        populated because the absorb BMM owns the latent prefix.
     """
     if query.ndim != 2 or query.shape[0] < 1:
         raise ValueError("query must have shape [tokens, query_width]")
@@ -661,7 +1297,7 @@ def mla_normalize_project_query(
                 out=out,
                 tail_out=tail_out,
             )
-            return MLAQueryProjection(output, absorbed_query)
+            return output, absorbed_query
 
     projection_out = out
     if query.is_cuda and query.dtype == torch.bfloat16:
@@ -697,7 +1333,1766 @@ def mla_normalize_project_query(
         )
         kv.copy_((kv_norm * kv_norm_weight.float()).to(kv.dtype))
         torch.mm(query_norm, projection_weight.t(), out=projection_out)
-    return MLAQueryProjection(out, None)
+    return out, None
+
+
+def mla_prefill(
+    # attention inputs
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    softmax_scale: float,
+    # attention options
+    seq_lens_kv: torch.Tensor | None = None,
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
+
+    This API is for the non-absorbed MLA path. Callers materialize full
+    per-head K/V before calling this function, so the kernel contract is close
+    to MHA ragged attention. It is used for both prompt/new-token causal
+    prefill and prefix-cache replay chunks after the compressed MLA cache has
+    been read and expanded by the model.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, qk_head_dim], where
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
+        k: Key tensor with shape [total_kv, num_kv_heads, qk_head_dim]. For
+            DeepSeek MLA prefill today, num_kv_heads is normally num_q_heads
+            after expanding the shared RoPE key part across heads.
+        v: Value tensor with shape [total_kv, num_kv_heads, v_head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+            This is independent from cu_seqlens_q so prefix-cache chunks can use
+            q_lens != kv_lens.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_kv: Maximum KV length in the batch.
+        softmax_scale: Scale applied to QK logits before softmax.
+        seq_lens_kv: Optional per-request KV lengths with shape [batch]. Some
+            backends need this in addition to cu_seqlens_kv.
+        is_causal: Whether to apply a causal mask between Q and KV. Prefix-cache
+            replay chunks should pass False because all prefix tokens precede all
+            extend tokens.
+        logit_cap: Optional soft cap applied to attention logits.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads]. Required when partial attention states
+            will be merged.
+        out: Optional output tensor with shape [total_q, num_q_heads, v_head_dim].
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with shape [total_q, num_q_heads, v_head_dim], or
+        (output, lse) when return_lse is True.
+    """
+    batch_size = cu_seqlens_q.shape[0] - 1
+    traits = {
+        "qk_head_dim": q.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "is_causal": is_causal,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "mla_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "qk_head_dim": q.shape[-1],
+        "v_head_dim": v.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_kv": max_seqlen_kv,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            softmax_scale=softmax_scale,
+            seq_lens_kv=seq_lens_kv,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def mla_use_absorbed_extend(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    page_size: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    max_seqlen_q: int | None = None,
+    solution: str | None = None,
+) -> bool:
+    """Return whether a registered kernel supports absorbed MLA extend.
+
+    Args:
+        q_dtype: Absorbed query dtype.
+        kv_dtype: Compressed KV-cache dtype.
+        num_q_heads: Number of local query heads.
+        page_size: Number of cache tokens per page.
+        qk_nope_head_dim: Original non-RoPE query/key dimension.
+        kv_lora_rank: Compressed MLA latent rank.
+        qk_rope_head_dim: RoPE query/key dimension.
+        max_seqlen_q: Optional maximum query length used to filter kernels whose
+            registered shape domain is narrower than their operator API.
+        solution: Optional kernel solution to restrict the query.
+
+    Returns:
+        Whether the current platform has a matching causal absorbed-extend
+        implementation. Kernel registrations remain the source of truth for
+        hardware, dtype, and shape support.
+    """
+    signature = format_signature(
+        q=dense_tensor_format(q_dtype),
+        kv_cache=dense_tensor_format(kv_dtype),
+    )
+    traits = {
+        "num_q_heads": num_q_heads,
+        "page_size": page_size,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "is_causal": True,
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+    if max_seqlen_q is not None:
+        traits["max_seqlen_q"] = max_seqlen_q
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "mla_extend_with_kvcache",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    return any(spec_matches_traits(spec, traits) for spec in candidates)
+
+
+def mla_extend_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    # MLA dimensions
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    # attention options
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA multi-token attention over a compressed paged KV cache.
+
+    The model supplies packed absorbed queries and prewrites the current tokens
+    to the compressed cache. A zero-length prefix represents initial prefill;
+    a nonzero prefix represents cached extend.
+
+    Args:
+        q: Packed absorbed query shaped ``[total_q, num_q_heads,
+            kv_lora_rank + qk_rope_head_dim]``.
+        kv_cache: Compressed paged cache shaped ``[num_pages, page_size, 1,
+            kv_lora_rank + qk_rope_head_dim]``.
+        page_table: Page table shaped ``[batch, max_pages_per_seq]``.
+        cache_seqlens: Total visible KV lengths, including the current query
+            tokens, shaped ``[batch]``.
+        cu_seqlens_q: Packed query boundaries shaped ``[batch + 1]``.
+        cu_seqlens_kv: Packed total-KV boundaries shaped ``[batch + 1]``.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_k: Maximum visible KV length in the batch.
+        qk_nope_head_dim: Original non-RoPE query/key dimension.
+        kv_lora_rank: Compressed MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE query/key dimension.
+        softmax_scale: Scale applied to QK logits.
+        is_causal: Whether each query chunk is a causal suffix of its cache.
+        logit_cap: Optional soft cap applied to logits.
+        return_lse: Whether to return natural-log log-sum-exp values.
+        out: Optional output shaped ``[total_q, num_q_heads, kv_lora_rank]``.
+        override: Optional exact kernel name.
+        solution: Optional kernel solution backend.
+
+    Returns:
+        Latent attention output, or ``(output, lse)`` when supported and
+        ``return_lse`` is true. The caller applies the MLA value projection.
+    """
+    batch_size = cache_seqlens.shape[0]
+    traits = {
+        "page_size": kv_cache.shape[1],
+        "num_q_heads": q.shape[1],
+        "max_seqlen_q": max_seqlen_q,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "is_causal": is_causal,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def mla_decode_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    # MLA dimensions
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    # attention options
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+    # optional projected-value epilogue
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+) -> AttentionResult:
+    """MLA absorbed decode over compressed paged MLA KV cache.
+
+    This API is for the absorbed MLA decode path. The model has already
+    transformed the non-RoPE query part into latent space using the key half of
+    kv_b_proj, so Q and the compressed cache share the same q/k dimension:
+    kv_lora_rank + qk_rope_head_dim. The kernel returns the attention-weighted
+    latent value. When ``value_weight`` is provided, a supporting kernel may
+    instead apply the value projection and optional output gate while reducing
+    the attention partials. Otherwise the API composes the latent decode and
+    value projection.
+
+    Args:
+        q: Absorbed query with shape
+            [batch, q_len, num_q_heads, kv_lora_rank + qk_rope_head_dim]. For
+            plain decode q_len is 1; speculative/draft paths may pass q_len > 1.
+        kv_cache: Paged compressed MLA cache with shape
+            [num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]. The first
+            kv_lora_rank elements are latent KV; the final qk_rope_head_dim
+            elements are the RoPE key part.
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. These
+            lengths include current decode tokens when they were prewritten.
+        max_seqlen_k: Maximum visible KV length.
+        qk_nope_head_dim: Original non-RoPE q/k head dim. Some backends need
+            this for kernel specialization even though q stores the absorbed
+            latent dimension.
+        kv_lora_rank: MLA latent rank R. The output head dim is R.
+        qk_rope_head_dim: RoPE q/k head dim.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Optional soft cap applied to attention logits.
+        window_left: Number of historical positions visible to the first query
+            in a proposal block, or -1 for full attention. A non-causal row
+            also sees the whole proposal block. DFlash2 passes the model's
+            ``sliding_window - 1`` value here.
+        noncausal_block_size: Number of flattened proposal rows per request.
+            Use one for ordinary causal decode.
+        return_lse: Whether to also return log-sum-exp values.
+        out: Optional output tensor with shape [batch, q_len, num_q_heads,
+            kv_lora_rank]. When ``value_weight`` is provided, this is required
+            and has shape [batch, num_q_heads * value_head_dim].
+        value_weight: Optional per-head value projection with shape
+            [num_q_heads, kv_lora_rank, value_head_dim].
+        gate: Optional raw sigmoid gate with shape
+            [batch, num_q_heads * value_head_dim]. Requires ``value_weight``.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent attention output with shape [batch, q_len, num_q_heads,
+        kv_lora_rank], or (output, lse) when return_lse is True. When
+        ``value_weight`` is provided, returns ``out`` containing the projected
+        and optionally gated value.
+    """
+    if gate is not None and value_weight is None:
+        raise ValueError("gate requires value_weight")
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if noncausal_block_size <= 0:
+        raise ValueError(
+            f"noncausal_block_size must be positive, got {noncausal_block_size}"
+        )
+    if 0 <= window_left < noncausal_block_size - 1:
+        raise ValueError(
+            "window_left must cover the complete non-causal block; got "
+            f"window_left={window_left}, block_size={noncausal_block_size}"
+        )
+
+    projected_value = value_weight is not None
+    if projected_value:
+        if q.ndim != 4 or q.shape[1] != 1:
+            raise ValueError(
+                "projected MLA decode requires q shape [batch,1,heads,dim]"
+            )
+        if value_weight.ndim != 3 or value_weight.shape[:2] != (
+            q.shape[2],
+            kv_lora_rank,
+        ):
+            raise ValueError(
+                "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
+            )
+        if out is None:
+            raise ValueError("projected MLA decode requires out")
+        expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
+        if out.shape != expected_output:
+            raise ValueError(f"out must have shape {expected_output}")
+        if (
+            out.dtype != value_weight.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must match value_weight dtype and be contiguous and colocated with q"
+            )
+        if gate is not None and gate.shape != expected_output:
+            raise ValueError(f"gate must have shape {expected_output}")
+        if return_lse:
+            raise ValueError("projected MLA decode does not support return_lse")
+
+    # The portable Triton MLA kernel is currently the exact implementation of
+    # DFlash2's non-causal sliding mask. Keep full-attention dispatch unchanged;
+    # optimized projected-value kernels can add this trait independently.
+    if window_left >= 0:
+        if override not in (None, "triton_mla_decode_with_kvcache"):
+            raise ValueError(
+                "sliding MLA decode currently requires "
+                "triton_mla_decode_with_kvcache"
+            )
+        if solution not in (None, "triton"):
+            raise ValueError("sliding MLA decode currently requires solution='triton'")
+        override = "triton_mla_decode_with_kvcache"
+        solution = "triton"
+        if projected_value:
+            attention = mla_decode_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=logit_cap,
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
+                override=override,
+                solution=solution,
+            )
+            return mla_project_value(
+                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                value_weight,
+                gate=gate,
+                out=out,
+            )
+
+    traits = {
+        "batch_size": q.shape[0],
+        "page_size": kv_cache.shape[1],
+        "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "batch_size_div_64": q.shape[0] % 64 == 0,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
+    }
+    if projected_value:
+        traits.update(
+            {
+                "value_head_dim": value_weight.shape[2],
+                "gate_kind": "none" if gate is None else "sigmoid",
+            }
+        )
+        signature = _attention_format_signature(
+            q=q,
+            kv_cache=kv_cache,
+            value_weight=value_weight,
+            out=out,
+        )
+    else:
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    dispatch_mode = (
+        "mla_decode_projected_value" if projected_value else "mla_decode_with_kvcache"
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            dispatch_mode,
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if projected_value:
+            if override is not None or solution is not None:
+                raise
+            attention = mla_decode_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=logit_cap,
+            )
+            return mla_project_value(
+                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                value_weight,
+                gate=gate,
+                out=out,
+            )
+        if q.dtype == kv_cache.dtype:
+            raise
+        q = q.to(kv_cache.dtype)
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+
+    shape_params = {
+        "batch_size": q.shape[0],
+        "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "max_seqlen_k": max_seqlen_k,
+        "window_left": window_left,
+        "noncausal_block_size": noncausal_block_size,
+    }
+    if projected_value:
+        shape_params["value_head_dim"] = value_weight.shape[2]
+    ShapeCapture.get().record(
+        "attention",
+        dispatch_mode,
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        dispatch_mode,
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        if projected_value:
+            return kernel(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                value_weight=value_weight,
+                gate=gate,
+                out=out,
+                logit_cap=logit_cap,
+            )
+        kernel_kwargs = dict(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
+        if window_left >= 0:
+            kernel_kwargs.update(
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
+            )
+        return kernel(**kernel_kwargs)
+
+
+# ===-----------------------------------------------------------------------===#
+# KPool Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def _validate_kpool_topk_inputs(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    pool_size: int,
+    topk_pools: int,
+    page_size: int,
+) -> None:
+    if q.dim() != 3 or q.dtype != torch.bfloat16:
+        raise ValueError("KPool queries must be [tokens, heads, dim] in bfloat16")
+    if weights.dim() != 2 or weights.shape != q.shape[:2]:
+        raise ValueError("KPool weights must match the query token and head axes")
+    head_dim = q.shape[2]
+    if head_dim % 128 or pool_size <= 1 or topk_pools <= 0 or page_size <= 0:
+        raise ValueError("invalid KPool head, pool, top-k, or page geometry")
+    row_bytes = head_dim + head_dim // 128 * 4
+    expected = (int(page_size), row_bytes)
+    flat = pooled_k_cache.dim() == 2 and pooled_k_cache.shape[1] == math.prod(expected)
+    rows = pooled_k_cache.dim() == 3 and pooled_k_cache.shape[1:] == expected
+    if (
+        not (flat or rows)
+        or pooled_k_cache.stride(-1) != 1
+        or pooled_k_cache.stride(0) % 4
+    ):
+        raise ValueError("invalid packed KPool cache geometry")
+
+
+def kpool_prefill_write(
+    slot_k: torch.Tensor,
+    slot_score: torch.Tensor,
+    write_slots: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    """Compress completed prefill pools directly into the index cache.
+
+    Args:
+        slot_k: Raw index keys shaped ``[rows, pool_size, head_dim]``.
+        slot_score: Per-channel pool scores with the same shape as ``slot_k``.
+        write_slots: Flattened physical index-cache slots.
+        index_values: Paged FP8 pool values, updated in place.
+        index_scales: Paged FP32 pool scales, updated in place.
+        ape: Learned intra-pool bias shaped ``[pool_size, head_dim]``.
+    Returns:
+        None. Cache tensors are updated in place.
+    """
+    rows, pool_size, head_dim = slot_k.shape
+    traits = {
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "index_k_format": "fp8_scaled",
+        "rotate": True,
+    }
+    signature = _attention_format_signature(slot_k=slot_k)
+    kernel = select_kernel(
+        "attention",
+        "kpool_prefill_write",
+        signature,
+        traits=traits,
+    )
+    shape_params = {
+        "rows": int(rows),
+        "pool_size": int(pool_size),
+        "head_dim": int(head_dim),
+        "index_rows_per_page": int(index_values.shape[1]),
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "kpool_prefill_write",
+        kernel.name,
+        slot_k.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_prefill_write",
+        slot_k.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            slot_k=slot_k,
+            slot_score=slot_score,
+            write_slots=write_slots,
+            index_values=index_values,
+            index_scales=index_scales,
+            ape=ape,
+        )
+
+
+def kpool_prefill_tail_write(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    source_starts: torch.Tensor,
+    destination_slots: torch.Tensor,
+    destination_positions: torch.Tensor,
+    valid_counts: torch.Tensor,
+    *,
+    pool_size: int,
+) -> None:
+    """Copy incomplete prefill pools into fixed request-local tail buffers.
+
+    Args:
+        k: Full index-key tensor shaped ``[tokens, head_dim]``.
+        gate: Per-channel scores with the same shape as ``k``.
+        tail_k: Request-local key ring, updated in place.
+        tail_gate: Request-local score ring, updated in place.
+        source_starts: First source token for each fixed metadata row.
+        destination_slots: Stable request-tail slot for each metadata row.
+        destination_positions: First logical destination position per row.
+        valid_counts: Live token count per row. Zero marks graph padding.
+        pool_size: Maximum number of tokens copied by one metadata row.
+
+    Returns:
+        None. Cache tensors are updated in place.
+    """
+    head_dim = k.shape[1]
+    traits = {
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+    }
+    signature = _attention_format_signature(k=k)
+    kernel = select_kernel(
+        "attention",
+        "kpool_prefill_tail_write",
+        signature,
+        traits=traits,
+    )
+    shape_params = {
+        "tokens": int(k.shape[0]),
+        "rows": int(source_starts.numel()),
+        "pool_size": int(pool_size),
+        "tail_size": int(tail_k.shape[1]),
+        "head_dim": int(head_dim),
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "kpool_prefill_tail_write",
+        kernel.name,
+        k.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_prefill_tail_write",
+        k.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            k=k,
+            gate=gate,
+            tail_k=tail_k,
+            tail_gate=tail_gate,
+            source_starts=source_starts,
+            destination_slots=destination_slots,
+            destination_positions=destination_positions,
+            valid_counts=valid_counts,
+            pool_size=pool_size,
+        )
+
+
+def kpool_decode_append(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_gate: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request_slots: torch.Tensor,
+    index_block_table: torch.Tensor,
+    index_values: torch.Tensor,
+    index_scales: torch.Tensor,
+    ape: torch.Tensor,
+) -> None:
+    """Append a decode/verify window to request-local tails and paged indices.
+
+    Args:
+        k: Index keys shaped ``[requests, steps, head_dim]``.
+        gate: Per-channel pool scores with the same shape as ``k``.
+        tail_k: Request-local raw KPool key tails, updated in place.
+        tail_gate: Request-local raw KPool score tails, updated in place.
+        seq_lens: Final sequence lengths after the decode window.
+        request_slots: Stable request-pool row for each batch request.
+        index_block_table: Logical-pool-page to physical-index-page table.
+        index_values: Paged FP8 pooled values, updated in place.
+        index_scales: Paged FP32 pooled-row scales, updated in place.
+        ape: Learned intra-pool position bias.
+
+    Returns:
+        None. All cache outputs are written in place.
+    """
+    requests, steps, head_dim = k.shape
+    pool_size = ape.shape[0]
+    tail_size = tail_k.shape[1]
+    traits = {
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "index_k_format": "fp8_scaled",
+        "rotate": True,
+    }
+    signature = _attention_format_signature(k=k)
+    kernel = select_kernel(
+        "attention",
+        "kpool_decode_append",
+        signature,
+        traits=traits,
+    )
+    shape_params = {
+        "requests": int(requests),
+        "steps": int(steps),
+        "pool_size": int(pool_size),
+        "tail_size": int(tail_size),
+        "head_dim": int(head_dim),
+        "index_rows_per_page": int(index_values.shape[1]),
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "kpool_decode_append",
+        kernel.name,
+        k.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_decode_append",
+        k.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            k=k,
+            gate=gate,
+            tail_k=tail_k,
+            tail_gate=tail_gate,
+            seq_lens=seq_lens,
+            request_slots=request_slots,
+            index_block_table=index_block_table,
+            index_values=index_values,
+            index_scales=index_scales,
+            ape=ape,
+        )
+
+
+def kpool_decode_topk(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    index_block_table: torch.Tensor,
+    kv_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    kv_page_size: int,
+    topk_pools: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    apply_relu: bool = True,
+    append_tail: bool = True,
+    chunk_pools: int = 8192,
+    max_seq_len: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select pooled decode candidates and map them to a FlatKV layout.
+
+    Args:
+        q: Indexer queries shaped ``[tokens, heads, head_dim]``.
+        pooled_k_cache: Paged compressed index-key cache.
+        weights: Per-token indexer head weights.
+        seq_lens: Raw-token history length for each request.
+        index_block_table: Page table for ``pooled_k_cache``.
+        kv_block_table: Page table for the raw FlatKV cache.
+        pool_size: Number of raw tokens represented by a pooled row.
+        page_size: Number of pooled rows per index-cache page.
+        kv_page_size: Number of raw tokens per FlatKV page.
+        topk_pools: Number of completed pools to select.
+        softmax_scale: Scale applied to indexer scores.
+        q_len_per_req: Query rows per request.
+        apply_relu: Whether to apply ReLU before top-k selection.
+        append_tail: Whether to append visible partial-pool tokens.
+        chunk_pools: Pools scored per bounded portable reduction window.
+        max_seq_len: Optional static context bound for CUDA Graph replay.
+        out: Optional global-slot output buffer.
+        lens_out: Optional selected-length output buffer.
+
+    Returns:
+        Expanded FlatKV indices and raw-token counts.
+    """
+    _validate_kpool_topk_inputs(
+        q, pooled_k_cache, weights, pool_size, topk_pools, page_size
+    )
+    tokens, num_heads, head_dim = q.shape
+    traits = {
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "page_size": int(page_size),
+        "index_k_format": "fp8_scaled",
+        "score_activation": "relu" if apply_relu else "none",
+        "topk_layout": "global_slots",
+        "topk_pools": int(topk_pools),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "kpool_decode_topk",
+        signature,
+        traits=traits,
+    )
+    shape_params = {
+        "tokens": int(tokens),
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "topk_pools": int(topk_pools),
+        "page_size": int(page_size),
+        "kv_page_size": int(kv_page_size),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    ShapeCapture.get().record(
+        "attention", "kpool_decode_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_decode_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            pooled_k_cache=pooled_k_cache,
+            weights=weights,
+            seq_lens=seq_lens,
+            index_block_table=index_block_table,
+            kv_block_table=kv_block_table,
+            pool_size=pool_size,
+            page_size=page_size,
+            kv_page_size=kv_page_size,
+            topk_pools=topk_pools,
+            softmax_scale=softmax_scale,
+            q_len_per_req=q_len_per_req,
+            apply_relu=apply_relu,
+            append_tail=append_tail,
+            chunk_pools=chunk_pools,
+            max_seq_len=max_seq_len,
+            out=out,
+            lens_out=lens_out,
+        )
+
+
+def kpool_prefill_topk(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    index_block_table: torch.Tensor,
+    kv_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    kv_page_size: int,
+    topk_pools: int,
+    softmax_scale: float,
+    apply_relu: bool = True,
+    append_tail: bool = True,
+    chunk_pools: int = 8192,
+    req_ids: torch.Tensor | None = None,
+    causal_lens: torch.Tensor | None = None,
+    pool_workspace_slots: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
+    max_num_pools: int | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select ragged-prefill pools and expand them to FlatKV slots.
+
+    Args:
+        q: Packed indexer queries shaped ``[tokens, heads, head_dim]``.
+        pooled_k_cache: Paged compressed index-key cache.
+        weights: Per-token indexer head weights.
+        positions: Absolute position for every packed query token.
+        query_start_loc: Packed query boundaries for each request.
+        index_block_table: Page table for ``pooled_k_cache``.
+        kv_block_table: Page table for the raw FlatKV cache.
+        pool_size: Number of raw tokens represented by a pooled row.
+        page_size: Number of pooled rows per index-cache page.
+        kv_page_size: Number of raw tokens per FlatKV page.
+        topk_pools: Number of completed pools to select.
+        softmax_scale: Scale applied to indexer scores.
+        apply_relu: Whether to apply ReLU before top-k selection.
+        append_tail: Whether to append visible partial-pool tokens.
+        chunk_pools: Number of pools scored per reduction window.
+        req_ids: Optional precomputed request id for every query token.
+        causal_lens: Optional precomputed visible raw-token length per query.
+        pool_workspace_slots: Optional physical pooled-cache slots concatenated
+            in request-major logical-pool order.
+        row_starts: Optional inclusive workspace start per query token.
+        row_ends: Optional exclusive workspace end per query token.
+        max_num_pools: Host-known maximum completed-pool count, required with
+            the optional prefill plan.
+        max_logits_bytes: Optional temporary-logits memory cap for performant
+            implementations.
+        out: Optional expanded global-slot output buffer.
+        lens_out: Optional selected-length output buffer.
+
+    Returns:
+        Expanded FlatKV indices and raw-token counts.
+    """
+    _validate_kpool_topk_inputs(
+        q, pooled_k_cache, weights, pool_size, topk_pools, page_size
+    )
+    tokens, num_heads, head_dim = q.shape
+    plan_parts = (
+        req_ids,
+        causal_lens,
+        pool_workspace_slots,
+        row_starts,
+        row_ends,
+        max_num_pools,
+    )
+    has_prefill_plan = all(part is not None for part in plan_parts)
+    if any(part is not None for part in plan_parts) and not has_prefill_plan:
+        raise ValueError(
+            "KPool prefill plan requires req_ids, causal_lens, "
+            "pool_workspace_slots, row_starts, row_ends, and max_num_pools together"
+        )
+    traits = {
+        "index_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "page_size": int(page_size),
+        "index_k_format": "fp8_scaled",
+        "score_activation": "relu" if apply_relu else "none",
+        "topk_layout": "global_slots",
+        "topk_pools": int(topk_pools),
+        "prefill_plan": has_prefill_plan,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "kpool_prefill_topk",
+        signature,
+        traits=traits,
+    )
+    shape_params = {
+        "tokens": int(tokens),
+        "requests": int(query_start_loc.numel() - 1),
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "pool_size": int(pool_size),
+        "topk_pools": int(topk_pools),
+        "page_size": int(page_size),
+        "kv_page_size": int(kv_page_size),
+        "workspace_rows": (
+            0 if pool_workspace_slots is None else int(pool_workspace_slots.numel())
+        ),
+    }
+    ShapeCapture.get().record(
+        "attention", "kpool_prefill_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "kpool_prefill_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            pooled_k_cache=pooled_k_cache,
+            weights=weights,
+            positions=positions,
+            query_start_loc=query_start_loc,
+            index_block_table=index_block_table,
+            kv_block_table=kv_block_table,
+            pool_size=pool_size,
+            page_size=page_size,
+            kv_page_size=kv_page_size,
+            topk_pools=topk_pools,
+            softmax_scale=softmax_scale,
+            apply_relu=apply_relu,
+            append_tail=append_tail,
+            chunk_pools=chunk_pools,
+            req_ids=req_ids,
+            causal_lens=causal_lens,
+            pool_workspace_slots=pool_workspace_slots,
+            row_starts=row_starts,
+            row_ends=row_ends,
+            max_num_pools=max_num_pools,
+            max_logits_bytes=max_logits_bytes,
+            out=out,
+            lens_out=lens_out,
+        )
+
+
+# ===-----------------------------------------------------------------------===#
+# DSA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def dsa_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+    kv_seq_lens: torch.Tensor | None = None,
+) -> AttentionResult:
+    """Sparse DSA decode over selected global KV slots.
+
+    Args:
+        q: Absorbed MLA query with shape [tokens, heads, R + D_rope] or
+            [batch, q_len, heads, R + D_rope].
+        kv_cache: Regular compressed MLA KV cache, flat [slots, dim] or paged.
+        sparse_kv_cache: Packed sparse DSA KV cache, flat [slots, row_bytes] or
+            paged.
+        topk_slots: Global KV slot ids with shape [tokens, topk]. Invalid
+            entries are -1.
+        topk_lens: Valid selected-slot count per token, or None when the
+            implementation relies on -1 padding.
+        max_seqlen_k: Maximum dense visible context length for this batch.
+        qk_nope_head_dim: Original non-RoPE q/k dimension.
+        kv_lora_rank: MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE q/k dimension.
+        softmax_scale: Scale applied to attention logits.
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request.
+        kv_seq_lens: Optional physical KV length for every query row. Sparse
+            backends that gather direct global slots use this separately from
+            ``topk_lens``, which describes the selected sparse width.
+        logit_cap: Optional logit cap.
+        k_scale: KV scale multiplier for FP8 backends.
+        return_lse: Whether to return LSE in addition to output.
+        out: Optional output buffer.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+    """
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = int(q_len_per_req)
+        batch_size = tokens // q_len
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            kv_seq_lens=kv_seq_lens,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+            enable_pdl=pdl_enabled(),
+        )
+
+
+def dsa_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+    kv_seq_lens: torch.Tensor | None = None,
+) -> AttentionResult:
+    """Sparse DSA prefill over selected global KV slots.
+
+    Args:
+        q: Absorbed MLA query with shape [tokens, heads, R + D_rope] or
+            [batch, q_len, heads, R + D_rope].
+        kv_cache: Regular compressed MLA KV cache, flat [slots, dim] or paged.
+        sparse_kv_cache: Packed sparse DSA KV cache, flat [slots, row_bytes] or
+            paged.
+        topk_slots: Global KV slot ids with shape [tokens, topk]. Invalid
+            entries are -1.
+        topk_lens: Valid selected-slot count per token.
+        max_seqlen_k: Maximum dense visible context length for this batch.
+        qk_nope_head_dim: Original non-RoPE q/k dimension.
+        kv_lora_rank: MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE q/k dimension.
+        softmax_scale: Scale applied to attention logits.
+        page_size: KV cache page size.
+        kv_seq_lens: Optional physical KV length for every query row. Sparse
+            backends that gather direct global slots use this separately from
+            ``topk_lens``, which describes the selected sparse width.
+        logit_cap: Optional logit cap.
+        k_scale: KV scale multiplier for FP8 backends.
+        return_lse: Whether to return LSE in addition to output.
+        out: Optional output buffer.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+    """
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = 1
+        batch_size = tokens
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": 1,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_prefill", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_prefill", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=1,
+            kv_seq_lens=kv_seq_lens,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+            enable_pdl=pdl_enabled(),
+        )
+
+
+def dsa_prefill_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    candidate_lens_cpu: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA prefill top-k over packed workspace rows.
+
+    Args:
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
+        kv_workspace_slots: Global KV slot for each workspace row, shape
+            [workspace_rows].
+        row_starts: Inclusive workspace-row start per query token, shape [tokens].
+        row_ends: Exclusive workspace-row end per query token, shape [tokens].
+        topk: Number of workspace candidates to select.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
+        index_k_cache: Packed or page-planar FP8 index-K cache with scales
+            (uint8). Page-planar caches may have a padded outer page stride.
+            Used with kv_workspace_slots to resolve workspace rows inside the
+            selected implementation.
+        page_size: KV cache page size for index_k_cache.
+        index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
+            provided together with index_k_scale.
+        index_k_scale: FP8 index-K scales already in workspace-row order. Must
+            be provided together with index_k_fp8.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
+        max_logits_bytes: Optional temporary logits memory cap.
+        candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``.
+            DeepGEMM uses it to select chunk launch bounds without synchronizing
+            the CUDA stream; other implementations ignore it.
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, kv_workspace_slots, row_starts, and row_ends
+    must be contiguous on q's device. index_k_cache may be a contiguous packed
+    slot matrix or a page-planar matrix with contiguous bytes within each page.
+    kv_workspace_slots must be int64; row_starts and row_ends must be int32.
+
+    Returns:
+        Tuple of workspace row ids and valid counts. Returned indices are
+        absolute row ids into kv_workspace_slots; invalid entries are -1.
+    """
+    if candidate_lens_cpu is not None and (
+        candidate_lens_cpu.device.type != "cpu"
+        or candidate_lens_cpu.shape != (q.shape[0],)
+    ):
+        raise ValueError(
+            "candidate_lens_cpu must be a CPU tensor with shape "
+            f"{(q.shape[0],)}, got device={candidate_lens_cpu.device}, "
+            f"shape={tuple(candidate_lens_cpu.shape)}"
+        )
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+        "page_size": None if page_size is None else int(page_size),
+    }
+    has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
+    if (index_k_fp8 is None) != (index_k_scale is None):
+        raise ValueError(
+            "index_k_fp8 and index_k_scale must be provided together for "
+            "workspace-row input"
+        )
+    has_fp8 = index_k_cache is not None or has_workspace_rows
+    if has_fp8:
+        traits["index_k_format"] = "fp8_scaled"
+    if index_k_cache is not None:
+        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
+        traits["index_k_layout"] = (
+            "packed"
+            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+            else "page_planar"
+        )
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "workspace_rows": kv_workspace_slots.numel(),
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_prefill_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_prefill_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "kv_workspace_slots": kv_workspace_slots,
+            "row_starts": row_starts,
+            "row_ends": row_ends,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "index_k_cache": index_k_cache,
+            "page_size": page_size,
+            "index_k_fp8": index_k_fp8,
+            "index_k_scale": index_k_scale,
+            "max_logits_bytes": max_logits_bytes,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
+            kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
+        return kernel(**kernel_kwargs)
+
+
+def dsa_decode_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
+    index_k_cache: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA decode top-k over a paged KV cache.
+
+    Args:
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
+        seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
+            q_len_per_req). Each query token's causal bound
+            seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.
+        block_table: Paged KV block table with one row per request,
+            shape [num_reqs, max_pages].
+        page_size: Number of tokens per KV page.
+        topk: Number of KV candidates to select.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
+        q_len_per_req: Query rows per request (spec-verify next_n). Plain
+            decode uses 1, where per-request is equivalent to per-token.
+        topk_layout: Return physical cache slots when ``global_slots`` or
+            absolute logical row offsets when ``logical_offsets``.
+        block_table_base_offsets: Optional compact-table base page per request.
+            Used only with ``topk_layout="logical_offsets"``.
+        index_k_cache: Packed or page-planar FP8 index-K cache with scales
+            (uint8). Page-planar caches may have a padded outer page stride.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
+        plan: Optional opaque backend-specific plan.
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, seq_lens, and block_table must be contiguous
+    on q's device. index_k_cache may be a contiguous packed slot matrix or a
+    page-planar matrix with contiguous bytes within each page. seq_lens and
+    block_table must be int32.
+
+    Returns:
+        Tuple of selected indices and valid counts. Indices are global KV slots
+        or absolute logical offsets according to ``topk_layout``; invalid
+        entries are -1.
+    """
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if topk_layout not in ("global_slots", "logical_offsets"):
+        raise ValueError(
+            "topk_layout must be 'global_slots' or 'logical_offsets', got "
+            f"{topk_layout!r}"
+        )
+    if q_len_per_req < 1 or q.shape[0] % int(q_len_per_req) != 0:
+        raise ValueError(
+            f"q_len_per_req={q_len_per_req} must divide tokens={q.shape[0]}"
+        )
+    if block_table_base_offsets is not None and topk_layout != "logical_offsets":
+        raise ValueError(
+            "block_table_base_offsets requires topk_layout='logical_offsets'"
+        )
+    kernel_seq_lens = seq_lens
+    if block_table_base_offsets is not None:
+        num_reqs = q.shape[0] // int(q_len_per_req)
+        if (
+            block_table_base_offsets.ndim != 1
+            or block_table_base_offsets.numel() < num_reqs
+            or block_table_base_offsets.device != seq_lens.device
+        ):
+            raise ValueError(
+                "block_table_base_offsets must have one entry per request on "
+                "the same device as seq_lens"
+            )
+        kernel_seq_lens = (
+            (
+                seq_lens.to(torch.int64)
+                - block_table_base_offsets[:num_reqs].to(torch.int64) * int(page_size)
+            )
+            .clamp(0, int(block_table.shape[1]) * int(page_size))
+            .to(torch.int32)
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    if index_k_cache is not None:
+        traits["index_k_format"] = "fp8_scaled"
+        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
+        traits["index_k_layout"] = (
+            "packed"
+            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+            else "page_planar"
+        )
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode_topk",
+        signature,
+        traits=traits,
+        features=(
+            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
+        ),
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "max_pages": block_table.shape[1],
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_decode_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "seq_lens": kernel_seq_lens,
+            "block_table": block_table,
+            "page_size": page_size,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "q_len_per_req": q_len_per_req,
+            "index_k_cache": index_k_cache,
+            "seq_lens_2d": seq_lens_2d,
+            "plan": plan,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if topk_layout == "logical_offsets":
+            kernel_kwargs["topk_layout"] = topk_layout
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        return kernel(**kernel_kwargs)
+
+
+def dsa_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    """Build or refresh an opaque plan for DSA decode top-k.
+
+    Args:
+        page_size: KV cache page size.
+        seq_lens_2d: Prebuilt [num_reqs, next_n] context_lens (last column =
+            full per-request KV length), built once per forward by the caller.
+        out: Optional previously allocated plan object to refresh in place.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Opaque backend-owned plan object, or None when no selected backend needs
+        an explicit plan.
+    """
+    if seq_lens_2d.dtype != torch.int32:
+        seq_lens_2d = seq_lens_2d.to(torch.int32)
+    traits = {"page_size": int(page_size)}
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsa_plan",
+            format_signature(),
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+
+    shape_params = {
+        "batch_size": int(seq_lens_2d.shape[0]),
+        "tokens": int(seq_lens_2d.numel()),
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_plan", kernel.name, seq_lens_2d.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_plan",
+        seq_lens_2d.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            seq_lens_2d=seq_lens_2d,
+            page_size=page_size,
+            out=out,
+        )
+
+
+# ===-----------------------------------------------------------------------===#
+# MSA Kernels
+# ===-----------------------------------------------------------------------===#
 
 
 def msa_decode_with_kvcache(
@@ -722,7 +3117,6 @@ def msa_decode_with_kvcache(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -757,8 +3151,6 @@ def msa_decode_with_kvcache(
             ``-inf`` and reused across layers; forwarded to the kernel to avoid
             a per-layer allocation + fill. Ignored by kernels that do not
             accept it or when its shape does not match.
-        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
-            indexer's index-key store; forwarded to the kernel.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -840,7 +3232,7 @@ def msa_decode_with_kvcache(
             k_scale=k_scale,
             v_scale=v_scale,
             score_out=score_out,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
 
@@ -994,8 +3386,990 @@ def msa_extend_with_kvcache(
 
 
 # ===-----------------------------------------------------------------------===#
+# DSv4 Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def dsv4_indexer_cache_format(use_fp4: bool | None = None) -> str:
+    """Resolve the DeepSeek V4 indexer cache format for this kernel platform.
+
+    Args:
+        use_fp4: Explicit format request. ``True`` selects MXFP4, ``False``
+            selects scaled FP8, and ``None`` selects the platform default.
+
+    Returns:
+        ``"mxfp4"`` or ``"fp8_scaled"``.
+    """
+
+    if use_fp4 is not None:
+        return "mxfp4" if use_fp4 else "fp8_scaled"
+    platform = current_platform()
+    return (
+        "mxfp4"
+        if platform.is_nvidia and platform.arch_version.major >= 10
+        else "fp8_scaled"
+    )
+
+
+def dsv4_padded_heads(num_local_heads: int) -> int:
+    """Return the local head extent required by DeepSeek V4 kernels.
+
+    Args:
+        num_local_heads: Number of attention heads assigned to this rank.
+
+    Returns:
+        A kernel-compatible local head extent. GFX950 accepts the native
+        16-head Pro TP8 and 32-head Pro TP4 shapes; other platform behavior
+        retains the 64/128-head padding policy.
+    """
+
+    if current_platform().is_cdna4 and num_local_heads in (16, 32):
+        return num_local_heads
+    if num_local_heads <= 64:
+        return 64
+    if num_local_heads <= 128:
+        return 128
+    raise ValueError(
+        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
+    )
+
+
+def dsv4_reset_attention_state() -> None:
+    """Reset backend-owned value-dependent state before a DSV4 forward."""
+    from tokenspeed_kernel.ops.attention.flash_mla import reset_dsv4_tile_metadata
+
+    reset_dsv4_tile_metadata()
+
+
+def dsv4_swa_cache_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    page_size: int,
+    q_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
+
+    Args:
+        q: Query latents shaped ``[tokens, heads, 512]``. Updated in place when
+            ``q_out`` is not provided.
+        kv: Shared K/V latents shaped ``[tokens, 512]``.
+        swa_kv_cache: Uint8 page-planar V4 FP8 SWA cache.
+        slot_mapping: Destination cache slot for each inserted token. Slots
+            outside the cache capacity suppress insertion.
+        positions: Absolute positions for all query/KV tokens.
+        cos_sin_cache: FP32 GPT-J-style fused cosine/sine cache of width 64.
+        rms_norm_eps: Positive epsilon used to normalize Q.
+        page_size: Number of cache entries in each page.
+        q_out: Optional contiguous destination for normalized and rotated Q.
+            When provided, ``q`` is left unchanged.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        None. Q and the selected cache rows are written in place.
+    """
+    if q.ndim != 3 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if kv.shape != (q.shape[0], 512):
+        raise ValueError(f"kv must have shape [tokens, 512], got {tuple(kv.shape)}")
+    if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
+        raise TypeError("q and kv must have matching float16 or bfloat16 dtypes")
+    if not q.is_contiguous() or not kv.is_contiguous():
+        raise ValueError("q and kv must be contiguous")
+    if positions.ndim != 1 or positions.numel() != q.shape[0]:
+        raise ValueError("positions must have one entry per query token")
+    if slot_mapping.ndim != 1 or slot_mapping.numel() > q.shape[0]:
+        raise ValueError("slot_mapping must be one-dimensional and no longer than q")
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("positions must have dtype int32 or int64")
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError("slot_mapping must have dtype int32 or int64")
+    if not positions.is_contiguous() or not slot_mapping.is_contiguous():
+        raise ValueError("positions and slot_mapping must be contiguous")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if rms_norm_eps <= 0.0:
+        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != 64:
+        raise ValueError("cos_sin_cache must have shape [max_position, 64]")
+    if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
+        raise TypeError("cos_sin_cache must be contiguous float32")
+    row_bytes = 448 + 2 * 64 + 448 // 64 + 1
+    if (
+        swa_kv_cache.dtype != torch.uint8
+        or swa_kv_cache.ndim != 2
+        or swa_kv_cache.shape[1] < page_size * row_bytes
+        or swa_kv_cache.stride(1) != 1
+    ):
+        raise ValueError(
+            "swa_kv_cache must be a 2D uint8 page-planar cache with "
+            f"at least {page_size * row_bytes} bytes per page"
+        )
+    tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
+    positions_valid = ((positions >= 0) & (positions < cos_sin_cache.shape[0])).all()
+    position_error = "positions entries must index cos_sin_cache"
+    if positions.device.type == "cpu":
+        if not bool(positions_valid.item()):
+            raise ValueError(position_error)
+    else:
+        torch._assert_async(positions_valid, position_error)
+    if q_out is not None and (
+        q_out.shape != q.shape
+        or q_out.dtype != q.dtype
+        or q_out.device != q.device
+        or not q_out.is_contiguous()
+    ):
+        raise ValueError(
+            "q_out must be contiguous and match q shape, dtype, and device"
+        )
+
+    signature = format_signature(
+        q=dense_tensor_format(q.dtype),
+        kv=dense_tensor_format(kv.dtype),
+        swa_kv_cache=dense_tensor_format(swa_kv_cache.dtype),
+    )
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "rope_dim": int(cos_sin_cache.shape[-1]),
+        "quant_block_size": 64,
+        "cache_layout": "fp8_swa_page_planar",
+        "has_q_out": q_out is not None,
+    }
+    kernel = select_kernel(
+        "attention",
+        "dsv4_swa_cache_insert",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    shape_params = {
+        "tokens": int(q.shape[0]),
+        "insert_tokens": min(int(kv.shape[0]), int(slot_mapping.numel())),
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "rope_dim": int(cos_sin_cache.shape[-1]),
+        "page_size": int(page_size),
+        "num_pages": int(swa_kv_cache.shape[0]),
+        "has_q_out": q_out is not None,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_swa_cache_insert",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_swa_cache_insert",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            q=q,
+            kv=kv,
+            swa_kv_cache=swa_kv_cache,
+            slot_mapping=slot_mapping,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            rms_norm_eps=rms_norm_eps,
+            page_size=page_size,
+            q_out=q_out,
+        )
+
+
+def dsv4_csa_indexer_fp8_cache_insert(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    compress_ratio: int = 4,
+    block_table_base_offsets: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Compress and insert DeepSeek V4 FP8 CSA indexer-cache rows.
+
+    Args:
+        state_cache: FP32 paged compressor values and scores.
+        token_to_req_indices: Request index for each input token.
+        positions: Absolute token positions.
+        compressor_slot_mapping: Compressor-state slots for input tokens.
+        block_table: Logical-to-physical compressor-state page table.
+        compressor_block_size: Number of compressor-state rows per page.
+        rms_norm_weight: Width-128 RMSNorm weight.
+        rms_norm_eps: RMSNorm epsilon.
+        cos_sin_cache: Width-64 fused cosine and sine cache.
+        kv_cache_2d: Uint8 page-planar FP8 indexer cache.
+        kv_slot_mapping: Destination indexer-cache slots.
+        kv_cache_block_size: Number of destination rows per page.
+        compress_ratio: CSA compression ratio, currently four.
+        block_table_base_offsets: Optional logical page base per request.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        None. Valid rows are written in place.
+    """
+
+    signature = _attention_format_signature(
+        state_cache=state_cache,
+        kv_cache=kv_cache_2d,
+    )
+    traits = {
+        "index_head_dim": int(rms_norm_weight.numel()),
+        "compress_ratio": int(compress_ratio),
+        "page_size": int(kv_cache_block_size),
+        "cache_format": "fp8_scaled_page_planar",
+    }
+    kernel = select_kernel(
+        "attention",
+        "dsv4_csa_indexer_fp8_cache_insert",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    shape_params = {
+        "tokens": min(
+            int(positions.numel()),
+            int(compressor_slot_mapping.numel()),
+            int(kv_slot_mapping.numel()),
+        ),
+        **traits,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_csa_indexer_fp8_cache_insert",
+        kernel.name,
+        state_cache.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_csa_indexer_fp8_cache_insert",
+        state_cache.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            compressor_slot_mapping=compressor_slot_mapping,
+            block_table=block_table,
+            compressor_block_size=compressor_block_size,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache_2d=kv_cache_2d,
+            kv_slot_mapping=kv_slot_mapping,
+            kv_cache_block_size=kv_cache_block_size,
+            compress_ratio=compress_ratio,
+            block_table_base_offsets=block_table_base_offsets,
+        )
+
+
+def dsv4_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run DeepSeek V4 selected attention over a dense K/V workspace.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, heads, 512]``.
+        kv: BF16 selected K/V workspace with rows of width 512.
+        indices: Selected workspace row indices shaped ``[tokens, width]``.
+            Negative entries are ignored. Nonnegative entries in each active
+            prefix must be smaller than the number of rows in ``kv``.
+        lens: Valid selected width for each query token.
+        attn_sink: One attention sink logit per query head.
+        softmax_scale: Scale applied to query-key dot products.
+        out: Optional output shaped like ``q``.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        BF16 attention output shaped like ``q``.
+    """
+    if q.ndim != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if kv.ndim < 2 or kv.shape[-1] != 512:
+        raise ValueError(f"kv must contain rows of width 512, got {tuple(kv.shape)}")
+    tokens = int(q.shape[0])
+    if indices.ndim != 2 or indices.shape[0] != tokens:
+        raise ValueError("indices must have one row per query token")
+    if lens.ndim != 1 or lens.numel() != tokens:
+        raise ValueError("lens must have one entry per query token")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("indices must have dtype int32 or int64")
+    if lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("lens must have dtype int32 or int64")
+    if attn_sink.numel() < q.shape[1]:
+        raise ValueError("attn_sink must provide one value per query head")
+    if any(tensor.device != q.device for tensor in (kv, indices, lens, attn_sink)):
+        raise ValueError("all selected-attention tensors must share a device")
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+    ):
+        raise ValueError("out must match q shape, dtype, and device")
+
+    signature = _attention_format_signature(q=q, kv=kv)
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "cache_layout": "dense_workspace",
+        "support_sink": True,
+        "selected_width": int(indices.shape[-1]),
+        "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
+    }
+    kernel = select_kernel(
+        "attention",
+        "dsv4_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q.shape[0]),
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "selected_width": int(indices.shape[-1]),
+        "kv_rows": int(kv.numel() // q.shape[-1]),
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv=kv,
+            indices=indices,
+            lens=lens,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
+
+
+def dsv4_decode(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run DeepSeek V4 selected attention over page-planar FP8 caches.
+
+    SWA and optional extra compressed rows form independent selected segments.
+    Invalid negative slots and entries beyond each segment's per-token length
+    do not contribute to attention.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, heads, 512]``.
+        swa_kv_cache: Uint8 page-planar SWA cache shaped
+            ``[pages, page_size * row_bytes]``.
+        swa_slots: Selected global SWA slots with one row per query token.
+            Negative entries are ignored. Nonnegative entries in each active
+            prefix must be smaller than ``pages * swa_page_size``.
+        swa_lens: Valid SWA selection length for each query token.
+        swa_page_size: Number of SWA rows in each cache page.
+        attn_sink: One attention sink logit per query head.
+        softmax_scale: Scale applied to query-key dot products.
+        extra_kv_cache: Optional uint8 page-planar compressed cache.
+        extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
+            entries in each active prefix must be smaller than
+            ``extra_pages * extra_page_size``.
+        extra_lens: Valid extra selection length for each query token.
+        extra_page_size: Number of rows in each extra cache page.
+        out: Optional output shaped like ``q``.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        BF16 attention output shaped like ``q``.
+    """
+    if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if swa_kv_cache.dim() != 2 or swa_kv_cache.dtype != torch.uint8:
+        raise ValueError("swa_kv_cache must be a 2D uint8 page-planar cache")
+    if swa_page_size <= 0 or swa_kv_cache.shape[1] % swa_page_size:
+        raise ValueError("swa_kv_cache width must be divisible by swa_page_size")
+    tokens = int(q.shape[0])
+    if swa_slots.dim() < 2 or int(swa_slots.shape[0]) != tokens:
+        raise ValueError("swa_slots must have one row per query token")
+    if swa_lens.numel() != tokens:
+        raise ValueError("swa_lens must have one entry per query token")
+    if swa_slots.dtype not in (torch.int32, torch.int64):
+        raise TypeError("swa_slots must have dtype int32 or int64")
+    if swa_lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("swa_lens must have dtype int32 or int64")
+    if attn_sink.numel() < q.shape[1]:
+        raise ValueError("attn_sink must provide one value per query head")
+    if any(
+        tensor.device != q.device
+        for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
+    ):
+        raise ValueError("all paged selected-attention tensors must share a device")
+
+    extra_values = (extra_kv_cache, extra_slots, extra_lens, extra_page_size)
+    has_extra_segment = any(value is not None for value in extra_values)
+    if has_extra_segment and not all(value is not None for value in extra_values):
+        raise ValueError(
+            "extra_kv_cache, extra_slots, extra_lens, and extra_page_size "
+            "must be provided together"
+        )
+    if extra_kv_cache is not None:
+        assert extra_slots is not None
+        assert extra_lens is not None
+        assert extra_page_size is not None
+        if extra_kv_cache.dim() != 2 or extra_kv_cache.dtype != torch.uint8:
+            raise ValueError("extra_kv_cache must be a 2D uint8 page-planar cache")
+        if extra_page_size <= 0 or extra_kv_cache.shape[1] % extra_page_size:
+            raise ValueError(
+                "extra_kv_cache width must be divisible by extra_page_size"
+            )
+        if extra_slots.dim() < 2 or int(extra_slots.shape[0]) != tokens:
+            raise ValueError("extra_slots must have one row per query token")
+        if extra_lens.numel() != tokens:
+            raise ValueError("extra_lens must have one entry per query token")
+        if extra_slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError("extra_slots must have dtype int32 or int64")
+        if extra_lens.dtype not in (torch.int32, torch.int64):
+            raise TypeError("extra_lens must have dtype int32 or int64")
+        if any(
+            tensor.device != q.device
+            for tensor in (extra_kv_cache, extra_slots, extra_lens)
+        ):
+            raise ValueError("all extra selected-attention tensors must share a device")
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+    ):
+        raise ValueError("out must match q shape, dtype, and device")
+
+    swa_width = int(swa_slots.numel() // tokens)
+    extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
+    signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
+    traits = {
+        "tokens": tokens,
+        "head_dim": int(q.shape[-1]),
+        "num_heads": int(q.shape[1]),
+        "cache_layout": "fp8_swa_page_planar",
+        "topk_layout": "global_slots",
+        "support_sink": True,
+        "has_extra": has_extra_segment,
+        "has_extra_segment": has_extra_segment,
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+        "swa_page_size": int(swa_page_size),
+        "extra_page_size": int(extra_page_size or 0),
+        "metadata_dtypes": frozenset(
+            {
+                swa_slots.dtype,
+                swa_lens.dtype,
+                *(
+                    (extra_slots.dtype, extra_lens.dtype)
+                    if extra_slots is not None and extra_lens is not None
+                    else ()
+                ),
+            }
+        ),
+    }
+    kernel = select_kernel(
+        "attention",
+        "dsv4_decode",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": tokens,
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+        "swa_page_size": int(swa_page_size),
+        "extra_page_size": int(extra_page_size or 0),
+        "has_extra_segment": has_extra_segment,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_decode",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_decode",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            swa_kv_cache=swa_kv_cache,
+            swa_slots=swa_slots,
+            swa_lens=swa_lens,
+            swa_page_size=swa_page_size,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            extra_kv_cache=extra_kv_cache,
+            extra_slots=extra_slots,
+            extra_lens=extra_lens,
+            extra_page_size=extra_page_size,
+            out=out,
+        )
+
+
+def dsv4_prefill_topk(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_seqlen_k_start: torch.Tensor,
+    cu_seqlen_k_end: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_seqlen_k: int,
+    index_k_format: str = "mxfp4",
+    block_table_base_offsets: torch.Tensor | None = None,
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Compute DSV4 prefill sparse-indexer top-k over packed cache rows.
+
+    Args:
+        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
+            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
+        weights: Contiguous FP32 per-token index-head weights.
+        index_k_cache: Page-backed uint8 index-K cache.
+        block_table: Logical-to-physical page table for the gathered requests.
+        cu_seq_lens: Cumulative gathered key-row lengths for those requests.
+            With a compact table these lengths cover retained rows only.
+        cu_seqlen_k_start: Inclusive gathered-key start for every query row.
+        cu_seqlen_k_end: Exclusive gathered-key end for every query row.
+        seq_lens: Candidate count for every query row.
+        page_size: Number of index-K rows in each cache page.
+        topk: Number of local candidate offsets to select.
+        max_seqlen_k: Maximum candidate count represented by the logits.
+        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        block_table_base_offsets: Optional logical base page for each row of a
+            compact ``block_table``. Returned indices are absolute logical
+            offsets when provided.
+        gathered_k: Optional previously gathered ``(values, scales)`` pair to
+            reuse instead of gathering index_k_cache again.
+        gather_workspace: Optional caller-owned MXFP4 value/scale buffers. The
+            returned gathered_k aliases these buffers.
+        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
+            (or a larger first dimension).
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution to force through selection.
+
+    Returns:
+        A pair ``(indices, gathered_k)``. Indices are local offsets within each
+        query row's packed candidate range when ``block_table_base_offsets`` is
+        absent, or absolute logical offsets when it is present. Invalid entries
+        are set to -1.
+    """
+    q_values, _ = index_q
+    if index_k_format not in ("mxfp4", "fp8_scaled"):
+        raise ValueError(
+            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+        )
+    if q_values.ndim < 3:
+        raise ValueError(
+            "index_q values must have at least 3 dimensions, got "
+            f"{tuple(q_values.shape)}"
+        )
+    logical_head_dim = (
+        q_values.shape[-1] * 2 if index_k_format == "mxfp4" else q_values.shape[-1]
+    )
+    traits = {
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(logical_head_dim),
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "index_k_format": index_k_format,
+    }
+    if weights.dtype != torch.float32:
+        raise TypeError(f"weights must be float32, got {weights.dtype}")
+    signature = _attention_format_signature(
+        q=q_values, weights=weights, index_k_cache=index_k_cache
+    )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_prefill_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q_values.shape[0]),
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(traits["head_dim"]),
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "max_seqlen_k": int(max_seqlen_k),
+        "index_k_format": index_k_format,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_prefill_topk",
+        kernel.name,
+        q_values.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_prefill_topk",
+        q_values.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel_kwargs = dict(
+            index_q=index_q,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            block_table=block_table,
+            cu_seq_lens=cu_seq_lens,
+            cu_seqlen_k_start=cu_seqlen_k_start,
+            cu_seqlen_k_end=cu_seqlen_k_end,
+            seq_lens=seq_lens,
+            page_size=page_size,
+            topk=topk,
+            max_seqlen_k=max_seqlen_k,
+            index_k_format=index_k_format,
+            gathered_k=gathered_k,
+            gather_workspace=gather_workspace,
+            out=out,
+        )
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is not None and spec.solution == "gluon":
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
+        return kernel(**kernel_kwargs)
+
+
+def dsv4_decode_topk(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str = "mxfp4",
+    block_table_base_offsets: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Compute DSV4 decode sparse-indexer top-k over a paged index-K cache.
+
+    Args:
+        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
+            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
+        weights: Contiguous FP32 per-token index-head weights.
+        index_k_cache: Page-backed uint8 index-K cache.
+        context_lens: Int32 context lengths shaped ``[tokens, 1]``.
+        block_table: Int32 page table with one row per query token.
+        page_size: Number of index-K rows in each cache page.
+        topk: Number of local candidate offsets to select.
+        max_context_len: Maximum context represented by block_table.
+        plan: Opaque schedule returned by :func:`dsv4_plan`.
+        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        block_table_base_offsets: Optional logical base page for each decode
+            row. Returned indices are absolute logical offsets when provided.
+        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
+            (or a larger first dimension).
+        persistent_topk_workspace: Optional caller-owned uint8 workspace of at
+            least 1 MiB for the persistent local top-k implementation.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution to force through selection.
+
+    Returns:
+        Int32 local offsets into each token's logical index-K context when
+        ``block_table_base_offsets`` is absent, or absolute logical offsets when
+        it is present. Invalid entries are -1; the return aliases out when out
+        is provided.
+    """
+    q_values, _ = index_q
+    if index_k_format not in ("mxfp4", "fp8_scaled"):
+        raise ValueError(
+            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+        )
+    if q_values.ndim < 3:
+        raise ValueError(
+            "index_q values must have at least 3 dimensions, got "
+            f"{tuple(q_values.shape)}"
+        )
+    logical_head_dim = (
+        q_values.shape[-1] * 2 if index_k_format == "mxfp4" else q_values.shape[-1]
+    )
+    traits = {
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(logical_head_dim),
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "index_k_format": index_k_format,
+    }
+    if weights.dtype != torch.float32:
+        raise TypeError(f"weights must be float32, got {weights.dtype}")
+    signature = _attention_format_signature(
+        q=q_values, weights=weights, index_k_cache=index_k_cache
+    )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_decode_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q_values.shape[0]),
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(traits["head_dim"]),
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "max_context_len": int(max_context_len),
+        "index_k_format": index_k_format,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_decode_topk",
+        kernel.name,
+        q_values.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_decode_topk",
+        q_values.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel_kwargs = dict(
+            index_q=index_q,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            context_lens=context_lens,
+            block_table=block_table,
+            page_size=page_size,
+            topk=topk,
+            max_context_len=max_context_len,
+            plan=plan,
+            index_k_format=index_k_format,
+            out=out,
+            persistent_topk_workspace=persistent_topk_workspace,
+        )
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is not None and spec.solution == "gluon":
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
+        return kernel(**kernel_kwargs)
+
+
+def dsv4_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    """Build or refresh an opaque DeepSeek V4 decode-indexer plan.
+
+    Args:
+        page_size: Indexer KV-cache page size.
+        seq_lens_2d: Per-token context lengths shaped ``[tokens, 1]``.
+        out: Optional previously allocated plan object to refresh in place.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Opaque backend-owned plan object, or None when the selected backend does
+        not require an explicit plan.
+    """
+    if seq_lens_2d.dtype != torch.int32:
+        seq_lens_2d = seq_lens_2d.to(torch.int32)
+    traits = {"page_size": int(page_size)}
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsv4_plan",
+            format_signature(),
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+
+    shape_params = {
+        "batch_size": int(seq_lens_2d.shape[0]),
+        "tokens": int(seq_lens_2d.numel()),
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsv4_plan", kernel.name, seq_lens_2d.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_plan",
+        seq_lens_2d.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            seq_lens_2d=seq_lens_2d,
+            page_size=page_size,
+            out=out,
+        )
+
+
+def dsv4_warmup(
+    *,
+    hidden_size: int,
+    num_attention_heads: int,
+    head_dim: int,
+    hc_mult: int,
+    kv_lora_rank: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    indexer_cache_block_size: int,
+    max_decode_tokens: int,
+    mxfp4_block_size: int,
+    tp_size: int,
+    max_tokens: int,
+    device: torch.device,
+    solution: str | None = None,
+) -> None:
+    """Warm selected DeepSeek V4 kernels for serving shapes.
+
+    Runtime provides only model geometry and serving bounds. Vendor and
+    architecture selection, optional-library behavior, and synchronization are
+    owned by the selected kernel implementation.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsv4_warmup",
+            format_signature(),
+            traits={},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return
+    kernel(
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        head_dim=head_dim,
+        hc_mult=hc_mult,
+        kv_lora_rank=kv_lora_rank,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        indexer_cache_block_size=indexer_cache_block_size,
+        max_decode_tokens=max_decode_tokens,
+        mxfp4_block_size=mxfp4_block_size,
+        tp_size=tp_size,
+        max_tokens=max_tokens,
+        device=device,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
 # GDN Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+class GdnCheckpointLayout(str, Enum):
+    """Backend-native checkpoint layout returned by GDN chunk prefill."""
+
+    NONE = "none"
+    FLA = "fla"
+    FLASHINFER = "flashinfer"
+
+
+@dataclass(frozen=True)
+class GdnChunkPrefillResult:
+    """Structured result for GDN chunk prefill.
+
+    Args:
+        out: GDN output tensor.
+        final_state: Final recurrent state, when requested.
+        h: Optional backend-native intermediate recurrent checkpoints.
+        h_cu_starts: Optional cumulative checkpoint starts for FlashInfer layout.
+        h_layout: Layout of ``h``.
+    """
+
+    out: torch.Tensor
+    final_state: torch.Tensor | None
+    h: torch.Tensor | None = None
+    h_cu_starts: torch.Tensor | None = None
+    h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
 
 
 def gdn_chunk_prefill(
@@ -1482,6 +4856,38 @@ def gdn_replay_commit_supported(
     return True
 
 
+# ===-----------------------------------------------------------------------===#
+# KDA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+@dataclass(frozen=True)
+class KdaPrefillResult:
+    """Results from a packed KDA prefill.
+
+    Attributes:
+        out: Packed output ``[1, total_tokens, heads, value_dim]``.
+        final_state: One final recurrent state per packed sequence.
+    """
+
+    out: torch.Tensor
+    final_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KdaFusedDecodeResult:
+    """Result from an optional pre-convolution KDA decode fusion.
+
+    Attributes:
+        out: Packed decode output ``[1, batch, heads, value_dim]``.
+        output_norm_applied: Whether the selected kernel applied the output
+            gate and RMSNorm, so the caller must not apply them again.
+    """
+
+    out: torch.Tensor
+    output_norm_applied: bool
+
+
 def kda_recurrent_layout() -> str:
     """Return the recurrent state layout this platform's KDA kernels consume.
 
@@ -1696,7 +5102,7 @@ def try_kda_fused_paged_decode(
     override: str | None = None,
     solution: str | None = None,
 ) -> KdaFusedDecodeResult | None:
-    """Try a registered pre-convolution KDA decode fusion.
+    """Run a registered pre-convolution KDA decode fusion when available.
 
     ``output_gate``, ``norm_weight``, and ``norm_eps`` request a fused gated
     RMSNorm epilogue. If the selected backend only supports the original core
@@ -1804,7 +5210,7 @@ def try_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
+    state_scratch: torch.Tensor | None,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     num_heads: int,
@@ -1815,8 +5221,11 @@ def try_kda_fused_paged_verify(
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
+    replay_mixed_qkv: torch.Tensor | None = None,
+    replay_gate: torch.Tensor | None = None,
+    replay_beta: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Try a registered pre-convolution KDA target-verify fusion.
+    """Run a registered pre-convolution KDA target-verify fusion when available.
 
     Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
     per-position conv windows and recurrent states land in the verify
@@ -1843,12 +5252,21 @@ def try_kda_fused_paged_verify(
                 "paged_state": True,
                 "store_states": store_states,
                 "recurrent_layout": recurrent_layout,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
             },
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         return None
+    kwargs = {}
+    if replay_mixed_qkv is not None:
+        kwargs = {
+            "replay_mixed_qkv": replay_mixed_qkv,
+            "replay_gate": replay_gate,
+            "replay_beta": replay_beta,
+        }
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1867,6 +5285,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        **kwargs,
     )
 
 
@@ -1893,9 +5312,10 @@ def try_kda_replay_commit(
     override: str | None = None,
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
+    replay_gate: torch.Tensor | None = None,
     recurrent_layout: str | None = None,
 ) -> bool:
-    """Try a registered KDA speculative replay-commit.
+    """Run a registered KDA speculative replay-commit when available.
 
     Replays the accepted prefix of a verified draft window from the committed
     page, so the caller never has to keep a recurrent state per draft
@@ -1920,12 +5340,18 @@ def try_kda_replay_commit(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+            },
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         return False
+    kwargs = {"replay_gate": replay_gate} if replay_gate is not None else {}
     kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1946,37 +5372,74 @@ def try_kda_replay_commit(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
+        **kwargs,
     )
     return True
 
 
-def resolve_kda_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
+def resolve_kda_batched_replay_commit(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
-    ``None`` for any dtype but bfloat16: the batched kernels dereference raw
-    descriptor addresses as bf16 (an override resolves by name and skips the
-    signature check), so other dtypes must use the per-layer commit, which
-    reads its dtypes from the tensors.
+    Batched kernels dereference descriptor addresses as BF16, so other dtypes
+    use the per-layer commit.
+
+    Args:
+        dtype: Activation dtype used by the replay payload.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
     """
     if dtype is not torch.bfloat16:
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {"flat_state": True, "batched_layers": True}
+    if num_heads is not None:
+        traits["num_heads"] = num_heads
+    if head_dim is not None:
+        traits["head_dim"] = head_dim
     try:
         return select_kernel(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "batched_layers": True},
-            override="triton_nvidia_kda_batched_replay_commit",
+            traits=traits,
+            override=(
+                "triton_nvidia_kda_batched_replay_commit"
+                if current_platform().is_nvidia
+                else None
+            ),
         )
     except NoKernelFoundError:
         return None
 
 
-# ===-----------------------------------------------------------------------===#
-# MHA Kernels
-# ===-----------------------------------------------------------------------===#
+def kda_batched_replay_uses_raw_gate(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+) -> bool:
+    """Whether the selected batched replay consumes persistent BF16 raw-g.
+
+    Args:
+        dtype: Activation dtype used by the replay payload.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
+    """
+    kernel = resolve_kda_batched_replay_commit(
+        dtype, num_heads=num_heads, head_dim=head_dim
+    )
+    if kernel is None:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    if registered is None:
+        return False
+    return registered.traits.get("replay_raw_gate") == frozenset({True})
 
 
 def kda_replay_commit_supported(
@@ -1984,6 +5447,8 @@ def kda_replay_commit_supported(
     *,
     solution: str | None = None,
     recurrent_layout: str | None = None,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
 ) -> bool:
     """Whether this platform can run the KDA speculative replay path.
 
@@ -1998,6 +5463,8 @@ def kda_replay_commit_supported(
         recurrent_layout: Layout of the committed state; the platform default
             when omitted. It must match what the caller stores, or the probe
             answers for kernels the backend will not select.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
 
     Returns:
         ``True`` when both kernels are registered for the current platform.
@@ -2005,12 +5472,21 @@ def kda_replay_commit_supported(
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    shape_traits = {}
+    if num_heads is not None:
+        shape_traits["num_heads"] = num_heads
+    if head_dim is not None:
+        shape_traits["head_dim"] = head_dim
     try:
         select_kernel(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                **shape_traits,
+            },
             solution=solution,
         )
         select_kernel(
@@ -2021,6 +5497,7 @@ def kda_replay_commit_supported(
                 "paged_state": True,
                 "store_states": False,
                 "recurrent_layout": recurrent_layout,
+                **shape_traits,
             },
             solution=solution,
         )
@@ -2029,2712 +5506,8 @@ def kda_replay_commit_supported(
     return True
 
 
-def mha_prefill(
-    # attention inputs
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: list[int],
-    max_seqlen: int,
-    # attention options
-    window_left: int = -1,
-    logit_cap: float = 0.0,
-    sinks: torch.Tensor | None = None,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """MHA prefill from uncached KV.
-
-    Args:
-        q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
-        v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
-        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
-            KV cumulative sequence lengths are assumed to be identical.
-        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
-            list[int]. Used for host-side launch metadata; must match cu_seqlens.
-        max_seqlen: Maximum sequence length.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        logit_cap: Optional soft cap applied to attention logits.
-        sinks: Optional attention sink tensor.
-        return_lse: Whether to also return natural-log log-sum-exp values with
-            shape [total_q, num_q_heads].
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Standard full-sequence prefill assumes query and KV sequence boundaries match.
-    """
-    batch_size = cu_seqlens.shape[0] - 1
-
-    # Select kernel
-    traits = {
-        "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q, k=k, v=v)
-    kernel = select_kernel(
-        "attention",
-        "mha_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    # Record shapes
-    shape_params = {
-        "batch_size": batch_size,
-        "total_q": q.shape[0],
-        "total_kv": k.shape[0],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1],
-        "head_dim": q.shape[-1],
-        "max_seqlen": max_seqlen,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mha_prefill",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    # Enter profiling scope
-    with kernel_scope(
-        "attention",
-        "mha_prefill",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            max_seqlen=max_seqlen,
-            window_left=window_left,
-            logit_cap=logit_cap,
-            sinks=sinks,
-            return_lse=return_lse,
-            softmax_scale=softmax_scale,
-        )
-
-
-def mha_extend_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    # attention options
-    is_causal: bool = False,
-    window_left: int = -1,
-    logit_cap: float = 0.0,
-    sinks: torch.Tensor | None = None,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    q_scale: torch.Tensor | None = None,
-    k_scale: torch.Tensor | None = None,
-    v_scale: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """MHA extend with paged KV cache.
-
-    Args:
-        q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
-        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
-            lengths are independent and may be smaller than KV lengths.
-        max_seqlen_q: Maximum query length.
-        max_seqlen_k: Maximum KV length.
-        is_causal: Whether query tokens are a causal suffix of cached KV.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        logit_cap: Optional soft cap applied to attention logits.
-        sinks: Optional attention sink tensor.
-        return_lse: Whether to also return natural-log log-sum-exp values with
-            shape [total_q, num_q_heads].
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
-            elements), shape [total_q, num_q_heads, head_dim // 32]. Providing
-            it selects the block-scaled path; q/k_cache/v_cache must then be
-            float8_e4m3fn.
-        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
-            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
-            page_size 128).
-        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Each request's query tokens attend all visible cached KV tokens.
-    """
-    signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
-    )
-
-    # Select kernel
-    traits = {
-        "head_dim": q.shape[-1],
-        "page_size": k_cache.shape[1],
-        "is_causal": is_causal,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
-        "return_lse": return_lse,
-    }
-    kernel = select_kernel(
-        "attention",
-        "mha_extend_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    # Record shapes
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0],
-        "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0],
-        "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
-        "head_dim": q.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mha_extend_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    # Enter profiling scope
-    with kernel_scope(
-        "attention",
-        "mha_extend_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            is_causal=is_causal,
-            window_left=window_left,
-            logit_cap=logit_cap,
-            sinks=sinks,
-            return_lse=return_lse,
-            softmax_scale=softmax_scale,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            **scale_kwargs,
-        )
-
-
-def mha_decode_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    max_seqlen_q: int,
-    # attention options
-    window_left: int = -1,
-    logit_cap: float = 0.0,
-    sinks: torch.Tensor | None = None,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    q_scale: torch.Tensor | None = None,
-    k_scale: torch.Tensor | None = None,
-    v_scale: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """MHA decode with paged KV cache.
-
-    Args:
-        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
-        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Total visible KV lengths after appending current decode tokens, shape [batch].
-        max_seqlen_k: Maximum KV length.
-        max_seqlen_q: Number of uniformly packed query tokens per request. This
-            is 1 for normal decode and `spec_num_tokens` for compact
-            speculative decode.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        logit_cap: Optional soft cap applied to attention logits.
-        sinks: Optional attention sink tensor.
-        return_lse: Whether to also return log-sum-exp values.
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
-            elements), shape [batch * max_seqlen_q, num_q_heads, head_dim // 32].
-            Providing it selects the block-scaled path; q/k_cache/v_cache must
-            then be float8_e4m3fn.
-        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
-            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
-            page_size 128).
-        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-    """
-    signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
-    )
-
-    # Select kernel
-    traits = {
-        "q_len": max_seqlen_q,
-        "head_dim": q.shape[-1],
-        "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
-        "return_lse": return_lse,
-    }
-    kernel = select_kernel(
-        "attention",
-        "mha_decode_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    # Record shapes
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0],
-        "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0],
-        "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
-        "head_dim": q.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mha_decode_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    # Enter profiling scope
-    with kernel_scope(
-        "attention",
-        "mha_decode_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            window_left=window_left,
-            logit_cap=logit_cap,
-            sinks=sinks,
-            return_lse=return_lse,
-            softmax_scale=softmax_scale,
-            max_seqlen_k=max_seqlen_k,
-            max_seqlen_q=max_seqlen_q,
-            **scale_kwargs,
-        )
-
-
-# rel_mha: relative-distance-bias MHA; own family keeps model-specific args out of plain mha.
-
-
-def rel_mha_prefill(
-    # attention inputs
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    rel_logits: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: list[int],
-    max_seqlen: int,
-    # attention options
-    window_left: int = -1,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """Relative-attention MHA prefill from uncached KV.
-
-    Args:
-        q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
-        v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
-        rel_logits: Learned relative bias logits with shape
-            [total_q, num_q_heads, rel_extent]. rel_logits[t, h, d] is added
-            to the pre-softmax logit of query row t against the key d
-            positions behind it, for 0 <= d < rel_extent; other distances
-            contribute zero bias.
-        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
-            KV cumulative sequence lengths are assumed to be identical.
-        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
-            list[int]. Used for host-side launch metadata; must match cu_seqlens.
-        max_seqlen: Maximum sequence length.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        return_lse: Whether to also return natural-log log-sum-exp values with
-            shape [total_q, num_q_heads].
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
-            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
-            q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Attention is always causal within each sequence.
-    """
-    batch_size = cu_seqlens.shape[0] - 1
-
-    traits = {
-        "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q, k=k, v=v)
-    kernel = select_kernel(
-        "attention",
-        "rel_mha_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    shape_params = {
-        "batch_size": batch_size,
-        "total_q": q.shape[0],
-        "total_kv": k.shape[0],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1],
-        "head_dim": q.shape[-1],
-        "rel_extent": rel_logits.shape[-1],
-        "max_seqlen": max_seqlen,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "rel_mha_prefill",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        "rel_mha_prefill",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            k=k,
-            v=v,
-            rel_logits=rel_logits,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            max_seqlen=max_seqlen,
-            window_left=window_left,
-            return_lse=return_lse,
-            softmax_scale=softmax_scale,
-            tau=tau,
-            enable_pdl=enable_pdl,
-        )
-
-
-def rel_mha_extend_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    rel_logits: torch.Tensor,
-    # attention options
-    window_left: int = -1,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
-    q_scale: torch.Tensor | None = None,
-    k_scale: torch.Tensor | None = None,
-    v_scale: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """Relative-attention MHA extend with paged KV cache.
-
-    Args:
-        q: Query tensor with shape [total_q, num_q_heads, head_dim].
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
-        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
-            lengths are independent and may be smaller than KV lengths.
-        max_seqlen_q: Maximum query length.
-        max_seqlen_k: Maximum KV length.
-        rel_logits: Learned relative bias logits with shape
-            [total_q, num_q_heads, rel_extent]; rows are addressed by each
-            request's batch-flattened query positions (cu_seqlens_q). The
-            relative distance is computed against the query's absolute
-            position in the cached sequence.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        return_lse: Whether to also return natural-log log-sum-exp values with
-            shape [total_q, num_q_heads].
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
-            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
-            q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Each request's query tokens attend all visible cached KV tokens causally.
-
-    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
-    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
-    UE8M0 [total_q, num_q_heads, head_dim // 32], k_scale/v_scale use the
-    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
-    32, 4, 4].
-    """
-    signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
-    )
-    traits = {
-        "head_dim": q.shape[-1],
-        "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
-        "return_lse": return_lse,
-    }
-    kernel = select_kernel(
-        "attention",
-        "rel_mha_extend_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0],
-        "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0],
-        "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
-        "head_dim": q.shape[-1],
-        "rel_extent": rel_logits.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "rel_mha_extend_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        "rel_mha_extend_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            rel_logits=rel_logits,
-            window_left=window_left,
-            return_lse=return_lse,
-            softmax_scale=softmax_scale,
-            tau=tau,
-            enable_pdl=enable_pdl,
-            **scale_kwargs,
-        )
-
-
-def rel_mha_decode_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    rel_logits: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int = 1,
-    # attention options
-    window_left: int = -1,
-    softmax_scale: float | None = None,
-    tau: torch.Tensor | None = None,
-    enable_pdl: bool = False,
-    q_scale: torch.Tensor | None = None,
-    k_scale: torch.Tensor | None = None,
-    v_scale: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """Relative-attention MHA decode with paged KV cache.
-
-    Args:
-        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
-        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
-        page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Total visible KV lengths after appending current decode
-            tokens, shape [batch].
-        max_seqlen_k: Maximum KV length.
-        rel_logits: Learned relative bias logits with shape
-            [batch * max_seqlen_q, num_q_heads, rel_extent], one row per
-            decode token.
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1]
-            (arange(batch + 1) * max_seqlen_q). Required: decode runs the
-            varlen path so each request's query rows map into rel_logits at
-            their batch-flattened positions.
-        max_seqlen_q: Number of uniformly packed query tokens per request. This
-            is 1 for normal decode and `spec_num_tokens` for compact
-            speculative decode.
-        window_left: Exclusive left sliding-window size. -1 means full attention.
-        softmax_scale: Scale applied to QK logits before softmax. None uses the
-            backend default 1/sqrt(head_dim).
-        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
-            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
-            q's row count and values must be positive.
-        enable_pdl: Launch eligible kernels with Programmatic Dependent
-            Launch (Hopper+).
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
-    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
-    UE8M0 [batch, num_q_heads, head_dim // 32], k_scale/v_scale use the
-    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
-    32, 4, 4].
-
-    Uniform ``max_seqlen_q > 1`` (spec verify) rides v2's native prediction
-    dimension — unexpanded ``[batch]`` seqlens and ``[batch, W]`` table, one
-    KV load per request. Non-uniform multi-query takes the fork varlen path.
-    """
-    blockscaled = q_scale is not None
-    signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
-    )
-    traits = {
-        "head_dim": q.shape[-1],
-        "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
-        "return_lse": False,
-    }
-    kernel = select_kernel(
-        "attention",
-        "rel_mha_decode_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0],
-        "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0],
-        "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
-        "head_dim": q.shape[-1],
-        "rel_extent": rel_logits.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "rel_mha_decode_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        "rel_mha_decode_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=max_seqlen_k,
-            rel_logits=rel_logits,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            window_left=window_left,
-            softmax_scale=softmax_scale,
-            tau=tau,
-            enable_pdl=enable_pdl,
-            **scale_kwargs,
-        )
-
-
 # ===-----------------------------------------------------------------------===#
-# MLA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
-def mla_prefill(
-    # attention inputs
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_kv: int,
-    softmax_scale: float,
-    # attention options
-    seq_lens_kv: torch.Tensor | None = None,
-    is_causal: bool = True,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
-
-    This API is for the non-absorbed MLA path. Callers materialize full
-    per-head K/V before calling this function, so the kernel contract is close
-    to MHA ragged attention. It is used for both prompt/new-token causal
-    prefill and prefix-cache replay chunks after the compressed MLA cache has
-    been read and expanded by the model.
-
-    Args:
-        q: Query tensor with shape [total_q, num_q_heads, qk_head_dim], where
-            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim.
-        k: Key tensor with shape [total_kv, num_kv_heads, qk_head_dim]. For
-            DeepSeek MLA prefill today, num_kv_heads is normally num_q_heads
-            after expanding the shared RoPE key part across heads.
-        v: Value tensor with shape [total_kv, num_kv_heads, v_head_dim].
-        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
-        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
-            This is independent from cu_seqlens_q so prefix-cache chunks can use
-            q_lens != kv_lens.
-        max_seqlen_q: Maximum query length in the batch.
-        max_seqlen_kv: Maximum KV length in the batch.
-        softmax_scale: Scale applied to QK logits before softmax.
-        seq_lens_kv: Optional per-request KV lengths with shape [batch]. Some
-            backends need this in addition to cu_seqlens_kv.
-        is_causal: Whether to apply a causal mask between Q and KV. Prefix-cache
-            replay chunks should pass False because all prefix tokens precede all
-            extend tokens.
-        logit_cap: Optional soft cap applied to attention logits.
-        return_lse: Whether to also return natural-log log-sum-exp values with
-            shape [total_q, num_q_heads]. Required when partial attention states
-            will be merged.
-        out: Optional output tensor with shape [total_q, num_q_heads, v_head_dim].
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Returns:
-        Attention output with shape [total_q, num_q_heads, v_head_dim], or
-        (output, lse) when return_lse is True.
-    """
-    batch_size = cu_seqlens_q.shape[0] - 1
-    traits = {
-        "qk_head_dim": q.shape[-1],
-        "v_head_dim": v.shape[-1],
-        "is_causal": is_causal,
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q, k=k, v=v)
-    kernel = select_kernel(
-        "attention",
-        "mla_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    shape_params = {
-        "batch_size": batch_size,
-        "total_q": q.shape[0],
-        "total_kv": k.shape[0],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k.shape[1],
-        "qk_head_dim": q.shape[-1],
-        "v_head_dim": v.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_kv": max_seqlen_kv,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mla_prefill",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        "mla_prefill",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv,
-            softmax_scale=softmax_scale,
-            seq_lens_kv=seq_lens_kv,
-            is_causal=is_causal,
-            logit_cap=logit_cap,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-def mla_use_absorbed_extend(
-    *,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    num_q_heads: int,
-    page_size: int,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    max_seqlen_q: int | None = None,
-    solution: str | None = None,
-) -> bool:
-    """Return whether a registered kernel supports absorbed MLA extend.
-
-    Args:
-        q_dtype: Absorbed query dtype.
-        kv_dtype: Compressed KV-cache dtype.
-        num_q_heads: Number of local query heads.
-        page_size: Number of cache tokens per page.
-        qk_nope_head_dim: Original non-RoPE query/key dimension.
-        kv_lora_rank: Compressed MLA latent rank.
-        qk_rope_head_dim: RoPE query/key dimension.
-        max_seqlen_q: Optional maximum query length used to filter kernels whose
-            registered shape domain is narrower than their operator API.
-        solution: Optional kernel solution to restrict the query.
-
-    Returns:
-        Whether the current platform has a matching causal absorbed-extend
-        implementation. Kernel registrations remain the source of truth for
-        hardware, dtype, and shape support.
-    """
-    signature = format_signature(
-        q=dense_tensor_format(q_dtype),
-        kv_cache=dense_tensor_format(kv_dtype),
-    )
-    traits = {
-        "num_q_heads": num_q_heads,
-        "page_size": page_size,
-        "qk_nope_head_dim": qk_nope_head_dim,
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "is_causal": True,
-        "support_logit_cap": False,
-        "return_lse": False,
-    }
-    if max_seqlen_q is not None:
-        traits["max_seqlen_q"] = max_seqlen_q
-    candidates = KernelRegistry.get().get_for_operator(
-        "attention",
-        "mla_extend_with_kvcache",
-        platform=current_platform(),
-        format_signature=signature,
-        solution=solution,
-    )
-    return any(spec_matches_traits(spec, traits) for spec in candidates)
-
-
-def mla_extend_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    # MLA dimensions
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    # attention options
-    is_causal: bool = True,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """MLA multi-token attention over a compressed paged KV cache.
-
-    The model supplies packed absorbed queries and prewrites the current tokens
-    to the compressed cache. A zero-length prefix represents initial prefill;
-    a nonzero prefix represents cached extend.
-
-    Args:
-        q: Packed absorbed query shaped ``[total_q, num_q_heads,
-            kv_lora_rank + qk_rope_head_dim]``.
-        kv_cache: Compressed paged cache shaped ``[num_pages, page_size, 1,
-            kv_lora_rank + qk_rope_head_dim]``.
-        page_table: Page table shaped ``[batch, max_pages_per_seq]``.
-        cache_seqlens: Total visible KV lengths, including the current query
-            tokens, shaped ``[batch]``.
-        cu_seqlens_q: Packed query boundaries shaped ``[batch + 1]``.
-        cu_seqlens_kv: Packed total-KV boundaries shaped ``[batch + 1]``.
-        max_seqlen_q: Maximum query length in the batch.
-        max_seqlen_k: Maximum visible KV length in the batch.
-        qk_nope_head_dim: Original non-RoPE query/key dimension.
-        kv_lora_rank: Compressed MLA latent rank and output head dimension.
-        qk_rope_head_dim: RoPE query/key dimension.
-        softmax_scale: Scale applied to QK logits.
-        is_causal: Whether each query chunk is a causal suffix of its cache.
-        logit_cap: Optional soft cap applied to logits.
-        return_lse: Whether to return natural-log log-sum-exp values.
-        out: Optional output shaped ``[total_q, num_q_heads, kv_lora_rank]``.
-        override: Optional exact kernel name.
-        solution: Optional kernel solution backend.
-
-    Returns:
-        Latent attention output, or ``(output, lse)`` when supported and
-        ``return_lse`` is true. The caller applies the MLA value projection.
-    """
-    batch_size = cache_seqlens.shape[0]
-    traits = {
-        "page_size": kv_cache.shape[1],
-        "num_q_heads": q.shape[1],
-        "max_seqlen_q": max_seqlen_q,
-        "qk_nope_head_dim": qk_nope_head_dim,
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "is_causal": is_causal,
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    kernel = select_kernel(
-        "attention",
-        "mla_extend_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-
-    shape_params = {
-        "batch_size": batch_size,
-        "total_q": q.shape[0],
-        "num_q_heads": q.shape[1],
-        "num_pages": kv_cache.shape[0],
-        "page_size": kv_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "qk_nope_head_dim": qk_nope_head_dim,
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mla_extend_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        "mla_extend_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            logit_cap=logit_cap,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-def mla_decode_with_kvcache(
-    # attention inputs
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    # MLA dimensions
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    # attention options
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    # dispatch options
-    override: str | None = None,
-    solution: str | None = None,
-    # optional projected-value epilogue
-    value_weight: torch.Tensor | None = None,
-    gate: torch.Tensor | None = None,
-) -> AttentionResult:
-    """MLA absorbed decode over compressed paged MLA KV cache.
-
-    This API is for the absorbed MLA decode path. The model has already
-    transformed the non-RoPE query part into latent space using the key half of
-    kv_b_proj, so Q and the compressed cache share the same q/k dimension:
-    kv_lora_rank + qk_rope_head_dim. The kernel returns the attention-weighted
-    latent value. When ``value_weight`` is provided, a supporting kernel may
-    instead apply the value projection and optional output gate while reducing
-    the attention partials. Otherwise the API composes the latent decode and
-    value projection.
-
-    Args:
-        q: Absorbed query with shape
-            [batch, q_len, num_q_heads, kv_lora_rank + qk_rope_head_dim]. For
-            plain decode q_len is 1; speculative/draft paths may pass q_len > 1.
-        kv_cache: Paged compressed MLA cache with shape
-            [num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]. The first
-            kv_lora_rank elements are latent KV; the final qk_rope_head_dim
-            elements are the RoPE key part.
-        page_table: Page table with shape [batch, max_pages_per_seq].
-        cache_seqlens: Visible KV lengths in the cache, shape [batch]. These
-            lengths include current decode tokens when they were prewritten.
-        max_seqlen_k: Maximum visible KV length.
-        qk_nope_head_dim: Original non-RoPE q/k head dim. Some backends need
-            this for kernel specialization even though q stores the absorbed
-            latent dimension.
-        kv_lora_rank: MLA latent rank R. The output head dim is R.
-        qk_rope_head_dim: RoPE q/k head dim.
-        softmax_scale: Scale applied to QK logits before softmax.
-        logit_cap: Optional soft cap applied to attention logits.
-        return_lse: Whether to also return log-sum-exp values.
-        out: Optional output tensor with shape [batch, q_len, num_q_heads,
-            kv_lora_rank]. When ``value_weight`` is provided, this is required
-            and has shape [batch, num_q_heads * value_head_dim].
-        value_weight: Optional per-head value projection with shape
-            [num_q_heads, kv_lora_rank, value_head_dim].
-        gate: Optional raw sigmoid gate with shape
-            [batch, num_q_heads * value_head_dim]. Requires ``value_weight``.
-        override: Optional kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Returns:
-        Latent attention output with shape [batch, q_len, num_q_heads,
-        kv_lora_rank], or (output, lse) when return_lse is True. When
-        ``value_weight`` is provided, returns ``out`` containing the projected
-        and optionally gated value.
-    """
-    if gate is not None and value_weight is None:
-        raise ValueError("gate requires value_weight")
-
-    projected_value = value_weight is not None
-    if projected_value:
-        if q.ndim != 4 or q.shape[1] != 1:
-            raise ValueError(
-                "projected MLA decode requires q shape [batch,1,heads,dim]"
-            )
-        if value_weight.ndim != 3 or value_weight.shape[:2] != (
-            q.shape[2],
-            kv_lora_rank,
-        ):
-            raise ValueError(
-                "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
-            )
-        if out is None:
-            raise ValueError("projected MLA decode requires out")
-        expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
-        if out.shape != expected_output:
-            raise ValueError(f"out must have shape {expected_output}")
-        if (
-            out.dtype != value_weight.dtype
-            or out.device != q.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(
-                "out must match value_weight dtype and be contiguous and colocated with q"
-            )
-        if gate is not None and gate.shape != expected_output:
-            raise ValueError(f"gate must have shape {expected_output}")
-        if return_lse:
-            raise ValueError("projected MLA decode does not support return_lse")
-
-    traits = {
-        "batch_size": q.shape[0],
-        "page_size": kv_cache.shape[1],
-        "q_len": q.shape[1],
-        "num_q_heads": q.shape[2],
-        "batch_size_div_64": q.shape[0] % 64 == 0,
-        "qk_nope_head_dim": qk_nope_head_dim,
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
-    if projected_value:
-        traits.update(
-            {
-                "value_head_dim": value_weight.shape[2],
-                "gate_kind": "none" if gate is None else "sigmoid",
-            }
-        )
-        signature = _attention_format_signature(
-            q=q,
-            kv_cache=kv_cache,
-            value_weight=value_weight,
-            out=out,
-        )
-    else:
-        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    dispatch_mode = (
-        "mla_decode_projected_value" if projected_value else "mla_decode_with_kvcache"
-    )
-    try:
-        kernel = select_kernel(
-            "attention",
-            dispatch_mode,
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        if projected_value:
-            if override is not None or solution is not None:
-                raise
-            attention = mla_decode_with_kvcache(
-                q=q,
-                kv_cache=kv_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                qk_nope_head_dim=qk_nope_head_dim,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                softmax_scale=softmax_scale,
-                logit_cap=logit_cap,
-            )
-            return mla_project_value(
-                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
-                value_weight,
-                gate=gate,
-                out=out,
-            )
-        if q.dtype == kv_cache.dtype:
-            raise
-        q = q.to(kv_cache.dtype)
-        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-        kernel = select_kernel(
-            "attention",
-            "mla_decode_with_kvcache",
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
-
-    shape_params = {
-        "batch_size": q.shape[0],
-        "q_len": q.shape[1],
-        "num_q_heads": q.shape[2],
-        "num_pages": kv_cache.shape[0],
-        "page_size": kv_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "qk_nope_head_dim": qk_nope_head_dim,
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    if projected_value:
-        shape_params["value_head_dim"] = value_weight.shape[2]
-    ShapeCapture.get().record(
-        "attention",
-        dispatch_mode,
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-
-    with kernel_scope(
-        "attention",
-        dispatch_mode,
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        if projected_value:
-            return kernel(
-                q=q,
-                kv_cache=kv_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                qk_nope_head_dim=qk_nope_head_dim,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                softmax_scale=softmax_scale,
-                value_weight=value_weight,
-                gate=gate,
-                out=out,
-                logit_cap=logit_cap,
-            )
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            logit_cap=logit_cap,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-# ===-----------------------------------------------------------------------===#
-# DSA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
-def dsv4_swa_cache_insert(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    swa_kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rms_norm_eps: float,
-    page_size: int,
-    q_out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> None:
-    """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
-
-    Args:
-        q: Query latents shaped ``[tokens, heads, 512]``. Updated in place when
-            ``q_out`` is not provided.
-        kv: Shared K/V latents shaped ``[tokens, 512]``.
-        swa_kv_cache: Uint8 page-planar V4 FP8 SWA cache.
-        slot_mapping: Destination cache slot for each inserted token. Slots
-            outside the cache capacity suppress insertion.
-        positions: Absolute positions for all query/KV tokens.
-        cos_sin_cache: FP32 GPT-J-style fused cosine/sine cache of width 64.
-        rms_norm_eps: Positive epsilon used to normalize Q.
-        page_size: Number of cache entries in each page.
-        q_out: Optional contiguous destination for normalized and rotated Q.
-            When provided, ``q`` is left unchanged.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        None. Q and the selected cache rows are written in place.
-    """
-    if q.ndim != 3 or q.shape[-1] != 512:
-        raise ValueError(
-            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
-        )
-    if kv.shape != (q.shape[0], 512):
-        raise ValueError(f"kv must have shape [tokens, 512], got {tuple(kv.shape)}")
-    if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
-        raise TypeError("q and kv must have matching float16 or bfloat16 dtypes")
-    if not q.is_contiguous() or not kv.is_contiguous():
-        raise ValueError("q and kv must be contiguous")
-    if positions.ndim != 1 or positions.numel() != q.shape[0]:
-        raise ValueError("positions must have one entry per query token")
-    if slot_mapping.ndim != 1 or slot_mapping.numel() > q.shape[0]:
-        raise ValueError("slot_mapping must be one-dimensional and no longer than q")
-    if positions.dtype not in (torch.int32, torch.int64):
-        raise TypeError("positions must have dtype int32 or int64")
-    if slot_mapping.dtype not in (torch.int32, torch.int64):
-        raise TypeError("slot_mapping must have dtype int32 or int64")
-    if not positions.is_contiguous() or not slot_mapping.is_contiguous():
-        raise ValueError("positions and slot_mapping must be contiguous")
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}")
-    if rms_norm_eps <= 0.0:
-        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
-    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != 64:
-        raise ValueError("cos_sin_cache must have shape [max_position, 64]")
-    if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
-        raise TypeError("cos_sin_cache must be contiguous float32")
-    row_bytes = 448 + 2 * 64 + 448 // 64 + 1
-    if (
-        swa_kv_cache.dtype != torch.uint8
-        or swa_kv_cache.ndim != 2
-        or swa_kv_cache.shape[1] < page_size * row_bytes
-        or swa_kv_cache.stride(1) != 1
-    ):
-        raise ValueError(
-            "swa_kv_cache must be a 2D uint8 page-planar cache with "
-            f"at least {page_size * row_bytes} bytes per page"
-        )
-    tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
-    if any(tensor.device != q.device for tensor in tensors):
-        raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
-    positions_valid = ((positions >= 0) & (positions < cos_sin_cache.shape[0])).all()
-    position_error = "positions entries must index cos_sin_cache"
-    if positions.device.type == "cpu":
-        if not bool(positions_valid.item()):
-            raise ValueError(position_error)
-    else:
-        torch._assert_async(positions_valid, position_error)
-    if q_out is not None and (
-        q_out.shape != q.shape
-        or q_out.dtype != q.dtype
-        or q_out.device != q.device
-        or not q_out.is_contiguous()
-    ):
-        raise ValueError(
-            "q_out must be contiguous and match q shape, dtype, and device"
-        )
-
-    signature = format_signature(
-        q=dense_tensor_format(q.dtype),
-        kv=dense_tensor_format(kv.dtype),
-        swa_kv_cache=dense_tensor_format(swa_kv_cache.dtype),
-    )
-    traits = {
-        "head_dim": int(q.shape[-1]),
-        "rope_dim": int(cos_sin_cache.shape[-1]),
-        "quant_block_size": 64,
-        "cache_layout": "fp8_swa_page_planar",
-        "has_q_out": q_out is not None,
-    }
-    kernel = select_kernel(
-        "attention",
-        "dsv4_swa_cache_insert",
-        signature,
-        traits=traits,
-        override=override,
-        solution=solution,
-    )
-    shape_params = {
-        "tokens": int(q.shape[0]),
-        "insert_tokens": min(int(kv.shape[0]), int(slot_mapping.numel())),
-        "num_heads": int(q.shape[1]),
-        "head_dim": int(q.shape[2]),
-        "rope_dim": int(cos_sin_cache.shape[-1]),
-        "page_size": int(page_size),
-        "num_pages": int(swa_kv_cache.shape[0]),
-        "has_q_out": q_out is not None,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_swa_cache_insert",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_swa_cache_insert",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        kernel(
-            q=q,
-            kv=kv,
-            swa_kv_cache=swa_kv_cache,
-            slot_mapping=slot_mapping,
-            positions=positions,
-            cos_sin_cache=cos_sin_cache,
-            rms_norm_eps=rms_norm_eps,
-            page_size=page_size,
-            q_out=q_out,
-        )
-
-
-def dsv4_csa_indexer_fp8_cache_insert(
-    state_cache: torch.Tensor,
-    token_to_req_indices: torch.Tensor,
-    positions: torch.Tensor,
-    compressor_slot_mapping: torch.Tensor,
-    block_table: torch.Tensor,
-    compressor_block_size: int,
-    rms_norm_weight: torch.Tensor,
-    rms_norm_eps: float,
-    cos_sin_cache: torch.Tensor,
-    kv_cache_2d: torch.Tensor,
-    kv_slot_mapping: torch.Tensor,
-    kv_cache_block_size: int,
-    compress_ratio: int = 4,
-    block_table_base_offsets: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> None:
-    """Compress and insert DeepSeek V4 FP8 CSA indexer-cache rows.
-
-    Args:
-        state_cache: FP32 paged compressor values and scores.
-        token_to_req_indices: Request index for each input token.
-        positions: Absolute token positions.
-        compressor_slot_mapping: Compressor-state slots for input tokens.
-        block_table: Logical-to-physical compressor-state page table.
-        compressor_block_size: Number of compressor-state rows per page.
-        rms_norm_weight: Width-128 RMSNorm weight.
-        rms_norm_eps: RMSNorm epsilon.
-        cos_sin_cache: Width-64 fused cosine and sine cache.
-        kv_cache_2d: Uint8 page-planar FP8 indexer cache.
-        kv_slot_mapping: Destination indexer-cache slots.
-        kv_cache_block_size: Number of destination rows per page.
-        compress_ratio: CSA compression ratio, currently four.
-        block_table_base_offsets: Optional logical page base per request.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        None. Valid rows are written in place.
-    """
-
-    signature = _attention_format_signature(
-        state_cache=state_cache,
-        kv_cache=kv_cache_2d,
-    )
-    traits = {
-        "index_head_dim": int(rms_norm_weight.numel()),
-        "compress_ratio": int(compress_ratio),
-        "page_size": int(kv_cache_block_size),
-        "cache_format": "fp8_scaled_page_planar",
-    }
-    kernel = select_kernel(
-        "attention",
-        "dsv4_csa_indexer_fp8_cache_insert",
-        signature,
-        traits=traits,
-        override=override,
-        solution=solution,
-    )
-    shape_params = {
-        "tokens": min(
-            int(positions.numel()),
-            int(compressor_slot_mapping.numel()),
-            int(kv_slot_mapping.numel()),
-        ),
-        **traits,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_csa_indexer_fp8_cache_insert",
-        kernel.name,
-        state_cache.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_csa_indexer_fp8_cache_insert",
-        state_cache.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        kernel(
-            state_cache=state_cache,
-            token_to_req_indices=token_to_req_indices,
-            positions=positions,
-            compressor_slot_mapping=compressor_slot_mapping,
-            block_table=block_table,
-            compressor_block_size=compressor_block_size,
-            rms_norm_weight=rms_norm_weight,
-            rms_norm_eps=rms_norm_eps,
-            cos_sin_cache=cos_sin_cache,
-            kv_cache_2d=kv_cache_2d,
-            kv_slot_mapping=kv_slot_mapping,
-            kv_cache_block_size=kv_cache_block_size,
-            compress_ratio=compress_ratio,
-            block_table_base_offsets=block_table_base_offsets,
-        )
-
-
-def dsv4_selected_attention(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    lens: torch.Tensor,
-    attn_sink: torch.Tensor,
-    softmax_scale: float,
-    out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> torch.Tensor:
-    """Run DeepSeek V4 selected attention over a dense K/V workspace.
-
-    Args:
-        q: BF16 queries shaped ``[tokens, heads, 512]``.
-        kv: BF16 selected K/V workspace with rows of width 512.
-        indices: Selected workspace row indices shaped ``[tokens, width]``.
-            Negative entries are ignored. Nonnegative entries in each active
-            prefix must be smaller than the number of rows in ``kv``.
-        lens: Valid selected width for each query token.
-        attn_sink: One attention sink logit per query head.
-        softmax_scale: Scale applied to query-key dot products.
-        out: Optional output shaped like ``q``.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        BF16 attention output shaped like ``q``.
-    """
-    if q.ndim != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
-        raise ValueError(
-            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
-        )
-    if kv.ndim < 2 or kv.shape[-1] != 512:
-        raise ValueError(f"kv must contain rows of width 512, got {tuple(kv.shape)}")
-    tokens = int(q.shape[0])
-    if indices.ndim != 2 or indices.shape[0] != tokens:
-        raise ValueError("indices must have one row per query token")
-    if lens.ndim != 1 or lens.numel() != tokens:
-        raise ValueError("lens must have one entry per query token")
-    if indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("indices must have dtype int32 or int64")
-    if lens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
-        raise ValueError("attn_sink must provide one value per query head")
-    if any(tensor.device != q.device for tensor in (kv, indices, lens, attn_sink)):
-        raise ValueError("all selected-attention tensors must share a device")
-    if out is not None and (
-        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
-    ):
-        raise ValueError("out must match q shape, dtype, and device")
-
-    signature = _attention_format_signature(q=q, kv=kv)
-    traits = {
-        "head_dim": int(q.shape[-1]),
-        "cache_layout": "dense_workspace",
-        "support_sink": True,
-        "selected_width": int(indices.shape[-1]),
-        "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
-    }
-    kernel = select_kernel(
-        "attention",
-        "dsv4_selected_attention",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": int(q.shape[0]),
-        "num_heads": int(q.shape[1]),
-        "head_dim": int(q.shape[2]),
-        "selected_width": int(indices.shape[-1]),
-        "kv_rows": int(kv.numel() // q.shape[-1]),
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_selected_attention",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_selected_attention",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            kv=kv,
-            indices=indices,
-            lens=lens,
-            attn_sink=attn_sink,
-            softmax_scale=softmax_scale,
-            out=out,
-        )
-
-
-def dsv4_paged_selected_attention(
-    q: torch.Tensor,
-    swa_kv_cache: torch.Tensor,
-    swa_slots: torch.Tensor,
-    swa_lens: torch.Tensor,
-    swa_page_size: int,
-    attn_sink: torch.Tensor,
-    softmax_scale: float,
-    extra_kv_cache: torch.Tensor | None = None,
-    extra_slots: torch.Tensor | None = None,
-    extra_lens: torch.Tensor | None = None,
-    extra_page_size: int | None = None,
-    out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> torch.Tensor:
-    """Run DeepSeek V4 selected attention over page-planar FP8 caches.
-
-    SWA and optional extra compressed rows form independent selected segments.
-    Invalid negative slots and entries beyond each segment's per-token length
-    do not contribute to attention.
-
-    Args:
-        q: BF16 queries shaped ``[tokens, heads, 512]``.
-        swa_kv_cache: Uint8 page-planar SWA cache shaped
-            ``[pages, page_size * row_bytes]``.
-        swa_slots: Selected global SWA slots with one row per query token.
-            Negative entries are ignored. Nonnegative entries in each active
-            prefix must be smaller than ``pages * swa_page_size``.
-        swa_lens: Valid SWA selection length for each query token.
-        swa_page_size: Number of SWA rows in each cache page.
-        attn_sink: One attention sink logit per query head.
-        softmax_scale: Scale applied to query-key dot products.
-        extra_kv_cache: Optional uint8 page-planar compressed cache.
-        extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
-            entries in each active prefix must be smaller than
-            ``extra_pages * extra_page_size``.
-        extra_lens: Valid extra selection length for each query token.
-        extra_page_size: Number of rows in each extra cache page.
-        out: Optional output shaped like ``q``.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        BF16 attention output shaped like ``q``.
-    """
-    if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
-        raise ValueError(
-            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
-        )
-    if swa_kv_cache.dim() != 2 or swa_kv_cache.dtype != torch.uint8:
-        raise ValueError("swa_kv_cache must be a 2D uint8 page-planar cache")
-    if swa_page_size <= 0 or swa_kv_cache.shape[1] % swa_page_size:
-        raise ValueError("swa_kv_cache width must be divisible by swa_page_size")
-    tokens = int(q.shape[0])
-    if swa_slots.dim() < 2 or int(swa_slots.shape[0]) != tokens:
-        raise ValueError("swa_slots must have one row per query token")
-    if swa_lens.numel() != tokens:
-        raise ValueError("swa_lens must have one entry per query token")
-    if swa_slots.dtype not in (torch.int32, torch.int64):
-        raise TypeError("swa_slots must have dtype int32 or int64")
-    if swa_lens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("swa_lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
-        raise ValueError("attn_sink must provide one value per query head")
-    if any(
-        tensor.device != q.device
-        for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
-    ):
-        raise ValueError("all paged selected-attention tensors must share a device")
-
-    extra_values = (extra_kv_cache, extra_slots, extra_lens, extra_page_size)
-    has_extra_segment = any(value is not None for value in extra_values)
-    if has_extra_segment and not all(value is not None for value in extra_values):
-        raise ValueError(
-            "extra_kv_cache, extra_slots, extra_lens, and extra_page_size "
-            "must be provided together"
-        )
-    if extra_kv_cache is not None:
-        assert extra_slots is not None
-        assert extra_lens is not None
-        assert extra_page_size is not None
-        if extra_kv_cache.dim() != 2 or extra_kv_cache.dtype != torch.uint8:
-            raise ValueError("extra_kv_cache must be a 2D uint8 page-planar cache")
-        if extra_page_size <= 0 or extra_kv_cache.shape[1] % extra_page_size:
-            raise ValueError(
-                "extra_kv_cache width must be divisible by extra_page_size"
-            )
-        if extra_slots.dim() < 2 or int(extra_slots.shape[0]) != tokens:
-            raise ValueError("extra_slots must have one row per query token")
-        if extra_lens.numel() != tokens:
-            raise ValueError("extra_lens must have one entry per query token")
-        if extra_slots.dtype not in (torch.int32, torch.int64):
-            raise TypeError("extra_slots must have dtype int32 or int64")
-        if extra_lens.dtype not in (torch.int32, torch.int64):
-            raise TypeError("extra_lens must have dtype int32 or int64")
-        if any(
-            tensor.device != q.device
-            for tensor in (extra_kv_cache, extra_slots, extra_lens)
-        ):
-            raise ValueError("all extra selected-attention tensors must share a device")
-    if out is not None and (
-        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
-    ):
-        raise ValueError("out must match q shape, dtype, and device")
-
-    swa_width = int(swa_slots.numel() // tokens)
-    extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
-    signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
-    traits = {
-        "tokens": tokens,
-        "head_dim": int(q.shape[-1]),
-        "num_heads": int(q.shape[1]),
-        "cache_layout": "fp8_swa_page_planar",
-        "topk_layout": "global_slots",
-        "support_sink": True,
-        "has_extra": has_extra_segment,
-        "has_extra_segment": has_extra_segment,
-        "swa_selected_width": swa_width,
-        "extra_selected_width": extra_width,
-        "swa_page_size": int(swa_page_size),
-        "extra_page_size": int(extra_page_size or 0),
-        "metadata_dtypes": frozenset(
-            {
-                swa_slots.dtype,
-                swa_lens.dtype,
-                *(
-                    (extra_slots.dtype, extra_lens.dtype)
-                    if extra_slots is not None and extra_lens is not None
-                    else ()
-                ),
-            }
-        ),
-    }
-    kernel = select_kernel(
-        "attention",
-        "dsv4_paged_selected_attention",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": tokens,
-        "num_heads": int(q.shape[1]),
-        "head_dim": int(q.shape[2]),
-        "swa_selected_width": swa_width,
-        "extra_selected_width": extra_width,
-        "swa_page_size": int(swa_page_size),
-        "extra_page_size": int(extra_page_size or 0),
-        "has_extra_segment": has_extra_segment,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_paged_selected_attention",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_paged_selected_attention",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            q=q,
-            swa_kv_cache=swa_kv_cache,
-            swa_slots=swa_slots,
-            swa_lens=swa_lens,
-            swa_page_size=swa_page_size,
-            attn_sink=attn_sink,
-            softmax_scale=softmax_scale,
-            extra_kv_cache=extra_kv_cache,
-            extra_slots=extra_slots,
-            extra_lens=extra_lens,
-            extra_page_size=extra_page_size,
-            out=out,
-        )
-
-
-def dsv4_indexer_prefill_topk(
-    index_q: tuple[torch.Tensor, torch.Tensor],
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seq_lens: torch.Tensor,
-    cu_seqlen_k_start: torch.Tensor,
-    cu_seqlen_k_end: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    max_seqlen_k: int,
-    index_k_format: str = "mxfp4",
-    gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
-    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
-    out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-    """Compute DSV4 prefill sparse-indexer top-k over packed cache rows.
-
-    Args:
-        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
-            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
-        weights: Contiguous FP32 per-token index-head weights.
-        index_k_cache: Page-backed uint8 index-K cache.
-        block_table: Logical-to-physical page table for the gathered requests.
-        cu_seq_lens: Cumulative packed key-row lengths for those requests.
-        cu_seqlen_k_start: Inclusive packed-key start for every query row.
-        cu_seqlen_k_end: Exclusive packed-key end for every query row.
-        seq_lens: Candidate count for every query row.
-        page_size: Number of index-K rows in each cache page.
-        topk: Number of local candidate offsets to select.
-        max_seqlen_k: Maximum candidate count represented by the logits.
-        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
-        gathered_k: Optional previously gathered ``(values, scales)`` pair to
-            reuse instead of gathering index_k_cache again.
-        gather_workspace: Optional caller-owned MXFP4 value/scale buffers. The
-            returned gathered_k aliases these buffers.
-        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
-            (or a larger first dimension).
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution to force through selection.
-
-    Returns:
-        A pair ``(indices, gathered_k)``. Indices are local offsets within each
-        query row's packed candidate range, with invalid entries set to -1.
-    """
-    q_values, _ = index_q
-    signature, traits = _dsv4_indexer_selection(
-        q_values,
-        index_k_format=index_k_format,
-        page_size=page_size,
-        topk=topk,
-    )
-    if weights.dtype != torch.float32:
-        raise TypeError(f"weights must be float32, got {weights.dtype}")
-    signature = _attention_format_signature(
-        q=q_values, weights=weights, index_k_cache=index_k_cache
-    )
-    kernel = select_kernel(
-        "attention",
-        "dsv4_indexer_prefill_topk",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": int(q_values.shape[0]),
-        "index_heads": int(q_values.shape[-2]),
-        "head_dim": int(traits["head_dim"]),
-        "page_size": int(page_size),
-        "topk": int(topk),
-        "max_seqlen_k": int(max_seqlen_k),
-        "index_k_format": index_k_format,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_indexer_prefill_topk",
-        kernel.name,
-        q_values.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_indexer_prefill_topk",
-        q_values.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            index_q=index_q,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            block_table=block_table,
-            cu_seq_lens=cu_seq_lens,
-            cu_seqlen_k_start=cu_seqlen_k_start,
-            cu_seqlen_k_end=cu_seqlen_k_end,
-            seq_lens=seq_lens,
-            page_size=page_size,
-            topk=topk,
-            max_seqlen_k=max_seqlen_k,
-            index_k_format=index_k_format,
-            gathered_k=gathered_k,
-            gather_workspace=gather_workspace,
-            out=out,
-        )
-
-
-def dsv4_indexer_decode_topk(
-    index_q: tuple[torch.Tensor, torch.Tensor],
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    max_context_len: int,
-    plan: object,
-    index_k_format: str = "mxfp4",
-    out: torch.Tensor | None = None,
-    persistent_topk_workspace: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> torch.Tensor:
-    """Compute DSV4 decode sparse-indexer top-k over a paged index-K cache.
-
-    Args:
-        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
-            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
-        weights: Contiguous FP32 per-token index-head weights.
-        index_k_cache: Page-backed uint8 index-K cache.
-        context_lens: Int32 context lengths shaped ``[tokens, 1]``.
-        block_table: Int32 page table with one row per query token.
-        page_size: Number of index-K rows in each cache page.
-        topk: Number of local candidate offsets to select.
-        max_context_len: Maximum context represented by block_table.
-        plan: Opaque schedule returned by :func:`dsv4_plan`.
-        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
-        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
-            (or a larger first dimension).
-        persistent_topk_workspace: Optional caller-owned uint8 workspace of at
-            least 1 MiB for the persistent local top-k implementation.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution to force through selection.
-
-    Returns:
-        Int32 local offsets into each token's logical index-K context. Invalid
-        entries are -1; the return aliases out when out is provided.
-    """
-    q_values, _ = index_q
-    signature, traits = _dsv4_indexer_selection(
-        q_values,
-        index_k_format=index_k_format,
-        page_size=page_size,
-        topk=topk,
-    )
-    if weights.dtype != torch.float32:
-        raise TypeError(f"weights must be float32, got {weights.dtype}")
-    signature = _attention_format_signature(
-        q=q_values, weights=weights, index_k_cache=index_k_cache
-    )
-    kernel = select_kernel(
-        "attention",
-        "dsv4_indexer_decode_topk",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": int(q_values.shape[0]),
-        "index_heads": int(q_values.shape[-2]),
-        "head_dim": int(traits["head_dim"]),
-        "page_size": int(page_size),
-        "topk": int(topk),
-        "max_context_len": int(max_context_len),
-        "index_k_format": index_k_format,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "dsv4_indexer_decode_topk",
-        kernel.name,
-        q_values.dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "attention",
-        "dsv4_indexer_decode_topk",
-        q_values.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            index_q=index_q,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            context_lens=context_lens,
-            block_table=block_table,
-            page_size=page_size,
-            topk=topk,
-            max_context_len=max_context_len,
-            plan=plan,
-            index_k_format=index_k_format,
-            out=out,
-            persistent_topk_workspace=persistent_topk_workspace,
-        )
-
-
-def dsa_decode(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor | None,
-    sparse_kv_cache: torch.Tensor | None,
-    topk_slots: torch.Tensor,
-    topk_lens: torch.Tensor | None,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    page_size: int,
-    q_len_per_req: int = 1,
-    logit_cap: float = 0.0,
-    k_scale: float = 1.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """Sparse DSA decode over selected global KV slots.
-
-    Args:
-        q: Absorbed MLA query with shape [tokens, heads, R + D_rope] or
-            [batch, q_len, heads, R + D_rope].
-        kv_cache: Regular compressed MLA KV cache, flat [slots, dim] or paged.
-        sparse_kv_cache: Packed sparse DSA KV cache, flat [slots, row_bytes] or
-            paged.
-        topk_slots: Global KV slot ids with shape [tokens, topk]. Invalid
-            entries are -1.
-        topk_lens: Valid selected-slot count per token, or None when the
-            implementation relies on -1 padding.
-        max_seqlen_k: Maximum dense visible context length for this batch.
-        qk_nope_head_dim: Original non-RoPE q/k dimension.
-        kv_lora_rank: MLA latent rank and output head dimension.
-        qk_rope_head_dim: RoPE q/k dimension.
-        softmax_scale: Scale applied to attention logits.
-        page_size: KV cache page size.
-        q_len_per_req: Query rows per request.
-        logit_cap: Optional logit cap.
-        k_scale: KV scale multiplier for FP8 backends.
-        return_lse: Whether to return LSE in addition to output.
-        out: Optional output buffer.
-        override: Optional exact kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Returns:
-        Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
-    """
-    if q.dim() == 4:
-        batch_size, q_len, num_heads, head_dim = q.shape
-        tokens = batch_size * q_len
-    else:
-        tokens, num_heads, head_dim = q.shape
-        q_len = int(q_len_per_req)
-        batch_size = tokens // q_len
-
-    traits = {
-        "page_size": int(page_size),
-        "q_len_per_req": int(q_len_per_req),
-        "qk_nope_head_dim": int(qk_nope_head_dim),
-        "kv_lora_rank": int(kv_lora_rank),
-        "qk_rope_head_dim": int(qk_rope_head_dim),
-        "topk": int(topk_slots.shape[-1]),
-        "kv_cache_available": kv_cache is not None,
-        "sparse_kv_cache_available": sparse_kv_cache is not None,
-        "topk_layout": "global_slots",
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_decode",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "batch_size": batch_size,
-        "q_len": q_len,
-        "tokens": tokens,
-        "num_heads": num_heads,
-        "head_dim": head_dim,
-        "topk": topk_slots.shape[-1],
-        "page_size": int(page_size),
-        "max_seqlen_k": int(max_seqlen_k),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_decode", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
-    ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            sparse_kv_cache=sparse_kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            logit_cap=logit_cap,
-            k_scale=k_scale,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-def dsa_prefill(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor | None,
-    sparse_kv_cache: torch.Tensor | None,
-    topk_slots: torch.Tensor,
-    topk_lens: torch.Tensor,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    page_size: int,
-    logit_cap: float = 0.0,
-    k_scale: float = 1.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> AttentionResult:
-    """Sparse DSA prefill over selected global KV slots."""
-    if q.dim() == 4:
-        batch_size, q_len, num_heads, head_dim = q.shape
-        tokens = batch_size * q_len
-    else:
-        tokens, num_heads, head_dim = q.shape
-        q_len = 1
-        batch_size = tokens
-
-    traits = {
-        "page_size": int(page_size),
-        "q_len_per_req": 1,
-        "qk_nope_head_dim": int(qk_nope_head_dim),
-        "kv_lora_rank": int(kv_lora_rank),
-        "qk_rope_head_dim": int(qk_rope_head_dim),
-        "topk": int(topk_slots.shape[-1]),
-        "kv_cache_available": kv_cache is not None,
-        "sparse_kv_cache_available": sparse_kv_cache is not None,
-        "topk_layout": "global_slots",
-        "support_logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
-    signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "batch_size": batch_size,
-        "q_len": q_len,
-        "tokens": tokens,
-        "num_heads": num_heads,
-        "head_dim": head_dim,
-        "topk": topk_slots.shape[-1],
-        "page_size": int(page_size),
-        "max_seqlen_k": int(max_seqlen_k),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_prefill", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention", "dsa_prefill", q.dtype, kernel_name=kernel.name, **shape_params
-    ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            sparse_kv_cache=sparse_kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
-            q_len_per_req=1,
-            logit_cap=logit_cap,
-            k_scale=k_scale,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-def dsa_prefill_topk(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    kv_workspace_slots: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    topk: int,
-    softmax_scale: float,
-    index_k_cache: torch.Tensor | None = None,
-    page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
-    q_scales: torch.Tensor | None = None,
-    max_logits_bytes: int | None = None,
-    out: torch.Tensor | None = None,
-    lens_out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute DSA prefill top-k over packed workspace rows.
-
-    Args:
-        q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
-        weights: Per-token/head weights with shape [tokens, index_heads],
-            FP32 or raw BF16 (implementations upcast on the fly).
-        kv_workspace_slots: Global KV slot for each workspace row, shape
-            [workspace_rows].
-        row_starts: Inclusive workspace-row start per query token, shape [tokens].
-        row_ends: Exclusive workspace-row end per query token, shape [tokens].
-        topk: Number of workspace candidates to select.
-        softmax_scale: Score scale. Each candidate score is exactly
-            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
-            BF16 queries are already in their compute representation.
-        index_k_cache: Packed or page-planar FP8 index-K cache with scales
-            (uint8). Page-planar caches may have a padded outer page stride.
-            Used with kv_workspace_slots to resolve workspace rows inside the
-            selected implementation.
-        page_size: KV cache page size for index_k_cache.
-        index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
-            provided together with index_k_scale.
-        index_k_scale: FP8 index-K scales already in workspace-row order. Must
-            be provided together with index_k_fp8.
-        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
-            defining ``dequant(q[token, head]) = q[token, head].float() *
-            q_scales[token, head]``.
-        max_logits_bytes: Optional temporary logits memory cap.
-        out: Optional contiguous int32 output buffer on q's device with shape
-            [tokens, topk].
-        lens_out: Optional contiguous int32 output buffer on q's device with
-            shape [tokens].
-        override: Optional exact kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Implementations may accept a strided outer weight dimension, including the
-    fused model projection view. q, kv_workspace_slots, row_starts, and row_ends
-    must be contiguous on q's device. index_k_cache may be a contiguous packed
-    slot matrix or a page-planar matrix with contiguous bytes within each page.
-    kv_workspace_slots must be int64; row_starts and row_ends must be int32.
-
-    Returns:
-        Tuple of workspace row ids and valid counts. Returned indices are
-        absolute row ids into kv_workspace_slots; invalid entries are -1.
-    """
-    if out is not None and out.shape != (q.shape[0], int(topk)):
-        raise ValueError(
-            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
-        )
-    if lens_out is not None and lens_out.shape != (q.shape[0],):
-        raise ValueError(
-            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
-        )
-    traits = {
-        "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
-        "topk": int(topk),
-        "page_size": None if page_size is None else int(page_size),
-    }
-    has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
-    if (index_k_fp8 is None) != (index_k_scale is None):
-        raise ValueError(
-            "index_k_fp8 and index_k_scale must be provided together for "
-            "workspace-row input"
-        )
-    has_fp8 = index_k_cache is not None or has_workspace_rows
-    if has_fp8:
-        traits["index_k_format"] = "fp8_scaled"
-    if index_k_cache is not None:
-        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
-        traits["index_k_layout"] = (
-            "packed"
-            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
-            else "page_planar"
-        )
-    signature = _attention_format_signature(q=q, weights=weights)
-    kernel = select_kernel(
-        "attention",
-        "dsa_prefill_topk",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": q.shape[0],
-        "workspace_rows": kv_workspace_slots.numel(),
-        "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
-        "topk": int(topk),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_prefill_topk", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
-        "dsa_prefill_topk",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        kernel_kwargs = {
-            "q": q,
-            "weights": weights,
-            "kv_workspace_slots": kv_workspace_slots,
-            "row_starts": row_starts,
-            "row_ends": row_ends,
-            "topk": topk,
-            "softmax_scale": softmax_scale,
-            "index_k_cache": index_k_cache,
-            "page_size": page_size,
-            "index_k_fp8": index_k_fp8,
-            "index_k_scale": index_k_scale,
-            "max_logits_bytes": max_logits_bytes,
-            "out": out,
-            "lens_out": lens_out,
-        }
-        if q_scales is not None:
-            kernel_kwargs["q_scales"] = q_scales
-        return kernel(**kernel_kwargs)
-
-
-def dsa_decode_topk(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    softmax_scale: float,
-    q_len_per_req: int = 1,
-    topk_layout: str = "global_slots",
-    block_table_base_offsets: torch.Tensor | None = None,
-    index_k_cache: torch.Tensor | None = None,
-    q_scales: torch.Tensor | None = None,
-    seq_lens_2d: torch.Tensor | None = None,
-    plan: object | None = None,
-    out: torch.Tensor | None = None,
-    lens_out: torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute DSA decode top-k over a paged KV cache.
-
-    Args:
-        q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
-        weights: Per-token/head weights with shape [tokens, index_heads],
-            FP32 or raw BF16 (implementations upcast on the fly).
-        seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
-            q_len_per_req). Each query token's causal bound
-            seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.
-        block_table: Paged KV block table with one row per request,
-            shape [num_reqs, max_pages].
-        page_size: Number of tokens per KV page.
-        topk: Number of KV candidates to select.
-        softmax_scale: Score scale. Each candidate score is exactly
-            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
-            BF16 queries are already in their compute representation.
-        q_len_per_req: Query rows per request (spec-verify next_n). Plain
-            decode uses 1, where per-request is equivalent to per-token.
-        topk_layout: Return physical cache slots when ``global_slots`` or
-            absolute logical row offsets when ``logical_offsets``.
-        block_table_base_offsets: Optional compact-table base page per request.
-            Used only with ``topk_layout="logical_offsets"``.
-        index_k_cache: Packed or page-planar FP8 index-K cache with scales
-            (uint8). Page-planar caches may have a padded outer page stride.
-        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
-            defining ``dequant(q[token, head]) = q[token, head].float() *
-            q_scales[token, head]``.
-        plan: Optional opaque backend-specific plan.
-        out: Optional contiguous int32 output buffer on q's device with shape
-            [tokens, topk].
-        lens_out: Optional contiguous int32 output buffer on q's device with
-            shape [tokens].
-        override: Optional exact kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Implementations may accept a strided outer weight dimension, including the
-    fused model projection view. q, seq_lens, and block_table must be contiguous
-    on q's device. index_k_cache may be a contiguous packed slot matrix or a
-    page-planar matrix with contiguous bytes within each page. seq_lens and
-    block_table must be int32.
-
-    Returns:
-        Tuple of selected indices and valid counts. Indices are global KV slots
-        or absolute logical offsets according to ``topk_layout``; invalid
-        entries are -1.
-    """
-    if out is not None and out.shape != (q.shape[0], int(topk)):
-        raise ValueError(
-            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
-        )
-    if topk_layout not in ("global_slots", "logical_offsets"):
-        raise ValueError(
-            "topk_layout must be 'global_slots' or 'logical_offsets', got "
-            f"{topk_layout!r}"
-        )
-    if q_len_per_req < 1 or q.shape[0] % int(q_len_per_req) != 0:
-        raise ValueError(
-            f"q_len_per_req={q_len_per_req} must divide tokens={q.shape[0]}"
-        )
-    if block_table_base_offsets is not None and topk_layout != "logical_offsets":
-        raise ValueError(
-            "block_table_base_offsets requires topk_layout='logical_offsets'"
-        )
-    kernel_seq_lens = seq_lens
-    if block_table_base_offsets is not None:
-        num_reqs = q.shape[0] // int(q_len_per_req)
-        if (
-            block_table_base_offsets.ndim != 1
-            or block_table_base_offsets.numel() < num_reqs
-            or block_table_base_offsets.device != seq_lens.device
-        ):
-            raise ValueError(
-                "block_table_base_offsets must have one entry per request on "
-                "the same device as seq_lens"
-            )
-        kernel_seq_lens = (
-            (
-                seq_lens.to(torch.int64)
-                - block_table_base_offsets[:num_reqs].to(torch.int64) * int(page_size)
-            )
-            .clamp(0, int(block_table.shape[1]) * int(page_size))
-            .to(torch.int32)
-        )
-    if lens_out is not None and lens_out.shape != (q.shape[0],):
-        raise ValueError(
-            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
-        )
-    traits = {
-        "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
-        "topk": int(topk),
-        "page_size": int(page_size),
-        "q_len_per_req": int(q_len_per_req),
-    }
-    if index_k_cache is not None:
-        traits["index_k_format"] = "fp8_scaled"
-        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
-        traits["index_k_layout"] = (
-            "packed"
-            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
-            else "page_planar"
-        )
-    signature = _attention_format_signature(q=q, weights=weights)
-    kernel = select_kernel(
-        "attention",
-        "dsa_decode_topk",
-        signature,
-        traits=traits,
-        features=(
-            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
-        ),
-        solution=solution,
-        override=override,
-    )
-    shape_params = {
-        "tokens": q.shape[0],
-        "max_pages": block_table.shape[1],
-        "index_heads": q.shape[1],
-        "head_dim": q.shape[-1],
-        "page_size": int(page_size),
-        "topk": int(topk),
-        "q_len_per_req": int(q_len_per_req),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_decode_topk", kernel.name, q.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
-        "dsa_decode_topk",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        kernel_kwargs = {
-            "q": q,
-            "weights": weights,
-            "seq_lens": kernel_seq_lens,
-            "block_table": block_table,
-            "page_size": page_size,
-            "topk": topk,
-            "softmax_scale": softmax_scale,
-            "q_len_per_req": q_len_per_req,
-            "index_k_cache": index_k_cache,
-            "seq_lens_2d": seq_lens_2d,
-            "plan": plan,
-            "out": out,
-            "lens_out": lens_out,
-        }
-        if topk_layout == "logical_offsets":
-            kernel_kwargs["topk_layout"] = topk_layout
-            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
-        if q_scales is not None:
-            kernel_kwargs["q_scales"] = q_scales
-        return kernel(**kernel_kwargs)
-
-
-def _attention_plan(
-    operation: str,
-    *,
-    page_size: int,
-    seq_lens_2d: torch.Tensor,
-    out: object | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> object | None:
-    if seq_lens_2d.dtype != torch.int32:
-        seq_lens_2d = seq_lens_2d.to(torch.int32)
-    traits = {
-        "page_size": int(page_size),
-    }
-    signature = format_signature()
-    try:
-        kernel = select_kernel(
-            "attention",
-            operation,
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        return None
-
-    shape_params = {
-        "batch_size": int(seq_lens_2d.shape[0]),
-        "tokens": int(seq_lens_2d.numel()),
-        "page_size": int(page_size),
-    }
-    ShapeCapture.get().record(
-        "attention", operation, kernel.name, seq_lens_2d.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
-        operation,
-        seq_lens_2d.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            seq_lens_2d=seq_lens_2d,
-            page_size=page_size,
-            out=out,
-        )
-
-
-def dsa_plan(
-    *,
-    page_size: int,
-    seq_lens_2d: torch.Tensor,
-    out: object | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> object | None:
-    """Build or refresh an opaque plan for DSA decode top-k.
-
-    Args:
-        page_size: KV cache page size.
-        seq_lens_2d: Prebuilt [num_reqs, next_n] context_lens (last column =
-            full per-request KV length), built once per forward by the caller.
-        out: Optional previously allocated plan object to refresh in place.
-        override: Optional exact kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Returns:
-        Opaque backend-owned plan object, or None when no selected backend needs
-        an explicit plan.
-    """
-    return _attention_plan(
-        "dsa_plan",
-        page_size=page_size,
-        seq_lens_2d=seq_lens_2d,
-        out=out,
-        override=override,
-        solution=solution,
-    )
-
-
-def dsv4_plan(
-    *,
-    page_size: int,
-    seq_lens_2d: torch.Tensor,
-    out: object | None = None,
-    override: str | None = None,
-    solution: str | None = None,
-) -> object | None:
-    """Build or refresh an opaque DeepSeek V4 decode-indexer plan.
-
-    Args:
-        page_size: Indexer KV-cache page size.
-        seq_lens_2d: Per-token context lengths shaped ``[tokens, 1]``.
-        out: Optional previously allocated plan object to refresh in place.
-        override: Optional exact kernel override name.
-        solution: Optional kernel solution to force through normal selection.
-
-    Returns:
-        Opaque backend-owned plan object, or None when the selected backend does
-        not require an explicit plan.
-    """
-    return _attention_plan(
-        "dsv4_plan",
-        page_size=page_size,
-        seq_lens_2d=seq_lens_2d,
-        out=out,
-        override=override,
-        solution=solution,
-    )
-
-
-def dsv4_warmup(
-    *,
-    hidden_size: int,
-    num_attention_heads: int,
-    head_dim: int,
-    hc_mult: int,
-    kv_lora_rank: int,
-    index_n_heads: int,
-    index_head_dim: int,
-    indexer_cache_block_size: int,
-    max_decode_tokens: int,
-    mxfp4_block_size: int,
-    tp_size: int,
-    max_tokens: int,
-    device: torch.device,
-    solution: str | None = None,
-) -> None:
-    """Warm selected DeepSeek V4 kernels for serving shapes.
-
-    Runtime provides only model geometry and serving bounds. Vendor and
-    architecture selection, optional-library behavior, and synchronization are
-    owned by the selected kernel implementation.
-    """
-    try:
-        kernel = select_kernel(
-            "attention",
-            "dsv4_warmup",
-            format_signature(),
-            traits={},
-            solution=solution,
-        )
-    except NoKernelFoundError:
-        return
-    kernel(
-        hidden_size=hidden_size,
-        num_attention_heads=num_attention_heads,
-        head_dim=head_dim,
-        hc_mult=hc_mult,
-        kv_lora_rank=kv_lora_rank,
-        index_n_heads=index_n_heads,
-        index_head_dim=index_head_dim,
-        indexer_cache_block_size=indexer_cache_block_size,
-        max_decode_tokens=max_decode_tokens,
-        mxfp4_block_size=mxfp4_block_size,
-        tp_size=tp_size,
-        max_tokens=max_tokens,
-        device=device,
-    )
-
-
-# ===-----------------------------------------------------------------------===#
-# Attention Utility Kernels
+# Attention Utilities
 # ===-----------------------------------------------------------------------===#
 
 
@@ -4746,7 +5519,6 @@ def attn_merge_state(
     *,
     lse_scale_log2: float = LSE_LN,
     inplace: bool = False,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -4759,7 +5531,6 @@ def attn_merge_state(
         lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
         lse_scale_log2: Multiplier that converts input LSE to log2 domain.
         inplace: Whether to write the merged state back into ``out_a``/``lse_a``.
-        enable_pdl: Whether the selected backend should enable PDL when supported.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -4806,108 +5577,76 @@ def attn_merge_state(
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
             inplace=inplace,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
 
-def _prefill_plan(
-    operator: str,
-    dtype: torch.dtype,
-    traits: dict,
-    solution: str | None,
-) -> dict:
-    """Shared extend-mode planning over a prefill operator's registry entries.
+# Backend registration (side-effect imports)
+# isort: off
+import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.flash_attn  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.flash_mla  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.msa  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
-    FP8 currently prefers "prewrite" because the cache write and downcast
-    path is easier to fuse. Other dtypes use "postwrite" only when a
-    matching prefill kernel with at least performant priority exists;
-    otherwise they use "prewrite".
-    """
-    if dtype == torch.float8_e4m3fn:
-        return {"extend_mode": "prewrite"}
-
-    signature = format_signature(
-        q=dense_tensor_format(dtype),
-        k=dense_tensor_format(dtype),
-        v=dense_tensor_format(dtype),
-    )
-    candidates = KernelRegistry.get().get_for_operator(
-        "attention",
-        operator,
-        platform=current_platform(),
-        format_signature=signature,
-        solution=solution,
-    )
-    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
-    extend_mode = (
-        "postwrite"
-        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
-        else "prewrite"
-    )
-    return {"extend_mode": extend_mode}
+# isort: on
 
 
-def mha_plan(
-    dtype: torch.dtype,
-    head_dim: int,
-    window_left: int = -1,
-    logit_cap: float = 0.0,
-    sinks: torch.Tensor | None = None,
-    return_lse: bool = False,
-    solution: str | None = None,
-) -> dict:
-    """Build a dense MHA execution plan from registered kernel capabilities.
-
-    Args:
-        dtype: Query/K/V dtype for prefill planning.
-        head_dim: Attention head dimension.
-        window_left: Exclusive left sliding-window size, or -1 for full-context
-            attention.
-        logit_cap: Logit soft-cap value, or 0.0 when disabled.
-        sinks: Attention sinks tensor when sinks are enabled.
-        return_lse: Whether the selected path must return LSE values.
-        solution: Optional kernel solution to restrict planning.
-
-    Returns:
-        A dict containing:
-        - "extend_mode":
-          "postwrite" means run prefill before writing KV cache;
-          "prewrite" means write KV cache first and run cached extend.
-    """
-    traits = {
-        "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
-        "return_lse": return_lse,
-    }
-    return _prefill_plan("mha_prefill", dtype, traits, solution)
-
-
-def rel_mha_plan(
-    dtype: torch.dtype,
-    head_dim: int,
-    window_left: int = -1,
-    return_lse: bool = False,
-    solution: str | None = None,
-) -> dict:
-    """Build a relative-attention MHA execution plan.
-
-    Args:
-        dtype: Query/K/V dtype for prefill planning.
-        head_dim: Attention head dimension.
-        window_left: Exclusive left sliding-window size, or -1 for full-context
-            attention.
-        return_lse: Whether the selected path must return LSE values.
-        solution: Optional kernel solution to restrict planning.
-
-    Returns:
-        Same "extend_mode" dict as mha_plan, planned over the rel_mha_prefill
-        operator.
-    """
-    traits = {
-        "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
-        "return_lse": return_lse,
-    }
-    return _prefill_plan("rel_mha_prefill", dtype, traits, solution)
+__all__ = [
+    "mha_plan",
+    "mha_prefill",
+    "mha_extend_with_kvcache",
+    "mha_decode_with_kvcache",
+    "rel_mha_plan",
+    "rel_mha_prefill",
+    "rel_mha_extend_with_kvcache",
+    "rel_mha_decode_with_kvcache",
+    "mla_project_value_prefers_contiguous_weight",
+    "mla_project_value",
+    "mla_normalize_project_query",
+    "mla_prefill",
+    "mla_use_absorbed_extend",
+    "mla_extend_with_kvcache",
+    "mla_decode_with_kvcache",
+    "dsa_decode",
+    "dsa_prefill",
+    "dsa_prefill_topk",
+    "dsa_decode_topk",
+    "dsa_plan",
+    "msa_decode_with_kvcache",
+    "msa_extend_with_kvcache",
+    "dsv4_indexer_cache_format",
+    "dsv4_padded_heads",
+    "dsv4_reset_attention_state",
+    "dsv4_swa_cache_insert",
+    "dsv4_csa_indexer_fp8_cache_insert",
+    "dsv4_prefill",
+    "dsv4_decode",
+    "dsv4_prefill_topk",
+    "dsv4_decode_topk",
+    "dsv4_plan",
+    "dsv4_warmup",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
+    "gdn_chunk_prefill",
+    "gdn_decode_step",
+    "gdn_decode_mtp",
+    "gdn_replay_commit",
+    "gdn_replay_commit_supported",
+    "KdaPrefillResult",
+    "KdaFusedDecodeResult",
+    "kda_recurrent_layout",
+    "kda_paged_prefill",
+    "kda_paged_decode",
+    "try_kda_fused_paged_decode",
+    "try_kda_fused_paged_verify",
+    "try_kda_replay_commit",
+    "resolve_kda_batched_replay_commit",
+    "kda_batched_replay_uses_raw_gate",
+    "kda_replay_commit_supported",
+    "attn_merge_state",
+]

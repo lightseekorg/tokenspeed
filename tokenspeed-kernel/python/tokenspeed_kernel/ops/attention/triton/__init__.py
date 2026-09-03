@@ -26,10 +26,13 @@ import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.dsv4  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.kda_dispatch  # noqa: F401
+import tokenspeed_kernel.ops.attention.triton.kpool_cache  # noqa: F401
+import tokenspeed_kernel.ops.attention.triton.kpool_select  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
+import tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.rel_mha  # noqa: F401

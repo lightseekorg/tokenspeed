@@ -180,6 +180,68 @@ def test_load_w2_quantizes_shard() -> None:
     assert cosine > 0.99
 
 
+@pytest.mark.parametrize(
+    ("tp_rank", "real_blocks"),
+    [(0, 2), (1, 2), (2, 1), (3, 0)],
+)
+def test_load_w13_quantizes_after_global_padding_tp_shard(
+    tp_rank: int,
+    real_blocks: int,
+) -> None:
+    """Online FP8 quantization uses the same globally padded TP layout."""
+
+    block_n, block_k = BLOCK
+    hidden = 2 * block_k
+    local_ispp = 2 * block_n
+    real_rows = real_blocks * block_n
+    loaded = (
+        torch.randn(5 * block_n, hidden, device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    expert_data = torch.zeros(
+        2 * local_ispp, hidden, device="cuda", dtype=torch.float8_e4m3fn
+    )
+    expert_scale = torch.ones(
+        2 * local_ispp // block_n,
+        hidden // block_k,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    load_w13(
+        expert_data,
+        loaded,
+        "w1",
+        0,
+        tp_rank=tp_rank,
+        is_bias=False,
+        use_presharded_weights=False,
+        do_transpose=False,
+        tp_size=4,
+        expert_scale=expert_scale,
+        block_shape=BLOCK,
+    )
+
+    written = expert_data[:local_ispp]
+    written_scale = expert_scale[: local_ispp // block_n]
+    if real_rows:
+        source_start = tp_rank * local_ispp
+        reconstructed = _dequantize(
+            written[:real_rows],
+            written_scale[:real_blocks],
+        )
+        cosine = torch.nn.functional.cosine_similarity(
+            reconstructed.flatten(),
+            loaded[source_start : source_start + real_rows].float().flatten(),
+            dim=0,
+        )
+        assert cosine > 0.99
+    assert torch.all(written[real_rows:].float() == 0)
+    torch.testing.assert_close(
+        written_scale[real_blocks:],
+        torch.ones_like(written_scale[real_blocks:]),
+    )
+
+
 def test_load_w13_bias_is_not_quantized() -> None:
     """Bias is stored unquantized, so it must take the plain-copy path."""
     expert_data = torch.zeros(4, 512, device="cuda", dtype=torch.bfloat16)

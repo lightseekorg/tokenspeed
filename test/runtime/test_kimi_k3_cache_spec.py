@@ -58,20 +58,20 @@ def test_lcm_reference_geometry_is_exact() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 8
 
 
-def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
-    """KDA state halves at TP16; two pages pack per MLA-sized plane."""
+def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
+    """KDA state halves at TP16; the plane and the parent halve with it."""
     plan = _plan(7, tp_size=16)
 
     assert {
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
     } == {
-        "full_attention": 12,
-        "linear_attention_0": 2,
-        "linear_attention_1": 2,
-        "linear_attention_2": 2,
+        "full_attention": 6,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
     }
-    # MLA planes still dominate, so the LCM block geometry matches TP8.
-    assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
+    # Half the TP8 state needs half the plane width, so the parent halves.
+    assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES // 2
     assert len(plan.planes) == 24
     conv = next(
         field for field in plan.fields if field.field_id.endswith(".conv_state")
@@ -79,12 +79,66 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
+def test_attention_dp_layouts_grow_the_mla_packing() -> None:
+    """Attention-DP (tp < 8) grows the KDA state; the packing follows it.
+
+    The original constant-12 packing made every tp < 8 boot fail on the
+    exact-page-stride check: the state outgrew the plane and the planner
+    widened it, breaking the latent kernel's implicit 73,728-byte stride.
+    """
+    latent_page_bytes = 128 * 576
+    for tp_size, mla_packing in ((4, 23), (2, 45), (1, 89)):
+        plan = _plan(7, tp_size=tp_size)
+
+        assert {
+            group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+        } == {
+            "full_attention": mla_packing,
+            "linear_attention_0": 1,
+            "linear_attention_1": 1,
+            "linear_attention_2": 1,
+        }
+        assert plan.lcm_block_bytes == 24 * mla_packing * latent_page_bytes
+        assert len(plan.planes) == 24
+
+
+def test_latent_stride_stays_exact_for_every_tp() -> None:
+    """The MLA kernel indexes pages by an implicit payload-sized stride."""
+    latent_page_bytes = 128 * 576
+    for tp_size in (1, 2, 4, 8, 16):
+        plan = _plan(7, tp_size=tp_size)
+        latent = next(
+            field for field in plan.fields if field.field_id.endswith(".latent_kv")
+        )
+        assert latent.page_stride_bytes == latent_page_bytes, tp_size
+
+
+def test_bf16_mla_cache_reuses_the_same_packing_rule() -> None:
+    """The packing is a ratio of byte counts, so the cache dtype scales it."""
+    _, _, layout = kimi_tp8_layout(tp_size=1, kv_cache_dtype=torch.bfloat16)
+    plan = layout.bind(7)
+
+    latent_page_bytes = 128 * 576 * 2
+    assert {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    } == {
+        "full_attention": 45,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
+    }
+    latent = next(
+        field for field in plan.fields if field.field_id.endswith(".latent_kv")
+    )
+    assert latent.page_stride_bytes == latent_page_bytes
+
+
 def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
-        lambda dtype: False,
+        lambda dtype, **kwargs: False,
     )
     recipe, _, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -111,7 +165,11 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
-        lambda dtype: True,
+        lambda dtype, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: False,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,

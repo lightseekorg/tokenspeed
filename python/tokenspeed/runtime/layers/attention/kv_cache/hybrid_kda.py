@@ -103,6 +103,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                 for layer_id, label in enumerate(self._layer_types)
                 if label in STATE_LAYER_TYPES
             ),
+            state_field_suffixes=("conv_state", "recurrent_state"),
         )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:

@@ -27,17 +27,13 @@
 
 import enum
 
-import numpy as np
-import torch
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
 )
-from tokenspeed.runtime.utils.env import envs
 
 logger = logging.get_logger(__name__)
 
@@ -310,57 +306,3 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
             for i, type_value in enumerate(self.layers_block_type)
             if type_value == HybridLayerType.full_attention.value
         ]
-
-    @property
-    def mamba2_cache_params(self):
-        """Return per-layer cache shapes using the kernels' native layouts.
-
-        The temporal/SSM state shape is K-last ``[Hv, V, K]``, matching the
-        GDN decode, MTP, and chunk-prefill kernel boundary directly.
-        """
-        # Imported lazily to avoid config/env import cycles during module initialization.
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        self.mapping = global_server_args_dict["mapping"]
-        attn_tp_size = self.mapping.attn.tp_size
-
-        conv_dim = (
-            self.linear_key_head_dim * self.linear_num_key_heads * 2
-            + self.linear_value_head_dim * self.linear_num_value_heads
-        )
-        conv_state_shape = (
-            divide(conv_dim, attn_tp_size),
-            self.linear_conv_kernel_dim - 1,
-        )
-
-        temporal_state_shape = (
-            divide(self.linear_num_value_heads, attn_tp_size),
-            self.linear_value_head_dim,
-            self.linear_key_head_dim,
-        )
-        conv_dtype = torch.bfloat16
-        dtype_map = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }
-        ssm_dtype = dtype_map[envs.TOKENSPEED_MAMBA_SSM_DTYPE.get()]
-        mamba_layers = self.linear_layer_ids
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layers,
-        )
-
-    @property
-    def mamba_cache_per_req(self):
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.mamba2_cache_params
-        )
-        mamba_layers_len = len(mamba_layers)
-
-        return (
-            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
-            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
-        ) * mamba_layers_len

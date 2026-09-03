@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenspeed-mla"
-version = "0.2.5"
+version = "0.2.6"
 description = "Speed-of-light TokenSpeed MLA kernels for Blackwell SM100 and SM103."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
-    "apache-tvm-ffi==0.1.13",
+    "apache-tvm-ffi==0.1.13.post3",
     "nvidia-cutlass-dsl",
     "tokenspeed-triton>=3.8.10.post20260721",
     "torch",

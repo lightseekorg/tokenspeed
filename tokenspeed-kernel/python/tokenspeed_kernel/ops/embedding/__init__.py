@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -117,7 +118,6 @@ def apply_rope(
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
     # dispatch options
-    enable_pdl: bool = False,
     solution: str | None = None,
     override: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -143,7 +143,6 @@ def apply_rope(
             q is updated in place.
         k_rope_out: Optional output buffer for the rotated key. If omitted,
             k is updated in place.
-        enable_pdl: Passed through to kernels that support PDL.
         solution: Optional registered solution to select.
         override: Optional exact kernel-name or solution override.
 
@@ -234,7 +233,7 @@ def apply_rope(
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
     return (
@@ -260,7 +259,6 @@ def apply_rope_mla(
     k_rope_out: torch.Tensor | None = None,
     q_nope_out: torch.Tensor | None = None,
     k_nope_out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     # dispatch options
     solution: str | None = None,
     override: str | None = None,
@@ -296,7 +294,6 @@ def apply_rope_mla(
         k_nope_out: Optional FP8 output buffer for k_nope. If omitted together
             with k_rope_out, a combined key output is allocated and this slice is
             derived from it.
-        enable_pdl: Passed through to kernels that support PDL.
         solution: Optional registered solution to select.
         override: Optional exact kernel-name or solution override.
 
@@ -421,7 +418,7 @@ def apply_rope_mla(
             is_neox=is_neox,
             quant_scale_q=quant_scale_q,
             quant_scale_kv=quant_scale_kv,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
     query_fp8 = (
@@ -445,6 +442,8 @@ __all__ = [
 ]
 
 
+import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
@@ -458,7 +457,6 @@ def apply_rope_mla_set_kv(
     k_rope: torch.Tensor,
     fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
     q_rope_out: torch.Tensor,
-    enable_pdl: bool = False,
 ) -> None:
     """Assemble the MLA query and write the latent KV cache in one launch.
 
@@ -476,8 +474,6 @@ def apply_rope_mla_set_kv(
         fused_mla_set_kv_buffer_arg: destination pool, write locations, the
             latent NoPE half, the absorbed query half, and the RoPE tables.
         q_rope_out: ``[tokens, heads, nope_dim + rope_dim]`` query destination.
-        enable_pdl: allow programmatic dependent launch.
-
     Returns:
         ``None``. The kernel writes through ``q_rope_out`` and the pool buffer
         named by the arg; there is no value to hand back.
@@ -523,5 +519,5 @@ def apply_rope_mla_set_kv(
             is_neox=fused_mla_set_kv_buffer_arg.is_neox,
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=q_rope_out,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )

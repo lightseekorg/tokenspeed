@@ -7,6 +7,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "eval"
+PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
 STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-pr-test-stage.yml"
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
 FORK_PR_EXPRESSION = (
@@ -34,7 +35,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 8,
+        "count": 11,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -42,7 +43,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 4,
+        "count": 7,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -132,6 +133,85 @@ def test_evalscope_configs_use_expected_dataset_sources():
         len(paths) == expected_total
     ), f"expected {expected_total} EvalScope configs, found {len(paths)}"
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
+
+
+def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
+    path = EVAL_CONFIG_DIR / "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    command = shlex.split(task["eval"]["command"])
+
+    assert task["retries"] == 1
+    assert task["runner"]["env"]["b200-2gpu"]["GPT_OSS_EVAL_BATCH_SIZE"] == "64"
+    assert (
+        task["runner"]["env"]["amd-mi35x-2gpu-test"]["GPT_OSS_EVAL_BATCH_SIZE"] == "16"
+    )
+    assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
+
+
+def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
+    path = EVAL_CONFIG_DIR / "qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    eval_tokens = shlex.split(task["eval"]["command"])
+
+    assert task["type"] == "eval"
+    assert task["workflow_stage"] == "model-test"
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["gb200-2gpu"]
+    assert flag_value(server_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
+    assert flag_value(server_tokens, "--tensor-parallel-size") == "2"
+    assert flag_value(server_tokens, "--speculative-algorithm") == "MTP"
+    assert flag_value(server_tokens, "--speculative-num-steps") == "3"
+    assert flag_value(server_tokens, "--max-model-len") == "8192"
+    assert flag_value(server_tokens, "--max-num-seqs") == "16"
+    assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "16"
+    assert "--disable-kvstore" not in server_tokens
+    assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
+    assert flag_value(eval_tokens, "--datasets") == "gsm8k"
+    assert task["score_threshold"] == 0.90
+
+
+def test_kimi_k3_amd_gates_use_eagle3_tp8ep8():
+    filenames = (
+        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+    )
+    tasks = []
+    for config_dir, filename in zip(
+        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, strict=True
+    ):
+        task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
+        server_tokens = shlex.split(task["server"]["command"])
+
+        assert task["triggers"] == ["per-commit", "manual"]
+        assert flag_value(server_tokens, "--speculative-algorithm") == "EAGLE3"
+        assert (
+            flag_value(server_tokens, "--speculative-draft-model-path")
+            == "lightseekorg/kimi-k3-eagle3-mla"
+        )
+        assert flag_value(server_tokens, "--speculative-num-steps") == "3"
+        assert flag_value(server_tokens, "--speculative-num-draft-tokens") == "4"
+        assert flag_value(server_tokens, "--speculative-eagle-topk") == "1"
+        assert flag_value(server_tokens, "--eagle3-layers-to-capture") == "2,46,90"
+        assert flag_value(server_tokens, "--tp") == "8"
+        assert flag_value(server_tokens, "--ep-size") == "8"
+        tasks.append(task)
+
+    eval_tokens = shlex.split(tasks[0]["eval"]["command"])
+    generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
+    assert generation_config["seed"] == 42
+    assert tasks[0]["score_threshold"] == 0.90
+    assert tasks[1]["perf_reference"] == {1: [161, 18.8]}
+
+    control_filenames = (
+        "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+        "kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+    )
+    for config_dir, filename in zip(
+        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), control_filenames, strict=True
+    ):
+        task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
+        assert task["triggers"] == ["manual"]
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():

@@ -26,29 +26,28 @@ kernels consume. It launches entirely on the *caller's* CUDA stream and
 performs **no** device-to-host synchronization, so the whole prefill path is
 CUDA-graph capturable.
 
-The routing buffers are sized to the worst case and padding is marked with
-sentinels: ``sorted_expert_ids`` padding blocks are ``-1`` and
-``sorted_token_ids`` padding slots are ``(topk << 24) | M``. The stage kernels
-self-skip padding on-device (expert ``-1`` early-exits; token field ``>= M`` is
-masked), so the launcher sizes its grid from the deterministic worst-case shape
-with no host readback.
+The routing buffers are sized to the worst case. Valid expert blocks and every
+slot within their padded ranges are written by the scatter stage; padding token
+IDs use ``(topk << 24) | M``. The stage kernels use the device-side valid count
+and mask token fields ``>= M``, so launch grids remain deterministic with no
+host readback.
 
 Implemented in Triton Gluon (``@gluon.jit``) to match the AMD-kernel convention
-for this package and to leave room for manual layout/scheduling optimization
-later. The algorithm is a four-stage block-aligned sort: a per-program expert
-histogram, a column prefix sum, block-padded per-expert offsets, and a
-race-free scatter -- scalar/scan control code with no MFMA. The vectorized
-prefix sums use ``gl.associative_scan``; the histogram and scatter use scalar
-dynamic-index loops.
+for this package. The algorithm is a four-stage block-aligned sort: vectorized
+per-chunk expert histograms, a column prefix sum, block-padded per-expert
+offsets, and a vectorized scatter. Chunk prefix sums preserve source-token
+locality across chunks; atomics assign ranks only among routes in the same
+chunk.
 
 Output contract::
 
-    max_num_tokens_padded = M * TOPK + E * B - TOPK
+    max_num_tokens_padded = floor((R + min(E, R) * (B - 1)) / B) * B
+                            where R = M * TOPK
     max_num_m_blocks      = ceil(max_num_tokens_padded / B)
     sorted_ids            (max_num_tokens_padded,) int32
         low 24 bits = token_id, high bits = topk slot; padding = (TOPK << 24) | M
-    sorted_weights        (max_num_tokens_padded,) float32; padding = 0.0
-    sorted_expert_ids     (max_num_m_blocks,)       int32; padding block = -1
+    sorted_weights        (max_num_tokens_padded,) float32; padding is unused
+    sorted_expert_ids     (max_num_m_blocks,)       int32; valid blocks are written
     num_valid_ids         (2,) int32; [0] = total padded slots, [1] = M
     out                   (M, model_dim) uninitialized ``out_dtype`` buffer
                           (stage2 overwrites/zeros it; see wrapper note)
@@ -66,6 +65,24 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _SCAN_NUM_WARPS = 4
 
 
+def _max_padded_route_capacity(
+    num_routes: int,
+    num_experts: int,
+    block_size: int,
+) -> int:
+    """Bound block-padded routes by the maximum number of nonempty experts."""
+
+    if num_routes < 0 or num_experts < 0 or block_size <= 0:
+        raise ValueError(
+            "route/expert counts must be nonnegative and block_size positive"
+        )
+    max_nonempty_experts = min(num_routes, num_experts)
+    upper_bound = num_routes + max_nonempty_experts * (block_size - 1)
+    # The actual padded extent is block-aligned, so the largest multiple no
+    # greater than the per-expert padding bound is sufficient.
+    return upper_bound // block_size * block_size
+
+
 @gluon.jit
 def _add(a, b):
     return a + b
@@ -74,35 +91,63 @@ def _add(a, b):
 @gluon.jit
 def _moe_sorting_stage1_kernel(
     topk_ids_ptr,  # (numel,) int32, row-major (M, TOPK)
-    tokens_cnts_ptr,  # (E + 1, E) int32, zero-initialized
+    tokens_cnts_ptr,  # (num_programs + 1, E) int32
     num_experts: gl.constexpr,
     numel: gl.constexpr,
-    tokens_per_thread: gl.constexpr,
+    tokens_per_program: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    ROUTE_BLOCK: gl.constexpr,
+    EXPERT_PAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
-    """Per-program expert histogram.
+    """Vectorized per-program expert histogram.
 
     Program ``pid`` counts the experts appearing in flat token slice
-    ``[pid * tokens_per_thread, (pid + 1) * tokens_per_thread)`` and writes them
+    ``[pid * tokens_per_program, (pid + 1) * tokens_per_program)`` and writes them
     to row ``pid + 1`` of ``tokens_cnts`` (row 0 is reserved as the zero base
-    for the stage-2 column scan). Scalar uniform loads/stores -- no tile math.
+    for the stage-2 column scan).
     """
     pid = gl.program_id(0)
-    start_idx = pid * tokens_per_thread
+    route_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    route = gl.arange(0, ROUTE_BLOCK, layout=route_layout)
+    idx = pid * tokens_per_program + route
+    valid = (route < tokens_per_program) & (idx < numel)
+    expert_id = gl.load(
+        topk_ids_ptr + idx,
+        mask=valid,
+        other=EXPERT_START + num_experts,
+    )
+    expert_id -= EXPERT_START
+    valid &= (expert_id >= 0) & (expert_id < num_experts)
+    safe_expert = gl.where(valid, expert_id, num_experts)
+    histogram = gl.histogram(
+        safe_expert,
+        EXPERT_PAD,
+        mask=valid,
+        layout=expert_layout,
+    ).to(gl.int32)
+    expert = gl.arange(0, EXPERT_PAD, layout=expert_layout)
     off_c = (pid + 1) * num_experts
-
-    for i in range(tokens_per_thread):
-        if start_idx + i < numel:
-            expert_id = gl.load(topk_ids_ptr + start_idx + i)
-            if (expert_id >= 0) and (expert_id < num_experts):
-                cnt = gl.load(tokens_cnts_ptr + off_c + expert_id)
-                gl.store(tokens_cnts_ptr + off_c + expert_id, cnt + 1)
+    if pid == 0:
+        gl.store(
+            tokens_cnts_ptr + expert,
+            gl.zeros([EXPERT_PAD], gl.int32, layout=expert_layout),
+            mask=expert < num_experts,
+        )
+    gl.store(
+        tokens_cnts_ptr + off_c + expert,
+        histogram,
+        mask=expert < num_experts,
+    )
 
 
 @gluon.jit
 def _moe_sorting_stage2_kernel(
-    tokens_cnts_ptr,  # (E + 1, E) int32
+    tokens_cnts_ptr,  # (num_programs + 1, E) int32
     num_experts: gl.constexpr,
-    E_PAD: gl.constexpr,
+    num_programs: gl.constexpr,
+    PROGRAM_PAD: gl.constexpr,
 ):
     """Column-wise inclusive prefix sum over programs (vectorized).
 
@@ -113,8 +158,8 @@ def _moe_sorting_stage2_kernel(
     """
     pid = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    rows = gl.arange(0, E_PAD, layout=layout)  # maps to source rows 1..num_experts
-    mask = rows < num_experts
+    rows = gl.arange(0, PROGRAM_PAD, layout=layout)
+    mask = rows < num_programs
     offs = (rows + 1) * num_experts + pid
     cnt = gl.load(tokens_cnts_ptr + offs, mask=mask, other=0)
     inclusive = gl.associative_scan(cnt, 0, _add)
@@ -124,10 +169,11 @@ def _moe_sorting_stage2_kernel(
 @gluon.jit
 def _moe_sorting_stage3_kernel(
     num_valid_ids_ptr,  # (2,) int32
-    tokens_cnts_ptr,  # (E + 1, E) int32
+    tokens_cnts_ptr,  # (num_programs + 1, E) int32
     cumsum_ptr,  # (E + 1,) int32
     m_total,  # python int -> int32 scalar
     num_experts: gl.constexpr,
+    num_programs: gl.constexpr,
     block_size: gl.constexpr,
     E_PAD: gl.constexpr,
 ):
@@ -142,10 +188,11 @@ def _moe_sorting_stage3_kernel(
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
     e = gl.arange(0, E_PAD, layout=layout)
     mask = e < num_experts
-    off_last = num_experts * num_experts  # row E == total count per expert
+    off_last = num_programs * num_experts
     cnt = gl.load(tokens_cnts_ptr + off_last + e, mask=mask, other=0)
     padded = ((cnt + block_size - 1) // block_size) * block_size
     inclusive = gl.associative_scan(padded, 0, _add)
+    gl.store(cumsum_ptr, 0)
     gl.store(cumsum_ptr + 1 + e, inclusive, mask=mask)
     gl.store(num_valid_ids_ptr + 0, gl.sum(padded))
     gl.store(num_valid_ids_ptr + 1, m_total)
@@ -155,49 +202,72 @@ def _moe_sorting_stage3_kernel(
 def _moe_sorting_stage4_kernel(
     topk_ids_ptr,  # (numel,) int32
     topk_weights_ptr,  # (numel,) float32
-    sorted_ids_ptr,  # (max_num_tokens_padded,) int32, pre-filled with sentinel
-    sorted_weights_ptr,  # (max_num_tokens_padded,) float32, pre-filled with 0
-    expert_ids_ptr,  # (max_num_m_blocks,) int32, pre-filled with -1
-    tokens_cnts_ptr,  # (E + 1, E) int32
+    sorted_ids_ptr,  # (max_num_tokens_padded,) int32
+    sorted_weights_ptr,  # (max_num_tokens_padded,) float32
+    expert_ids_ptr,  # (max_num_m_blocks,) int32
+    tokens_cnts_ptr,  # (num_programs + 1, E) int32
     cumsum_ptr,  # (E + 1,) int32
     num_experts: gl.constexpr,
+    num_programs: gl.constexpr,
     block_size: gl.constexpr,
     numel: gl.constexpr,
-    tokens_per_thread: gl.constexpr,
+    tokens_per_program: gl.constexpr,
     TOPK: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    ROUTE_BLOCK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
     """Fill ``expert_ids`` block map and scatter routed rows + weights.
 
-    Program ``pid`` writes ``expert_ids`` for expert ``pid``'s block range and
-    scatters the routed rows in its own token slice. Because each program owns a
-    disjoint token slice *and* a disjoint sub-range of every expert's slots
-    (via the stage-2 offsets), the scatter is race-free with no atomics.
+    Expert programs write their block maps and padding, while route programs
+    scatter one input chunk. Stage 2 gives each chunk a disjoint sub-range of
+    every expert, so atomics assign ranks only within a chunk and retain stable
+    ordering between chunks.
     """
     pid = gl.program_id(0)
 
-    # Block map: mark every block owned by expert ``pid``.
-    start_slot = gl.load(cumsum_ptr + pid)
-    end_slot = gl.load(cumsum_ptr + pid + 1)
-    for slot in range(start_slot, end_slot, block_size):
-        gl.store(expert_ids_ptr + slot // block_size, pid)
+    if pid < num_experts:
+        # Initialize only padding so these writes never overlap real routes.
+        start_slot = gl.load(cumsum_ptr + pid)
+        end_slot = gl.load(cumsum_ptr + pid + 1)
+        padding_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        block_offsets = gl.arange(0, block_size, layout=padding_layout)
+        padding_id: gl.constexpr = (TOPK << 24) | (numel // TOPK)
+        for slot in range(start_slot, end_slot, block_size):
+            gl.store(expert_ids_ptr + slot // block_size, pid)
+        total_count = gl.load(tokens_cnts_ptr + num_programs * num_experts + pid)
+        padding_start = start_slot + total_count
+        padding_slots = padding_start + block_offsets
+        gl.store(
+            sorted_ids_ptr + padding_slots,
+            padding_id,
+            mask=padding_slots < end_slot,
+        )
 
-    # Scatter this program's token slice into per-expert padded slots.
-    start_idx = pid * tokens_per_thread
-    off_t = pid * num_experts
-    for i in range(tokens_per_thread):
-        idx = start_idx + i
-        if idx < numel:
-            expert_id = gl.load(topk_ids_ptr + idx)
-            if (expert_id >= 0) and (expert_id < num_experts):
-                cursor = gl.load(tokens_cnts_ptr + off_t + expert_id)
-                rank = cursor + gl.load(cumsum_ptr + expert_id)
-                token_id = idx // TOPK
-                topk_id = idx % TOPK
-                packed = (topk_id << 24) | token_id
-                gl.store(sorted_ids_ptr + rank, packed)
-                weight = gl.load(topk_weights_ptr + idx)
-                gl.store(sorted_weights_ptr + rank, weight)
-                gl.store(tokens_cnts_ptr + off_t + expert_id, cursor + 1)
+    if pid < num_programs:
+        route_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        route = gl.arange(0, ROUTE_BLOCK, layout=route_layout)
+        idx = pid * tokens_per_program + route
+        valid = (route < tokens_per_program) & (idx < numel)
+        expert_id = gl.load(topk_ids_ptr + idx, mask=valid, other=EXPERT_START)
+        expert_id -= EXPERT_START
+        valid &= (expert_id >= 0) & (expert_id < num_experts)
+        safe_expert = gl.where(valid, expert_id, 0)
+        one = gl.full([ROUTE_BLOCK], 1, gl.int32, layout=route_layout)
+        cursor = gl.atomic_add(
+            tokens_cnts_ptr + pid * num_experts + safe_expert,
+            one,
+            mask=valid,
+            sem="relaxed",
+            scope="gpu",
+        )
+        rank = cursor + gl.load(cumsum_ptr + safe_expert, mask=valid, other=0)
+        token_id = idx // TOPK
+        topk_id = idx % TOPK
+        packed = (topk_id << 24) | token_id
+        gl.store(sorted_ids_ptr + rank, packed, mask=valid)
+        weight = gl.load(topk_weights_ptr + idx, mask=valid, other=0.0)
+        gl.store(sorted_weights_ptr + rank, weight, mask=valid)
 
 
 def gluon_moe_sorting(
@@ -207,6 +277,9 @@ def gluon_moe_sorting(
     model_dim: int,
     out_dtype: torch.dtype,
     block_size: int,
+    *,
+    expert_start: int = 0,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Block-aligned expert sort producing sorted routing metadata.
 
@@ -215,13 +288,15 @@ def gluon_moe_sorting(
     contract).
 
     Args:
-        topk_ids: ``(M, TOPK)`` int32 expert assignments. ``-1`` entries are
-            treated as unrouted and skipped.
+        topk_ids: ``(M, TOPK)`` int32 expert assignments. IDs outside the
+            contiguous local expert range are treated as unrouted and skipped.
         topk_weights: ``(M, TOPK)`` float32 routing weights, same layout.
-        num_experts: total number of experts ``E``.
+        num_experts: number of local experts ``E`` represented by this sort.
         model_dim: hidden dim of the ``out`` buffer.
         out_dtype: dtype of the ``out`` buffer (bf16 in production).
         block_size: per-expert padding granularity ``B`` (the stage BLOCK_M).
+        expert_start: global ID of local expert zero.
+        out: optional preallocated ``(M, model_dim)`` output buffer.
 
     Returns:
         ``(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out)``
@@ -235,55 +310,91 @@ def gluon_moe_sorting(
     numel = M * topk
     E = int(num_experts)
     B = int(block_size)
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
 
-    # Worst-case allocation: every routed slot could land in its own
-    # partially-filled per-expert block.
-    max_num_tokens_padded = numel + E * B - topk
+    # Only experts receiving at least one route contribute a padding block.
+    # Bounding that count by min(E, routes) avoids scaling activation-sized
+    # consumers with every expert when a small prefill touches only a few.
+    max_num_tokens_padded = _max_padded_route_capacity(numel, E, B)
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, B)
 
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.to(torch.float32).contiguous()
 
-    # Padding sentinels let the stage kernels self-skip padding on-device
-    # (token field >= M is masked; expert -1 early-exits).
-    init_sorted_id = (int(topk) << 24) | int(M)
-    sorted_ids = torch.full(
-        (max_num_tokens_padded,), init_sorted_id, dtype=torch.int32, device=device
-    )
-    sorted_weights = torch.zeros(
+    # Stage 4 writes every routed/padding ID and every valid expert block.
+    # Padding weights are masked before stores by the consumers.
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(
         (max_num_tokens_padded,), dtype=torch.float32, device=device
     )
-    sorted_expert_ids = torch.full(
-        (max_num_m_blocks,), -1, dtype=torch.int32, device=device
+    sorted_expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=device
     )
     num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
     # ``out`` does not need zeroing: stage2's reduce epilogue overwrites every
     # token row, and its small-M atomic epilogue zeroes ``out`` itself. Zeroing
     # here would redundantly clear up to tens of MB at large M.
-    out = torch.empty((M, model_dim), dtype=out_dtype, device=device)
+    if out is None:
+        out = torch.empty((M, model_dim), dtype=out_dtype, device=device)
+    elif (
+        tuple(out.shape) != (M, model_dim)
+        or out.dtype != out_dtype
+        or out.device != device
+        or out.stride(1) != 1
+        or out.stride(0) < model_dim
+    ):
+        raise ValueError(
+            "MoE output must be a row-major, colocated (M, model_dim) tensor"
+        )
 
-    # Scratch: (E+1, E) histogram + (E+1,) padded prefix sums.
-    tokens_cnts = torch.zeros((E + 1, E), dtype=torch.int32, device=device)
-    cumsum = torch.zeros((E + 1,), dtype=torch.int32, device=device)
-    tokens_per_thread = triton.cdiv(numel, E)
-    e_pad = triton.next_power_of_2(E)
+    # Keep route chunks at a practical vector width. The chunk prefix scan
+    # preserves their source order even when there are fewer experts than
+    # required route programs.
+    max_routes_per_program = 1024
+    num_programs = max(E, triton.cdiv(numel, max_routes_per_program))
+    tokens_per_program = triton.cdiv(numel, num_programs)
+    route_block = triton.next_power_of_2(tokens_per_program)
+    expert_pad = triton.next_power_of_2(E + 1)
+    program_pad = triton.next_power_of_2(num_programs)
 
-    grid = (E,)
-    _moe_sorting_stage1_kernel[grid](
-        topk_ids, tokens_cnts, E, numel, tokens_per_thread, num_warps=1
+    # Scratch: per-chunk histograms + per-expert padded prefix sums.
+    tokens_cnts = torch.empty((num_programs + 1, E), dtype=torch.int32, device=device)
+    cumsum = torch.empty((E + 1,), dtype=torch.int32, device=device)
+
+    route_grid = (num_programs,)
+    _moe_sorting_stage1_kernel[route_grid](
+        topk_ids,
+        tokens_cnts,
+        E,
+        numel,
+        tokens_per_program,
+        EXPERT_START=int(expert_start),
+        ROUTE_BLOCK=route_block,
+        EXPERT_PAD=expert_pad,
+        NUM_WARPS=_SCAN_NUM_WARPS,
+        num_warps=_SCAN_NUM_WARPS,
     )
-    _moe_sorting_stage2_kernel[grid](tokens_cnts, E, e_pad, num_warps=_SCAN_NUM_WARPS)
+    expert_grid = (E,)
+    _moe_sorting_stage2_kernel[expert_grid](
+        tokens_cnts,
+        E,
+        num_programs,
+        program_pad,
+        num_warps=_SCAN_NUM_WARPS,
+    )
     _moe_sorting_stage3_kernel[(1,)](
         num_valid_ids,
         tokens_cnts,
         cumsum,
         int(M),
         E,
+        num_programs,
         B,
-        e_pad,
+        expert_pad,
         num_warps=_SCAN_NUM_WARPS,
     )
-    _moe_sorting_stage4_kernel[grid](
+    _moe_sorting_stage4_kernel[(max(E, num_programs),)](
         topk_ids,
         topk_weights,
         sorted_ids,
@@ -292,11 +403,15 @@ def gluon_moe_sorting(
         tokens_cnts,
         cumsum,
         E,
+        num_programs,
         B,
         numel,
-        tokens_per_thread,
+        tokens_per_program,
         int(topk),
-        num_warps=1,
+        EXPERT_START=int(expert_start),
+        ROUTE_BLOCK=route_block,
+        NUM_WARPS=_SCAN_NUM_WARPS,
+        num_warps=_SCAN_NUM_WARPS,
     )
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out

@@ -32,6 +32,11 @@ struct ExtendResult {
     // Tokens whose KV has already become stable request history.
     // token placeholder should be removed in python
     std::vector<std::int32_t> tokens;
+    // P role, final prefill chunk only: the drafter's candidate rows for the
+    // decode side to seed speculation from (candidate[0] == the sampled
+    // bootstrap token == tokens.back()). Empty otherwise. Carried here so
+    // the remote-decode operation is self-contained, like every decode op.
+    std::vector<std::int32_t> spec_candidate_ids;
 };
 
 struct Finish {

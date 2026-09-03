@@ -250,13 +250,29 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
+        # Most DSA sparse indexers read the attention backend's
         # ``chunked_prefill_metadata`` from inside the captured prefill segment,
         # but the prefill graph rebinds only the live ForwardContext at replay --
         # the backend metadata object stays frozen at capture-time (dummy) values.
-        # So the two are fundamentally incompatible; force eager prefill for DSA.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
-            model_config.attention_arch == AttentionArch.DSA
+        # GLM-5.3-Flash handles padded replay explicitly.
+        # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
+        # replay pads token rows to a bucket while their cache metadata remains
+        # real-token shaped. Keep those prefills eager so padding can never
+        # advance n-gram, short-conv, or compressed-key state.
+        text_config = model_config.hf_text_config
+        qwen4_exp_has_side_state = getattr(text_config, "model_type", None) == (
+            "qwen4_exp_text"
+        ) and bool(
+            getattr(text_config, "ple_layer_ids", None)
+            or getattr(text_config, "indexer_n_heads", None) is not None
+        )
+        disable_prefill_graph = (
+            bool(server_args.disable_prefill_graph)
+            or (
+                model_config.attention_arch == AttentionArch.DSA
+                and getattr(model_config.hf_config, "model_type", None) != "glm53_flash"
+            )
+            or qwen4_exp_has_side_state
         )
 
         return ModelExecutorConfig(
@@ -560,11 +576,16 @@ class ModelExecutor:
             self.model_runner, "encoder_graph_wrappers", {}
         )
 
-        self.execution_stream = torch.cuda.Stream()
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
-        # (control plane) never blocks on the GPU, so its cross-rank gloo
-        # collectives always find every rank promptly regardless of GPU depth.
+        # (control plane) never waits on the GPU along the per-round path —
+        # dispatch submits and moves on, only commit joins — so a round stays
+        # microseconds and its cross-rank gloo collectives always find every
+        # rank promptly regardless of GPU depth. (A few low-rate paths do
+        # block on purpose: the DP idle forward, the PD receive and landing,
+        # the post-wake KV repair, RL weight updates. See DeviceHandle.)
         self.forward_thread = ForwardThread(self.device)
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
@@ -639,7 +660,7 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope
@@ -653,7 +674,7 @@ class ModelExecutor:
                     out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
                 )
         set_autotune_process_group(None)
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
@@ -1214,10 +1235,10 @@ class ModelExecutor:
                     sanitized = sanitize(draft_pool, draft_pages) or sanitized
         if not sanitized:
             return None
-        if torch.device(self.device).type != "cuda":
+        if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
-        done = torch.cuda.Event()
-        done.record(torch.cuda.current_stream(self.device))
+        done = self.device_module.Event()
+        done.record(self.device_module.current_stream(self.device))
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
@@ -1243,7 +1264,7 @@ class ModelExecutor:
         A PD decode destination never executes the prompt locally, so no
         forward of its own can establish these lengths — they come from the
         complete remotely-computed prompt instead, before the first local
-        decode. Paged cache additionally selects the transferred
+        decode. The cache-transfer path additionally selects the transferred
         recurrent-state snapshot block from the resulting sequence length.
         """
         num_extends = forward_op.num_extends()
@@ -1256,8 +1277,8 @@ class ModelExecutor:
 
     def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+        self.execution_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
                 pool_indices,
                 dtype=torch.int64,
@@ -1301,9 +1322,9 @@ class ModelExecutor:
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+            self.device_module.current_stream().wait_stream(self.execution_stream)
+            self.execution_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
@@ -1568,7 +1589,7 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
-                copy_event = torch.cuda.Event()
+                copy_event = self.device_module.Event()
                 copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
@@ -1617,7 +1638,7 @@ class ModelExecutor:
         # Remote spec candidates are CPU materialized; enqueue the H2D copy and
         # future_input_map update on execution_stream. The next forward's input
         # prep already waits on execution_stream before reading runtime state.
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
@@ -1646,10 +1667,10 @@ class ModelExecutor:
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
         """Clear backend restore state before publishing RDMA destinations."""
         slots = [int(slot) for slot in req_pool_indices]
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 
     def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
         """Arm backend first-decode hydration after remote transfer success."""
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.attn_backend.mark_remote_cache_ready(int(req_pool_idx))

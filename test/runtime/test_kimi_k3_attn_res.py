@@ -76,6 +76,106 @@ def _reference_apply_attn_res(prefix_sum, block_residual, proj, norm):
 
 
 class AttnResTests(unittest.TestCase):
+    def test_batched_iris_reduce_consumes_attnres_combine(self):
+        import tokenspeed_kernel.ops.communication.triton as triton_comm
+
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        group = object()
+        state = SimpleNamespace(
+            attn_ar_fusion_ok=False,
+            mapping=SimpleNamespace(
+                nprocs_per_node=8,
+                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
+            ),
+        )
+        comm = kimi_k3_comm.K3AttnComm(state)
+        partial = torch.randn(4, _HIDDEN, dtype=torch.bfloat16)
+        prefix = torch.randn_like(partial)
+        scratch = (object(), object(), object())
+        mlp_wp = torch.randn(_HIDDEN, dtype=torch.bfloat16)
+        out_weight = torch.randn(_HIDDEN, dtype=torch.bfloat16)
+        combine = (scratch, object(), object(), out_weight, _EPS)
+        expected_h = torch.randn_like(partial)
+        expected_residual = torch.randn_like(partial)
+
+        with (
+            mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
+            mock.patch.object(
+                triton_comm,
+                "allreduce_residual_attnres_combine_supported",
+                return_value=True,
+            ) as supported,
+            mock.patch.object(
+                triton_comm,
+                "allreduce_residual_attnres_combine",
+                return_value=(expected_h, expected_residual),
+            ) as fused,
+        ):
+            residual, hidden = comm.attn_reduce(
+                partial,
+                prefix,
+                combine,
+                mlp_wp=mlp_wp,
+            )
+
+        self.assertIs(residual, expected_residual)
+        self.assertIs(hidden, expected_h)
+        supported.assert_called_once()
+        self.assertIs(supported.call_args.args[0], partial)
+        self.assertIs(supported.call_args.args[1], prefix)
+        self.assertIs(supported.call_args.args[2], mlp_wp)
+        fused.assert_called_once()
+
+    def test_unsupported_iris_reduce_defers_attnres_combine(self):
+        import tokenspeed_kernel.ops.communication.triton as triton_comm
+
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        group = object()
+        state = SimpleNamespace(
+            attn_ar_fusion_ok=False,
+            mapping=SimpleNamespace(
+                nprocs_per_node=8,
+                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
+            ),
+        )
+        comm = kimi_k3_comm.K3AttnComm(state)
+        partial = torch.randn(17, _HIDDEN, dtype=torch.bfloat16)
+        prefix = torch.randn_like(partial)
+        reduced = torch.randn_like(partial)
+        combine = (
+            (object(), object(), object()),
+            object(),
+            object(),
+            torch.randn(_HIDDEN, dtype=torch.bfloat16),
+            _EPS,
+        )
+
+        with (
+            mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
+            mock.patch.object(
+                triton_comm,
+                "allreduce_residual_attnres_combine_supported",
+                return_value=False,
+            ),
+            mock.patch.object(
+                kimi_k3_comm,
+                "all_reduce",
+                return_value=reduced,
+            ) as fallback_reduce,
+        ):
+            residual, hidden = comm.attn_reduce(
+                partial,
+                prefix,
+                combine,
+                mlp_wp=torch.randn(_HIDDEN, dtype=torch.bfloat16),
+            )
+
+        torch.testing.assert_close(residual, prefix + reduced)
+        self.assertIsNone(hidden)
+        fallback_reduce.assert_called_once_with(partial, state.mapping.attn.tp_group)
+
     def test_torch_fallback_matches_reference(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(17)
         got = torch_attn_res_fwd(

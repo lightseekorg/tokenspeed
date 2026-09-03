@@ -329,11 +329,17 @@ def resolve_dspark_prefix_replay_tokens(
 
 
 def make_extend_result_event(
-    request_id: str, tokens: Sequence[int] = ()
+    request_id: str,
+    tokens: Sequence[int] = (),
+    spec_candidate_ids: Sequence[int] | None = None,
 ) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
+    if spec_candidate_ids:
+        # P-side final chunk: the drafter candidates ride to the scheduler so
+        # its remote-decode operation is self-contained.
+        fe.spec_candidate_ids = list(spec_candidate_ids)
     return fe
 
 
@@ -359,6 +365,29 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     fe.request_id = request_id
     fe.reserve_num_tokens_in_next_schedule_event = new_reserve_num_tokens
     return fe
+
+
+def scheduler_cache_group_pages(scheduler):
+    """Return a ``group_id -> (total, available)`` page-count query.
+
+    Two counter reads, bound to the scheduler once, so the batch logger holds
+    a query rather than a reference to the loop that owns the scheduler.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+
+    Returns:
+        A callable taking a cache-group id and returning its total and
+        available page counts.
+    """
+
+    def pages(group_id: str) -> tuple[int, int]:
+        return (
+            scheduler.cache_group_total_pages(group_id),
+            scheduler.cache_group_available_pages(group_id),
+        )
+
+    return pages
 
 
 def advance_scheduler(scheduler, events: list) -> None:
@@ -638,17 +667,20 @@ def log_gpu_memory_summary(
     draft_model=None,
     kv_pool=None,
     draft_kv_pool=None,
+    device: str = "cuda",
 ) -> None:
-    """Log a per-rank GPU memory breakdown after model + KV pool are built.
+    """Log a per-rank accelerator memory breakdown after cache allocation.
 
     Weight groups are summed from the model's parameters and buffers (deduped
     by storage pointer). A draft model (speculative decoding) is summed
-    separately into its own row. KV cache / CUDA graphs / non-torch (context,
-    NCCL, DeepEP) are derived from the torch allocator and driver views, so the
-    summary is backend-agnostic. Best-effort: never raises into startup.
+    separately into its own row. KV cache, graph allocations, and non-torch
+    allocations are derived from the selected device's allocator and driver
+    views. Best-effort: never raises into startup.
     """
     try:
         GB = 1024**3
+        device_type = torch.device(device).type
+        device_module = torch.get_device_module(device_type)
         groups = {
             "attention_weights": 0,
             "moe_weights": 0,
@@ -658,7 +690,7 @@ def log_gpu_memory_summary(
         seen: set[int] = set()
 
         def _accumulate(name, tensor, sink):
-            if tensor is None or not tensor.is_cuda:
+            if tensor is None or tensor.device.type != device_type:
                 return
             ptr = tensor.data_ptr()
             if ptr in seen:
@@ -686,9 +718,9 @@ def log_gpu_memory_summary(
             draft_total = sum(draft_sink.values())
         draft_gb = draft_total / GB
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
-        allocated = torch.cuda.memory_allocated(gpu_id) / GB
-        reserved = torch.cuda.memory_reserved(gpu_id) / GB
+        free_bytes, total_bytes = device_module.mem_get_info(gpu_id)
+        allocated = device_module.memory_allocated(gpu_id) / GB
+        reserved = device_module.memory_reserved(gpu_id) / GB
         device_total = total_bytes / GB
         device_free = free_bytes / GB
         device_used = device_total - device_free
@@ -713,18 +745,18 @@ def log_gpu_memory_summary(
             rows.append(("Draft model weights", draft_gb))
         rows += [
             ("KV cache", kv_cache_gb),
-            ("Activations + CUDA graphs", activations_and_graphs),
+            ("Activations + device graphs", activations_and_graphs),
             ("Torch allocated (total)", allocated),
             ("Torch reserved (allocator pool)", reserved),
-            ("Non-torch (context/NCCL/DeepEP)", non_torch),
-            ("Device used (nvidia-smi view)", device_used),
+            ("Non-torch (context/collectives)", non_torch),
+            ("Device used (driver view)", device_used),
             ("Device free", device_free),
             ("Device total", device_total),
         ]
         name_width = max(len(n) for n, _ in rows)
         sep = "+" + "-" * (name_width + 2) + "+" + "-" * 12 + "+"
         lines = [
-            f"GPU memory summary (rank {rank}, gpu {gpu_id}, GB):",
+            f"Device memory summary (rank {rank}, {device_type} {gpu_id}, GB):",
             sep,
             f"| {'Component'.ljust(name_width)} | {'GB'.rjust(10)} |",
             sep,

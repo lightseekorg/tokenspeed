@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.platform import current_platform
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -41,6 +42,16 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.utils import set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, name, None)) is not None
+)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -51,6 +62,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         layer: torch.nn.Module,
         input_size_per_partition: int,
         output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -160,7 +173,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile
+@torch.compile(disable=current_platform().is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -281,22 +294,36 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         self.embedding_dim = embedding_dim
 
-        linear_method = UnquantizedEmbeddingMethod()
+        quant_method: QuantizeMethodBase = UnquantizedEmbeddingMethod()
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
-        is_embedding_layer = type(self.__class__) is VocabParallelEmbedding
-        linear_method_implements_embedding = method_has_implemented_embedding(
-            type(linear_method)
+        is_embedding_layer = type(self) is VocabParallelEmbedding
+
+        if not is_embedding_layer and quant_config is not None:
+            from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+            from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+                ModelOptMixedConfig,
+            )
+
+            if isinstance(quant_config, ModelOptMixedConfig):
+                method = quant_config.get_quant_method(self, prefix=prefix)
+                if method is not None and not isinstance(
+                    method, UnquantizedLinearMethod
+                ):
+                    quant_method = method
+
+        quant_method_implements_embedding = method_has_implemented_embedding(
+            type(quant_method)
         )
-        if is_embedding_layer and not linear_method_implements_embedding:
+        if is_embedding_layer and not quant_method_implements_embedding:
             raise NotImplementedError(
-                f"The class {type(linear_method).__name__} must implement "
+                f"The class {type(quant_method).__name__} must implement "
                 "the 'embedding' method, see UnquantizedEmbeddingMethod."
             )
 
-        self.linear_method: QuantizeMethodBase = linear_method
+        self.quant_method: QuantizeMethodBase = quant_method
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -317,10 +344,14 @@ class VocabParallelEmbedding(torch.nn.Module):
             - self.shard_indices.added_vocab_start_index
         )
 
-        self.linear_method.create_weights(
+        self.interleave_linear_and_gate = False
+        self.override_kernel_name = None
+        self.quant_method.create_weights(
             self,
             self.embedding_dim,
             [self.num_embeddings_per_partition],
+            self.embedding_dim,
+            self.num_embeddings_padded,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
@@ -441,6 +472,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
+            if getattr(param, "needs_scalar_to_array", False):
+                loaded_weight = loaded_weight.reshape(param.data.shape)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return
@@ -507,11 +540,19 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
 
         # Get the embeddings.
-        output_parallel = self.linear_method.embedding(self, masked_input)
+        output_parallel = self.quant_method.embedding(self, masked_input)
 
         # Mask the output embedding.
         if self.tp_size > 1:
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            output_mask = input_mask.unsqueeze(-1)
+            if output_parallel.dtype in _FLOAT8_DTYPES:
+                # CUDA does not implement masked_fill_ for FP8. PLE keeps its
+                # n-gram table in FP8 and dequantizes after this sharded
+                # lookup, so preserve the FP8 payload while zeroing rows that
+                # belong to another TP rank with the supported pointwise op.
+                output_parallel = torch.where(output_mask, 0.0, output_parallel)
+            else:
+                output_parallel.masked_fill_(output_mask, 0)
 
             if reduce_results:
                 output = all_reduce(output_parallel, self.tp_group)

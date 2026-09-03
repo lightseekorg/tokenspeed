@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention import KdaPrefillResult
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -496,6 +496,7 @@ def triton_nvidia_kda_replay_commit(
 def triton_nvidia_kda_batched_replay_commit(
     descriptors: torch.Tensor,
     *,
+    group_indices: torch.Tensor,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
@@ -510,16 +511,39 @@ def triton_nvidia_kda_batched_replay_commit(
     state_stride: int,
     gate_stride: int,
     conv_width: int,
-    layers_per_group: int,
     lower_bound: float,
 ) -> None:
-    """Replay every KDA layer described by stable device pointer tables."""
+    """Replay every KDA layer described by stable device pointer tables.
+
+    Args:
+        descriptors: Device pointers for every layer's inputs, weights, and state.
+        group_indices: Cache-group row for each descriptor.
+        read_indices: Source page indices, shaped ``[groups, batch]``.
+        write_indices: Destination page indices, shaped ``[groups, batch]``.
+        accepted_length: Accepted draft-token count for each request.
+        draft_token_num: Maximum number of draft tokens in the replay window.
+        num_heads: Number of local KDA value heads.
+        head_dim: Per-head key and value dimension.
+        f_a_dim: Width of the low-rank gate projection.
+        qkv_stride: Token stride of the packed QKV payload.
+        conv_stride: Page stride of the convolution state.
+        f_a_stride: Token stride of the low-rank gate payload.
+        beta_stride: Token stride of beta.
+        state_stride: Page stride of the recurrent state.
+        gate_stride: Token stride of the gate scratch tensor.
+        conv_width: Width of the depthwise convolution kernel.
+        lower_bound: Lower bound used by the KDA decay gate.
+
+    Returns:
+        None.
+    """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         batched_recurrent_kda_replay_commit,
     )
 
     batched_recurrent_kda_replay_commit(
         descriptors,
+        group_indices,
         read_indices,
         write_indices,
         accepted_length,
@@ -534,7 +558,6 @@ def triton_nvidia_kda_batched_replay_commit(
         state_stride=state_stride,
         gate_stride=gate_stride,
         conv_width=conv_width,
-        layers_per_group=layers_per_group,
         lower_bound=lower_bound,
     )
 

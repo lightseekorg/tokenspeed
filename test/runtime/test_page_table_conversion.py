@@ -91,6 +91,26 @@ class PageTableConversionTest(unittest.TestCase):
         self.assertEqual(actual.data_ptr(), table.data_ptr())
         self.assertEqual(actual.tolist(), [[3, 5, -1]])
 
+    def test_build_prefill_slots_with_known_output_size_matches_masked_path(self):
+        page_table = torch.tensor([[5, 6], [8, 9]], dtype=torch.int32)
+        seq_lens = torch.tensor([3, 2], dtype=torch.int32)
+        kwargs = {
+            "page_table": page_table,
+            "seq_lens": seq_lens,
+            "max_seq_len": 3,
+            "page_size": 2,
+            "device": torch.device("cpu"),
+        }
+
+        expected = self.module.build_prefill_kv_workspace_slots(**kwargs)
+        actual = self.module.build_prefill_kv_workspace_slots(
+            **kwargs,
+            num_tokens=5,
+        )
+
+        self.assertEqual(actual.tolist(), [10, 11, 12, 16, 17])
+        self.assertTrue(torch.equal(actual, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

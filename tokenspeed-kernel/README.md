@@ -99,8 +99,13 @@ folder.
 
 ### Solution choices
 
-- **Triton** — in-tree; default portable JIT path for various kernels
+- **Triton** — in-tree; default portable JIT path for various kernels, including
+  precomputed-routing MoE with unquantized or MXFP4 expert weights
 - **Gluon / CuteDSL** — in-tree; performant JIT path for key kernels
+- **gfx950 block-FP8 MoE** — direct compact-weight Gluon warp GEMVs for
+  decode-shaped batches and tuned BF16 Gluon kernels for prefill. BF16 expert
+  copies are created at load time while compact FP8 experts remain available
+  for decode
 - **Vendor libraries** — wrapped (FlashAttention, TRT-LLM, etc.);
   no in-tree C++ build
 - **PyTorch reference** — under `numerics/reference/`; never auto-selects
@@ -119,9 +124,9 @@ iteration.
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
-- End-to-end serving: pass `--profile --profile-activities PROTON` to
-  `tokenspeed bench serve` (or POST `/start_profile` / `/stop_profile` with
-  `{"activities": ["PROTON"]}`). Each scheduler process — the process where
+- End-to-end serving: POST `/start_profile` with
+  `{"activities": ["PROTON"]}`, run the workload, then POST `/stop_profile`.
+  Each scheduler process — the process where
   kernels actually launch — runs its own Proton session and finalizes it on
   `/stop_profile`, writing
   `<output_dir>/<profile_id>[-DP<rank>][-CP<rank>]-TP<rank>.proton.<fmt>`
@@ -146,6 +151,7 @@ from tokenspeed_kernel import (
     mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
     msa_extend_with_kvcache, msa_decode_with_kvcache,
     gdn_chunk_prefill,
+    gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
     mm,
     moe_softmax_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
@@ -156,7 +162,44 @@ from tokenspeed_kernel import (
 Using the above platform and solution-agnostic public APIs can get the most
 value out of TokenSpeed-kernel; but one can also directly call into a
 specific solution under `ops/<family>/`, or manually `select_kernel` with
-targeted filters:
+targeted filters.
+
+The public W4A16 NVFP4 GEMM accepts BF16 activations shaped `[M, K]`, packed
+`uint8` weights shaped `[N, K / 2]`, and block-16 E4M3 scales in the runtime
+128x4-swizzled layout. Runtime quantization methods perform this scale-layout
+conversion; direct callers must supply scales in that layout. Prepare the
+weights once after loading, then pass all returned values unchanged to `mm`:
+
+```python
+from tokenspeed_kernel import (
+    has_flashinfer_cute_dsl_nvfp4_a16,
+    mm,
+    prepare_nvfp4_a16_weights,
+)
+
+if not has_flashinfer_cute_dsl_nvfp4_a16():
+    raise RuntimeError(
+        "NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer"
+    )
+
+weight, weight_scale, alpha = prepare_nvfp4_a16_weights(
+    packed_weight,
+    swizzled_block16_scales,
+    alpha,
+)
+output = mm(
+    activation,
+    weight,
+    A_scales=None,
+    B_scales=weight_scale,
+    alpha=alpha,
+    quant="nvfp4_a16",
+)
+```
+
+Only NVIDIA SM100 and SM103 are supported.
+
+For targeted selection:
 
 ```python
 from tokenspeed_kernel.selection import select_kernel, kernel_override

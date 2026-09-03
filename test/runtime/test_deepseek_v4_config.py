@@ -18,12 +18,12 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    dsv4_compute_global_topk_indices_and_lens,
-)
 from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
+)
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
@@ -144,7 +144,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     get_dspark_topk_idxs_batched,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
-from tokenspeed.runtime.models.deepseek_v4_mtp import DeepseekV4ForCausalLMNextN
+from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import (
@@ -158,6 +158,28 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     prefers_deepseek_v4_tokenizer,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+# MLAConfig component fields; everything else in the flat test namespaces is
+# model-wide and stays on the config argument.
+_V4_SPEC_FIELDS = (
+    "num_attention_heads",
+    "num_kv_heads",
+    "head_dim",
+    "attn_tp_size",
+    "sliding_window_tokens",
+    "qk_rope_head_dim",
+)
+
+
+def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
+    """Split a flat test namespace into the (config, spec) backend arguments."""
+    fields = vars(flat)
+    spec_fields = {k: v for k, v in fields.items() if k in _V4_SPEC_FIELDS}
+    spec_fields.setdefault("sliding_window_tokens", None)
+    config_fields = {k: v for k, v in fields.items() if k not in _V4_SPEC_FIELDS}
+    return DeepseekV4AttentionBackend(
+        SimpleNamespace(**config_fields), SimpleNamespace(**spec_fields)
+    )
 
 
 def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
@@ -2496,7 +2518,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_backend_preserves_compact_cache_contract(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -2531,7 +2553,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(metadata.cache.swa_base_logical_page, base))
 
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -2572,7 +2594,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(widths[v4_compressed_kv_group_id(128)], 17)
 
     def test_deepseek_v4_lcm_tables_are_already_kernel_ready(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -2612,7 +2634,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         return backend
 
     def test_deepseek_v4_runtime_configures_eager_cache_group_contract(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -2841,7 +2863,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         draft_counts = {str(spec.group_id): 4096 for spec in draft_specs}
 
         def make_backend(*, is_draft: bool) -> DeepseekV4AttentionBackend:
-            return DeepseekV4AttentionBackend(
+            return _v4_backend(
                 SimpleNamespace(
                     prefix_granularity=64,
                     kernel_page_size=64,
@@ -2981,7 +3003,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertLessEqual(torch.cuda.memory_reserved(), reserved_before)
 
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3024,7 +3046,7 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_metadata_uses_runtime_verify_width(self):
         for verify_width in (1, 2, 4, 8):
             with self.subTest(verify_width=verify_width):
-                backend = DeepseekV4AttentionBackend(
+                backend = _v4_backend(
                     SimpleNamespace(
                         prefix_granularity=64,
                         kernel_page_size=64,
@@ -3083,7 +3105,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
 
     def test_deepseek_v4_mixed_metadata_rejects_packed_token_mismatch(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3115,7 +3137,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_prefill_metadata_uses_complete_cpu_mirrors(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3153,7 +3175,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(metadata.token_to_req_indices.tolist(), [0] * 5 + [1] * 9)
 
     def test_deepseek_v4_prefill_metadata_requires_complete_cpu_mirrors(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3294,7 +3316,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_chunked_prefill_uses_cpu_query_offsets(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3382,7 +3404,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_draft_keeps_mixed_step0_and_decode_step_metadata(self):
         verify_width = 4
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3440,7 +3462,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(_deepseek_v4_forward_metadata(decode_ctx), decode_metadata)
 
     def test_deepseek_v4_cuda_graph_refresh_keeps_compact_table_columns(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3481,7 +3503,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(table[:, 2:], torch.full_like(table[:, 2:], -1)))
 
     def test_deepseek_v4_metadata_splits_named_cache_groups(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3557,7 +3579,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_metadata_slice_preserves_compact_base_offsets(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3721,7 +3743,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             RuntimeError,
-            "missing paged-cache block table",
+            "missing cache-group block table",
         ):
             metadata.cache.compressed_page_table(128)
 
@@ -3831,7 +3853,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(slots, torch.tensor([10, -1, -1, -1])))
 
     def test_deepseek_v4_mixed_metadata_splits_prefill_and_decode(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3934,7 +3956,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_mixed_metadata_accepts_prefill_prefix_lens_only(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -3980,7 +4002,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_mixed_backend_slices_prefill_and_decode(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4075,7 +4097,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(out[3:], torch.full((2, 2, 4), 2.0)))
 
     def test_deepseek_v4_mixed_prefill_replaces_stale_slice(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4175,7 +4197,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         kernel page: kernel geometry is registry-sourced, never P-derived."""
 
         def build(prefix_granularity):
-            return DeepseekV4AttentionBackend(
+            return _v4_backend(
                 SimpleNamespace(
                     prefix_granularity=prefix_granularity,
                     kernel_page_size=None,
@@ -4223,7 +4245,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(c128.block_granularity, 256)
 
     def test_deepseek_v4_spec_metadata_requires_uniform_pack(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4258,7 +4280,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(backend.forward_metadata.decode_req_count(), 2)
         self.assertEqual(backend.forward_metadata.decode_token_count(), 8)
 
-        draft_backend = DeepseekV4AttentionBackend(
+        draft_backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4303,7 +4325,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_decode_metadata_defaults_to_one_token(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4337,7 +4359,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(backend.forward_metadata.decode_token_count(), 2)
 
     def test_deepseek_v4_select_decode_metadata_ignores_prefill_fallback(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4383,7 +4405,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(backend._select_decode_metadata(8), decode_metadata)
 
     def test_deepseek_v4_cuda_graph_replay_without_num_tokens_uses_plain_decode(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4423,7 +4445,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(backend.forward_metadata.decode_token_count(), 2)
 
     def test_deepseek_v4_decode_backend_maps_compressed_slots_batched(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4513,7 +4535,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for capture cache semantics")
         device = torch.device("cuda")
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4581,7 +4603,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_c128a_prefill_local_compressed_indices_contract(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4663,7 +4685,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_decode_backend_masks_padding_tokens(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4733,7 +4755,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(lens, torch.tensor([1, 0], dtype=torch.int32)))
 
     def test_deepseek_v4_cuda_graph_replay_marks_padding_tokens_invalid(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4783,7 +4805,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(metadata.decode_token_count(), 4)
 
     def test_deepseek_v4_cuda_graph_replay_preserves_padded_cache_tables(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -4988,7 +5010,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_cuda_graph_decode_uses_packed_metadata(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -5070,7 +5092,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(metadata.decode_token_count(), 16)
 
     def test_deepseek_v4_cuda_graph_packed_draft_decode_advances_metadata(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -5163,7 +5185,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(_deepseek_v4_forward_metadata(ctx), decode_metadata)
 
     def test_deepseek_v4_eager_draft_decode_refreshes_stale_graph_metadata(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,
@@ -5223,7 +5245,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_prefill_uses_prefill_metadata_slot(self):
-        backend = DeepseekV4AttentionBackend(
+        backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
                 kernel_page_size=64,

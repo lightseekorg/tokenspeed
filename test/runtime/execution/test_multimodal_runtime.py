@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Tests for MultimodalRuntime (mrope overrides factored out of ModelExecutor)."""
 
 from types import SimpleNamespace
@@ -41,7 +61,6 @@ def _mm_input(
         mrope_position_delta_scalar=delta_scalar,
         mrope_position_delta=delta_tensor,
         mrope_positions=positions,
-        mrope_position_delta_repeated_cache=None,
     )
 
 
@@ -80,13 +99,17 @@ def test_decode_applies_scalar_delta_per_request():
     assert out[:, 1].tolist() == [6, 6, 6]
 
 
-def test_decode_caches_tensor_delta_as_scalar():
+def test_decode_reads_tensor_delta_without_writing_back():
     rt, _ = _runtime()
     op = _FakeForwardOp([1])
     mm = _mm_input(delta_tensor=torch.tensor([[3]], dtype=torch.int64))
-    rt.build_positions_override(op, _FakeMmContext([mm]), 1)
-    # The .item() sync happens once; afterwards the scalar field is set.
-    assert mm.mrope_position_delta_scalar == 3
+    out = rt.build_positions_override(op, _FakeMmContext([mm]), 1)
+    # base 0 + delta 3.
+    assert out[:, 0].tolist() == [3, 3, 3]
+    # The forward runs on the data plane and must not edit the struct it was
+    # handed; the control plane resolves the scalar at gather time
+    # (multimodal_context_for_forward) instead of memoizing it from here.
+    assert mm.mrope_position_delta_scalar is None
 
 
 def test_decode_staging_ping_pongs_between_two_buffers():
@@ -142,6 +165,14 @@ def test_wire_drafter_sets_pad_ids_only_when_supported():
             self.ids = ids
 
     # A config with no mm pad ids resolves to falsy -> drafter untouched.
+    # Text-only, so the multimodal branch that would raise is not taken.
     drafter = _Drafter()
-    MultimodalRuntime.wire_drafter(drafter, SimpleNamespace())
+    MultimodalRuntime.wire_drafter(
+        drafter,
+        SimpleNamespace(
+            hf_config=SimpleNamespace(),
+            vocab_size=32000,
+            is_multimodal_active=False,
+        ),
+    )
     assert drafter.ids is None

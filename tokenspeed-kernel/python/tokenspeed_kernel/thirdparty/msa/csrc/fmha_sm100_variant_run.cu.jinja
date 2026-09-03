@@ -37,8 +37,9 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     int64_t max_k_tiles,
                     Optional<ffi::TensorView> maybe_kv_block_indexes,
                     int64_t pack_factor,
-                    bool qo_len_uniform,
-                    int64_t stream_ptr) {
+                     bool qo_len_uniform,
+                     int64_t stream_ptr,
+                     bool enable_pdl) {
   bool is_paged = maybe_kv_indices.has_value();
   int head_dim_qk = q.size(2);
   int head_dim_vo = is_paged ? v.size(3) : v.size(2);
@@ -92,6 +93,7 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                               ? static_cast<int*>(maybe_qo_offsets.value().data_ptr())
                               : nullptr;
   params.stream = stream;
+  params.enable_pdl = enable_pdl;
   params.num_kv_splits = static_cast<int>(num_kv_splits);
   params.kv_tile_begin_ptr = maybe_kv_tile_begin_indices.has_value()
                                  ? static_cast<int*>(maybe_kv_tile_begin_indices.value().data_ptr())

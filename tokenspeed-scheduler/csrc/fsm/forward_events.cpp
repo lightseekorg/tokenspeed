@@ -29,16 +29,35 @@
 
 namespace tokenspeed::fsm {
 
-std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFirstChunk(
-    TokenContainer* token_container, std::int32_t prefix_granularity) {
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
+SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_container, std::int32_t prefix_granularity) {
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent requires a cache coordinator");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "SchedulePrefillFirstChunkEvent requires one admitted table per cache group");
 
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
     TokenContainer::Window window{.begin = hit_tokens_, .size = tokens_this_round_};
-    const bool is_last_chunk = window.begin + window.size == token_container->PrefillSize();
-    if (is_last_chunk && source_ == PrefillSource::kLocal) {
+    if (source_ == PrefillSource::kRemote) {
+        // The peer prefills the whole prompt; this engine only holds the
+        // destination pages until RemotePrefillDone.
+        return RemotePrefilling{token_container,
+                                prefix_granularity,
+                                std::move(req_pool_index),
+                                window,
+                                reserve_num_tokens_in_next_schedule_event_,
+                                std::move(block_tables_),
+                                std::move(cache_progress_)};
+    }
+    if (window.begin + window.size == token_container->PrefillSize()) {
+        if (awaits_result_) {
+            return PrefillAwaitingResult{token_container,
+                                         prefix_granularity,
+                                         std::move(req_pool_index),
+                                         window,
+                                         reserve_num_tokens_in_next_schedule_event_,
+                                         std::move(block_tables_),
+                                         std::move(cache_progress_)};
+        }
         return PrefillDone{token_container,
                            prefix_granularity,
                            std::move(req_pool_index),
@@ -53,58 +72,71 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFi
                       window,
                       reserve_num_tokens_in_next_schedule_event_,
                       std::move(block_tables_),
-                      std::move(cache_progress_),
-                      source_};
+                      std::move(cache_progress_)};
 }
 
-std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
+SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
     return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
 }
 
-std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
+SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
     return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
 }
 
-std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();
-    const PrefillSource source = state.Source();
+    // The chunk forwards already out survive this transition -- see
+    // ForwardState::CarryResultsInFlight.
+    const std::int32_t results_in_flight = state.ResultsInFlight();
     TokenContainer::Window window{
         .begin = state.window.begin + state.window.size,
         .size = tokens_this_round_,
     };
     auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
+    auto build = [&]<typename Next>(std::type_identity<Next>) {
+        Next next{token_container,
+                  prefix_granularity,
+                  std::move(req_pool_index),
+                  window,
+                  reserve_num_tokens_in_next_schedule_event_,
+                  std::move(block_tables),
+                  std::move(cache_progress_)};
+        next.CarryResultsInFlight(results_in_flight);
+        return next;
+    };
     if (window.begin + window.size == token_container->PrefillSize()) {
-        return PrefillDone{token_container,
-                           prefix_granularity,
-                           std::move(req_pool_index),
-                           window,
-                           reserve_num_tokens_in_next_schedule_event_,
-                           std::move(block_tables),
-                           std::move(cache_progress_)};
+        if (awaits_result_) {
+            return build(std::type_identity<PrefillAwaitingResult>{});
+        }
+        return build(std::type_identity<PrefillDone>{});
     }
-    return Prefilling{token_container,
-                      prefix_granularity,
-                      std::move(req_pool_index),
-                      window,
-                      reserve_num_tokens_in_next_schedule_event_,
-                      std::move(block_tables),
-                      std::move(cache_progress_),
-                      source};
+    return build(std::type_identity<Prefilling>{});
 }
 
 template <typename State>
 Decoding ScheduleDecodeEvent::decode(State&& state) {
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();
+    // The overlap schedule plans this decode before the previous result
+    // lands -- see ForwardState::CarryResultsInFlight.
+    const std::int32_t results_in_flight = state.ResultsInFlight();
     auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
-    return Decoding{token_container,      prefix_granularity,      std::move(req_pool_index),
-                    decode_input_tokens_, std::move(block_tables), std::move(cache_progress_)};
+    Decoding decoding{token_container,      prefix_granularity,      std::move(req_pool_index),
+                      decode_input_tokens_, std::move(block_tables), std::move(cache_progress_)};
+    decoding.CarryResultsInFlight(results_in_flight);
+    return decoding;
 }
 
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
+    return decode(std::move(state));
+}
+
+Decoding ScheduleDecodeEvent::operator()(PrefillAwaitingResult&& state) {
     return decode(std::move(state));
 }
 
@@ -121,6 +153,10 @@ Finished FinishEvent::finish(State&& state) {
 }
 
 Finished FinishEvent::operator()(PrefillDone&& state) {
+    return finish(std::move(state));
+}
+
+Finished FinishEvent::operator()(PrefillAwaitingResult&& state) {
     return finish(std::move(state));
 }
 
@@ -152,7 +188,15 @@ Finished AbortEvent::operator()(Prefilling&& state) {
     return abortForward(std::move(state));
 }
 
+Finished AbortEvent::operator()(RemotePrefilling&& state) {
+    return abortForward(std::move(state));
+}
+
 Finished AbortEvent::operator()(PrefillDone&& state) {
+    return abortForward(std::move(state));
+}
+
+Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
     return abortForward(std::move(state));
 }
 
@@ -164,32 +208,30 @@ Finished AbortEvent::operator()(Retracted&&) {
     return Finished{};
 }
 
-Retracted RetractionEvent::operator()(Decoding&& state) {
-    _assert(coordinator_ != nullptr, "RetractionEvent requires a cache coordinator");
-    TokenContainer* token_container = state.TokenContainerPtr();
-    const std::int32_t prefix_granularity = state.PrefixGranularity();
-    token_container->RebasePrefill();
-    auto device_tables = std::move(state).TakeBlockTables();
-    FreeRequest(*coordinator_, device_tables);
-    return Retracted{.token_container = token_container, .prefix_granularity = prefix_granularity};
-}
-
 template <typename State>
-Submitted RetractEvent::retract(State&& state) {
+Retracted RetractEvent::retract(State&& state) {
     _assert(coordinator_ != nullptr, "RetractEvent requires a cache coordinator");
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();
     token_container->RebasePrefill();
     auto block_tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, block_tables);
-    return Submitted{token_container, prefix_granularity};
+    return Retracted{.token_container = token_container,
+                     .prefix_granularity = prefix_granularity,
+                     .retraction_epoch = epoch_,
+                     .has_recoverable_snapshot = has_recoverable_snapshot_,
+                     .resumes_generation = resumes_generation_};
 }
 
-Submitted RetractEvent::operator()(PrefillDone&& state) {
+Retracted RetractEvent::operator()(Prefilling&& state) {
     return retract(std::move(state));
 }
 
-Submitted RetractEvent::operator()(Decoding&& state) {
+Retracted RetractEvent::operator()(PrefillDone&& state) {
+    return retract(std::move(state));
+}
+
+Retracted RetractEvent::operator()(Decoding&& state) {
     return retract(std::move(state));
 }
 

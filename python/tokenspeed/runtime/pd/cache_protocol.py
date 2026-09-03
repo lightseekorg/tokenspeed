@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Paged cache transfer contract and per-request PD protocol.
+"""Cache transfer contract and per-request PD protocol.
 
 The cache recipe owns semantic group specs and the transfer schema, while the
 memory planner owns physical geometry. PD transports those objects directly
@@ -392,13 +392,11 @@ def validate_cache_peer_layout(
     layout: CacheTransferContract, peer_layout: CacheTransferContract
 ) -> None:
     if layout.plan.prefix_granularity != peer_layout.plan.prefix_granularity:
-        raise CacheContractError(
-            "Paged cache P/D contract mismatch: prefix_granularity"
-        )
+        raise CacheContractError("Cache P/D contract mismatch: prefix_granularity")
     local_group_ids = tuple(spec.group_id for spec in layout.group_specs)
     peer_group_ids = tuple(spec.group_id for spec in peer_layout.group_specs)
     if local_group_ids != peer_group_ids:
-        raise CacheContractError("Paged cache P/D contract mismatch: group order")
+        raise CacheContractError("Cache P/D contract mismatch: group order")
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
@@ -412,7 +410,7 @@ def validate_cache_peer_layout(
             or local_spec.transfer_policy != peer_spec.transfer_policy
         ):
             raise CacheContractError(
-                f"Paged cache P/D contract mismatch: group {local_spec.group_id!r} "
+                f"Cache P/D contract mismatch: group {local_spec.group_id!r} "
                 "semantics"
             )
         local_fields = layout.fields_for_group(local_spec.group_id)
@@ -421,7 +419,7 @@ def validate_cache_peer_layout(
         peer_field_ids = tuple(field.field_id for field in peer_fields)
         if local_field_ids != peer_field_ids:
             raise CacheContractError(
-                f"Paged cache P/D contract mismatch: group "
+                f"Cache P/D contract mismatch: group "
                 f"{local_spec.group_id!r} transfer field order"
             )
         for local_field, peer_field in zip(local_fields, peer_fields, strict=True):
@@ -442,7 +440,7 @@ def validate_cache_peer_layout(
                 or tuple(local_global_shape) != tuple(peer_global_shape)
             ):
                 raise CacheContractError(
-                    f"Paged cache P/D contract mismatch: field "
+                    f"Cache P/D contract mismatch: field "
                     f"{local_field.field_id!r} semantics"
                 )
 
@@ -494,16 +492,16 @@ def build_cache_block_manifest(
 ) -> CachePDBlockManifest:
     """Select each group's blocks according to its explicit transfer policy."""
     if prefix_len >= prompt_len:
-        raise CacheContractError("Paged cache PD requires prefix_len < prompt_len")
+        raise CacheContractError("Cache-transfer PD requires prefix_len < prompt_len")
     if prefix_len % layout.plan.prefix_granularity:
         raise CacheContractError(
-            "Paged cache PD prefix_len must be aligned to prefix_granularity"
+            "Cache-transfer PD prefix_len must be aligned to prefix_granularity"
         )
     mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
     expected_ids = {group.group_id for group in layout.group_specs}
     if set(mapping) != expected_ids:
         raise CacheContractError(
-            "scheduler group IDs disagree with the Paged cache layout: "
+            "scheduler group IDs disagree with the cache-transfer layout: "
             f"missing={sorted(expected_ids - set(mapping))}, "
             f"extra={sorted(set(mapping) - expected_ids)}"
         )
@@ -563,7 +561,7 @@ def build_cache_layerwise_block_selection(
     """
     if prefix_len % layout.plan.prefix_granularity:
         raise CacheContractError(
-            "Paged cache PD prefix_len must be aligned to prefix_granularity"
+            "Cache-transfer PD prefix_len must be aligned to prefix_granularity"
         )
     if prefix_len >= prompt_len:
         raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
@@ -577,7 +575,7 @@ def build_cache_layerwise_block_selection(
     expected_ids = {group.group_id for group in layout.group_specs}
     if set(mapping) != expected_ids:
         raise CacheContractError(
-            "scheduler group IDs disagree with the Paged cache layout: "
+            "scheduler group IDs disagree with the cache-transfer layout: "
             f"missing={sorted(expected_ids - set(mapping))}, "
             f"extra={sorted(set(mapping) - expected_ids)}"
         )

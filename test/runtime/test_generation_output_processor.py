@@ -105,7 +105,7 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
 
     events = processor.post_process_forward_op(
-        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False, on_first_token=None
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False
     )
 
     reserve_events = [
@@ -154,7 +154,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
     result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
 
     events = processor.post_process_forward_op(
-        _ForwardOp(), result, is_prefill_instance=False, on_first_token=None
+        _ForwardOp(), result, is_prefill_instance=False
     )
 
     # Flagged request: aborted with NumericalError, removed from tracking.
@@ -212,7 +212,7 @@ def test_nan_flag_keeps_single_sanitized_token():
     result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
 
     events = processor.post_process_forward_op(
-        _SpecForwardOp(), result, is_prefill_instance=False, on_first_token=None
+        _SpecForwardOp(), result, is_prefill_instance=False
     )
 
     assert decode_state.finished
@@ -225,8 +225,9 @@ def test_nan_flag_keeps_single_sanitized_token():
 
 
 def test_nan_flag_skips_first_token_pd_handoff():
-    """NaN-terminated requests must not hand their bootstrap token to the PD
-    transfer layer — their KV is suspect."""
+    """A NaN-terminated P-side request must never transfer its KV: it aborts
+    at the scheduler (no remote decode is emitted), while healthy requests in
+    the same batch proceed."""
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
@@ -236,16 +237,62 @@ def test_nan_flag_skips_first_token_pd_handoff():
     result.next_input_ids = None
     result.output_nan_flags = torch.tensor([1, 0], dtype=torch.int32)
 
-    handoffs = []
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
+        _ForwardOp(),
+        result,
+        is_prefill_instance=True,
+    )
+
+    by_request = [(type(e).__name__, e.request_id) for e in events]
+    assert ("Abort", "prefill") in by_request
+    assert ("Abort", "decode") not in by_request
+    assert "prefill" not in processor.rid_to_state
+
+
+def test_nan_outranks_a_client_abort_on_a_local_engine():
+    """A request that is both client-aborted and NaN-flagged aborts at the
+    scheduler rather than finishing: an ending the client asked for does not
+    make the numbers trustworthy, and Finish would cache the corrupt pages."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    processor.mark_abort("decode", notify_client=False)
+
+    result = _ExecutionResult()
+    result.next_input_ids = None
+    result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
         _ForwardOp(),
         result,
         is_prefill_instance=False,
-        on_first_token=lambda rid, *a: handoffs.append(rid),
     )
 
-    # Flagged prefill slot is skipped; the healthy decode slot still hands off.
-    assert handoffs == ["decode"]
+    by_request = [(type(e).__name__, e.request_id) for e in events]
+    assert ("Abort", "decode") in by_request
+    assert ("Finish", "decode") not in by_request
+
+
+def test_nan_outranks_a_client_abort_on_the_prefill_node():
+    """Numerical corruption must win over every other ending: a request that
+    is both client-aborted and NaN-flagged still aborts at the scheduler, so
+    its suspect KV is never shipped to the peer."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.mark_abort("prefill", notify_client=False)
+
+    result = _PrefillExecutionResult()
+    result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        result,
+        is_prefill_instance=True,
+    )
+
+    assert [type(event).__name__ for event in events] == ["ExtendResult", "Abort"]
+    assert "prefill" not in processor.rid_to_state
 
 
 class _RecordingLogger:
@@ -289,7 +336,6 @@ def test_log_request_stats_disabled_by_default():
             _DecodeOp(),
             _ExecutionResult(),
             is_prefill_instance=False,
-            on_first_token=None,
         )
     finally:
         gop.logger = gop_logger
@@ -462,7 +508,6 @@ def test_log_request_stats_records_timestamps_through_forward():
             _DecodeOp(),
             _ExecutionResult(),
             is_prefill_instance=False,
-            on_first_token=None,
         )
     finally:
         gop.logger = gop_logger
@@ -539,36 +584,39 @@ class _MismatchedPrefillExecutionResult(_PrefillExecutionResult):
     next_input_ids = torch.tensor([[201, 202, 203]], dtype=torch.int32)
 
 
-def test_prefill_first_token_passes_spec_candidates():
+def test_prefill_final_chunk_folds_spec_candidates_into_the_extend_result():
+    """The scheduler's remote decode is self-contained: the drafter candidates
+    ride the final chunk's ExtendResult (the bootstrap token is tokens[0],
+    which the scheduler reads back as LastToken)."""
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
-    calls = []
 
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
         _PrefillForwardOp(),
         _PrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: calls.append(args),
     )
 
-    assert calls == [("prefill", 3, 101, [101, 102, 103])]
+    extend = next(e for e in events if type(e).__name__ == "ExtendResult")
+    assert list(extend.tokens)[0] == 101
+    assert list(extend.spec_candidate_ids) == [101, 102, 103]
 
 
-def test_prefill_first_token_does_not_guess_from_next_input_ids():
+def test_prefill_extend_result_does_not_guess_from_next_input_ids():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
-    calls = []
 
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
         _PrefillForwardOp(),
         _EmptyPrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: calls.append(args),
     )
 
-    assert calls == []
+    for event in events:
+        if type(event).__name__ == "ExtendResult":
+            assert list(event.spec_candidate_ids) == []
 
 
 def test_prefill_first_token_checks_spec_candidate_bootstrap():
@@ -581,7 +629,6 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
             _PrefillForwardOp(),
             _MismatchedPrefillExecutionResult(),
             is_prefill_instance=True,
-            on_first_token=lambda *args: None,
         )
 
 
@@ -597,7 +644,6 @@ def test_aborted_prefill_waits_for_pd_transfer_completion(notify_client):
         _PrefillForwardOp(),
         _PrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: None,
     )
 
     assert [type(event).__name__ for event in events] == ["ExtendResult"]

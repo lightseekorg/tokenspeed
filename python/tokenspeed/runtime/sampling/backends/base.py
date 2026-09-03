@@ -143,7 +143,7 @@ class SamplingBackend(ABC):
                 process_group_manager as pg_manager,
             )
 
-            self._tp_pg = pg_manager.get_process_group("nccl", config.tp_group)
+            self._tp_pg = pg_manager.get_device_process_group(config.tp_group)
             self._tp_src_global_rank = config.tp_group[0]
 
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:

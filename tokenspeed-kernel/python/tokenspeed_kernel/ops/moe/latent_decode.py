@@ -12,6 +12,13 @@ from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
+class _UnsetLinearClamp:
+    pass
+
+
+_UNSET_LINEAR_CLAMP = _UnsetLinearClamp()
+
+
 def _selection(
     hidden_states: torch.Tensor,
     w13_weight: torch.Tensor,
@@ -79,11 +86,14 @@ def latent_moe_decode_pipeline_available(
     expert_plan: Mapping[str, Any],
     *,
     topk: int,
+    linear_clamp: float | None | _UnsetLinearClamp = _UNSET_LINEAR_CLAMP,
 ) -> bool:
-    """Return whether joint routed/shared one-token decode is available.
+    """Return whether joint routed/shared small-batch decode is available.
 
     This construction-time probe owns backend, tensor-format, expert-plan, and
-    exact-shape constraints needed by the orchestration-level optimization.
+    exact-shape constraints needed by the orchestration-level optimization. An
+    A8 plan must provide ``linear_clamp`` explicitly; callers of the pre-existing
+    A16 probe may omit it.
     """
     projection_weights = (
         router_weight,
@@ -92,9 +102,16 @@ def latent_moe_decode_pipeline_available(
         shared_down_weight,
     )
     expert_tensors = (w13_weight, w13_scale, w2_weight, w2_scale)
+    apply_kernel_name = expert_plan.get("apply_kernel_name")
+    uses_linear_weights = (
+        apply_kernel_name == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
+        or (
+            apply_kernel_name == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+            and linear_clamp is None
+        )
+    )
     if not (
-        expert_plan.get("apply_kernel_name")
-        == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
+        uses_linear_weights
         and router_weight.dtype
         == routed_weight.dtype
         == shared_gate_up_weight.dtype
@@ -119,26 +136,30 @@ def latent_moe_decode_pipeline_available(
         "linear_weights": True,
         "inputs_contiguous": True,
     }
-    for topk_weight_dtype in (torch.bfloat16, torch.float32):
-        signature = format_signature(
-            hidden_states=dense_tensor_format(routed_weight.dtype),
-            w13_weight=dense_tensor_format(w13_weight.dtype),
-            w13_scale=dense_tensor_format(w13_scale.dtype),
-            w2_weight=dense_tensor_format(w2_weight.dtype),
-            w2_scale=dense_tensor_format(w2_scale.dtype),
-            topk_weights=dense_tensor_format(topk_weight_dtype),
-            topk_ids=dense_tensor_format(torch.int32),
-            shared_input=dense_tensor_format(shared_gate_up_weight.dtype),
-            shared_weight=dense_tensor_format(shared_down_weight.dtype),
-            routed_out=dense_tensor_format(routed_weight.dtype),
-            shared_out=dense_tensor_format(shared_down_weight.dtype),
-        )
-        try:
-            select_kernel("moe", "latent_expert_shared", signature, traits=traits)
-        except NoKernelFoundError:
-            continue
-        return True
-    return False
+    for tokens in range(1, 5):
+        traits["tokens"] = tokens
+        for topk_weight_dtype in (torch.bfloat16, torch.float32):
+            signature = format_signature(
+                hidden_states=dense_tensor_format(routed_weight.dtype),
+                w13_weight=dense_tensor_format(w13_weight.dtype),
+                w13_scale=dense_tensor_format(w13_scale.dtype),
+                w2_weight=dense_tensor_format(w2_weight.dtype),
+                w2_scale=dense_tensor_format(w2_scale.dtype),
+                topk_weights=dense_tensor_format(topk_weight_dtype),
+                topk_ids=dense_tensor_format(torch.int32),
+                shared_input=dense_tensor_format(shared_gate_up_weight.dtype),
+                shared_weight=dense_tensor_format(shared_down_weight.dtype),
+                routed_out=dense_tensor_format(routed_weight.dtype),
+                shared_out=dense_tensor_format(shared_down_weight.dtype),
+            )
+            try:
+                select_kernel("moe", "latent_expert_shared", signature, traits=traits)
+            except NoKernelFoundError:
+                continue
+            break
+        else:
+            return False
+    return True
 
 
 def latent_moe_expert_shared(

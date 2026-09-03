@@ -24,7 +24,7 @@ import functools
 import itertools
 from typing import Optional, Tuple
 
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
 platform = current_platform()
@@ -285,12 +285,15 @@ if platform.is_nvidia:
                     (0, 0),
                     get_hybrid_num_tokens_buckets,
                     map_to_hybrid_bucket_uncapped,
-                    [_init_packed_fp4, autotuner_initializer_empty],
                 ),
             ),
             constraint_specs=(
                 ConstraintSpec(1, 0, lambda shapes: _round_up(shapes[0][0], 128)),
                 ConstraintSpec(7, 0, lambda shapes: _round_up(shapes[0][0], 128)),
+            ),
+            tensor_initializers=(
+                (0, _init_packed_fp4),
+                (6, autotuner_initializer_empty),
             ),
             use_cold_l2_cache=True,
         )
@@ -312,7 +315,7 @@ if platform.is_nvidia:
         use_prefetch: bool = False,
         prefetch_dist: int = 3,
         vectorized_f32: bool = True,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """NVFP4 GEMM fused with SwiGLU and NVFP4 output quantization.
 
@@ -324,6 +327,7 @@ if platform.is_nvidia:
             alpha: GEMM global dequant scale, scalar or ``[1, 1]``.
             output_global_scale: Output quantization scale-up factor.
             enable_pdl: Enable Programmatic Dependent Launch for this fused kernel.
+                Uses the platform default when omitted.
 
         Returns:
             ``(out_fp4, out_scale)`` directly consumable by NVFP4 ``down_proj``.
@@ -375,6 +379,7 @@ if platform.is_nvidia:
         if output_global_scale.dim() == 0:
             output_global_scale = output_global_scale.view(1)
 
+        enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
         runner = _Nvfp4GemmSwigluNvfp4QuantRunner.get(
             ab_dtype,
             sf_dtype,

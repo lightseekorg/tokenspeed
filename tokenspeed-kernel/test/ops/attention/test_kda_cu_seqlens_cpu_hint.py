@@ -34,8 +34,8 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.attention.cutedsl_kda as cutedsl_op
 import torch
+from tokenspeed_kernel.ops.attention import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
-    KdaPrefillResult,
     _nvidia_kda_prefill,
 )
 from tokenspeed_kernel.selection import SelectedKernel

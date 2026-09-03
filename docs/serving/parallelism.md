@@ -43,6 +43,26 @@ Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 
+### Pinning a request to an attention-DP rank
+
+Each attention-DP rank owns a private prefix cache, so multi-turn requests
+only reuse their cache when every turn lands on the same rank. The
+`data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
+the gateway's gRPC protocol) pins a request to one rank: it dispatches
+straight there, bypassing load balancing — overload spill is the router's
+job. An invalid pin fails that request; the engine keeps serving. Engines
+without attention DP drop the pin.
+
+Disaggregation engines ignore the pin: the `bootstrap_room` residue
+(`room % dp_size`) governs prefill placement (and decode placement under
+`round_robin`), so steer placement by minting the room instead. A
+conflicting pin is logged and ignored, never rejected.
+
+With the bundled gateway, pass `--policy cache_aware --dp-aware` to
+`ts serve` to enable per-rank affinity routing. This requires bundled smg
+releases that carry the TokenSpeed dp-affinity support; see the lockstep
+note in `serve_smg.py`.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:
@@ -58,6 +78,12 @@ Start with the recipe closest to your model family, then tune:
 - `--moe-backend`
 - `--all2all-backend`
 - `--deepep-mode`
+
+With `--moe-backend flashinfer_trtllm`, NVFP4 expert shards are automatically
+padded to a multiple of 64 along their per-rank intermediate dimension. The
+packed weights and block scales in the padded tail are zero-filled, so the
+extra dimensions do not change the MoE result. For example, a 640-wide expert
+under MoE TP4 is padded from 160 to 192 values per rank.
 
 ### DeepEP all-to-all
 
@@ -116,15 +142,21 @@ dispatch still transports FP32 power-of-two scales, but the existing expert
 scatter packs them while permuting tokens, so neither mode needs a separate
 sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
 
-On SM100, dense `(128, 128)` FP8 projections also keep FlashInfer's MN-major
-scale layout through the decode hot path. Weight scales are transposed once
-after loading, while online activation quantization writes MN-major scales and
-the at-most-three padded rows directly. This removes the per-projection scale
-transposes plus the zero/one fills and device-to-device padding copies that
-would otherwise run between activation quantization and GEMM. The runtime sets
-``prepacked_scales=True`` only for this prepared path. Generic callers keep the
-default canonical-scale contract, for which the FlashInfer wrapper performs the
-compatibility conversion.
+Dense `(128, 128)` FP8 projections have two scale contracts against
+FlashInfer's FP8 block-scale GEMM, and both are copy-free for the layout they
+own. The canonical K-major contract takes the quant kernel's `[M, K/128]`
+activation scales and the checkpoint's `[N/128, K/128]` weight scales with no
+layout conversion (strided scale views are normalized to contiguous first).
+The prepared MN-major contract, selected at load time on every Blackwell
+datacenter part, transposes the weight scales once and then consumes the
+TRT-LLM quantizer's native `[K/128, M]` activation scales directly, which is
+what the canonical path would otherwise have to transpose on every call. Both
+produce bitwise identical output.
+
+MN-major requires `M` to be a multiple of four, so a prepared layer falls back
+to the canonical contract once padding would cost more than the transpose it
+saves — the fused padding quantizer grows with `M` while the transpose does
+not. Decode row counts stay on the prepared path.
 
 ## Multi-Node
 
@@ -200,11 +232,21 @@ staging buffer used for per-step model inputs must therefore have per-step
 lifetime, or use an explicit synchronization before reuse. This applies to
 MTP/GDN mamba state indices as well as token, length, and request-pool inputs.
 
-CUDA IPC and symmetric-memory collectives are node-local. `AutoBackend` routes
-cross-node all-reduce, all-gather, and token all-gather/reduce-scatter groups to
-NCCL. Logits all-gather and distributed argmax use the same cross-node fallback.
-This is required for layouts such as attention DP with dense TP or MoE EP
-spanning nodes.
+CUDA IPC collectives are node-local; the mnnvl fabric workspace spans nodes.
+`AutoBackend` serves single-tensor SUM all-reduces (16-bit, or fp32 where a
+single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
+whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot
+inside its traffic window, two-shot up to the workspace token capacity.
+Cross-node groups arm the full two-shot capacity at startup; single-node
+groups start at the one-shot window and serve larger shapes once
+model-level preparation widens the shared workspace. Other
+fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
+(inside the trtllm backend for armed groups; the Triton all-reduce tier
+serves AMD only, where no trtllm workspace exists). Single-node token
+all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
+across nodes. Logits all-gather and distributed argmax use the same
+cross-node fallback. This is required for layouts such as attention DP
+with dense TP or MoE EP spanning nodes.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled

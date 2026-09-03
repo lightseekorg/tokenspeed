@@ -908,6 +908,12 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.device == "npu":
+            if not self.disable_prefill_graph:
+                raise ValueError("NPU execution requires --disable-prefill-graph")
+            if not self.disable_pdl:
+                raise ValueError("NPU execution requires --disable-pdl")
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1093,9 +1099,10 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3", "mxfp8"],
+            choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" will use model data type. '
-            '"fp8" is an alias for "fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
+            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -1139,7 +1146,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
+            choices=["cuda", "npu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -1582,6 +1589,7 @@ class ServerArgs:
             "fa3",
             "fa4",
             "triton",
+            "gluon",
             "flashinfer",
             "trtllm",
             "trtllm_mla",
@@ -1594,7 +1602,8 @@ class ServerArgs:
             type=str,
             choices=attention_backend_choices,
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
+            help="Choose the kernels for attention layers. 'gluon' forces "
+            "registered Gluon kernels for supported attention architectures.",
         )
         parser.add_argument(
             "--kda-backend",

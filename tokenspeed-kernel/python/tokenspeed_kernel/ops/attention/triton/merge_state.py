@@ -59,6 +59,9 @@ def attn_merge_state_kernel(
     out = (out_a * weight_a + out_b * weight_b) / denom
     merged_lse = (lse_max_log2 + tl.log2(denom)) / lse_scale_log2
 
+    # In-place mode aliases Lse with LseA. Ensure every wave has consumed the
+    # original LSE before any wave stores the merged value.
+    tl.debug_barrier()
     tl.store(Out + value_offsets, out, mask=mask_d)
     tl.store(Lse + row, merged_lse)
 

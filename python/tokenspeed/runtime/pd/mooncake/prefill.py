@@ -330,14 +330,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         decode_tp_sizes = {reg.decode_tp_size for reg in registrations}
         expected_rank_sets = {reg.expected_decode_ranks for reg in registrations}
         if len(decode_tp_sizes) != 1 or len(expected_rank_sets) != 1:
-            raise ValueError("Paged cache room has inconsistent TP metadata")
+            raise ValueError("Cache-transfer room has inconsistent TP metadata")
         expected_decode_ranks = next(iter(expected_rank_sets))
         actual_decode_ranks = tuple(reg.decode_tp_rank for reg in registrations)
         if len(reqs) != len(expected_decode_ranks) or set(actual_decode_ranks) != set(
             expected_decode_ranks
         ):
             raise ValueError(
-                "Paged cache room destination ranks disagree with the typed route plan"
+                "Cache-transfer room destination ranks disagree with the typed route plan"
             )
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
@@ -482,7 +482,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         if self.step_counter is None:
             if room is not None:
                 raise ValueError(
-                    "Paged cache layerwise transfer has no producer step counter"
+                    "Cache-transfer layerwise transfer has no producer step counter"
                 )
             return
         next_session_check = time.monotonic()
@@ -491,7 +491,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 None,
                 TransferPoll.Failed,
             ):
-                raise ValueError(f"Paged cache layerwise wait aborted for room {room}")
+                raise ValueError(
+                    f"Cache-transfer layerwise wait aborted for room {room}"
+                )
             now = time.monotonic()
             if session_ids and now >= next_session_check:
                 with self.session_lock:
@@ -501,7 +503,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     )
                 if failed:
                     raise ValueError(
-                        f"Paged cache layerwise peer failed for room {room}"
+                        f"Cache-transfer layerwise peer failed for room {room}"
                     )
                 next_session_check = now + 0.1
             ready_step = self.step_counter.query_ready_cache_step()
@@ -605,7 +607,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         )
                     self.abort_room(
                         kv_chunk.room,
-                        f"Failed to send Paged cache layer interval of "
+                        f"Failed to send cache layer interval of "
                         f"{kv_chunk.room} to "
                         f"{registration.endpoint}:{registration.dst_port}",
                     )

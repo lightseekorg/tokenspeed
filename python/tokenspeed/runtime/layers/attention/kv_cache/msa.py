@@ -1,7 +1,7 @@
 # Copyright (c) 2026 LightSeek Foundation
 # SPDX-License-Identifier: MIT
 
-"""Paged cache storage for MiniMax sparse attention."""
+"""Paged KV storage for MiniMax sparse attention."""
 
 from __future__ import annotations
 

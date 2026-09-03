@@ -288,11 +288,14 @@ if (
         softmax_scale: float,
         page_size: int,
         q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
+        del kv_seq_lens
         if sparse_kv_cache is None:
             raise RuntimeError("FlashMLA sparse decode requires sparse_kv_cache")
         if return_lse:
@@ -341,8 +344,8 @@ if (
 
     @register_kernel(
         "attention",
-        "dsv4_paged_selected_attention",
-        name="flashmla_dsv4_paged_selected_attention",
+        "dsv4_decode",
+        name="flashmla_dsv4_decode",
         solution="flashmla",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -367,7 +370,7 @@ if (
         priority=Priority.PERFORMANT,
         tags={"nvidia", "paged_cache", "selected_attention"},
     )
-    def flashmla_dsv4_paged_selected_attention(
+    def flashmla_dsv4_decode(
         q: torch.Tensor,
         swa_kv_cache: torch.Tensor,
         swa_slots: torch.Tensor,
@@ -473,10 +476,12 @@ if (
         softmax_scale: float,
         page_size: int,
         q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if kv_cache is None:
             raise RuntimeError("FlashMLA sparse prefill requires kv_cache")
@@ -508,8 +513,8 @@ if (
 
     @register_kernel(
         "attention",
-        "dsv4_selected_attention",
-        name="flashmla_dsv4_selected_attention",
+        "dsv4_prefill",
+        name="flashmla_dsv4_prefill",
         solution="flashmla",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -531,7 +536,7 @@ if (
         },
         priority=Priority.PERFORMANT,
     )
-    def flashmla_dsv4_selected_attention(
+    def flashmla_dsv4_prefill(
         q: torch.Tensor,
         kv: torch.Tensor,
         indices: torch.Tensor,

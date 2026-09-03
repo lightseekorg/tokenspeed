@@ -201,7 +201,7 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("self_attn", prefix),
         )
-        # The draft's MLA layers join the target's full_attention paged-cache
+        # The draft's MLA layers join the target's full_attention cache
         # group (K3 publishes 4 groups: full_attention + 3 KDA linear). The
         # inherited attn_mqa/attn_mha are built without a group_id; tag them so
         # validate_cache_group_ids binds them to the full_attention table

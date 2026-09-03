@@ -44,14 +44,12 @@ public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
                      const BlockPool& pool, std::span<const GroupDemand> demands,
                      const CacheCoordinator::PrefixProbe& prefix,
-                     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
           geometry_{geometry},
           pool_{pool},
           demands_{demands},
           prefix_{prefix},
-          pending_store_releases_{pending_store_releases},
           victims_{victims},
           remaining_occupied_(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1),
           local_free_slots_(groups.size()),
@@ -208,21 +206,14 @@ private:
 
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::uint32_t group_id = static_cast<std::uint32_t>(i);
-            std::vector<CacheBlockLocation> group_pending_store_releases;
-            for (const auto& [released_group_id, location] : pending_store_releases_) {
-                if (released_group_id == group_id) {
-                    group_pending_store_releases.push_back(location);
-                }
-            }
-            for (CacheBlockLocation location :
-                 groups_[i].Index().EvictableLocationsAfterReleasing(pool_, group_pending_store_releases)) {
+            for (CacheBlockLocation location : groups_[i].Index().EvictableLocations(pool_)) {
                 add_candidate(group_id, location);
             }
             if (demands_[i].num_computed_tokens >= 0) {
                 const std::int32_t expired_blocks =
                     geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demands_[i].num_computed_tokens);
                 for (CacheBlockLocation location : groups_[i].Allocator().ReclaimableBlockLocationsAt(
-                         groups_[i].Index(), *demands_[i].table, expired_blocks, group_pending_store_releases)) {
+                         groups_[i].Index(), *demands_[i].table, expired_blocks)) {
                     add_candidate(group_id, location);
                 }
             }
@@ -276,9 +267,6 @@ private:
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
     const CacheCoordinator::PrefixProbe& prefix_;
-    // These locations are still pinned by in-flight Store tickets. The planner only discounts those ticket refs to
-    // decide whether waiting for Store ACK makes admission feasible; it never mutates the real pool.
-    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::vector<std::int32_t> remaining_occupied_;
     std::vector<std::int64_t> local_free_slots_;
@@ -294,7 +282,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, geometry, pool, demands, prefix, {}, victims};
+    AdmissionPlanner planner{groups, geometry, pool, demands, prefix, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -302,14 +290,6 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 }
 
 }  // namespace
-
-bool CacheCoordinator::CanAdmitAfterReleasing(
-    const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const {
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups_, geometry_, pool_, demands, prefix, pending_store_releases, victims};
-    return planner.Plan();
-}
 
 std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
     const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);

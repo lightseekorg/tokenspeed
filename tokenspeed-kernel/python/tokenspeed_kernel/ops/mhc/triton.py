@@ -24,6 +24,11 @@ from functools import cache
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.mhc.triton_prefill import (
+    _mhc_prefill_config_hc4,
+    mhc_pre_mix_hc4,
+    mhc_prefill_project_hc4,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -554,6 +559,87 @@ def _mhc_pre_impl(
     )
 
 
+def _tiled_mhc_pre_hc4(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the shared branch's tiled four-stream prefill projection."""
+    outer_shape = residual.shape[:-2]
+    hidden_size = residual.shape[-1]
+    residual_flat = residual.view(-1, 4, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    if num_tokens == 0:
+        return (
+            residual.new_empty(*outer_shape, hidden_size),
+            torch.empty(
+                *outer_shape, 4, 1, dtype=torch.float32, device=residual.device
+            ),
+            torch.empty(
+                *outer_shape, 4, 4, dtype=torch.float32, device=residual.device
+            ),
+        )
+
+    n_splits, block_m, block_k = _mhc_prefill_config_hc4(num_tokens)
+    n_splits = min(n_splits, triton.cdiv(4 * hidden_size, block_k))
+    projection = torch.empty(
+        n_splits, num_tokens, 24, dtype=torch.float32, device=residual.device
+    )
+    square_sum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+    )
+    pre_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=residual.device)
+    post_mix = torch.empty_like(pre_mix)
+    comb_mix = torch.empty(num_tokens, 16, dtype=torch.float32, device=residual.device)
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+
+    mhc_prefill_project_hc4(
+        residual_flat,
+        fn,
+        projection,
+        square_sum,
+        n_splits=n_splits,
+        block_m=block_m,
+        block_k=block_k,
+    )
+    mhc_pre_mix_hc4(
+        projection,
+        square_sum,
+        hc_scale,
+        hc_base,
+        pre_mix,
+        post_mix,
+        comb_mix,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        n_splits=n_splits,
+        num_tokens=num_tokens,
+    )
+    block_h = 1024
+    _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        pre_mix,
+        residual_flat,
+        layer_input,
+        hidden_size=hidden_size,
+        hc_mult=4,
+        block_h=block_h,
+        num_warps=4,
+    )
+    return (
+        layer_input.view(*outer_shape, hidden_size),
+        post_mix.view(*outer_shape, 4, 1),
+        comb_mix.view(*outer_shape, 4, 4),
+    )
+
+
 @register_kernel(
     "mhc",
     "pre",
@@ -583,6 +669,17 @@ def triton_mhc_pre(
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the portable Triton mHC pre-mapping."""
+    num_tokens = residual.numel() // (residual.shape[-2] * residual.shape[-1])
+    if residual.shape[-2] == 4 and num_tokens > 256:
+        return _tiled_mhc_pre_hc4(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+        )
     return _mhc_pre_impl(
         residual,
         fn,

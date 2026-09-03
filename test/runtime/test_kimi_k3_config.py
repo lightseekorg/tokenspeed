@@ -105,49 +105,72 @@ class KimiK3ConfigTests(unittest.TestCase):
             else:
                 self.assertEqual(cache_label, block_type)
 
-    def test_mamba2_cache_params_shapes(self):
-        c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=1))
-        import tokenspeed.runtime.utils.env as env_mod
+    @staticmethod
+    def _kda_spec(tp_size):
+        """The KDA component as boot construction builds it, at one TP width."""
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
 
-        with mock.patch.dict(
-            env_mod.global_server_args_dict, {"mapping": fake_mapping}
-        ):
-            (
-                conv_shape,
-                temporal_shape,
-                conv_dtype,
-                ssm_dtype,
-                mamba_layers,
-            ) = c.mamba2_cache_params
+        server_args = SimpleNamespace(
+            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
+        )
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=KimiLinearConfig())
+        )
+        return LinearAttnConfig.generate(server_args, model)
 
+    def test_kda_state_shapes(self):
+        spec = self._kda_spec(tp_size=1)
         # conv over q/k/v (3 * num_heads * head_dim) wide, kernel_size - 1 deep.
-        self.assertEqual(conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1))
-        # per-head (head_dim x head_dim) recurrent state.
-        self.assertEqual(temporal_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM))
-        self.assertEqual(conv_dtype, torch.bfloat16)
-        self.assertEqual(ssm_dtype, torch.float32)
-        self.assertEqual(mamba_layers, c.linear_layer_ids)
-
-    def test_mamba2_cache_params_respects_tp(self):
-        c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=4))
-        import tokenspeed.runtime.utils.env as env_mod
-
-        with mock.patch.dict(
-            env_mod.global_server_args_dict, {"mapping": fake_mapping}
-        ):
-            conv_shape, temporal_shape, *_ = c.mamba2_cache_params
-
         self.assertEqual(
-            conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1)
+            spec.conv_state_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1)
+        )
+        # per-head (head_dim x head_dim) recurrent state.
+        self.assertEqual(
+            spec.temporal_state_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+        )
+        self.assertEqual(spec.layer_ids, tuple(KimiLinearConfig().linear_layer_ids))
+
+    def test_kda_state_shapes_respect_tp(self):
+        spec = self._kda_spec(tp_size=4)
+        self.assertEqual(
+            spec.conv_state_shape,
+            (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1),
         )
         self.assertEqual(
-            temporal_shape, (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+            spec.temporal_state_shape,
+            (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
         )
 
 
 class KimiK3RegistrationTests(unittest.TestCase):
+    def test_hybrid_moe_precomputes_routing_only_for_decode(self):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        torch.nn.Module.__init__(layer)
+        layer.execution_plan = SimpleNamespace(use_trtllm=True)
+        layer._gather_dp_tokens_for_moe = False
+        layer.experts = SimpleNamespace(
+            support_routing=True,
+            supports_precomputed_topk=True,
+            topk_output_format=TopKOutputFormat.BYPASSED,
+        )
+
+        self.assertEqual(layer._routing_output_format(None), TopKOutputFormat.STANDARD)
+        for mode, expected in (
+            (ForwardMode.DECODE, TopKOutputFormat.STANDARD),
+            (ForwardMode.EXTEND, TopKOutputFormat.BYPASSED),
+            (ForwardMode.MIXED, TopKOutputFormat.BYPASSED),
+            (ForwardMode.IDLE, TopKOutputFormat.BYPASSED),
+        ):
+            with self.subTest(mode=mode):
+                ctx = SimpleNamespace(forward_mode=mode)
+                self.assertEqual(layer._routing_output_format(ctx), expected)
+
     def test_mla_mixed_batch_slices_decode_gate_to_live_rows(self):
         from tokenspeed.runtime.execution.context import ForwardContext
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -215,6 +238,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             moe=SimpleNamespace(
                 tp_ep_rank=0,
                 tp_ep_size=8,
+                has_tp_ep=True,
                 tp_ep_group=tuple(range(8)),
             )
         )
@@ -274,7 +298,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
 
@@ -343,7 +368,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
         rows, projection_width = 4, 64
@@ -389,8 +415,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
 
-    def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
+    def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 
         shared_calls = []
         expert_calls = []
@@ -406,14 +433,20 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 super().__init__()
                 expert_calls.append(kwargs)
                 self.support_routing = False
+                self.supports_precomputed_topk = True
+                self.topk_output_format = TopKOutputFormat.STANDARD
                 self.w13_weight = torch.empty(0)
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
                 self.plan = {}
+                self.activation_situ_linear_beta = kwargs["activation_situ_linear_beta"]
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).
                 self.supports_deferred_finalize = False
+
+            def forward(self, *, hidden_states, **kwargs):
+                return hidden_states + 1
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -445,6 +478,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 ep_size=8,
                 ep_group=ep_group,
                 tp_ep_size=8,
+                has_tp_ep=True,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
             ),
@@ -489,10 +523,110 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
 
         self.assertFalse(shared_calls[0]["reduce_results"])
+        self.assertIsNone(expert_calls[0]["routing_mode"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
+        self.assertEqual(
+            layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
+        )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
         self.assertEqual(
             layer.native_latent_moe.components["expert_parallel_group"], ep_group
+        )
+
+        # TP shards each produce only a partial W2 result. They must use the
+        # composed tail, whose reduction group spans TP x EP, instead of the
+        # native LatentMoELayer path that only reduces across EP.
+        tp_mapping = SimpleNamespace(
+            world_size=8,
+            attn=mapping.attn,
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=8,
+                tp_group=ep_group,
+                ep_rank=0,
+                ep_size=1,
+                ep_group=(0,),
+                tp_ep_size=8,
+                has_tp_ep=True,
+                tp_ep_rank=0,
+                tp_ep_group=ep_group,
+            ),
+        )
+        with (
+            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
+            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
+            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
+            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
+            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
+            mock.patch.object(
+                kimi_k3.Kimi3MoEExecutionPlan,
+                "build",
+                return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_native=True,
+                    use_trtllm=False,
+                    overlap_shared_experts=False,
+                    joint_moe_reduce=False,
+                ),
+            ),
+            mock.patch.dict(
+                kimi_k3.global_server_args_dict,
+                {"enforce_eager": False},
+            ),
+        ):
+            tp_layer = kimi_k3.KimiLinearMoE(
+                config,
+                tp_mapping,
+                layer_index=1,
+                model_scope="model.layers",
+                quant_config=None,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+
+        self.assertIsNone(tp_layer.native_latent_moe)
+        self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
+        routed_input = torch.zeros(1, config.routed_expert_hidden_size)
+        torch.testing.assert_close(
+            tp_layer._routed_experts(
+                routed_input,
+                mock.Mock(),
+                num_global_tokens=1,
+                max_num_tokens_per_gpu=1,
+            ),
+            routed_input + 1,
+        )
+
+    def test_native_kimi_moe_zero_tokens_bypass_fused_pipeline(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        hidden_states = torch.empty(0, 64)
+        prefix_sum = torch.empty_like(hidden_states)
+        native_latent_moe = mock.Mock(return_value=prefix_sum)
+        fused_pipeline = mock.Mock(
+            side_effect=AssertionError("zero tokens must bypass the fused pipeline")
+        )
+        layer = SimpleNamespace(
+            _gather_dp_tokens_for_moe=False,
+            native_latent_moe=native_latent_moe,
+            _use_fused_decode_pipeline=True,
+            _forward_fused_decode_pipeline=fused_pipeline,
+        )
+
+        output = KimiLinearMoE.forward(
+            layer,
+            hidden_states,
+            prefix_sum,
+            num_global_tokens=0,
+            max_num_tokens_per_gpu=0,
+        )
+
+        torch.testing.assert_close(output, prefix_sum)
+        self.assertEqual(tuple(output.shape), (0, 64))
+        fused_pipeline.assert_not_called()
+        native_latent_moe.assert_called_once_with(
+            hidden_states,
+            num_global_tokens=0,
+            max_num_tokens_per_gpu=0,
+            prefix_sum=prefix_sum,
         )
 
     def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
@@ -696,21 +830,29 @@ class KimiK3LcmPlanTests(unittest.TestCase):
 
         return kimi_tp8_layout(text_config=cfg, tp_size=tp)[2].bind(64)
 
-    def test_linear_packing_scales_with_attn_tp(self):
-        """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA
-        state page halves while the MLA latent page is tp-invariant -- packs
-        twice as many KDA pages per plane instead of failing the planner's
-        padding bound (1.268089 > 0.25 before the fix)."""
+    def test_mla_packing_scales_with_attn_tp(self):
+        """The MLA plane is the smallest that covers one per-layer KDA state,
+        so tp=16 -- where the KDA state page halves while the MLA latent page
+        is tp-invariant -- halves the plane and the parent, and tp=1
+        (attention-DP) grows them 8/tp-fold instead of failing the planner's
+        exact-page-stride check."""
         cfg = KimiLinearConfig()
         plan8 = self._plan(cfg, 8)
         plan16 = self._plan(cfg, 16)
+        plan1 = self._plan(cfg, 1)
         packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
         packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
-        self.assertEqual(packs8[FULL_ATTENTION], packs16[FULL_ATTENTION])
+        packs1 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan1.groups}
+        self.assertEqual(packs8[FULL_ATTENTION], 12)
+        self.assertEqual(packs16[FULL_ATTENTION], 6)
+        self.assertEqual(packs1[FULL_ATTENTION], 89)
         for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
-            self.assertEqual(packs16[gid], 2 * packs8[gid])
-        self.assertEqual(len(plan8.planes), _NUM_MLA)
-        self.assertEqual(len(plan16.planes), _NUM_MLA)
+            self.assertEqual(packs8[gid], 1)
+            self.assertEqual(packs16[gid], 1)
+            self.assertEqual(packs1[gid], 1)
+        self.assertEqual(plan16.lcm_block_bytes * 2, plan8.lcm_block_bytes)
+        for plan in (plan8, plan16, plan1):
+            self.assertEqual(len(plan.planes), _NUM_MLA)
 
     def test_reduced_layer_variant_plans(self):
         """Layer counts derive from the config: a structurally-identical

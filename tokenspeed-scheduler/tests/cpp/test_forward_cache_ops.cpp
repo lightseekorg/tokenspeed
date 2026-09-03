@@ -559,7 +559,10 @@ TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
 
 TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     SchedulerConfig config = MakeValidConfig();
-    config.enable_pd_cache = true;
+    // A P or D role IS the cache-transfer PD protocol, so it demands an
+    // explicit transfer_policy; the fused role (MakeValidConfig's default)
+    // never does.
+    config.role = Role::kD;
     CacheGroupConfig& history = config.cache_groups[0];
 
     // A History group ships its full suffix; leaving the policy to the default

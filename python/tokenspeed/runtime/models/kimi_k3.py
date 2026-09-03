@@ -102,6 +102,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     get_is_capture_mode,
+    get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.layernorm import (
@@ -158,7 +159,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -533,7 +533,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
             q = self.q_b_proj(q_norm)[0]
             return q, latent_cache, gate, None
-        projection = mla_normalize_project_query(
+        q, absorbed_query = mla_normalize_project_query(
             q_a,
             kv_a,
             self.fused_qk_layernorm.weight_q_a,
@@ -544,7 +544,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return projection.query, latent_cache, gate, projection.absorbed_query
+        return q, latent_cache, gate, absorbed_query
 
     def can_fuse_attnres_partials(
         self,
@@ -1038,9 +1038,12 @@ class KimiLinearKDA(nn.Module):
         proj = self.num_heads * self.head_dim
         hidden = config.hidden_size
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        # KDA parallelism reads the linear-attention mapping: it defaults to
+        # the attention TP width and diverges only under the
+        # MLA-DP + linear-attn-TP hybrid.
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
         self.local_num_heads = self.num_heads // tp_size
         proj_local = proj // tp_size
 
@@ -1141,7 +1144,6 @@ class KimiLinearKDA(nn.Module):
                 prepacked_scales=getattr(
                     self.qkvgb_proj, "_flashinfer_scales_mn", None
                 ),
-                enable_pdl=pdl_enabled(),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -1236,7 +1238,7 @@ class KimiLinearKDA(nn.Module):
             activation="silu",
             key_dim=proj,
             value_dim=proj,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=hd,
             head_v_dim=hd,
             f_a_out=f_a_out,
@@ -1290,7 +1292,6 @@ class KimiLinearMoEGate(nn.Module):
         return kimi3_router_projection(
             hidden_states,
             self.weight,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -1355,7 +1356,8 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE.
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE. The selected MoE kernel
+      advertises whether it consumes precomputed TopK or routes from logits.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
 
@@ -1440,24 +1442,9 @@ class KimiLinearMoE(nn.Module):
                 )
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
-        self.topk = TopK(
-            top_k=self.top_k,
-            renormalize=config.moe_renormalize,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            num_fused_shared_experts=0,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            output_format=TopKOutputFormat.STANDARD,
-            # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
-            topk_weights_dtype=(
-                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
-            ),
-        )
-
-        # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
-        # precomputed sigmoid/noaux_tc TopK.
+        # Leave routing unconstrained: the registry prefers a kernel-routing
+        # implementation when one exists and otherwise selects a precomputed-
+        # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
             num_experts=self.num_experts,
@@ -1483,8 +1470,9 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode="precomputed_topk",
-            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
+            routing_mode=None,
+            # Native gfx950 accepts bf16 model activations; the selected kernel
+            # may quantize them internally. Hopper Marlin runs A16W4.
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
             # runs w4a4 with the kernel wrapper quantizing the bf16 input
@@ -1499,11 +1487,30 @@ class KimiLinearMoE(nn.Module):
                 )
             ),
         )
-        if self.experts.support_routing:
-            raise RuntimeError(
-                "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
-                "selected backend unexpectedly performs internal routing"
-            )
+
+        # Derive the producer contract from the concrete registry selection;
+        # backend family alone is too coarse (TRT-LLM has both kernel-routing
+        # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=config.moe_renormalize,
+            use_grouped_topk=config.use_grouped_topk,
+            num_expert_group=config.num_expert_group,
+            num_fused_shared_experts=0,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if self.experts.supports_precomputed_topk
+                else self.experts.topk_output_format
+            ),
+            # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
+            # without a cast. This setting is unused by kernel-routing plans.
+            topk_weights_dtype=(
+                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
+            ),
+        )
 
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
@@ -1535,9 +1542,14 @@ class KimiLinearMoE(nn.Module):
                 int(global_server_args_dict["comm_fusion_max_num_tokens"]),
                 1,
             ),
+            shard_up_projection=self._shard_up_projection,
         )
 
-        self._topk_ready = torch.cuda.Event() if alt_stream is not None else None
+        self._topk_ready = (
+            torch.cuda.Event()
+            if alt_stream is not None and self.experts.supports_precomputed_topk
+            else None
+        )
 
         # Shared experts (SiTU dense MLP over the full hidden size).
         self.shared_experts = KimiLinearMLP(
@@ -1554,6 +1566,9 @@ class KimiLinearMoE(nn.Module):
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+        # LatentMoELayer reduces routed partials across EP only. A TP-sharded
+        # W2 also needs a TP reduction, which the graph-safe K3MoeTailComm path
+        # below performs across the full TP x EP group.
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1575,7 +1590,7 @@ class KimiLinearMoE(nn.Module):
                 expert_parallel_group=mapping.moe.ep_group,
                 input_projections=self._latent_input_projections,
             )
-            if self.execution_plan.use_native
+            if self.execution_plan.use_native and mapping.moe.tp_size == 1
             else None
         )
         # Dry-run exact registry selection for the fused decode pipeline.
@@ -1592,6 +1607,7 @@ class KimiLinearMoE(nn.Module):
                 self.experts.w2_weight_scale,
                 self.experts.plan,
                 topk=self.top_k,
+                linear_clamp=self.experts.activation_situ_linear_beta,
             )
         )
 
@@ -1684,9 +1700,9 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
     ) -> torch.Tensor:
-        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
+        """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
         plan = self.execution_plan
-        if not plan.use_trtllm and not plan.use_marlin:
+        if not plan.use_native and not plan.use_trtllm and not plan.use_marlin:
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
                 "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
@@ -1701,6 +1717,29 @@ class KimiLinearMoE(nn.Module):
         # The kernel returns this rank's pre-reduce partial; the selected
         # tail tier owns the combining reduction.
         return out
+
+    def _routing_output_format(self, ctx: ForwardContext | None) -> TopKOutputFormat:
+        """Choose between the selected kernel's two routing entry points."""
+        if not (
+            self.execution_plan.use_trtllm
+            and self.experts.support_routing
+            and self.experts.supports_precomputed_topk
+        ):
+            return self.experts.topk_output_format
+        # Keep the decode-optimized precomputed path. Extend/mixed forwards use
+        # FlashInfer's public routing API, which wins for prefill-sized batches.
+        # Cross-DP-EP gathers the same global batch onto every MoE rank, so use
+        # the replicated phase decision rather than a rank-local IDLE mode.
+        if ctx is None:
+            return TopKOutputFormat.STANDARD
+        is_decode = (
+            ctx.all_decode_or_idle
+            if self._gather_dp_tokens_for_moe
+            else ctx.forward_mode.is_decode()
+        )
+        if is_decode:
+            return TopKOutputFormat.STANDARD
+        return TopKOutputFormat.BYPASSED
 
     def _forward_fused_decode_pipeline(
         self,
@@ -1821,7 +1860,7 @@ class KimiLinearMoE(nn.Module):
             max_num_tokens_per_gpu = num_global_tokens
 
         if self.native_latent_moe is not None:
-            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
+            if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
                 output = self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
             else:
                 output = self.native_latent_moe(
@@ -1836,35 +1875,86 @@ class KimiLinearMoE(nn.Module):
         if num_tokens == 0:
             return prefix_sum
 
-        # Router runs uncontended on main (3us; on aux it starves to 14us
-        # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
-        # down_proj from the aux stream, followed by the shared chain.
-        router_logits = self.gate(hidden_states)
-        plan = self.comm.plan(num_tokens, hidden_states)
-        if plan.lane is not None:
-            self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
-        else:
-            self.experts._situ_output_buffer = None
-        prepared_shared_shard = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
-            with fork.branch():
-                topk_output = self.topk(hidden_states, router_logits)
-                if self._topk_ready is not None and fork._active:
-                    self._topk_ready.record(torch.cuda.current_stream())
-                shared_partial = self.shared_experts(
-                    hidden_states,
-                    down_out=(
-                        plan.lane[:, self.routed_hidden :]
-                        if plan.lane is not None
-                        else None
-                    ),
+        routing_output_format = self._routing_output_format(ctx)
+        precompute_topk = routing_output_format.is_standard()
+        plan = self.comm.plan(
+            num_tokens,
+            hidden_states,
+            # Rank-uniform by construction: DP-EP gather replicates the phase.
+            is_decode=(
+                ctx is not None
+                and (
+                    ctx.all_decode_or_idle
+                    if self._gather_dp_tokens_for_moe
+                    else ctx.forward_mode.is_decode()
                 )
+            ),
+        )
+        # Producer-direct destinations for the routed and shared partials. The
+        # symmetric pair is preferred (the tail reduces it in place); the packed
+        # lane is the fallback, and its two halves are slices of one buffer.
+        if plan.symm_outputs is not None:
+            routed_out_buf, shared_out_buf = plan.symm_outputs
+        elif plan.lane is not None:
+            routed_out_buf = plan.lane[:, : self.routed_hidden]
+            shared_out_buf = plan.lane[:, self.routed_hidden :]
+        else:
+            routed_out_buf = shared_out_buf = None
+        self.experts._situ_output_buffer = routed_out_buf
+
+        # The router, routed latent and shared gate/up read the same activation
+        # and reduce over the same width, so one GEMM replaces three. Returns
+        # None when the packed weight is unavailable or the shapes are outside
+        # the fused kernel, which leaves the separate projections below.
+        fused_inputs = self._latent_input_projections(
+            hidden_states, shared_out=shared_out_buf
+        )
+        if fused_inputs is not None:
+            router_logits, routed_in, shared_partial = fused_inputs
+        else:
+            # Router runs uncontended on main (3us; on aux it starves to 14us
+            # under concurrent GEMMs). When the selected experts need
+            # precomputed TopK runs on the fork branch beside down_proj;
+            # routing bypasses it.
+            router_logits = self.gate(hidden_states)
+            routed_in = shared_partial = None
+
+        prepared_shared_shard = None
+        # Enable the fork for the whole graph phase, but only overlap during
+        # capture. The pre-capture warmup runs with capture mode off, so gating
+        # ``enable`` on it left the auxiliary stream completely untouched until
+        # capture itself -- the first hipBLASLt call on that stream then did its
+        # lazy handle/workspace setup inside the capturing stream and raised
+        # "operation not permitted when stream is capturing" (900) on every
+        # rank, deadlocking startup. Enabling on the graph phase makes warmup
+        # execute the same branches on the auxiliary stream, serially
+        # (``overlap=False``), so every backend is initialized before capture.
+        # This matches the contract _capture_one documents and the pattern the
+        # other fork-using models already follow.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
+            with fork.branch():
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    output_format=routing_output_format,
+                )
+                if self._topk_ready is not None and precompute_topk and fork._active:
+                    self._topk_ready.record(torch.cuda.current_stream())
+                if shared_partial is None:
+                    shared_partial = self.shared_experts(
+                        hidden_states,
+                        down_out=shared_out_buf,
+                    )
                 if plan.split_shared_rs and fork._active:
                     prepared_shared_shard = self.comm.reduce_scatter_shared(
                         shared_partial
                     )
-            routed_in, _ = self.routed_expert_down_proj(hidden_states)
-            if self._topk_ready is not None and fork._active:
+            if routed_in is None:
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+            if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
                 routed_in,
@@ -2081,7 +2171,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm.variance_epsilon,
                 _sliced_scratch(prefix_sum, 1, n_tok),
                 torch.empty_like(prefix_sum),
-                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(
@@ -2284,10 +2373,11 @@ class KimiLinearDecoderLayer(nn.Module):
             else None
         )
         attnres_partial_args = None
-        if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
+        if next_mix is not None and self._hoist_next_mlp:
             next_layer, _ = next_mix
             # This layer's attention projection writes both block partials
             # hoisted for the next layer, which consumes their scratch slots.
+            # Kernel availability below is the token-count capability gate.
             candidate_args = (
                 block_residual[:mlp_valid_blocks],
                 next_layer._mlp_wp,
@@ -2308,6 +2398,12 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.k3_comm.state.attn_ar_fusion_ok
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
+                )
+                or (
+                    # The gfx950 fused reducer consumes the AttnRes scratch
+                    # through M=16, so its producer stream must join first.
+                    current_platform().is_cdna4
+                    and num_tokens <= ATTNRES_STREAM_FORK_THRESHOLD
                 )
             )
         )

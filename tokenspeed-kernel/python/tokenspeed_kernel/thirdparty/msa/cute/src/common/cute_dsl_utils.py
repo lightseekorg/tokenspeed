@@ -98,17 +98,8 @@ def load_cubin_module_data_patched(cubin_data, filepath):
     return load_cubin_module_data_og(cubin_data)
 
 
-def cute_compile_patched(*args, **kwargs):
-    """A patched version of cute.compile.
-
-    Behaviour:
-    - Dumps SASS to a file if ``CUTE_CUBIN_PATH`` is set.
-    - Logs JIT compile wall time at DEBUG level via the ``minimax`` logger,
-      tagged with the kernel's class name when available.  Enable with
-      ``logging.getLogger("minimax").setLevel(logging.DEBUG)`` or env
-      ``MINIMAX_LOG_COMPILE=1``; this is how we distinguish a slow JIT
-      (~2-10s) from a kernel hang (>30s = deadlock, see CLAUDE.md).
-    """
+def _compile_with_instrumentation(compile_callable, *args, **kwargs):
+    """Compile while preserving the optional MSA logging and cubin dump."""
     cubin_path = os.getenv("CUTE_CUBIN_PATH", None)
     if cubin_path is not None:
         cutlass.base_dsl.runtime.cuda.load_cubin_module_data = partial(
@@ -117,15 +108,49 @@ def cute_compile_patched(*args, **kwargs):
     kernel_obj = args[0] if args else kwargs.get("op")
     kernel_name = type(kernel_obj).__name__ if kernel_obj is not None else "<unknown>"
     t0 = time.time()
-    output = cute_compile_og(*args, **kwargs)
-    dt = time.time() - t0
-    logger.debug("[%s] compiled in %.1fs", kernel_name, dt)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
-        if extract is not None:
-            sass = extract(cubin_path, None)
-            pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
+    try:
+        output = compile_callable(*args, **kwargs)
+    finally:
+        logger.debug("[%s] compiled in %.1fs", kernel_name, time.time() - t0)
+        if cubin_path is not None:
+            cutlass.base_dsl.runtime.cuda.load_cubin_module_data = (
+                load_cubin_module_data_og
+            )
+    if cubin_path is not None and extract is not None:
+        sass = extract(cubin_path, None)
+        pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
     return output
+
+
+class _CompileCallableProxy:
+    """Instrument ``cute.compile`` without narrowing its public interface.
+
+    Behaviour:
+    - Dumps SASS to a file if ``CUTE_CUBIN_PATH`` is set.
+    - Logs JIT compile wall time at DEBUG level via the ``minimax`` logger,
+      tagged with the kernel's class name when available.  Enable with
+      ``logging.getLogger("minimax").setLevel(logging.DEBUG)`` or env
+      ``MINIMAX_LOG_COMPILE=1``; this is how we distinguish a slow JIT
+      (~2-10s) from a kernel hang (>30s = deadlock, see CLAUDE.md).
+
+    CuTe also supports option-bound calls through ``cute.compile[options]``.
+    Returning another proxy from ``__getitem__`` keeps that API available to
+    other CuTe users imported in the same process, including FlashInfer.
+    """
+
+    _tokenspeed_msa_compile_proxy = True
+
+    def __init__(self, compile_callable):
+        self._compile_callable = compile_callable
+
+    def __call__(self, *args, **kwargs):
+        return _compile_with_instrumentation(self._compile_callable, *args, **kwargs)
+
+    def __getitem__(self, options):
+        return type(self)(self._compile_callable[options])
+
+    def __getattr__(self, name):
+        return getattr(self._compile_callable, name)
 
 
 if os.getenv("MINIMAX_LOG_COMPILE", "0") == "1":
@@ -140,8 +165,8 @@ if os.getenv("MINIMAX_LOG_COMPILE", "0") == "1":
 
 # Monkey-patch cute.compile so every JIT compile across the repo gets timed
 # without touching individual call sites.  Idempotent: only patches once.
-if cute.compile is not cute_compile_patched:
-    cute.compile = cute_compile_patched
+if not getattr(cute.compile, "_tokenspeed_msa_compile_proxy", False):
+    cute.compile = _CompileCallableProxy(cute_compile_og)
 
 
 def assume_strides_aligned(t):

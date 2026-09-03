@@ -52,18 +52,17 @@ from tokenspeed.runtime.distributed.comm_backend import (
 )
 
 # Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
-# tensors past the one-shot admission window always take an NCCL path.
+# tensor collections past the one-shot window take an NCCL path.
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _get_process_group(group: Group):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_device_process_group(group)
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +191,30 @@ def all_reduce_latent_norm(
         group=process_group,
         eps=eps,
         max_token_num=max_token_num,
-        launch_with_pdl=pdl_enabled(),
         trigger_completion_at_end=True,
     )
+
+
+def can_acquire_all_reduce_outputs(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> bool:
+    """Whether ``acquire_all_reduce_outputs`` returns producer-direct memory.
+
+    ``acquire_all_reduce_outputs`` always returns writable buffers, falling
+    back to ordinary allocations the collective has to stage. Ask here when the
+    buffers are only worth taking if the reduction consumes them in place.
+
+    This is COLLECTIVE in the same sense the acquire is: every rank of
+    ``group`` must call it with identical arguments, or the group will disagree
+    on which collective the tail runs.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.can_acquire_all_reduce_outputs(shapes, like, group, op=op)
 
 
 def acquire_all_reduce_outputs(
@@ -294,7 +314,6 @@ def fused_all_reduce(
             has_partial_norm_out=fusion_params.has_partial_norm_out,
             trigger_completion_at_end=fusion_params.trigger_completion_at_end,
             max_sm_to_use=fusion_params.max_sm_to_use,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -327,8 +346,8 @@ def fused_reduce_scatter(
             add_in=fusion_params.add_in,
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num or tensor.shape[0],
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -361,11 +380,11 @@ def fused_all_gather(
             rank=rank,
             group=_get_process_group(group),
             total_num_tokens=fusion_params.total_num_tokens,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num
             or max(tensor.shape[0], fusion_params.total_num_tokens),
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(

@@ -32,12 +32,8 @@ All default values below are taken verbatim from the reference checkpoint
 ``a527b42cb673d79569f3ffe0b3a0a655df98a739``).
 """
 
-import math
-
-import torch
 from transformers.configuration_utils import PretrainedConfig
 
-from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -133,7 +129,7 @@ class KimiLinearConfig(PretrainedConfig):
       KV-cache allocator.
 
     The ``layers_block_type`` / ``layer_types`` / ``linear_layer_ids`` /
-    ``full_attention_layer_ids`` / ``mamba2_cache_params`` / ``mamba_cache_per_req``
+    ``full_attention_layer_ids``
     properties are the **interface consumed by the KV-cache / hybrid-attention
     layer** (owned by the KV-cache team). Their shapes are derived from the KDA
     config here; the final state layout/dtype is validated on the cache side.
@@ -297,60 +293,6 @@ class KimiLinearConfig(PretrainedConfig):
         return [
             i for i, t in enumerate(self.layers_block_type) if t == _ATTENTION_LAYER
         ]
-
-    @property
-    def mamba2_cache_params(self):
-        """KDA per-request state spec consumed by the hybrid KV-cache allocator.
-
-        Returns ``(conv_state_shape, temporal_state_shape, conv_dtype,
-        ssm_dtype, mamba_layer_ids)``. KDA runs three short causal convolutions
-        (q/k/v), each ``num_heads * head_dim`` wide, and keeps a per-head
-        ``head_dim x head_dim`` recurrent (delta-rule) state in fp32.
-
-        NOTE: this is the interface for the KV-cache team; the concrete state
-        layout is validated on the cache side.
-        """
-        # Imported lazily to avoid config/env import cycles at module load.
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        mapping = global_server_args_dict["mapping"]
-        attn_tp_size = mapping.attn.tp_size
-
-        la = self.linear_attn_config
-        num_heads = la["num_heads"]
-        head_dim = la["head_dim"]
-        conv_kernel_size = la["short_conv_kernel_size"]
-
-        conv_dim = 3 * num_heads * head_dim
-        conv_state_shape = (
-            divide(conv_dim, attn_tp_size),
-            conv_kernel_size - 1,
-        )
-        temporal_state_shape = (
-            divide(num_heads, attn_tp_size),
-            head_dim,
-            head_dim,
-        )
-        conv_dtype = torch.bfloat16
-        # KDA recurrent (delta-rule) state is fp32.
-        ssm_dtype = torch.float32
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            self.linear_layer_ids,
-        )
-
-    @property
-    def mamba_cache_per_req(self) -> int:
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.mamba2_cache_params
-        )
-        return (
-            math.prod(conv_state_shape) * conv_dtype.itemsize
-            + math.prod(temporal_state_shape) * ssm_dtype.itemsize
-        ) * len(mamba_layers)
 
 
 def _default_linear_attn_config() -> dict:

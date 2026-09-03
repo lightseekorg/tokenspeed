@@ -178,16 +178,18 @@ class GenerateReqInput:
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
 
+    # Hard-pin to this attention-DP rank, bypassing load balancing. Ignored on
+    # disaggregation engines, where the bootstrap_room residue is authoritative.
+    data_parallel_rank: list[int] | int | None = None
+
     def normalize_batch_and_arguments(self):
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
+        provided_sources = sum(
+            source is not None
+            for source in (self.text, self.input_ids, self.input_embeds)
+        )
+        if provided_sources != 1:
             raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of text, input_ids, or input_embeds should be provided."
             )
 
         # Derive the batch size
@@ -280,6 +282,14 @@ class GenerateReqInput:
                 self.token_ids_logprob = None
             if isinstance(self.input_extra_infos, dict):
                 self.input_extra_infos = [self.input_extra_infos]
+            if isinstance(self.data_parallel_rank, list):
+                _require(
+                    len(self.data_parallel_rank) == 1,
+                    "data_parallel_rank list should have length 1 for "
+                    "single request.",
+                )
+                # Unwrap: TokenizedGenerateReqInput types this int | None.
+                self.data_parallel_rank = self.data_parallel_rank[0]
         else:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
@@ -393,6 +403,20 @@ class GenerateReqInput:
                     "bootstrap_room cannot be a list when n > 1.",
                 )
 
+            if self.data_parallel_rank is None:
+                self.data_parallel_rank = [None] * num
+            elif not isinstance(self.data_parallel_rank, list):
+                self.data_parallel_rank = [self.data_parallel_rank] * num
+            else:
+                _require(
+                    self.parallel_sample_num == 1,
+                    "data_parallel_rank cannot be a list when n > 1.",
+                )
+                _require(
+                    len(self.data_parallel_rank) == num,
+                    "data_parallel_rank list length must match the batch size.",
+                )
+
         # Other checks
         if self.session_params is not None:
             _require(
@@ -450,6 +474,11 @@ class GenerateReqInput:
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
+            data_parallel_rank=(
+                self.data_parallel_rank[i]
+                if self.data_parallel_rank is not None
+                else None
             ),
         )
         sub.rid = self.rid[i]
@@ -512,6 +541,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # makes RequestHandler admit the request pre-finished with FINISH_ABORT so
     # the client receives a terminal abort instead of a silent drop.
     validation_error: str | None = None
+
+    # Hard-pin to an attention-DP rank. Keep last: array_like declaration
+    # order is the wire contract.
+    data_parallel_rank: int | None = None
 
 
 @dataclass

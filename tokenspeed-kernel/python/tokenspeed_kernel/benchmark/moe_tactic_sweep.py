@@ -75,10 +75,8 @@ from tokenspeed_kernel.ops.tuning import (
 SITU_TUNE_MAX_NUM_TOKENS = get_autotune_max_num_tokens()
 
 SF_BLOCK = 32
-# Buckets below this are left on the autotuner's own choice: the enumeration
-# and profiling problems only bite once tokens-per-expert crosses tile
-# boundaries, and measured decode-range picks were already optimal.
-DEFAULT_SWEEP_MIN_BUCKET = 128
+# With the heuristic floor every bucket is safe to sweep; kept for opt-outs.
+DEFAULT_SWEEP_MIN_BUCKET = 1
 STAGE1_CONFIGS_PER_FAMILY = 3
 STAGE2_MAX_CONFIGS = 64
 
@@ -129,18 +127,35 @@ def _make_tokens(
     return x_q, x_scale, topk_ids, topk_weights
 
 
-def _time_call(fn, iters: int, warmup: int = 3) -> float:
+def _time_call(fns, iters: int, warmup: int = 3) -> float:
+    """Time CUDA-graph replays of one pass over every weight copy.
+
+    Replay keeps the host out of the timed region (at small buckets the op's
+    GPU work is ~17us against ~300us of host path, so host-inclusive timing
+    ranks host jitter instead of tactics), and cycling copies keeps every
+    call streaming cold weights, both matching how serving runs the op.
+    """
+    if not isinstance(fns, (list, tuple)):
+        fns = [fns]
+    n = len(fns)
+    for i in range(max(warmup, n)):
+        fns[i % n]()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for fn in fns:
+            fn()
+    g.replay()
+    torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
+    reps = max(1, iters // n)
     start.record()
-    for _ in range(iters):
-        fn()
+    for _ in range(reps):
+        g.replay()
     stop.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(stop) * 1000.0 / iters  # us
+    return start.elapsed_time(stop) * 1000.0 / (reps * n)
 
 
 def _candidate_tactics(args) -> list[tuple[int, int]]:
@@ -185,7 +200,7 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
     from flashinfer.tllm_enums import ActivationType
 
     x_q, x_scale, topk_ids, topk_weights = tokens
-    w13, w13_scale, w2, w2_scale = W
+    W_list = W if isinstance(W, list) else [W]
     # The cache key carries the output shape, so the modes need separate sweeps.
     output = (
         torch.zeros(
@@ -201,43 +216,46 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
         (args.local_experts,), args.situ_beta, dtype=torch.float32, device=x_q.device
     )
 
-    def call():
-        trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(topk_ids, topk_weights),
-            routing_bias=None,
-            hidden_states=x_q,
-            hidden_states_scale=x_scale,
-            gemm1_weights=w13,
-            gemm1_weights_scale=w13_scale,
-            gemm1_bias=None,
-            gemm1_alpha=alpha,
-            gemm1_beta=beta,
-            gemm1_clamp_limit=None,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
-            num_experts=args.num_experts,
-            top_k=args.top_k,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=args.intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=args.local_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            do_finalize=do_finalize,
-            enable_pdl=False,
-            activation_type=10,  # ActivationType.Situ; probed at startup
-            tune_max_num_tokens=SITU_TUNE_MAX_NUM_TOKENS,
-            output=output,
-        )
+    def _mk(w13, w13_scale, w2, w2_scale):
+        def call():
+            trtllm_fp4_block_scale_routed_moe(
+                topk_ids=(topk_ids, topk_weights),
+                routing_bias=None,
+                hidden_states=x_q,
+                hidden_states_scale=x_scale,
+                gemm1_weights=w13,
+                gemm1_weights_scale=w13_scale,
+                gemm1_bias=None,
+                gemm1_alpha=alpha,
+                gemm1_beta=beta,
+                gemm1_clamp_limit=None,
+                gemm2_weights=w2,
+                gemm2_weights_scale=w2_scale,
+                gemm2_bias=None,
+                output1_scale_scalar=None,
+                output1_scale_gate_scalar=None,
+                output2_scale_scalar=None,
+                num_experts=args.num_experts,
+                top_k=args.top_k,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=args.intermediate_size,
+                local_expert_offset=0,
+                local_num_experts=args.local_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,
+                do_finalize=do_finalize,
+                enable_pdl=False,
+                activation_type=10,  # ActivationType.Situ; probed at startup
+                tune_max_num_tokens=SITU_TUNE_MAX_NUM_TOKENS,
+                output=output,
+            )
+
+        return call
 
     assert ActivationType.Situ.value == 10
     tactic_setter(tactic)
-    return _time_call(call, iters=iters)
+    return _time_call([_mk(*w) for w in W_list], iters=iters)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -283,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--min-bucket",
         type=int,
-        default=DEFAULT_SWEEP_MIN_BUCKET,
+        default=1,
         help="Sweep buckets >= this; smaller buckets keep the autotuner's pick",
     )
     parser.add_argument(
@@ -296,6 +314,13 @@ def main(argv: list[str] | None = None) -> int:
             "misses every deferred-finalize call (K3 decode, where the MoE "
             "tail owns finalize)"
         ),
+    )
+    parser.add_argument("--weight-copies", type=int, default=8)
+    parser.add_argument(
+        "--floor-margin",
+        type=float,
+        default=1.04,
+        help="Ship a tuned tactic only if it beats the untuned heuristic by this",
     )
     parser.add_argument("--coarse-iters", type=int, default=8)
     parser.add_argument("--fine-iters", type=int, default=50)
@@ -318,9 +343,16 @@ def main(argv: list[str] | None = None) -> int:
             cudnn_version,
         )
         print(f"generated output path: {output}")
-    W = _make_weights(
-        args.local_experts, args.hidden_size, args.intermediate_size, device, seed=1
-    )
+    W = [
+        _make_weights(
+            args.local_experts,
+            args.hidden_size,
+            args.intermediate_size,
+            device,
+            seed=1 + c,
+        )
+        for c in range(args.weight_copies)
+    ]
 
     modes = (
         (True, False)
@@ -407,11 +439,23 @@ def main(argv: list[str] | None = None) -> int:
             best_time, best_tactic = min(timed)
             if native_time <= best_time:
                 best_time, best_tactic = native_time, tuple(native_tactic)
-            set_tactic(best_tactic)
+            # Floor: a tuned tactic must clear the untuned heuristic; else
+            # the entry pins -1 (a cache miss to the runner), so the table
+            # can never be slower than no table and every bucket is safe.
+            saved = tuner.profiling_cache.pop(key)
+            heuristic_time = run(None, args.fine_iters)
+            tuner.profiling_cache[key] = saved
+            if best_time * args.floor_margin <= heuristic_time:
+                set_tactic(best_tactic)
+                verdict = "tuned"
+            else:
+                best_time, best_tactic = heuristic_time, (-1, -1)
+                set_tactic(best_tactic)
+                verdict = "heuristic floor"
             print(
-                f"bucket {bucket:>5} ({label}): tactic {best_tactic} "
+                f"bucket {bucket:>5} ({label}): {verdict} {best_tactic} "
                 f"{best_time:7.1f}us (native {tuple(native_tactic)} "
-                f"{native_time:7.1f}us)"
+                f"{native_time:7.1f}us, heuristic {heuristic_time:7.1f}us)"
             )
 
     tuner.save_configs(output)

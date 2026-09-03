@@ -68,6 +68,8 @@ _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+_FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
+
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -79,7 +81,10 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -126,7 +131,6 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -219,7 +223,8 @@ class DeepseekV3MLP(nn.Module):
 
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
             x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x, self.gate_up_proj.input_scale_inv, enable_pdl=pdl_enabled()
+                x,
+                self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -228,7 +233,6 @@ class DeepseekV3MLP(nn.Module):
                 self.gate_up_proj.weight_scale_swiglu_interleaved,
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
@@ -266,7 +270,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                enable_pdl=pdl_enabled(),
             )
         else:
             logits = F.linear(hidden_states, self.weight, None)
@@ -363,7 +366,11 @@ class DeepseekV3MoE(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
 
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        # Warm the shared-expert branch serially on its capture stream, then
+        # overlap it with routed experts during capture.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if num_tokens > 0:
@@ -397,7 +404,6 @@ class DeepseekV3MoE(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             final_hidden_states = (
@@ -465,6 +471,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
         if (
             self.use_min_latency
             and x.size(0) > 0
+            and x.size(0) <= _FUSED_A_MAX_M
             and block_scale is None
             and (output_dtype is None or output_dtype == torch.bfloat16)
         ):
@@ -849,12 +856,23 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
+        cache_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the Paged cache path.
-        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
-            self.attn_mqa, out_cache_loc, ctx.forward_mode
+        # group-derived locations on the cache-group path.
+        query_tokens = q.shape[0]
+        if cache_num_tokens is None:
+            cache_num_tokens = query_tokens
+        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
+            raise RuntimeError(
+                "MLA cache write count is outside the query capacity: "
+                f"writes={cache_num_tokens}, queries={query_tokens}"
+            )
+        cache_out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mqa,
+            out_cache_loc[:cache_num_tokens],
+            ctx.forward_mode,
         )
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
@@ -891,15 +909,19 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope_raw = K[..., : self.kv_lora_rank]
             k_pe_raw = K[..., self.kv_lora_rank :]
 
-            fused_kv_arg = create_fused_mla_set_kv_buffer_arg(
-                k_nope=k_nope_raw,
-                rope_dim=self.qk_rope_head_dim,
-                rotary_emb=self.rotary_emb,
-                out_cache_loc=out_cache_loc,
-                token_to_kv_pool=ctx.token_to_kv_pool,
-                layer_id=self.attn_mqa.layer_id,
-                num_q_heads=self.num_local_heads,
-                q_nope=q_nope_absorbed,
+            fused_kv_arg = (
+                create_fused_mla_set_kv_buffer_arg(
+                    k_nope=k_nope_raw,
+                    rope_dim=self.qk_rope_head_dim,
+                    rotary_emb=self.rotary_emb,
+                    out_cache_loc=cache_out_cache_loc,
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    layer_id=self.attn_mqa.layer_id,
+                    num_q_heads=self.num_local_heads,
+                    q_nope=q_nope_absorbed,
+                )
+                if cache_num_tokens == query_tokens
+                else None
             )
             if fused_kv_arg is not None:
                 # One launch for RoPE (or its absence), the FP8 quantize, and
@@ -918,7 +940,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_rope=k_pe_raw,
                     fused_mla_set_kv_buffer_arg=fused_kv_arg,
                     q_rope_out=query_fp8,
-                    enable_pdl=pdl_enabled(),
                 )
                 return query_fp8, None
 
@@ -940,15 +961,14 @@ class DeepseekV3AttentionMLA(nn.Module):
                 ),
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
             # Write FP8 KV cache (single write, no double-write)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                out_cache_loc,
-                cache_k_nope=key_fp8[..., : self.kv_lora_rank],
-                cache_k_rope=key_fp8[..., self.kv_lora_rank :],
+                cache_out_cache_loc,
+                cache_k_nope=key_fp8[:cache_num_tokens, ..., : self.kv_lora_rank],
+                cache_k_rope=key_fp8[:cache_num_tokens, ..., self.kv_lora_rank :],
             )
             return query_fp8, key_fp8
 
@@ -958,12 +978,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_nope=K[..., : self.kv_lora_rank],
                     rope_dim=self.qk_rope_head_dim,
                     rotary_emb=self.rotary_emb,
-                    out_cache_loc=out_cache_loc,
+                    out_cache_loc=cache_out_cache_loc,
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
                     num_q_heads=self.num_local_heads,
                 )
                 if self.attention_backend in self._MLA_KERNEL_BACKENDS
+                and cache_num_tokens == query_tokens
                 else None
             )
             if fused_mla_kv_arg is not None:
@@ -979,7 +1000,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_rope=K[..., self.kv_lora_rank :],
                     fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
                     q_rope_out=Q[..., self.kv_lora_rank :],
-                    enable_pdl=pdl_enabled(),
                 )
                 K = None
             else:
@@ -1001,9 +1021,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                out_cache_loc,
-                cache_k_nope=K[..., : self.kv_lora_rank],
-                cache_k_rope=K[..., self.kv_lora_rank :],
+                cache_out_cache_loc,
+                cache_k_nope=K[:cache_num_tokens, ..., : self.kv_lora_rank],
+                cache_k_rope=K[:cache_num_tokens, ..., self.kv_lora_rank :],
             )
 
         return Q, K
@@ -1083,7 +1103,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the Paged cache path).
+        # (identity off the cache-group path).
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mha, out_cache_loc, ctx.forward_mode
         )
@@ -1131,18 +1151,16 @@ class DeepseekV3AttentionMLA(nn.Module):
                 is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
+            v_fp8 = fp8_quantize(v)
 
-            # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
+            # The cache scatter converts the compressed BF16 latent directly to FP8.
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
-                cache_k_nope=kv_a_fp8.unsqueeze(1),
+                cache_k_nope=kv_a.unsqueeze(1),
                 cache_k_rope=k_pe_for_cache,
             )
 
@@ -1236,7 +1254,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
+                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale
                 )
             else:
                 # BF16 Attention
@@ -1265,7 +1283,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=pdl_enabled(),
             )
 
         return output

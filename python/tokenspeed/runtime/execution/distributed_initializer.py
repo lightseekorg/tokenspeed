@@ -138,6 +138,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -150,7 +152,9 @@ class DistributedInitializer:
         # Pass the device so PyTorch binds the process group to it (eager NCCL
         # init) instead of inferring it later — this also mutes the c10d
         # "barrier(): using the device under current context" warning.
-        device_id = torch.device(config.device, config.gpu_id)
+        device_id = (
+            None if backend == "hccl" else torch.device(config.device, config.gpu_id)
+        )
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(
@@ -163,6 +167,9 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
+        # No-op at the default linear_attn.tp == attn.tp (same group,
+        # idempotent).
+        pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
         if config.mapping.has_pp:
@@ -170,14 +177,7 @@ class DistributedInitializer:
             # broadcasts like the sampled first token (gloo).
             pg_manager.init_process_group(config.mapping.pp_group)
 
-        # Register the trtllm one-shot all-reduce workspaces for the TP
-        # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,
-        # i.e. the per-step decode reductions) through them; larger payloads
-        # and every other op keep using NCCL. Without this the one-shot
-        # backend is never armed and raw all_reduce callers (e.g. models whose
-        # comm cannot fuse into a norm) pay ring latency per layer.
-        # Unconditional: --force-deterministic-rsag is the escape hatch, and
-        # it overrides at dispatch (auto.py) rather than at registration.
+        # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
@@ -186,7 +186,7 @@ class DistributedInitializer:
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
-                # One-shot serves <= 2 MB only; a small token window bounds the IPC workspace (else NCCL).
+                # One-shot window; configure_group widens cross-node groups.
                 max_oneshot_tokens = max(
                     1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
                 )

@@ -66,6 +66,26 @@ run_as_root() {
     fi
 }
 
+apt_install_with_retry() {
+    local max_attempts=5
+    local attempt=1
+    local delay=10
+    while [ "${attempt}" -le "${max_attempts}" ]; do
+        if run_as_root apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 update &&
+            run_as_root apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3 install -y "$@"; then
+            return 0
+        fi
+        if [ "${attempt}" -eq "${max_attempts}" ]; then
+            echo "apt install failed after ${max_attempts} attempts: $*" >&2
+            return 1
+        fi
+        echo "apt install attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..." >&2
+        sleep "${delay}"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+}
+
 ensure_flashinfer_jit_cache() {
     # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
@@ -122,9 +142,7 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # Step 2: Upgrade base tools
 # ============================================================
 if ! dpkg -s openmpi-bin libopenmpi-dev libssl-dev pkg-config > /dev/null 2>&1; then
-    run_as_root apt-get -o DPkg::Lock::Timeout=600 update
-    run_as_root apt-get -o DPkg::Lock::Timeout=600 install -y \
-        openmpi-bin libopenmpi-dev libssl-dev pkg-config
+    apt_install_with_retry openmpi-bin libopenmpi-dev libssl-dev pkg-config
 else
     echo "apt packages already installed, skipping apt"
 fi
@@ -222,7 +240,7 @@ FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
     case "${FLASHINFER_VERSION}" in
-        0.6.16) FLASHINFER_CUBIN_SHA256="6af91f9fdae7b6fd0282f891cbcae3416afdd2c4c14783649d04d1dd83cddee5" ;;
+        0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,

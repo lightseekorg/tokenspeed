@@ -41,35 +41,19 @@ protected:
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
-        auto plan_wb = PlanOnce();
+        const ExecutionPlan seed_stream = PlanOnce();
+        ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty());
+        AckWriteBacks(seed_stream);
         SendFinish("r_seed");
-        const WriteBackBatch* wb = nullptr;
-        for (const auto& op : plan_wb.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    wb = w;
-                    break;
-                }
-            }
-        }
-        ASSERT_NE(wb, nullptr);
-        ASSERT_FALSE(wb->op_ids.empty());
-        SendWriteBackDone(wb->op_ids[0]);
+        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        auto plan_wb2 = PlanOnce();
+        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
-        for (const auto& op : plan_wb2.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
-                    if (!w->op_ids.empty()) SendWriteBackDone(w->op_ids[0]);
-                    break;
-                }
-            }
-        }
+        AckWriteBacks(PlanOnce());
         PlanOnce();
     }
 };
@@ -153,11 +137,11 @@ protected:
     }
 };
 
-TEST_F(StableCandidateOrderingSuite, ForwardOperationsTieBreakOnRequestId) {
-    // TP-determinism regression: requests_ is unordered_map<string, ...> so
-    // candidates are visited in per-process random order. Without the request-id
-    // tiebreaker, each rank can pick a different request when the loop budget
-    // admits only a subset, which deadlocks NCCL.
+TEST_F(StableCandidateOrderingSuite, ForwardOperationsFollowSubmissionOrder) {
+    // TP-determinism + FIFO: requests_ is a vector in submission order, and
+    // the mirrored schedulers receive identical submission sequences -- so
+    // when the loop budget admits only a subset, every rank picks the same
+    // request, and it is the OLDEST one, whatever its id sorts like.
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
     Submit(MakeRequestSpec("r_bbb", 2, 200));
@@ -169,13 +153,13 @@ TEST_F(StableCandidateOrderingSuite, ForwardOperationsTieBreakOnRequestId) {
         }
     }
     ASSERT_EQ(ids.size(), 1u);
-    EXPECT_EQ(ids[0], "r_aaa");
+    EXPECT_EQ(ids[0], "r_ccc") << "first submitted, first scheduled";
 }
 
-TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
-    // Mirror of the above using two scheduler instances fed the same request
-    // set in opposite submit orders. The chosen forward request must depend
-    // only on the SET of request ids, not the submission sequence.
+TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSchedulers) {
+    // Two scheduler instances fed the SAME submission sequence must build
+    // the same batch -- the mirrored-ranks invariant. (Different submission
+    // orders legitimately differ: FIFO means arrival order is meaningful.)
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
     Submit(MakeRequestSpec("r_bbb", 2, 200));
@@ -188,9 +172,9 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
     }
 
     scheduler_ = std::make_unique<Scheduler>(config_);
-    Submit(MakeRequestSpec("r_bbb", 2, 200));
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
+    Submit(MakeRequestSpec("r_bbb", 2, 200));
     auto plan_b = PlanOnce();
     std::vector<std::string> ids_b;
     for (const auto& op : plan_b.Operations()) {

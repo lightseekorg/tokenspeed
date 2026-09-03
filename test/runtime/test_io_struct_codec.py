@@ -352,7 +352,7 @@ def test_small_tensor_is_inlined_as_raw_view_ext():
 
     # The tensor slot is (dtype, shape, Ext(CUSTOM_TYPE_RAW_VIEW, bytes)).
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    mm = raw[-2]  # multimodal_inputs (validation_error is last)
+    mm = raw[-3]  # multimodal_inputs (then validation_error, data_parallel_rank)
     feature_slot = mm[0][0][4]
     dtype, shape, data = feature_slot
     assert dtype == "float32"
@@ -368,7 +368,7 @@ def test_large_tensor_rides_out_of_band_aux_frame():
     assert len(frames) == 2  # primary + one aux frame for the 2 KiB tensor
 
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    dtype, shape, data = raw[-2][0][0][4]
+    dtype, shape, data = raw[-3][0][0][4]
     assert dtype == "bfloat16"
     assert shape == [4, 256]
     assert data == 1  # one-based aux frame index (frame 0 = primary buffer)
@@ -404,6 +404,7 @@ def test_mm_struct_field_order_is_pinned():
         "mrope_positions",
         "mrope_position_delta",
         "mrope_position_delta_scalar",
+        # Reserved wire slot (retired cache field); see MultimodalInputs.
         "mrope_position_delta_repeated_cache",
     ]
 

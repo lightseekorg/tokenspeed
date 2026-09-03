@@ -33,7 +33,6 @@ from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class TopKOutputFormat(Enum):
@@ -390,13 +389,13 @@ class TopK(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
-        if self.topk_config.output_format is not None:
-            output_format = self.topk_config.output_format
-        else:
-            output_format = TopKOutputFormat.STANDARD
+        output_format = (
+            output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
+        )
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
@@ -485,7 +484,6 @@ def select_experts(
             top_k=top_k,
             n_routed=router_logits.shape[1] - topk_config.num_sink_experts,
             route_scale=routed_scaling_factor,
-            enable_pdl=pdl_enabled(),
         )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     elif use_grouped_topk:
@@ -606,7 +604,6 @@ def select_experts(
             routed_scaling_factor=(
                 1.0 if routed_scaling_factor is None else routed_scaling_factor
             ),
-            enable_pdl=pdl_enabled(),
         )
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,

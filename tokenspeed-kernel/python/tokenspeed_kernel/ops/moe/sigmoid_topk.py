@@ -8,7 +8,7 @@ import torch
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement, Platform
+from tokenspeed_kernel.platform import CapabilityRequirement, Platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -120,6 +120,7 @@ def moe_sigmoid_bias_topk(
         topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,
+            enable_pdl=pdl_enabled(),
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
             logical_to_physical_map=(

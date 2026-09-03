@@ -19,6 +19,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -50,6 +51,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.attention_backend, "mla")
 
+    def test_attention_backend_accepts_gluon(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--attention-backend", "gluon"]
+        )
+        self.assertEqual(args.attention_backend, "gluon")
+
     def test_attention_backend_accepts_mha_kernel_solutions(self):
         for backend in ("fa3", "fa4", "triton", "flashinfer"):
             args = self._build_parser().parse_args(
@@ -57,12 +64,24 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
             self.assertEqual(args.attention_backend, backend)
 
+    def test_attention_backend_uses_generic_mha_for_ascend(self):
+        choices = set(self._action(self._build_parser(), "attention_backend").choices)
+        self.assertIn("mha", choices)
+        self.assertNotIn("ascend_mha", choices)
+        self.assertNotIn("npu", choices)
+
     def test_drafter_attention_backend_accepts_trtllm_mla(self):
         """Regression: trtllm_mla must be accepted here too."""
         args = self._build_parser().parse_args(
             ["--model", "x", "--drafter-attention-backend", "trtllm_mla"]
         )
         self.assertEqual(args.drafter_attention_backend, "trtllm_mla")
+
+    def test_drafter_attention_backend_accepts_gluon(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--drafter-attention-backend", "gluon"]
+        )
+        self.assertEqual(args.drafter_attention_backend, "gluon")
 
     def test_drafter_choices_match_main_choices(self):
         parser = self._build_parser()
@@ -118,6 +137,99 @@ class TestAttentionBackendChoices(unittest.TestCase):
             registry._get_backend_cls("mla", AttentionArch.MLA),
             MLAAttnBackend,
         )
+
+    def test_gluon_backend_registered_for_mla(self):
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+
+        self.assertIs(
+            registry._get_backend_cls("gluon", AttentionArch.MLA),
+            MLAAttnBackend,
+        )
+
+    def test_gluon_mla_backend_forces_gluon_kernel_solution(self):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+        from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+        spec = MLAConfig(
+            backend_name="gluon",
+            num_attention_heads=128,
+            num_kv_heads=1,
+            head_dim=576,
+            attn_tp_size=8,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            kv_cache_dim=576,
+            scaling=192**-0.5,
+        )
+        config = AttnConfig(
+            device="cpu",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            kv_cache_quant_method="none",
+            prefix_granularity=128,
+            is_draft=True,
+            speculative_num_draft_tokens=4,
+            context_len=65536,
+            kernel_page_size=64,
+            max_bs=8,
+            max_graph_bs=8,
+            components=(spec,),
+        )
+
+        self.assertEqual(MLAAttnBackend(config, spec).kernel_solution, "gluon")
+
+    def test_dsa_routes_dense_attention_through_registry(self):
+        from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+
+        config = object()
+        dense_backend = object()
+
+        for platform, name in (
+            (SimpleNamespace(is_nvidia=True, is_amd=False), "trtllm_mla"),
+            (SimpleNamespace(is_nvidia=False, is_amd=True), "mla"),
+        ):
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    registry,
+                    "_create_attn_backend_with_name",
+                    return_value=dense_backend,
+                ) as create,
+            ):
+                self.assertIs(
+                    dsa_backend._make_dense_backend(config, platform), dense_backend
+                )
+                create.assert_called_once_with(name, AttentionArch.MLA, config)
+
+    def test_named_backend_routing_does_not_mutate_source_spec(self):
+        from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+        source = SoftmaxAttnConfig(
+            backend_name="parent",
+            num_attention_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            attn_tp_size=1,
+        )
+        config = SimpleNamespace(component=lambda _: source)
+        routed = {}
+
+        class ProbeBackend:
+            def __init__(self, _config, spec):
+                routed["source_name"] = source.backend_name
+                routed["spec"] = spec
+
+        with mock.patch.object(registry, "_get_backend_cls", return_value=ProbeBackend):
+            registry._create_attn_backend_with_name("child", AttentionArch.MHA, config)
+
+        self.assertEqual(routed["source_name"], "parent")
+        self.assertEqual(routed["spec"].backend_name, "child")
+        self.assertIsNot(routed["spec"], source)
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

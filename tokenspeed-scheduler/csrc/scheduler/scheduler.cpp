@@ -164,15 +164,13 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         if (coordinator_.GroupIsPrefixClosed(i)) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
-            const bool latest_snapshot =
-                config_.enable_pd_cache && group.transfer_policy == CacheTransferPolicy::LatestSnapshot;
-            if (latest_snapshot) {
+            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 1;
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (config_.enable_pd_cache && group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
                     ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
@@ -211,8 +209,8 @@ std::int32_t Scheduler::calculateMaxSingleRequestTokens(std::int64_t usable_lcm_
 }
 
 Request* Scheduler::findRequest(const std::string& request_id) {
-    const auto it = requests_.find(request_id);
-    return it == requests_.end() ? nullptr : it->second.get();
+    const auto it = requests_by_id_.find(request_id);
+    return it == requests_by_id_.end() ? nullptr : it->second;
 }
 
 std::size_t Scheduler::groupIndex(const std::string& group_id) const {
@@ -236,16 +234,16 @@ bool Scheduler::ClearCache() {
 }
 
 bool Scheduler::clearCache(bool include_host) {
-    const bool has_live_request =
-        std::ranges::any_of(requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
-    const bool has_pending_forward_results = !pending_forward_results_.empty();
+    // A live request's pages are protected by their pins, and the coordinator
+    // completes its pin check before mutating anything -- so residency is not
+    // this function's business. What IS its business are the writers the pins
+    // do not cover: an asynchronous transfer still landing into a cached
+    // block would race a clear that succeeded on the pin check alone.
     const bool has_pd_transfers = !pd_transfer_pins_.empty();
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_live_request || has_pending_forward_results || has_pd_transfers || has_tier_transfers) {
-        spdlog::info(
-            "[Scheduler] flush L1 cache rejected: live_requests={} pending_forward_results={} pd_transfers={} "
-            "tier_transfers={}",
-            has_live_request, has_pending_forward_results, has_pd_transfers, has_tier_transfers);
+    if (has_pd_transfers || has_tier_transfers) {
+        spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
+                     has_tier_transfers);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
@@ -340,7 +338,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
         }
-        if (requests_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
+        if (requests_by_id_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
             throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
         }
         if (spec.max_new_tokens < 0) {
@@ -358,26 +356,29 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
 
+    requests_.reserve(requests_.size() + pending_requests.size());
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
-        const bool inserted = requests_.emplace(request_specs[i].request_id, std::move(pending_requests[i])).second;
+        const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
         FatalCheck(inserted, "validated request id became duplicate before insertion");
+        requests_.push_back(std::move(pending_requests[i]));
     }
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
-        return item.second->template Is<fsm::Submitted>() || item.second->template Is<fsm::Retracted>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
+        return request->template Is<fsm::Submitted>() || request->template Is<fsm::Retracted>();
     }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
     return static_cast<std::size_t>(
-        std::ranges::count_if(requests_, [](const auto& item) { return item.second->template Is<fsm::Decoding>(); }));
+        std::ranges::count_if(requests_, [](const auto& request) { return request->template Is<fsm::Decoding>(); }));
 }
 
 std::size_t Scheduler::PrefillSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
-        return item.second->template Is<fsm::Prefilling>() || item.second->template Is<fsm::PrefillDone>();
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
+        return request->template Is<fsm::Prefilling>() || request->template Is<fsm::RemotePrefilling>() ||
+               request->template Is<fsm::PrefillAwaitingResult>() || request->template Is<fsm::PrefillDone>();
     }));
 }
 
@@ -388,8 +389,10 @@ std::size_t Scheduler::AvailableKvPages() const {
 std::size_t Scheduler::ActiveKvPages() const {
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
-    for (const auto& [_, request] : requests_) {
-        if (!request->Is<fsm::Prefilling>() && !request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::Prefilling>() && !request->Is<fsm::RemotePrefilling>() &&
+            !request->Is<fsm::PrefillAwaitingResult>() && !request->Is<fsm::PrefillDone>() &&
+            !request->Is<fsm::Decoding>()) {
             continue;
         }
         request_tables.emplace_back(request->BlockTablesRef());
@@ -416,32 +419,33 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
 }
 
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
-    const auto it = requests_.find(id);
-    return it == requests_.end() ? -1 : it->second->TokenSize();
+    const auto it = requests_by_id_.find(id);
+    return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
-    std::erase_if(requests_, [this](const auto& item) {
-        if (!item.second->template Is<fsm::Finished>()) {
+    std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
+    std::erase_if(requests_, [this](const auto& request) {
+        if (!request->template Is<fsm::Finished>()) {
             return false;
         }
-        kv_event_hash_progress_.erase(item.first);
+        kv_event_hash_progress_.erase(request->Id());
+        requests_by_id_.erase(request->Id());
         return true;
     });
 
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
-    for (auto& [_, request] : requests_) {
-        if (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>() || request->Is<fsm::PrefillDone>() ||
-            request->Is<fsm::Decoding>() || request->Is<fsm::Retracted>()) {
+    for (const auto& request : requests_) {
+        if (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>() || request->Is<fsm::RemotePrefilling>() ||
+            request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Retracted>()) {
             candidates.push_back(request.get());
         }
     }
-
     ExecutionPlan plan;
-    std::vector<WriteBackOperation> write_back_operations;
     auto [forward_operations, load_back_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
+
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
@@ -449,6 +453,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             write_back_operations.push_back(std::move(*store));
         }
     }
+
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }

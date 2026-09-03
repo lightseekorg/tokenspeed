@@ -60,7 +60,6 @@ from tokenspeed.runtime.models.utils import (
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class LlamaMLP(nn.Module):
@@ -292,7 +291,6 @@ class LlamaAttention(nn.Module):
             k,
             fused_set_kv_buffer_arg=fused_kv_arg,
             output_q_rope=q_rope,
-            enable_pdl=pdl_enabled(),
         )
         return q_rope
 

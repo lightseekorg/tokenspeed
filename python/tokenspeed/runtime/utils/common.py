@@ -157,22 +157,23 @@ def get_available_gpu_memory(
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+    if device in {"cuda", "npu"}:
+        device_module = torch.get_device_module(device)
+        num_gpus = device_module.device_count()
         if gpu_id >= num_gpus:
             raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
-        if torch.cuda.current_device() != gpu_id:
+        if device_module.current_device() != gpu_id:
             logger.debug(
                 "Current device is not %s, but %s, which may cause useless "
                 "memory allocation for torch CUDA context.",
                 gpu_id,
-                torch.cuda.current_device(),
+                device_module.current_device(),
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            device_module.empty_cache()
+        free_gpu_memory, _ = device_module.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -524,6 +525,47 @@ def set_weight_attrs(
         if hasattr(weight, key):
             raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
+
+
+class PipelinedPyobjBroadcaster:
+    """Overlap empty Python-object notifications with useful work."""
+
+    def __init__(
+        self,
+        rank: int,
+        dist_group: torch.distributed.ProcessGroup | None = None,
+        src: int = 0,
+    ) -> None:
+        self.rank = rank
+        self.dist_group = dist_group
+        self.src = src
+        self._data = None
+        self._ready = torch.zeros(1, dtype=torch.long)
+        self._work = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._work is not None
+
+    def start(self, data: list[Any] | None) -> None:
+        self._data = data
+        if self.rank == self.src:
+            self._ready[0] = bool(data)
+        self._work = dist.broadcast(
+            self._ready,
+            src=self.src,
+            group=self.dist_group,
+            async_op=True,
+        )
+
+    def finish(self) -> list[Any]:
+        self._work.wait()
+        data = self._data
+        self._data = None
+        self._work = None
+        if self._ready.item():
+            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
+        return data or []
 
 
 def broadcast_pyobj(

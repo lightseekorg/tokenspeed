@@ -194,6 +194,31 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "min_bytes"),
+    [
+        (4, torch.bfloat16, 160 << 10),
+        (4, torch.float32, 160 << 10),
+        (8, torch.bfloat16, 96 << 10),
+        (8, torch.float32, 96 << 10),
+    ],
+)
+def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            _use_two_stage_producer_direct,
+        )
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    alignment = world_size * (8 // dtype.itemsize)
+    min_numel = min_bytes // dtype.itemsize
+    assert _use_two_stage_producer_direct(world_size, min_numel, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel - alignment, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel + 1, dtype)
+    assert not _use_two_stage_producer_direct(2, min_numel, dtype)
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
@@ -286,6 +311,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             ((3, 5), (1, 1)),
             device,
         )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp16_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
 
         fp32_state = create_iris_state(
             group=dist.group.WORLD,
@@ -300,6 +333,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             ((3, 5), (1, 1)),
             device,
         )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp32_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
         if world_size == 8:
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
@@ -377,7 +418,8 @@ def _check_all_reduce_symmetric_outputs(
             output.fill_(index * (rank + 1))
         graph_results = iris_all_reduce_symmetric(state, outputs)
     dist.barrier()
-    graph.replay()
+    for _ in range(4):
+        graph.replay()
     torch.cuda.synchronize()
     for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
         torch.testing.assert_close(
@@ -401,44 +443,40 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         allreduce_residual_attnres_combine_supported,
     )
 
-    torch.manual_seed(101)
-    hidden = 7168
-    blocks = (torch.randn(4, 1, hidden, device=device) * 0.1).to(torch.bfloat16)
-    score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
-    output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
-    residual = (torch.randn(1, hidden, device=device) * 0.1).to(torch.bfloat16)
-    local = (torch.randn(1, hidden, device=device) * 0.01 + (rank + 1) * 0.002).to(
-        torch.bfloat16
-    )
-    scratch = (
-        torch.empty(1, device=device, dtype=torch.float32),
-        torch.empty(1, device=device, dtype=torch.float32),
-        torch.empty(1, hidden, device=device, dtype=torch.float32),
-    )
-    attnres_partial(blocks, score_weight, 1e-6, scratch)
+    for num_tokens in (1, 2, 4, 8, 16):
+        torch.manual_seed(101 + num_tokens)
+        hidden = 7168
+        blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+        output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(
+            torch.bfloat16
+        )
+        residual = (torch.randn(num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        local = (
+            torch.randn(num_tokens, hidden, device=device) * 0.01 + (rank + 1) * 0.002
+        ).to(torch.bfloat16)
+        scratch = (
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, hidden, device=device, dtype=torch.float32),
+        )
+        attnres_partial(blocks, score_weight, 1e-6, scratch)
 
-    reduced = iris_all_reduce(state, local.clone(), safe=False)
-    expected_residual = residual + reduced
-    expected_hidden = attnres_combine(
-        expected_residual,
-        score_weight,
-        output_weight,
-        1e-6,
-        scratch,
-        torch.empty_like(residual),
-    )
-    assert allreduce_residual_attnres_combine_supported(
-        local,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        rank=rank,
-        group=state.group,
-        local_world_size=8,
-    )
-    for _ in range(4):
-        actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+        reduced = iris_all_reduce(state, local.clone(), safe=False)
+        expected_residual = residual + reduced
+        expected_hidden = attnres_combine(
+            expected_residual,
+            score_weight,
+            output_weight,
+            1e-6,
+            scratch,
+            torch.empty_like(residual),
+        )
+        assert allreduce_residual_attnres_combine_supported(
             local,
             residual,
             score_weight,
@@ -447,28 +485,43 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             rank=rank,
             group=state.group,
             local_world_size=8,
-            eps=1e-6,
         )
-        torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
-        torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        for _ in range(4):
+            actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+            torch.testing.assert_close(
+                actual_residual, expected_residual, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
+            )
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_hidden, graph_residual = allreduce_residual_attnres_combine(
-            local,
-            residual,
-            score_weight,
-            output_weight,
-            scratch,
-            rank=rank,
-            group=state.group,
-            local_world_size=8,
-            eps=1e-6,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
-    torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_hidden, graph_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
 
 
 def _run_ar_test(world_size: int) -> None:
@@ -513,7 +566,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         state = create_iris_state(
             group=group,
             rank_in_group=group_rank,
-            max_numel=32,
+            max_numel=8 * (7168 + 3584),
             dtype=torch.bfloat16,
         )
         _check_all_reduce(
@@ -528,6 +581,13 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             group_rank,
             len(groups[group_index]),
             ((3, 5), (1, 1)),
+            device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            ((8, 7168), (8, 3584)),
             device,
         )
     except Exception:

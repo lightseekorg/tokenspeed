@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
@@ -68,7 +69,7 @@ class FlashMLADecodeMetadata:
     flashmla_metadata: object | None = None
     page_table: torch.Tensor | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Paged cache only: absolute latent write locations, request-major, with
+    # Cache-group path only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
     # None on the classic page_table path.
     group_out_cache_loc: torch.Tensor | None = None
@@ -79,7 +80,7 @@ class FlashMLADecodeMetadata:
 class _PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
-    # Paged cache only: packed absolute latent write locations for the extend
+    # Cache-group path only: packed absolute latent write locations for the extend
     # tokens (query order). None on the classic page_table path.
     group_out_cache_loc: torch.Tensor | None = None
 
@@ -110,7 +111,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     Uses the FlashMLA kernel for decode (any q_len); uses FlashInfer's MLA
     prefill wrappers for the EXTEND path.
 
-    Decode consumes the LCM full-history table when bound to a paged-cache
+    Decode consumes the LCM full-history table when bound to a cache-group
     contract (see :class:`MlaCacheGroupMixin`); otherwise it reads the classic
     ``page_table`` table. The FlashMLA kernel walks pages at a fixed
     ``PAGE_SIZE`` stride, so that is the backend's kernel page size.
@@ -118,15 +119,15 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         # Parse constants
         self.max_context_len = config.context_len
         self.kv_cache_quant_method = config.kv_cache_quant_method
         self.cache_dtype = config.kv_cache_dtype
 
-        # Cache-group (LCM) state. Latched on the first paged-cache metadata;
+        # Cache-group (LCM) state. Latched on the first cache metadata;
         # the FlashMLA kernel's page stride is PAGE_SIZE, so that is the kernel
         # page size the group-table expansion targets.
         self._cache_groups_bound = False
@@ -140,17 +141,17 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         # MLA-specific dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim
-        self.scaling = config.scaling
-        self.softmax_scale = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_lora_rank + spec.qk_rope_head_dim
+        self.scaling = spec.scaling
+        self.softmax_scale = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_q_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_q_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # FlashMLA-specific
         self.draft_token_num = 0
@@ -195,7 +196,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self.workspace_buffer,
             backend="auto",
         )
-        self.indices_updater_prefill = _PrefillIndicesUpdater(config, self)
+        self.indices_updater_prefill = _PrefillIndicesUpdater(config, spec, self)
 
         # Metadata state. Decode and prefill metadata are split so MIXED batches
         # can carry both simultaneously (decode-half + prefill-half sub-contexts
@@ -252,8 +253,8 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_table = page_table[:bs]
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
-                "FlashMLABackend is bound to Paged cache but received no paged "
-                "cache metadata; refusing the legacy page_table path"
+                "FlashMLABackend is bound to cache groups but received no cache "
+                "metadata; refusing the legacy page_table path"
             )
 
         if forward_mode.is_extend_or_mixed():
@@ -363,7 +364,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Group-derived latent write location on the paged-cache path.
+        """Group-derived latent write location on the cache-group path.
 
         Identity when not cache-group bound (classic page_table path) or when
         idle. Decode writes one location per request (position seq-1); extend
@@ -428,7 +429,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
         )
 
-        # Paged cache path needs two differently-shaped views of the kernel
+        # The cache-group path needs two differently-shaped views of the kernel
         # full-history table:
         #   * flashinfer paged prefill (plan page_size=1) walks a PER-TOKEN slot
         #     table, so expand each token to its absolute latent slot.
@@ -456,11 +457,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 validate_pages=cache_debug_enabled(),
             )
         else:
-            # No group table: the autotune/warmup dummy prefill (uses_cache_groups
-            # is False for FlashMLA, so the prefill_graph dummy builds no cache
-            # metadata). It never reads real KV, so page_table is an empty/dummy
-            # batch-ordered placeholder here (row i == batch position i). A live
-            # LCM batch always resolves a group table.
+            # No group table: a dummy prefill built while the prefill graph is
+            # off, or an unbound backend. It never reads real KV, so page_table
+            # is an empty/dummy batch-ordered placeholder here (row i == batch
+            # position i). A live LCM batch always resolves a group table.
             prefill_table = page_table
             prefill_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=page_table.device
@@ -585,7 +585,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if self._cache_contract_bound:
             if self.cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "FlashMLA Paged cache graph capture buffer was not "
+                    "FlashMLA cache-group graph capture buffer was not "
                     "allocated; mark_cache_contract must run before "
                     "init_cuda_graph_state"
                 )
@@ -639,7 +639,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         ) and cache_metadata is not None:
             self._cache_groups_bound = True
             # Refresh the block table and per-request write locations in place
-            # from the live full-history table (paged-cache path).
+            # from the live full-history table (cache-group path).
             table = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
@@ -925,14 +925,16 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
 class _PrefillIndicesUpdater:
     """Plans FlashInfer MLA prefill wrappers for the EXTEND path."""
 
-    def __init__(self, config: MLAConfig, attn_backend: FlashMLABackend):
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+    def __init__(
+        self, config: AttnConfig, spec: MLAConfig, attn_backend: FlashMLABackend
+    ):
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self.kv_cache_quant_method = config.kv_cache_quant_method
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.attn_backend = attn_backend

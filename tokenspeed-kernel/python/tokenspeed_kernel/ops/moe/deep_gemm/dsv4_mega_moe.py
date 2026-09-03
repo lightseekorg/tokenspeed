@@ -27,14 +27,16 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import (
         fp8_fp4_mega_moe,
+        get_pdl,
         get_symm_buffer_for_mega_moe,
+        set_pdl,
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
         warmup_mega_moe_jit,
@@ -42,7 +44,9 @@ try:
     from tokenspeed_kernel.thirdparty.triton import stage_dsv4_mega_moe_inputs
 except ImportError:  # pragma: no cover - DeepGEMM and Triton are optional
     fp8_fp4_mega_moe = None
+    get_pdl = None
     get_symm_buffer_for_mega_moe = None
+    set_pdl = None
     transform_sf_into_required_layout = None
     transform_weights_for_mega_moe = None
     warmup_mega_moe_jit = None
@@ -207,6 +211,8 @@ def _warmup_deep_gemm_dsv4_mega_moe(
     max_num_tokens: int,
     activation_clamp: float | None,
 ) -> None:
+    if get_pdl() != pdl_enabled():
+        set_pdl(pdl_enabled())
     if os.environ.get(_DISABLE_WARMUP_ENV) == "1":
         return
     if not isinstance(state, _DeepGemmMegaMoEState):
@@ -275,7 +281,7 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
             "scale_block_size": frozenset({_MXFP4_BLOCK_SIZE}),
             "supports_ep": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
         tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
     )
@@ -294,6 +300,8 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
         activation_clamp: float | None,
         fast_math: bool,
     ) -> torch.Tensor:
+        if get_pdl() != pdl_enabled():
+            set_pdl(pdl_enabled())
         if not isinstance(state, _DeepGemmMegaMoEState):
             raise TypeError("invalid DeepGEMM MegaMoE state")
         if hidden_states.device != state.device:

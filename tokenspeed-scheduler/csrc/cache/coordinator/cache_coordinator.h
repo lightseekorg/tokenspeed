@@ -92,7 +92,7 @@ public:
     bool GroupHasReclaimableBlocksAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
         return !group.Allocator()
-                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens), {})
+                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens))
                     .empty();
     }
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
@@ -141,9 +141,6 @@ public:
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    bool CanAdmitAfterReleasing(
-        const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-        std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const;
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.
@@ -169,7 +166,8 @@ public:
                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
     void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                               std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind);
+                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
+                              bool stream_completed_to_host = false);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -183,11 +181,27 @@ public:
     struct StoreCandidate {
         CacheKey key;
     };
-    // Retry ordinary D2H Store for already-published Device cache entries.
+    struct HostAllocationStats {
+        std::size_t requested{0};
+        std::size_t allocated{0};
+        std::size_t unallocated{0};
+        std::size_t same_group_scans{0};
+        std::size_t cross_group_scans{0};
+    };
+    struct HostAllocationBatch {
+        std::vector<CacheBlockRef> blocks;
+        HostAllocationStats stats;
+    };
+    // Queue every already-published non-state Device cache entry for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
+    // Queue the newest Device-resident checkpoint from each snapshot-state
+    // group. State checkpoints are intentionally deferred from continuous
+    // Host streaming and persisted at request lifecycle boundaries instead.
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
+    HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
@@ -236,7 +250,7 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host = false);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

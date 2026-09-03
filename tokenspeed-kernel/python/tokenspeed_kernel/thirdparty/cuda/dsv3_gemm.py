@@ -27,6 +27,7 @@ import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 def _objs_dir() -> Path:
@@ -51,7 +52,7 @@ def dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
     out_dtype: torch.dtype = torch.float32,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Router GEMM for DeepSeek-V3 MoE gating.
 
@@ -59,6 +60,7 @@ def dsv3_router_gemm(
         hidden_states: bf16 CUDA tensor [num_tokens, hidden_dim]
         router_weights: bf16 or fp32 CUDA tensor [num_experts, hidden_dim]
         out_dtype: output dtype (must be torch.float32)
+        enable_pdl: whether to use PDL; defaults to the platform setting.
 
     Returns:
         float32 CUDA tensor [num_tokens, num_experts]
@@ -70,6 +72,7 @@ def dsv3_router_gemm(
         device=hidden_states.device,
         dtype=torch.float32,
     )
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_dsv3_gemm_module().dsv3_router_gemm(
         output, hidden_states, router_weights, bool(enable_pdl)
     )

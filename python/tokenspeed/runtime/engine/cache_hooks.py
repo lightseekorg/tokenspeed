@@ -21,16 +21,18 @@
 """L2 cache-op submission and rank-synchronized completion tracking.
 
 Owns everything between an execution plan's cache ops and the scheduler
-events their completions eventually produce: submit ops to the L2 executor,
-count what is in flight, poll completions, and agree across attn-tp ranks on
+events their completions eventually produce: count what the plan puts in
+flight (``DeviceHandle.execute`` submits the transfers themselves, on the
+data plane, from the same plan), poll
+completions (control-side event queries), and agree across attn-tp ranks on
 which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
 event may only advance once all ranks hold it). ``poll_ready_events`` returns
 events for the event loop to apply — feedback into the scheduler stays an
 explicit ``advance_scheduler`` call in the loop body.
 
-Standalone by construction: depends only on static parallel-layout config,
-not on live event-loop state. ``executor=None`` (kvstore disabled) makes
-every method a cheap no-op.
+Depends only on the device handle and static parallel-layout config, not on
+live event-loop state. ``device=None`` (kvstore disabled) makes every method
+a cheap no-op.
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ class L2CacheHooks:
 
     def __init__(
         self,
-        executor,
+        device,
         *,
         speculative_algorithm: str | None,
         attn_tp_rank: int,
@@ -66,7 +68,7 @@ class L2CacheHooks:
         attn_tp_cpu_group,
         global_rank: int,
     ) -> None:
-        self._executor = executor
+        self._device = device
         self._speculative_algorithm = speculative_algorithm
         self._attn_tp_rank = attn_tp_rank
         self._attn_tp_size = attn_tp_size
@@ -79,11 +81,16 @@ class L2CacheHooks:
         # in poll_ready_events entirely when nothing is in flight.
         self._num_inflight = 0
 
-    def submit(self, execution_plan) -> None:
-        """Hand the plan's cache ops to the L2 executor and count them in flight."""
-        if self._executor is None:
+    def count_plan_ops(self, execution_plan) -> None:
+        """Count the cache ops this plan will put in flight.
+
+        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
+        ahead of the page zeroing, load-backs behind it). Call this with the
+        SAME plan and only when ``execute`` will run: a plan counted but never
+        submitted leaves ops in flight forever.
+        """
+        if self._device is None:
             return
-        self._executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
                 self._num_inflight += len(op.op_ids)
@@ -94,9 +101,9 @@ class L2CacheHooks:
         """Poll completed L2 cache ops and return their rank-synchronized
         scheduler events. Returns an empty list when there is nothing ready.
         """
-        if self._executor is None:
+        if self._device is None:
             return []
-        cache_results = self._executor.poll_results()
+        cache_results = self._device.poll_cache_results()
         self._num_inflight -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -107,8 +114,8 @@ class L2CacheHooks:
         # _pending_payloads) diverges transiently. A rank-local skip would let
         # some ranks gather while others return, deadlocking the group. Agree on
         # the skip via a cheap single-int all_reduce.
-        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
-        # ranks, so the local short-circuit is safe and avoids collective overhead.
+        # Outside DFLASH/DSPARK cache ops are rank-deterministic, so the local
+        # short-circuit is safe and avoids the collective.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
         if self._speculative_algorithm in ("DFLASH", "DSPARK"):
             if not self._group_has_work(local_has_work):

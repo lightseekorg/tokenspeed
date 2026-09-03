@@ -26,7 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
+from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -180,6 +180,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=config.layer_types[layer_id],
         )
 
     def _apply_qk_norm(

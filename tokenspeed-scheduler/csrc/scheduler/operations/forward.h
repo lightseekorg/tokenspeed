@@ -24,8 +24,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <optional>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -48,11 +46,13 @@ struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t extend_prefix_len{0};
-    bool local_prefill{true};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
     std::int32_t decode_input_id = -1;
+    // P-role remote decode only: drafter candidates for the decode side
+    // (candidate[0] == decode_input_id). Empty everywhere else.
+    std::vector<std::int32_t> spec_candidate_ids;
 };
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
@@ -68,6 +68,9 @@ struct ForwardBatch {
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
     std::vector<std::int32_t> decode_input_ids;
+    // Parallel to decode_input_ids (one entry per decode row); rows without
+    // candidates hold an empty vector.
+    std::vector<std::vector<std::int32_t>> spec_candidate_ids;
 
     // Per-group block tables: dict[group_id] =
     // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
@@ -77,11 +80,9 @@ struct ForwardBatch {
     // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
     // vectors above cost one PyLong per page id at every attribute access.
     std::map<std::string, std::vector<std::int32_t>> block_tables_contig;
-    bool local_prefill{false};
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
-        std::optional<bool> prefill_source;
         for (auto& op : ops) {
             std::visit(
                 [this](auto& inner) {
@@ -95,17 +96,13 @@ struct ForwardBatch {
                 },
                 op);
             if (auto* prefill = std::get_if<PrefillOperation>(&op)) {
-                if (prefill_source && *prefill_source != prefill->local_prefill) {
-                    throw std::logic_error("one ForwardBatch cannot mix local and remote prefills");
-                }
-                prefill_source = prefill->local_prefill;
-                local_prefill = prefill->local_prefill;
                 input_ids.insert(input_ids.end(), prefill->input_ids.begin(), prefill->input_ids.end());
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
+                spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));
             }
         }
         const std::size_t num_reqs = request_ids.size();
@@ -140,7 +137,6 @@ struct ForwardBatch {
 
     bool empty() const { return request_ids.empty(); }
     std::size_t NumExtends() const { return extend_prefix_lens.size(); }
-    bool IsLocalPrefill() const { return NumExtends() > 0 && local_prefill; }
 };
 
 }  // namespace tokenspeed

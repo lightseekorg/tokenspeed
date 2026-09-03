@@ -21,7 +21,7 @@
 """CPU-only, single-rank tests for L2CacheHooks (attn_tp_size == 1, so no
 collectives run). The cross-rank payload agreement itself is covered by the
 pop_common_cache_event_payloads tests; these drive submit/poll bookkeeping
-with a fake executor.
+with a fake device handle.
 """
 
 from __future__ import annotations
@@ -49,22 +49,22 @@ class _FakeWriteBackOp:
         self.op_ids = op_ids
 
 
-class _Executor:
+class _Device:
+    """The DeviceHandle surface the hooks use. Submission rides
+    ``DeviceHandle.execute`` with the rest of the round's plan-derived device
+    work; this side only counts and polls."""
+
     def __init__(self) -> None:
-        self.submitted_plans: list = []
         self.results: list = []
 
-    def submit_plan(self, plan) -> None:
-        self.submitted_plans.append(plan)
-
-    def poll_results(self) -> list:
+    def poll_cache_results(self) -> list:
         results, self.results = self.results, []
         return results
 
 
-def _hooks(executor, speculative_algorithm=None) -> L2CacheHooks:
+def _hooks(device, speculative_algorithm=None) -> L2CacheHooks:
     return L2CacheHooks(
-        executor,
+        device,
         speculative_algorithm=speculative_algorithm,
         attn_tp_rank=0,
         attn_tp_size=1,
@@ -92,33 +92,32 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
 
 def test_disabled_kvstore_is_a_no_op() -> None:
     hooks = _hooks(None)
-    hooks.submit(SimpleNamespace(cache=[SimpleNamespace()]))
+    hooks.count_plan_ops(SimpleNamespace(cache=[SimpleNamespace()]))
     assert hooks.poll_ready_events() == []
 
 
 def test_submit_counts_in_flight_and_rejects_unknown_ops(fake_cache_ops) -> None:
-    executor = _Executor()
-    hooks = _hooks(executor)
+    device = _Device()
+    hooks = _hooks(device)
     plan = SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[1, 2])])
 
-    hooks.submit(plan)
+    hooks.count_plan_ops(plan)
 
-    assert executor.submitted_plans == [plan]
     assert hooks._num_inflight == 2
 
     with pytest.raises(TypeError, match="unsupported cache op kind"):
-        hooks.submit(SimpleNamespace(cache=[object()]))
+        hooks.count_plan_ops(SimpleNamespace(cache=[object()]))
 
 
 def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> None:
-    executor = _Executor()
-    hooks = _hooks(executor)
-    hooks.submit(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    device = _Device()
+    hooks = _hooks(device)
+    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
 
     # Nothing completed yet: in flight, but no ready payloads.
     assert hooks.poll_ready_events() == []
 
-    executor.results = [_writeback_done_event(7)]
+    device.results = [_writeback_done_event(7)]
     events = hooks.poll_ready_events()
 
     assert [type(e).__name__ for e in events] == ["WriteBackDoneEvent"]

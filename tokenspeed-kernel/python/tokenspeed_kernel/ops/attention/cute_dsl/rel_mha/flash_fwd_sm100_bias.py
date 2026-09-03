@@ -20,28 +20,10 @@
 
 import argparse
 import math
-import os
-import sys
 import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, Optional, Tuple, Type
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CACHE_ROOT = os.path.join(_SCRIPT_DIR, ".cache", "flash_fwd_sm100_bias")
-# Never touch TMPDIR here: torch's symmetric-memory rendezvous binds a
-# unix socket under it, and this package-relative path exceeds the 108-char
-# sun_path limit -> "Failed to bind socket: Invalid argument" on every rank.
-for _cache_name, _cache_path in (
-    ("CUTE_DSL_CACHE_DIR", os.path.join(_CACHE_ROOT, "cute_dsl")),
-    ("TRITON_CACHE_DIR", os.path.join(_CACHE_ROOT, "triton")),
-    ("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE_ROOT, "torchinductor")),
-):
-    os.environ.setdefault(_cache_name, _cache_path)
-    os.makedirs(os.environ[_cache_name], exist_ok=True)
-
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -77,11 +59,11 @@ from .fmha_bias_helper import (
     AttentionMask,
     BlockInfo,
     BlockSparseTensors,
-    ClcState,
     DynamicPersistentVarlenScheduler,
     NamedBarrierFwdSm100,
     PackGQA,
     PagedKVManager,
+    SchedulerState,
     SchedulingMode,
     SeqlenInfoQK,
     SingleTileLPTScheduler,
@@ -1553,7 +1535,8 @@ class FlashAttentionForwardSm100:
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar_ptr: Int64
-            # Scheduler m_barrier and work info for dynamic persistent
+            # PipelineAsync requires 2 * sched_stages barriers; sched_stages is
+            # currently fixed at 1.
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             work_info: cute.struct.MemRange[Int32, 4]
             # Tmem holding buffer
@@ -2255,6 +2238,7 @@ class FlashAttentionForwardSm100:
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
 
+        sched_ctx = None
         if const_expr(self.use_clc_scheduler):
             clc_response_ptr = storage.clc_response.data_ptr()
             clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
@@ -2273,7 +2257,7 @@ class FlashAttentionForwardSm100:
             )
 
             block_idx = cute.arch.block_idx()
-            clc = ClcState.create(
+            sched_ctx = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
                     block_idx,
@@ -2295,7 +2279,6 @@ class FlashAttentionForwardSm100:
                     cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
                 ),
             )
-            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
         elif const_expr(self.dynamic_persistent):
             assert tile_count_semaphore is not None
             work_info = storage.work_info.get_tensor((4,))
@@ -2306,14 +2289,26 @@ class FlashAttentionForwardSm100:
             sched_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_non_empty_warps
             )
-            sched_pipeline = pipeline.PipelineAsync.create(
+            sched_pipeline = cutlass_pipeline.PipelineAsync.create(
                 barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
-                num_stages=1,
+                num_stages=self.sched_stages,
                 producer_group=sched_pipeline_producer_group,
                 consumer_group=sched_pipeline_consumer_group,
             )
+            sched_ctx = SchedulerState.create_dynamic_persistent(
+                work_info=work_info,
+                pipeline=sched_pipeline,
+                consumer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
+                ),
+                producer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
+                ),
+            )
+
+        if const_expr(self.use_clc_scheduler or self.dynamic_persistent):
             tile_scheduler = self.tile_scheduler_cls.create(
-                tile_sched_params, work_info, sched_pipeline
+                tile_sched_params, ctx=sched_ctx
             )
         else:
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)

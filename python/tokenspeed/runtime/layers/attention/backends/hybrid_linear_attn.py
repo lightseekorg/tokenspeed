@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
 )
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -69,7 +70,10 @@ from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
@@ -82,7 +86,7 @@ def _mask_fresh_initial_state(
 ) -> torch.Tensor:
     """Zero the initial recurrent state of sequences that have no history.
 
-    On the paged cache path a fresh sequence's ``state_in`` page is freshly
+    On the cache-group path a fresh sequence's ``state_in`` block is freshly
     allocated from the shared BlockPool and may carry a previous tenant's
     bytes (the slabs alias every cache group, so those bytes can be fp8 MLA
     latents that reinterpret as huge/NaN fp32) — the recurrent kernels have
@@ -119,8 +123,8 @@ def _compute_state_block_index_plan(
     seq_lens_before: torch.Tensor,
     seq_lens_after: torch.Tensor,
 ) -> _StateBlockIndexPlan:
-    before = seq_lens_before.to(torch.int64)
-    after = seq_lens_after.to(torch.int64)
+    before = seq_lens_before
+    after = seq_lens_after
     in_slots = torch.div(
         before - 1, checkpoint_granularity, rounding_mode="floor"
     ).clamp_(min=0)
@@ -351,8 +355,8 @@ class MambaAttnBackend(AttentionBackend):
     cache_consumer_families = frozenset({"state"})
     _replay_active: bool = False
 
-    def __init__(self, config: BaseAttnConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
+        super().__init__(config, spec)
         self.pad_slot_id = -1
         self.forward_metadata: MambaForwardMetadata = None
         self.query_start_loc_list = []
@@ -370,7 +374,8 @@ class MambaAttnBackend(AttentionBackend):
         # size. Values are keyed by group ID and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
-        self.replay_ssm = bool(getattr(config, "replay_ssm", False))
+        linear_attn = config.component(LinearAttnConfig)
+        self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
         self._gdn_replay: _GDNReplayWorkspace | None = None
         self._verify_scratch = None
         self._verify_commit_ctx = None
@@ -591,7 +596,14 @@ class MambaAttnBackend(AttentionBackend):
         if self._gdn_replay is not None:
             total += self._gdn_replay.payload.nbytes
             total += self._gdn_replay.parameters.nbytes
+        total += self._preallocate_aux_verify_workspace(max_bs, draft_token_num)
         return total
+
+    def _preallocate_aux_verify_workspace(
+        self, max_bs: int, draft_token_num: int
+    ) -> int:
+        """Allocate model-owned verify state and return its byte size."""
+        return 0
 
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies and replay:
@@ -693,7 +705,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_by_group = self.forward_metadata.state_in_blocks_by_group
         sin_stack = torch.stack(
             [state_in_by_group[group_id][:bs] for group_id in self._state_groups()]
-        ).to(torch.int64)
+        )
         src_rows = sin_stack.index_select(0, tables["group_sel"]).reshape(-1)
         copy_state_rows(
             tables["conv_comp"],
@@ -763,6 +775,7 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
+        self._commit_aux_verified_state(accepted_length, pages_by_group)
         copy_tables = self._verify_copy_tables_get()
         pages_stack = torch.stack(
             [pages_by_group[group_id] for group_id in self._state_groups()]
@@ -814,6 +827,13 @@ class MambaAttnBackend(AttentionBackend):
                 dst_row_strides=copy_tables["ssm_comp_stride"],
             )
         self._verify_commit_ctx = None
+
+    def _commit_aux_verified_state(
+        self,
+        accepted_length: torch.Tensor,
+        pages_by_group: dict[str, torch.Tensor],
+    ) -> None:
+        """Commit model-owned side state after speculative verification."""
 
     def _cache_contract_state_blocks(
         self,

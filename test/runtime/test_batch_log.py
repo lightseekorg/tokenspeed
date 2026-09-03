@@ -40,7 +40,6 @@ def _logger(**overrides) -> BatchLogger:
         num_total_pages=100,
         spec_num_steps=0,
         spec_num_tokens=0,
-        token_to_kv_pool=SimpleNamespace(maybe_log_cache_group_pages=lambda: None),
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -104,6 +103,44 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
     assert args[1:5] == (2, 40, 15, 100)  # running-req, pages active/cached/total
     assert args[5] == 0.4  # page ratio
     assert args[6] > 0  # gen throughput over the window
+
+
+def test_state_group_pages_ride_the_decode_line_at_debug():
+    """Recurrent/conv state groups are sized apart from the KV groups, so the
+    decode line's single page ratio cannot show one of them binding."""
+    queried = []
+
+    def pages(group_id):
+        queried.append(group_id)
+        return {"state_a": (10, 4), "state_b": (8, 8)}[group_id]
+
+    logger = _logger(
+        decode_log_interval=1,
+        cache_state_group_ids=("state_a", "state_b"),
+        cache_group_pages=pages,
+    )
+
+    with mock.patch.object(batch_log_module.logger, "isEnabledFor", return_value=True):
+        with mock.patch.object(batch_log_module.logger, "debug") as debug:
+            logger.log_dispatch(_decode_op(2), STATS)
+
+    assert queried == ["state_a", "state_b"]
+    assert debug.call_args.args[1] == (
+        "state_a: used=6/10, available=4; state_b: used=0/8, available=8"
+    )
+
+
+def test_a_pool_with_no_state_group_never_queries_the_scheduler():
+    def pages(group_id):  # pragma: no cover - must not be reached
+        raise AssertionError("queried with no state group")
+
+    logger = _logger(decode_log_interval=1, cache_group_pages=pages)
+
+    with mock.patch.object(batch_log_module.logger, "isEnabledFor", return_value=True):
+        with mock.patch.object(batch_log_module.logger, "debug") as debug:
+            logger.log_dispatch(_decode_op(2), STATS)
+
+    debug.assert_not_called()
 
 
 def test_disabled_rank_still_counts_but_never_logs():

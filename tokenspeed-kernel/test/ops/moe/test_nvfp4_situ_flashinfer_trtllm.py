@@ -133,13 +133,22 @@ class _MoEWeights(torch.nn.Module):
         )
 
 
-def _make_nvfp4_moe_weights(generator: torch.Generator) -> dict[str, torch.Tensor]:
+def _make_nvfp4_moe_weights(
+    generator: torch.Generator, *, logical_ispp: int = ISPP
+) -> dict[str, torch.Tensor]:
     """K3-style [gate|up]-concatenated NVFP4 expert weights (loader layout)."""
     w13, w13_scale, w13_s2 = [], [], []
     w2, w2_scale, w2_s2 = [], [], []
     for _ in range(NUM_EXPERTS):
-        w13_bf16 = torch.randn(2 * ISPP, HIDDEN, generator=generator) * 0.5
-        w2_bf16 = torch.randn(HIDDEN, ISPP, generator=generator) * 0.5
+        w13_bf16 = torch.zeros(2, ISPP, HIDDEN)
+        w13_bf16[:, :logical_ispp] = (
+            torch.randn(2, logical_ispp, HIDDEN, generator=generator) * 0.5
+        )
+        w13_bf16 = w13_bf16.flatten(0, 1)
+        w2_bf16 = torch.zeros(HIDDEN, ISPP)
+        w2_bf16[:, :logical_ispp] = (
+            torch.randn(HIDDEN, logical_ispp, generator=generator) * 0.5
+        )
         packed, sf, s2 = _nvfp4_quantize(w13_bf16)
         w13.append(packed), w13_scale.append(sf), w13_s2.append(s2)
         packed, sf, s2 = _nvfp4_quantize(w2_bf16)
@@ -225,7 +234,10 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 @requires_flashinfer_situ
-def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference() -> None:
+@pytest.mark.parametrize("logical_ispp", [ISPP, 160])
+def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
+    logical_ispp: int,
+) -> None:
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
         flashinfer_trtllm_nvfp4_moe_weights,
         flashinfer_trtllm_nvfp4_routed_moe_apply,
@@ -236,7 +248,7 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference() -> None:
     generator = torch.Generator().manual_seed(20260817)
     num_tokens = 16
 
-    raw = _make_nvfp4_moe_weights(generator)
+    raw = _make_nvfp4_moe_weights(generator, logical_ispp=logical_ispp)
     hidden_states = (
         (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
     )
@@ -324,19 +336,23 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference() -> None:
 
 
 @requires_flashinfer_situ
-def test_moe_plan_selects_nvfp4_situ_routed_kernel() -> None:
+@pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
+def test_moe_plan_selects_nvfp4_situ_routed_kernel(
+    routing_mode: str | None,
+) -> None:
     import tokenspeed_kernel
 
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
-        routing_mode="precomputed_topk",
+        routing_mode=routing_mode,
         ep_size=1,
         ispp=ISPP,
         internal_activation_dtype="input",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    assert plan["support_routing"] is False
     preprocessor = plan["weight_preprocessor"]
     assert (
         getattr(preprocessor, "__name__", None)
@@ -375,6 +391,24 @@ def test_registry_deferred_finalize_bit_matches_wiring() -> None:
     if spec is None:
         pytest.skip("nvfp4 SiTU kernel not registered on this platform")
     assert spec.traits["supports_deferred_finalize"] == frozenset({True, False})
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "flashinfer_trtllm_nvfp4_moe_apply",
+        "flashinfer_trtllm_nvfp4_routed_moe_apply",
+        "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+    ],
+)
+def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None:
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
+    assert spec.traits["ispp_alignment"] == frozenset({64})
 
 
 @requires_flashinfer_situ

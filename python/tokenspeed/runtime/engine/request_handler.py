@@ -71,7 +71,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
-from tokenspeed.runtime.utils import broadcast_pyobj
+from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
@@ -111,7 +111,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
-        model_runner=None,
+        device=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -121,9 +121,10 @@ class RequestHandler:
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
-        # ModelRunner for in-place RL weight sync (NCCL group init + receive).
-        # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
-        self.model_runner = model_runner
+        # In-place RL weight sync (NCCL group init + receive) goes over the
+        # data plane so it is ordered against forwards. The scheduler worker
+        # passes the handle in; None elsewhere (e.g. unit tests).
+        self._device = device
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -145,7 +146,20 @@ class RequestHandler:
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        self.req_broadcaster = (
+            PipelinedPyobjBroadcaster(
+                self.attn_global_rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_src_rank,
+            )
+            if self.attn_tp_size != 1
+            else None
+        )
         self.profile_rank_tag = _profile_rank_tag(mapping.attn)
+        # Rendezvous buffer for _profile_sync. Preallocated because the stage
+        # transitions run on the control-plane thread, where allocating is what
+        # Principle 1 forbids -- see _profile_sync.
+        self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -173,8 +187,7 @@ class RequestHandler:
 
         self.init_profiler()
 
-    def recv_reqs(self) -> list:
-        """Receive results at attn_tp_rank = 0 and broadcast it to all other TP ranks."""
+    def _drain_reqs(self) -> list | None:
         if self.attn_tp_rank == 0:
             recv_reqs = []
 
@@ -187,16 +200,21 @@ class RequestHandler:
         else:
             recv_reqs = None
 
-        if self.attn_tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.attn_global_rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_src_rank,
-            )
+        return recv_reqs
+
+    def recv_reqs(self) -> list:
+        if self.attn_tp_size == 1:
+            recv_reqs = self._drain_reqs()
+        else:
+            if not self.req_broadcaster.in_flight:
+                self.req_broadcaster.start(self._drain_reqs())
+            recv_reqs = self.req_broadcaster.finish()
 
         if recv_reqs:
             prepare_shm_features(recv_reqs, self.attn_tp_cpu_group)
+
+        if self.attn_tp_size != 1:
+            self.req_broadcaster.start(self._drain_reqs())
 
         return recv_reqs
 
@@ -245,19 +263,19 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.init_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
                 # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
@@ -519,6 +537,29 @@ class RequestHandler:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _profile_sync(self) -> None:
+        """Rendezvous the attention TP peers without touching the device.
+
+        ``torch.distributed.barrier`` cannot be used here. It prefers
+        ``group.bound_device_id`` over its CPU branch, and
+        ``DistributedInitializer`` binds ``cuda:N`` to every group -- including
+        the gloo ones -- to force eager NCCL init. A gloo barrier therefore
+        allocates ``aten.empty`` on CUDA, and these calls run on the
+        control-plane thread (stage transitions arrive through
+        ``_profile_batch_predicate``), where ``_NoDeviceWork`` rejects exactly
+        that. The result was every rank dying mid-profile with "control-plane
+        thread ran CUDA factory".
+
+        An all-reduce over a preallocated CPU tensor rendezvouses identically
+        and allocates nothing, matching how the loop's other in-round
+        collectives are written.
+        """
+        if self.attn_tp_size == 1:
+            return
+        torch.distributed.all_reduce(
+            self._profile_sync_buf, group=self.attn_tp_cpu_group
+        )
+
     def stop_profile(self, stage: ForwardMode | None = None) -> ProfileReqOutput | None:
         if not self.profile_in_progress:
             return ProfileReqOutput(
@@ -539,7 +580,7 @@ class RequestHandler:
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
-            torch.distributed.barrier(self.attn_tp_cpu_group)
+            self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -563,7 +604,7 @@ class RequestHandler:
                 proton_error = exc
             finally:
                 # Do not reply until every TP peer has finished writing.
-                torch.distributed.barrier(self.attn_tp_cpu_group)
+                self._profile_sync()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()

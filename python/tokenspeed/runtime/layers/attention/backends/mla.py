@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
@@ -67,7 +68,8 @@ class MLAPrefillMetadata:
     cum_seq_lens_kv: torch.Tensor | None
     page_table: torch.Tensor | None
     # Host-side metadata.
-    extend_seq_lens_cpu: list[int]
+    extend_prefix_lens_cpu: torch.Tensor
+    extend_seq_lens_cpu: torch.Tensor
     max_extend_seq_len: int
     max_extend_prefix_len: int
     use_absorbed_cached_extend: bool
@@ -77,7 +79,7 @@ class MLAPrefillMetadata:
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list[int]
-    # Paged cache only: absolute latent locations for model-owned extend writes.
+    # Cache-group path only: absolute latent locations for model-owned extend writes.
     group_out_cache_loc: torch.Tensor | None = None
 
 
@@ -87,7 +89,7 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
-    # Paged cache only: absolute latent write locations, request-major, with
+    # Cache-group path only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
@@ -106,8 +108,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
 
     supports_mla_projected_value_decode = True
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         self._cache_groups_bound = False
         self._cache_contract_bound = False
@@ -119,15 +121,15 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         )
         self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
 
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # DFLASH/DSpark draft: the drafter proposes a whole block in one decode
         # forward and needs the block to be non-causal. Rather than a mask, each
@@ -137,7 +139,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        self.kernel_solution = None
+        backend_name = spec.backend_name or "mla"
+        self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -211,7 +214,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             published_draft_page_table = True
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
-                "MLAAttnBackend is bound to Paged cache but received no paged cache "
+                "MLAAttnBackend is bound to cache groups but received no cache "
                 "metadata; refusing the legacy page_table path"
             )
 
@@ -340,7 +343,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             cum_extend_seq_lens=cum_extend_seq_lens,
             cum_seq_lens_kv=cum_seq_lens_kv,
             page_table=absorbed_page_table,
-            extend_seq_lens_cpu=extend_seq_lens_cpu_list,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
             use_absorbed_cached_extend=use_absorbed_cached_extend,
@@ -480,6 +484,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             not self._cache_groups_bound
             or forward_mode is None
             or forward_mode.is_idle()
+            or (self.is_draft and getattr(self, "reads_staged_draft_page_table", False))
         ):
             return out_cache_loc
         if self._block_decode_active:
@@ -544,7 +549,13 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 f"mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
+        # Contract-bound MLA drafts consume the staged, batch-ordered draft
+        # page table rather than the target's per-group tables.  Only an
+        # explicit group dispatch puts a draft on the grouped path; targets
+        # still use the contract marker established before graph allocation.
+        uses_cache_groups = bool(cache_group_ids) or (
+            self._cache_contract_bound and not self.is_draft
+        )
         if self._block_decode_active:
             if uses_cache_groups:
                 self._cache_groups_bound = True
@@ -552,7 +563,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             return
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "MLA draft worker does not take the Paged cache path"
+                "MLA draft worker does not take the cache-group path"
             )
         page_table = self.cuda_graph_page_table[:bs, :]
         capture_q_len = self._graph_verify_q_len()
@@ -560,7 +571,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "MLA Paged cache graph capture buffer was not allocated; "
+                    "MLA cache-group graph capture buffer was not allocated; "
                     "mark_cache_contract must run before init_cuda_graph_state"
                 )
             page_table.zero_()
@@ -813,6 +824,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
+        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        noncausal_block_size = self.spec_num_tokens if self._block_decode_active else 1
         if value_weight is not None:
             # Fuse projection and gate into decode to avoid materializing latent output.
             result = mla_decode_with_kvcache(
@@ -829,6 +842,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 gate=gate,
                 out=projected_out,
                 logit_cap=layer.logit_cap,
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
             )
         else:
             result = mla_decode_with_kvcache(
@@ -843,6 +858,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 softmax_scale=softmax_scale,
                 logit_cap=layer.logit_cap,
                 solution=self.kernel_solution,
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
             )
         output = self._unwrap_output(result)
         if value_weight is not None:
@@ -981,4 +998,5 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         return result
 
 
-register_backend("mla", {AttentionArch.MLA}, MLAAttnBackend)
+for _backend_name in ("mla", "gluon"):
+    register_backend(_backend_name, {AttentionArch.MLA}, MLAAttnBackend)

@@ -54,7 +54,8 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK, SeqlenInfoQKNewK
 from flash_attn.cute.softmax import SoftmaxSm100 as _Fa4SoftmaxSm100
 from flash_attn.cute.softmax import apply_score_mod_inner
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    DynamicPersistentVarlenScheduler,
+    SchedulerState,
     SchedulingMode,
     SingleTileLPTScheduler,
     SingleTileScheduler,
@@ -407,16 +408,6 @@ class TileSchedulerArguments(_Fa4TileSchedulerArguments):
     causal: cutlass.Constexpr[bool] = False
     local: cutlass.Constexpr[bool] = False
     disable_swizzle: cutlass.Constexpr[bool] = False
-
-
-class DynamicPersistentVarlenScheduler:
-    """Fail clearly for an optional scheduler absent from this FA4 build."""
-
-    @staticmethod
-    def to_underlying_arguments(*args, **kwargs):
-        raise NotImplementedError(
-            "Dynamic persistent varlen requires a newer tokenspeed-fa4 build"
-        )
 
 
 @cute.jit

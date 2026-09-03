@@ -32,7 +32,6 @@ from tokenspeed.runtime.pd.mooncake.prefill import (
 )
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 
 logger = get_colorful_logger(__name__)
 
@@ -41,11 +40,6 @@ from tokenspeed_scheduler import PD, Forward
 
 class DisaggPrefillExecutor:
     def __init__(self, args, kv_args, gloo_group):
-        self._dispatcher = TypeBasedDispatcher(
-            [
-                (Forward.Batch, self._cache_decode),
-            ]
-        )
         self.cache_layout = kv_args.cache_layout
         self.senders: dict[str, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
@@ -53,39 +47,6 @@ class DisaggPrefillExecutor:
         self._local_states = {}
         self._layerwise_enabled = False
         self._layerwise_interval = 1
-        # request_id -> bootstrap metadata, populated after the prefill forward pass.
-        # Request ids and bootstrap rooms are stable across request-pool slot reuse.
-        self._request_token: dict[str, int] = {}
-        self._request_spec_candidate_ids: dict[str, list[int]] = {}
-        self._layerwise_token_published = set()
-
-    def store_prefill_token(
-        self,
-        request_id: str,
-        aux_index: int,
-        token: int,
-        spec_candidate_ids: list[int] | None = None,
-    ) -> None:
-        """Called by event_loop after prefill forward to record the first output token."""
-        if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-            raise ValueError("Paged cache PD requires a non-negative bootstrap token")
-        self._request_token[request_id] = token
-        if spec_candidate_ids is not None:
-            self._request_spec_candidate_ids[request_id] = spec_candidate_ids
-        if self._layerwise_enabled:
-            sender = self.senders.get(request_id)
-            if sender is None:
-                logger.warning(
-                    "Prefill token arrived before sender registration for request_id=%s",
-                    request_id,
-                )
-                return
-            self.kv_manager.set_prefill_metadata(
-                sender.bootstrap_room,
-                token,
-                spec_candidate_ids,
-            )
-            self._layerwise_token_published.add(request_id)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
@@ -93,30 +54,6 @@ class DisaggPrefillExecutor:
         self.kv_manager.register_layerwise_step_counter(
             step_counter, self._layerwise_interval
         )
-
-    def setup_layerwise_transfer(
-        self, model_executor, gpu_id: int, interval: int
-    ) -> None:
-        """Wire a shared step counter between the attention backends and this
-        executor's KV sender so KV pages stream out layer-by-layer during the
-        prefill forward instead of all at once after it.
-
-        Args:
-            model_executor: Owner of the attention backend(s) the counter hooks
-                into (and of the draft backend in spec-decode runs).
-            gpu_id: Device index the counter is created against.
-            interval: Layer interval between sends; ``<= 0`` disables
-                layerwise transfer (this call becomes a no-op).
-        """
-        if interval <= 0:
-            return
-        from tokenspeed.runtime.pd.utils import StepCounter
-
-        step_counter = StepCounter(model_executor.device, gpu_id)
-        model_executor.attn_backend.register_step_counter(step_counter)
-        if model_executor.draft_attn_backend is not None:
-            model_executor.register_draft_final_step_counter(step_counter)
-        self.register_layerwise_step_counter(step_counter, interval)
 
     def _bootstrap(self, request_id, info):
         self.senders[request_id] = MooncakeKVSender(
@@ -135,9 +72,6 @@ class DisaggPrefillExecutor:
             sender.clear()
             self.kv_manager.discard_room(sender.bootstrap_room)
         self._local_states.pop(req_id, None)
-        self._request_token.pop(req_id, None)
-        self._request_spec_candidate_ids.pop(req_id, None)
-        self._layerwise_token_published.discard(req_id)
 
     def prepare_prefill(self, op) -> None:
         if not self._layerwise_enabled or op.num_extends() == 0:
@@ -165,7 +99,7 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = tuple(
                 info for info in transfer_infos.values() if not info.is_dummy
             )
@@ -175,14 +109,14 @@ class DisaggPrefillExecutor:
                 continue
             first = destinations[0]
             if first.block_manifest is None:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             prefix_len = first.block_manifest.prefix_len
             prompt_len = first.block_manifest.prompt_len
             chunk_begin = int(op.extend_prefix_lens[index])
             chunk_end = chunk_begin + int(op.input_lengths[index])
             if chunk_end > prompt_len:
                 raise ValueError(
-                    "Paged cache Prefill chunk extends past Decode's prompt manifest"
+                    "Cache-transfer Prefill chunk extends past Decode's prompt manifest"
                 )
             is_last = chunk_end == prompt_len
             # On the first submitted chunk, include blocks that Prefill found in
@@ -204,14 +138,14 @@ class DisaggPrefillExecutor:
             for destination in destinations:
                 if destination.block_manifest is None:
                     raise RuntimeError(
-                        "Paged cache destination metadata is unavailable"
+                        "Cache-transfer destination metadata is unavailable"
                     )
                 if (
                     destination.block_manifest.prefix_len != prefix_len
                     or destination.block_manifest.prompt_len != prompt_len
                 ):
                     raise ValueError(
-                        "Paged cache destinations disagree on the prompt window"
+                        "Cache-transfer destinations disagree on the prompt window"
                     )
             if (
                 not any(group.source_block_ids for group in block_selection.groups)
@@ -239,13 +173,25 @@ class DisaggPrefillExecutor:
             )
 
     def _cache_decode(self, op) -> None:
-        if self._layerwise_enabled:
-            # Layerwise already streamed the KV during prepare_prefill; only the
-            # bootstrap token still needs publishing on the last chunk.
-            for request_id in op.request_ids:
-                sender = self.senders.get(request_id)
-                if sender is None:
-                    continue
+        """Publish each request's bootstrap payload and finish its transfer.
+
+        ``op`` is the plan's remote-decode batch, and it is self-contained:
+        the scheduler emits a row only once the final chunk's result has
+        landed, so ``decode_input_ids[i]`` is the bootstrap token (the
+        sampled first decode token) and ``spec_candidate_ids[i]`` the
+        drafter's candidate rows (empty without speculation).
+        """
+        pending = []
+        for index, request_id in enumerate(op.request_ids):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                continue
+            token = int(op.decode_input_ids[index])
+            if token < 0:
+                raise RuntimeError("Cache-transfer bootstrap token is unavailable")
+            spec_candidate_ids = list(op.spec_candidate_ids[index]) or None
+
+            if self._layerwise_enabled:
                 if not sender.layerwise_final_chunk_submitted():
                     transfer_infos = self.kv_manager.transfer_infos.get(
                         sender.bootstrap_room, {}
@@ -254,72 +200,33 @@ class DisaggPrefillExecutor:
                         info.is_dummy for info in transfer_infos.values()
                     ):
                         # Idle representative ranks have no cache fields to
-                        # stream, but still participate in the Prefill TP status
-                        # collective. Submit their final no-op only after the
-                        # Prefill forward has completed.
-                        token = self._request_token.get(request_id)
-                        spec_candidate_ids = self._request_spec_candidate_ids.get(
-                            request_id
-                        )
-                        if (
-                            isinstance(token, bool)
-                            or not isinstance(token, int)
-                            or token < 0
-                        ):
-                            raise RuntimeError(
-                                "Paged cache bootstrap token is unavailable"
-                            )
+                        # stream, but still participate in the Prefill TP
+                        # status collective. Submit their final no-op only
+                        # after the Prefill forward has completed.
                         sender.send(
                             True,
                             bootstrap_token=token,
                             spec_candidate_ids=spec_candidate_ids,
                             block_manifest=None,
                         )
-                        self._request_token.pop(request_id, None)
-                        self._request_spec_candidate_ids.pop(request_id, None)
-                        self._layerwise_token_published.discard(request_id)
                     continue
-                token = self._request_token.get(request_id)
-                spec_candidate_ids = self._request_spec_candidate_ids.get(request_id)
-                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                    raise RuntimeError("Paged cache bootstrap token is unavailable")
-                if request_id not in self._layerwise_token_published:
-                    self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room,
-                        token,
-                        spec_candidate_ids,
-                    )
-                self._request_token.pop(request_id, None)
-                self._request_spec_candidate_ids.pop(request_id, None)
-                self._layerwise_token_published.discard(request_id)
-            return
-        pending = []
-        for index, request_id in enumerate(op.request_ids):
-            sender = self.senders.get(request_id)
-            if sender is None:
-                continue
-            if sender.layerwise_final_chunk_submitted():
-                token = self._request_token.pop(request_id, None)
-                spec_candidate_ids = self._request_spec_candidate_ids.pop(
-                    request_id, None
+                # Layerwise already streamed the KV during prepare_prefill;
+                # only the bootstrap payload still needs publishing.
+                self.kv_manager.set_prefill_metadata(
+                    sender.bootstrap_room, token, spec_candidate_ids
                 )
-                if request_id not in self._layerwise_token_published:
-                    if (
-                        isinstance(token, bool)
-                        or not isinstance(token, int)
-                        or token < 0
-                    ):
-                        raise RuntimeError("Paged cache bootstrap token is unavailable")
-                    self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room, token, spec_candidate_ids
-                    )
-                self._layerwise_token_published.discard(request_id)
+                continue
+
+            if sender.layerwise_final_chunk_submitted():
+                self.kv_manager.set_prefill_metadata(
+                    sender.bootstrap_room, token, spec_candidate_ids
+                )
                 continue
             transfer_infos = self.kv_manager.transfer_infos.get(
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy
             ]
@@ -328,23 +235,11 @@ class DisaggPrefillExecutor:
                 # TP status collective. Decode TP rank zero sends it one dummy
                 # rendezvous; enqueueing a final no-op lets the existing
                 # transfer worker mark this rank successful without DMA.
-                token = self._request_token.get(request_id)
-                spec_candidate_ids = self._request_spec_candidate_ids.get(request_id)
-                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                    raise RuntimeError("Paged cache bootstrap token is unavailable")
-                pending.append(
-                    (
-                        request_id,
-                        sender,
-                        token,
-                        spec_candidate_ids,
-                        None,
-                    )
-                )
+                pending.append((sender, token, spec_candidate_ids, None))
                 continue
             destination = destinations[0]
             if destination.block_manifest is None:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             block_manifest = build_cache_block_manifest(
                 op,
                 layout=self.cache_layout,
@@ -355,7 +250,7 @@ class DisaggPrefillExecutor:
             for destination in destinations:
                 if destination.block_manifest is None:
                     raise RuntimeError(
-                        "Paged cache destination metadata is unavailable"
+                        "Cache-transfer destination metadata is unavailable"
                     )
                 if (
                     destination.block_manifest.prefix_len != block_manifest.prefix_len
@@ -363,37 +258,17 @@ class DisaggPrefillExecutor:
                     != block_manifest.prompt_len
                 ):
                     raise ValueError(
-                        "Paged cache destinations disagree on the prompt window"
+                        "Cache-transfer destinations disagree on the prompt window"
                     )
-            token = self._request_token.get(request_id)
-            spec_candidate_ids = self._request_spec_candidate_ids.get(request_id)
-            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                raise RuntimeError("Paged cache bootstrap token is unavailable")
-            pending.append(
-                (
-                    request_id,
-                    sender,
-                    token,
-                    spec_candidate_ids,
-                    block_manifest,
-                )
-            )
+            pending.append((sender, token, spec_candidate_ids, block_manifest))
 
-        for (
-            request_id,
-            sender,
-            token,
-            spec_candidate_ids,
-            block_manifest,
-        ) in pending:
+        for sender, token, spec_candidate_ids, block_manifest in pending:
             sender.send(
                 True,
                 bootstrap_token=token,
                 spec_candidate_ids=spec_candidate_ids,
                 block_manifest=block_manifest,
             )
-            self._request_token.pop(request_id, None)
-            self._request_spec_candidate_ids.pop(request_id, None)
 
     def register(
         self,
@@ -414,7 +289,15 @@ class DisaggPrefillExecutor:
         )
 
     def execute(self, op):
-        self._dispatcher(op)
+        """Send this completed prompt's KV to the node that will decode it.
+
+        The P-role half of the plan's remote streams, submitted on the
+        forward thread like any forward; completion arrives as a transfer
+        event, not from here.
+        """
+        if not isinstance(op, Forward.Batch):
+            raise TypeError(f"Expected Batch, got {type(op).__name__}.")
+        self._cache_decode(op)
 
     def generate_events(self):
         if not self.senders:

@@ -90,17 +90,16 @@ def situ_moe_unavailable_reason() -> str | None:
     Importable on every platform so runtime callers need no vendor guards.
 
     Returns:
-        None when the installed flashinfer exposes ``ActivationType.Situ``
-        (which ships together with routed SiTU support); otherwise a
-        human-readable reason, suitable for surfacing in model-level
-        configuration errors.
+        None when the installed flashinfer exposes both SiTU routing entry
+        points used here; otherwise a human-readable reason, suitable for
+        surfacing in model-level configuration errors.
     """
     if not platform.is_nvidia:
         return "flashinfer TRTLLM-Gen SiTU MoE requires an NVIDIA platform"
     if _SITU_ACTIVATION_TYPE is None or _fi_fp4_routed_moe is None:
         return (
-            "Kimi-K3 SiTU requires flashinfer > 0.6.15 with native "
-            f"TRTLLM-Gen SiTU (PR #4180): {_situ_import_error}"
+            "Kimi-K3 SiTU requires flashinfer with public and precomputed "
+            f"TRTLLM-Gen SiTU routing: {_situ_import_error}"
         )
     return None
 
@@ -385,9 +384,26 @@ if platform.is_nvidia:
         plan: dict,
         w: torch.nn.Module,
     ):
-        # The private SiTU kernel uses the same standard TRT-LLM [up|gate]
-        # physical layout as SwiGLU; keep the shared reorder/shuffle above.
+        # The public TRTLLM-Gen SiTU entry point uses the same standard
+        # TRT-LLM [up|gate] physical layout as SwiGLU; keep the shared
+        # reorder/shuffle above.
         return _flashinfer_trtllm_mxfp4_moe_weights(plan, w, situ=True)
+
+    def _local_expert_range(w: torch.nn.Module) -> tuple[int, int, int]:
+        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        if local_experts != w.w13_weight.shape[0]:
+            raise RuntimeError(
+                f"expected {local_experts} local experts, "
+                f"got {w.w13_weight.shape[0]} weight batches"
+            )
+        local_expert_offset = getattr(w, "ep_rank", 0) * local_experts
+        num_experts = getattr(w, "num_experts")
+        if local_expert_offset < 0 or local_expert_offset + local_experts > num_experts:
+            raise RuntimeError(
+                f"invalid local expert range [{local_expert_offset}, "
+                f"{local_expert_offset + local_experts}) for {num_experts} experts"
+            )
+        return num_experts, local_experts, local_expert_offset
 
     def _call_mxfp4_moe(
         w: torch.nn.Module,
@@ -395,9 +411,10 @@ if platform.is_nvidia:
         x_quant: torch.Tensor,
         x_scale: torch.Tensor | None,
         output: torch.Tensor,
+        enable_pdl: bool,
     ) -> torch.Tensor:
         routing_logits = router_logits.to(torch.float32)
-        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        num_experts, local_experts, local_expert_offset = _local_expert_range(w)
         return trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
             routing_bias=None,
@@ -417,18 +434,19 @@ if platform.is_nvidia:
             output1_scale_scalar=None,
             output1_scale_gate_scalar=None,
             output2_scale_scalar=None,
-            num_experts=getattr(w, "num_experts"),
+            num_experts=num_experts,
             top_k=getattr(w, "top_k"),
             n_group=None,
             topk_group=None,
             intermediate_size=getattr(w, "intermediate_size_per_partition"),
-            local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
+            local_expert_offset=local_expert_offset,
             local_num_experts=local_experts,
             routed_scaling_factor=None,
             routing_method_type=1,
             do_finalize=True,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
+            enable_pdl=enable_pdl,
         )[0]
 
     def _call_mxfp4_situ_routed_moe(
@@ -436,32 +454,18 @@ if platform.is_nvidia:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         x: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         enable_pdl: bool,
         hidden_states_scale: torch.Tensor | None = None,
         do_finalize: bool = True,
-    ) -> torch.Tensor:
-        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
-        if local_experts != w.w13_weight.shape[0]:
-            raise RuntimeError(
-                f"expected {local_experts} local experts, "
-                f"got {w.w13_weight.shape[0]} weight batches"
-            )
-        local_expert_offset = getattr(w, "ep_rank", 0) * local_experts
-        num_experts = getattr(w, "num_experts")
-        if local_expert_offset < 0 or local_expert_offset + local_experts > num_experts:
-            raise RuntimeError(
-                f"invalid local expert range [{local_expert_offset}, "
-                f"{local_expert_offset + local_experts}) for {num_experts} experts"
-            )
+    ):
+        num_experts, local_experts, local_expert_offset = _local_expert_range(w)
+        # FlashInfer's precomputed route is an unpacked (ids, weights) tuple.
+        # IDs remain global; the kernel filters them to this rank's expert range.
         topk = (
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        # The unpacked ``(ids, weights)`` tuple is flashinfer's precomputed-topk
-        # format; expert IDs stay global and the kernel filters to the local
-        # range. routing_method_type=1 (Renormalize) matches K3's
-        # pre-normalized topk weights, which the kernel consumes as-is.
         result = _fi_fp4_routed_moe(
             topk_ids=topk,
             routing_bias=None,
@@ -494,10 +498,7 @@ if platform.is_nvidia:
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output if do_finalize else None,
         )
-        if not do_finalize:
-            # [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
-            return result
-        return output
+        return output if do_finalize else result
 
     @register_kernel(
         "moe",
@@ -562,7 +563,12 @@ if platform.is_nvidia:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
+            x_quant, x_scale = mxfp8_quantize(
+                x,
+                False,
+                enable_pdl=enable_pdl,
+                alignment=hidden_padded,
+            )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
             raise NotImplementedError(
@@ -581,24 +587,22 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
+        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output, enable_pdl)
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result
 
-    def _register_private_situ_kernel(function):
+    def _register_mxfp4_situ_kernel(function):
         reason = situ_moe_unavailable_reason()
         if reason is not None:
-            # Skipping is normal for deployments that don't serve Kimi-K3, so
-            # log at INFO -- but keep the reason (e.g. a flashinfer build
-            # without SiTU), which otherwise vanishes and makes "kernel not
-            # found" failures hard to trace back here.
+            # Skipping is normal for deployments that do not serve Kimi-K3,
+            # but retain the reason for otherwise opaque selection failures.
             logger.info("Kimi-K3 SiTU MoE kernel not registered: %s", reason)
             return function
         return register_kernel(
             "moe",
             "apply",
-            name="flashinfer_trtllm_mxfp4_situ_routed_moe_apply",
+            name="flashinfer_trtllm_mxfp4_situ_moe_apply",
             solution="flashinfer_trtllm",
             weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
             capability=CapabilityRequirement(
@@ -606,28 +610,36 @@ if platform.is_nvidia:
                 min_arch_version=ArchVersion(10, 0),
                 max_arch_version=ArchVersion(10, 3),
             ),
-            signatures=format_signatures(
-                "x",
-                "dense",
-                {torch.bfloat16},
-            ),
+            signatures=format_signatures("x", "dense", {torch.bfloat16}),
             traits={
                 "weight_dtype": frozenset({"mxfp4"}),
                 "activation": frozenset({"situ"}),
-                "routing_mode": frozenset({"precomputed_topk"}),
+                "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
                 "supports_deferred_finalize": frozenset({True, False}),
                 "supports_ep": frozenset({True}),
                 "supports_all_to_all_ep": frozenset({False}),
                 "ispp_alignment": frozenset({1}),
-                # flashinfer's SiTU cubins are MxFP4 x MxFP8 (w4a8) only.
+                # FlashInfer's SiTU cubins are MxFP4 x MxFP8 (w4a8) only.
                 "internal_activation_dtype": frozenset({"fp8"}),
                 "supports_bias": frozenset({False}),
             },
             priority=Priority.SPECIALIZED,
         )(function)
 
-    @_register_private_situ_kernel
-    def flashinfer_trtllm_mxfp4_situ_routed_moe_apply(
+    def _normalize_kernel_routing_deferred_result(result):
+        gemm2_output, expert_weights, expanded_idx = result
+        if expert_weights.dtype == torch.float32:
+            # FlashInfer allocates this buffer using routing_logits.dtype, but
+            # TRT-LLM's DeepSeekV3 router writes packed BF16 values into its
+            # live prefix. Recover the BF16 view expected by the latent tail.
+            num_tokens, top_k = expert_weights.shape
+            expert_weights = expert_weights.view(torch.bfloat16).view(-1, top_k)[
+                :num_tokens
+            ]
+        return gemm2_output, expert_weights, expanded_idx
+
+    @_register_mxfp4_situ_kernel
+    def flashinfer_trtllm_mxfp4_situ_moe_apply(
         plan: dict,
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -639,15 +651,28 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        if topk_weights is None or topk_ids is None:
-            raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
+        has_topk_weights = topk_weights is not None
+        has_topk_ids = topk_ids is not None
+        if has_topk_weights != has_topk_ids:
+            raise ValueError(
+                "topk_weights and topk_ids must either both be set or both be None"
+            )
+        use_precomputed_topk = has_topk_weights
+        if not use_precomputed_topk and router_logits is None:
+            raise ValueError("kernel_routing plan requires router_logits")
         if x.dtype != torch.bfloat16:
             raise TypeError("FlashInfer MXFP4 SiTU requires bf16 input")
 
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)
         if x.shape[0] == 0:
-            return x.new_empty(0, hidden_original)
+            if do_finalize:
+                return x.new_empty((0, hidden_original))
+            return (
+                x.new_empty((0, hidden_padded)),
+                x.new_empty((0, getattr(w, "top_k")), dtype=torch.bfloat16),
+                x.new_empty((0,), dtype=torch.int32),
+            )
         if x.shape[-1] > hidden_padded:
             raise RuntimeError(
                 f"expected hidden size at most {hidden_padded}, got {x.shape[-1]}"
@@ -660,16 +685,17 @@ if platform.is_nvidia:
                 value=0.0,
             )
 
-        # cute-dsl beats the cuda backend at every size under CUDA-graph
-        # replay (1.5x at decode M, +6-16% at prefill); its higher eager
-        # launch overhead is amortized by graph capture.
+        # cute-dsl wins under CUDA-graph replay.
         x, x_scale = mxfp8_quantize(
-            x, False, alignment=hidden_padded, backend="cute-dsl"
+            x,
+            False,
+            enable_pdl=enable_pdl,
+            alignment=hidden_padded,
+            backend="cute-dsl",
         )
         hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
 
-        # Deferred finalize returns the raw triple, so it needs no
-        # [tokens, hidden] destination at all — skip the allocation.
+        # Deferred finalize returns the raw triple and needs no destination.
         output = None
         if do_finalize:
             out_buf = getattr(w, "_situ_output_buffer", None)
@@ -678,31 +704,69 @@ if platform.is_nvidia:
                 and out_buf.shape == (x.shape[0], hidden_padded)
                 and out_buf.is_contiguous()
             ):
-                # Caller-owned destination (e.g. a fused all-reduce lane slice).
                 output = out_buf
             else:
                 output = torch.empty(
                     x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
                 )
-        # Tactics come from the autotuner cache, seeded by a pre-swept table
-        # and/or the runtime's startup autotune window (which exercises this
-        # op via the dummy prefill); uncovered shapes take the heuristic
-        # fallback. Serving never enters a tuning context.
-        result = _call_mxfp4_situ_routed_moe(
-            w,
-            topk_weights,
-            topk_ids,
-            x,
-            output,
-            enable_pdl,
-            hidden_states_scale=hidden_states_scale,
-            do_finalize=do_finalize,
-        )
-        if not do_finalize:
-            # Deferred: [gemm2_output(permuted), expert_weights,
-            # expanded_idx_to_permuted_idx]; padded width is the caller's
-            # concern (K3 latent 3584 needs no pad on this path).
+
+        if use_precomputed_topk:
+            result = _call_mxfp4_situ_routed_moe(
+                w,
+                topk_weights,
+                topk_ids,
+                x,
+                output,
+                enable_pdl,
+                hidden_states_scale=hidden_states_scale,
+                do_finalize=do_finalize,
+            )
+            if not do_finalize:
+                return result
+            assert result is not None
+            if hidden_original != hidden_padded:
+                return result[:, :hidden_original].contiguous()
             return result
+
+        num_experts, local_experts, local_expert_offset = _local_expert_range(w)
+
+        result = trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=_routing_value(w, "correction_bias", None),
+            hidden_states=x,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=w.w13_weight,
+            gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=w.gemm1_alpha,
+            gemm1_beta=w.gemm1_beta,
+            gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
+            gemm2_weights=w.w2_weight,
+            gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=num_experts,
+            top_k=getattr(w, "top_k"),
+            n_group=_routing_value(w, "n_group", 0),
+            topk_group=_routing_value(w, "topk_group", 0),
+            intermediate_size=getattr(w, "intermediate_size_per_partition"),
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_experts,
+            routed_scaling_factor=_routing_value(w, "routed_scaling_factor", 1.0),
+            routing_method_type=int(_routing_value(w, "routing_method_type", 2)),
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            activation_type=_SITU_ACTIVATION_TYPE,
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
+            norm_topk_prob=_routing_value(w, "normalize_topk_weights", True),
+            output=output if do_finalize else None,
+        )
+
+        if not do_finalize:
+            return _normalize_kernel_routing_deferred_result(result)
+        assert output is not None
         if hidden_original != hidden_padded:
-            result = result[:, :hidden_original].contiguous()
-        return result
+            return output[:, :hidden_original].contiguous()
+        return output

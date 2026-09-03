@@ -104,6 +104,22 @@ struct ForwardState {
     CacheProgress TakeCacheProgress() && { return std::move(cache_progress_); }
     const CacheProgress& CacheProgressRef() const { return cache_progress_; }
 
+    // Forwards scheduled for this request whose results have not come back.
+    // More than one is normal under the overlap schedule, which plans the
+    // next step before committing the previous one.
+    //
+    // It lives on the base, not on the states that happen to consume a
+    // result: a forward is out against the PAGES, and every forward state
+    // owns pages. A prefill chunk produces no ExtendResult, but its result
+    // still writes KV into this request's tables -- retract it mid-flight
+    // and the write lands on pages someone else now owns.
+    std::int32_t ResultsInFlight() const { return results_in_flight_; }
+    void TrackScheduledForward() { ++results_in_flight_; }
+    void ResultLanded() { results_in_flight_ = std::max(0, results_in_flight_ - 1); }
+    // Carried across a state transition: a transition relabels the request,
+    // and the forwards already out do not care what it is called.
+    void CarryResultsInFlight(std::int32_t count) { results_in_flight_ = count; }
+
 protected:
     TokenContainer* token_container_{};
     std::int32_t prefix_granularity_{};
@@ -112,18 +128,18 @@ private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
     std::vector<BlockTable> block_tables_;
     CacheProgress cache_progress_;
+    std::int32_t results_in_flight_{0};
 };
 
 struct Prefilling : public ForwardState {
     Prefilling(TokenContainer* token_container, std::int32_t prefix_granularity,
                std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
                std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-               CacheProgress cache_progress, PrefillSource source = PrefillSource::kLocal)
+               CacheProgress cache_progress)
         : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
                        std::move(cache_progress)),
           window{window},
-          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
-          source_{source} {}
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
     std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
     std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
@@ -137,13 +153,14 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    PrefillSource Source() const { return source_; }
+    // The final mamba state checkpoint's pages are already reserved, so this
+    // request's remaining prompt is capacity-safe.
+    bool TailCheckpointReserved() const { return CacheProgressRef().state_checkpoint_tail_reserved; }
 
     TokenContainer::Window window{};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
-    PrefillSource source_{PrefillSource::kLocal};
 };
 
 struct PrefillDone : public ForwardState {
@@ -157,6 +174,7 @@ struct PrefillDone : public ForwardState {
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+
     std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
     std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
     PrefillInfo CurrentPrefillInfo() const {
@@ -199,9 +217,23 @@ private:
 struct Retracted {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
+    // Monotonic stamp from the retraction that produced this state. The plan
+    // builder derives the readmission order off the states themselves -- no
+    // separate queue to keep in step with the FSM.
+    std::int64_t retraction_epoch{0};
+    // False when the retraction had nowhere to store the KV (no host cache):
+    // there is no snapshot to recover, so the request re-prefills like any
+    // newcomer and does not queue behind other readmissions.
+    bool has_recoverable_snapshot{true};
+    // A victim with generated output a client is reading resumes ahead of
+    // one that had produced nothing, whatever their retraction epochs say.
+    bool resumes_generation{false};
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
+    std::int64_t RetractionEpoch() const { return retraction_epoch; }
+    bool HasRecoverableSnapshot() const { return has_recoverable_snapshot; }
+    bool ResumesGeneration() const { return resumes_generation; }
 };
 
 struct Finished {};

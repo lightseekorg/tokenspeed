@@ -461,10 +461,10 @@ def _run_dsa(
     traits={
         "page_size": frozenset({64}),
         "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
-        "qk_nope_head_dim": frozenset({128, 192}),
+        "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
-        "qk_rope_head_dim": frozenset({64}),
-        "topk": frozenset({512, 1024, 2048}),
+        "qk_rope_head_dim": frozenset({0, 64}),
+        "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "kv_cache_available": frozenset({False, True}),
         "sparse_kv_cache_available": frozenset({False, True}),
         "topk_layout": frozenset({"global_slots"}),
@@ -487,11 +487,14 @@ def triton_dsa_decode(
     softmax_scale: float,
     page_size: int,
     q_len_per_req: int = 1,
+    kv_seq_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
+    del kv_seq_lens
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -521,10 +524,10 @@ def triton_dsa_decode(
     traits={
         "page_size": frozenset({64}),
         "q_len_per_req": frozenset({1}),
-        "qk_nope_head_dim": frozenset({128, 192}),
+        "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
-        "qk_rope_head_dim": frozenset({64}),
-        "topk": frozenset({512, 1024, 2048}),
+        "qk_rope_head_dim": frozenset({0, 64}),
+        "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "kv_cache_available": frozenset({False, True}),
         "sparse_kv_cache_available": frozenset({False, True}),
         "topk_layout": frozenset({"global_slots"}),
@@ -547,11 +550,14 @@ def triton_dsa_prefill(
     softmax_scale: float,
     page_size: int,
     q_len_per_req: int = 1,
+    kv_seq_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
+    del kv_seq_lens
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,

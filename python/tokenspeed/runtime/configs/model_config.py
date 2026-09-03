@@ -55,6 +55,13 @@ _DEEPSEEK_V4_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLMNextN",
     }
 )
+_QWEN4_EXP_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
+    }
+)
 _MLA_ARCHITECTURES = frozenset(
     {
         "DeepseekV3ForCausalLM",
@@ -77,6 +84,8 @@ _DSA_ARCHITECTURES = frozenset(
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(
@@ -127,6 +136,13 @@ def override_model_config(model_config, ext_yaml):
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
+
+
+def is_qwen4_exp(config: PretrainedConfig) -> bool:
+    return (
+        getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+        or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
+    )
 
 
 def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
@@ -190,6 +206,7 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_topk = mla_config.index_topk
     model_config.index_head_dim = mla_config.index_head_dim
     model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
 
     model_config.scaling = 1 / math.sqrt(
@@ -282,6 +299,21 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def _is_dflash2_mla(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> bool:
+    architectures = _model_architectures(hf_config, hf_text_config)
+    dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
+        hf_config, "dflash_config", None
+    )
+    return (
+        "DFlash2DraftModel" in architectures
+        and isinstance(dflash_config, dict)
+        and dflash_config.get("attention_mode") == "mla"
+    )
 
 
 def _apply_attention_family_defaults(
@@ -417,7 +449,7 @@ class ModelConfig:
             # pattern (mtp_config.local_layer_ids) and only depths
             # 0..steps-1 ever run; swap in the depth-specialized (and
             # steps-pruned) text config so layer construction, attention
-            # metadata, and paged-cache layout all derive from it.
+            # metadata, and cache-group layout all derive from it.
             from tokenspeed.runtime.configs.inkling_config import (
                 inkling_mtp_text_config,
             )
@@ -541,6 +573,8 @@ class ModelConfig:
         if attention_family is not None:
             _apply_attention_family_defaults(server_args, attention_family)
             attention_family.configure(self)
+        elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
+            configure_mla_attention(self)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -821,10 +855,12 @@ def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }

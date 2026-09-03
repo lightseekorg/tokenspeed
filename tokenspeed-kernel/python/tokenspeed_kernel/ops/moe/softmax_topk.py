@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.platform import Platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -55,7 +55,6 @@ def moe_softmax_topk(
     *,
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
-    enable_pdl: bool = False,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using softmax routing in one fused launch when supported.
@@ -68,8 +67,6 @@ def moe_softmax_topk(
         renormalize: Normalize the selected weights to sum to one. When false,
             return probabilities from the softmax over all experts.
         routed_scaling_factor: Scale applied to every selected route weight.
-        enable_pdl: Join a Programmatic Dependent Launch chain on supported
-            NVIDIA devices.
         solution: Optional implementation override, such as ``"triton"`` or
             ``"torch"``.
 
@@ -94,6 +91,7 @@ def moe_softmax_topk(
 
     if solution is None and not _triton_eligible(router_logits, topk):
         solution = "torch"
+    enable_pdl = pdl_enabled()
     if solution == "torch":
         return torch_softmax_topk(
             router_logits=router_logits,

@@ -19,10 +19,15 @@
 # SOFTWARE.
 
 
+import logging
 from collections.abc import Callable
+from dataclasses import replace
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    TRTLLM_NVFP4_ISPP_ALIGNMENT,
+)
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -37,13 +42,15 @@ from tokenspeed.runtime.layers.moe.utils import (
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
+from tokenspeed.runtime.layers.moe.weights.loaders import round_up
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+
+logger = logging.getLogger(__name__)
 
 
 class MoELayer(torch.nn.Module):
@@ -188,6 +195,25 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            self._apply_trtllm_ispp_padding(
+                fp8_scale_block_shape[0], "FP8 block scales tile it"
+            )
+        if self._quant_kind == "unquant":
+            # The flashinfer_trtllm unquant kernel declares
+            # ispp_alignment={128} (ops/moe/flashinfer/trtllm_unquant.py);
+            # without padding a misaligned intermediate size silently
+            # deselects it during moe_plan and the layer falls back to the
+            # triton bf16 path. The padded tail rows/columns stay zero
+            # (create_dense_weight_pair zero-initializes) and contribute
+            # nothing to the MoE output.
+            self._apply_trtllm_ispp_padding(
+                128, "the flashinfer_trtllm unquant kernel accepts it"
+            )
+        if self._quant_kind == "nvfp4":
+            self._apply_trtllm_ispp_padding(
+                TRTLLM_NVFP4_ISPP_ALIGNMENT,
+                "the flashinfer_trtllm NVFP4 weight layout accepts it",
+            )
         if self._quant_kind == "mxfp4":
             if self.quant_config.is_w4a8_fp8:
                 internal_activation_dtype = "fp8"
@@ -251,6 +277,31 @@ class MoELayer(torch.nn.Module):
         )
         self._weights_processed = False
 
+    def _apply_trtllm_ispp_padding(self, alignment: int, reason: str) -> None:
+        """Round the intermediate size up when the trtllm backend needs it.
+
+        Args:
+            alignment: Required multiple along the intermediate dimension
+                (the FP8 scale block size, or the kernel's declared
+                ``ispp_alignment``).
+            reason: Log fragment describing why the padding is required.
+        """
+        if get_moe_backend().value != "flashinfer_trtllm":
+            return
+        ispp = self.intermediate_size // self.tp_size
+        if ispp % alignment == 0:
+            return
+        padded = round_up(ispp, alignment)
+        logger.info(
+            "%s: padding MoE intermediate size per partition %d -> %d so %s",
+            self.prefix,
+            ispp,
+            padded,
+            reason,
+        )
+        self.intermediate_size = padded * self.tp_size
+        self._spec = replace(self._spec, intermediate_size=self.intermediate_size)
+
     def process_weights_after_loading(self, module) -> None:
         if self._weights_processed:
             return
@@ -261,6 +312,11 @@ class MoELayer(torch.nn.Module):
     @property
     def support_routing(self) -> bool:
         return self.plan["support_routing"]
+
+    @property
+    def supports_precomputed_topk(self) -> bool:
+        # The fallback keeps lightweight out-of-tree/mock plans compatible.
+        return self.plan.get("supports_precomputed_topk", not self.support_routing)
 
     @property
     def topk_output_format(self):
@@ -293,6 +349,9 @@ class MoELayer(torch.nn.Module):
         do_finalize: bool = True,
         low_latency: bool | None = None,
         overlap_fn: Callable[[], None] | None = None,
+        shared_input: torch.Tensor | None = None,
+        shared_weight: torch.Tensor | None = None,
+        shared_out: torch.Tensor | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -313,7 +372,31 @@ class MoELayer(torch.nn.Module):
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
 
-        if self.support_routing:
+        shared_tensors = (shared_input, shared_weight, shared_out)
+        if any(value is not None for value in shared_tensors) and not all(
+            value is not None for value in shared_tensors
+        ):
+            raise ValueError(
+                "joint shared projection requires input, weight, and output"
+            )
+        shared_kwargs = (
+            {
+                "shared_input": shared_input,
+                "shared_weight": shared_weight,
+                "shared_out": shared_out,
+            }
+            if all(value is not None for value in shared_tensors)
+            else {}
+        )
+
+        use_kernel_routing = topk_output.format.is_bypassed() or (
+            self.support_routing and not self.supports_precomputed_topk
+        )
+        if use_kernel_routing:
+            if not self.support_routing:
+                raise ValueError(
+                    "selected MoE kernel does not support in-kernel routing"
+                )
             return tokenspeed_kernel.moe_apply(
                 self.plan,
                 hidden_states,
@@ -322,22 +405,25 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
+                **shared_kwargs,
             )
-        else:
-            return tokenspeed_kernel.moe_apply(
-                self.plan,
-                hidden_states,
-                self,
-                topk_output.router_logits,
-                topk_weights=topk_output.topk_weights,
-                topk_ids=topk_output.topk_ids,
-                num_tokens_global=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
-                low_latency=low_latency,
-                overlap_fn=overlap_fn,
+        if not self.supports_precomputed_topk:
+            raise ValueError(
+                "selected MoE kernel does not support precomputed top-k routing"
             )
+        return tokenspeed_kernel.moe_apply(
+            self.plan,
+            hidden_states,
+            self,
+            topk_output.router_logits,
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_output.topk_ids,
+            num_tokens_global=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=do_finalize,
+            low_latency=low_latency,
+            overlap_fn=overlap_fn,
+            **shared_kwargs,
+        )

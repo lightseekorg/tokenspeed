@@ -28,11 +28,15 @@ import triton.language as tl
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    create_dist_argmax_state,
+    DistArgmaxState,
     distributed_argmax,
 )
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     is_available as dist_argmax_available,
+)
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    supports_dist_argmax_shape,
+    try_create_dist_argmax_state,
 )
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -59,6 +63,48 @@ from tokenspeed.runtime.sampling.logits_layout import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+_UNQUANTIZED_LM_HEAD_METHODS = frozenset(
+    {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod"}
+)
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    """Whether ``lm_head``'s quant method should run the logits GEMM.
+
+    Returns ``True`` only when the head is genuinely quantized and its runtime
+    tensor layout matches the method (so a packed weight is never matmul'd, and
+    a mismatched/stale method never runs). Otherwise the caller falls back to a
+    dense ``weight`` matmul.
+    """
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    if method_name == "Nvfp4W4A16LinearMethod":
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "alpha",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+
+    return True
 
 
 def _force_deterministic_rsag() -> bool:
@@ -185,7 +231,7 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        return lm_head_gemm(cast_hidden, weight)
     return torch.matmul(cast_hidden, weight.T)
 
 
@@ -327,41 +373,85 @@ class LogitsProcessor(nn.Module):
             )
         return self._LOGITS_AG_STATES[key]
 
-    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia or _force_deterministic_rsag():
-            return None
+    def _agree_across_tp(self, ok: bool, group, device: torch.device) -> bool:
+        """Reduce a per-rank verdict so the whole group takes the same path."""
+        vote = torch.tensor([int(ok)], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(
+            vote, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        return bool(vote.item())
 
-        # CuTe DSL argmax is unavailable on some SKUs (e.g. H20 lacks TMA
-        # cluster launch). Fall back to the plain all-gather + argmax path.
-        if not dist_argmax_available():
-            return None
+    def acquire_dist_argmax_state(
+        self,
+        lm_head: VocabParallelEmbedding,
+        *,
+        max_M: int,
+        skip_ping_pong: bool,
+    ) -> DistArgmaxState | None:
+        """Build this TP group's distributed-argmax state, or None to fall back.
 
-        if (
-            self.tp_size == 1
-            or self.skip_all_gather
-            or self.dp_sampling_enabled
-            or self._tp_group_spans_nodes()
+        Shared by the sampler and the drafters. Construction rendezvouses and
+        barriers, so a rank deciding alone would strand the others: platform
+        eligibility and the build outcome are both reduced with MIN. Callers
+        apply their own config-uniform gates first, which may return early
+        because those cost no collective work.
+
+        Args:
+            lm_head: The vocab-parallel head whose shard the argmax reduces.
+            max_M: Largest row count the caller will ever pass.
+            skip_ping_pong: Pin the slot band instead of alternating; only
+                when the caller synchronizes across ranks between calls.
+
+        Returns:
+            The state, or None when this group must use the gather path.
+        """
+        key = (self.tp_group, lm_head.weight.size(0), max_M, skip_ping_pong)
+        if key in self._LOGITS_DIST_ARGMAX_STATES:
+            return self._LOGITS_DIST_ARGMAX_STATES[key]
+        if torch.cuda.is_current_stream_capturing():
+            return None  # never rendezvous inside capture; warmup probes first
+
+        device = lm_head.weight.device
+        group = pg_manager.get_process_group("nccl", self.tp_group)
+        if self._agree_across_tp(
+            current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
+            state = try_create_dist_argmax_state(
+                group=group,
+                rank_in_group=self.tp_rank,
+                max_M=max_M,
+                dtype=lm_head.weight.dtype,
+                device=device,
+                skip_ping_pong=skip_ping_pong,
+            )
+            if not self._agree_across_tp(state is not None, group, device):
+                state = None
+        else:
+            state = None
+        self._LOGITS_DIST_ARGMAX_STATES[key] = state
+        return state
+
+    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
+        if _force_deterministic_rsag():
+            return None
+        if not 2 <= self.tp_size <= 32:
+            return None  # the kernel's cross-rank reduce is a single warp shuffle
+        if self.skip_all_gather or self.dp_sampling_enabled:
             return None
 
         vocab_per_rank = lm_head.weight.size(0)
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
-        if vocab_per_rank < 4096 or vocab_per_rank % 32 != 0:
-            return None  # below the kernel's vocab floor / alignment
+        if not supports_dist_argmax_shape(
+            vocab_per_rank, lm_head.weight.dtype, self.tp_size
+        ):
+            return None
 
-        key = (self.tp_group, vocab_per_rank)
-        if key not in self._LOGITS_DIST_ARGMAX_STATES:
-            self._LOGITS_DIST_ARGMAX_STATES[key] = create_dist_argmax_state(
-                group=pg_manager.get_process_group("nccl", self.tp_group),
-                rank_in_group=self.tp_rank,
-                max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
-                dtype=lm_head.weight.dtype,
-                device=lm_head.weight.device,
-                skip_ping_pong=True,
-            )
-
-        return self._LOGITS_DIST_ARGMAX_STATES[key]
+        return self.acquire_dist_argmax_state(
+            lm_head,
+            max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
+            skip_ping_pong=True,
+        )
 
     def forward(
         self,
@@ -585,7 +675,10 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
-        if hasattr(lm_head, "weight"):
+        quant_method = getattr(lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(lm_head, quant_method):
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
@@ -594,7 +687,7 @@ class LogitsProcessor(nn.Module):
                 )
         else:
             # GGUF models
-            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -608,11 +701,15 @@ class LogitsProcessor(nn.Module):
 
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             if self.do_argmax:
-                if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+                if (
+                    self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
                 if (
-                    self._dist_argmax_state is not None
+                    self._dist_argmax_state
+                    not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
                     and not self.final_logit_softcapping
                     and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
                 ):

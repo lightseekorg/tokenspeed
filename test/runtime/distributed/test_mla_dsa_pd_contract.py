@@ -55,17 +55,30 @@ _NUM_LCM_BLOCKS = 6
 
 
 def _attn_config(family: str, pd_enabled: bool):
-    """A real MLA/DSA config: the recipe dispatches fields on the type."""
+    """A real MLA/DSA config: the recipe dispatches fields on the spec type."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
     common = dict(
-        device="cpu",
         backend_name="mla",
         num_attention_heads=64,
         num_kv_heads=64,
         attn_tp_size=1,
         head_dim=192,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=1.0,
+        kv_cache_dim=576,
+    )
+    if family == "dsa":
+        spec = DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
+    else:
+        spec = MLAConfig(**common)
+    return AttnConfig(
+        device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         context_len=1024,
@@ -74,18 +87,10 @@ def _attn_config(family: str, pd_enabled: bool):
         prefix_granularity=_P,
         kernel_page_size=_P,
         kv_cache_quant_method="",
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        scaling=1.0,
-        kv_cache_dim=576,
         max_scheduled_tokens=_P,
         pd_disaggregation_enabled=pd_enabled,
+        components=(spec,),
     )
-    if family == "dsa":
-        return DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
-    return MLAConfig(**common)
 
 
 def _recipe(family: str, pd_enabled: bool = False):

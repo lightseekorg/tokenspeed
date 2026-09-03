@@ -36,6 +36,7 @@ from pathlib import Path
 
 import torch
 import tvm_ffi
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 def _objs_dir() -> Path:
@@ -150,7 +151,7 @@ def lm_head_gemm(
     weight: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Fused bf16 GEMM for lm_head / router-like projections.
 
@@ -159,7 +160,8 @@ def lm_head_gemm(
         weight:        ``[vocab_shard, hidden_dim]`` bf16 contiguous CUDA tensor
                        (i.e. the raw ``lm_head.weight``; no explicit transpose).
         out:           optional pre-allocated output ``[num_tokens, vocab_shard]``.
-        enable_pdl:    whether to request Programmatic Dependent Launch.
+        enable_pdl:    whether to request Programmatic Dependent Launch. Uses
+                       the platform default when omitted.
 
     Returns:
         bf16 CUDA tensor ``[num_tokens, vocab_shard]``.
@@ -180,6 +182,7 @@ def lm_head_gemm(
         assert out.dtype == torch.bfloat16
     if num_tokens == 0:
         return out
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     # tile_n=8 is the minimum-latency config for M<=8; tile_n=16 amortizes
     # the store/epilogue when M>8.
     tile_n = 8 if num_tokens <= 8 else 16

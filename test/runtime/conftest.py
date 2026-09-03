@@ -1,4 +1,4 @@
-"""Shared helpers for Kimi-K3 paged cache runtime tests."""
+"""Shared helpers for Kimi-K3 cache-group runtime tests."""
 
 from __future__ import annotations
 
@@ -44,33 +44,66 @@ def kimi_recipe(
     overlap_schedule_depth: int = 0,
     speculative_algorithm: str | None = None,
     speculative_num_draft_tokens: int = 1,
+    kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
+    import dataclasses
     from types import SimpleNamespace
 
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+        LinearAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         KimiK3Recipe,
     )
 
     text_config = text_config if text_config is not None else KimiLinearConfig()
-    attn_config = SimpleNamespace(
+    # The real components, not namespace fakes: the recipe reads the linear
+    # component's state-shape properties and the MLA spec's latent dims.
+    kda = text_config.linear_attn_config
+    linear_attn = LinearAttnConfig(
+        num_k_heads=int(kda["num_heads"]),
+        num_v_heads=int(kda["num_heads"]),
+        head_k_dim=int(kda["head_dim"]),
+        head_v_dim=int(kda["head_dim"]),
+        conv_kernel_size=int(kda["short_conv_kernel_size"]),
+        layer_ids=tuple(text_config.linear_layer_ids),
+        tp_size=tp_size,
+    )
+    mla = MLAConfig(
+        backend_name="mla",
+        num_attention_heads=text_config.num_attention_heads,
+        num_kv_heads=text_config.num_key_value_heads,
+        head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
         attn_tp_size=tp_size,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.float8_e4m3fn,
-        kv_cache_quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
+        qk_nope_head_dim=text_config.qk_nope_head_dim,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
+        v_head_dim=text_config.v_head_dim,
+        scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
+        kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+    )
+    attn_config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_quant_method=None,
         prefix_granularity=128,
         max_bs=max_bs,
+        max_graph_bs=max_bs,
         # K3's per-group demand reads the scheduler's concurrency through
         # CacheRecipe.scheduler_limits, context length included.
         context_len=context_len,
         pd_disaggregation_enabled=pd_enabled,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        components=(mla, linear_attn),
     )
     # The real K3 draft is BF16 MLA over the FP8 target arena.
     draft_attn_config = (
-        SimpleNamespace(**{**vars(attn_config), "kv_cache_dtype": torch.bfloat16})
+        dataclasses.replace(attn_config, kv_cache_dtype=torch.bfloat16)
         if draft_layers
         else None
     )

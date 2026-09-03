@@ -38,9 +38,10 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
                         int64_t topk,
                         int64_t num_valid_pages,
                         Optional<TensorView> maybe_num_valid_pages_per_token,
-                        int64_t force_begin_blocks, int64_t force_end_blocks,
-                        int64_t input_layout,
-                        int64_t stream_ptr) {
+                         int64_t force_begin_blocks, int64_t force_end_blocks,
+                         int64_t input_layout,
+                         int64_t stream_ptr,
+                         bool enable_pdl) {
   CHECK_INPUT(max_score);
   CHECK_CUDA(output_indices);
   CHECK_DIM(3, max_score);
@@ -145,7 +146,7 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       num_valid_pages_per_token, layout,
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
-      stream, /*enable_pdl=*/true);
+      stream, enable_pdl);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
