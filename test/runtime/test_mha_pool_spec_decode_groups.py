@@ -87,6 +87,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         device = kwargs.pop("device")
         for owned_by_arena in ("size", "prefix_granularity", "enable_memory_saver"):
             kwargs.pop(owned_by_arena, None)
+        kwargs.pop("layer_types", None)
         from cache_pool_test_utils import make_pool
 
         _, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
