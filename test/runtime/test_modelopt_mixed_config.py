@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel
 import torch
 
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
@@ -82,7 +83,35 @@ def test_from_config_rejects_unknown_algo():
         )
 
 
-def test_qwen35_w4a16_and_static_fp8_routing():
+def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: False,
+    )
+    config = _renamed_config(
+        {
+            "language_model.model.layers.5.mlp.up_proj": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16,
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="SM100/SM103.*FlashInfer"):
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.layers.5.mlp.up_proj",
+        )
+
+
+def test_qwen35_w4a16_and_static_fp8_routing(monkeypatch):
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: True,
+    )
+
     from tokenspeed.runtime.layers.dense import (
         Fp8LinearMethod,
         Nvfp4W4A16LinearMethod,

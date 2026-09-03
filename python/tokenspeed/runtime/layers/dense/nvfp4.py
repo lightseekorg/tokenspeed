@@ -210,6 +210,10 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
     ignored_checkpoint_params = frozenset({"input_scale"})
 
     def __init__(self, quant_config):
+        if not tokenspeed_kernel.has_flashinfer_cute_dsl_nvfp4_a16():
+            raise RuntimeError(
+                "NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer"
+            )
         self.quant_config = quant_config
         self.group_size = quant_config.group_size
 
@@ -288,10 +292,6 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
         layer.alpha = layer.weight_scale_2
 
     def apply(self, layer, x, bias=None):
-        if x.dtype is not torch.bfloat16:
-            raise ValueError(
-                f"FlashInfer CuTe-DSL W4A16 requires BF16 input, got {x.dtype}"
-            )
         return tokenspeed_kernel.mm(
             x,
             layer.weight,

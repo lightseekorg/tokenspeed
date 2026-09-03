@@ -162,7 +162,44 @@ from tokenspeed_kernel import (
 Using the above platform and solution-agnostic public APIs can get the most
 value out of TokenSpeed-kernel; but one can also directly call into a
 specific solution under `ops/<family>/`, or manually `select_kernel` with
-targeted filters:
+targeted filters.
+
+The public W4A16 NVFP4 GEMM accepts BF16 activations shaped `[M, K]`, packed
+`uint8` weights shaped `[N, K / 2]`, and block-16 E4M3 scales in the runtime
+128x4-swizzled layout. Runtime quantization methods perform this scale-layout
+conversion; direct callers must supply scales in that layout. Prepare the
+weights once after loading, then pass all returned values unchanged to `mm`:
+
+```python
+from tokenspeed_kernel import (
+    has_flashinfer_cute_dsl_nvfp4_a16,
+    mm,
+    prepare_nvfp4_a16_weights,
+)
+
+if not has_flashinfer_cute_dsl_nvfp4_a16():
+    raise RuntimeError(
+        "NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer"
+    )
+
+weight, weight_scale, alpha = prepare_nvfp4_a16_weights(
+    packed_weight,
+    swizzled_block16_scales,
+    alpha,
+)
+output = mm(
+    activation,
+    weight,
+    A_scales=None,
+    B_scales=weight_scale,
+    alpha=alpha,
+    quant="nvfp4_a16",
+)
+```
+
+Only NVIDIA SM100 and SM103 are supported.
+
+For targeted selection:
 
 ```python
 from tokenspeed_kernel.selection import select_kernel, kernel_override
