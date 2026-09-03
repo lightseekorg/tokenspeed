@@ -24,10 +24,13 @@ A V4 MTP draft alternates two row shapes each round: the packed bs*N verify
 step (step 0, served by the GraphBuffers views) and the plain bs-row steps
 1+ that this object serves. The plain-step metadata is one pointer-stable
 view per bs, exactly like the unified decode path's per-bs views. ``prepare``
-and ``advance`` are copy-only plus the sanctioned ``cache``-slot swap — no
-arm ever rebinds a tensor field, so there is nothing a captured graph could
-have recorded that a later round can invalidate, on the graph path and the
-eager path alike (they are the same object).
+and ``advance`` are copy-only — no arm ever rebinds a tensor field, so there
+is nothing a captured graph could have recorded that a later round can
+invalidate, on the graph path and the eager path alike (they are the same
+object). The one non-tensor slot, ``cache``, is borrowed from the round's
+source metadata: the packed GraphBuffers views on the graph path (whose
+group tables are themselves fixed slices of the persistent buffers), the
+round's fresh prefill metadata on the eager extend path.
 
 Storage-sharing rules with :class:`DeepseekV4GraphBuffers` (request-major
 row state is safe to share, token-major packed state is NOT):
@@ -98,9 +101,9 @@ class DeepseekV4DraftRounds:
     ) -> DeepseekV4ForwardMetadata:
         """Bind this round's step metadata from the packed/prefill state.
 
-        Copy-only over the per-bs views plus the sanctioned ``cache`` swap
-        (the guard-exempt slot); returns the views for the backend to run
-        the indexer/slot-mapping refresh hooks over and publish.
+        Copy-only over the per-bs views; the ``cache`` slot borrows the
+        source's (see the module docstring). Returns the views for the
+        backend to run the indexer/slot-mapping refresh hooks over and publish.
         """
         bs = prefill_metadata.seq_lens.numel()
         metadata = self.step_views(bs)

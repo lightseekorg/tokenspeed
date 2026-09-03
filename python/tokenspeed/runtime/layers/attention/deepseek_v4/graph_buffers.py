@@ -108,6 +108,9 @@ class DeepseekV4GraphBuffers:
             self.block_tables[gid] = torch.zeros(
                 (self.max_bs, max_pages), dtype=torch.int32, device=self.device
             )
+        # Views slice the group tables at construction; any built over the
+        # previous set must rebuild.
+        self._views.clear()
 
     # ------------------------------------------------------------------
     # The single per-shape view builder
@@ -124,13 +127,13 @@ class DeepseekV4GraphBuffers:
     ) -> DeepseekV4ForwardMetadata:
         """The pointer-stable metadata views for ``(bs, tokens_per_req)``.
 
-        Built once per shape and cached; every tensor field is a fixed slice
-        of the persistent buffers, assigned exactly at construction — capture,
-        replay refresh and lazy eager building all receive the same object, so
-        a refresh can never bind storage the captured graph did not record.
-        Only the ``cache`` slot is swapped per round (exempted from the
-        pointer guard via ``graph_unstable_metadata_fields``); callers own
-        that swap and the per-round ``forward_mode`` update.
+        Built once per shape and cached; every tensor field — the ``cache``
+        slot's group tables included — is a fixed slice of the persistent
+        buffers, assigned exactly at construction. Capture, replay refresh and
+        lazy eager building all receive the same object and only fill the
+        buffers underneath, so a refresh can never bind storage the captured
+        graph did not record. Callers own the per-round ``forward_mode``
+        update.
         """
         total_tokens = bs * tokens_per_req
         metadata = self._views.get((bs, tokens_per_req))
@@ -142,10 +145,10 @@ class DeepseekV4GraphBuffers:
             query_lens=self.query_lens[:bs],
             query_start_loc=self.query_start_loc[: bs + 1],
             token_to_req_indices=self.token_to_req[:total_tokens],
-            cache=DeepseekV4CacheMetadata(
+            cache=DeepseekV4CacheMetadata.from_group_tables(
                 page_size=kernel_page_size,
                 page_table=self.page_table[:bs, :max_num_pages],
-                block_tables={},
+                block_tables={gid: buf[:bs] for gid, buf in self.block_tables.items()},
             ),
             is_valid_token=self.is_valid_token[:total_tokens],
             seq_lens_cpu=None,
@@ -211,33 +214,29 @@ class DeepseekV4GraphBuffers:
         *,
         actual_bs: int | None = None,
         pad_value: int = 0,
-    ) -> dict[str, torch.Tensor]:
-        """Refresh the persistent per-group tables in place; returns the
-        ``[:bs]`` views keyed by gid. Missing groups keep the pad fill."""
-        out: dict[str, torch.Tensor] = {}
-        if not self.block_tables:
-            return out
+    ) -> None:
+        """Refresh the persistent per-group tables in place (the views built
+        over them see the new rows). Missing groups keep the pad fill."""
         active_rows = bs if actual_bs is None else actual_bs
         for group_id, buf in self.block_tables.items():
             table = block_tables.get(group_id)
             buf[:bs].fill_(pad_value)
-            if table is not None:
-                if int(table.shape[0]) < active_rows:
-                    raise RuntimeError(
-                        "DeepSeek V4 CUDA graph cache-group table row count "
-                        f"mismatch for {group_id!r}: got {int(table.shape[0])}, "
-                        f"expected at least actual_bs {active_rows}"
-                    )
-                cols = int(table.shape[1])
-                if cols > int(buf.shape[1]):
-                    raise RuntimeError(
-                        "DeepSeek V4 CUDA graph cache-group table width "
-                        f"mismatch for {group_id!r}: got {cols}, capture "
-                        f"buffer has {int(buf.shape[1])}"
-                    )
-                if active_rows > 0 and cols > 0:
-                    buf[:active_rows, :cols].copy_(
-                        table[:active_rows, :cols].to(torch.int32)
-                    )
-            out[group_id] = buf[:bs]
-        return out
+            if table is None:
+                continue
+            if int(table.shape[0]) < active_rows:
+                raise RuntimeError(
+                    "DeepSeek V4 CUDA graph cache-group table row count "
+                    f"mismatch for {group_id!r}: got {int(table.shape[0])}, "
+                    f"expected at least actual_bs {active_rows}"
+                )
+            cols = int(table.shape[1])
+            if cols > int(buf.shape[1]):
+                raise RuntimeError(
+                    "DeepSeek V4 CUDA graph cache-group table width "
+                    f"mismatch for {group_id!r}: got {cols}, capture "
+                    f"buffer has {int(buf.shape[1])}"
+                )
+            if active_rows > 0 and cols > 0:
+                buf[:active_rows, :cols].copy_(
+                    table[:active_rows, :cols].to(torch.int32)
+                )

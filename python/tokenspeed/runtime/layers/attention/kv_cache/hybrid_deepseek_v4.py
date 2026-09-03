@@ -41,25 +41,6 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-def _split_block_tables_into_v4_metadata(
-    block_tables: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor | None, dict[int, torch.Tensor], torch.Tensor | None]:
-    """Split the cache-group dict into V4-named tables.
-
-    Returns (swa, {ratio: compressor_state}, indexer_state). Unknown group
-    ids are ignored.
-    """
-    swa = block_tables.get(V4_SWA_KV_GROUP_ID)
-    indexer_state = block_tables.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
-    compressor_state: dict[int, torch.Tensor] = {}
-    for gid, table in block_tables.items():
-        ratio = parse_v4_compressor_state_group_id(gid)
-        if ratio is None:
-            continue
-        compressor_state[ratio] = table
-    return swa, compressor_state, indexer_state
-
-
 def _compressed_boundary_mask(
     positions: torch.Tensor,
     compress_ratio: int,
@@ -80,6 +61,42 @@ class DeepseekV4CacheMetadata:
     decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
         default_factory=dict
     )
+
+    @classmethod
+    def from_group_tables(
+        cls,
+        *,
+        page_size: int,
+        page_table: torch.Tensor,
+        block_tables: dict[str, torch.Tensor],
+    ) -> "DeepseekV4CacheMetadata":
+        """Bind the cache-group tables and name the V4-specific ones.
+
+        Args:
+            page_size: Kernel page size of ``page_table``.
+            page_table: Batch-ordered base full-history table.
+            block_tables: Cache-group tables keyed by group id; the SWA,
+                per-ratio compressor-state and indexer-state groups are
+                also exposed under their V4 names. Unknown ids ride along.
+
+        Returns:
+            The metadata over exactly these tensors (no copies).
+        """
+        compressor_state: dict[int, torch.Tensor] = {}
+        for gid, table in block_tables.items():
+            ratio = parse_v4_compressor_state_group_id(gid)
+            if ratio is not None:
+                compressor_state[ratio] = table
+        return cls(
+            page_size=page_size,
+            page_table=page_table,
+            block_tables=block_tables,
+            swa_page_table=block_tables.get(V4_SWA_KV_GROUP_ID),
+            compressor_state_block_tables=compressor_state,
+            indexer_state_block_table=block_tables.get(
+                V4_INDEXER_COMPRESSOR_STATE_GROUP_ID
+            ),
+        )
 
     def compressed_page_table(self, compress_ratio: int) -> torch.Tensor:
         if compress_ratio <= 1:

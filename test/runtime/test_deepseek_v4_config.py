@@ -74,13 +74,14 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     deepseek_v4_nope_dim,
     deepseek_v4_swa_row_bytes,
     deepseek_v4_swa_token_stride,
+    parse_v4_compressed_kv_group_id,
+    parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
-    _split_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
@@ -307,37 +308,55 @@ def _make_deepseek_v4_forward_metadata(
     query_start_loc,
     token_to_req_indices,
     block_tables=None,
-    swa_page_table=None,
-    compressor_state_block_tables=None,
-    indexer_state_block_table=None,
     **kwargs,
 ):
-    (
-        split_swa,
-        split_compressor_state,
-        split_indexer_state,
-    ) = _split_block_tables_into_v4_metadata(block_tables or {})
-    if swa_page_table is None:
-        swa_page_table = split_swa
-    if compressor_state_block_tables is None:
-        compressor_state_block_tables = split_compressor_state
-    if indexer_state_block_table is None:
-        indexer_state_block_table = split_indexer_state
-
-    cache = DeepseekV4CacheMetadata(
-        page_size=page_size,
-        page_table=page_table,
-        block_tables=block_tables or {},
-        swa_page_table=swa_page_table,
-        compressor_state_block_tables=compressor_state_block_tables,
-        indexer_state_block_table=indexer_state_block_table,
-    )
     return DeepseekV4ForwardMetadata(
         seq_lens=seq_lens,
         query_lens=query_lens,
         query_start_loc=query_start_loc,
         token_to_req_indices=token_to_req_indices,
-        cache=cache,
+        cache=DeepseekV4CacheMetadata.from_group_tables(
+            page_size=page_size,
+            page_table=page_table,
+            block_tables=block_tables or {},
+        ),
+        **kwargs,
+    )
+
+
+def _v4_cache_group_spec(group_id: str) -> CacheGroupSpec:
+    """The recipe spec a delivered table's group id names."""
+    if group_id == V4_SWA_KV_GROUP_ID:
+        return v4_swa_kv_spec(SimpleNamespace(sliding_window=128))
+    if group_id == V4_INDEXER_COMPRESSOR_STATE_GROUP_ID:
+        return v4_indexer_state_spec(c4_state_window=v4_c4_state_window(1))
+    ratio = parse_v4_compressor_state_group_id(group_id)
+    if ratio is not None:
+        return v4_compressor_state_spec(ratio, c4_state_window=v4_c4_state_window(1))
+    ratio = parse_v4_compressed_kv_group_id(group_id)
+    if ratio is not None:
+        return v4_compressed_kv_spec(ratio)
+    raise ValueError(f"not a DeepSeek V4 cache group id: {group_id!r}")
+
+
+def _init_v4_graph_state_for_groups(
+    backend: DeepseekV4AttentionBackend,
+    group_ids,
+    *,
+    max_bs: int,
+    page_count: int = 1024,
+    **kwargs,
+) -> None:
+    """``init_cuda_graph_state`` under the contract naming ``group_ids``.
+
+    The decode metadata views slice the persistent group tables the contract
+    allocates, so a refresh can only deliver tables for declared groups.
+    """
+    group_ids = tuple(group_ids)
+    backend.init_cuda_graph_state(
+        max_bs,
+        cache_group_specs=tuple(_v4_cache_group_spec(gid) for gid in group_ids),
+        cache_group_page_counts={gid: page_count for gid in group_ids},
         **kwargs,
     )
 
@@ -3392,13 +3411,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_tokens_per_req=1,
         )
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
-        refreshed = backend.graph.refresh_block_tables(
+        backend.graph.refresh_block_tables(
             2,
             {"v4.swa_kv": compact},
             pad_value=-1,
         )
 
-        table = refreshed["v4.swa_kv"]
+        table = backend.graph.block_tables["v4.swa_kv"][:2]
         self.assertTrue(torch.equal(table[:, :2], compact))
         self.assertTrue(torch.equal(table[:, 2:], torch.full_like(table[:, 2:], -1)))
 
@@ -3422,36 +3441,47 @@ class TestDeepseekV4Config(unittest.TestCase):
         c4_state = torch.tensor([[30], [40]], dtype=torch.int32)
         c128_state = torch.tensor([[50], [60]], dtype=torch.int32)
         indexer_state = torch.tensor([[70], [80]], dtype=torch.int32)
+        block_tables = {
+            "v4.swa_kv": swa,
+            "v4.c4a.compressor_state": c4_state,
+            "v4.c128a.compressor_state": c128_state,
+            "v4.c4a.indexer_compressor_state": indexer_state,
+        }
 
-        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        _init_v4_graph_state_for_groups(backend, block_tables, max_bs=4)
         backend.refresh_decode_metadata(
             2,
             2,
             torch.tensor([0, 1], dtype=torch.int64),
-            torch.tensor([200, 80], dtype=torch.int32),
+            # Each live row's active page must sit inside the delivered
+            # columns (the narrowest state group holds 4 tokens per page).
+            torch.tensor([4, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            block_tables={
-                "v4.swa_kv": swa,
-                "v4.c4a.compressor_state": c4_state,
-                "v4.c128a.compressor_state": c128_state,
-                "v4.c4a.indexer_compressor_state": indexer_state,
-            },
+            block_tables=block_tables,
         )
 
         metadata = backend.forward_metadata
         self.assertIsNotNone(metadata)
         assert metadata is not None
         cache_metadata = metadata.cache
-        self.assertTrue(torch.equal(cache_metadata.swa_page_table, swa))
-        self.assertTrue(
-            torch.equal(cache_metadata.compressor_state_block_tables[4], c4_state)
-        )
-        self.assertTrue(
-            torch.equal(cache_metadata.compressor_state_block_tables[128], c128_state)
-        )
-        self.assertTrue(
-            torch.equal(cache_metadata.indexer_state_block_table, indexer_state)
-        )
+        named = {
+            "v4.swa_kv": cache_metadata.swa_page_table,
+            "v4.c4a.compressor_state": cache_metadata.compressor_state_block_tables[4],
+            "v4.c128a.compressor_state": (
+                cache_metadata.compressor_state_block_tables[128]
+            ),
+            "v4.c4a.indexer_compressor_state": cache_metadata.indexer_state_block_table,
+        }
+        for group_id, table in named.items():
+            delivered = block_tables[group_id]
+            # The named table IS the persistent group buffer's [:bs] view:
+            # delivered columns in front, the pad fill behind.
+            self.assertEqual(
+                table.data_ptr(), backend.graph.block_tables[group_id].data_ptr()
+            )
+            self.assertTrue(torch.equal(table[:, : delivered.shape[1]], delivered))
+            tail = table[:, delivered.shape[1] :]
+            self.assertTrue(torch.equal(tail, torch.full_like(tail, -1)))
 
     def test_deepseek_v4_metadata_slice_slices_named_cache_groups(self):
         backend = _v4_backend(
@@ -4334,19 +4364,26 @@ class TestDeepseekV4Config(unittest.TestCase):
                 is_draft=False,
                 speculative_num_draft_tokens=1,
                 head_dim=512,
-                context_len=128,
+                # Wide enough that the c128 group's persistent table (8192
+                # tokens per page) holds the four delivered columns.
+                context_len=32768,
             )
         )
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         c4_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        c128_table = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=torch.int32,
+        )
+        block_tables = _v4_compressed_kv_tables(c4=c4_table, c128=c128_table)
+        _init_v4_graph_state_for_groups(backend, block_tables, max_bs=4)
         backend.refresh_decode_metadata(
             2,
             2,
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_tables=_v4_compressed_kv_tables(c4=c4_table),
+            block_tables=block_tables,
         )
         positions = seq_lens.to(torch.int64) - 1
 
@@ -4373,18 +4410,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         seq_lens = torch.tensor([256, 129], dtype=torch.int32)
-        c128_table = torch.tensor(
-            [[10, 11, 12, 13], [20, 21, 22, 23]],
-            dtype=torch.int32,
-        )
-        backend.init_cuda_graph_state(max_bs=max(2, 4))
         backend.refresh_decode_metadata(
             2,
             2,
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_tables=_v4_compressed_kv_tables(c128=c128_table),
+            block_tables=block_tables,
         )
         hca_positions = seq_lens.to(torch.int64) - 1
         indices, lens = backend._decode_compressed_attention_indices_and_lens(
@@ -4429,7 +4461,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 is_draft=False,
                 speculative_num_draft_tokens=1,
                 head_dim=512,
-                context_len=128,
+                # Wide enough that the c128 group's persistent table (8192
+                # tokens per page) holds both delivered columns.
+                context_len=16384,
             )
         )
         seq_lens = torch.tensor([128, 64], device=device, dtype=torch.int32)
@@ -4438,14 +4472,15 @@ class TestDeepseekV4Config(unittest.TestCase):
             device=device,
             dtype=torch.int32,
         )
-        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        block_tables = _v4_compressed_kv_tables(c128=c128_table)
+        _init_v4_graph_state_for_groups(backend, block_tables, max_bs=4)
         backend.refresh_decode_metadata(
             2,
             2,
             torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_tables=_v4_compressed_kv_tables(c128=c128_table),
+            block_tables=block_tables,
         )
         positions = seq_lens.to(torch.int64) - 1
 
@@ -4583,22 +4618,25 @@ class TestDeepseekV4Config(unittest.TestCase):
                 is_draft=False,
                 speculative_num_draft_tokens=1,
                 head_dim=512,
-                context_len=128,
+                # Wide enough that the c128 group's persistent table (8192
+                # tokens per page) holds both delivered columns.
+                context_len=16384,
             )
         )
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         compressed_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        block_tables = _v4_compressed_kv_tables(
+            c4=compressed_table,
+            c128=compressed_table,
+        )
+        _init_v4_graph_state_for_groups(backend, block_tables, max_bs=4)
         backend.refresh_decode_metadata(
             2,
             2,
             torch.tensor([0, 1], dtype=torch.int64),
             seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_tables=_v4_compressed_kv_tables(
-                c4=compressed_table,
-                c128=compressed_table,
-            ),
+            block_tables=block_tables,
         )
         metadata = backend.forward_metadata
         metadata.is_valid_token = torch.tensor([True, False])
@@ -4741,6 +4779,71 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(table[2:, :2], torch.zeros((2, 2), dtype=torch.int32))
         )
+
+    def test_deepseek_v4_replay_refresh_keeps_the_captured_metadata_addresses(self):
+        """graph_ptr_guard parity: a live replay refresh rebinds no tensor the
+        capture recorded — the cache slot's group tables included, for the
+        target's packed views and the draft's borrowed step views alike."""
+        from tokenspeed.runtime.execution.graph_ptr_guard import (
+            snapshot_graph_metadata,
+            verify_graph_metadata,
+        )
+
+        c4_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+        c128_table = torch.tensor([[30, 31], [40, 41]], dtype=torch.int32)
+        block_tables = _v4_compressed_kv_tables(c4=c4_table, c128=c128_table)
+        for is_draft in (False, True):
+            with self.subTest(is_draft=is_draft):
+                backend = _v4_backend(
+                    SimpleNamespace(
+                        prefix_granularity=64,
+                        kernel_page_size=64,
+                        device="cpu",
+                        num_attention_heads=64,
+                        num_kv_heads=1,
+                        attn_tp_size=1,
+                        dtype=torch.bfloat16,
+                        is_draft=is_draft,
+                        speculative_num_draft_tokens=4,
+                        head_dim=512,
+                        context_len=16384,
+                    )
+                )
+                _init_v4_graph_state_for_groups(
+                    backend, block_tables, max_bs=4, max_tokens_per_req=4
+                )
+                backend.init_forward_metadata_capture_cuda_graph(
+                    bs=4,
+                    num_tokens=16,
+                    req_pool_indices=torch.arange(4, dtype=torch.int32),
+                    seq_lens=torch.ones(4, dtype=torch.int32),
+                    forward_mode=ForwardMode.DECODE,
+                    block_tables={
+                        gid: torch.zeros((4, 1), dtype=torch.int32)
+                        for gid in block_tables
+                    },
+                )
+                snapshot = snapshot_graph_metadata(backend)
+                self.assertTrue(
+                    any(".cache." in path for path in snapshot),
+                    "the guard must see the cache slot's tables",
+                )
+
+                backend.refresh_decode_metadata(
+                    4,
+                    2,
+                    torch.arange(4, dtype=torch.int32),
+                    torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+                    num_tokens=16,
+                    forward_mode=ForwardMode.DECODE,
+                    block_tables=block_tables,
+                    for_graph_replay=True,
+                )
+
+                verify_graph_metadata(backend, snapshot, context="test")
+                table = backend.forward_metadata.cache.compressed_page_table(4)
+                self.assertTrue(torch.equal(table[:2, :2], c4_table))
+                self.assertTrue(torch.equal(table[2:], torch.full_like(table[2:], -1)))
 
     def test_deepseek_v4_indexer_metadata_refresh_masks_padding_tokens(self):
         key = (4, 4, 3)
@@ -5144,7 +5247,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         # Same object, same tensors: the eager round copies INTO the views the
-        # graph recorded (cache is the sanctioned per-round swap).
+        # graph recorded; the cache slot borrows the round's source metadata.
         self.assertIs(backend.draft_rounds.current, graph_draft)
         self.assertIs(graph_draft.seq_lens, recorded[0])
         self.assertIs(graph_draft.query_start_loc, recorded[1])

@@ -55,7 +55,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
-    _split_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -215,12 +214,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
     cache_consumer_families = frozenset({"history", "state"})
-    # The refresh replaces metadata.cache wholesale each step (the bespoke
-    # multi-group slot mapping travels on the live cache_metadata object);
-    # the captured kernels read only the persistent buffers the refresh
-    # fills FROM it, never this object through Python. Exempt it from the
-    # capture-time pointer snapshot (graph_ptr_guard).
-    graph_unstable_metadata_fields = frozenset({"cache"})
 
     def __init__(self, config: AttnConfig, spec: MLAConfig) -> None:
         super().__init__(config, spec)
@@ -375,6 +368,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         phase: str,
         output_buffers: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Claim this backend's declared groups out of the delivered tables and
+        validate them; returns the claimed tables keyed by group id. With
+        ``output_buffers`` (decode/capture), also copy each into its persistent
+        graph table — the metadata views slice those, so a refresh only fills.
+        """
         if actual_bs < 0 or actual_bs > bs:
             raise RuntimeError(
                 f"DeepSeek V4 {phase} actual_bs={actual_bs} must be within 0..{bs}"
@@ -447,11 +445,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             actual_bs=actual_bs,
             phase=phase,
         )
-        materialized: dict[str, torch.Tensor] = {}
+        if output_buffers is None:
+            return validated
         for group_id, table in validated.items():
-            if output_buffers is None:
-                materialized[group_id] = table
-                continue
             out = output_buffers[group_id]
             # The graph replays bs (padded) rows; the scheduler delivers rows
             # for the live requests only. Copy the live rows and null the
@@ -468,8 +464,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             out[:bs].fill_(-1)
             out[:rows, :columns].copy_(table[:rows])
-            materialized[group_id] = out[:bs]
-        return materialized
+        return validated
 
     def _assert_active_cache_pages(
         self,
@@ -812,15 +807,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=device,
             )
-        block_tables = {
-            str(gid): table[:bs].to(device=device, dtype=torch.int32)
-            for gid, table in block_tables.items()
-        }
-        (
-            swa_page_table,
-            compressor_state_block_tables,
-            indexer_state_block_table,
-        ) = _split_block_tables_into_v4_metadata(block_tables)
+        cache_metadata = DeepseekV4CacheMetadata.from_group_tables(
+            page_size=self.kernel_page_size,
+            page_table=page_table,
+            block_tables={
+                str(gid): table[:bs].to(device=device, dtype=torch.int32)
+                for gid, table in block_tables.items()
+            },
+        )
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
         num_prefill_tokens = sum(prefill_query_lens)
         if num_prefill_reqs == bs:
@@ -845,14 +839,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
-        )
-        cache_metadata = DeepseekV4CacheMetadata(
-            page_size=self.kernel_page_size,
-            page_table=page_table,
-            block_tables=block_tables,
-            swa_page_table=swa_page_table,
-            compressor_state_block_tables=compressor_state_block_tables,
-            indexer_state_block_table=indexer_state_block_table,
         )
         metadata = DeepseekV4ForwardMetadata(
             seq_lens=seq_lens,
@@ -1468,14 +1454,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.int32
         ) - int(req_start)
         cache_metadata = metadata.cache
-        block_tables = {
-            key: table[req_start:req_end]
-            for key, table in cache_metadata.block_tables.items()
-        }
-        compressor_state_block_tables = {
-            key: table[req_start:req_end]
-            for key, table in cache_metadata.compressor_state_block_tables.items()
-        }
         query_lens = metadata.query_lens[req_start:req_end]
         req_count = max(0, req_end - req_start)
         token_count = max(0, token_end - token_start)
@@ -1485,21 +1463,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
         )
-        sliced_cache = DeepseekV4CacheMetadata(
+        sliced_cache = DeepseekV4CacheMetadata.from_group_tables(
             page_size=cache_metadata.page_size,
             page_table=cache_metadata.page_table[req_start:req_end],
-            block_tables=block_tables,
-            swa_page_table=(
-                cache_metadata.swa_page_table[req_start:req_end]
-                if cache_metadata.swa_page_table is not None
-                else None
-            ),
-            compressor_state_block_tables=compressor_state_block_tables,
-            indexer_state_block_table=(
-                cache_metadata.indexer_state_block_table[req_start:req_end]
-                if cache_metadata.indexer_state_block_table is not None
-                else None
-            ),
+            block_tables={
+                key: table[req_start:req_end]
+                for key, table in cache_metadata.block_tables.items()
+            },
         )
         return DeepseekV4ForwardMetadata(
             seq_lens=metadata.seq_lens[req_start:req_end],
@@ -1771,7 +1741,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 torch.full_like(capture_seq_lens, tokens_per_req),
             )
         self.graph.write_batch(bs, capture_seq_lens)
-        metadata_block_tables = self._prepare_cache_group_tables(
+        self._prepare_cache_group_tables(
             block_tables,
             bs=bs,
             # Capture tables are placeholders and may name the null page. The
@@ -1782,31 +1752,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             phase="capture",
             output_buffers=self.graph.block_tables,
         )
-        (
-            swa_page_table,
-            compressor_state_block_tables,
-            indexer_state_block_table,
-        ) = _split_block_tables_into_v4_metadata(metadata_block_tables)
-        # The single builder: every tensor field of the view is a fixed slice
-        # assigned at construction; per-round state travels on the cache slot
-        # (guard-exempt) swapped below.
+        # The single builder: every tensor field of the view, the cache
+        # slot's group tables included, is a fixed slice assigned at
+        # construction; the fills above are all this round contributes.
         metadata = self.graph.views(
             bs,
             tokens_per_req,
             kernel_page_size=self.kernel_page_size,
             max_num_pages=self.max_num_pages,
             forward_mode=forward_mode,
-        )
-        metadata.cache = DeepseekV4CacheMetadata(
-            page_size=self.kernel_page_size,
-            page_table=self.graph.page_table[:bs, : self.max_num_pages],
-            block_tables=metadata_block_tables,
-            swa_page_table=swa_page_table,
-            compressor_state_block_tables=compressor_state_block_tables,
-            indexer_state_block_table=indexer_state_block_table,
-            decode_compressed_slot_mappings=(
-                metadata.cache.decode_compressed_slot_mappings
-            ),
         )
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
@@ -1885,19 +1839,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
-        # actual_bs == 0 replays only ever carry capture/idle placeholder
-        # tables; those must go through the refresh path below, never the
-        # live-table prepare path.
-        if actual_bs > 0 and block_tables and not self._expected_cache_group_ids:
-            # An empty published contract (a backend whose pool declares no
-            # cache groups) has no persistent group tables to fill; the
-            # delivered tables are bound as-is.
-            metadata_block_tables = {
-                str(group_id): table.to(device=self.device, dtype=torch.int32)
-                for group_id, table in block_tables.items()
-            }
-        elif actual_bs > 0 and block_tables:
-            metadata_block_tables = self._prepare_cache_group_tables(
+        # The views slice the persistent group tables; this round only fills
+        # them. actual_bs == 0 replays carry capture/idle placeholder tables
+        # and take the pad-fill path, never the live-table prepare path.
+        if actual_bs > 0 and block_tables:
+            self._prepare_cache_group_tables(
                 block_tables,
                 bs=bs,
                 actual_bs=actual_bs,
@@ -1912,7 +1858,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "capture placeholders cannot be reused"
             )
         else:
-            metadata_block_tables = self.graph.refresh_block_tables(
+            self.graph.refresh_block_tables(
                 bs,
                 {
                     str(group_id): table.to(device=self.device, dtype=torch.int32)
@@ -1921,23 +1867,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 actual_bs=actual_bs,
                 pad_value=-1,
             )
-        (
-            swa_page_table,
-            compressor_state_block_tables,
-            indexer_state_block_table,
-        ) = _split_block_tables_into_v4_metadata(metadata_block_tables)
         is_decode = forward_mode.is_decode()
-        metadata.cache = DeepseekV4CacheMetadata(
-            page_size=self.kernel_page_size,
-            page_table=self.graph.page_table[:bs, : self.max_num_pages],
-            block_tables=metadata_block_tables,
-            swa_page_table=swa_page_table,
-            compressor_state_block_tables=compressor_state_block_tables,
-            indexer_state_block_table=indexer_state_block_table,
-            decode_compressed_slot_mappings=(
-                metadata.cache.decode_compressed_slot_mappings
-            ),
-        )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
         if is_packed_decode and self.is_draft:
