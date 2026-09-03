@@ -31,9 +31,13 @@ unpack reads it directly); the padding contract is uniform: rows past the
 live batch and columns past a group's table are 0, the zero-initialized
 dummy page, safe to dereference and never a live request's cache.
 
-The stack is scratch for the router: leaves copy their ``[bs, W_g]`` view
-into their own graph-recorded buffers, so nothing here is pointer-frozen by
-a captured graph except the decode write-slot views the router publishes.
+The stacks are allocated once (``init_cuda_graph_state``) and refilled in
+place. Leaves copy their ``[bs, W_g]`` view into their own graph-recorded
+buffers, but three consumers read the stack storage directly inside captured
+graphs and so pin its address: the decode write-slot views the router
+publishes, the full-history table the block drafters get from
+``draft_history_view``, and the per-group tables the QSA indexer takes from
+``table()``.
 """
 
 from __future__ import annotations

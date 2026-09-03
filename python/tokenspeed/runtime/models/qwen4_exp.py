@@ -151,7 +151,6 @@ class _Qwen4ExpRMSNormGated(nn.Module):
             return rmsnorm_fn(
                 x,
                 self.weight,
-                None,
                 z=z,
                 eps=self.eps,
                 norm_before_gate=True,
