@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -53,7 +53,7 @@ class BaseTransformerModel(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -132,7 +132,7 @@ class BaseTransformerModel(nn.Module):
             lm_head_group_type=ParallelGroup.ATTN_TP,
         )
 
-    def resolve_embed(self, config: PretrainedConfig, prefix: str) -> nn.Module:
+    def resolve_embed(self, config: BaseConfig, prefix: str) -> nn.Module:
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -144,7 +144,7 @@ class BaseTransformerModel(nn.Module):
 
     def resolve_layers(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:

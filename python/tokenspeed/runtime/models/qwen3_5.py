@@ -35,12 +35,12 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     qk_rmsnorm,
 )
 
+from tokenspeed.runtime.configs.base_config import get_rope_parameters
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
-from tokenspeed.runtime.configs.utils import get_rope_parameters
 
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -717,7 +717,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.rope_scaling = get_rope_parameters(config)
-
         self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
         self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
         self.layer_id = layer_id

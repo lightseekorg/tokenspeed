@@ -30,12 +30,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from transformers import PretrainedConfig
-
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 
 
-class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
+class Qwen3ASRAudioEncoderConfig(BaseConfig):
     """Qwen3 audio tower configuration shipped by Qwen3-ASR."""
 
     model_type = "qwen3_asr_audio_encoder"
@@ -47,49 +46,29 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         "intermediate_size": "encoder_ffn_dim",
     }
 
-    def __init__(
-        self,
-        *,
-        num_mel_bins: int = 128,
-        encoder_layers: int = 24,
-        encoder_attention_heads: int = 16,
-        encoder_ffn_dim: int = 4096,
-        d_model: int = 1024,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        activation_function: str = "gelu",
-        activation_dropout: float = 0.0,
-        scale_embedding: bool = False,
-        initializer_range: float = 0.02,
-        max_source_positions: int = 1500,
-        n_window: int = 50,
-        n_window_infer: int = 800,
-        conv_chunksize: int = 500,
-        downsample_hidden_size: int = 480,
-        output_dim: int = 2048,
-        **kwargs: Any,
-    ) -> None:
-        self.num_mel_bins = num_mel_bins
-        self.encoder_layers = encoder_layers
-        self.encoder_attention_heads = encoder_attention_heads
-        self.encoder_ffn_dim = encoder_ffn_dim
-        self.d_model = d_model
-        self.dropout = dropout
-        self.attention_dropout = attention_dropout
-        self.activation_function = activation_function
-        self.activation_dropout = activation_dropout
-        self.scale_embedding = scale_embedding
-        self.initializer_range = initializer_range
-        self.max_source_positions = max_source_positions
-        self.n_window = n_window
-        self.n_window_infer = n_window_infer
-        self.conv_chunksize = conv_chunksize
-        self.downsample_hidden_size = downsample_hidden_size
-        self.output_dim = output_dim
-        super().__init__(**kwargs)
+    num_mel_bins: int = 128
+    encoder_layers: int = 24
+    encoder_attention_heads: int = 16
+    encoder_ffn_dim: int = 4096
+    d_model: int = 1024
+    dropout: float = 0.0
+    attention_dropout: float = 0.0
+    activation_function: str = "gelu"
+    activation_dropout: float = 0.0
+    scale_embedding: bool = False
+    initializer_range: float = 0.02
+    max_source_positions: int = 1500
+    n_window: int = 50
+    n_window_infer: int = 800
+    conv_chunksize: int = 500
+    downsample_hidden_size: int = 480
+    output_dim: int = 2048
+
+    def __post_init__(self, **kwargs: Any) -> None:
+        super().__post_init__(**kwargs)
 
 
-class Qwen3ASRThinkerConfig(PretrainedConfig):
+class Qwen3ASRThinkerConfig(BaseConfig):
     """Audio/text thinker configuration nested below the outer ASR config."""
 
     model_type = "qwen3_asr_thinker"
@@ -100,24 +79,17 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         "text_config": Qwen3Config,
     }
 
-    def __init__(
-        self,
-        *,
-        audio_config: dict[str, Any] | Qwen3ASRAudioEncoderConfig | None = None,
-        text_config: dict[str, Any] | Qwen3Config | None = None,
-        audio_start_token_id: int = 151669,
-        audio_end_token_id: int = 151670,
-        audio_token_id: int = 151676,
-        initializer_range: float = 0.02,
-        **kwargs: Any,
-    ) -> None:
-        self.audio_config = self._ensure_audio_config(audio_config)
-        self.text_config = self._ensure_text_config(text_config)
-        self.audio_start_token_id = audio_start_token_id
-        self.audio_end_token_id = audio_end_token_id
-        self.audio_token_id = audio_token_id
-        self.initializer_range = initializer_range
-        super().__init__(**kwargs)
+    audio_config: dict[str, Any] | Qwen3ASRAudioEncoderConfig | None = None
+    text_config: dict[str, Any] | Qwen3Config | None = None
+    audio_start_token_id: int = 151669
+    audio_end_token_id: int = 151670
+    audio_token_id: int = 151676
+    initializer_range: float = 0.02
+
+    def __post_init__(self, **kwargs: Any) -> None:
+        self.audio_config = self._ensure_audio_config(self.audio_config)
+        self.text_config = self._ensure_text_config(self.text_config)
+        super().__post_init__(**kwargs)
 
     @staticmethod
     def _ensure_audio_config(
@@ -146,23 +118,20 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         return self.text_config
 
 
-class Qwen3ASRConfig(PretrainedConfig):
+class Qwen3ASRConfig(BaseConfig):
     """Outer config matching ``Qwen/Qwen3-ASR-*`` config.json files."""
 
     model_type = "qwen3_asr"
     keys_to_ignore_at_inference = ["past_key_values"]
     sub_configs = {"thinker_config": Qwen3ASRThinkerConfig}
 
-    def __init__(
-        self,
-        *,
-        thinker_config: dict[str, Any] | Qwen3ASRThinkerConfig | None = None,
-        support_languages: list[str] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self.thinker_config = self._ensure_thinker_config(thinker_config)
-        self.support_languages = list(support_languages or [])
-        super().__init__(**kwargs)
+    thinker_config: dict[str, Any] | Qwen3ASRThinkerConfig | None = None
+    support_languages: list[str] | None = None
+
+    def __post_init__(self, **kwargs: Any) -> None:
+        self.thinker_config = self._ensure_thinker_config(self.thinker_config)
+        self.support_languages = list(self.support_languages or [])
+        super().__post_init__(**kwargs)
 
     @staticmethod
     def _ensure_thinker_config(

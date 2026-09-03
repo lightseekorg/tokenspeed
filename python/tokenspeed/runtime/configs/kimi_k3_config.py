@@ -32,8 +32,7 @@ All default values below are taken verbatim from the reference checkpoint
 ``a527b42cb673d79569f3ffe0b3a0a655df98a739``).
 """
 
-from transformers.configuration_utils import PretrainedConfig
-
+from tokenspeed.runtime.configs.base_config import BaseConfig, TextConfigBase
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -47,7 +46,7 @@ _ATTENTION_LAYER = "attention"
 _LINEAR_ATTENTION_LAYER = LINEAR_ATTENTION
 
 
-class KimiK3VisionConfig(PretrainedConfig):
+class KimiK3VisionConfig(BaseConfig):
     """Vision-tower + mm-projector configuration for Kimi-K3.
 
     This config keeps the checkpoint's native ``vt_*`` field names. The shared
@@ -57,66 +56,43 @@ class KimiK3VisionConfig(PretrainedConfig):
 
     model_type = "kimi_k3_vision"
 
-    def __init__(
-        self,
-        patch_size: int = 14,
-        init_pos_emb_height: int = 64,
-        init_pos_emb_width: int = 64,
-        init_pos_emb_time: int = 4,
-        pos_emb_type: str = "divided_fixed",
-        pos_emb_interpolation_mode: str = "bilinear",
-        vt_num_attention_heads: int = 12,
-        vt_num_hidden_layers: int = 27,
-        vt_hidden_size: int = 1024,
-        vt_intermediate_size: int = 4096,
-        qkv_hidden_size: int = 1536,
-        merge_kernel_size: tuple[int, int] = (2, 2),
-        video_attn_type: str = "spatial_temporal",
-        merge_type: str = "sd2_tpool",
-        mm_projector_type: str = "patchmergerv2",
-        mm_hidden_size: int | None = None,
-        projector_hidden_act: str = "gelu",
-        projector_ln_eps: float = 1e-5,
-        norm_type: str = "rmsnorm",
-        attn_bias: bool = False,
-        patch_embed_proj_bias: bool = False,
-        mlp_type: str = "mlp2",
-        linear_bias: bool = False,
-        activation_func: str = "gelu_pytorch_tanh",
-        text_hidden_size: int = 7168,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.patch_size = patch_size
-        self.init_pos_emb_height = init_pos_emb_height
-        self.init_pos_emb_width = init_pos_emb_width
-        self.init_pos_emb_time = init_pos_emb_time
-        self.pos_emb_type = pos_emb_type
-        self.pos_emb_interpolation_mode = pos_emb_interpolation_mode
-        self.vt_num_attention_heads = vt_num_attention_heads
-        self.vt_num_hidden_layers = vt_num_hidden_layers
-        self.vt_hidden_size = vt_hidden_size
-        self.vt_intermediate_size = vt_intermediate_size
-        self.qkv_hidden_size = qkv_hidden_size
-        self.merge_kernel_size = tuple(merge_kernel_size)
-        self.video_attn_type = video_attn_type
-        self.merge_type = merge_type
-        self.mm_projector_type = mm_projector_type
+    patch_size: int = 14
+    init_pos_emb_height: int = 64
+    init_pos_emb_width: int = 64
+    init_pos_emb_time: int = 4
+    pos_emb_type: str = "divided_fixed"
+    pos_emb_interpolation_mode: str = "bilinear"
+    vt_num_attention_heads: int = 12
+    vt_num_hidden_layers: int = 27
+    vt_hidden_size: int = 1024
+    vt_intermediate_size: int = 4096
+    qkv_hidden_size: int = 1536
+    merge_kernel_size: tuple[int, int] = (2, 2)
+    video_attn_type: str = "spatial_temporal"
+    merge_type: str = "sd2_tpool"
+    mm_projector_type: str = "patchmergerv2"
+    mm_hidden_size: int | None = None
+    projector_hidden_act: str = "gelu"
+    projector_ln_eps: float = 1e-5
+    norm_type: str = "rmsnorm"
+    attn_bias: bool = False
+    patch_embed_proj_bias: bool = False
+    mlp_type: str = "mlp2"
+    linear_bias: bool = False
+    activation_func: str = "gelu_pytorch_tanh"
+    text_hidden_size: int = 7168
+
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        self.merge_kernel_size = tuple(self.merge_kernel_size)
         self.mm_hidden_size = (
-            mm_hidden_size if mm_hidden_size is not None else vt_hidden_size
+            self.mm_hidden_size
+            if self.mm_hidden_size is not None
+            else self.vt_hidden_size
         )
-        self.projector_hidden_act = projector_hidden_act
-        self.projector_ln_eps = projector_ln_eps
-        self.norm_type = norm_type
-        self.attn_bias = attn_bias
-        self.patch_embed_proj_bias = patch_embed_proj_bias
-        self.mlp_type = mlp_type
-        self.linear_bias = linear_bias
-        self.activation_func = activation_func
-        self.text_hidden_size = text_hidden_size
 
 
-class KimiLinearConfig(PretrainedConfig):
+class KimiLinearConfig(TextConfigBase):
     """Text-backbone configuration for Kimi-K3 (``model_type = "kimi_linear"``).
 
     Carries three groups of fields:
@@ -137,106 +113,60 @@ class KimiLinearConfig(PretrainedConfig):
 
     model_type = "kimi_linear"
 
-    def __init__(
-        self,
-        vocab_size: int = 163840,
-        hidden_size: int = 7168,
-        intermediate_size: int = 33792,
-        num_hidden_layers: int = 93,
-        num_attention_heads: int = 96,
-        num_key_value_heads: int | None = 96,
-        hidden_act: str = "situ",
-        activation_situ_beta: float | None = 4.0,
-        activation_situ_linear_beta: float | None = 25.0,
-        rms_norm_eps: float = 1e-5,
-        max_position_embeddings: int = 1048576,
-        tie_word_embeddings: bool = False,
-        # MLA
-        q_lora_rank: int | None = 1536,
-        kv_lora_rank: int | None = 512,
-        qk_nope_head_dim: int | None = 128,
-        qk_rope_head_dim: int | None = 64,
-        v_head_dim: int | None = 128,
-        mla_use_nope: bool = True,
-        mla_use_output_gate: bool = True,
-        # MoE
-        num_experts: int | None = 896,
-        num_experts_per_token: int | None = 16,
-        num_shared_experts: int = 2,
-        moe_intermediate_size: int | None = 3072,
-        routed_expert_hidden_size: int | None = 3584,
-        latent_moe_use_norm: bool = True,
-        moe_renormalize: bool = True,
-        moe_router_activation_func: str = "sigmoid",
-        topk_method: str = "noaux_tc",
-        use_grouped_topk: bool = True,
-        num_expert_group: int = 1,
-        topk_group: int = 1,
-        routed_scaling_factor: float = 1.0,
-        first_k_dense_replace: int = 1,
-        moe_layer_freq: int = 1,
-        # Kimi extras
-        attn_res_block_size: int | None = 12,
-        num_nextn_predict_layers: int = 0,
-        linear_attn_config: dict | None = None,
-        pad_token_id: int = 163839,
-        bos_token_id: int = 163584,
-        eos_token_id: int = 163586,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = (
-            num_key_value_heads
-            if num_key_value_heads is not None
-            else num_attention_heads
-        )
-        self.hidden_act = hidden_act
-        self.activation_situ_beta = activation_situ_beta
-        self.activation_situ_linear_beta = activation_situ_linear_beta
-        self.rms_norm_eps = rms_norm_eps
-        self.max_position_embeddings = max_position_embeddings
+    vocab_size: int = 163840
+    hidden_size: int = 7168
+    intermediate_size: int = 33792
+    num_hidden_layers: int = 93
+    num_attention_heads: int = 96
+    num_key_value_heads: int | None = 96
+    hidden_act: str = "situ"
+    activation_situ_beta: float | None = 4.0
+    activation_situ_linear_beta: float | None = 25.0
+    rms_norm_eps: float = 1e-5
+    max_position_embeddings: int = 1048576
+    tie_word_embeddings: bool = False
+    # MLA
+    q_lora_rank: int | None = 1536
+    kv_lora_rank: int | None = 512
+    qk_nope_head_dim: int | None = 128
+    qk_rope_head_dim: int | None = 64
+    v_head_dim: int | None = 128
+    mla_use_nope: bool = True
+    mla_use_output_gate: bool = True
+    # MoE
+    num_experts: int | None = 896
+    num_experts_per_token: int | None = 16
+    num_shared_experts: int = 2
+    moe_intermediate_size: int | None = 3072
+    routed_expert_hidden_size: int | None = 3584
+    latent_moe_use_norm: bool = True
+    moe_renormalize: bool = True
+    moe_router_activation_func: str = "sigmoid"
+    topk_method: str = "noaux_tc"
+    use_grouped_topk: bool = True
+    num_expert_group: int = 1
+    topk_group: int = 1
+    routed_scaling_factor: float = 1.0
+    first_k_dense_replace: int = 1
+    moe_layer_freq: int = 1
+    # Kimi extras
+    attn_res_block_size: int | None = 12
+    num_nextn_predict_layers: int = 0
+    linear_attn_config: dict | None = None
+    pad_token_id: int = 163839
+    bos_token_id: int = 163584
+    eos_token_id: int = 163586
 
-        # MLA
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.mla_use_nope = mla_use_nope
-        self.mla_use_output_gate = mla_use_output_gate
-
-        # MoE
-        self.num_experts = num_experts
-        self.num_experts_per_token = num_experts_per_token
-        self.num_shared_experts = num_shared_experts
-        self.moe_intermediate_size = moe_intermediate_size
-        self.routed_expert_hidden_size = routed_expert_hidden_size
-        self.latent_moe_use_norm = latent_moe_use_norm
-        self.moe_renormalize = moe_renormalize
-        self.moe_router_activation_func = moe_router_activation_func
+    def __post_init__(self, **kwargs):
         if self.moe_router_activation_func not in ("softmax", "sigmoid"):
             raise ValueError(
                 "moe_router_activation_func must be 'softmax' or 'sigmoid', got "
                 f"{self.moe_router_activation_func!r}"
             )
-        self.topk_method = topk_method
-        self.use_grouped_topk = use_grouped_topk
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.routed_scaling_factor = routed_scaling_factor
-        self.first_k_dense_replace = first_k_dense_replace
-        self.moe_layer_freq = moe_layer_freq
 
-        # Kimi extras
-        self.attn_res_block_size = attn_res_block_size
-        self.num_nextn_predict_layers = num_nextn_predict_layers
         self.linear_attn_config = (
-            linear_attn_config
-            if linear_attn_config is not None
+            self.linear_attn_config
+            if self.linear_attn_config is not None
             else _default_linear_attn_config()
         )
         # full-attention layers are derived as the complement of kda_layers
@@ -244,13 +174,11 @@ class KimiLinearConfig(PretrainedConfig):
         if self.linear_attn_config.get("kda_layers") is None:
             raise ValueError("linear_attn_config must provide 'kda_layers'")
 
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        # The checkpoint resolves the MLA head_dim from the RoPE head dim, not
+        # the quotient of hidden_size // num_attention_heads.
+        self.head_dim = self.qk_rope_head_dim
+
+        super().__post_init__(**kwargs)
 
     # ----- helpers -----
 
@@ -314,45 +242,37 @@ def _default_linear_attn_config() -> dict:
     }
 
 
-class KimiK3Config(PretrainedConfig):
+class KimiK3Config(BaseConfig):
     """Top-level Kimi-K3 config: ``KimiLinear`` text + MoonViT3d vision."""
 
     model_type = "kimi_k3"
 
-    def __init__(
-        self,
-        text_config: dict | KimiLinearConfig | None = None,
-        vision_config: dict | KimiK3VisionConfig | None = None,
-        ignore_index: int = -100,
-        media_placeholder_token_id: int = 163605,
-        image_placeholder: str = "<|kimi_image_placeholder|>",
-        pad_token_id: int = 163839,
-        **kwargs,
-    ):
-        if text_config is None:
-            text_config = KimiLinearConfig()
-        elif isinstance(text_config, dict):
-            text_config = KimiLinearConfig(**text_config)
-        self.text_config = text_config
+    text_config: dict | KimiLinearConfig | None = None
+    vision_config: dict | KimiK3VisionConfig | None = None
+    ignore_index: int = -100
+    media_placeholder_token_id: int = 163605
+    image_placeholder: str = "<|kimi_image_placeholder|>"
+    pad_token_id: int = 163839
 
-        if vision_config is None:
-            vision_config = KimiK3VisionConfig()
-        elif isinstance(vision_config, dict):
-            vision_config = KimiK3VisionConfig(**vision_config)
-        self.vision_config = vision_config
+    def __post_init__(self, **kwargs):
+        if self.text_config is None:
+            self.text_config = KimiLinearConfig()
+        elif isinstance(self.text_config, dict):
+            self.text_config = KimiLinearConfig(**self.text_config)
+
+        if self.vision_config is None:
+            self.vision_config = KimiK3VisionConfig()
+        elif isinstance(self.vision_config, dict):
+            self.vision_config = KimiK3VisionConfig(**self.vision_config)
 
         # The vision projector must emit the text model's hidden size.
         self.vision_config.text_hidden_size = self.text_config.hidden_size
-
-        self.ignore_index = ignore_index
-        self.media_placeholder_token_id = media_placeholder_token_id
-        self.image_placeholder = image_placeholder
 
         # Propagate quantization config from the text model.
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
 
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__post_init__(**kwargs)
 
     @property
     def hidden_size(self) -> int:

@@ -31,9 +31,9 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.base_config import get_rope_theta
+from tokenspeed.runtime.configs.gpt_oss_config import GptOssConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -426,13 +426,6 @@ class _WeightCreator:
             obj._fn = None
             return output
         return obj
-
-
-class GptOssConfig(PretrainedConfig):
-    model_type = "gpt_oss"
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
 
 def get_attention_sliding_window_size(config):

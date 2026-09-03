@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
 
+from tokenspeed.runtime.configs.base_config import get_rope_parameters, get_rope_theta
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -112,13 +113,8 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
         self._qk_norm_eps = eps
-        rope_parameters = getattr(config, "rope_parameters", None)
-        if rope_parameters is not None:
-            rope_theta = float(rope_parameters["rope_theta"])
-            rope_scaling = rope_parameters
-        else:
-            rope_theta = float(getattr(config, "rope_theta", 1000000))
-            rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = get_rope_theta(config, 1000000)
+        rope_scaling = get_rope_parameters(config) or None
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,

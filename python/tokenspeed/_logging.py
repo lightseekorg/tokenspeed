@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import logging
 import os
 import warnings
 from importlib import import_module
+from typing import Any
 
 _original_showwarning = warnings.showwarning
 
@@ -108,3 +110,18 @@ def suppress_noisy_third_party_logs():
         disable_progress_bars()
     except Exception:
         pass
+
+
+@functools.lru_cache(maxsize=None)
+def _warning_once(
+    self: logging.Logger,
+    msg: object,
+    *args: object,
+    **kwargs: Any,
+) -> None:
+    self.warning(msg, *args, **kwargs)
+
+
+def install_logger_extensions() -> None:
+    if not hasattr(logging.Logger, "warning_once"):
+        setattr(logging.Logger, "warning_once", _warning_once)

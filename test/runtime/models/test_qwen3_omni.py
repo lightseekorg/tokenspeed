@@ -39,6 +39,7 @@ def _omni_config():
         text_config=text,
         position_id_per_seconds=13,
         seconds_per_chunk=2,
+        dtype=torch.float16,
     )
     return SimpleNamespace(
         architectures=["Qwen3OmniMoeForConditionalGeneration"],

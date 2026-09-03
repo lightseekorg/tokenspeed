@@ -10,6 +10,7 @@ import os
 import sys
 import unittest
 
+from tokenspeed.runtime.configs import get_config_class
 from tokenspeed.runtime.configs.inkling_config import (
     InklingConvStream,
     InklingMMConfig,
@@ -17,7 +18,7 @@ from tokenspeed.runtime.configs.inkling_config import (
     inkling_conv_stream_layout,
     inkling_conv_total_dim,
 )
-from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
+from tokenspeed.runtime.configs.utils import get_config
 
 # Add project root directory to path for importing test.* helpers.
 sys.path.insert(
@@ -51,11 +52,11 @@ if not has_blackwell():
 
 class TestInklingConfigRegistry(unittest.TestCase):
     def test_config_registry(self):
-        self.assertIs(_CONFIG_REGISTRY["inkling_mm_model"], InklingMMConfig)
-        self.assertIs(_CONFIG_REGISTRY["inkling_model"], InklingModelConfig)
+        self.assertIs(get_config_class("inkling_mm_model"), InklingMMConfig)
+        self.assertIs(get_config_class("inkling_model"), InklingModelConfig)
 
     def test_get_config_loads_hub_snapshot(self):
-        config = get_config(INKLING_NVFP4, trust_remote_code=False, revision=None)
+        config = get_config(INKLING_NVFP4, revision=None)
         self.assertIsInstance(config, InklingMMConfig)
         text = config.get_text_config()
         self.assertEqual(text.num_hidden_layers, 66)

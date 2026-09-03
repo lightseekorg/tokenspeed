@@ -95,9 +95,9 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.tokenizer_utils import get_tokenizer
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -143,7 +143,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig(
             server_args.model,
-            trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.max_model_len,
             model_override_args=server_args.hf_overrides,

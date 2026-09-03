@@ -30,6 +30,7 @@ from tokenspeed_kernel.thirdparty.cuda import (
     softplus_sqrt_topk_flash,
 )
 
+from tokenspeed.runtime.configs import get_config_class
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
@@ -38,6 +39,7 @@ from tokenspeed.runtime.configs.model_config import (
     configure_deepseek_v4_attention,
     is_deepseek_v4,
     is_deepseek_v4_nextn,
+    yarn_get_mscale,
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
@@ -151,13 +153,12 @@ from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
     global_server_args_dict_update,
 )
-from tokenspeed.runtime.utils.hf_transformers_utils import (
-    _CONFIG_REGISTRY,
+from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.tokenizer_utils import (
     _wrap_deepseek_v4_tokenizer,
     get_tokenizer,
     prefers_deepseek_v4_tokenizer,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
 
 # MLAConfig component fields; everything else in the flat test namespaces is
 # model-wide and stays on the config argument.
@@ -203,7 +204,7 @@ def _v4_recipe(
         DeepseekV4Recipe,
     )
 
-    num_layers = len(hf_config.compress_ratios)
+    num_layers = len(hf_config.layer_types)
     return DeepseekV4Recipe(
         server_args=SimpleNamespace(
             max_total_tokens=None,
@@ -424,7 +425,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_config_registry(self):
         self.assertEqual(DeepseekV4Config.model_type, "deepseek_v4")
-        self.assertIs(_CONFIG_REGISTRY["deepseek_v4"], DeepseekV4Config)
+        self.assertIs(get_config_class("deepseek_v4"), DeepseekV4Config)
 
     def test_fp4_expert_contract_overrides_model_wide_fp8_config(self):
         quant_config = Fp8Config(
@@ -1219,15 +1220,15 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with (
             patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.snapshot_download",
+                "tokenspeed.runtime.utils.tokenizer_utils.snapshot_download",
                 return_value="/nonexistent/tokenizer-snapshot",
             ),
             patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
+                "tokenspeed.runtime.utils.tokenizer_utils.AutoTokenizer.from_pretrained",
                 return_value=DummyTokenizer(),
             ),
             patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils._load_deepseek_v4_encode_messages",
+                "tokenspeed.runtime.utils.tokenizer_utils._load_deepseek_v4_encode_messages",
                 return_value=encode_messages,
             ),
         ):
@@ -1403,7 +1404,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ),
                 patch(
                     "tokenspeed.runtime.configs.model_config.get_generation_config",
-                    return_value=SimpleNamespace(eos_token_id=None),
+                    return_value={"eos_token_id": None},
                 ),
                 patch(
                     "tokenspeed.runtime.configs.model_config.get_hf_text_config",
@@ -1522,7 +1523,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
-            rope_scaling=None,
+            rope_parameters={
+                "main": {"rope_type": "default", "rope_theta": 10_000},
+                "compress": {
+                    "rope_type": "yarn",
+                    "factor": 16,
+                    "mscale_all_dim": 1,
+                },
+            },
         )
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
@@ -1536,7 +1544,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(model_config.qk_nope_head_dim, 448)
         self.assertEqual(model_config.v_head_dim, 512)
         self.assertEqual(model_config.index_head_dim, 128)
-        self.assertAlmostEqual(model_config.scaling, 512**-0.5)
+        mscale = yarn_get_mscale(16, float(1))
+        self.assertAlmostEqual(model_config.scaling, 512**-0.5 * mscale * mscale)
 
     def test_deepseek_v4_cache_helpers_match_attention_contract(self):
         head_dim = 512
@@ -2300,7 +2309,15 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_attention_layout_matches_compressed_cache_contract(self):
         config = SimpleNamespace(
-            compress_ratios=[0, 4, 128],
+            layer_types=[
+                "sliding_attention",
+                "compressed_sparse_attention",
+                "heavily_compressed_attention",
+            ],
+            compress_rates={
+                "compressed_sparse_attention": 4,
+                "heavily_compressed_attention": 128,
+            },
             num_attention_heads=64,
             head_dim=512,
             qk_rope_head_dim=64,
@@ -2332,7 +2349,16 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
-            compress_ratios=[0, 4, 128, 0],
+            layer_types=[
+                "sliding_attention",
+                "compressed_sparse_attention",
+                "heavily_compressed_attention",
+                "sliding_attention",
+            ],
+            compress_rates={
+                "compressed_sparse_attention": 4,
+                "heavily_compressed_attention": 128,
+            },
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -2346,17 +2372,28 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         self.assertEqual(layout.layer_ratio, (1,))
+
+        # MTP/DSpark draft layers (indices >= num_hidden_layers) slice as SWA.
+        draft_layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+            layer_indices=range(4, 5),
+        )
+        self.assertEqual(draft_layout.layer_ratio, (1,))
+
         with self.assertRaisesRegex(ValueError, "out of range"):
             deepseek_v4_cache_layout_from_config(
                 config,
                 page_size=64,
                 use_fp4_indexer_cache=True,
-                layer_indices=range(4, 5),
+                layer_indices=range(-1, 0),
             )
 
     def test_deepseek_v4_attention_layout_rejects_unknown_ratio(self):
         config = SimpleNamespace(
-            compress_ratios=[8],
+            layer_types=["compressed_sparse_attention"],
+            compress_rates={"compressed_sparse_attention": 8},
             num_attention_heads=64,
             head_dim=512,
             qk_rope_head_dim=64,
@@ -2372,9 +2409,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_rope_config_matches_layer_type(self):
-        config = SimpleNamespace(
-            rope_theta=10000,
-            compress_rope_theta=160000,
+        config = DeepseekV4Config(
             rope_scaling={
                 "type": "yarn",
                 "factor": 16,
@@ -2390,15 +2425,35 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(swa_base, 10000.0)
         self.assertIsNone(swa_scaling)
         self.assertEqual(csa_base, 160000.0)
-        self.assertIsNot(csa_scaling, config.rope_scaling)
+        self.assertIsNot(csa_scaling, config.rope_parameters["compress"])
+        self.assertNotIn("main", csa_scaling)
+        self.assertNotIn("compress", csa_scaling)
         self.assertEqual(csa_scaling["rope_type"], "deepseek_yarn")
         self.assertEqual(csa_scaling["factor"], 16)
         self.assertEqual(csa_scaling["mscale"], 0)
         self.assertEqual(csa_scaling["mscale_all_dim"], 0)
 
+    def test_deepseek_v4_rope_config_supports_default_compress_rope(self):
+        config = DeepseekV4Config()
+
+        compress_base, compress_scaling = deepseek_v4_rope_config(
+            config, compress_ratio=4
+        )
+
+        self.assertEqual(compress_base, 160000.0)
+        self.assertIsNone(compress_scaling)
+
     def test_deepseek_v4_kv_pool_allocates_v4_cache_families(self):
         config = SimpleNamespace(
-            compress_ratios=[1, 4, 128],
+            layer_types=[
+                "sliding_attention",
+                "compressed_sparse_attention",
+                "heavily_compressed_attention",
+            ],
+            compress_rates={
+                "compressed_sparse_attention": 4,
+                "heavily_compressed_attention": 128,
+            },
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -2447,7 +2502,15 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
         config = SimpleNamespace(
-            compress_ratios=[1, 4, 128],
+            layer_types=[
+                "sliding_attention",
+                "compressed_sparse_attention",
+                "heavily_compressed_attention",
+            ],
+            compress_rates={
+                "compressed_sparse_attention": 4,
+                "heavily_compressed_attention": 128,
+            },
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -2476,7 +2539,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         # Capacity is a plan quantity (the pool derives its size from the
         # arena), so the planner owns this guard.
         config = SimpleNamespace(
-            compress_ratios=[1],
+            layer_types=["sliding_attention"],
+            compress_rates={},
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -3691,7 +3755,8 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
         config = SimpleNamespace(
-            compress_ratios=[1],
+            layer_types=["sliding_attention"],
+            compress_rates={},
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
@@ -5990,10 +6055,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         config = SimpleNamespace(
             n_routed_experts=4,
             hidden_size=8,
-            num_hash_layers=0,
+            mlp_layer_types=["hash_moe", "moe"],
             topk_method=None,
         )
         gate = DeepseekV4MoEGate(config, layer_index=1)
+        self.assertFalse(gate.is_hash_moe)
         with torch.no_grad():
             gate.weight.copy_(torch.randn_like(gate.weight))
         hidden_states = torch.randn(3, config.hidden_size)
@@ -6004,6 +6070,24 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.allclose(logits, expected))
 
+    def test_deepseek_v4_gate_uses_mlp_layer_type_schedule(self):
+        config = SimpleNamespace(
+            n_routed_experts=4,
+            hidden_size=8,
+            vocab_size=16,
+            num_experts_per_tok=2,
+            mlp_layer_types=["hash_moe", "moe"],
+            topk_method=None,
+        )
+
+        hash_gate = DeepseekV4MoEGate(config, layer_index=0)
+        routed_gate = DeepseekV4MoEGate(config, layer_index=1)
+
+        self.assertTrue(hash_gate.is_hash_moe)
+        self.assertIsNotNone(hash_gate.tid2eid)
+        self.assertFalse(routed_gate.is_hash_moe)
+        self.assertIsNone(routed_gate.tid2eid)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_gate_dsv3_router_gemm_shape(self):
         major, _ = torch.cuda.get_device_capability()
@@ -6013,7 +6097,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         config = SimpleNamespace(
             n_routed_experts=256,
             hidden_size=4096,
-            num_hash_layers=0,
+            mlp_layer_types=["hash_moe", "moe"],
             topk_method=None,
         )
         gate = DeepseekV4MoEGate(config, layer_index=1).cuda().to(torch.bfloat16)
@@ -6138,13 +6222,19 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_v4_merged_solve_draft_is_a_continuation_layer():
-    """One big model on V4: the MTP draft layer is simply the next layer of
-    the merged model (compress_ratios already carries it), so one solve
-    yields one plan whose draft fields share the target groups' packing."""
+def test_v4_merged_solve_shares_one_swa_group():
+    """One V4 model: every layer's swa field shares the one v4.swa_kv group,
+    so one solve yields one plan with a single packing / page-id space."""
     hf_config = SimpleNamespace(
-        num_hidden_layers=6,
-        compress_ratios=[0, 4, 128],
+        layer_types=[
+            "sliding_attention",
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+        ],
+        compress_rates={
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        },
         num_attention_heads=64,
         head_dim=512,
         qk_rope_head_dim=64,
@@ -6156,9 +6246,8 @@ def test_v4_merged_solve_draft_is_a_continuation_layer():
     )
     merged = _v4_layout(hf_config)[2]
     plan = merged.bind(2)
-    # Every layer's swa field (all 6 layers incl. the MTP continuation
-    # layer) shares the one v4.swa_kv group — one packing, one page-id
-    # space for target and draft alike.
+    # Every layer's swa field shares the one v4.swa_kv group — one packing,
+    # one page-id space.
     swa_fields = [f for f in plan.fields if f.group_id == "v4.swa_kv"]
     assert len(swa_fields) == len(layout.layer_ratio)
     packing = dict(merged.group_packing)
@@ -6177,7 +6266,15 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         model_config=SimpleNamespace(
             num_attention_layers=3,
             hf_config=SimpleNamespace(
-                compress_ratios=(1, 4, 128),
+                layer_types=[
+                    "sliding_attention",
+                    "compressed_sparse_attention",
+                    "heavily_compressed_attention",
+                ],
+                compress_rates={
+                    "compressed_sparse_attention": 4,
+                    "heavily_compressed_attention": 128,
+                },
                 head_dim=512,
                 qk_rope_head_dim=64,
                 sliding_window=128,

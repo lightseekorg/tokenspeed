@@ -20,22 +20,9 @@
 
 """Qwen 3.5 configuration wrappers."""
 
-from transformers import PretrainedConfig
-
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
 from tokenspeed.runtime.configs.qwen3_vision_config import Qwen3VLVisionConfig
-
-_MROPE_EXTENSION_KEYS = frozenset({"mrope_section", "mrope_interleaved"})
-
-
-def _to_transformers_rope_parameters(rope_config):
-    if not isinstance(rope_config, dict):
-        return rope_config
-    return {
-        key: value
-        for key, value in rope_config.items()
-        if key not in _MROPE_EXTENSION_KEYS
-    }
 
 
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
@@ -46,24 +33,13 @@ class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
 class Qwen3_5TextConfig(Qwen3_5BaseTextConfig):
     model_type = "qwen3_5_text"
     base_config_key = "text_config"
-
-    def __init__(
-        self,
-        **kwargs,
-    ):
-        # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
-        # Normalize it before parent init so downstream code sees the expected values.
-        full_rope_parameters = kwargs.get("rope_parameters")
-        if full_rope_parameters is not None:
-            kwargs["rope_parameters"] = _to_transformers_rope_parameters(
-                full_rope_parameters
-            )
-
-        super().__init__(**kwargs)
-        self._tokenspeed_rope_parameters = full_rope_parameters or self.rope_parameters
+    ignore_keys_at_rope_validation = {
+        "mrope_section",
+        "mrope_interleaved",
+    }
 
 
-class Qwen3_5Config(PretrainedConfig):
+class Qwen3_5Config(BaseConfig):
     model_type = "qwen3_5"
     sub_configs = {
         "vision_config": Qwen3_5VisionConfig,
@@ -71,25 +47,17 @@ class Qwen3_5Config(PretrainedConfig):
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    def __init__(
-        self,
-        text_config=None,
-        vision_config=None,
-        image_token_id=151655,
-        video_token_id=151656,
-        vision_start_token_id=151652,
-        vision_end_token_id=151653,
-        tie_word_embeddings=False,
-        **kwargs,
-    ):
-        self.vision_config = self._ensure_vision_config(vision_config)
-        self.text_config = self._ensure_text_config(text_config)
+    text_config: Qwen3_5TextConfig | dict | None = None
+    vision_config: Qwen3_5VisionConfig | dict | None = None
+    image_token_id: int = 151655
+    video_token_id: int = 151656
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
 
-        self.image_token_id = image_token_id
-        self.video_token_id = video_token_id
-        self.vision_start_token_id = vision_start_token_id
-        self.vision_end_token_id = vision_end_token_id
-        super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+    def __post_init__(self, **kwargs):
+        self.vision_config = self._ensure_vision_config(self.vision_config)
+        self.text_config = self._ensure_text_config(self.text_config)
+        super().__post_init__(**kwargs)
 
     def _ensure_text_config(self, text_config):
         """Convert text_config to the proper config class if it's a dict."""
@@ -149,11 +117,6 @@ class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
-    def __init__(self, **kwargs):
-        # Explicit __init__ prevents transformers from auto-generating one
-        # that skips Qwen3_5TextConfig.__init__ (rope_parameters normalization).
-        super().__init__(**kwargs)
-
 
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"
@@ -161,8 +124,3 @@ class Qwen3_5MoeConfig(Qwen3_5Config):
         "vision_config": Qwen3_5MoeVisionConfig,
         "text_config": Qwen3_5MoeTextConfig,
     }
-
-    def __init__(self, **kwargs):
-        # Explicit __init__ prevents transformers from auto-generating one
-        # that skips Qwen3_5Config.__init__ (text/vision config setup).
-        super().__init__(**kwargs)

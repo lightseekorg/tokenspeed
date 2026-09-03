@@ -65,8 +65,11 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_indexer_decode_metadata_compute,
 )
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig, get_rope_parameters
+from tokenspeed.runtime.configs.deepseek_v4_config import (
+    get_deepseek_v4_compress_ratio,
+)
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
@@ -1515,7 +1518,7 @@ def _deepseek_v4_swa_slot_mapping(
     )
 
 
-def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
+def _attention_use_fp4_indexer_cache(config: BaseConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
     attention_config = getattr(config, "attention_config", None)
     if isinstance(attention_config, dict):
@@ -1527,7 +1530,7 @@ def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
 
 
 def deepseek_v4_rope_config(
-    config: PretrainedConfig, compress_ratio: int
+    config: BaseConfig, compress_ratio: int
 ) -> tuple[float, dict | None]:
     """Return the per-layer DeepSeek V4 RoPE base and scaling config.
 
@@ -1535,25 +1538,39 @@ def deepseek_v4_rope_config(
     use the checkpoint's separate `compress_rope_theta` together with YaRN.
     """
 
-    if compress_ratio <= 1:
-        return float(getattr(config, "rope_theta", 10000.0)), None
-
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is not None:
-        rope_scaling = dict(rope_scaling)
-        rope_scaling["rope_type"] = "deepseek_yarn"
-        rope_scaling["mscale"] = 0
-        rope_scaling["mscale_all_dim"] = 0
-    return (
-        float(
-            getattr(
-                config,
-                "compress_rope_theta",
-                getattr(config, "rope_theta", 10000.0),
-            )
-        ),
-        rope_scaling,
+    is_compressed = compress_ratio > 1
+    rope_label = "compress" if is_compressed else "main"
+    default_theta = getattr(
+        config,
+        "compress_rope_theta" if is_compressed else "rope_theta",
+        getattr(config, "rope_theta", 10000.0),
     )
+
+    rope_parameters = get_rope_parameters(config) or None
+    branch_parameters = (
+        rope_parameters.get(rope_label) if isinstance(rope_parameters, dict) else None
+    )
+    if isinstance(branch_parameters, dict):
+        rope_theta = branch_parameters.get("rope_theta", default_theta)
+        rope_scaling = dict(branch_parameters)
+    else:
+        rope_theta = default_theta
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = dict(rope_scaling) if rope_scaling is not None else None
+
+    if not is_compressed:
+        return float(rope_theta), None
+
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        if rope_type == "default":
+            rope_scaling = None
+        elif rope_type in {"yarn", "deepseek_yarn"}:
+            rope_scaling["rope_type"] = "deepseek_yarn"
+            rope_scaling["mscale"] = 0
+            rope_scaling["mscale_all_dim"] = 0
+
+    return float(rope_theta), rope_scaling
 
 
 class DeepseekV4MLP(nn.Module):
@@ -1682,7 +1699,7 @@ def dsv4_linear_fp32(
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         layer_index: int,
         hash_indices_dtype: torch.dtype = torch.int32,
     ) -> None:
@@ -1690,7 +1707,13 @@ class DeepseekV4MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(config.n_routed_experts, config.hidden_size)
         )
-        self.is_hash_moe = layer_index < config.num_hash_layers
+        # Draft layers (MTP / DSpark) use routed MoE, never the hash-MoE
+        # bootstrap; their global `layer_index` sits past `num_hidden_layers`.
+        mlp_layer_types = config.mlp_layer_types
+        self.is_hash_moe = (
+            layer_index < len(mlp_layer_types)
+            and mlp_layer_types[layer_index] == "hash_moe"
+        )
         if self.is_hash_moe:
             self.tid2eid = nn.Parameter(
                 torch.empty(
@@ -1873,7 +1896,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
 
 def _deepseek_v4_routed_expert_quant_config(
-    config: PretrainedConfig,
+    config: BaseConfig,
     quant_config: QuantizationConfig,
 ) -> tuple[QuantizationConfig, bool]:
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
@@ -1894,7 +1917,7 @@ def _deepseek_v4_routed_expert_quant_config(
 
 
 def _deepseek_v4_expert_scale_parameter_name(
-    config: PretrainedConfig,
+    config: BaseConfig,
     *,
     use_mega_moe: bool,
 ) -> str:
@@ -1906,7 +1929,7 @@ def _deepseek_v4_expert_scale_parameter_name(
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         layer_index: int,
@@ -2190,7 +2213,7 @@ class DeepseekV4MoE(nn.Module):
 class DeepseekV4Compressor(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         hidden_size: int,
         head_dim: int,
         compress_ratio: int,
@@ -2400,7 +2423,7 @@ class DeepseekV4Compressor(nn.Module):
 class DeepseekV4Indexer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -2937,7 +2960,7 @@ class DeepseekV4Indexer(nn.Module):
 class DeepseekV4Attention(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         layer_index: int,
         quant_config: QuantizationConfig | None,
@@ -2954,7 +2977,7 @@ class DeepseekV4Attention(nn.Module):
             layer_index if cache_layer_index is None else cache_layer_index
         )
         self.stream_fork = StreamFork(aux_stream)
-        self.compress_ratio = max(1, int(config.compress_ratios[layer_index]))
+        self.compress_ratio = get_deepseek_v4_compress_ratio(config, layer_index)
         if self.compress_ratio <= 1:
             self.attention_kind = "swa"
         elif self.compress_ratio == 4:
@@ -3403,7 +3426,7 @@ class DeepseekV4Attention(nn.Module):
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         layer_id: int,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
@@ -3599,7 +3622,7 @@ class DeepseekV4Model(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
