@@ -1,7 +1,8 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3 + EAGLE3 is the per-commit AIME26 gate. The matching speculator-free
-# configuration remains available as a manual control for direct comparison.
-name: eval-kimi-k3-eagle3-mxfp4-tp8ep8-aime26-amd
+# Kimi-K3 + EAGLE3 TP8/EP1 is the per-commit AIME26 gate. Its small target-MoE
+# verification batches use the optimized A8W4 SiTU path; the matching
+# speculator-free configuration remains available as a manual control.
+name: eval-kimi-k3-eagle3-mxfp4-tp8ep1-aime26-amd
 type: eval
 workflow_stage: model-test
 triggers:
@@ -30,7 +31,7 @@ server:
     --speculative-draft-model-quantization unquant
     --eagle3-layers-to-capture 2,46,90
     --tp 8
-    --ep-size 8
+    --ep-size 1
     --attention-backend mla
     --drafter-attention-backend mla
     --moe-backend auto
