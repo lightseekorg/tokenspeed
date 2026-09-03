@@ -37,9 +37,8 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_norm_rope,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_rope,
-    qwen4_exp_qsa_selected_tokens,
+    qwen4_exp_qsa_selected_slots,
     qwen4_exp_qsa_sparse_attention,
-    qwen4_exp_qsa_sparse_slots,
     qwen4_exp_qsa_stage_verify,
 )
 
@@ -1023,20 +1022,32 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         assert got_logits_scores == ref_scores
 
 
-def test_qwen4_exp_qsa_selected_tokens_matches_torch(device: str) -> None:
+def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
     ratio, block_topk = 4, 8
     token_topk = block_topk * ratio
     selected_blocks = torch.tensor(
-        [[0, 5, 2, 9, 1, 3, 4, 6], [7, 0, 0, 0, 0, 0, 0, 0]],
+        [[0, 5, 2, 9, 1, 3, 4, 6], [2, 0, 0, 0, 0, 0, 0, 0]],
         device=device,
         dtype=torch.int64,
     )
     selected_blocks[0, 5:] = -1
     complete_blocks = torch.tensor([6, 3], device=device, dtype=torch.int32)
     logical = torch.tensor([25, 10], device=device, dtype=torch.long)
+    requests = torch.tensor([0, 1], device=device, dtype=torch.long)
+    page_size = 8
+    page_table = torch.tensor(
+        [[2, 4, 0, 7], [9, 1, 6, 3]], device=device, dtype=torch.int32
+    )
 
-    actual = qwen4_exp_qsa_selected_tokens(
-        selected_blocks, complete_blocks, logical, ratio, token_topk
+    actual = qwen4_exp_qsa_selected_slots(
+        selected_blocks,
+        complete_blocks,
+        logical,
+        requests,
+        page_table,
+        page_size,
+        ratio,
+        token_topk,
     )
 
     blocks = torch.where(
@@ -1048,26 +1059,9 @@ def test_qwen4_exp_qsa_selected_tokens_matches_torch(device: str) -> None:
     suffix_offsets = torch.arange(ratio - 1, device=device)
     suffix = complete_blocks.long().unsqueeze(1) * ratio + suffix_offsets
     suffix = torch.where(suffix <= logical.unsqueeze(1), suffix, -1)
-    expected = torch.cat((tokens, suffix), dim=1).to(torch.int32)
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_qwen4_exp_qsa_sparse_slots_matches_torch(device: str) -> None:
-    page_size = 16
-    selected = torch.tensor(
-        [[0, 15, 16, 40, -1], [3, 7, 8, 2, 5]], device=device, dtype=torch.int32
-    )
-    logical = torch.tensor([20, 7], device=device, dtype=torch.long)
-    requests = torch.tensor([0, 1], device=device, dtype=torch.long)
-    page_table = torch.tensor([[2, 4, 0], [9, 1, 6]], device=device, dtype=torch.int32)
-
-    actual = qwen4_exp_qsa_sparse_slots(
-        selected, logical, requests, page_table, page_size
-    )
-
-    valid = (selected.long() >= 0) & (selected.long() <= logical.unsqueeze(1))
-    safe = selected.long().clamp_min(0)
+    selected = torch.cat((tokens, suffix), dim=1)
+    valid = (selected >= 0) & (selected <= logical.unsqueeze(1))
+    safe = selected.clamp_min(0)
     columns = safe // page_size
     pages = page_table[requests.unsqueeze(1).expand_as(columns), columns].long()
     expected = pages * page_size + safe % page_size

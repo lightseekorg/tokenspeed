@@ -33,11 +33,11 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_logical_layout,
     qwen4_exp_qsa_norm_rope,
     qwen4_exp_qsa_recent_write,
-    qwen4_exp_qsa_selected_tokens,
-    qwen4_exp_qsa_sparse_slots,
+    qwen4_exp_qsa_selected_slots,
     qwen4_exp_qsa_stage_draft,
     qwen4_exp_qsa_stage_verify,
 )
+from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
@@ -606,17 +606,21 @@ class QSAIndexer(nn.Module):
         # the budget routing falls back to zero-materialization streaming.
         return "logits" if rows * num_blocks * 4 <= budget_mb << 20 else "stream"
 
-    def _select_tokens(
+    def _select_slots(
         self,
         q: torch.Tensor,
         logical_positions: torch.Tensor,
         request_indices: torch.Tensor,
         qsa_page_table: torch.Tensor,
+        full_page_table: torch.Tensor,
         compressed: torch.Tensor,
         *,
+        full_page_size: int,
         qsa_page_expansion: int = 1,
         complete_blocks: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Select logical QSA blocks and emit physical full-cache slots."""
+
         output_width = self.token_topk + self.compress_ratio - 1
         if q.shape[0] == 0:
             return torch.empty((0, output_width), dtype=torch.int32, device=q.device)
@@ -643,10 +647,13 @@ class QSAIndexer(nn.Module):
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=pdl_enabled(),
         )
-        return qwen4_exp_qsa_selected_tokens(
+        return qwen4_exp_qsa_selected_slots(
             selected_blocks,
             complete_blocks,
             logical_positions,
+            request_indices,
+            full_page_table,
+            full_page_size,
             self.compress_ratio,
             self.token_topk,
         )
@@ -658,7 +665,7 @@ class QSAIndexer(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Top-k token indices for this layer, one eager breakable-graph break.
+        """Top-k physical cache slots for this layer, one eager graph break.
 
         Everything here is per-request: the logical layout comes from the live
         query lengths, the compressed / recent writes address freshly built page
@@ -789,18 +796,20 @@ class QSAIndexer(nn.Module):
                 )
             if shared_topk is not None:
                 return shared_topk[:num_rows]
-        selected = self._select_tokens(
+        selected_slots = self._select_slots(
             q,
             logical,
             requests,
             qsa_page_table,
+            metadata.page_tables[FULL_ATTENTION],
             compressed,
+            full_page_size=self._backend_group_page_size(full_backend, FULL_ATTENTION),
             qsa_page_expansion=qsa_expansion,
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:
-            ctx.dsa_decode_topk = selected
-        return selected
+            ctx.dsa_decode_topk = selected_slots
+        return selected_slots
 
     @break_point
     def sparse_attention(
@@ -813,7 +822,7 @@ class QSAIndexer(nn.Module):
         attention_layer,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        topk_indices: torch.Tensor,
+        selected_slots: torch.Tensor,
     ) -> torch.Tensor:
         """Run QSA while preserving the backend's layerwise PD step contract.
 
@@ -825,8 +834,8 @@ class QSAIndexer(nn.Module):
         """
         num_real = current_valid_rows()
         if num_real is not None:
-            q, k, v, gate, out_cache_loc, topk_indices = slice_to_real_tokens(
-                num_real, q, k, v, gate, out_cache_loc, topk_indices
+            q, k, v, gate, out_cache_loc, selected_slots = slice_to_real_tokens(
+                num_real, q, k, v, gate, out_cache_loc, selected_slots
             )
         with ctx.attn_backend.record_pd_cache_step(
             ctx.forward_mode,
@@ -841,7 +850,7 @@ class QSAIndexer(nn.Module):
                 attention_layer=attention_layer,
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
-                topk_indices=topk_indices,
+                selected_slots=selected_slots,
             )
 
     def _sparse_attention_impl(
@@ -854,7 +863,7 @@ class QSAIndexer(nn.Module):
         attention_layer,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        topk_indices: torch.Tensor,
+        selected_slots: torch.Tensor,
     ) -> torch.Tensor:
         metadata = self._metadata(ctx)
         full_backend = self._full_backend(ctx)
@@ -866,31 +875,41 @@ class QSAIndexer(nn.Module):
         q = q.view(-1, attention_layer.tp_q_head_num, attention_layer.head_dim)
         k = k.view(-1, attention_layer.tp_k_head_num, attention_layer.head_dim)
         v = v.view(-1, attention_layer.tp_v_head_num, attention_layer.v_head_dim)
-        ctx.token_to_kv_pool.set_kv_buffer(
-            attention_layer,
-            full_locs,
-            k,
-            v,
-            attention_layer.k_scale,
-            attention_layer.v_scale,
-        )
+        pool = ctx.token_to_kv_pool
+        k_cache, v_cache = pool.get_kv_buffer(attention_layer.layer_id)
+        if (
+            k_cache.dtype == torch.float8_e4m3fn
+            and v_cache.dtype == torch.float8_e4m3fn
+            and k.dtype != k_cache.dtype
+            and v.dtype != v_cache.dtype
+        ):
+            # QSA calls sparse attention directly instead of entering the full
+            # attention backend's normal FP8 save path. Quantize and scatter in
+            # one launch here as that backend does, avoiding two materialized
+            # BF16-to-FP8 temporaries before the cache write.
+            fused_fp8_set_kv_buffer(
+                k=k,
+                v=v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_loc=full_locs,
+                k_scale=attention_layer.k_scale,
+                v_scale=attention_layer.v_scale,
+                page_size=self._backend_group_page_size(full_backend, FULL_ATTENTION),
+            )
+        else:
+            pool.set_kv_buffer(
+                attention_layer,
+                full_locs,
+                k,
+                v,
+                attention_layer.k_scale,
+                attention_layer.v_scale,
+            )
         query_lengths = self._decode_query_lengths(
             ctx,
             q.shape[0],
             force_uniform=ctx.accept_lengths is not None,
-        )
-        logical, requests, _ = self._logical_layout(
-            metadata,
-            q.shape[0],
-            ctx.bs,
-            query_lengths=query_lengths,
-        )
-        page_table = metadata.page_tables[FULL_ATTENTION]
-        k_cache = ctx.token_to_kv_pool.get_key_buffer(attention_layer.layer_id)
-        v_cache = ctx.token_to_kv_pool.get_value_buffer(attention_layer.layer_id)
-        page_size = self._backend_group_page_size(full_backend, FULL_ATTENTION)
-        slots = qwen4_exp_qsa_sparse_slots(
-            topk_indices, logical, requests, page_table, page_size
         )
         fp8_dtypes = (
             torch.float8_e4m3fn,
@@ -902,7 +921,7 @@ class QSAIndexer(nn.Module):
             q,
             k_cache,
             v_cache,
-            slots,
+            selected_slots,
             scale=attention_layer.scaling,
             max_seqlen_q=(query_lengths if isinstance(query_lengths, int) else 1),
             k_scale=(

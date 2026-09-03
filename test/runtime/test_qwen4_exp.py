@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -443,6 +444,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
 
     metadata = SimpleNamespace(
         page_tables={
+            FULL_ATTENTION: torch.ones((2, 1), dtype=torch.int32),
             QWEN4_EXP_QSA_CACHE_GROUP: torch.zeros((2, 1), dtype=torch.int32),
             QWEN4_EXP_QSA_RECENT_CACHE_GROUP: torch.zeros((2, 1), dtype=torch.int32),
         }
@@ -484,7 +486,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     indexer._write_and_compress = lambda *args, **kwargs: updates.append((args, kwargs))
 
     selections = []
-    indexer._select_tokens = lambda *args, **kwargs: (
+    indexer._select_slots = lambda *args, **kwargs: (
         selections.append((args, kwargs)) or rows
     )
     ctx = SimpleNamespace(
@@ -507,7 +509,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     def fail_selection(*args, **kwargs):
         raise AssertionError("top-k selection must be skipped")
 
-    indexer._select_tokens = fail_selection
+    indexer._select_slots = fail_selection
     actual = indexer(torch.zeros((2, 4)), torch.tensor([9, 10]), ctx)
 
     torch.testing.assert_close(actual, rows)
@@ -997,7 +999,7 @@ def test_qwen4_exp_qsa_stage_verified_snapshots_strided_sources() -> None:
 
 
 @_requires_cuda
-def test_qwen4_exp_qsa_select_tokens_matches_reference() -> None:
+def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
     device = "cuda"
     indexer, pool, _, _, _ = _qsa_cache_test_indexer(device)
     # The scoring dot product needs head_dim >= 8, and the streaming block
@@ -1011,8 +1013,20 @@ def test_qwen4_exp_qsa_select_tokens_matches_reference() -> None:
     logical = torch.tensor([21, 10], dtype=torch.long, device=device)
     requests = torch.tensor([0, 1], dtype=torch.long, device=device)
     qsa_page_table = torch.tensor([[1], [2]], dtype=torch.int32, device=device)
+    full_page_size = 8
+    full_page_table = torch.tensor(
+        [[3, 7, 11], [13, 17, 19]], dtype=torch.int32, device=device
+    )
 
-    selected = indexer._select_tokens(q, logical, requests, qsa_page_table, compressed)
+    selected = indexer._select_slots(
+        q,
+        logical,
+        requests,
+        qsa_page_table,
+        full_page_table,
+        compressed,
+        full_page_size=full_page_size,
+    )
 
     # Only blocks before ``complete_blocks`` hold valid compressed keys, so
     # the selection is deterministic; compare selected token sets per row
@@ -1028,8 +1042,12 @@ def test_qwen4_exp_qsa_select_tokens_matches_reference() -> None:
         ).reshape(-1)
         suffix_values = complete[row] * ratio + torch.arange(ratio - 1, device=device)
         suffix_values = suffix_values[suffix_values <= logical[row]]
+        logical_tokens = torch.cat((block_tokens, suffix_values))
+        pages = full_page_table[row].index_select(0, logical_tokens // full_page_size)
         expected = (
-            torch.cat((block_tokens, suffix_values)).sort().values.to(torch.int32)
+            (pages * full_page_size + logical_tokens % full_page_size)
+            .sort()
+            .values.to(torch.int32)
         )
         got = selected[row][selected[row] >= 0].sort().values
         torch.testing.assert_close(got, expected)
@@ -1325,6 +1343,96 @@ def test_qwen4_exp_qsa_entry_points_are_eager_breaks() -> None:
     # address live page tables and per-request layouts that cannot be captured.
     assert hasattr(QSAIndexer.forward, "__wrapped__")
     assert hasattr(QSAIndexer.sparse_attention, "__wrapped__")
+
+
+@pytest.mark.parametrize(
+    "cache_dtype,expect_fused",
+    [
+        (torch.float8_e4m3fn, True),
+        (torch.bfloat16, False),
+    ],
+)
+def test_qwen4_exp_qsa_fuses_fp8_kv_store(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: torch.dtype,
+    expect_fused: bool,
+) -> None:
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    page_size = 16
+    full_locs = torch.tensor([5], dtype=torch.int32)
+    metadata = SimpleNamespace(out_cache_locs={FULL_ATTENTION: full_locs})
+    backend = SimpleNamespace(
+        is_draft=False,
+        _consumer_page_size=lambda group_id: page_size,
+    )
+    indexer._metadata = lambda ctx: metadata
+    indexer._full_backend = lambda ctx: backend
+
+    k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
+    v_cache = torch.empty_like(k_cache)
+    pool_store_calls = []
+    pool = SimpleNamespace(
+        get_kv_buffer=lambda layer_id: (k_cache, v_cache),
+        set_kv_buffer=lambda *args: pool_store_calls.append(args),
+    )
+    ctx = SimpleNamespace(
+        token_to_kv_pool=pool,
+        bs=1,
+        forward_mode=ForwardMode.DECODE,
+        accept_lengths=None,
+    )
+    attention_layer = SimpleNamespace(
+        layer_id=3,
+        tp_q_head_num=1,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        head_dim=8,
+        v_head_dim=8,
+        k_scale=None,
+        v_scale=None,
+        scaling=0.5,
+    )
+    fused_store_calls = []
+    sparse_attention_calls = []
+
+    def fused_store(**kwargs):
+        fused_store_calls.append(kwargs)
+
+    def sparse_attention(query, key_cache, value_cache, selected_slots, **kwargs):
+        sparse_attention_calls.append(
+            (query, key_cache, value_cache, selected_slots, kwargs)
+        )
+        return torch.ones_like(query)
+
+    monkeypatch.setattr(qsa_indexer_module, "fused_fp8_set_kv_buffer", fused_store)
+    monkeypatch.setattr(qsa_indexer_module, "qsa_sparse_attention", sparse_attention)
+
+    selected_slots = torch.tensor([[5, 9]], dtype=torch.int32)
+    output = indexer._sparse_attention_impl(
+        q=torch.zeros((1, 8), dtype=torch.bfloat16),
+        k=torch.ones((1, 8), dtype=torch.bfloat16),
+        v=torch.full((1, 8), 2.0, dtype=torch.bfloat16),
+        gate=None,
+        attention_layer=attention_layer,
+        ctx=ctx,
+        out_cache_loc=torch.tensor([7], dtype=torch.int32),
+        selected_slots=selected_slots,
+    )
+
+    assert output.shape == (1, 8)
+    assert len(sparse_attention_calls) == 1
+    if expect_fused:
+        assert pool_store_calls == []
+        assert len(fused_store_calls) == 1
+        call = fused_store_calls[0]
+        assert call["k_cache"] is k_cache
+        assert call["v_cache"] is v_cache
+        torch.testing.assert_close(call["cache_loc"], full_locs)
+        assert call["page_size"] == page_size
+    else:
+        assert fused_store_calls == []
+        assert len(pool_store_calls) == 1
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:

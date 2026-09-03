@@ -2340,69 +2340,106 @@ def qwen4_exp_qsa_block_topk(
 
 
 @triton.jit
-def _qwen4_exp_qsa_selected_tokens_kernel(
+def _qwen4_exp_qsa_selected_slots_kernel(
     selected_blocks,
     complete_blocks,
     logical_positions,
-    selected_tokens,
-    token_topk,
-    compress_ratio,
-    width,
+    request_indices,
+    page_table,
+    selected_slots,
     stride_b_n,
+    stride_pt_b,
     stride_o_n,
+    TOKEN_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = columns < width
+    mask = columns < WIDTH
     complete = tl.load(complete_blocks + row).to(tl.int64)
-    is_token = columns < token_topk
+    is_token = columns < TOKEN_TOPK
     block_ids = tl.load(
-        selected_blocks + row * stride_b_n + columns // compress_ratio,
+        selected_blocks + row * stride_b_n + columns // COMPRESS_RATIO,
         mask=mask & is_token,
         other=-1,
     ).to(tl.int64)
     token_ok = (block_ids >= 0) & (block_ids < complete)
-    token_values = block_ids * compress_ratio + columns % compress_ratio
+    token_values = block_ids * COMPRESS_RATIO + columns % COMPRESS_RATIO
     position = tl.load(logical_positions + row).to(tl.int64)
-    suffix_values = complete * compress_ratio + (columns - token_topk)
+    suffix_values = complete * COMPRESS_RATIO + (columns - TOKEN_TOPK)
     suffix_ok = suffix_values <= position
-    values = tl.where(
+    logical_tokens = tl.where(
         is_token,
         tl.where(token_ok, token_values, -1),
         tl.where(suffix_ok, suffix_values, -1),
     )
+    # Keep the final causal guard local to the physical mapping. Besides
+    # protecting externally supplied block lists, this prevents a stale
+    # complete-block count from exposing later rows during MTP compaction.
+    valid = (logical_tokens >= 0) & (logical_tokens <= position)
+    safe_tokens = tl.maximum(logical_tokens, 0)
+    page_columns = safe_tokens // PAGE_SIZE
+    request = tl.load(request_indices + row).to(tl.int64)
+    pages = tl.load(
+        page_table + request * stride_pt_b + page_columns,
+        mask=mask & valid,
+        other=0,
+    ).to(tl.int64)
+    slots = pages * PAGE_SIZE + safe_tokens % PAGE_SIZE
     tl.store(
-        selected_tokens + row * stride_o_n + columns,
-        values.to(tl.int32),
+        selected_slots + row * stride_o_n + columns,
+        tl.where(valid & (pages > 0), slots, -1).to(tl.int32),
         mask=mask,
     )
 
 
-def qwen4_exp_qsa_selected_tokens(
+def qwen4_exp_qsa_selected_slots(
     selected_blocks: torch.Tensor,
     complete_blocks: torch.Tensor,
     logical_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Materialize per-token sparse selection lists from chosen blocks.
+    """Expand selected blocks directly into physical full-attention slots.
 
     Args:
         selected_blocks: Top-k block ids shaped ``[rows, block_topk]``;
             negative entries are invalid.
         complete_blocks: Fully compressed block counts shaped ``[rows]``.
         logical_positions: Absolute logical position per row.
+        request_indices: Owning request id per row.
+        page_table: Full-attention page table shaped
+            ``[requests, max_pages]``.
+        page_size: Tokens covered by one full-attention page-table entry.
         compress_ratio: Tokens grouped into one compressed block.
         token_topk: Number of block-derived tokens kept per row.
 
     Returns:
-        Int32 token ids shaped ``[rows, token_topk + compress_ratio - 1]``;
-        invalid entries are ``-1`` and the trailing columns cover the
-        in-progress compression group.
+        Int32 physical cache slots shaped
+        ``[rows, token_topk + compress_ratio - 1]``; invalid entries are
+        ``-1`` and the trailing columns cover the in-progress compression
+        group.
     """
 
+    if selected_blocks.ndim != 2:
+        raise ValueError("Qwen4-Exp QSA selected blocks must be rank two")
     rows = selected_blocks.shape[0]
+    if complete_blocks.shape != (rows,):
+        raise ValueError("complete_blocks must have one entry per selected row")
+    if logical_positions.shape != (rows,):
+        raise ValueError("logical_positions must have one entry per selected row")
+    if request_indices.shape != (rows,):
+        raise ValueError("request_indices must have one entry per selected row")
+    if page_table.ndim != 2:
+        raise ValueError("Qwen4-Exp QSA full page table must be rank two")
+    if page_size <= 0:
+        raise ValueError("Qwen4-Exp QSA full page size must be positive")
     width = token_topk + compress_ratio - 1
     # The kernel stores every column including the -1 invalid entries, so
     # the buffer starts uninitialized.
@@ -2410,99 +2447,23 @@ def qwen4_exp_qsa_selected_tokens(
         (rows, width), dtype=torch.int32, device=selected_blocks.device
     )
     if rows:
-        _qwen4_exp_qsa_selected_tokens_kernel[(rows, triton.cdiv(width, 256))](
+        _qwen4_exp_qsa_selected_slots_kernel[(rows, triton.cdiv(width, 256))](
             selected_blocks,
             complete_blocks,
             logical_positions,
+            request_indices,
+            page_table,
             output,
-            token_topk,
-            compress_ratio,
-            width,
             selected_blocks.stride(0),
+            page_table.stride(0),
             output.stride(0),
+            TOKEN_TOPK=token_topk,
+            COMPRESS_RATIO=compress_ratio,
+            PAGE_SIZE=page_size,
+            WIDTH=width,
             BLOCK=256,
         )
     return output
-
-
-@triton.jit
-def _qwen4_exp_qsa_sparse_slots_kernel(
-    selected_tokens,
-    logical_positions,
-    request_indices,
-    page_table,
-    slots,
-    page_size,
-    width,
-    stride_s_n,
-    stride_pt_b,
-    stride_o_n,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = columns < width
-    selected = tl.load(
-        selected_tokens + row * stride_s_n + columns,
-        mask=mask,
-        other=-1,
-    ).to(tl.int64)
-    position = tl.load(logical_positions + row).to(tl.int64)
-    valid = (selected >= 0) & (selected <= position)
-    safe_selected = tl.maximum(selected, 0)
-    page_columns = safe_selected // page_size
-    request = tl.load(request_indices + row).to(tl.int64)
-    pages = tl.load(
-        page_table + request * stride_pt_b + page_columns,
-        mask=mask & valid,
-        other=0,
-    ).to(tl.int64)
-    values = pages * page_size + safe_selected % page_size
-    values = tl.where(valid & (pages > 0), values, -1)
-    tl.store(slots + row * stride_o_n + columns, values.to(tl.int32), mask=mask)
-
-
-def qwen4_exp_qsa_sparse_slots(
-    selected_tokens: torch.Tensor,
-    logical_positions: torch.Tensor,
-    request_indices: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    """Translate selected token ids into physical full-attention slots.
-
-    Args:
-        selected_tokens: Selected logical token ids shaped
-            ``[rows, budget]``; negative entries are invalid.
-        logical_positions: Absolute logical position per row.
-        request_indices: Owning request id per row.
-        page_table: Full-attention page table shaped
-            ``[requests, max_pages]``.
-        page_size: Tokens covered by one page-table entry.
-
-    Returns:
-        Int32 slots shaped ``[rows, budget]``; invalid entries are ``-1``.
-    """
-
-    rows, width = selected_tokens.shape
-    # The kernel stores every column including the -1 invalid entries, so
-    # the buffer starts uninitialized.
-    slots = torch.empty((rows, width), dtype=torch.int32, device=selected_tokens.device)
-    if rows and width:
-        _qwen4_exp_qsa_sparse_slots_kernel[(rows, triton.cdiv(width, 256))](
-            selected_tokens,
-            logical_positions,
-            request_indices,
-            page_table,
-            slots,
-            page_size,
-            width,
-            selected_tokens.stride(0),
-            page_table.stride(0),
-            slots.stride(0),
-            BLOCK=256,
-        )
-    return slots
 
 
 @triton.jit
@@ -2674,9 +2635,8 @@ __all__ = [
     "qwen4_exp_qsa_norm_rope",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_rope",
-    "qwen4_exp_qsa_selected_tokens",
+    "qwen4_exp_qsa_selected_slots",
     "qwen4_exp_qsa_sparse_attention",
-    "qwen4_exp_qsa_sparse_slots",
     "qwen4_exp_qsa_stage_draft",
     "qwen4_exp_qsa_stage_verify",
 ]

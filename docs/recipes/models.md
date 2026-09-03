@@ -722,6 +722,12 @@ For the default 512-block QSA selection, the materialized-logits path uses a
 native CUDA persistent radix-select specialization on NVIDIA GPUs. Other top-k
 sizes and platforms retain the portable top-k fallback.
 
+QSA block expansion maps selected logical tokens directly to physical KV-cache
+slots. Sparse attention therefore keeps a backend-neutral direct-slot API and
+does not materialize a second logical layout or a separate logical-token
+selection table. When the full-attention cache uses NVIDIA E4M3 FP8, QSA also
+quantizes and scatters K/V into that cache in one launch.
+
 On NVIDIA B200, the TP4 QSA decode geometry (six query heads, one KV head,
 256-wide heads, and a 2051-token sparse budget) uses an adaptive CuTe DSL
 cluster specialization for BF16 queries with FP8 E4M3 KV cache at every
