@@ -72,7 +72,7 @@ jobs:
             ~/.cache/pip
             ~/.cache/uv
             ${{ runner.temp }}/tokenspeed-mi450-sim
-          key: mi450-sim-${{ runner.os }}-rocjitsu-2ab62717-rocm-20260812-v1
+          key: mi450-sim-${{ runner.os }}-rocjitsu-056c1cc3-rocm-20260812-v1
 
       - name: Install pipeline dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
