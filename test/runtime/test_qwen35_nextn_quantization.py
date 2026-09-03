@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
 from tokenspeed.runtime.layers.logits_processor import (
@@ -12,6 +13,7 @@ from tokenspeed.runtime.layers.logits_processor import (
     LogitsProcessor,
     should_apply_lm_head_quant_method,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.models.qwen3_5_nextn import (
     Qwen3_5ForConditionalGenerationNextN,
@@ -29,6 +31,54 @@ def test_quantized_mtp_checkpoint_keeps_draft_quantization():
     quant_config = Nvfp4Config()
 
     assert _resolve_mtp_quant_config(quant_config) is quant_config
+
+
+def test_attention_dp_draft_lm_head_receives_quant_config(monkeypatch):
+    quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
+    lm_head = nn.Linear(4, 8, bias=False)
+    replicated_linear = mock.Mock(return_value=lm_head)
+    monkeypatch.setattr(nextn_module, "ReplicatedLinear", replicated_linear)
+    monkeypatch.setattr(
+        nextn_module,
+        "Qwen3_5DraftForCausalLM",
+        mock.Mock(return_value=nn.Module()),
+    )
+    monkeypatch.setattr(
+        nextn_module, "GemmaRMSNorm", mock.Mock(return_value=nn.Identity())
+    )
+    monkeypatch.setattr(
+        nextn_module, "LogitsProcessor", mock.Mock(return_value=nn.Module())
+    )
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(
+            has_dp=True,
+            tp_rank=0,
+            tp_size=1,
+            tp_group=None,
+        )
+    )
+    config = SimpleNamespace(
+        hidden_size=4,
+        vocab_size=8,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+
+    draft = Qwen3_5ForConditionalGenerationNextN(
+        config,
+        mapping,
+        quant_config=quant_config,
+    )
+
+    assert draft.lm_head is lm_head
+    replicated_linear.assert_called_once_with(
+        4,
+        8,
+        bias=False,
+        quant_config=quant_config,
+        prefix="lm_head",
+    )
 
 
 class _DraftModel(nn.Module):

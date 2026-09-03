@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import tokenspeed_kernel
 import torch
+from torch import nn
 
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
 _RENAMES = (("language_model.", ""),)
 
@@ -103,6 +107,36 @@ def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
             torch.nn.Linear(1, 1),
             "model.layers.5.mlp.up_proj",
         )
+
+
+def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
+    from tokenspeed.runtime.layers.dense import Nvfp4W4A16LinearMethod
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: True,
+    )
+    quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
+    model = BaseCausalLM.__new__(BaseCausalLM)
+    nn.Module.__init__(model)
+    model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
+
+    lm_head = model.resolve_lm_head(
+        SimpleNamespace(
+            tie_word_embeddings=False,
+            hidden_size=32,
+            vocab_size=64,
+        ),
+        quant_config,
+        prefix="",
+    )
+
+    assert isinstance(lm_head, ReplicatedLinear)
+    assert isinstance(lm_head.quant_method, Nvfp4W4A16LinearMethod)
+    assert lm_head.weight.dtype == torch.uint8
+    assert lm_head.weight.shape == (64, 16)
 
 
 def test_qwen35_w4a16_and_static_fp8_routing(monkeypatch):

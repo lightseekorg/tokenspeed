@@ -208,6 +208,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     config.hidden_size,
                     config.vocab_size,
                     bias=False,
+                    quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
             else:
