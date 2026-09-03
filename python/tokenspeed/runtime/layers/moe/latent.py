@@ -334,36 +334,35 @@ class Kimi3LatentProjection(ReplicatedLinear):
     at a full 8152-token prefill chunk. The gate sits at the first width that
     wins reproducibly rather than the first that wins once.
 
-    Replay is the regime that decides it, because the gather costs a flat
-    ~70us of host submission that a capture pays once and a replay never
-    pays again. That couples this width to ``prefill_graph_max_tokens``:
-    it is unconditionally right only while every chunk at or above it is
-    captured. A chunk past that bucket ceiling runs eager, pays the
-    submission on every call, and does not clear it until somewhere past
-    4096 -- so lowering the ceiling below the widest chunk moves those
-    chunks onto the losing side of this gate without touching it, and a
-    deployment whose chunks exceed the ceiling wants
-    ``--prefill-graph-max-tokens`` raised to its chunked-prefill size. The
-    bucket is the thing to move there, not this width.
+    The gather also wins eager, so the width does not depend on whether the
+    chunk was captured. Measured host-in-the-loop, replicated against the
+    shard: 35.8/34.0 at 1280, 64.3/53.8 at 2048, 101.8/78.7 at 4096 and
+    208.9/138.6 at 8192. An earlier reading put the eager crossover past
+    4096 and had this gate coupled to ``prefill_graph_max_tokens``; that
+    measurement was superseded and the coupling with it, so a deployment
+    whose chunks exceed the capture ceiling needs nothing done here.
 
     1280 is itself a capture bucket in that ladder, so the gate cannot
     bisect one: a captured chunk is wholly below it or wholly at or above
     it, and 1153..1280 pads up onto the gate, into the arm that wins.
 
     This width is a floor, not the boundary. The mailbox is asked first and
-    claims everything up to its own ceiling, which the caller sizes to at
-    least this width but which grows with ``max_num_seqs``, the capture
-    sizes and the verify width. So on a wider shape the mailbox, not the
-    gather, serves the buckets just above here -- a claim the sweep behind
-    this number did not cover, since it measured the gather there.
+    claims everything up to its own ceiling, which the caller sets to this
+    same constant rather than deriving from the capture ladder, so the two
+    meet with no gap: 1280 takes the mailbox and 1281 the gather. A caller
+    that raised the ceiling would move the buckets just above here onto the
+    mailbox -- which the sweep behind this number did not cover, since it
+    measured the gather there.
 
     ``get_is_cuda_graph_phase`` cannot decide the two regimes apart, which
     is worth knowing because it reads as though it could. Its only setters
     are the decode wrapper's capture and its comm prewarm, and the executor
     runs prefill capture as a later statement, after that capture has
     already restored the flag -- so it is False throughout prefill capture.
-    A gate keyed on it would bake the eager threshold into every prefill
-    bucket and lose exactly the replayed band it was meant to protect.
+    Nothing here keys on it, and nothing should: with the shard winning in
+    both regimes there is no threshold for it to select between, and a
+    reader who assumes it distinguishes them will mis-attribute anything
+    measured across the two.
     """
 
     def __init__(
