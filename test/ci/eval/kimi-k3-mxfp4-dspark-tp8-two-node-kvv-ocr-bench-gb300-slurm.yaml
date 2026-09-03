@@ -30,7 +30,7 @@ server:
     --tensor-parallel-size 8
     --mm-encoder-tp-mode data
     --moe-backend flashinfer_trtllm
-    --gpu-memory-utilization 0.92
+    --gpu-memory-utilization 0.95
     --max-num-seqs 16
     --disable-prefill-graph
     --disable-kvstore
