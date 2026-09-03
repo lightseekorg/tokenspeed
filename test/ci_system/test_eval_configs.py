@@ -35,7 +35,8 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 11,
+        # +1 for the EAGLE3 tp8ep1 gate, whose tp8ep8 twin is the manual control.
+        "count": 12,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -171,7 +172,48 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert task["score_threshold"] == 0.90
 
 
-def test_kimi_k3_amd_gates_use_eagle3_tp8ep8():
+def test_kimi_k3_amd_gates_use_tp8ep1():
+    """The AMD per-commit gates run the tensor-parallel MoE placement.
+
+    tp8ep1 leads tp8ep8 at every concurrency measured -- 77.59 against 73.89 at
+    concurrency 1 on an 8x MI355X box, and 75.64 tps/user on the CI runner
+    against tp8ep8's own reference of 65 -- and it is where the gfx950 A8W4 SiTU
+    kernel and the tensor-parallel MoE tail live, both of which reached main
+    unguarded before.
+
+    Two gates covering different things: the perf job is plain decode and the
+    only throughput number, the eval drives the MoE input projection at 4+
+    tokens through EAGLE3 and so selects a different kernel. Neither subsumes
+    the other.
+    """
+    gates = (
+        (EVAL_CONFIG_DIR, "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml"),
+        (PERF_CONFIG_DIR, "kimi-k3-mxfp4-tp8ep1-evalscope-random-4k-1k-mi35x.yaml"),
+    )
+    for config_dir, filename in gates:
+        task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
+        assert task["triggers"] == ["per-commit", "manual"], filename
+        server_tokens = shlex.split(task["server"]["command"])
+        assert flag_value(server_tokens, "--tp") == "8", filename
+        assert flag_value(server_tokens, "--ep-size") == "1", filename
+
+    # The eval gate reports its AIME26 score rather than gating on it: a
+    # 30-problem bar cannot be both meaningful and stable, and inheriting the
+    # tp8ep8 twin's 0.90 would fail roughly half of all runs at the accuracy
+    # this placement measures. See that file for the arithmetic.
+    eval_task = yaml.safe_load(
+        (EVAL_CONFIG_DIR / gates[0][1]).read_text(encoding="utf-8")
+    )
+    assert "score_threshold" not in eval_task
+
+
+def test_kimi_k3_amd_eagle3_tp8ep8_controls():
+    """The EAGLE3 tp8ep8 pair, kept as manual controls for the tp8ep1 gates.
+
+    Everything here except the trigger is the speculator contract and is
+    unchanged; the pair differs from the tp8ep1 gates only in --ep-size, which
+    is what makes it useful for attributing a regression to the placement.
+    """
     filenames = (
         "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
         "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
@@ -183,7 +225,7 @@ def test_kimi_k3_amd_gates_use_eagle3_tp8ep8():
         task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
 
-        assert task["triggers"] == ["per-commit", "manual"]
+        assert task["triggers"] == ["manual"]
         assert flag_value(server_tokens, "--speculative-algorithm") == "EAGLE3"
         assert (
             flag_value(server_tokens, "--speculative-draft-model-path")

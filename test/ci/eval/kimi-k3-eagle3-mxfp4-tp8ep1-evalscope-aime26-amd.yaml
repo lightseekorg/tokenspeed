@@ -1,0 +1,120 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3 + EAGLE3 at the tensor-parallel MoE placement. Differs from the tp8ep8
+# twin only in --ep-size, so a disagreement between them is attributable to the
+# placement and nothing else.
+#
+# Speculative decoding is why this placement wants its own eval rather than
+# inheriting the speculator-free tp8ep1 job's coverage: EAGLE3 verifies 4 draft
+# tokens per step, so the MoE input projection runs at 4+ tokens and selects a
+# different kernel than the single-token decode specialist plain decode reaches.
+# That branch has no other per-commit coverage at ep1.
+name: eval-kimi-k3-eagle3-mxfp4-tp8ep1-aime26-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+# --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
+# ones and OOM at this memory fraction. Decode graphs, which speculative
+# decoding rides on, capture cleanly at every bucket.
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+    --eagle3-layers-to-capture 2,46,90
+    --tp 8
+    --ep-size 1
+    --attention-backend mla
+    --drafter-attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 65536
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+
+# No score_threshold, deliberately and not as a placeholder.
+#
+# What this job guards per commit is that the configuration still *runs*: server
+# startup, HIP graph capture, the gfx950 A8W4 SiTU kernel and the speculator, at
+# the tensor-parallel placement. That is the coverage whose absence let a
+# graph-capture deadlock reach main -- it was found by hand, not by CI. The
+# AIME26 score is reported for humans to watch, not gated on.
+#
+# It is not gated on because a 30-problem AIME26 bar cannot be made both
+# meaningful and stable. Measured on the DSpark tp8ep1 predecessor of this job
+# (26/30 then 27/30, so p ~= 0.883), the false-failure rate by the score values
+# a 30-problem run can actually take:
+#
+#   passes at   score    P(false failure)
+#      27/30    0.9000        47.2%
+#      26/30    0.8667        27.0%
+#      25/30    0.8333        13.1%
+#      24/30    0.8000         5.4%
+#      23/30    0.7667         1.9%
+#      22/30    0.7333         0.6%
+#
+# Stated as exact fractions on purpose. A threshold is compared against a score
+# that can only be k/30, so a rounded decimal silently moves the bar: 0.867 does
+# not admit 26/30, because 26/30 = 0.8667 is below it, and lands on the 47.2%
+# row rather than the 27.0% one. Pick k first, then write k/30 to four places.
+#
+# Inheriting the tp8ep8 twin's 0.90 would fail almost half of all PRs. The same
+# arithmetic applies to that twin, which gates commits today at 0.90 with
+# roughly a 1-in-8 false-failure rate; fixing that means more problems per run
+# and is out of scope here. Those numbers come from the DSpark predecessor, so
+# re-derive them from this job's own history before setting any bar.
+#
+# On whether A8W4 costs accuracy at all: measured on GSM8K (1319 greedy
+# problems) and GPQA-Diamond, tp8ep1 sat 0.5 and 3.0 points below tp8ep8, both
+# under 1 sigma, with the effect bounded under 1.07 pp. Resolving it more finely
+# needs ~12,300 samples per arm, so it is bounded rather than measured, and no
+# AIME26 threshold could ever see it.

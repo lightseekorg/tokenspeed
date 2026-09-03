@@ -15,20 +15,24 @@ api_version: ci.tokenspeed.io/v1
 # would skip capture entirely and silence exactly the class of bug it exists
 # to catch.
 #
-# Manual trigger only, so this does not gate commits and does not consume the
-# 8-GPU bench runner on every push. That leaves no automated signal for the
-# EP1 placement: the per-commit guard for the graph-capture contract is the
-# CPU-only test/runtime/test_kimi_k3_moe_fork_warmup.py, which is narrower --
-# it pins the call site, not the stream behaviour. Run this job by hand when
-# touching the MoE stream fork, the A8W4 SiTU kernel, or graph capture.
+# Per-commit, so this consumes the 8-GPU bench runner on every push. The EP1
+# placement carries two per-commit signals and they cover different things:
 #
-# Being manual is why the tokenizer defect below went unnoticed for so long: a
-# cold-runner failure in a job nobody runs on a schedule looks like bad luck the
-# one time someone does run it.
+#   this job                  plain decode, and the only throughput number
+#   eval-kimi-k3-eagle3-...   speculative decode, which drives the MoE input
+#     ...-tp8ep1-aime26-amd   projection at 4+ tokens and so selects a different
+#                             kernel than single-token decode
+#
+# Neither subsumes the other, and only this one would catch a throughput
+# regression, so weigh them separately before demoting either. The remaining
+# guard for the graph-capture contract if both went is the CPU-only
+# test/runtime/test_kimi_k3_moe_fork_warmup.py, which is narrower -- it pins the
+# call site, not the stream behaviour.
 name: perf-kimi-k3-mxfp4-tp8ep1-random-4k-1k-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
+  - per-commit
   - manual
 runner:
   labels:
