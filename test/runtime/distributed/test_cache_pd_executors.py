@@ -207,6 +207,7 @@ def _transfer_cache(
     src_block_manifest: CachePDBlockManifest,
     dst_block_manifest: CachePDBlockManifest,
     dst_cache_layout,
+    packer=None,
 ) -> int:
     return manager._transfer_data(
         session,
@@ -217,6 +218,7 @@ def _transfer_cache(
             transfer_fragments=transfer_fragments,
             dst_cache_layout=dst_cache_layout,
         ),
+        packer,
     )
 
 
@@ -708,6 +710,277 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
+class _FakePackScratch:
+    def __init__(self, base: int = 0xB000) -> None:
+        self.base = base
+
+    def materialize(self, blocks):
+        from tokenspeed.runtime.pd.mooncake.pack import PackedCopy
+
+        sges = []
+        offset = 0
+        for block in blocks:
+            if isinstance(block, PackedCopy):
+                sges.append((self.base + offset, block.dst, block.nbytes))
+                offset += block.nbytes
+            else:
+                src, dst, length = block
+                sges.append((int(src), int(dst), int(length)))
+        return sges
+
+
+def test_dest_contiguous_strided_src_packs_into_one_sge() -> None:
+    source_segment = make_segment(
+        "layer.0.k",
+        dtype="bfloat16",
+        shape=(2, 2, 2),
+        stride=32,
+        axis=1,
+        extent=4,
+    )
+    destination_segment = make_segment(
+        "layer.0.k",
+        dtype="bfloat16",
+        shape=(2, 1, 2),
+        stride=16,
+        axis=1,
+        extent=4,
+    )
+
+    def one_field_layout(field):
+        return make_layout(make_group("history", field), capacity=5, page_bytes=64)
+
+    source_layout = one_field_layout(source_segment)
+    destination_layout = one_field_layout(destination_segment)
+    source_manifest = _single_group_block_manifest("history", (1,))
+    destination_manifest = _single_group_block_manifest("history", (2,))
+    fragment = CacheTransferFragment(
+        group_id="history",
+        field_id="layer.0.k",
+        src_byte_offset=0,
+        dst_byte_offset=0,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=8,
+        bytes_per_row=8,
+        rows_per_page=2,
+    )
+    manager, calls = _recording_transfer_manager(source_layout, 0x1000)
+
+    assert (
+        _transfer_cache(
+            manager,
+            "session",
+            0x2000,
+            (fragment,),
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            dst_cache_layout=destination_layout,
+            packer=_FakePackScratch(),
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    session, src, dst, lengths = calls[0]
+    assert session == "session"
+    assert lengths == [16]
+    assert src == [0xB000]
+    assert len(dst) == 1
+
+
+def test_flatten_packed_copy_emits_contiguous_dest_rows() -> None:
+    from tokenspeed.runtime.pd.mooncake.pack import PackedCopy, flatten_transfer_blocks
+
+    copy = PackedCopy(src=0x10, dst=0x20, width=8, src_pitch=16, rows=2)
+    flattened = flatten_transfer_blocks([copy, (1, 2, 3)])
+    assert not isinstance(flattened, list)
+    assert list(flattened) == [
+        (0x10, 0x20, 8),
+        (0x20, 0x28, 8),
+        (1, 2, 3),
+    ]
+
+
+def test_pack_scratch_device_uses_explicit_gpu_index() -> None:
+    import torch
+
+    from tokenspeed.runtime.pd.mooncake.pack import PrefillPackScratch, scratch_device
+
+    assert scratch_device(3) == torch.device("cuda", 3)
+    assert scratch_device(None).type == "cuda"
+    engine = SimpleNamespace(
+        register=lambda *_a, **_k: None, deregister=lambda *_a: None
+    )
+    assert PrefillPackScratch(engine, gpu_id=3)._gpu_id == 3
+
+
+def test_pack_scratch_keeps_old_buffer_when_growth_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.pd.mooncake.pack import PrefillPackScratch
+
+    events: list[tuple] = []
+
+    def register(ptr, nbytes):
+        events.append(("register", int(ptr), int(nbytes)))
+
+    def deregister(ptr):
+        events.append(("deregister", int(ptr)))
+
+    class _Tensor:
+        def __init__(self, ptr: int) -> None:
+            self._ptr = ptr
+
+        def data_ptr(self) -> int:
+            return self._ptr
+
+    scratch = PrefillPackScratch(
+        SimpleNamespace(register=register, deregister=deregister), gpu_id=0
+    )
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda device=None: SimpleNamespace(cuda_stream=1)
+    )
+
+    def fake_empty(nbytes, dtype=None, device=None):
+        if nbytes > 64:
+            raise RuntimeError("OOM")
+        return _Tensor(0x1000)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    scratch._ensure(64)
+    with pytest.raises(RuntimeError, match="OOM"):
+        scratch._ensure(256)
+    assert scratch._ptr == 0x1000
+    assert scratch._nbytes == 64
+    assert events == [("register", 0x1000, 64)]
+
+
+def test_pack_cuda_skips_non_nvidia(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tokenspeed.runtime.pd.mooncake.pack import PackedCopy, PrefillPackScratch
+
+    monkeypatch.setattr(
+        "tokenspeed_kernel.platform.current_platform",
+        lambda: SimpleNamespace(is_nvidia=False),
+    )
+    copy = PackedCopy(src=0x10, dst=0x20, width=8, src_pitch=16, rows=2)
+    engine = SimpleNamespace(
+        register=lambda *_a, **_k: None, deregister=lambda *_a: None
+    )
+    assert list(PrefillPackScratch(engine).materialize([copy])) == [
+        (0x10, 0x20, 8),
+        (0x20, 0x28, 8),
+    ]
+
+
+def test_pack_scratch_keeps_old_buffer_when_register_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.pd.mooncake.pack import PrefillPackScratch
+
+    events: list[tuple] = []
+
+    def register(ptr, nbytes):
+        events.append(("register", int(ptr), int(nbytes)))
+        return 0 if nbytes <= 64 else -1
+
+    def deregister(ptr):
+        events.append(("deregister", int(ptr)))
+
+    class _Tensor:
+        def __init__(self, ptr: int) -> None:
+            self._ptr = ptr
+
+        def data_ptr(self) -> int:
+            return self._ptr
+
+    scratch = PrefillPackScratch(
+        SimpleNamespace(register=register, deregister=deregister), gpu_id=0
+    )
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda device=None: SimpleNamespace(cuda_stream=1)
+    )
+
+    def fake_empty(nbytes, dtype=None, device=None):
+        return _Tensor(0x1000 if nbytes <= 64 else 0x2000)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    scratch._ensure(64)
+    with pytest.raises(RuntimeError, match="registration failed"):
+        scratch._ensure(256)
+    assert scratch._ptr == 0x1000
+    assert scratch._nbytes == 64
+    assert events == [
+        ("register", 0x1000, 64),
+        ("register", 0x2000, 256),
+    ]
+
+
+def test_materialize_falls_back_when_register_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.pd.mooncake.pack import PackedCopy, PrefillPackScratch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        "tokenspeed_kernel.platform.current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *a, **k: SimpleNamespace(data_ptr=lambda: 0x1000),
+    )
+    events: list[str] = []
+    copy = PackedCopy(src=0x10, dst=0x20, width=8, src_pitch=16, rows=2)
+    engine = SimpleNamespace(
+        register=lambda *_a, **_k: -1,
+        deregister=lambda *_a: events.append("deregister"),
+    )
+    scratch = PrefillPackScratch(engine, gpu_id=0)
+    assert list(scratch.materialize([copy])) == [
+        (0x10, 0x20, 8),
+        (0x20, 0x28, 8),
+    ]
+    assert scratch._ptr == 0
+    assert events == []
+
+
+def test_fallback_write_batches_expanded_row_sges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.pd.mooncake.pack import PackedCopy, PrefillPackScratch
+    from tokenspeed.runtime.pd.mooncake.prefill import (
+        _TRANSFER_DESCRIPTOR_BATCH_SIZE,
+        MooncakeKVManagerPrefill,
+    )
+
+    monkeypatch.setattr(
+        "tokenspeed_kernel.platform.current_platform",
+        lambda: SimpleNamespace(is_nvidia=False),
+    )
+    batch_sizes: list[int] = []
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.engine = SimpleNamespace(
+        batch_transfer_sync=lambda _s, src, _d, _l: batch_sizes.append(len(src)) or 0
+    )
+    packer = PrefillPackScratch(
+        SimpleNamespace(register=lambda *_a, **_k: None, deregister=lambda *_a: None)
+    )
+    copies = [
+        PackedCopy(src=index * 16, dst=index * 8, width=8, src_pitch=16, rows=2)
+        for index in range(3000)
+    ]
+    assert manager._transfer_data("session", copies, packer) == 0
+    assert batch_sizes == [4096, 1904]
+    assert sum(batch_sizes) == 6000
+    assert all(size <= _TRANSFER_DESCRIPTOR_BATCH_SIZE for size in batch_sizes)
+
+
 def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> None:
     from tokenspeed.runtime.pd.base.status import TransferPoll
 
@@ -728,7 +1001,7 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
     manager.transfer_infos = {9: requests}
     manager.session_lock = nullcontext()
     manager._is_session_failed = lambda _session: False
-    manager._transfer_data = lambda session, blocks: (
+    manager._transfer_data = lambda session, blocks, packer=None: (
         sends.append((session, tuple(blocks))) or 0
     )
     manager.update_status = lambda room, status: statuses.__setitem__(room, status)
@@ -764,19 +1037,26 @@ def test_shared_manager_lazily_bounds_application_descriptor_batches() -> None:
     )
 
     batch_sizes = []
+    pulled_at_first_write = []
+    pulled = []
     manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.engine = SimpleNamespace(
-        batch_transfer_sync=lambda _session, src, dst, lengths: (
-            batch_sizes.append((len(src), len(dst), len(lengths))) or 0
-        )
-    )
+
+    def record_write(_session, src, dst, lengths):
+        if not pulled_at_first_write:
+            pulled_at_first_write.append(len(pulled))
+        batch_sizes.append((len(src), len(dst), len(lengths)))
+        return 0
+
+    manager.engine = SimpleNamespace(batch_transfer_sync=record_write)
     block_count = 2 * _TRANSFER_DESCRIPTOR_BATCH_SIZE + 17
 
     def blocks():
         for index in range(block_count):
+            pulled.append(index)
             yield (0x1000 + index * 64, 0x2000 + index * 64, 64)
 
     assert manager._transfer_data("decode-session", blocks()) == 0
+    assert pulled_at_first_write == [_TRANSFER_DESCRIPTOR_BATCH_SIZE]
     assert batch_sizes == [
         (_TRANSFER_DESCRIPTOR_BATCH_SIZE,) * 3,
         (_TRANSFER_DESCRIPTOR_BATCH_SIZE,) * 3,
