@@ -324,11 +324,15 @@ class Kimi3LatentProjection(ReplicatedLinear):
     the group and one all-gather concatenates the blocks. It is taken only
     where a mailbox exists, which is to say only where the fabric can map
     symmetric memory, and it narrows storage the same way ``shard_group``
-    does. That coupling is deliberate. Without the fabric the gather falls
-    back to a buffer-and-permute over NCCL, which at a full 8152-token chunk
-    costs 239us against the 224us of the replicated projection it would be
-    replacing -- so on such a machine the split is a loss at every width, and
-    the projection stays replicated throughout.
+    does. That coupling is deliberate, and measured rather than inferred: with
+    the fabric probe forced to decline so the gather runs on NCCL, 8 ranks over
+    two hosts read replicated against column-plus-gather 76.7/345.0us at 1280,
+    106.4/340.6 at 2048, 149.1/337.3 at 4096 and 257.9/375.4 at 8192. The
+    replica wins at every width, by 350 percent at the low end and still 46 at
+    the high one, so on such a machine the projection stays replicated
+    throughout. Those absolute numbers are from a standalone harness with no
+    inter-block context and warm cache; only the within-harness comparison
+    transfers.
 
     Where the fabric is there, the split pays from the mailbox ceiling
     upward: measured on GB300 TP8 under graph replay with cold weights, the
@@ -439,12 +443,18 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
         ``column_group`` asks the backend for that layout instead, and only
         where storage narrowed: a full-width projection already holds every
-        column and has nothing to concatenate. The NCCL
-        backend does the same buffer-and-permute, so nothing is lost where the
-        fabric has no symmetric memory; where it does, the fused NVLink gather
-        writes the final layout and skips the copy -- at 8152 tokens 135us this
-        way against 239us through the buffer, either side of the 224us it
-        replaces.
+        column and has nothing to concatenate. That request reaches
+        ``all_gather_inner`` -- the fused NVLink gather writes the final layout
+        in one pass, 135us at 8152 tokens where a buffer-and-permute needs 239.
+
+        It reaches that kernel only on NVIDIA, with a 2-D bf16 tensor gathered
+        on the last dim; anything else, and any group the fabric cannot map,
+        falls back to the NCCL backend's allocate-gather-transpose. That
+        fallback is not a near-equivalent: measured on 8 ranks over two hosts
+        it costs 345us at 1280 tokens against 77us for the replicated
+        projection, because a cross-host gather of 9MB is latency-bound long
+        before it is bandwidth-bound. Which is why a projection that cannot
+        narrow does not take this route at all.
 
         Returns:
             The full-width projection. **It may alias the backend's workspace**,
