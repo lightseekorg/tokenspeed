@@ -220,14 +220,16 @@ def gather_fabric_map() -> list[bool]:
 def group_has_fabric(ranks: Sequence[int]) -> bool:
     """Return whether every rank in ``ranks`` reported fabric support.
 
-    The world map is expected to be populated during distributed
-    initialization. Gathering while CUDA graph capture is active is impossible
-    and indicates that the initialization hook did not run.
+    Raises if the map has not been gathered, rather than gathering it here.
+    This is asked from dispatch, where the ranks present are the group's and
+    not the world's, so a lazy gather would run a world collective from a
+    stage or a data-parallel subset and hang the ranks that never arrive. A
+    missing map means the initialization hook did not run, which is a wiring
+    bug; callers outside a server must gather it themselves.
     """
-    if _fabric_map is None and torch.cuda.is_current_stream_capturing():
+    if _fabric_map is None:
         raise RuntimeError(
-            "fabric map should have been gathered at distributed initialization "
-            "before CUDA graph capture"
+            "fabric map was never gathered; call gather_fabric_map() at "
+            "distributed initialization before any reachability gate"
         )
-    fabric_map = gather_fabric_map()
-    return all(fabric_map[rank] for rank in ranks)
+    return all(_fabric_map[rank] for rank in ranks)

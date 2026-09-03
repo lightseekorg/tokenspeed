@@ -294,3 +294,29 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
             assert fabric.group_has_fabric([0, 1]) is False
     finally:
         fabric._fabric_map = None
+
+
+def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
+    """The lazy gather would be a world collective from a group-scoped call.
+
+    This is asked at dispatch, where the ranks present are the group's -- a
+    stage under pipeline parallelism, or a data-parallel subset. Gathering
+    there would block on world ranks that never arrive, so a missing map has
+    to be loud instead: it means the initialization hook did not run.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    saved = fabric._fabric_map
+    fabric._fabric_map = None
+    try:
+        with mock.patch.object(
+            fabric.torch.distributed,
+            "all_gather",
+            side_effect=AssertionError("must not gather from dispatch"),
+        ):
+            with pytest.raises(RuntimeError, match="never gathered"):
+                fabric.group_has_fabric([0, 1])
+    finally:
+        fabric._fabric_map = saved
