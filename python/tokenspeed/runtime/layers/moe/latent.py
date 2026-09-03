@@ -324,19 +324,16 @@ class Kimi3LatentProjection(ReplicatedLinear):
     the group and one all-gather concatenates the blocks. It is taken only
     where a mailbox exists, which is to say only where the fabric can map
     symmetric memory, and it narrows storage the same way ``shard_group``
-    does. That coupling is deliberate, and measured rather than inferred: with
-    the fabric probe forced to decline so the gather runs on NCCL, 8 ranks over
-    two hosts read replicated against column-plus-gather 76.7/345.0us at 1280,
-    106.4/340.6 at 2048, 149.1/337.3 at 4096 and 257.9/375.4 at 8192. The
-    replica wins at every width, by 350 percent at the low end and still 46 at
-    the high one, so on such a machine the projection stays replicated
-    throughout. Those absolute numbers are from a standalone harness with no
-    inter-block context and warm cache; only the within-harness comparison
-    transfers.
+    does. That coupling is deliberate, and measured rather than inferred: the
+    replica wins at every width where the fabric cannot carry the gather. The
+    numbers are on ``_gather_shards``, which is where the two routes are
+    described together; they are not repeated here because an earlier eager
+    set that was repriced away lived in this paragraph, two decimal places
+    from a value in the other arm.
 
     Where the fabric is there, the split pays from the mailbox ceiling
     upward: measured on GB300 TP8 under graph replay with cold weights, the
-    shard wins from 1280 by 7 to 9 percent out to 40 percent at 8152, and the
+    shard wins from 1280 by about 5 percent out to 36 at 8192, and the
     fused NVLink gather writes the final layout for 135us where the buffer
     path needs 239us. It wins eager as well -- 64.3/53.8 at 2048, 101.8/78.7
     at 4096, 208.9/138.6 at 8192 -- so the width does not depend on whether
