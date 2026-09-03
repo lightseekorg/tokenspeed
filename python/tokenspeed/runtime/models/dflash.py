@@ -49,6 +49,7 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
 
 class DFlashAttention(nn.Module):
@@ -391,7 +392,8 @@ class DFlashDraftModel(nn.Module):
             bias=False,
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
-        self.block_size = int(getattr(config, "block_size", 8))
+        # Name the DFlash drafter reads off the draft model.
+        self.block_size = read_checkpoint_block_size(config)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(self.fc(target_hidden))

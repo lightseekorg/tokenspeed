@@ -44,6 +44,10 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    BLOCK_SPEC_RULES,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -395,6 +399,12 @@ class ServerArgs:
             self.seed = random.randint(0, 1 << 30)
 
     def resolve_config_aliases(self):
+        # Whether the block-drafter widths were given rather than defaulted.
+        self._speculative_widths_explicit = (
+            self.speculative_num_steps != ServerArgs.speculative_num_steps
+            or self.speculative_num_draft_tokens is not None
+        )
+
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
@@ -439,6 +449,7 @@ class ServerArgs:
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
+                self._speculative_widths_explicit = True
                 if self.speculative_algorithm == "DFLASH" or (
                     self.speculative_algorithm == "DSPARK"
                     and not dspark_uses_base_model
@@ -720,7 +731,7 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
@@ -730,7 +741,8 @@ class ServerArgs:
                     "speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
-                    f"{self.speculative_num_draft_tokens=}."
+                    f"{self.speculative_num_draft_tokens=}. "
+                    f"{BLOCK_SPEC_RULES}"
                 )
 
         if self.eagle3_layers_to_capture is not None:
