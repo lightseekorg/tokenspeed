@@ -230,3 +230,37 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert flag_value(command, "--max-tokens") == max_tokens
         assert "--thinking" in command
         assert flag_value(command, "--thinking-effort") == "max"
+
+
+def test_kimi_k3_perf_configs_materialize_the_tokenizer_locally():
+    """EvalScope perf jobs must not pass a remote tokenizer ID.
+
+    EvalScope resolves remote tokenizer paths through ModelScope even when the
+    dataset source is Hugging Face, so passing the model ID makes the benchmark
+    depend on a warm ModelScope cache. On a cold runner it fails partway through
+    with "Couldn't instantiate the backend tokenizer" while the server is
+    already healthy, and a re-run against the now-warm cache passes -- so the
+    failure reads as flaky and the cause is easy to miss.
+
+    Every Kimi-K3 perf job therefore saves the Hugging Face tokenizer locally
+    first and points EvalScope at the directory. Pinning it here because
+    reverting to the model ID reintroduces a failure that only appears on a cold
+    runner, which is exactly the kind nobody reproduces on demand.
+    """
+    filenames = (
+        "kimi-k3-mxfp4-tp8ep1-evalscope-random-4k-1k-mi35x.yaml",
+        "kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+    )
+    for filename in filenames:
+        task = yaml.safe_load((PERF_CONFIG_DIR / filename).read_text(encoding="utf-8"))
+        command = task["perf"]["command"]
+        tokens = shlex.split(command)
+
+        assert "save_pretrained" in command, filename
+        assert flag_value(tokens, "--data-source") == "huggingface", filename
+
+        tokenizer_path = flag_value(tokens, "--tokenizer-path")
+        # A local directory built by the materialization step, not a hub id.
+        assert tokenizer_path == "$TOKENIZER_PATH", filename
+        assert "/" not in tokenizer_path.lstrip("$"), filename
