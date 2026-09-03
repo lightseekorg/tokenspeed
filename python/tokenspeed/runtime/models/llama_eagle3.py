@@ -89,19 +89,19 @@ class LlamaAttention(BaseLlamaAttention):
         v: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        # Active draft first step (drafter set up gather_ids + accept_lengths).
+        # Active draft first step (the drafter attached the narrowing).
         # Covers both decode catch-up and prefill catch-up; multi-step decode
         # delegates to base.
-        if ctx.accept_lengths is None:
+        if ctx.draft_narrowing is None:
             return super()._attn(positions, q, k, v, ctx)
 
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
             fused_kv_arg = self._build_fused_kv_arg(v, ctx)
             if fused_kv_arg is not None:
-                # Trim only on the sliced single-token decode path; the
-                # post-slice fallback below still runs full N-row attn and
-                # needs the original seq_lens.
-                self._apply_correction(ctx)
+                # The sliced single-token decode attends over the accepted
+                # prefix; the post-slice fallback below still runs the full
+                # N-row attn over the verify window and must not publish.
+                ctx.draft_narrowing.publish_accepted_prefix()
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
@@ -121,21 +121,6 @@ class LlamaAttention(BaseLlamaAttention):
                 )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx).index_select(0, ctx.gather_ids)
-
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        # Publish: the backend owns its buffer, so in-graph edits need a copy.
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +258,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Align residual with attn output narrowed to [bs, H]."""
-        if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is not None and not ctx.forward_mode.is_idle():
             return residual.index_select(0, ctx.gather_ids)
         return residual
 

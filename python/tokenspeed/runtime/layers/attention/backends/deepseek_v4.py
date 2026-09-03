@@ -46,6 +46,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.graph_buffers import (
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
+    DeepseekV4ForwardSlotMappings,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     first_v4_compressed_kv_group_id,
@@ -251,6 +254,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.forward_metadata: DeepseekV4ForwardMetadata | None = None
         self.forward_prefill_metadata: DeepseekV4ForwardMetadata | None = None
         self.forward_decode_metadata: DeepseekV4ForwardMetadata | None = None
+        # The write-slot mappings the model's layers share within one forward
+        # (SWA / compressor / indexer state), cleared by every slot publish.
+        self.slot_mappings = DeepseekV4ForwardSlotMappings()
         # The persistent decode buffers + per-shape views; allocated by
         # init_cuda_graph_state (unconditionally at wrapper construction).
         self.graph: DeepseekV4GraphBuffers | None = None
@@ -599,16 +605,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     # reproduce capture's end state" is one line of code, not a cross-method
     # contract (graph_ptr_guard verifies the slots' object graph against the
     # capture-end snapshot). Forwards are read-only: resolution results
-    # travel as parameters, never through a slot write.
+    # travel as parameters, never through a slot write. Every publish also
+    # starts a fresh per-forward slot-mapping memo (``slot_mappings``): the
+    # mappings the layers share are derived from the published metadata and
+    # the forward's rows, so a publish is exactly when they go stale.
     # ------------------------------------------------------------------
 
     def _publish_prefill(self, metadata: DeepseekV4ForwardMetadata) -> None:
         self.forward_prefill_metadata = metadata
         self.forward_metadata = metadata
+        self.slot_mappings.clear()
+        self.sparse_topk.clear()
 
     def _publish_decode(self, metadata: DeepseekV4ForwardMetadata) -> None:
         self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
+        self.slot_mappings.clear()
+        self.sparse_topk.clear()
 
     def _publish_draft_round(
         self,
@@ -622,6 +635,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.forward_prefill_metadata = packed
         self.forward_decode_metadata = step
         self.forward_metadata = step
+        self.slot_mappings.clear()
+        self.sparse_topk.clear()
 
     def _prepare_draft_round(
         self,

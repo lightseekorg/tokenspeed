@@ -90,6 +90,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4IndexerPrefillMetadata,
     DeepseekV4SparseIndexerMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
+    DeepseekV4ForwardSlotMappings,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
     V4_KERNEL_BLOCK_ROWS,
@@ -2167,7 +2170,7 @@ class DeepseekV4Compressor(nn.Module):
         state_block_size: int | None = None,
         state_slot_mapping: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
-        compressor_slot_cache: dict | None = None,
+        slot_mappings: DeepseekV4ForwardSlotMappings | None,
         kv_score: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
@@ -2197,7 +2200,7 @@ class DeepseekV4Compressor(nn.Module):
         # state/compressed slot mappings depend only on (per-step state, ratio), so reuse
         # them across layers of the same ratio within a step. Attn-compressor path only:
         # the indexer-compressor passes an explicit state_block_table and is excluded.
-        memo = compressor_slot_cache if state_block_table is None else None
+        memo = slot_mappings if state_block_table is None else None
         if state_block_table is None:
             state_block_table = cache_metadata.compressor_state_block_tables.get(
                 self.compress_ratio
@@ -2214,32 +2217,31 @@ class DeepseekV4Compressor(nn.Module):
             else None
         )
         if state_slot_mapping is None:
-            state_hit = (
-                memo.get(("state", self.compress_ratio)) if memo is not None else None
-            )
-            if state_hit is not None:
-                state_slot_mapping, state_block_table = state_hit
-            else:
-                if state_block_table is None:
+            resolved_state_block_table = state_block_table
+
+            def resolve_state_slots() -> tuple[torch.Tensor, torch.Tensor]:
+                if resolved_state_block_table is None:
                     raise RuntimeError(
                         "DeepSeek V4 missing cache-group block table for compressor "
                         f"state ratio={self.compress_ratio}"
                     )
-                state_slot_mapping = _group_slot_mapping_from_raw(
+                mapping = _group_slot_mapping_from_raw(
                     positions,
                     metadata.token_to_req_indices[: positions.numel()],
-                    state_block_table,
+                    resolved_state_block_table,
                     state_block_size,
                 )
-                state_slot_mapping = _mask_invalid_graph_tokens(
-                    state_slot_mapping,
-                    valid_token,
+                return (
+                    _mask_invalid_graph_tokens(mapping, valid_token),
+                    resolved_state_block_table,
                 )
-                if memo is not None:
-                    memo[("state", self.compress_ratio)] = (
-                        state_slot_mapping,
-                        state_block_table,
-                    )
+
+            if memo is not None:
+                state_slot_mapping, state_block_table = memo.get_or_compute(
+                    ("state", self.compress_ratio), resolve_state_slots
+                )
+            else:
+                state_slot_mapping, state_block_table = resolve_state_slots()
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
                 kv=kv,
@@ -2255,14 +2257,10 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
-        compressed_hit = (
-            memo.get(("compressed", self.compress_ratio)) if memo is not None else None
-        )
-        if compressed_hit is not None:
-            compressed_slots = compressed_hit
-        else:
+
+        def resolve_compressed_slots() -> torch.Tensor:
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
-                compressed_slots = cache_metadata.compressed_slot_mapping(
+                return cache_metadata.compressed_slot_mapping(
                     positions,
                     self.compress_ratio,
                     token_to_req_indices=metadata.token_to_req_indices[
@@ -2276,8 +2274,13 @@ class DeepseekV4Compressor(nn.Module):
                     ),
                     is_valid_token=valid_token,
                 )
-            if memo is not None:
-                memo[("compressed", self.compress_ratio)] = compressed_slots
+
+        if memo is not None:
+            compressed_slots = memo.get_or_compute(
+                ("compressed", self.compress_ratio), resolve_compressed_slots
+            )
+        else:
+            compressed_slots = resolve_compressed_slots()
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -2682,7 +2685,7 @@ class DeepseekV4Indexer(nn.Module):
         ctx: ForwardContext,
         layer_index: int,
         cos_sin_cache: torch.Tensor,
-        compressor_slot_cache: dict,
+        slot_mappings: DeepseekV4ForwardSlotMappings | None,
         indexer_compressor_kv_score: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
@@ -2696,41 +2699,41 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        idx_hit = (
-            compressor_slot_cache.get("indexer_state")
-            if compressor_slot_cache is not None
-            else None
-        )
-        if idx_hit is not None:
-            (
-                indexer_state_slot_mapping,
-                indexer_state_block_table,
-                indexer_state_block_size,
-            ) = idx_hit
-        else:
-            indexer_state_block_table = cache_metadata.indexer_state_block_table
-            if indexer_state_block_table is None:
+
+        def resolve_indexer_state_slots() -> tuple[torch.Tensor, torch.Tensor, int]:
+            block_table = cache_metadata.indexer_state_block_table
+            if block_table is None:
                 raise RuntimeError(
                     "DeepSeek V4 missing cache-group block table for indexer "
                     "compressor state"
                 )
-            indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
-            indexer_state_slot_mapping = _group_slot_mapping_from_raw(
+            block_size = pool.get_indexer_state_block_size(layer_index)
+            mapping = _group_slot_mapping_from_raw(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
+                block_table,
+                block_size,
+            )
+            return (
+                _mask_invalid_graph_tokens(mapping, valid_token),
+                block_table,
+                block_size,
+            )
+
+        if slot_mappings is not None:
+            (
+                indexer_state_slot_mapping,
                 indexer_state_block_table,
                 indexer_state_block_size,
+            ) = slot_mappings.get_or_compute(
+                "indexer_state", resolve_indexer_state_slots
             )
-            indexer_state_slot_mapping = _mask_invalid_graph_tokens(
+        else:
+            (
                 indexer_state_slot_mapping,
-                valid_token,
-            )
-            if compressor_slot_cache is not None:
-                compressor_slot_cache["indexer_state"] = (
-                    indexer_state_slot_mapping,
-                    indexer_state_block_table,
-                    indexer_state_block_size,
-                )
+                indexer_state_block_table,
+                indexer_state_block_size,
+            ) = resolve_indexer_state_slots()
         with nvtx_range("indexer_compressor_total"):
             self.compressor(
                 hidden_states=hidden_states,
@@ -2743,6 +2746,9 @@ class DeepseekV4Indexer(nn.Module):
                 state_block_size=indexer_state_block_size,
                 state_slot_mapping=indexer_state_slot_mapping,
                 write_compressed_cache=False,
+                # The indexer resolved its own state slots above; the
+                # attention-compressor memo is not this path's.
+                slot_mappings=None,
                 kv_score=indexer_compressor_kv_score,
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
@@ -3033,8 +3039,6 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        swa_slot_mapping: torch.Tensor | None = None,
-        compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
         """DSA attention, one COARSE breakable-graph break point.
 
@@ -3046,17 +3050,14 @@ class DeepseekV4Attention(nn.Module):
         direct call otherwise (see ``break_point``). Padding rows are handled
         by the existing ``metadata.is_valid_token`` masking, and the
         token-shaped inputs are sliced to the real count DSA kernels assert
-        (see ``slice_to_real_tokens`` below). The cross-layer SWA slot mapping
-        and compressor memo are shared via ctx -- replay-safe because ctx is
-        rebound to the live forward (see ``DeepseekV4Model.forward``).
+        (see ``slice_to_real_tokens`` below). The cross-layer SWA / compressor
+        / indexer slot mappings are memoized on the backend
+        (``slot_mappings``), which every metadata publish clears -- so a
+        breakable replay's breaks, running live, compute them fresh.
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
-        # Cross-layer compressor memo, created once per forward by the first layer.
-        if compressor_slot_cache is None:
-            compressor_slot_cache = ctx.dsa_compressor_slot_cache
-            if compressor_slot_cache is None:
-                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
+        slot_mappings = ctx.attn_backend.slot_mappings
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
@@ -3072,11 +3073,10 @@ class DeepseekV4Attention(nn.Module):
         # with metadata whose token_to_req_indices does NOT describe q's rows.
         token_to_req = getattr(metadata, "token_to_req_indices", None)
         if current_forward_ctx() is not None and token_to_req is not None:
-            positions, hidden_states, swa_slot_mapping = slice_to_real_tokens(
+            positions, hidden_states = slice_to_real_tokens(
                 token_to_req.numel(),
                 positions,
                 hidden_states,
-                swa_slot_mapping,
             )
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
@@ -3103,12 +3103,10 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
-        if swa_slot_mapping is None:
-            # Cross-layer SWA slot mapping (per-token, layer-invariant), first layer computes.
-            swa_slot_mapping = ctx.dsa_swa_slot_mapping
-            if swa_slot_mapping is None:
-                swa_slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions)
-                ctx.dsa_swa_slot_mapping = swa_slot_mapping
+        # Per-token, layer-invariant: the first layer computes, the rest reuse.
+        swa_slot_mapping = slot_mappings.get_or_compute(
+            "swa", lambda: _deepseek_v4_swa_slot_mapping(ctx, positions)
+        )
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -3132,7 +3130,7 @@ class DeepseekV4Attention(nn.Module):
                     ctx=ctx,
                     layer_index=self.cache_layer_index,
                     cos_sin_cache=cos_sin_cache,
-                    compressor_slot_cache=compressor_slot_cache,
+                    slot_mappings=slot_mappings,
                     kv_score=compressor_kv_score,
                 )
 
@@ -3164,7 +3162,7 @@ class DeepseekV4Attention(nn.Module):
                         ctx=ctx,
                         layer_index=self.cache_layer_index,
                         cos_sin_cache=cos_sin_cache,
-                        compressor_slot_cache=compressor_slot_cache,
+                        slot_mappings=slot_mappings,
                         indexer_compressor_kv_score=indexer_compressor_kv_score,
                     )
                 with fork.branch():
@@ -3341,8 +3339,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
-        swa_slot_mapping: torch.Tensor | None = None,
-        compressor_slot_cache: dict | None = None,
         hc_x_prev: torch.Tensor | None = None,
         hc_post_prev: torch.Tensor | None = None,
         hc_comb_prev: torch.Tensor | None = None,
@@ -3377,13 +3373,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = self.attn_norm(hidden_states)
 
         with nvtx_range("attn_total"):
-            hidden_states = self.attn(
-                positions,
-                hidden_states,
-                ctx,
-                swa_slot_mapping,
-                compressor_slot_cache,
-            )
+            hidden_states = self.attn(positions, hidden_states, ctx)
 
         with nvtx_range("hc_fused_ffn_pre"):
             residual, hidden_states, post, comb = mhc_fused_hc(
@@ -3577,10 +3567,6 @@ class DeepseekV4Model(nn.Module):
         input_embeds: torch.Tensor | None = None,
         pp_inbound: PPStageState | None = None,
     ) -> tuple[torch.Tensor | PPStageState, list[torch.Tensor] | None]:
-        # Layer-invariant DSA memos: computing them HERE (graphed scope) would bake
-        # dummy addresses; the first attention break computes them LIVE onto ctx.
-        ctx.dsa_swa_slot_mapping = None
-        ctx.dsa_compressor_slot_cache = None
         if pp_inbound is not None:
             # Mid-pipeline stage: resume the mHC thread state received from
             # the upstream stage instead of embedding.
@@ -3606,8 +3592,6 @@ class DeepseekV4Model(nn.Module):
                 hidden_states,
                 ctx,
                 input_ids,
-                None,  # swa_slot_mapping: first break computes + caches on ctx
-                None,  # compressor_slot_cache: shared dict created on ctx
                 hc_x_prev,
                 hc_post_prev,
                 hc_comb_prev,

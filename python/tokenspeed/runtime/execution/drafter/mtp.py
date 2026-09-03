@@ -394,7 +394,6 @@ class Mtp(BaseDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
-                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_frontier_forward", color="red"):
@@ -502,7 +501,6 @@ class Mtp(BaseDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
-                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_extend_forward", color="red"):

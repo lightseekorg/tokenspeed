@@ -82,6 +82,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def supports_mla_projected_value_decode(self) -> bool:
         return self.full_attn_backend.supports_mla_projected_value_decode
 
+    @property
+    def sparse_topk(self):
+        # The sparse layers (QSA) index the full-attention child's groups.
+        return self.full_attn_backend.sparse_topk
+
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 

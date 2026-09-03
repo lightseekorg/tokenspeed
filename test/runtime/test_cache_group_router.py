@@ -665,6 +665,64 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
         self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
 
+    def test_every_metadata_build_clears_the_sparse_topk_share(self):
+        """The sparse layers' shared selection is per forward: extend init,
+        decode refresh and capture seeding each start it empty, so a "shared"
+        layer can never consume the previous forward's top-k."""
+        router, _ = self._router()
+        share = router.sparse_topk
+        self.assertIs(share, router.sparse_topk, "one share per node")
+
+        def publish():
+            share.prefill, share.decode = object(), object()
+
+        publish()
+        seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+        new = torch.tensor([3, 1], dtype=torch.int32)
+        prefix = torch.zeros(2, dtype=torch.int32)
+        router.init_forward_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            ForwardMode.EXTEND,
+            block_tables=self._tables(),
+            extend_seq_lens=new,
+            extend_seq_lens_cpu=new.clone(),
+            extend_prefix_lens=prefix,
+            extend_prefix_lens_cpu=prefix.clone(),
+            extend_with_prefix=False,
+        )
+        self.assertEqual((share.prefill, share.decode), (None, None))
+
+        publish()
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+        )
+        self.assertEqual((share.prefill, share.decode), (None, None))
+
+        publish()
+        router.init_forward_metadata_capture_cuda_graph(
+            2,
+            torch.arange(2, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            ForwardMode.DECODE,
+            block_tables=self._tables(),
+        )
+        self.assertEqual((share.prefill, share.decode), (None, None))
+
+        # The drafter's in-loop seq_lens edit is not a new forward: it leaves
+        # the share it just attached alone.
+        publish()
+        kept = (share.prefill, share.decode)
+        router.advance_draft_forward_metadata(torch.ones(2, dtype=torch.int32))
+        self.assertEqual((share.prefill, share.decode), kept)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -393,6 +393,8 @@ class CacheGroupRouter(AttentionBackend):
         paged-prefix metadata by it, so it must reach them unchanged.
         """
         del kwargs
+        # A new forward: the sparse layers' shared top-k is per forward.
+        self.sparse_topk.clear()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "decode metadata goes through refresh_decode_metadata; "
@@ -445,6 +447,7 @@ class CacheGroupRouter(AttentionBackend):
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
         del kwargs
+        self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
@@ -481,6 +484,7 @@ class CacheGroupRouter(AttentionBackend):
         refreshes, then each leaf's own capture hook (the leaf default is
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
         del kwargs
+        self.sparse_topk.clear()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"

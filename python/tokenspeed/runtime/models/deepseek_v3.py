@@ -1308,7 +1308,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None:
+        if ctx.draft_narrowing is None:
             return super()._attn(
                 positions,
                 q,
@@ -1317,7 +1317,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 absorbed_query=absorbed_query,
             )
 
-        self._apply_correction(ctx)
+        # The live rows attend over the accepted prefix, not the verify window.
+        ctx.draft_narrowing.publish_accepted_prefix()
 
         # This step writes every input row's KV in one shot: the extend span
         # (when a MIXED round carries prefill rows) followed by the decode
@@ -1362,21 +1363,6 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
             )
         return attn_output
-
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        # Publish: the backend owns its buffer, so in-graph edits need a copy.
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -2101,7 +2087,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
 
             # Active first draft step narrows attn output to [bs, H]; align the
             # residual to the same live rows before the post-attn reduce-norm.
-            if ctx.accept_lengths is not None:
+            if ctx.draft_narrowing is not None:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx

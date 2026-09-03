@@ -612,7 +612,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         num_prefill_tokens: int,
     ) -> GlmDsaPrefillTopK | None:
-        cached = ctx.dsa_prefill_topk
+        cached = ctx.attn_backend.sparse_topk.prefill
         if (
             isinstance(cached, GlmDsaPrefillTopK)
             and cached.row_starts is not None
@@ -827,6 +827,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # indexer's full-round index_k write consumes the concatenation
         # (eager-only here: this break never runs inside a captured graph).
         backend = ctx.attn_backend
+        # The forward's shared top-k: an indexer layer publishes, "shared"
+        # layers (and the MTP head reusing the target's) consume.
+        shared_topk = backend.sparse_topk
         prefill_locs = (
             backend.write_locations(self.attn_mqa, ForwardMode.EXTEND)
             if num_prefill_tokens > 0
@@ -849,8 +852,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
             and (
-                (num_prefill_tokens > 0 and ctx.dsa_prefill_topk is None)
-                or (num_decode_tokens > 0 and ctx.dsa_decode_topk is None)
+                (num_prefill_tokens > 0 and shared_topk.prefill is None)
+                or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
         if should_compute_indexer:
@@ -862,13 +865,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 indexer_output.key,
             )
             if ctx.num_extends > 0:
-                ctx.dsa_prefill_topk = self._compute_prefill_topk_indices(
+                shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
                     ctx,
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                ctx.dsa_decode_topk = self._compute_decode_topk_indices(
+                shared_topk.decode = self._compute_decode_topk_indices(
                     indexer_output,
                     ctx,
                 )
@@ -888,7 +891,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            if ctx.dsa_prefill_topk is None:
+            if shared_topk.prefill is None:
                 raise RuntimeError(
                     "GLM DSA sparse prefill requires computed top-k indices."
                 )
@@ -899,7 +902,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 prefill_ctx,
                 prefill_locs,
                 attn_output[:num_prefill_tokens],
-                prefill_topk=ctx.dsa_prefill_topk,
+                prefill_topk=shared_topk.prefill,
             )
 
         if num_decode_tokens > 0:
@@ -910,12 +913,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-            if ctx.dsa_decode_topk is None:
+            if shared_topk.decode is None:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
             topk_indices, topk_lens = self._slice_decode_topk(
-                ctx.dsa_decode_topk,
+                shared_topk.decode,
                 decode_start,
                 decode_end,
             )
@@ -930,7 +933,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 topk_lens=topk_lens,
             )
 
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1143,7 +1146,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
-            if ctx.accept_lengths is not None:
+            if ctx.draft_narrowing is not None:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx

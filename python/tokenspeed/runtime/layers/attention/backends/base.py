@@ -43,7 +43,8 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import torch
 
@@ -78,6 +79,33 @@ class SpeculativeStateBackend(Protocol):
 _SpeculativeStateBackendT = TypeVar(
     "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
 )
+
+
+@dataclass
+class SparseTopKShare:
+    """The sparse indexer's selection shared across one forward's layers.
+
+    Sparse attention (GLM DSA, Qwen4-Exp QSA) selects the KV positions each
+    query row attends to with an indexer; a model may declare layers that
+    carry no indexer and reuse the previous indexer layer's selection
+    (``indexer_types == "shared"``), and an MTP head may reuse the target's
+    selection for its draft steps. The indexer layer that computes a
+    selection publishes it here; the consumers read it. It is the sparse
+    kernels' per-forward metadata, so it lives on the backend like the rest
+    — as scratch outside the graph-guarded metadata slots — and the node
+    clears it when it builds the next forward's metadata; between draft
+    steps the drafter carries it across explicitly.
+
+    ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
+    verify window); each family stores its own record type.
+    """
+
+    prefill: Any | None = None
+    decode: Any | None = None
+
+    def clear(self) -> None:
+        self.prefill = None
+        self.decode = None
 
 
 class AttentionBackend(ABC):
@@ -274,6 +302,18 @@ class AttentionBackend(ABC):
         """Temporarily override the decode-row slice discriminator (MLA
         family). Default no-op."""
         yield
+
+    @property
+    def sparse_topk(self) -> SparseTopKShare:
+        """This node's layer-shared sparse selection for the current forward
+        (:class:`SparseTopKShare`). Every runner-facing node clears it when it
+        builds a forward's metadata; composites fronting a paged child route
+        to the child's, so the model, the indexer and the drafter meet the
+        same object whichever level of the tree they hold."""
+        share = self.__dict__.get("_sparse_topk")
+        if share is None:
+            share = self.__dict__["_sparse_topk"] = SparseTopKShare()
+        return share
 
     def update_mamba_state_after_mtp_verify(self, accepted_lengths) -> None:
         """Commit recurrent-state pages after MTP verification; only nodes

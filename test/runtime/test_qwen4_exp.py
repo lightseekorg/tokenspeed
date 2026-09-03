@@ -37,10 +37,10 @@ from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     CacheGroupGeometry,
 )
 from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
     Qwen4ExpMambaAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
@@ -620,16 +620,16 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         bs=2,
         num_extends=2,
         forward_mode=ForwardMode.EXTEND,
-        accept_lengths=None,
+        draft_narrowing=None,
         attn_backend=SimpleNamespace(full_attn_backend=router),
         token_to_kv_pool=pool,
-        dsa_decode_topk=None,
     )
 
     actual = indexer(torch.zeros((2, 4)), torch.tensor([7, 8]), ctx)
 
     torch.testing.assert_close(actual, rows)
-    torch.testing.assert_close(ctx.dsa_decode_topk, rows)
+    # The MTP-shared selection is published on the router, not the context.
+    torch.testing.assert_close(router.sparse_topk.decode, rows)
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert len(selections) == 1
@@ -777,21 +777,18 @@ def test_qwen4_exp_qsa_rebuilds_layout_after_mtp_prefill_row_gather() -> None:
 
 
 def test_qwen4_exp_qsa_draft_write_mask_keeps_only_accepted_prefix() -> None:
-    ctx = SimpleNamespace(
-        bs=3,
-        num_extends=1,
-        accept_lengths=torch.tensor([0, 2, 1]),
-    )
-    seq_lens = torch.tensor([3, 14, 23])
-    lengths = torch.tensor([3, 4, 4])
+    ctx = SimpleNamespace(bs=3, num_extends=1)
+    # Verify windows start at 10 and 19 (vc); the drafter published the
+    # accepted frontier vc + a with a = [2, 1]. The prompt row's length is
+    # irrelevant: extend rows are always written.
+    accepted_seq_lens = torch.tensor([3, 12, 20])
     logical = torch.tensor([0, 1, 2, 10, 11, 12, 13, 19, 20, 21, 22])
     requests = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
     recent_locs = torch.ones_like(logical, dtype=torch.int32)
 
     actual = QSAIndexer._draft_accepted_write_mask(
         ctx,
-        seq_lens,
-        lengths,
+        accepted_seq_lens,
         logical,
         requests,
         recent_locs,

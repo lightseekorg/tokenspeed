@@ -66,8 +66,9 @@ logger = logging.getLogger(__name__)
 class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     """Decoder layer that injects the draft attention and narrows residuals.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates
-    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
+    Restricted to single-layer drafts: the narrowing happens once, at this
+    layer's attention, so a second layer would receive the already-narrowed
+    ``[bs, H]`` rows.
     """
 
     @property
@@ -80,7 +81,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Narrow residual to the draft attention's [bs, H] live rows."""
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
             return residual
         return residual.index_select(0, ctx.gather_ids)
 

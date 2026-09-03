@@ -199,7 +199,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
             if (
-                ctx.accept_lengths is not None
+                ctx.draft_narrowing is not None
                 and attn_out.shape[0] != residual.shape[0]
             ):
                 residual = residual.index_select(0, ctx.gather_ids)

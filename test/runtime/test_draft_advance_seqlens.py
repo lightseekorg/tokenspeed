@@ -1,11 +1,13 @@
 """Draft seq_lens must stay visible to the backend now that it owns the buffer.
 
 The drafter edits ``draft_seq_lens_buf`` in place inside the captured graph --
-``add_(1)`` per multi-step iteration, and ``_apply_correction`` trimming the
-rejected tail at step 0. Backends read their own buffer, so both edits must be
-published via ``advance_draft_forward_metadata`` or the draft attends over a
-stale prefix and the accept rate silently drops. CPU-only: drives the leaf
-metadata builders and the hook directly, no GPU or KV pool.
+``add_(1)`` per multi-step iteration -- and publishes the accepted frontier
+for step 0 through ``AcceptedPrefixPublisher`` (the ``ctx.draft_narrowing``
+handle the draft model fires when it switches to its live rows). Backends read
+their own buffer, so both must land via ``advance_draft_forward_metadata`` or
+the draft attends over a stale prefix and the accept rate silently drops.
+CPU-only: drives the leaf metadata builders and the hook directly, no GPU or
+KV pool.
 """
 
 from __future__ import annotations
@@ -235,57 +237,84 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
     assert torch.equal(full.decode_seq_lens_buffer[:4], seq_lens)
 
 
-# Step 0: `_apply_correction` trims the rejected tail (vc + N -> vc + a).
+# Step 0: the drafter publishes the accepted frontier (vc + N -> vc + a); the
+# model only names the moment.
 
 
-def _correction_models():
-    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3DraftAttentionMLA
-    from tokenspeed.runtime.models.glm_moe_dsa_nextn import GlmMoeDsaForCausalLMNextN
-    from tokenspeed.runtime.models.llama_eagle3 import LlamaAttention
-    from tokenspeed.runtime.models.qwen3_5_nextn import (
-        Qwen3_5DraftAttentionDecoderLayer,
+def _make_eagle_for_frontier(bs: int, seq_lens, req_pool_indices, valid_cache_lengths):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+    drafter = Eagle.__new__(Eagle)
+    drafter.input_buffers = SimpleNamespace(
+        seq_lens_buf=torch.tensor(seq_lens, dtype=torch.int32),
+        req_pool_indices_buf=torch.tensor(req_pool_indices, dtype=torch.int64),
+    )
+    drafter.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.tensor(valid_cache_lengths, dtype=torch.int32)
+    )
+    return drafter
+
+
+def test_accepted_frontier_is_vc_plus_accept_for_decode_rows():
+    from types import SimpleNamespace
+
+    # Target verify left seq_lens at vc + N (vc=100, N=4); prompt rows keep
+    # their own lengths.
+    drafter = _make_eagle_for_frontier(
+        bs=4,
+        seq_lens=[17, 104, 104, 104],
+        req_pool_indices=[3, 0, 1, 2],
+        valid_cache_lengths=[100, 100, 100, 5],
+    )
+    draft_input = SimpleNamespace(
+        num_extends=1,
+        accept_lengths=torch.tensor([1, 2, 1, 4], dtype=torch.int32),
     )
 
-    return [
-        ("llama_eagle3", LlamaAttention._apply_correction),
-        ("qwen3_5_nextn", Qwen3_5DraftAttentionDecoderLayer._apply_correction),
-        ("deepseek_v3", DeepseekV3DraftAttentionMLA._apply_correction),
-        ("glm_moe_dsa_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
-    ]
+    frontier = drafter._accepted_frontier(4, draft_input)
+
+    assert frontier.tolist() == [17, 102, 101, 104]
+    # A fresh tensor: publishing it must not alias the runner's seq_lens buffer.
+    assert frontier.data_ptr() != drafter.input_buffers.seq_lens_buf.data_ptr()
 
 
-@pytest.mark.parametrize("name,correction", _correction_models())
-def test_first_step_correction_reaches_backend(name, correction):
-    from types import SimpleNamespace
+def test_publish_accepted_prefix_reaches_backend_and_is_idempotent():
+    from tokenspeed.runtime.execution.drafter.eagle import AcceptedPrefixPublisher
 
     be = _mha_backend()
     max_bs, bs = 8, 4
     be.init_cuda_graph_state(max_bs)
 
-    # Target verify left seq_lens at vc + N (vc=100, N=4).
     draft_seq_lens = torch.full((bs,), 104, dtype=torch.int32)
     _capture(be, bs, draft_seq_lens)
 
-    accept_lengths = torch.tensor([2, 1, 4, 3], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        draft_seq_lens_buf=draft_seq_lens,
-        accept_lengths=accept_lengths,
-        num_extends=0,
-        bs=bs,
-        attn_backend=be,
+    frontier = torch.tensor([102, 101, 104, 103], dtype=torch.int32)  # vc + a
+    narrowing = AcceptedPrefixPublisher(be, frontier)
+    narrowing.publish_accepted_prefix()
+    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], frontier), (
+        "accepted frontier never reached the backend; draft step 0 would "
+        "attend over the rejected tail"
     )
-    # Bound methods on the class need an explicit (unused) self.
-    try:
-        correction(ctx)
-    except TypeError:
-        correction(None, ctx)
+    # Every layer of a multi-layer draft may fire it: no double trim.
+    narrowing.publish_accepted_prefix()
+    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], frontier)
+    # The drafter's own buffer is untouched -- the backend owns the copy.
+    assert torch.equal(draft_seq_lens, torch.full((bs,), 104, dtype=torch.int32))
 
-    expected = torch.tensor([102, 101, 104, 103], dtype=torch.int32)  # vc + a
-    assert torch.equal(draft_seq_lens, expected), f"{name}: correction wrong"
-    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], expected), (
-        f"{name}: trimmed seqlens never reached the backend; draft step 0 "
-        f"would attend over the rejected tail"
-    )
+
+def test_draft_narrowing_is_the_only_step0_flag_on_forward_context():
+    """The drafter tensors left ForwardContext: the narrowing handle is the
+    step-0 discriminator, with no ``accept_lengths`` / ``draft_seq_lens_buf``
+    fields to fall back on."""
+    from dataclasses import fields
+
+    from tokenspeed.runtime.execution.context import ForwardContext
+
+    names = {f.name for f in fields(ForwardContext)}
+    assert "draft_narrowing" in names
+    assert not {"accept_lengths", "draft_seq_lens_buf"} & names
 
 
 if __name__ == "__main__":

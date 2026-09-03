@@ -65,6 +65,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4IndexerDecodePlan,
     DeepseekV4IndexerPrefillMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
+    DeepseekV4ForwardSlotMappings,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
     V4_SWA_KV_GROUP_ID,
@@ -4823,10 +4826,21 @@ class TestDeepseekV4Config(unittest.TestCase):
                         for gid in block_tables
                     },
                 )
+                # The layers' shared slot mappings are backend scratch outside
+                # the slots: a mapping computed under capture must neither be
+                # pinned by the guard nor survive the next publish.
+                captured_mapping = backend.slot_mappings.get_or_compute(
+                    "swa", lambda: torch.arange(16, dtype=torch.int64)
+                )
                 snapshot = snapshot_graph_metadata(backend)
                 self.assertTrue(
                     any(".cache." in path for path in snapshot),
                     "the guard must see the cache slot's tables",
+                )
+                self.assertNotIn(
+                    captured_mapping.data_ptr(),
+                    {identity[0] for identity in snapshot.values()},
+                    "the per-forward slot-mapping memo must stay off the slots",
                 )
 
                 backend.refresh_decode_metadata(
@@ -4841,6 +4855,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
 
                 verify_graph_metadata(backend, snapshot, context="test")
+                fresh = backend.slot_mappings.get_or_compute(
+                    "swa", lambda: torch.zeros(16, dtype=torch.int64)
+                )
+                self.assertIsNot(
+                    fresh, captured_mapping, "a publish must clear the memo"
+                )
                 table = backend.forward_metadata.cache.compressed_page_table(4)
                 self.assertTrue(torch.equal(table[:2, :2], c4_table))
                 self.assertTrue(torch.equal(table[2:], torch.full_like(table[2:], -1)))
@@ -5745,7 +5765,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ctx=ctx,
                 layer_index=0,
                 cos_sin_cache=torch.empty((1, 1)),
-                compressor_slot_cache={},
+                slot_mappings=DeepseekV4ForwardSlotMappings(),
             )
 
         self.assertEqual(captured["indexer_block_size"], 4)

@@ -632,7 +632,7 @@ class PrefillGraph:
         split itself, while the captured token-shaped compute is uniform over
         all rows (pure decode is the decode graph's job). Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
-        draft first-step row narrowing (keyed on ``accept_lengths``) and the
+        draft first-step row narrowing (``draft_narrowing``) and the
         ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
         different values falls back to eager rather than silently dropping the
         reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
@@ -647,7 +647,7 @@ class PrefillGraph:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return None
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None

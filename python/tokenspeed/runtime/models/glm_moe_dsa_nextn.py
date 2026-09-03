@@ -225,21 +225,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_group=self.mapping.attn.tp_group,
         )
 
-    @staticmethod
-    def _apply_first_step_correction(ctx: ForwardContext) -> None:
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        accept_lengths = ctx.accept_lengths
-        if seq_lens_buf is None or accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
-
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)
 
     @torch.no_grad()
@@ -250,6 +235,10 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         positions: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # The first NextN pass is the sparse catch-up over the whole target
+        # verify window and keeps the target's post-verify lengths for it; the
+        # accepted prefix is never published here (the drafter's step loop
+        # publishes it for the one-token steps that follow).
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, _ = self.model(
                 input_ids,
@@ -257,7 +246,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                 ctx,
                 captured_hidden_states=captured_hidden_states,
             )
-        self._apply_first_step_correction(ctx)
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata

@@ -67,7 +67,9 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
+    from tokenspeed.runtime.layers.attention.backends.router import (
+        CacheGroupRouter,
+    )
 
 _DRAFT_INVALID_POSITION = torch.iinfo(torch.int64).min
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -444,28 +446,23 @@ class QSAIndexer(nn.Module):
     @staticmethod
     def _draft_accepted_write_mask(
         ctx: ForwardContext,
-        seq_lens: torch.Tensor,
-        query_lengths: torch.Tensor | int,
+        accepted_seq_lens: torch.Tensor,
         logical_positions: torch.Tensor,
         request_indices: torch.Tensor,
         recent_locs: torch.Tensor,
     ) -> torch.Tensor:
-        """Select extend rows and the accepted prefix of draft verify rows."""
+        """Select extend rows and the accepted prefix of draft verify rows:
+        the rows whose logical position lies under the published accepted
+        frontier (``valid_cache_len + accept_len``)."""
 
-        if ctx.accept_lengths is None:
-            raise RuntimeError("QSA draft accepted writes require acceptance lengths")
-        lengths = (
-            query_lengths if isinstance(query_lengths, int) else query_lengths[: ctx.bs]
-        )
-        starts = seq_lens[: ctx.bs] - lengths
         request_rows = request_indices.to(torch.long)
-        offsets = logical_positions - starts.index_select(0, request_rows)
-        accepted = ctx.accept_lengths[: ctx.bs].to(logical_positions.dtype)
-        limits = accepted.index_select(0, request_rows)
-        return (
-            (recent_locs > 0)
-            & (offsets >= 0)
-            & ((request_indices < ctx.num_extends) | (offsets < limits))
+        frontier = (
+            accepted_seq_lens[: ctx.bs]
+            .to(logical_positions.dtype)
+            .index_select(0, request_rows)
+        )
+        return (recent_locs > 0) & (
+            (request_indices < ctx.num_extends) | (logical_positions < frontier)
         )
 
     def commit_verified(self, accepted_lengths: torch.Tensor) -> None:
@@ -717,9 +714,9 @@ class QSAIndexer(nn.Module):
             and not router.is_draft
         )
         is_draft = router.is_draft
-        is_draft_first_step = is_draft and ctx.accept_lengths is not None
+        is_draft_first_step = is_draft and ctx.draft_narrowing is not None
         is_draft_decode_step = (
-            is_draft and ctx.accept_lengths is None and ctx.forward_mode.is_decode()
+            is_draft and ctx.draft_narrowing is None and ctx.forward_mode.is_decode()
         )
         # ctx.bs is the row count the router filled its stacks for: the live
         # batch on extend and eager decode, the padded graph batch on replay.
@@ -750,10 +747,14 @@ class QSAIndexer(nn.Module):
                 ctx.bs,
                 reset=True,
             )
+            # The layout above described the target's verify window; from
+            # here on the draft reads the accepted prefix — the write mask
+            # keeps the rows under it, and the sparse attention's live rows
+            # attend over it.
+            ctx.draft_narrowing.publish_accepted_prefix()
             write_mask = self._draft_accepted_write_mask(
                 ctx,
                 self._seq_lens(metadata),
-                lengths,
                 logical,
                 requests,
                 recent_locs,
@@ -793,7 +794,7 @@ class QSAIndexer(nn.Module):
                 pool,
             )
         if self.share_topk_for_mtp_iteration:
-            shared_topk = ctx.dsa_decode_topk
+            shared_topk = router.sparse_topk.decode
             num_rows = hidden_states.shape[0]
             if shared_topk is not None and shared_topk.shape[0] < num_rows:
                 raise RuntimeError(
@@ -811,7 +812,7 @@ class QSAIndexer(nn.Module):
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:
-            ctx.dsa_decode_topk = selected
+            router.sparse_topk.decode = selected
         return selected
 
     @break_point
@@ -888,7 +889,7 @@ class QSAIndexer(nn.Module):
         query_lengths = self._decode_query_lengths(
             ctx,
             q.shape[0],
-            force_uniform=ctx.accept_lengths is not None,
+            force_uniform=ctx.draft_narrowing is not None,
         )
         logical, requests, _ = self._logical_layout(
             metadata,

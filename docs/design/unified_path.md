@@ -173,11 +173,30 @@ Drafters republish their in-loop seq_lens edits explicitly each step via
 `advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
 (vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
 drafter mutates behind the backend's back. Those two hooks are deliberately
-seq-lens-only: Eagle's step-0 rejected-tail correction fires
+seq-lens-only: Eagle's step-0 accepted-prefix publish fires
 `advance_draft_forward_metadata` BEFORE the step-0 attention has consumed
 the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
 "Write locations have one owner").
+
+**Step 0 narrows rows; the drafter owns the lengths, the model names the
+moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
+decode request), writes KV for every row, and continues from one live row
+per request (`gather_ids`), whose context is the accepted frontier
+`valid_cache_len + accept_len` — not the `vc + N` the round's refresh
+published. The drafter computes that frontier once per round (it is also
+step 1's `cache_start`) and attaches an `AcceptedPrefixPublisher` to the
+step-0 context as `ctx.draft_narrowing`; the model calls
+`publish_accepted_prefix()` right before the first kernel that reads the
+live rows (the MLA/MHA drafts at attention start; the QSA indexer after its
+verify-window layout, since that layout is derived from the decode-slot
+lengths), and a draft whose step 0 attends the whole verify window (the GLM
+DSA NextN heads) never calls it — the step loop publishes for step 1+.
+The call is idempotent (a copy of a fixed tensor into the leaves'
+buffers), so it carries no single-layer restriction. `ForwardContext`
+carries no drafter tensors: `accept_lengths` and `draft_seq_lens_buf` are
+gone, the handle's presence is the step-0 discriminator, and no model
+computes or edits seq_lens.
 
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh
@@ -269,7 +288,19 @@ replays pay one bool check). The snapshot has no exemption list: every
 tensor a slot reaches is an address the refresh must keep. Per-step-mutable
 objects a kernel owns (FlashMLA's tile schedule, which the kernel builds and
 freezes on first use) therefore live on the backend, outside the slots, not
-on the views. What unification still can NOT test: mempool reuse and
+on the views — and so do the two per-forward memos the models' layers
+share: V4's write-slot mappings (`DeepseekV4AttentionBackend.slot_mappings`:
+SWA, compressor state / compressed per ratio, indexer state) and the sparse
+indexer's selection (`AttentionBackend.sparse_topk`, a `SparseTopKShare`:
+GLM DSA's `"shared"` layers and the DSA / QSA MTP heads reuse the last
+indexer layer's top-k). Every runner-facing node clears both when it builds
+a forward's metadata (the router's extend init / decode refresh / capture
+seeding, V4's three slot publishers), so the first layer computes, the rest
+reuse, and nothing outlives its forward; the drafter's in-loop seq_lens
+edits are not a new forward and leave the share alone — the drafter itself
+hands each draft step the top-k it reuses (or clears it) through the draft
+backend, and starts from the target backend's. `ForwardContext` carries
+none of this. What unification still can NOT test: mempool reuse and
 hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
 configurations for this reason.
 
@@ -459,6 +490,15 @@ down to the router and V4).
   path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rn "ctx.accept_lengths\|ctx.draft_seq_lens_buf\|_apply_correction"
+  python/` must stay empty — the step-0 accepted prefix is published through
+  `ctx.draft_narrowing.publish_accepted_prefix()`, never computed in a model
+  (`test/runtime/test_draft_advance_seqlens.py`).
+* `grep -rn "ctx.dsa_\|dsa_swa_slot_mapping\|dsa_compressor_slot_cache"
+  python/` must stay empty — the layer-shared sparse top-k and V4 slot
+  mappings are backend scratch (`sparse_topk`, `slot_mappings`), cleared by
+  every metadata build (`test_cache_group_router.py`,
+  `test_deepseek_v4_slot_mappings.py`, `test_deepseek_v4_config.py`).
 * `grep -rnE '^\s+extend_(seq|prefix)_lens(_cpu)?: torch\.Tensor \| None,|
   extend_with_prefix: bool = False' python/tokenspeed/runtime/layers/attention/backends/`
   must stay empty — no `init_forward_metadata` parameter in the extend

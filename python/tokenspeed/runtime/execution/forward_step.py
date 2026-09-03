@@ -714,11 +714,11 @@ class ForwardStepRunner:
             **cache_kwargs,
         )
         if self.draft_attn_backend is not None:
-            # Seed the drafter-owned buffer for the round: models and the
-            # DFLASH drafter read it directly, and the refresh below snapshots
-            # it into the backend's own seq_lens buffer. Drafters republish
-            # their in-loop edits each step through the same refresh (block
-            # drafters) or advance_draft_forward_metadata.
+            # Seed the drafter-owned buffer for the round: the DFLASH drafter
+            # reads it directly, and the refresh below snapshots it into the
+            # backend's own seq_lens buffer. Drafters republish their in-loop
+            # edits each step through the same refresh (block drafters) or
+            # advance_draft_forward_metadata.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             self.draft_attn_backend.refresh_decode_metadata(
@@ -766,8 +766,8 @@ class ForwardStepRunner:
             # the draft's step-1+ decode metadata. Drafters republish their
             # in-loop seq_lens edits through advance_draft_forward_metadata /
             # update_draft_forward_metadata. The copy below seeds the
-            # drafter-owned buffer for the round (models and the DFLASH
-            # drafter read ctx.draft_seq_lens_buf directly).
+            # drafter-owned buffer for the round (the DFLASH drafter reads it
+            # directly; Eagle advances it per step).
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
             draft_extend_kwargs = dict(kwargs)

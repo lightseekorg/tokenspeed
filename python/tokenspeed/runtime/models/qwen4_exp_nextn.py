@@ -88,18 +88,6 @@ def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
 class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
     """Qwen4-Exp draft attention that removes dead catch-up rows on step zero."""
 
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        seq_lens = ctx.draft_seq_lens_buf
-        if seq_lens is None or ctx.accept_lengths is None:
-            return
-        if ctx.num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[ctx.num_extends :]
-        ).to(seq_lens.dtype)
-        seq_lens[ctx.num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens[: ctx.bs])
-
     def _attn(
         self,
         q: torch.Tensor,
@@ -108,11 +96,12 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         gate: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None:
+        if ctx.draft_narrowing is None:
             return super()._attn(q, k, v, gate, ctx)
         from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
-        self._apply_correction(ctx)
+        # The live rows attend over the accepted prefix, not the verify window.
+        ctx.draft_narrowing.publish_accepted_prefix()
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
@@ -130,9 +119,10 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
 
     def _qsa_attention(self, **kwargs) -> torch.Tensor:
         ctx = kwargs["ctx"]
-        if ctx.accept_lengths is None:
+        if ctx.draft_narrowing is None:
             return super()._qsa_attention(**kwargs)
-        self._apply_correction(ctx)
+        # The indexer published the accepted prefix once its verify-window
+        # layout was done; the sparse attention reads it for the live rows.
         kwargs["q"] = kwargs["q"].index_select(0, ctx.gather_ids)
         kwargs["topk_indices"] = kwargs["topk_indices"].index_select(0, ctx.gather_ids)
         if kwargs["gate"] is not None:
@@ -149,7 +139,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
             if ctx.forward_mode.is_idle()
             else self.self_attention(kwargs["positions"], mixed, ctx)
         )
-        if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is not None and not ctx.forward_mode.is_idle():
             residuals = tuple(
                 value.index_select(0, ctx.gather_ids) for value in residuals
             )

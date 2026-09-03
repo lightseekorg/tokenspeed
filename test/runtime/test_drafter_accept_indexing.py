@@ -31,22 +31,40 @@ def _make_eagle(spec_num_tokens: int = 4, max_bs: int = 8) -> Eagle:
     return drafter
 
 
-def test_mtp_index_sharing_uses_model_context_state() -> None:
+def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
+    from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
+
     model = SimpleNamespace(index_share_for_mtp_iteration=True)
     drafter = Eagle.__new__(Eagle)
     drafter.draft_model_runner = SimpleNamespace(model=model)
-    ctx = SimpleNamespace(dsa_prefill_topk=None, dsa_decode_topk=None)
+    drafter.attn_backend = SimpleNamespace(sparse_topk=SparseTopKShare())
+    share = drafter.attn_backend.sparse_topk
     first_step_topk = (object(), object())
 
-    drafter._attach_dsa_topk(ctx, first_step_topk)
+    drafter._attach_dsa_topk(first_step_topk)
 
-    assert ctx.dsa_prefill_topk is first_step_topk[0]
-    assert ctx.dsa_decode_topk is first_step_topk[1]
-    assert drafter._extract_dsa_topk(ctx, (None, None)) == first_step_topk
+    assert share.prefill is first_step_topk[0]
+    assert share.decode is first_step_topk[1]
+    assert drafter._extract_dsa_topk((None, None)) == first_step_topk
 
+    # The target's last indexer layer leaves its selection on the target
+    # backend; the drafter starts the MTP head from there.
+    target_share = SparseTopKShare(prefill=object(), decode=object())
+    base_ctx = SimpleNamespace(attn_backend=SimpleNamespace(sparse_topk=target_share))
+    assert drafter._target_dsa_topk(base_ctx) == (
+        target_share.prefill,
+        target_share.decode,
+    )
+
+    # A head that does not share gets a cleared share every step (a stale
+    # selection would otherwise be reused as "already computed"), and the
+    # drafter passes its own state through untouched.
     model.index_share_for_mtp_iteration = False
     fallback = (object(), object())
-    assert drafter._extract_dsa_topk(ctx, fallback) == fallback
+    drafter._attach_dsa_topk(fallback)
+    assert share.prefill is None and share.decode is None
+    assert drafter._extract_dsa_topk(fallback) == fallback
+    assert drafter._target_dsa_topk(base_ctx) == (None, None)
 
 
 class TestDrafterAcceptIndexing(unittest.TestCase):
