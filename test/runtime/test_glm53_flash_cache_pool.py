@@ -195,10 +195,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         contract=pool.arena.runtime_contract,
         num_requests=1,
     )
-    assert metadata.full_attention_group_id == FULL_ATTENTION
-    assert metadata.require_table(
-        FULL_ATTENTION, active_forward_op=forward_op
-    ).shape == (1, 1)
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tables[FULL_ATTENTION].shape == (1, 1)
     backing_ptr = pool.arena.buffer.untyped_storage().data_ptr()
     dsa_layer = text_config.full_attention_layer_ids[0]
     assert pool.kv_buffer[dsa_layer].untyped_storage().data_ptr() == backing_ptr

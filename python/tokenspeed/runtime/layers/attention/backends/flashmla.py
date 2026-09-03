@@ -81,7 +81,6 @@ class _ChunkedPrefillMetadata:
     extend_prefix_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
     extend_seq_lens_cpu: torch.Tensor
-    req_pool_indices: torch.Tensor
     cum_extend_seq_lens: torch.Tensor
     max_extend_seq_len: int
     chunked_loop_num: int
@@ -154,19 +153,15 @@ class FlashMLABackend(PagedAttentionBackend):
         self.qk_rope_head_dim = spec.qk_rope_head_dim
         self.v_head_dim = spec.v_head_dim
         self.kv_cache_dim = spec.kv_lora_rank + spec.qk_rope_head_dim
-        self.scaling = spec.scaling
-        self.softmax_scale = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self.num_q_heads = spec.num_attention_heads // spec.attn_tp_size
 
-        # FlashMLA-specific
-        self.draft_token_num = 0
         # A block drafter (DFLASH/DSpark) drafts a whole block per pass; its
         # captured decode graph seeds block-end lengths via
         # ``fill_block_decode_seq_lens`` (see the drafter's is_capturing path).
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         if self.kv_cache_quant_method == "per_token_head":
             raise NotImplementedError(
@@ -212,7 +207,6 @@ class FlashMLABackend(PagedAttentionBackend):
         self.forward_decode_metadata: FlashMLADecodeMetadata | None = None
         self.forward_prefill_metadata: _PrefillMetadata | None = None
         self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
-        self.last_seq_lens_sum: int | None = None
         self.page_table_buf: torch.Tensor | None = None
         self.seq_lens_buf: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, FlashMLADecodeMetadata] = {}
@@ -318,7 +312,6 @@ class FlashMLABackend(PagedAttentionBackend):
         # EXTEND path — flashinfer ragged/paged prefill.
         seq_lens_cpu = seq_lens.cpu()
         seq_lens_sum = seq_lens_cpu.sum().item()
-        self.last_seq_lens_sum = seq_lens_sum
 
         extend_no_prefix = not extend_with_prefix
         if extend_no_prefix and bool(extend_prefix_lens_cpu.any()):
@@ -345,13 +338,8 @@ class FlashMLABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             max_context_len=self.max_context_len,
         ).to(torch.int32)
-        # The table is batch-ordered (row i == batch position i).
-        prefill_req_pool_indices = torch.arange(
-            seq_lens.shape[0], dtype=torch.int64, device=page_table.device
-        )
 
         self.indices_updater_prefill.update(
-            prefill_req_pool_indices,
             seq_lens,
             seq_lens_sum,
             extend_prefix_lens,
@@ -379,7 +367,6 @@ class FlashMLABackend(PagedAttentionBackend):
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table[: seq_lens.shape[0]],
-            prefill_req_pool_indices,
             self.kernel_page_size,
         )
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
@@ -387,7 +374,6 @@ class FlashMLABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_pool_indices=prefill_req_pool_indices,
             cum_extend_seq_lens=cum_extend_seq_lens,
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
@@ -402,14 +388,11 @@ class FlashMLABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
-        max_context_len = self.max_context_len + PAGE_SIZE - 1
-        # 4 PAGES are reserved for speculation; init to page 1 so untouched
-        # reserve columns stay dereferenceable.
-        self.page_table_buf = torch.full(
-            (max_bs, (max_context_len + 4 * PAGE_SIZE) // PAGE_SIZE),
-            1,
-            dtype=torch.int32,
-            device=self.device,
+        # The router hands this leaf [bs, max_num_pages] tables (context_len
+        # already carries the spec verify overshoot); null page 0 is the
+        # padding contract's dereferenceable dummy.
+        self.page_table_buf = torch.zeros(
+            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
         # Own the persistent cache_seqlens buffer the captured decode kernel reads
         self.seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
@@ -472,9 +455,7 @@ class FlashMLABackend(PagedAttentionBackend):
         # floor 1). Padding rows replay at seq_len 1 and clamp the same way.
         q_len = metadata.q_len_per_req
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-        # Copy the router-resolved kernel page table into the persistent
-        # buffer; the reserved speculation columns past max_num_pages keep
-        # their init value.
+        # Copy the router-resolved kernel page table into the persistent buffer.
         self.page_table_buf[:bs, : page_table.shape[1]].copy_(page_table[:bs])
         metadata.num_extends = num_extends
         # flash_mla freezes its tile schedule on the first kernel call against
@@ -587,8 +568,8 @@ class FlashMLABackend(PagedAttentionBackend):
         save_kv_cache: bool,
         **kwargs,
     ) -> torch.Tensor:
-        # Multi-token decode (target verify or drafter compound) reuses
-        # the multi-token kernel path in forward_extend.
+        # Multi-token decode (target verify or drafter compound) runs the same
+        # FlashMLA decode kernel with q_len > 1 rows per request.
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         if q_len_per_req > 1:
             metadata = self.forward_decode_metadata
@@ -608,7 +589,6 @@ class FlashMLABackend(PagedAttentionBackend):
             token_to_kv_pool,
             bs,
             save_kv_cache=save_kv_cache,
-            cache_seqlens_offset=self.draft_token_num,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -686,7 +666,6 @@ class FlashMLABackend(PagedAttentionBackend):
         bs: int,
         *,
         save_kv_cache: bool,
-        cache_seqlens_offset: int,
     ):
         if k is not None:
             assert v is not None
@@ -702,7 +681,7 @@ class FlashMLABackend(PagedAttentionBackend):
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
 
         page_table = metadata.page_table[num_extends : num_extends + bs]
-        cache_seqlens = metadata.seq_lens_k.to(torch.int32) + cache_seqlens_offset
+        cache_seqlens = metadata.seq_lens_k.to(torch.int32)
         # Draft block-decode: forward_decode flattened q to one kernel row per
         # drafted block position (bs == bs_orig * draft_query_width), but the
         # page table and seq_lens carry one entry per request. Repeat each
@@ -734,7 +713,6 @@ class _PrefillIndicesUpdater:
         self, config: AttnConfig, spec: MLAConfig, attn_backend: FlashMLABackend
     ):
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
-        self.kv_cache_quant_method = config.kv_cache_quant_method
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
         self.qk_rope_head_dim = spec.qk_rope_head_dim
@@ -742,7 +720,6 @@ class _PrefillIndicesUpdater:
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.attn_backend = attn_backend
 
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
@@ -750,13 +727,13 @@ class _PrefillIndicesUpdater:
 
     def update(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        page_table: torch.Tensor = None,
-        prefill_wrapper_paged: BatchMLAPagedAttentionWrapper = None,
-        use_ragged: bool = False,
+        *,
+        page_table: torch.Tensor,
+        prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
+        use_ragged: bool,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -768,7 +745,6 @@ class _PrefillIndicesUpdater:
         self._call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
-            req_pool_indices,
             paged_kernel_lens,
             paged_kernel_lens_sum,
             seq_lens,
@@ -776,14 +752,13 @@ class _PrefillIndicesUpdater:
             self.kv_indptr,
             self.qo_indptr,
             use_ragged,
-            page_table=page_table,
+            page_table,
         )
 
     def _call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
         wrapper_paged: BatchMLAPagedAttentionWrapper,
-        req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
@@ -791,32 +766,25 @@ class _PrefillIndicesUpdater:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        page_table: torch.Tensor = None,
+        page_table: torch.Tensor,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
 
-        assert len(seq_lens) == len(req_pool_indices)
         torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
         kv_indptr = kv_indptr[: bs + 1]
-        if wrapper_paged._use_cuda_graph:
-            kv_indices = wrapper_paged._kv_indices_buf
-        else:
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
-        if page_table is not None:
-            create_flashinfer_kv_indices_triton[(bs,)](
-                page_table,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                page_table.shape[1],
-            )
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum,
+            dtype=torch.int32,
+            device=seq_lens.device,
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            page_table,
+            paged_kernel_lens,
+            kv_indptr,
+            kv_indices,
+            page_table.shape[1],
+        )
         torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
         qo_indptr = qo_indptr[: bs + 1]
 

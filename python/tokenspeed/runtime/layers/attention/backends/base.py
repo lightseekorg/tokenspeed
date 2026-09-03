@@ -142,9 +142,10 @@ class AttentionBackend(ABC):
 
         Args:
             max_bs: Persistent-buffer row capacity.
-            **kwargs: Runner extras every node accepts (``max_tokens_per_req``,
-                ``overlap_schedule_depth``); a narrower signature TypeErrors
-                at boot.
+            **kwargs: Runner extras every node accepts
+                (``cache_group_specs``, ``cache_group_page_counts``,
+                ``max_tokens_per_req``, ``overlap_schedule_depth``); a
+                narrower signature TypeErrors at boot.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement init_cuda_graph_state"
@@ -276,7 +277,7 @@ class AttentionBackend(ABC):
         family). Default no-op."""
         yield
 
-    def update_mamba_state_after_mtp_verify(self, accepted_lengths, model) -> None:
+    def update_mamba_state_after_mtp_verify(self, accepted_lengths) -> None:
         """Commit recurrent-state pages after MTP verification; only nodes
         with Mamba/GDN state override."""
 

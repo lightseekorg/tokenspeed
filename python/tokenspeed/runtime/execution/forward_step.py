@@ -1012,7 +1012,7 @@ class ForwardStepRunner:
 
         # Update mamba/GDN state after speculative verify (base default no-op).
         if self.drafter is not None and ctx.forward_mode.is_decode():
-            self.attn_backend.update_mamba_state_after_mtp_verify(result[1], None)
+            self.attn_backend.update_mamba_state_after_mtp_verify(result[1])
         if self.drafter is not None and (
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):

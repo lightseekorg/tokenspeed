@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import triton
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
@@ -49,8 +48,8 @@ from tokenspeed.runtime.layers.attention.backends.paged import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
-    TRTLLM_BLOCK_CONSTRAINT,
     TRTLLMMLAChunkedPrefillMetadata,
+    calc_padded_blocks,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -185,21 +184,13 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     @property
     def max_num_pages(self) -> int:
         # Kernel page-table width, padded to the fused-kernel block constraint.
-        return self._calc_padded_blocks(self.max_context_len)
+        return calc_padded_blocks(self.max_context_len, self.kernel_page_size)
 
     @max_num_pages.setter
     def max_num_pages(self, value: int) -> None:
         # The base constructor assigns the plain ceil-div width; this leaf
         # derives the padded width from context instead.
         del value
-
-    def _calc_padded_blocks(self, max_seq_len: int) -> int:
-        """Calculate block count padded to satisfy the fused-kernel constraint."""
-        blocks = triton.cdiv(max_seq_len, self.kernel_page_size)
-        constraint = TRTLLM_BLOCK_CONSTRAINT // self.kernel_page_size
-        if blocks % constraint != 0:
-            blocks = triton.cdiv(blocks, constraint) * constraint
-        return blocks
 
     # ---- Metadata initialization ----
 
@@ -285,10 +276,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
-        # The table is batch-ordered kernel pages (row i == batch position i).
-        req_pool_indices = torch.arange(
-            num_extends, dtype=torch.int64, device=page_table.device
-        )
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -299,7 +286,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table,
-            req_pool_indices,
             self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
@@ -307,7 +293,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_pool_indices=req_pool_indices,
             cum_extend_seq_lens=cum_extend_seq_lens,
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,

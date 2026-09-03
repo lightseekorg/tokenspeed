@@ -24,7 +24,6 @@ MLA attention leaf using fused kernels optimized for SM100 (Blackwell) GPUs.
 
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -56,10 +55,28 @@ from tokenspeed.runtime.utils.env import envs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
-logger = logging.getLogger(__name__)
-
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
+
+
+def calc_padded_blocks(max_seq_len: int, kernel_page_size: int) -> int:
+    """Kernel page-table width for ``max_seq_len`` tokens, padded to the
+    fused-kernel block constraint.
+
+    Args:
+        max_seq_len: Per-request token extent the table must cover.
+        kernel_page_size: Tokens per kernel page.
+
+    Returns:
+        The page count, rounded up to a multiple of
+        ``TRTLLM_BLOCK_CONSTRAINT // kernel_page_size``.
+    """
+    blocks = triton.cdiv(max_seq_len, kernel_page_size)
+    constraint = TRTLLM_BLOCK_CONSTRAINT // kernel_page_size
+    if blocks % constraint != 0:
+        blocks = triton.cdiv(blocks, constraint) * constraint
+    return blocks
+
 
 # Shared workspace buffer for fused kernels, zero-initialized. NOT eligible
 # for the WorkspacePool: zero-init is required for the kernel's internal
@@ -94,7 +111,6 @@ class TRTLLMMLAChunkedPrefillMetadata:
     extend_prefix_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
     extend_seq_lens_cpu: torch.Tensor
-    req_pool_indices: torch.Tensor
     cum_extend_seq_lens: torch.Tensor  # cumsum prefix-padded, sized num_extends+1
     max_extend_seq_len: int
     # Per-prefix-chunk arrays for non-causal cross-attention (built once per
@@ -104,8 +120,8 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
-    # Per-request batch-ordered kernel page table. Populated only by the DSA
-    # backend for sparse-prefill top-k; plain MLA leaves it None.
+    # The extend rows' batch-ordered [num_extends, max_num_pages] kernel page
+    # table; the DSA wrapper maps its sparse-prefill top-k through it.
     page_table: torch.Tensor | None = None
 
 
@@ -132,7 +148,7 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # The trtllm kernel walks pages at page_size, padded to the
         # fused-kernel block constraint.
-        self.max_num_pages = self._calc_padded_blocks(config.context_len)
+        self.max_num_pages = calc_padded_blocks(config.context_len, kernel_page_size)
 
         # MLA dimensions
         self.kv_lora_rank = spec.kv_lora_rank
@@ -157,14 +173,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.page_table_buf: torch.Tensor | None = None
         self.seq_lens_buf: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, TRTLLMMLADecodeMetadata] = {}
-
-    def _calc_padded_blocks(self, max_seq_len: int) -> int:
-        """Calculate block count padded to satisfy the fused-kernel constraint."""
-        blocks = triton.cdiv(max_seq_len, self.kernel_page_size)
-        constraint = TRTLLM_BLOCK_CONSTRAINT // self.kernel_page_size
-        if blocks % constraint != 0:
-            blocks = triton.cdiv(blocks, constraint) * constraint
-        return blocks
 
     # ---- Metadata initialization ----
 
@@ -245,10 +253,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
-        # The table is batch-ordered (row i == batch position i).
-        req_pool_indices = torch.arange(
-            num_extends, dtype=torch.int64, device=page_table.device
-        )
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -259,7 +263,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table,
-            req_pool_indices,
             self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
@@ -267,7 +270,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_pool_indices=req_pool_indices,
             cum_extend_seq_lens=cum_extend_seq_lens,
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
@@ -376,9 +378,8 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             )
 
         metadata = self.forward_decode_metadata
-        # A block drafter describes only decode rows. Older callers used
-        # num_extends=bs as an internal "whole block" convention; honoring it
-        # here slices every page-table and sequence-length row away.
+        # A block drafter's decode metadata describes only decode rows, so
+        # there are no leading extend rows to slice away.
         num_extends = 0 if self.draft_block_decode else metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 

@@ -42,26 +42,11 @@ class CacheBatchMetadata:
 
     Attributes:
         group_ids: Cache group IDs in runtime-contract order.
-        num_requests: Number of request rows in each group table.
-        max_page_ids: Inclusive maximum page ID accepted for each group.
-        block_granularity: Full-history table grain in tokens (equals the
-            contract prefix_granularity by the 1:1 convention).
-        full_attention_group_id: The unique ``family="history"`` +
-            ``retention="full_history"`` group ID, or ``None`` when the
-            contract does not contain exactly one such group.
     """
 
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
-    num_requests: int
-    max_page_ids: Mapping[str, int]
-    # Grain of the scheduler's full-history table (equals prefix_granularity
-    # by the 1:1 prefix-page <-> CacheBlock convention).
-    block_granularity: int
-    full_attention_group_id: str | None
     _forward_op: Any = field(repr=False, compare=False)
-    # Kernel-page expansions memoized per (group_id, kernel_page_size, max_pages);
-    # metadata lives exactly one forward operation, so entries never go stale.
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError("CacheBatchMetadata is factory-only; use from_forward_op()")
@@ -97,14 +82,6 @@ class CacheBatchMetadata:
             raise ValueError(
                 "runtime contract must provide ordered nonempty unique group IDs"
             )
-        block_granularity = require_positive_int(
-            "contract prefix_granularity", contract.prefix_granularity
-        )
-        full_attention_ids = tuple(
-            spec.group_id
-            for spec in contract.group_specs
-            if spec.family == "history" and spec.retention == "full_history"
-        )
         tables = block_tables_from_forward_op(
             forward_op,
             device,
@@ -116,11 +93,6 @@ class CacheBatchMetadata:
             group_ids=group_ids,
             group_tables=tables,
             num_requests=num_requests,
-            max_page_ids=max_page_ids,
-            block_granularity=block_granularity,
-            full_attention_group_id=(
-                full_attention_ids[0] if len(full_attention_ids) == 1 else None
-            ),
             forward_op=forward_op,
         )
 
@@ -131,9 +103,6 @@ class CacheBatchMetadata:
         group_ids: tuple[str, ...],
         group_tables: Mapping[str, torch.Tensor],
         num_requests: int,
-        max_page_ids: Mapping[str, int],
-        block_granularity: int,
-        full_attention_group_id: str | None,
         forward_op: Any,
     ) -> CacheBatchMetadata:
         if tuple(group_tables) != group_ids:
@@ -167,12 +136,6 @@ class CacheBatchMetadata:
         metadata = object.__new__(cls)
         object.__setattr__(metadata, "group_ids", group_ids)
         object.__setattr__(metadata, "_group_tables", MappingProxyType(ordered))
-        object.__setattr__(metadata, "num_requests", num_requests)
-        object.__setattr__(
-            metadata, "max_page_ids", MappingProxyType(dict(max_page_ids))
-        )
-        object.__setattr__(metadata, "block_granularity", block_granularity)
-        object.__setattr__(metadata, "full_attention_group_id", full_attention_group_id)
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
         object.__setattr__(metadata, "_forward_op", forward_op)
@@ -188,42 +151,3 @@ class CacheBatchMetadata:
         """Return all immutable table views after freshness validation."""
         self._validate_active_forward_op(active_forward_op)
         return self._group_tables
-
-    def require_table(
-        self,
-        group_id: str,
-        *,
-        active_forward_op: Any,
-    ) -> torch.Tensor:
-        """Return one required table after freshness validation."""
-        self._validate_active_forward_op(active_forward_op)
-        try:
-            return self._group_tables[group_id]
-        except KeyError:
-            raise KeyError(f"missing cache group {group_id!r}") from None
-
-    def require_full_attention_table(self, *, active_forward_op: Any) -> torch.Tensor:
-        """Return the unique full-history history-group table.
-
-        Args:
-            active_forward_op: The scheduler forward operation this batch is
-                executing; must be the operation the metadata was built from.
-
-        Returns:
-            The ``[num_requests, max_pages]`` int32 page table of the single
-            ``family="history"``, ``retention="full_history"`` group.
-
-        Raises:
-            RuntimeError: If the metadata is stale, or the contract does not
-                contain exactly one full-attention history group.
-        """
-        self._validate_active_forward_op(active_forward_op)
-        if self.full_attention_group_id is None:
-            raise RuntimeError(
-                "runtime contract does not define exactly one full-history "
-                "history group; the MLA cache path requires it"
-            )
-        return self.require_table(
-            self.full_attention_group_id,
-            active_forward_op=active_forward_op,
-        )

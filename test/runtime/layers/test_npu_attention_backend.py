@@ -166,7 +166,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
         contract=contract,
         num_requests=1,
     )
-    table = metadata.require_full_attention_table(active_forward_op=forward_op)
+    table = metadata.tables(active_forward_op=forward_op)["full_attention"]
 
     assert table.device.type == "npu"
     assert table.tolist() == [[1]]

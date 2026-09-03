@@ -173,9 +173,6 @@ class GroupTableStacks:
     def index(self, group_id: str) -> int:
         return self._index[group_id]
 
-    def spec(self, group_id: str) -> GroupTableSpec:
-        return self._specs[group_id]
-
     def group_capacity_tokens(self, group_id: str) -> int:
         """Per-request token capacity of one group's own columns."""
         i = self._index[group_id]
@@ -218,7 +215,8 @@ class GroupTableStacks:
             actual_bs: Live rows; ``block_tables`` rows past it are ignored
                 and stack rows ``[actual_bs, bs)`` are zeroed.
             block_tables: ``group_id -> [>= actual_bs, cols]`` int32 raw
-                scheduler tables; every routed group must be present.
+                scheduler tables covering every routed group (the router's
+                ``_check_live_delivery`` guards a live batch's dict).
         """
         if bs < actual_bs or actual_bs < 0:
             raise RuntimeError(f"need 0 <= actual_bs <= bs, got {actual_bs=} {bs=}")
@@ -231,12 +229,6 @@ class GroupTableStacks:
             # page, whatever placeholder (or nothing) was delivered.
             self.tables[:, :bs].zero_()
             return
-        missing = [gid for gid in self.group_ids if gid not in block_tables]
-        if missing:
-            raise RuntimeError(
-                f"block_tables is missing routed cache groups {missing} "
-                f"(delivered: {sorted(block_tables)})"
-            )
         srcs = [block_tables[gid] for gid in self.group_ids]
         for gid, src in zip(self.group_ids, srcs):
             if src.ndim != 2 or src.dtype != torch.int32:
@@ -273,23 +265,23 @@ class GroupTableStacks:
     def _fill_torch(
         self, bs: int, actual_bs: int, srcs: Sequence[torch.Tensor]
     ) -> None:
-        """CPU reference of the unpack kernel (unit tests)."""
+        """CPU reference of the unpack kernel (unit tests); ``actual_bs > 0``
+        (``fill`` handles the idle case before dispatching here)."""
         for i, src in enumerate(srcs):
             dst = self.tables[i, :bs]
             width = self._widths[i]
             ratio = self._ratios[i]
-            if actual_bs > 0:
-                cols = min(src.shape[1], -(-width // ratio))
-                live = src[:actual_bs, :cols].clamp_min(0)
-                if ratio != 1:
-                    offsets = torch.arange(ratio, dtype=live.dtype, device=live.device)
-                    live = (live.unsqueeze(-1) * ratio + offsets).reshape(actual_bs, -1)
-                    live = torch.where(
-                        live >= ratio, live, torch.zeros_like(live)
-                    )  # page 0 stays 0 across its ratio slots
-                cols = min(live.shape[1], width)
-                dst[:actual_bs, :cols].copy_(live[:, :cols])
-                dst[:actual_bs, cols:].zero_()
+            cols = min(src.shape[1], -(-width // ratio))
+            live = src[:actual_bs, :cols].clamp_min(0)
+            if ratio != 1:
+                offsets = torch.arange(ratio, dtype=live.dtype, device=live.device)
+                live = (live.unsqueeze(-1) * ratio + offsets).reshape(actual_bs, -1)
+                live = torch.where(
+                    live >= ratio, live, torch.zeros_like(live)
+                )  # page 0 stays 0 across its ratio slots
+            cols = min(live.shape[1], width)
+            dst[:actual_bs, :cols].copy_(live[:, :cols])
+            dst[:actual_bs, cols:].zero_()
             dst[actual_bs:bs].zero_()
 
     def compute_decode_locations(

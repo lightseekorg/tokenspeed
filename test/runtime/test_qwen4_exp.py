@@ -420,7 +420,6 @@ def _qsa_router(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
             families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
             full_history_group_id=FULL_ATTENTION,
-            history_block_granularity=256,
         ),
         {
             gid: leaf_factory(gid, granularity)

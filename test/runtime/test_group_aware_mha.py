@@ -56,6 +56,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             speculative_num_draft_tokens=1,
             context_len=24,
             kv_cache_dtype=torch.bfloat16,
+            kv_cache_mxfp8=False,
             draft_block_decode=False,
             max_bs=8,
             kernel_page_size=None,
@@ -85,7 +86,6 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
                 granularities={gid: 4 for gid in group_ids},
                 families={gid: "history" for gid in group_ids},
                 full_history_group_id=FULL,
-                history_block_granularity=4,
             ),
             leaves,
         )

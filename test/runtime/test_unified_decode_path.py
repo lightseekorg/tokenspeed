@@ -97,7 +97,6 @@ class _RouterCase(_TorchCase):
                 granularities={FULL: 2},
                 families={FULL: "history"},
                 full_history_group_id=FULL,
-                history_block_granularity=2,
             ),
             {FULL: leaf},
         )

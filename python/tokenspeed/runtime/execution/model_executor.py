@@ -684,7 +684,7 @@ class ModelExecutor:
         return self.config.pp_rank == 0
 
     @nvtx_range("target_forward", color="red")
-    def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+    def _run_target_forward(self, ctx: ForwardContext):
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
@@ -702,11 +702,6 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
-                req_pool_indices=req_pool_indices,
-                seq_lens=self.input_buffers.seq_lens_buf[:bs],
-                extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                    : ctx.num_extends
-                ],
                 pp_inbound=pp_inbound,
             )
             return output
@@ -727,11 +722,6 @@ class ModelExecutor:
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
-            req_pool_indices=req_pool_indices,
-            seq_lens=self.input_buffers.seq_lens_buf[:bs],
-            extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
-                : ctx.num_extends
-            ],
             multimodal_context=self._active_multimodal_context,
         )
 
@@ -877,8 +867,6 @@ class ModelExecutor:
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
     ):
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-
         # Fork grammar onto its side stream so fill + H2D overlap with
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
@@ -902,7 +890,7 @@ class ModelExecutor:
                 self.attn_backend.decode_window_locations()[: ctx.input_num_tokens],
             )
 
-        logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+        logits_output = self._run_target_forward(ctx)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not

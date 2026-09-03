@@ -177,9 +177,7 @@ class CacheGroupRouter(AttentionBackend):
         """Bind the pool: learn the group geometry from its published specs
         and build one leaf per paged group of this view (``paged_group_ids``)."""
         self.cache_pool = cache_pool
-        geometry = learn_cache_group_geometry(
-            cache_pool.arena.cache_group_specs, default_granularity=1
-        )
+        geometry = learn_cache_group_geometry(cache_pool.arena.cache_group_specs)
         self.bind(
             geometry,
             {
@@ -501,8 +499,8 @@ class CacheGroupRouter(AttentionBackend):
         """Stack index of the full-history group the draft chain writes.
 
         The multi-step drafters commit their KV along the full-history
-        table (the pre-router staging staged exactly this group); a pool
-        without one serves a single group, which then IS the history.
+        table; a pool without one serves a single group, which then IS the
+        history.
         """
         gid = self.geometry.full_history_group_id
         if gid is not None and gid in self.leaves:
@@ -519,9 +517,8 @@ class CacheGroupRouter(AttentionBackend):
 
         The multi-step drafters resolve their KV write slots inside the
         captured graph (inputs derive from verify's in-graph accept lengths),
-        so their kernels record this table's address at capture; the refresh
-        rewrites it in place each round (the address-stable staging contract,
-        served by the router's stack).
+        so their kernels record this table's address at capture; the router
+        owns the storage and its refresh rewrites it in place each round.
 
         The tensor is the FULL contiguous stack row (``[max_bs, Wmax]``,
         batch-ordered): the slot kernels assume row-major contiguity.
@@ -597,19 +594,6 @@ class CacheGroupRouter(AttentionBackend):
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
         return self.stacks.decode_locs[i, : bs * num_tokens]
-
-    def draft_step_location_buffer(self, bs: int, num_tokens: int) -> torch.Tensor:
-        """The full-history ``[bs * num_tokens]`` location view for kernels
-        that WRITE the step's slots themselves (DFLASH's fused prep computes
-        block-window slots in the same launch that derives the block); pair
-        with :meth:`publish_draft_step_view` so readers see the window."""
-        i = self._draft_history_index()
-        return self.stacks.decode_locs[i, : bs * num_tokens]
-
-    def publish_draft_step_view(self, bs: int, num_tokens: int) -> None:
-        """Point ``write_locations`` at an externally filled step window."""
-        self._decode_row_offset = 0
-        self._publish_decode_locations(bs, num_tokens)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Eagle chain step: republish the leaves' seq_lens, in-graph.

@@ -250,15 +250,3 @@ def extend_write_locations(
     for g in range(tables.shape[0]):
         out[g] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))
     return out
-
-
-def check_write_locations(
-    table: torch.Tensor, locs: torch.Tensor, page_size: int, *, what: str
-) -> None:
-    """TOKENSPEED_CACHE_DEBUG assertion (eager only, device sync): every slot
-    lands in a real page of ``table``. Not for padded batches — dummy rows
-    resolve to page 0 by contract."""
-    pages = (locs.to(torch.int64) // page_size).to(torch.int32)
-    assert (pages != 0).all(), f"{what}: cache write location in null page 0"
-    real = table[table > 0]
-    assert torch.isin(pages, real).all(), f"{what}: cache write pages escape the table"

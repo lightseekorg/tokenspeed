@@ -229,7 +229,6 @@ class _Harness:
                     if "full_attention" in self.attn_groups
                     else self.attn_groups[0]
                 ),
-                history_block_granularity=PAGE_SIZE,
             ),
             leaves,
         )

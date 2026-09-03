@@ -118,22 +118,21 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
 
 
 # ---------------------------------------------------------------------------
-# Bridge: full-attention table accessor
+# Bridge: per-group table views
 # ---------------------------------------------------------------------------
 
 
-def test_bridge_exposes_full_attention_group_and_block_size() -> None:
+def test_bridge_exposes_full_attention_table() -> None:
     pool = _make_pool("cpu", usable_pages=2)
     table = np.array([[1, 2]], dtype=np.int32)
     metadata, forward_op = _metadata_for(pool, table, "cpu")
 
-    assert metadata.full_attention_group_id == "full_attention"
-    assert metadata.block_granularity == pool.arena.prefix_granularity
-    resolved = metadata.require_full_attention_table(active_forward_op=forward_op)
-    assert torch.equal(resolved, torch.tensor(table, dtype=torch.int32))
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tuple(tables) == metadata.group_ids
+    assert torch.equal(tables["full_attention"], torch.tensor(table, dtype=torch.int32))
 
     with pytest.raises(RuntimeError, match="stale"):
-        metadata.require_full_attention_table(active_forward_op=object())
+        metadata.tables(active_forward_op=object())
 
 
 # ---------------------------------------------------------------------------

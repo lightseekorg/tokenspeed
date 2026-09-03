@@ -123,8 +123,8 @@ class DSABackend(PagedAttentionBackend):
     def kpool_prefill_page_table(self, num_requests: int) -> torch.Tensor:
         """The kernel-page history rows KPool prefill maps its top-k through."""
         table = self._prefill_page_table
-        if table is None:
-            table = getattr(self.chunked_prefill_metadata, "page_table", None)
+        if table is None and self.chunked_prefill_metadata is not None:
+            table = self.chunked_prefill_metadata.page_table
         if table is None:
             raise RuntimeError("DSA KPool prefill requires a full-history page table")
         if num_requests < 0 or table.shape[0] < num_requests:
@@ -139,9 +139,7 @@ class DSABackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         """The kernel-page history rows KPool decode maps its top-k through."""
         metadata = self.forward_decode_metadata
-        table = getattr(metadata, "block_kv_indices", None)
-        if table is None:
-            table = getattr(metadata, "page_table", None)
+        table = None if metadata is None else metadata.page_table
         row_end = row_start + num_requests
         if (
             table is None
@@ -171,10 +169,6 @@ class DSABackend(PagedAttentionBackend):
     @property
     def chunked_prefill_metadata(self):
         return self._dense_backend.chunked_prefill_metadata
-
-    @property
-    def trtllm_workspace(self):
-        return self._dense_backend.trtllm_workspace
 
     @property
     def max_num_pages(self) -> int:
@@ -258,14 +252,11 @@ class DSABackend(PagedAttentionBackend):
             out=metadata._dsa_plan,
         )
 
-    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         metadata = self.forward_decode_metadata
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA draft decode metadata was not initialized")
-        if seq_lens is None:
-            metadata.seq_lens_k.add_(1)
-        else:
-            metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
+        metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
 
         dsa_plan(
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
@@ -280,6 +271,12 @@ class DSABackend(PagedAttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         **kwargs,
     ):
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -293,6 +290,11 @@ class DSABackend(PagedAttentionBackend):
             seq_lens,
             page_table,
             forward_mode,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_with_prefix=extend_with_prefix,
             **kwargs,
         )
         # Target mixed batches carry decode rows needing the per-token plan.
@@ -359,12 +361,6 @@ class DSABackend(PagedAttentionBackend):
                 f"max seq_len {max_seq_len}. Sparse DSA top-k indices are "
                 "required for longer contexts."
             )
-
-    def _metadata_seq_lens(self, metadata) -> torch.Tensor | None:
-        seq_lens = getattr(metadata, "seq_lens_k", None)
-        if seq_lens is not None:
-            return seq_lens
-        return getattr(metadata, "seq_lens", None)
 
     # ------------------------------------------------------------------
     # Forward
@@ -452,10 +448,9 @@ class DSABackend(PagedAttentionBackend):
                 topk_lens=topk_lens,
             )
         metadata = self.forward_decode_metadata
-        seq_lens = self._metadata_seq_lens(metadata) if metadata is not None else None
-        if seq_lens is not None:
+        if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
-            self._validate_dense_context(seq_lens[num_extends:], bs)
+            self._validate_dense_context(metadata.seq_lens_k[num_extends:], bs)
         return self._dense_backend.forward_decode(
             q=q,
             k=k,
@@ -528,11 +523,6 @@ class DSABackend(PagedAttentionBackend):
         if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        sparse_kv_cache = None
-        if hasattr(token_to_kv_pool, "get_sparse_decode_kv_buffer"):
-            sparse_kv_cache = token_to_kv_pool.get_sparse_decode_kv_buffer(
-                layer.layer_id
-            )
 
         k_scale = (
             layer.k_scale_float
@@ -542,7 +532,7 @@ class DSABackend(PagedAttentionBackend):
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
-            sparse_kv_cache=sparse_kv_cache,
+            sparse_kv_cache=None,
             topk_slots=topk_slots,
             topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
             kv_seq_lens=(
@@ -682,11 +672,6 @@ class DSABackend(PagedAttentionBackend):
         if self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        sparse_kv_cache = None
-        if hasattr(token_to_kv_pool, "get_sparse_decode_kv_buffer"):
-            sparse_kv_cache = token_to_kv_pool.get_sparse_decode_kv_buffer(
-                layer.layer_id
-            )
 
         k_scale = (
             layer.k_scale_float
@@ -699,7 +684,7 @@ class DSABackend(PagedAttentionBackend):
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
-            sparse_kv_cache=sparse_kv_cache,
+            sparse_kv_cache=None,
             topk_slots=topk_indices.view(num_tokens, -1),
             topk_lens=topk_lens,
             max_seqlen_k=max_seqlen_k,

@@ -188,9 +188,6 @@ class ModelRunner:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        req_pool_indices: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
@@ -201,12 +198,6 @@ class ModelRunner:
         kwargs = {}
         if pp_inbound is not None:
             kwargs["pp_inbound"] = pp_inbound
-        if req_pool_indices is not None:
-            kwargs["req_pool_indices"] = req_pool_indices
-        if seq_lens is not None:
-            kwargs["seq_lens"] = seq_lens
-        if extend_prefix_lens is not None:
-            kwargs["extend_prefix_lens"] = extend_prefix_lens
         if not self.is_generation:
             kwargs["get_embedding"] = True
         if captured_hidden_states is not None:

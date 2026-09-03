@@ -61,7 +61,6 @@ def _draft_router(rows: int = 8) -> CacheGroupRouter:
             granularities={FULL: 128},
             families={FULL: "history"},
             full_history_group_id=FULL,
-            history_block_granularity=128,
         ),
         {FULL: _Leaf()},
     )

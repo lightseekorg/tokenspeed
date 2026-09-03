@@ -222,11 +222,6 @@ class MLAAttnBackend(PagedAttentionBackend):
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
-        # The table is batch-ordered kernel pages (row i == batch position i),
-        # so identity row indices feed the chunked prefix walk.
-        chunk_req_pool_indices = torch.arange(
-            seq_lens.shape[0], dtype=torch.int64, device=page_table.device
-        )
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -237,7 +232,6 @@ class MLAAttnBackend(PagedAttentionBackend):
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table,
-            chunk_req_pool_indices,
             self.kernel_page_size,
         )
 

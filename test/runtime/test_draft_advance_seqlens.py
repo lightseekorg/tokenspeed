@@ -211,7 +211,6 @@ def test_router_fans_advance_out_to_every_leaf():
             granularities={"full_attention": 64},
             families={"full_attention": "history"},
             full_history_group_id="full_attention",
-            history_block_granularity=64,
         ),
         {"full_attention": leaf},
     )

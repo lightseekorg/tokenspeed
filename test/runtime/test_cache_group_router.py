@@ -157,11 +157,9 @@ class GroupTableStacksTest(unittest.TestCase):
             [[10, 11, 12, 13, 0, 0], [18, 19, 0, 0, 4, 5], [0, 0, 0, 0, 0, 0]],
         )
 
-    def test_fill_rejects_missing_or_short_tables(self):
+    def test_fill_rejects_short_tables(self):
         stacks = self._stacks()
         full = torch.ones((2, 3), dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "missing routed cache groups"):
-            stacks.fill(2, 2, {FULL: full})
         with self.assertRaisesRegex(RuntimeError, "has 2 rows for a live batch of 3"):
             stacks.fill(3, 3, {FULL: full, SWA: full})
 
@@ -297,7 +295,6 @@ def _geometry():
         granularities={FULL: 4, SWA: 4, "linear_attention_0": 8},
         families={FULL: "history", SWA: "history", "linear_attention_0": "state"},
         full_history_group_id=FULL,
-        history_block_granularity=4,
     )
 
 

@@ -3,13 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention.backends import trtllm_mla
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
+    calc_padded_blocks,
 )
 
 
@@ -29,7 +29,9 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.data_type = torch.bfloat16
     backend.trtllm_workspace = torch.empty(1, dtype=torch.uint8)
     backend.device = torch.device("cpu")
-    backend.max_num_pages = backend._calc_padded_blocks(backend.max_context_len)
+    backend.max_num_pages = calc_padded_blocks(
+        backend.max_context_len, backend.kernel_page_size
+    )
     backend.forward_decode_metadata = None
     backend.page_table_buf = None
     backend.seq_lens_buf = None

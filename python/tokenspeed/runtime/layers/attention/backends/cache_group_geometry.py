@@ -23,7 +23,7 @@
 One immutable value object answers every "what shape is this group?"
 question a backend asks — group block granularities, every group's family
 (the positive-claim vocabulary ``cache_consumer_families`` filters against),
-and the full-history grain that batch-ordered draft tables carry. Learned
+and which group is the full history the draft chain writes along. Learned
 exactly once, at ``set_cache_pool`` (the arena's published specs are the
 only source, so the eager and CUDA-graph arms can never answer
 differently).
@@ -49,17 +49,15 @@ class CacheGroupGeometry:
             groups) ride the same dict to their own consumers. Empty when
             no pool is bound (unit fixtures, pre-contract draft pools).
         full_history_group_id: The first ``family="history"`` group with
-            ``retention="full_history"``, or None when no pool bound (unit
-            fixtures). Same selection rule as the executor's staging.
-        history_block_granularity: That group's grain — the unit of the
-            batch-ordered draft page table; falls back to the backend's
-            kernel page size when no pool bound.
+            ``retention="full_history"`` — the table the router's draft
+            write locations ride — or None when the pool publishes no such
+            group (a single-group pool's sole group then serves as the
+            history).
     """
 
     granularities: dict[str, int] = field(default_factory=dict)
     families: dict[str, str] = field(default_factory=dict)
     full_history_group_id: str | None = None
-    history_block_granularity: int = 0
 
     def granularity_of(self, group_id: str) -> int:
         """This group's block granularity; an unknown id is a contract bug.
@@ -79,15 +77,11 @@ class CacheGroupGeometry:
             ) from None
 
 
-def learn_cache_group_geometry(
-    cache_group_specs, default_granularity: int
-) -> CacheGroupGeometry:
+def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
     """Build the geometry from the pool's published group specs.
 
     Args:
         cache_group_specs: The arena's ``cache_group_specs`` tuple.
-        default_granularity: Fallback history grain when the pool publishes
-            no full-history group (the backend's kernel page size).
 
     Returns:
         The frozen geometry.
@@ -96,8 +90,7 @@ def learn_cache_group_geometry(
         (
             spec
             for spec in cache_group_specs
-            if spec.family == "history"
-            and getattr(spec, "retention", "full_history") == "full_history"
+            if spec.family == "history" and spec.retention == "full_history"
         ),
         None,
     )
@@ -110,10 +103,5 @@ def learn_cache_group_geometry(
         families={str(spec.group_id): str(spec.family) for spec in cache_group_specs},
         full_history_group_id=(
             str(full_history.group_id) if full_history is not None else None
-        ),
-        history_block_granularity=(
-            int(full_history.block_granularity)
-            if full_history is not None
-            else default_granularity
         ),
     )

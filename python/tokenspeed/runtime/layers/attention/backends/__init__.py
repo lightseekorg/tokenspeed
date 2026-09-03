@@ -20,12 +20,9 @@
 
 # ruff: noqa: E402,F401
 # Import all backend modules to trigger register_backend() calls.
-import logging
-
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
-logger = logging.getLogger(__name__)
 
 from tokenspeed.runtime.layers.attention.backends import deepseek_v4  # noqa: F401
 

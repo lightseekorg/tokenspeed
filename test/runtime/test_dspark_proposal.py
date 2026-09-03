@@ -364,7 +364,7 @@ def test_kda_commit_is_a_base_no_op_hook() -> None:
             pass
 
     backend = _StatelessBackend.__new__(_StatelessBackend)
-    assert backend.update_mamba_state_after_mtp_verify(None, None) is None
+    assert backend.update_mamba_state_after_mtp_verify(None) is None
 
 
 class _ShardIndices:

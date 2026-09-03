@@ -119,10 +119,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
-        families: frozenset[str] = frozenset()
-        for backend in (self.full_attn_backend, self.linear_attn_backend):
-            families |= frozenset(getattr(backend, "cache_consumer_families", ()))
-        return families
+        return (
+            self.full_attn_backend.cache_consumer_families
+            | self.linear_attn_backend.cache_consumer_families
+        )
 
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
@@ -133,7 +133,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             backend.set_cache_pool(cache_pool)
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
-        if self.linear_attn_backend is None or layer_id in self.full_attn_layers:
+        if layer_id in self.full_attn_layers:
             return self.full_attn_backend
         return self.linear_attn_backend
 
@@ -144,11 +144,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
-        # kwargs (e.g. cache_group_specs, so the full backend sheds
-        # state-family groups) are forwarded through the shared signature
-        # filter: the full backend is user-selectable and may have a narrow
-        # signature (e.g. TRTLLM MHA takes only (max_bs,)), and the mamba
-        # backend keeps its narrow signature today.
+        # Both children are runner-facing nodes whose init_cuda_graph_state
+        # absorbs the runner extras (cache_group_specs, ...) through **kwargs.
         self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
         self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
@@ -198,20 +195,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
         batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].
         """
-        if forward_mode is None:
-            return super().forward(
-                q,
-                k,
-                v,
-                layer,
-                token_to_kv_pool,
-                forward_mode,
-                bs,
-                save_kv_cache,
-                record_kv_cache=record_kv_cache,
-                **kwargs,
-            )
-
         # Frozen capture-time scalars, re-read live (see docstring); no-op in eager.
         amb = current_forward_ctx()
         if amb is not None:
@@ -262,17 +245,5 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
-    def forward_decode(self, q, k, v, layer, token_to_kv_pool, bs, **kwargs):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        return self._backend_for_layer(layer_id).forward_decode(
-            q, k, v, layer, token_to_kv_pool, bs, **kwargs
-        )
-
-    def forward_extend(self, q, k, v, layer, token_to_kv_pool, bs, **kwargs):
-        layer_id = layer.layer_id if layer else kwargs["layer_id"]
-        return self._backend_for_layer(layer_id).forward_extend(
-            q, k, v, layer, token_to_kv_pool, bs, **kwargs
-        )
-
-    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-        self.linear_attn_backend.commit_verified_state(accepted_length)
+    def update_mamba_state_after_mtp_verify(self, accepted_lengths):
+        self.linear_attn_backend.commit_verified_state(accepted_lengths)

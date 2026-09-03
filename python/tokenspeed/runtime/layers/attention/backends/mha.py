@@ -125,7 +125,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
-        self.is_mxfp8 = bool(getattr(config, "kv_cache_mxfp8", False))
+        self.is_mxfp8 = bool(config.kv_cache_mxfp8)
         # mxfp8 shares the fp8 storage dtype but uses block scales; keep it off
         # the per-tensor casts
         self.is_fp8 = (
@@ -454,10 +454,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
-            # DFLASH marks its draft attention non-causal so the draft block's
-            # query positions attend bidirectionally. Every other layer leaves
-            # the attribute unset, so this stays causal by default.
-            is_causal=not bool(getattr(layer, "non_causal", False)),
+            is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,

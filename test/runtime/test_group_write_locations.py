@@ -2,8 +2,7 @@
 
 test_cache_group_router.py owns the core slot math and the router's
 publication discipline; this file keeps the residue that still adds value:
-the TOKENSPEED_CACHE_DEBUG checker (``check_write_locations``), hole /
-overflow routing edge cases of the pure functions, the MTP re-anchor
+hole / overflow routing edge cases of the pure functions, the MTP re-anchor
 (``update_draft_forward_metadata`` + recompute over the same stacks), and
 the base backend's refusal to serve write locations it does not own.
 """
@@ -32,48 +31,12 @@ from tokenspeed.runtime.layers.attention.backends.paged import (
 )
 from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.write_locations import (
-    check_write_locations,
     decode_write_locations,
     extend_write_locations,
 )
 
 FULL = "full_attention"
 SWA = "sliding_attention"
-
-
-class CheckWriteLocationsTest(unittest.TestCase):
-    """The TOKENSPEED_CACHE_DEBUG assertion: every slot must land in a real
-    page of the group's table (the caller gates on the env var; the checker
-    itself is unconditional)."""
-
-    def _front_hole_table(self):
-        # SWA-style table: front hole (slid-out page 0) then real pages 2, 3.
-        return torch.tensor([[0, 2, 3, 0]], dtype=torch.int32)
-
-    def test_valid_locs_pass(self):
-        # Pages 2 and 3 are real entries; the hole 0 is excluded.
-        locs = torch.tensor([4, 5, 6], dtype=torch.int32)
-        check_write_locations(self._front_hole_table(), locs, 2, what="swa decode")
-
-    def test_rejects_write_into_null_page(self):
-        # loc 1 -> page 0 = the slid-out hole; a write there is corruption.
-        bad = torch.tensor([1], dtype=torch.int32)
-        with self.assertRaisesRegex(AssertionError, "null page"):
-            check_write_locations(self._front_hole_table(), bad, 2, what="swa decode")
-
-    def test_rejects_page_outside_table(self):
-        # loc 18 -> page 9, not in the table.
-        bad = torch.tensor([18], dtype=torch.int32)
-        with self.assertRaisesRegex(AssertionError, "escape"):
-            check_write_locations(self._front_hole_table(), bad, 2, what="swa decode")
-
-    def test_honors_kernel_page_size(self):
-        # Same locs read differently at P=4: 11 -> page 2, 15 -> page 3.
-        table = torch.tensor([[2, 3]], dtype=torch.int32)
-        locs = torch.tensor([11, 15], dtype=torch.int32)
-        check_write_locations(table, locs, 4, what="wide")
-        with self.assertRaisesRegex(AssertionError, "escape"):
-            check_write_locations(table, locs, 2, what="wide")
 
 
 class HoleOverflowRoutingTest(unittest.TestCase):
@@ -182,7 +145,6 @@ class MtpReanchorTest(unittest.TestCase):
             granularities={FULL: 4, SWA: 4},
             families={FULL: "history", SWA: "history"},
             full_history_group_id=FULL,
-            history_block_granularity=4,
         )
         router.bind(geometry, leaves)
         router.init_cuda_graph_state(4)

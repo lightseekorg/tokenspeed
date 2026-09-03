@@ -117,7 +117,6 @@ class MSAAttnBackend(PagedAttentionBackend):
         )
 
         # Sparse attention parameters
-        self.sparse_layer_ids = spec.sparse_layer_ids
         self.index_head_dim = spec.index_head_dim
         self.index_topk_blocks = spec.index_topk_blocks
         self.index_init_blocks = spec.index_init_blocks

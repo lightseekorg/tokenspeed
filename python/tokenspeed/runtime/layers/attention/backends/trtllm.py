@@ -55,13 +55,10 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-
-logger = get_colorful_logger(__name__)
 
 
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
@@ -94,7 +91,6 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
 class TRTLLMMHAMetadata:
     cache_seqlens_int32: torch.Tensor = None
     max_seq_len_q: int = 1
-    max_seq_len_k: int = 0
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
     page_table: torch.Tensor = None
@@ -207,7 +203,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seq_len_q,
-            max_seq_len_k=self.max_context_len,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table[:bs],
@@ -261,7 +256,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 metadata = TRTLLMMHAMetadata(
                     cache_seqlens_int32=self.seq_lens_buf[:rows],
                     max_seq_len_q=1,
-                    max_seq_len_k=self.max_context_len,
                     cu_seqlens_q=self._uniform_cu_seqlens(rows, 1),
                     page_table=self.page_table_buf[:rows],
                 )
@@ -269,7 +263,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 metadata = TRTLLMMHAMetadata(
                     cache_seqlens_int32=self.seq_lens_buf[:bs],
                     max_seq_len_q=1,
-                    max_seq_len_k=self.max_context_len,
                     cu_seqlens_q=self._uniform_cu_seqlens(bs, 1),
                     page_table=self.page_table_buf[:bs],
                 )
@@ -285,7 +278,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             metadata = TRTLLMMHAMetadata(
                 cache_seqlens_int32=self.spec_cache_seqlens_buf[:bs],
                 max_seq_len_q=spec,
-                max_seq_len_k=self.max_context_len,
                 cu_seqlens_q=self._uniform_cu_seqlens(bs, spec),
                 page_table=self.page_table_buf[:bs],
             )
