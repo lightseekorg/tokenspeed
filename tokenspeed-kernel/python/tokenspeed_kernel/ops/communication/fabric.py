@@ -33,8 +33,15 @@ from __future__ import annotations
 
 import ctypes
 import logging
+from collections.abc import Sequence
 
-__all__ = ["fabric_allocation_supported"]
+import torch
+
+__all__ = [
+    "fabric_allocation_supported",
+    "gather_fabric_map",
+    "group_has_fabric",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,7 @@ _CU_MEM_LOCATION_TYPE_DEVICE = 1
 _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 
 _probe_cache: dict[int, bool] = {}
+_fabric_map: list[bool] | None = None
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -170,3 +178,43 @@ def fabric_allocation_supported(device_index: int) -> bool:
         _probe_cache[device_index] = cached
         logger.info("fabric allocation on device %s: %s", device_index, cached)
     return cached
+
+
+def gather_fabric_map() -> list[bool]:
+    """Gather and cache every world rank's fabric-allocation verdict."""
+    global _fabric_map
+
+    if _fabric_map is not None:
+        return _fabric_map
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    local = torch.tensor(
+        [fabric_allocation_supported(device.index)], dtype=torch.bool, device=device
+    )
+    gathered = [
+        torch.empty_like(local) for _ in range(torch.distributed.get_world_size())
+    ]
+    torch.distributed.all_gather(gathered, local, group=torch.distributed.group.WORLD)
+    _fabric_map = [bool(value.item()) for value in gathered]
+    logger.info(
+        "fabric allocation available on %s/%s ranks",
+        sum(_fabric_map),
+        len(_fabric_map),
+    )
+    return _fabric_map
+
+
+def group_has_fabric(ranks: Sequence[int]) -> bool:
+    """Return whether every rank in ``ranks`` reported fabric support.
+
+    The world map is expected to be populated during distributed
+    initialization. Gathering while CUDA graph capture is active is impossible
+    and indicates that the initialization hook did not run.
+    """
+    if _fabric_map is None and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "fabric map should have been gathered at distributed initialization "
+            "before CUDA graph capture"
+        )
+    fabric_map = gather_fabric_map()
+    return all(fabric_map[rank] for rank in ranks)

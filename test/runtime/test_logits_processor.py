@@ -132,18 +132,7 @@ def _set_fabric(monkeypatch, supported: bool) -> None:
         global_server_args_dict, "mapping", SimpleNamespace(nprocs_per_node=4)
     )
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        fabric, "fabric_allocation_supported", lambda device_index: supported
-    )
-    # The gate votes; stand in for the collective so the local answer survives.
-    logits_processor_module.LogitsProcessor._LOGITS_MC_REACHABLE.clear()
-    monkeypatch.setattr(
-        logits_processor_module.pg_manager, "get_process_group", lambda *a: "pg"
-    )
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
-    )
+    monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
 
 def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
@@ -201,10 +190,12 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
     yes-ranks would then block in a rendezvous the no-ranks never enter.
     """
     _set_fabric(monkeypatch, True)
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
     monkeypatch.setattr(
-        torch.distributed,
-        "all_reduce",
-        lambda tensor, op=None, group=None: tensor.zero_(),
+        fabric,
+        "group_has_fabric",
+        lambda ranks: False,
     )
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=64),

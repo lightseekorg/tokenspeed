@@ -188,7 +188,7 @@ def test_the_probe_is_skipped_only_within_one_host_window(
     import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.moe.latent_tail as tail
 
-    seen: list[int] = []
+    seen: list[list[int]] = []
     asked = mock.Mock()
 
     def only_this_group(group):
@@ -207,12 +207,14 @@ def test_the_probe_is_skipped_only_within_one_host_window(
         mock.patch.object(torch.cuda, "current_device", return_value=0),
         mock.patch.object(
             fabric,
-            "fabric_allocation_supported",
-            side_effect=lambda i: seen.append(i) or False,
+            "group_has_fabric",
+            side_effect=lambda group_ranks: seen.append(list(group_ranks)) or False,
         ),
     ):
         assert tail.multicast_reachable(asked) is not probed
     assert bool(seen) is probed
+    if probed:
+        assert seen == [ranks]
 
 
 @pytest.mark.parametrize("per_host,probed", [(4, True), (8, False)])
@@ -228,7 +230,7 @@ def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
     import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.moe.latent_tail as tail
 
-    seen: list[int] = []
+    seen: list[list[int]] = []
     with (
         mock.patch.object(tail.dist, "is_initialized", return_value=True),
         mock.patch.object(
@@ -238,8 +240,8 @@ def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
         mock.patch.object(torch.cuda, "current_device", return_value=0),
         mock.patch.object(
             fabric,
-            "fabric_allocation_supported",
-            side_effect=lambda i: seen.append(i) or False,
+            "group_has_fabric",
+            side_effect=lambda ranks: seen.append(list(ranks)) or False,
         ),
     ):
         assert tail.multicast_reachable() is not probed

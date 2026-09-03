@@ -103,15 +103,11 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     differs, since this package sees the device count rather than the launcher's
     placement.
 
-    Residual: those two agree unless engines are colocated or a node is
-    under-subscribed, and with more devices visible than the job places per
-    host a spanning group is admitted unprobed. The reachability vote its
-    callers take does not catch that -- a uniformly permissive divisor makes
-    every rank agree -- so callers holding the launch topology should pass it
-    down rather than rely on the reduction.
+    Fabric verdicts for spanning groups come from the world map gathered at
+    distributed initialization, so every rank makes the same local decision.
     """
     import torch.distributed as dist
-    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+    from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 
     if not dist.is_initialized():
         return False
@@ -124,7 +120,7 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     )
     if len({rank // per_host for rank in ranks}) <= 1:
         return True
-    return fabric_allocation_supported(torch.cuda.current_device())
+    return group_has_fabric(ranks)
 
 
 # sm100 and up may attempt the multicast path; sm90 lacks the fabric handles.

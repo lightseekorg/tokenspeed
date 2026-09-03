@@ -47,9 +47,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
-    # Not lru_cache: the capture path returns a verdict it must not memoise.
-    _REACHABLE: dict[Group, bool] = {}
-
     def __init__(self):
         self._nccl = NcclBackend()
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
@@ -95,39 +92,14 @@ class AutoBackend(CommBackend):
         ``attn_tp_size=8``, which is smaller than one host's device count while
         living on two hosts, so counting would admit it with no probe at all.
 
-        The fabric answer is reduced across the group. Topology is rank-uniform
-        by construction, but the probe allocates on this device alone: one node
-        with no IMEX channels answers no while its peers answer yes, and the
-        yes-ranks then block in a rendezvous the no-ranks never enter.
+        The world fabric map is gathered during distributed initialization, so
+        the group verdict is a local lookup with no dispatch-time collective.
         """
-        from tokenspeed_kernel.ops.communication.fabric import (
-            fabric_allocation_supported,
-        )
-
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
+        from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 
         if not AutoBackend._group_spans_nodes(group):
             return True
-        if group in AutoBackend._REACHABLE:
-            return AutoBackend._REACHABLE[group]
-        # nccl is always safe, so decline rather than reduce inside a capture.
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        vote = torch.tensor(
-            [int(fabric_allocation_supported(device.index))],
-            dtype=torch.int32,
-            device=device,
-        )
-        torch.distributed.all_reduce(
-            vote,
-            op=torch.distributed.ReduceOp.MIN,
-            group=pg_manager.get_process_group("nccl", group),
-        )
-        AutoBackend._REACHABLE[group] = bool(vote.item())
-        return AutoBackend._REACHABLE[group]
+        return group_has_fabric(group)
 
     # ---- Token-aware ops ----
 

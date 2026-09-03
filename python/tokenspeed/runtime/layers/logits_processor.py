@@ -198,7 +198,6 @@ class LogitsProcessor(nn.Module):
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
     _LOGITS_AG_STATES = {}
-    _LOGITS_MC_REACHABLE = {}
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
@@ -308,17 +307,14 @@ class LogitsProcessor(nn.Module):
         rank count cannot stand in for the topology test -- a strided group can
         be smaller than one host's device count while living on two.
 
-        The fabric answer is reduced across the group. Every other term here is
-        derived from config or topology and so is rank-uniform, but the probe
-        allocates on this device alone: one node with no IMEX channels answers
-        no while its peers answer yes, and the yes-ranks then block in a
-        rendezvous the no-ranks never enter.
+        The world fabric map is gathered during distributed initialization, so
+        the group verdict is a local lookup with no dispatch-time collective.
         """
         if self.tp_group is None:
             return False
 
         from tokenspeed_kernel.ops.communication.fabric import (
-            fabric_allocation_supported,
+            group_has_fabric,
         )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -330,13 +326,7 @@ class LogitsProcessor(nn.Module):
         )
         if not spans_hosts:
             return True
-        if self.tp_group not in self._LOGITS_MC_REACHABLE:
-            self._LOGITS_MC_REACHABLE[self.tp_group] = self._agree_across_tp(
-                fabric_allocation_supported(torch.cuda.current_device()),
-                pg_manager.get_process_group("nccl", self.tp_group),
-                torch.device(f"cuda:{torch.cuda.current_device()}"),
-            )
-        return self._LOGITS_MC_REACHABLE[self.tp_group]
+        return group_has_fabric(self.tp_group)
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
@@ -704,8 +694,7 @@ class LogitsProcessor(nn.Module):
 
             state = self._all_gather_state
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
-                # The gate reduces across the group, so leave it for an eager
-                # call; the plain path below is correct meanwhile.
+                # create_state rendezvouses; leave it for an eager call.
                 if torch.cuda.is_current_stream_capturing():
                     state = None
                 else:
