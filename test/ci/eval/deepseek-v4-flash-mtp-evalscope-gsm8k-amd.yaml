@@ -22,7 +22,7 @@ server:
     --max-total-tokens 16384
     --chunked-prefill-size 8192
     --prefill-graph-max-tokens 8192
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization 0.95
     --disable-kvstore
     --trust-remote-code
     --speculative-algorithm MTP

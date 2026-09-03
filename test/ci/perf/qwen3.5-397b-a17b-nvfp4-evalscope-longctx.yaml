@@ -21,7 +21,7 @@ server:
     --max-model-len 1048576
     --hf-overrides '{"max_position_embeddings": 1048576}'
     --max-num-seqs 4
-    --gpu-memory-utilization 0.8
+    --gpu-memory-utilization 0.95
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm

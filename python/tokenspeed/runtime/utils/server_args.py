@@ -293,6 +293,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
+    disable_cudagraph_memory_reserve: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
     disable_overlap_schedule: bool = False
@@ -464,21 +465,6 @@ class ServerArgs:
         else:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
-
-        # Set GPU memory utilization, which depends on the tensor parallelism size.
-        self._gpu_memory_utilization_defaulted = False
-        if self.gpu_memory_utilization is None:
-            if self.mapping.world_size >= 16:
-                self.gpu_memory_utilization = 0.79
-            elif self.mapping.world_size >= 8:
-                self.gpu_memory_utilization = 0.81
-            elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.95
-            elif self.mapping.world_size >= 2:
-                self.gpu_memory_utilization = 0.87
-            else:
-                self.gpu_memory_utilization = 0.88
-            self._gpu_memory_utilization_defaulted = True
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -833,6 +819,14 @@ class ServerArgs:
                     "multiple independent encode servers for horizontal scale."
                 )
             self.enable_prefix_caching = False
+
+        self._gpu_memory_utilization_defaulted = False
+        if self.gpu_memory_utilization is None:
+            # Both opt-outs capture graphs the budget cannot see, so they keep
+            # ordinary headroom instead of the fraction the projection earns.
+            unguarded = self.enforce_eager or self.disable_cudagraph_memory_reserve
+            self.gpu_memory_utilization = 0.9 if unguarded else 0.95
+            self._gpu_memory_utilization_defaulted = True
 
         # Prefill graph disable logic is handled by AttnInitializer.modify_args
         # after the attention backend is resolved.
@@ -1852,6 +1846,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--disable-cudagraph-memory-reserve",
+            action="store_true",
+            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
         )
         parser.add_argument(
             "--disable-autotune",
