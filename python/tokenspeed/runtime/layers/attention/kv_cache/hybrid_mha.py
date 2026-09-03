@@ -42,8 +42,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 class HybridMHATokenToKVPool(MHATokenToKVPool):
     """MHA compute interface whose history and state share one buffer."""
 
-    def __init__(self, **kwargs):
-        layer_types = tuple(kwargs.get("layer_types", ()))
+    def __init__(self, *, layer_types: tuple[str, ...], **kwargs):
+        layer_types = tuple(layer_types)
         self._state_layer_ids = tuple(
             layer_id
             for layer_id, label in enumerate(layer_types)

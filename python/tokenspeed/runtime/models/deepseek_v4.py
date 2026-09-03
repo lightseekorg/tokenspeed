@@ -1439,10 +1439,7 @@ def _deepseek_v4_indexer_page_table(
     compress_ratio: int,
     indexer_block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    page_table = metadata.cache.compressed_page_table(
-        compress_ratio,
-        indexer_block_size,
-    )
+    page_table = metadata.cache.compressed_page_table(compress_ratio)
     base_offsets = None
     if page_table is not metadata.cache.page_table:
         base_offsets = metadata.cache.block_table_base_offsets.get(

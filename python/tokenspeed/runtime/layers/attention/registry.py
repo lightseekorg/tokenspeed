@@ -730,7 +730,6 @@ def _wrap_inkling_backend(
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
-    Returns ``(backend, conv_pool)``.
     """
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
     from tokenspeed.runtime.layers.attention.backends.inkling import (
@@ -751,7 +750,6 @@ def _wrap_inkling_backend(
         conv_dim=inkling_conv_total_dim(
             text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
         ),
-        kernel_size=kernel_size,
         ring_size=ring_size,
         dtype=torch.bfloat16,
         device=attn_config.device,
@@ -770,7 +768,7 @@ def _wrap_inkling_backend(
         spec_num_tokens=spec_tokens,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
-    return backend, conv_pool
+    return backend
 
 
 def _inkling_conv_columns(pool, text_config):
@@ -850,7 +848,7 @@ def _create_target_components(
         return backend, pool
 
     text_config = model_config.hf_config.get_text_config()
-    backend, _ = _wrap_inkling_backend(
+    backend = _wrap_inkling_backend(
         backend,
         text_config,
         config,
@@ -859,7 +857,7 @@ def _create_target_components(
         conv_columns=_inkling_conv_columns(pool, text_config),
         enable_layerwise_cache_ready=(
             server_args.disaggregation_mode == "prefill"
-            and getattr(server_args, "disaggregation_layerwise_interval", 0) > 0
+            and server_args.disaggregation_layerwise_interval > 0
         ),
     )
     return backend, pool
@@ -922,7 +920,7 @@ def _create_draft_components(
         # of the target's kvconv/hiddenconv groups; the draft gets the same
         # paged bridges (publish/restore) the target wrapper gets.
         text_config = model_config.hf_config.get_text_config()
-        backend, _ = _wrap_inkling_backend(
+        backend = _wrap_inkling_backend(
             backend,
             text_config,
             config,

@@ -54,7 +54,6 @@ class MHATokenToKVPool(CachePool):
         layer_num: int,
         rank: int,
         *,
-        layer_types: tuple[str, ...] = (),
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,

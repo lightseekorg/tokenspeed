@@ -90,12 +90,7 @@ class DeepseekV4CacheMetadata:
         default_factory=dict
     )
 
-    def compressed_page_table(
-        self,
-        compress_ratio: int,
-        kv_cache_block_size: int | None = None,
-    ) -> torch.Tensor:
-        del kv_cache_block_size
+    def compressed_page_table(self, compress_ratio: int) -> torch.Tensor:
         if compress_ratio <= 1:
             return self.page_table
         table = self.block_tables.get(v4_compressed_kv_group_id(compress_ratio))
@@ -129,7 +124,7 @@ class DeepseekV4CacheMetadata:
                 out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
             self.decode_compressed_slot_mappings[key] = out
 
-        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
+        page_table = self.compressed_page_table(compress_ratio)
         if page_table is not self.page_table:
             req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
             query_starts = query_start_loc[req_idx].to(torch.int64)
@@ -223,7 +218,7 @@ class DeepseekV4CacheMetadata:
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
-        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
+        page_table = self.compressed_page_table(compress_ratio)
         if (
             use_decode_cache
             and positions.is_cuda

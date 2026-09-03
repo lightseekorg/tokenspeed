@@ -113,10 +113,7 @@ def _refresh_decode_indexer_plan_cache(
             continue
         positions = _decode_positions_from_metadata(metadata, num_tokens)
         token_to_req_indices = metadata.token_to_req_indices[:num_tokens]
-        page_table = metadata.cache.compressed_page_table(
-            compress_ratio,
-            cache_block_size,
-        )
+        page_table = metadata.cache.compressed_page_table(compress_ratio)
         rows = int(page_table.shape[0]) if page_table.ndim >= 1 else 0
         cols = int(page_table.shape[1]) if page_table.ndim >= 2 else 0
         if rows <= 0 or cols <= 0:
@@ -950,7 +947,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             return None, None
         num_tokens = positions.numel()
         req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
-        page_table = metadata.cache.compressed_page_table(compress_ratio, block_size)
+        page_table = metadata.cache.compressed_page_table(compress_ratio)
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
@@ -1297,10 +1294,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4 and topk_indices is not None:
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
             compressed_cache = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
-            compressed_page_table = cache_metadata.compressed_page_table(
-                compress_ratio,
-                compressed_block_size,
-            )
+            compressed_page_table = cache_metadata.compressed_page_table(compress_ratio)
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
@@ -1351,10 +1345,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             assert compressed_cache is not None
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
-            compressed_page_table = cache_metadata.compressed_page_table(
-                compress_ratio,
-                compressed_block_size,
-            )
+            compressed_page_table = cache_metadata.compressed_page_table(compress_ratio)
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )

@@ -65,7 +65,7 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     """Adjust degenerate strides for a tensor, make it canonical.
 
     When a dimension has size=1, PyTorch may use the same stride as the next dim.
-    This causes TMA desc validation failures in the trtllm_mha backend.
+    This causes TMA desc validation failures in the TRT-LLM MHA kernels.
     See: https://github.com/flashinfer-ai/flashinfer/issues/2232
     """
     sizes = tensor.size()
@@ -97,7 +97,7 @@ class TRTLLMMHAMetadata:
 
 
 class TRTLLMMHAAttnBackend(PagedAttentionBackend):
-    """trtllm_mha attention leaf optimized for SM100 (Blackwell)."""
+    """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
 

@@ -255,7 +255,6 @@ class _Harness:
             num_layers=text.num_hidden_layers,
             num_slots=6,
             conv_dim=inkling_conv_total_dim(text, 1),
-            kernel_size=text.sconv_kernel_size,
             # Non-spec ring: (W-1) + K(1) = W.
             ring_size=text.sconv_kernel_size,
             dtype=torch.bfloat16,

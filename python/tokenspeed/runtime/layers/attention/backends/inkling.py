@@ -123,13 +123,11 @@ class InklingConvStatePool:
         num_layers: int,
         num_slots: int,
         conv_dim: int,
-        kernel_size: int,
         ring_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ):
         self.num_slots = num_slots
-        self.kernel_size = kernel_size
         self.conv_state = torch.zeros(
             (num_layers, num_slots, ring_size, conv_dim),
             dtype=dtype,

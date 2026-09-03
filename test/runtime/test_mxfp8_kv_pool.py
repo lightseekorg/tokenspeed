@@ -238,7 +238,6 @@ def _make_shared_pool(size: int = 512):
         head_dim=HEAD_DIM,
         layer_num=len(SHARED_LAYER_TYPES),
         rank=0,
-        layer_types=SHARED_LAYER_TYPES,
         layer_kv_head_counts=SHARED_KV_HEADS,
     )
 
