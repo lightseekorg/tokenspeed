@@ -1,7 +1,8 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3 + DSpark is the per-commit AIME26 gate. The matching speculator-free
-# configuration remains available as a manual control for direct comparison.
-name: eval-kimi-k3-dspark-mxfp4-tp8ep8-aime26-amd
+# Kimi-K3 + EAGLE3 TP8/EP1 is the per-commit AIME26 gate. Its small target-MoE
+# verification batches use the optimized A8W4 SiTU path; the matching
+# speculator-free configuration remains available as a manual control.
+name: eval-kimi-k3-eagle3-mxfp4-tp8ep1-aime26-amd
 type: eval
 workflow_stage: model-test
 triggers:
@@ -22,11 +23,15 @@ server:
     ts serve
     --model moonshotai/Kimi-K3
     --served-model-name kimi-k3
-    --speculative-algorithm DSPARK
-    --speculative-draft-model-path Inferact/Kimi-K3-DSpark
-    --speculative-num-draft-tokens 8
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+    --eagle3-layers-to-capture 2,46,90
     --tp 8
-    --ep-size 8
+    --ep-size 1
     --attention-backend mla
     --drafter-attention-backend mla
     --moe-backend auto
@@ -66,21 +71,9 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
-# Same bar as the speculator-free gate, which measured 0.933 (28/30) on 8x
-# MI350X. DSpark preserves the target's distribution rather than its exact
-# tokens, so this score is the correctness check that matters; a per-token diff
-# is not available on batch-variant kernels.
-#
-# A same-machine control on 8x MI355X, both arms in this exact configuration:
-#   DSpark   0.800 (24/30), TPOT  45.56 ms, 17.35 tok/s, TTFT 3779 ms
-#   no spec  0.667 (20/30), TPOT 103.22 ms,  9.94 tok/s, TTFT 1945 ms
-# So DSpark does not regress accuracy (it scored higher, within the noise of 30
-# problems at temperature 1.0) and cuts TPOT by 2.27x, consistent with the
-# measured accept length of ~2.6. Note the MI355X control also came in well
-# under the 0.933 recorded on MI350X, so this threshold wants re-calibrating
-# against the CI runner's own speculator-free number rather than trusted across
-# hardware.
+# Two consecutive seed-42 runs scored 0.933 and 0.900. Keep the same correctness
+# bar as the speculator-free gate; per-token equality is not expected.
 score_threshold: 0.90

@@ -121,7 +121,36 @@ from tokenspeed.runtime.utils.env import envs
 logger = logging.getLogger(__name__)
 
 
-def _gdn_group_unquantized(prefix, shard_names, ignored_layers) -> bool:
+def _is_ignored_checkpoint_param(model, name: str) -> bool:
+    """Whether ``name`` is a checkpoint tensor the owning module's quant method
+    deliberately does not consume (e.g. a residual A16 ``input_scale``).
+
+    The decision is owned by the layer's quant method via its
+    ``ignored_checkpoint_params`` attribute, so a method that genuinely uses the
+    tensor (e.g. static FP8 ``input_scale``) still loads it.
+    """
+    parent, _, leaf = name.rpartition(".")
+    if not parent:
+        return False
+    try:
+        module = model.get_submodule(parent)
+    except AttributeError:
+        return False
+    quant_method = getattr(module, "quant_method", None)
+    return leaf in getattr(quant_method, "ignored_checkpoint_params", ())
+
+
+def _gdn_group_unquantized(prefix, shard_names, quant_config) -> bool:
+    is_quantized_layer = getattr(quant_config, "is_quantized_layer", None)
+    if is_quantized_layer is not None:
+        quantized = {is_quantized_layer(f"{prefix}.{shard}") for shard in shard_names}
+        if len(quantized) > 1:
+            raise ValueError(
+                f"Partially quantized Gated DeltaNet projection group at {prefix}"
+            )
+        return not quantized.pop()
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
     if not ignored_layers:
         return False
     targets = list(ignored_layers)
@@ -195,12 +224,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        ignored_layers = getattr(quant_config, "ignored_layers", None) or []
         qkvz_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_qkv", "in_proj_z"), ignored_layers
+            prefix, ("in_proj_qkv", "in_proj_z"), quant_config
         )
         ba_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_b", "in_proj_a"), ignored_layers
+            prefix, ("in_proj_b", "in_proj_a"), quant_config
         )
         self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
         if self._split_in_proj:
@@ -401,23 +429,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 if len(loaded_weight.shape) == 0:
-                    # Scalar only makes sense for a single logical shard.
-                    if len(split_sizes) != 1 or split_sizes[0] != 1:
+                    # A per-tensor scalar (FP8 weight_scale / input_scale) from
+                    # a checkpoint module fused across one or more runtime
+                    # shards (e.g. in_proj_qkv -> qkvz shards (0, 1, 2)). Every
+                    # shard slot receives the same single checkpoint scale.
+                    if any(size != 1 for size in split_sizes):
                         raise ValueError(
                             f"Unexpected scalar for tuple shard load: "
                             f"{loaded_shard_id=}, {split_sizes=}"
                         )
-                    chunks = [loaded_weight.reshape(1)]
-                else:
-                    split_dim = getattr(param, "output_dim", 0)
-                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
+                    for idx in loaded_shard_id:
+                        original_weight_loader(param, loaded_weight.reshape(1), idx)
+                    return
 
+                split_dim = getattr(param, "output_dim", 0)
+                chunks = loaded_weight.split(split_sizes, dim=split_dim)
                 if len(chunks) != len(loaded_shard_id):
                     raise ValueError(
                         f"Chunk/shard mismatch: {len(chunks)=}, "
                         f"{len(loaded_shard_id)=}, {split_sizes=}"
                     )
-
                 for idx, chunk in zip(loaded_shard_id, chunks):
                     # Delegate each chunk to the param's original int-shard loader.
                     original_weight_loader(param, chunk, idx)
@@ -1558,6 +1589,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if _is_ignored_checkpoint_param(self, name):
+                        break
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
@@ -1571,12 +1604,15 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if _is_ignored_checkpoint_param(self, name):
+                        continue
                     logger.warning("Parameter %s not found in params_dict", name)
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
         return loaded_params
 
 

@@ -18,6 +18,10 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 `M >= 9`, staged MFMA decode), so the kernel dependency arrow points from
 `fused/` to the staged files, never back.
 
+For the staged package's second GEMM, TP uses direct atomic accumulation through
+64 tokens and scratch-plus-FP32-reduce at larger sizes; EP uses atomic
+accumulation because each rank owns only a sparse subset of the routed experts.
+
 ## Staged package files
 
 | File | Role |
