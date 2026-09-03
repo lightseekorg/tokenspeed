@@ -793,12 +793,15 @@ class ModelExecutor:
         prefill_tokens, prefill_accept = self.sampling_backend.sample(
             prefill_out, sampling_info[:num_extends]
         )
-        # sample() lands its outputs in the backend's packed output region —
-        # the same buffer prefix verify() writes next, so snapshot the
-        # prefill rows before verifying. Mixed rounds are eager-only, so the
-        # allocation never lands inside a captured graph.
+        # sample() lands its outputs (tokens, accept lengths and, with output
+        # logprobs on, the selected logprobs) in the backend's packed output
+        # region — the same buffer prefix verify() writes next, so snapshot
+        # the prefill rows before verifying. Mixed rounds are eager-only, so
+        # the allocation never lands inside a captured graph.
         prefill_tokens = prefill_tokens.clone()
         prefill_accept = prefill_accept.clone()
+        if prefill_out.next_token_logprobs is not None:
+            prefill_out.next_token_logprobs = prefill_out.next_token_logprobs.clone()
         decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
         decode_tokens, decode_accept = self.sampling_backend.verify(
             decode_out, sampling_info[num_extends:], candidates

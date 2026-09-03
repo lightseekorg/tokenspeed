@@ -235,8 +235,11 @@ drafter loop itself — not the sampling or metadata shape of the target.
 ### Outputs are persistent-buffer slices on both paths
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-packed output region (`_output_pack_buf`), so `get_packed_output_d2h`'s
-single-D2H fast path fires on eager and replay alike.
+persistent output buffers, on eager and replay alike. The flashinfer backend
+packs tokens and accept lengths into one region (`_output_pack_buf`), so its
+`get_packed_output_d2h` collapses the two device-to-host copies into one; the
+Triton backends return separate token and length buffers and take the
+executor's two-copy path (`get_packed_output_d2h` returns None).
 
 ## What stays graph-only
 

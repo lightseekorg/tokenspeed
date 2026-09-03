@@ -234,6 +234,85 @@ def test_mixed_round_preserves_prefill_outputs():
     assert out_accept[:num_extends].tolist() == [1, 1]
 
 
+@requires_cuda
+def test_mixed_round_preserves_prefill_logprobs():
+    """With output logprobs on, sample() hands back a view of the Triton
+    backend's selected-logprob buffer; verify() writes the same prefix, so the
+    executor must snapshot the prefill logprobs too."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
+
+    config = SamplingBackendConfig(
+        max_bs=MAX_BS,
+        max_draft_tokens_per_req=MAX_N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cuda",
+        enable_output_logprobs=True,
+        enable_nan_detection=False,
+    )
+    backend = TritonSamplingBackend(config)
+
+    num_extends, num_decodes, n = 2, 2, 2
+    bs = num_extends + num_decodes
+    rids = [f"m{i}" for i in range(bs)]
+    pool = list(range(bs))
+    sp = [SamplingParams(temperature=0.0) for _ in range(bs)]
+    for p in sp:
+        p.verify(VOCAB)
+    backend.prepare_step(
+        request_ids=rids,
+        request_pool_indices=pool,
+        sampling_params_list=sp,
+        num_tokens_per_req=n,
+    )
+
+    # One dominant logit per row, with a per-row runner-up gap so every row's
+    # selected logprob is distinct.
+    logits = torch.full((num_extends + num_decodes * n, VOCAB), -10.0, device="cuda")
+    for row in range(logits.shape[0]):
+        logits[row, row + 1] = 10.0
+        logits[row, 0] = 10.0 - float(row + 1)
+    expected = torch.log_softmax(logits.float(), dim=-1)
+    expected_prefill = expected[
+        torch.arange(num_extends, device="cuda"),
+        torch.arange(1, num_extends + 1, device="cuda"),
+    ]
+
+    info = SamplingBatchInfo(
+        req_pool_indices=torch.tensor(pool, device="cuda"),
+        valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int32, device="cuda"),
+        device="cuda",
+    )
+    candidates = torch.zeros(num_decodes, n, device="cuda", dtype=torch.int32)
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.num_extends = num_extends
+    ctx.bs = bs
+    ctx.decode_input_ids = None
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.sampling_backend = backend
+    executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
+
+    logits_output = LogitsProcessorOutput(next_token_logits=logits)
+    out_tokens, _ = ModelExecutor._run_sampling(
+        executor, logits_output, info, ctx, candidates=candidates
+    )
+    torch.cuda.synchronize()
+    assert out_tokens[:num_extends].tolist() == [1, 2]
+    torch.testing.assert_close(
+        logits_output.next_token_logprobs[:num_extends].float(),
+        expected_prefill,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
 def test_explicit_top_k_one_pins_seed():
     sp = SamplingParams(temperature=0.7, top_k=1, seed=None)
     sp.verify(VOCAB)
