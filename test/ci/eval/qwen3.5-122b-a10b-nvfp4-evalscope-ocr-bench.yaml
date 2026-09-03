@@ -22,7 +22,7 @@ server:
     --max-num-seqs 16
     --chunked-prefill-size 8192
     --max-prefill-tokens 8192
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization 0.95
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm

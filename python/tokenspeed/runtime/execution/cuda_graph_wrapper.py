@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
@@ -149,7 +150,7 @@ class DeepEPCudaGraphRunnerAdapter:
         except ImportError:
             return None
 
-    def capture(self):
+    def capture(self) -> None:
         """Call before ``torch.cuda.graph()`` capture."""
         cls = self._get_buffer_cls()
         if cls is None or cls._buffer is None:
@@ -298,12 +299,12 @@ class CudaGraphWrapper:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self):
+    def capture(self, observer: MemoryDeltaObserver) -> None:
         """
         Capture CUDA graphs for all configured batch sizes.
 
         Args:
-            forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
+            observer: Measurement scope entered around each graph capture.
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
@@ -330,7 +331,8 @@ class CudaGraphWrapper:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
+                with observer.measure("decode"):
+                    graph, output_buffers = self._capture_one(bs, variant=variant)
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
 

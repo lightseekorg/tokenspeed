@@ -28,7 +28,10 @@ from functools import partial
 from typing import Literal
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
+    CacheRecipe,
+    ProbeBatch,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
 )
@@ -182,6 +185,7 @@ def prepare_cache_setup(
     cache_budget_bytes: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
+    probe_batch: ProbeBatch | None = None,
 ) -> CacheSetup:
     """Apply one model recipe and size target/draft arenas from one budget."""
     recipe = _RECIPES.get(family)
@@ -196,4 +200,5 @@ def prepare_cache_setup(
         cache_budget_bytes=cache_budget_bytes,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        probe_batch=probe_batch,
     ).setup()

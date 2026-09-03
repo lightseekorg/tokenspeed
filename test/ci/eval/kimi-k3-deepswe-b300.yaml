@@ -38,7 +38,7 @@ server:
     --cudagraph-capture-sizes 1 2 4
     --max-prefill-tokens 32768
     --chunked-prefill-size 32768
-    --gpu-memory-utilization 0.90
+    --gpu-memory-utilization 0.95
     --disable-kvstore
     --disable-autotune
     --enable-allreduce-fusion

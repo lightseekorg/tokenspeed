@@ -174,6 +174,13 @@ to the kernel page tables that attention kernels consume (the
 happen at **one designated point**; beyond that point, kernels see physical
 page tables and nothing upstream sees them at all.
 
+`create_attn_components` must stay callable more than once for the same
+startup arguments: the CUDA-graph memory probe builds a throwaway arena before
+the real one. The backend overrides it derives from the model architecture are
+idempotent, and the one input they destroy -- the operator's own
+`attention_backend` -- is preserved in `original_attention_backend` on first
+resolution, so a second call resolves the same sub-backends as the first.
+
 Outside the mapping point, Python code should perceive `prefix_granularity`
 and `page_size` as little as possible. If a Python component needs either
 value, that is a design smell to justify, not a default to reach for.

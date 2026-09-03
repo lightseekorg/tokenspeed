@@ -41,7 +41,7 @@ server:
     --max-cudagraph-capture-size 16
     --cudagraph-capture-sizes 1 2 4 8 16
     --disable-prefill-graph
-    --gpu-memory-utilization 0.92
+    --gpu-memory-utilization 0.95
     --trust-remote-code
     --sampling-backend greedy
     --disable-kvstore

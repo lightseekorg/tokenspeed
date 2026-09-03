@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -55,6 +56,14 @@ if TYPE_CHECKING:
 CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]
 
 
+@dataclass(frozen=True)
+class ProbeBatch:
+    """The concurrency a throwaway probe arena holds, not the server's."""
+
+    requests: int
+    tokens: int
+
+
 class CacheRecipe(ABC):
     """One model family's cache recipe.
 
@@ -83,6 +92,7 @@ class CacheRecipe(ABC):
         cache_budget_bytes: int,
         decode_input_tokens: int,
         overlap_schedule_depth: int,
+        probe_batch: ProbeBatch | None = None,
     ) -> None:
         self.server_args = server_args
         self.model_config = model_config
@@ -92,6 +102,7 @@ class CacheRecipe(ABC):
         self.cache_budget_bytes = cache_budget_bytes
         self.decode_input_tokens = decode_input_tokens
         self.overlap_schedule_depth = overlap_schedule_depth
+        self.probe_batch = probe_batch
 
     # ------------------------------------------------------------------
     # The pipeline. One place, one order.
@@ -113,7 +124,11 @@ class CacheRecipe(ABC):
             max_padding_fraction=self.max_padding_fraction,
         )
         self.check_layout(layout)
-        num_lcm_blocks = self.num_lcm_blocks(layout)
+        num_lcm_blocks = (
+            self.num_lcm_blocks(layout)
+            if self.probe_batch is None
+            else self.parents_needed(layout, self.probe_batch.tokens)
+        )
         return CacheSetup(
             spec=CachePoolSpec(
                 family=self.family,
@@ -128,7 +143,12 @@ class CacheRecipe(ABC):
                 pool_options=self.pool_options(),
             ),
             num_draft_layers=self.num_draft_layers,
-            cache_budget_bytes=self.cache_budget_bytes,
+            cache_budget_bytes=(
+                self.cache_budget_bytes
+                if self.probe_batch is None
+                else self.workspace_bytes()
+                + (num_lcm_blocks + 1) * layout.lcm_block_bytes
+            ),
             fixed_workspace_bytes=self.workspace_bytes(),
         )
 
@@ -312,10 +332,17 @@ class CacheRecipe(ABC):
         The one place a recipe reads the scheduler's limits, so per-group page
         demand and the capacity search cannot size against different numbers.
         """
+        live_requests = self.attn_config.max_bs
+        scheduled_tokens = max(0, int(self.server_args.chunked_prefill_size))
+        context_len = self.attn_config.context_len
+        if self.probe_batch is not None:
+            live_requests = self.probe_batch.requests
+            scheduled_tokens = self.probe_batch.tokens
+            context_len = self.probe_batch.tokens
         return {
-            "max_live_requests": self.attn_config.max_bs,
-            "max_scheduled_tokens": max(0, int(self.server_args.chunked_prefill_size)),
-            "max_context_len": self.attn_config.context_len,
+            "max_live_requests": live_requests,
+            "max_scheduled_tokens": scheduled_tokens,
+            "max_context_len": context_len,
             "decode_input_tokens": self.decode_input_tokens,
             "overlap_schedule_depth": self.overlap_schedule_depth,
         }

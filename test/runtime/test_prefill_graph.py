@@ -21,6 +21,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.memory_delta import memory_delta_observer
+
 
 def _spec(
     group_id: str,
@@ -690,7 +692,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
             weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
         )
 
-        def _capture_all_buckets(_decode_wrapper):
+        def _capture_all_buckets(_decode_wrapper, _observer):
             if raises is not None:
                 raise raises
 
@@ -704,18 +706,18 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
         with self.assertRaises(RuntimeError) as caught:
-            pg.capture(None)
+            pg.capture(None, memory_delta_observer(record=False))
         self.assertIs(caught.exception, cause)
 
     def test_successful_capture_does_not_raise(self):
-        self._bare().capture(None)
+        self._bare().capture(None, memory_delta_observer(record=False))
 
     def test_oom_propagates(self):
         """OOM keeps its own type and message. The capture pool not fitting is
         an operator-visible sizing failure, not something to recover from."""
         pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
         with self.assertRaises(self.torch.cuda.OutOfMemoryError):
-            pg.capture(None)
+            pg.capture(None, memory_delta_observer(record=False))
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
