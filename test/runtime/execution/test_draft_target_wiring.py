@@ -100,6 +100,49 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     target.model.set_eagle3_layers_to_capture.assert_called_once_with([1, 2, 3])
 
 
+class _ModuleSharingDraft:
+    def __init__(self):
+        self.shared = None
+        self.legacy = None
+
+    def set_embed_and_head_module(self, embed, lm_head):
+        self.shared = (embed, lm_head)
+
+    def set_embed_and_head(self, embed, head):
+        self.legacy = (embed, head)
+
+
+def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
+    lm_head = object()
+    target = SimpleNamespace(
+        model=SimpleNamespace(
+            lm_head=lm_head,
+            get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"),
+        )
+    )
+    draft_model = _ModuleSharingDraft()
+    draft = SimpleNamespace(model=draft_model)
+
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
+        factory._wire_draft_to_target_model(_server_args("MTP"), target, draft)
+
+    assert draft_model.shared == ("EMBED", lm_head)
+    assert draft_model.legacy is None
+
+
+def test_wire_mtp_module_sharing_requires_target_lm_head():
+    target = SimpleNamespace(
+        model=SimpleNamespace(get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"))
+    )
+    draft = SimpleNamespace(model=_ModuleSharingDraft())
+
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Mtp),
+        pytest.raises(ValueError, match="complete lm_head module"),
+    ):
+        factory._wire_draft_to_target_model(_server_args("MTP"), target, draft)
+
+
 def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
     target, draft = mock.MagicMock(), mock.MagicMock()
     target.model.get_embed_and_head.return_value = ("E", "H")

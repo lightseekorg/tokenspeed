@@ -245,6 +245,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     @torch.no_grad()
     def forward(
         self,
