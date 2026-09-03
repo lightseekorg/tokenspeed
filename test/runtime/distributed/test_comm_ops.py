@@ -219,18 +219,27 @@ def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
     assert calls == [torch.distributed.group.WORLD]
 
 
-def test_missing_fabric_map_during_capture_is_a_wiring_error(monkeypatch):
+@pytest.mark.parametrize("capturing", [True, False])
+def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
+    monkeypatch, capturing
+):
+    """The raise does not depend on capture, and that is the point.
+
+    Outside a capture a missing map used to be gathered lazily, over WORLD.
+    This question is asked at dispatch, where the ranks present are the
+    group's, so that gather would block on world ranks that never arrive.
+    """
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
     monkeypatch.setattr(fabric, "_fabric_map", None)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather",
-        lambda *args: pytest.fail("capture must not start a collective"),
+        lambda *args, **kw: pytest.fail("a missing map must not start a collective"),
     )
 
-    with pytest.raises(RuntimeError, match="gathered at distributed initialization"):
+    with pytest.raises(RuntimeError, match="never gathered"):
         fabric.group_has_fabric((0, 1))
 
 
