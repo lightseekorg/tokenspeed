@@ -1,9 +1,8 @@
 api_version: ci.tokenspeed.io/v1
 # NVFP4 target + DSpark speculative decoding, on the same two-node shape as
-# the speculator-free NVFP4 gate. Speculative flags follow the proven AMD
-# DSpark gate (kimi-k3-dspark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml), except
-# the drafter backend: that gate's `mla` is the portable choice, and CuteDSL
-# is faster where it exists.
+# the speculator-free NVFP4 gate. This NVIDIA job intentionally retains DSpark
+# even though the AMD AIME26 gate now uses EAGLE3; CuteDSL remains the faster
+# drafter backend where it is available.
 # --disable-prefill-graph because prefill graphs add ~40 capture buckets on
 # top of the decode ones the speculator rides on, and the draft weights plus
 # its BF16 cache (kept BF16 automatically when the target KV is FP8) need the
