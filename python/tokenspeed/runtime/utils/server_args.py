@@ -293,6 +293,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
+    disable_cudagraph_memory_reserve: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
     disable_overlap_schedule: bool = False
@@ -1852,6 +1853,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--disable-cudagraph-memory-reserve",
+            action="store_true",
+            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
         )
         parser.add_argument(
             "--disable-autotune",

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
@@ -51,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import ProbeBatch
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -770,6 +772,9 @@ def create_attn_components(
     draft_model_config: ModelConfig | None = None,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    *,
+    graph_reserve_bytes: int = 0,
+    probe_batch: ProbeBatch | None = None,
 ) -> tuple[
     AttentionBackend,
     CachePool,
@@ -803,6 +808,7 @@ def create_attn_components(
         and not is_dspark_draft_model
         and is_deepseek_v4(draft_model_config.hf_config)
     )
+    server_args = copy.copy(server_args)
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
         server_args.attention_backend = "deepseek_v4"
@@ -939,14 +945,18 @@ def create_attn_components(
         cache_family,
         draft_cache_family,
     )
-    cache_memory = profile_available_cache_memory_bytes(
-        attn_config=config,
-        gpu_id=gpu_id,
-        tp_size=server_args.mapping.world_size,
-        gpu_memory_utilization=server_args.gpu_memory_utilization,
-        total_gpu_memory=gpu_memory,
-        world_group=server_args.mapping.world_group,
-    )
+    if probe_batch is None:
+        cache_memory = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            graph_reserve_bytes=graph_reserve_bytes,
+            world_group=server_args.mapping.world_group,
+        )
+    else:
+        cache_memory = 0
     cache_setup = prepare_cache_setup(
         family=cache_family,
         server_args=server_args,
@@ -957,6 +967,7 @@ def create_attn_components(
         cache_budget_bytes=cache_memory,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        probe_batch=probe_batch,
     )
     spec = cache_setup.spec
     target_spec = spec

@@ -61,6 +61,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -271,18 +272,20 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
+    def capture(
+        self, decode_wrapper: CudaGraphWrapper | None, observer: MemoryDeltaObserver
+    ) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
-        not stored). Buckets share
-        one PRIVATE mempool (first capture
-        allocates it), so graph memory stays ~the largest bucket's peak --
-        but never the decode graphs' pool: eager ops cache raw pointers to
-        buffers they lazily allocated inside a decode capture (flashinfer's
-        trtllm-gen MoE runner), and a prefill capture reusing those freed
-        blocks means every replay rewrites them, corrupting the next eager
-        call (IMA; A/B-proven on qwen3.5 MTP).
+        not stored) and ``observer`` measures each bucket capture. Buckets
+        share one PRIVATE mempool (first capture allocates it), so graph
+        memory stays ~the largest bucket's peak -- but never the decode
+        graphs' pool: eager ops cache raw pointers to buffers they lazily
+        allocated inside a decode capture (flashinfer's trtllm-gen MoE
+        runner), and a prefill capture reusing those freed blocks means every
+        replay rewrites them, corrupting the next eager call (IMA; A/B-proven
+        on qwen3.5 MTP).
 
         Runs under inference mode like serving forwards (in-place updates on
         inference-mode model state buffers are only legal there). There is no
@@ -310,9 +313,13 @@ class PrefillGraph:
                 max_bs=int(self.page_table.shape[0]),
             )
         with maybe_inference_mode():
-            self._capture_all_buckets(decode_wrapper)
+            self._capture_all_buckets(decode_wrapper, observer)
 
-    def _capture_all_buckets(self, decode_wrapper: CudaGraphWrapper | None) -> None:
+    def _capture_all_buckets(
+        self,
+        decode_wrapper: CudaGraphWrapper | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         rank = self.config.global_rank
         buckets = sorted(self.capture_buckets, reverse=True)
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
@@ -324,17 +331,18 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self.make_dummy_batch(bucket)
-            self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
-            )
-            self._captured_hidden_mode = self._ctx.capture_hidden_mode
-            # Breaks record the ambient dummy ctx; it is rebound live at replay.
-            try:
+            with observer.measure("prefill"):
+                self._ctx = self.make_dummy_batch(bucket)
+                self._land_input_embeds(
+                    self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]),
+                    bucket,
+                )
+                self._captured_hidden_mode = self._ctx.capture_hidden_mode
+                # Breaks record the ambient dummy ctx; it is rebound live at replay.
                 with active_forward(self._ctx):
                     self._capture_bucket(bucket, decode_wrapper)
-            finally:
-                self._ctx = None
+
+            self._ctx = None
         if self.config.global_rank == 0:
             sample = next(iter(self._captures.values()), None)
             logger.info(

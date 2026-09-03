@@ -27,6 +27,10 @@ from typing import TYPE_CHECKING
 import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.memory_delta import (
+    MemoryDeltaObserver,
+    memory_delta_observer,
+)
 from tokenspeed.runtime.execution.model_executor import (
     ModelExecutor,
     ModelExecutorConfig,
@@ -151,6 +155,7 @@ def create_model_executor(
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: CachePool | None = None,
+    memory_observer: MemoryDeltaObserver = memory_delta_observer(record=False),
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:
@@ -182,4 +187,5 @@ def create_model_executor(
         draft_model_runner=draft_model_runner,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
+        memory_observer=memory_observer,
     )

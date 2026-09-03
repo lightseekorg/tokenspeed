@@ -82,6 +82,10 @@ from typing import Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    CudagraphProbeConfig,
+    probe_cudagraph_memory,
+)
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -670,6 +674,31 @@ def build_device_side(
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
 
+    graph_reserve_bytes = 0
+    # Measured over Inkling, K2.5 and K3: the decode pools project at most a few
+    # hundred MB, so without the prefill buckets a probe reserves nothing while
+    # still leaving its own residue behind.
+    if (
+        not server_args.disable_cudagraph_memory_reserve
+        and not server_args.enforce_eager
+        and not server_args.disable_prefill_graph
+    ):
+        graph_reserve_bytes = probe_cudagraph_memory(
+            CudagraphProbeConfig(
+                server_args=server_args,
+                model_config=model_config,
+                draft_model_config=draft_model_config,
+                target=target,
+                draft=draft,
+                gpu_id=gpu_id,
+                global_rank=global_rank,
+                gpu_memory=min_per_gpu_mem,
+                overlap_schedule_depth=overlap_schedule_depth,
+                decode_input_tokens=decode_input_tokens,
+                max_batch_size=max_batch_size,
+            )
+        )
+
     (
         attn_backend,
         token_to_kv_pool,
@@ -686,6 +715,7 @@ def build_device_side(
         draft_model_config,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        graph_reserve_bytes=graph_reserve_bytes,
     )
 
     cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)

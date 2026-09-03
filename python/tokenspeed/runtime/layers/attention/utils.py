@@ -95,6 +95,8 @@ def profile_available_cache_memory_bytes(
     tp_size: int,
     gpu_memory_utilization: float,
     total_gpu_memory: int,
+    *,
+    graph_reserve_bytes: int = 0,
     world_group=None,
 ) -> int:
     cpu_group = (
@@ -108,7 +110,9 @@ def profile_available_cache_memory_bytes(
         distributed=tp_size > 1,
         cpu_group=cpu_group,
     )
-    cache_memory = available_gpu_memory - total_gpu_memory * (
-        1 - gpu_memory_utilization
+    cache_memory = (
+        available_gpu_memory
+        - total_gpu_memory * (1 - gpu_memory_utilization)
+        - graph_reserve_bytes / (1 << 30)
     )
     return int(cache_memory * (1 << 30))
