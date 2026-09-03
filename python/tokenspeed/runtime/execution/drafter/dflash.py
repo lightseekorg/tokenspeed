@@ -181,11 +181,48 @@ class DFlash(BaseDrafter):
         self.hidden_size = int(getattr(cfg, "hidden_size"))
         self.idle_forward_steps = 1
         self._init_native_buffers()
+        self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    def _validate_draft_attention_window(self) -> None:
+        """Reject a drafter backend that would drop the draft's window.
+
+        A backend that ignores a layer's ``sliding_window_size`` answers with
+        full-history attention instead, which raises nothing and shows up only
+        as wrong draft hidden states. Ask the built layers, not the config:
+        only the layers know whether this draft family applies the window.
+
+        Raises:
+            ValueError: The draft declares a window the backend cannot apply.
+        """
+        if getattr(self.attn_backend, "supports_layer_sliding_window", False):
+            return
+        windows = {
+            int(window)
+            for window in (
+                getattr(module, "sliding_window_size", None)
+                for module in self.model.modules()
+            )
+            if window is not None and int(window) >= 0
+        }
+        if not windows:
+            return
+        backend_name = (
+            self.draft_model_runner.server_args.drafter_attention_backend
+            or type(self.attn_backend).__name__
+        )
+        raise ValueError(
+            "The draft's attention layers declare a sliding window "
+            f"(window_left={sorted(windows)}), but the {backend_name!r} drafter "
+            "attention backend ignores per-layer sliding windows and would "
+            "silently give those layers full-history attention. Launch with "
+            "--drafter-attention-backend mla ('gluon' on AMD) for MLA drafts, "
+            "or one of mha/fa3/fa4/triton/flashinfer/trtllm_mha for GQA drafts."
+        )
 
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
