@@ -143,15 +143,13 @@ class MHAAttnBackend(PagedAttentionBackend):
             return_lse=False,
             solution=self.kernel_solution,
         )
-        # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
-        # (whole block in one decode forward), with uniform non-causal seq_lens.
+        # DFLASH draft: the whole block in one decode forward, with one
+        # decode metadata entry per block position and uniform non-causal
+        # seq_lens (block_decode_expansion).
         self.draft_block_decode = bool(config.draft_block_decode)
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, MHADecodeMetadata] = {}
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -211,34 +209,15 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_extend_prefix_len=int(extend_prefix_lens_cpu[:bs].max().item()),
         )
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        rows = max_bs * (self.spec_num_tokens if self.block_decode_active else 1)
-        self.page_table_buf = torch.zeros(
-            (rows, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        # Own the cache-seqlens buffer; every refresh copies the live lengths
-        # in. Under block decode the drafter fills it in-graph; seed a valid
-        # baseline so any pre-broadcast read stays in range.
-        self.seq_lens_buf = torch.full(
-            (rows,),
-            self.spec_num_tokens if self.block_decode_active else 0,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._decode_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
-
     def _decode_views(self, bs: int) -> MHADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers: one
         builder for capture and refresh, cached per bs — pointer-stable."""
         metadata = self._decode_views_by_bs.get(bs)
         if metadata is None:
-            rows = bs * (self.spec_num_tokens if self.block_decode_active else 1)
+            expanded_bs = bs * self.block_decode_expansion
             metadata = MHADecodeMetadata(
-                page_table=self.page_table_buf[:rows], seq_lens=self.seq_lens_buf[:rows]
+                page_table=self.page_table_buf[:expanded_bs],
+                seq_lens=self.seq_lens_buf[:expanded_bs],
             )
             self._decode_views_by_bs[bs] = metadata
         return metadata
@@ -256,8 +235,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         del num_extends
         if self.block_decode_active:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block rows. Under replay the block-end seq_lens
-            # are re-derived inside the captured graph
+            # spec_num_tokens block positions. Under replay the block-end
+            # seq_lens are re-derived inside the captured graph
             # (fill_block_decode_seq_lens); eager has no in-graph writer, and
             # the capture seeding needs the same safe baseline.
             spec = self.spec_num_tokens
@@ -267,9 +246,10 @@ class MHAAttnBackend(PagedAttentionBackend):
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
         else:
-            # Clamp short rows (padded rows replay at seq_len 1) to the verify
-            # floor: verify derives row lengths as seq - N + t + 1, which must
-            # stay positive. Plain decode and drafts have floor 1 (identity).
+            # Clamp short requests (padded requests replay at seq_len 1) to
+            # the verify floor: verify derives per-token lengths as
+            # seq - N + t + 1, which must stay positive. Plain decode and
+            # drafts have floor 1 (identity).
             torch.clamp_min(
                 seq_lens[:bs], self.verify_floor, out=self.seq_lens_buf[:bs]
             )

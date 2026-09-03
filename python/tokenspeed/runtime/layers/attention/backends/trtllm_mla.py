@@ -170,9 +170,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, TRTLLMMLADecodeMetadata] = {}
 
     # ---- Metadata initialization ----
 
@@ -282,19 +279,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        # Own the cache-seqlens buffer; every refresh copies the live lengths
-        # in, so graph state never depends on a shared mutable tensor.
-        self.seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
-        self.page_table_buf = torch.zeros(
-            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        self._decode_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
-
     def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -336,12 +320,19 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
         # bounds access by seq_lens).
-        cols = min(page_table.shape[1], self.max_num_pages)
-        self.page_table_buf[:bs, :cols].copy_(page_table[:bs, :cols])
+        num_pages = min(page_table.shape[1], self.max_num_pages)
+        self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs, :num_pages])
         self.forward_decode_metadata = metadata
 
+    @property
+    def block_decode_expansion(self) -> int:
+        """One entry per request even under block decode: ``forward_decode``
+        repeats it across the block's queries at forward time."""
+        return 1
+
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """Publish block-end cache lengths inside a captured draft graph.
+        """Publish block-end cache lengths inside a captured draft graph (one
+        entry per request; see :attr:`block_decode_expansion`).
 
         Args:
             bs: Number of draft requests.

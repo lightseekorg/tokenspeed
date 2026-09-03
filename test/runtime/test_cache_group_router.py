@@ -20,15 +20,15 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    PagedAttentionBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     CacheGroupGeometry,
 )
 from tokenspeed.runtime.layers.attention.backends.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
-)
-from tokenspeed.runtime.layers.attention.backends.paged import (
-    PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.write_locations import (
@@ -44,7 +44,7 @@ class WriteLocationMathTest(unittest.TestCase):
     """The slot rule over stacked tables, on CPU (the reference)."""
 
     def _tables(self, device="cpu"):
-        # Two groups, kernel pages 4 and 2, three rows, max_num_pages 6.
+        # Two groups, kernel pages 4 and 2, three requests, max_num_pages 6.
         tables = torch.tensor(
             [
                 [[7, 8, 9, 0, 0, 0], [3, 0, 5, 6, 0, 0], [0, 0, 0, 0, 0, 0]],
@@ -64,12 +64,12 @@ class WriteLocationMathTest(unittest.TestCase):
             tables, page_sizes, seq_lens, out, bs=3, tokens_per_req=1
         )
         # group 0 (P=4): pos 8 -> page 9 slot 0 = 36; pos 3 -> page 3 slot 3 = 15;
-        # padded row pos 0 -> page 0 -> dummy slot 0.
+        # padded request pos 0 -> page 0 -> dummy slot 0.
         self.assertEqual(out[0, :3].tolist(), [36, 15, 0])
         # group 1 (P=2): pos 8 -> page 10 slot 0 = 20; pos 3 -> page 0 (hole) -> 0.
         self.assertEqual(out[1, :3].tolist(), [20, 0, 0])
 
-    def test_verify_window_is_token_major_and_clamps_padded_rows(self):
+    def test_verify_window_is_token_major_and_clamps_padded_requests(self):
         tables, page_sizes = self._tables()
         seq_lens = torch.tensor([9, 1, 1], dtype=torch.int32)
         out = torch.zeros((2, 12), dtype=torch.int32)
@@ -79,9 +79,9 @@ class WriteLocationMathTest(unittest.TestCase):
         # request 0 writes positions 6,7,8 -> group 0 page 8 slots 2,3 then
         # page 9 slot 0 -> 34, 35, 36.
         self.assertEqual(out[0, :3].tolist(), [34, 35, 36])
-        # A short live row (seq_len 1 < 3) clamps every position at 0.
+        # A short live request (seq_len 1 < 3) clamps every position at 0.
         self.assertEqual(out[0, 3:6].tolist(), [12, 12, 12])
-        # A padded row is a null-page row by the fill contract -> slot 0.
+        # A padded request is all null pages by the fill contract -> slot 0.
         self.assertEqual(out[0, 6:9].tolist(), [0, 0, 0])
 
     def test_extend_span_is_request_major(self):
@@ -164,10 +164,12 @@ class GroupTableStacksTest(unittest.TestCase):
     def test_fill_rejects_short_tables(self):
         stacks = self._stacks()
         full = torch.ones((2, 3), dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "has 2 rows for a live batch of 3"):
+        with self.assertRaisesRegex(
+            RuntimeError, "has 2 request rows for a live batch of 3"
+        ):
             stacks.fill(3, 3, {FULL: full, SWA: full})
 
-    def test_idle_fill_zeroes_every_row(self):
+    def test_idle_fill_zeroes_every_request(self):
         stacks = self._stacks()
         stacks.tables.fill_(7)
         placeholder = torch.ones((4, 3), dtype=torch.int32)
@@ -205,13 +207,13 @@ class GroupTableStacksTest(unittest.TestCase):
         torch.manual_seed(1)
         stacks_cuda = self._stacks("cuda", max_bs=8)
         stacks_ref = self._stacks("cuda", max_bs=8)
-        rows, cols = 5, 3
+        bs, num_blocks = 5, 3
         # Bridge layout: per-group views of one packed storage (holes -1/0).
         packed = torch.randint(
-            -1, 20, (2 * rows * cols,), dtype=torch.int32, device="cuda"
+            -1, 20, (2 * bs * num_blocks,), dtype=torch.int32, device="cuda"
         )
-        full = packed[: rows * cols].view(rows, cols)
-        swa = packed[rows * cols :].view(rows, cols)
+        full = packed[: bs * num_blocks].view(bs, num_blocks)
+        swa = packed[bs * num_blocks :].view(bs, num_blocks)
         raw = {FULL: full, SWA: swa}
         stacks_cuda.fill(7, 5, raw)
         stacks_ref._fill_torch(7, 5, [full, swa])
@@ -319,12 +321,12 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.init_cuda_graph_state(4)
         return router, leaves
 
-    def _tables(self, rows=2):
-        base = torch.tensor([[5, 6, -1], [9, 0, 2]], dtype=torch.int32)[:rows]
+    def _tables(self, bs=2):
+        base = torch.tensor([[5, 6, -1], [9, 0, 2]], dtype=torch.int32)[:bs]
         return {
             FULL: base,
             SWA: base,
-            "linear_attention_0": torch.ones((rows, 2), dtype=torch.int32),
+            "linear_attention_0": torch.ones((bs, 2), dtype=torch.int32),
         }
 
     def test_rejects_non_history_groups(self):
@@ -379,9 +381,9 @@ class CacheGroupRouterTest(unittest.TestCase):
         router.forward(q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2)
         kind, gid, loc = leaves[SWA].calls[-1]
         self.assertEqual((kind, gid), ("decode", SWA))
-        # Slot math is page-size invariant: pos 8 of row 0 is raw page 7 slot 0
-        # (= kernel page 14 slot 0 at P=2) -> 28; pos 3 of row 1 is raw page 9
-        # slot 3 -> 39. Both groups agree because their tables alias.
+        # Slot math is page-size invariant: pos 8 of request 0 is raw page 7
+        # slot 0 (= kernel page 14 slot 0 at P=2) -> 28; pos 3 of request 1 is
+        # raw page 9 slot 3 -> 39. Both groups agree because their tables alias.
         self.assertEqual(loc.tolist(), [28, 39])
         self.assertIs(loc, router.write_locations(_layer(SWA), ForwardMode.DECODE))
         self.assertEqual(
@@ -462,7 +464,7 @@ class CacheGroupRouterTest(unittest.TestCase):
                 forward_mode=ForwardMode.DECODE,
                 block_tables=tables,
             )
-        # The idle replay has no live rows and tolerates any placeholder.
+        # The idle replay has no live requests and tolerates any placeholder.
         router.refresh_decode_metadata(
             2,
             0,
@@ -534,9 +536,10 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_with_prefix=False,
             )
 
-    def test_mixed_round_slices_decode_rows_after_the_extend_rows(self):
+    def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
         router, _ = self._router(spec=1)
-        # Row 0 extends (prefix 4, 5 new tokens), row 1 decodes at seq 4.
+        # Request 0 extends (prefix 4, 5 new tokens), request 1 decodes at
+        # seq 4.
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
         router.init_forward_metadata(
             2,
@@ -555,7 +558,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
             [24, 25, 26, 27, 0],
         )
-        # Decode row 1: pos 3 on page 9 -> 39.
+        # Decode request 1: pos 3 on page 9 -> 39.
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
         )
@@ -612,9 +615,9 @@ class CacheGroupRouterTest(unittest.TestCase):
 
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
-        full-history stack row: page-size invariant vs the raw table, and the
-        view survives refreshes at the same address (the capture contract the
-        deleted DraftPageStaging carried)."""
+        full-history table in the stack: page-size invariant vs the raw table,
+        and the view survives refreshes at the same address (the capture
+        contract the deleted DraftPageStaging carried)."""
         router, _ = self._router(is_draft=True)
         raw = torch.tensor([[5, 6, 2], [9, 3, 7]], dtype=torch.int32)
         tables = {

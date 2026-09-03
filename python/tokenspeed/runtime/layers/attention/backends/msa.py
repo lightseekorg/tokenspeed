@@ -44,10 +44,10 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.backends.paged import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
@@ -122,15 +122,13 @@ class MSAAttnBackend(PagedAttentionBackend):
         self.index_init_blocks = spec.index_init_blocks
         self.index_local_blocks = spec.index_local_blocks
 
-        # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
-        # (whole block in one decode forward), with uniform non-causal seq_lens.
+        # DFLASH draft: the whole block in one decode forward, with one
+        # decode metadata entry per block position and uniform non-causal
+        # seq_lens (block_decode_expansion).
         self.draft_block_decode = bool(config.draft_block_decode)
 
         self.forward_decode_metadata: MSADecodeMetadata | None = None
         self.forward_extend_metadata: MSAExtendMetadata | None = None
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, MSADecodeMetadata] = {}
 
         # Persistent decode index-score buffer, shared across sparse layers so
         # the indexer's -inf tail is reset once per forward instead of a
@@ -212,35 +210,16 @@ class MSAAttnBackend(PagedAttentionBackend):
             max_extend_prefix_len=max_extend_prefix_len,
         )
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        rows = max_bs * (self.spec_num_tokens if self.block_decode_active else 1)
-        self.page_table_buf = torch.zeros(
-            (rows, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        # Own the cache-seqlens buffer; under block decode the drafter fills
-        # it in-graph, so seed a valid baseline.
-        self.seq_lens_buf = torch.full(
-            (rows,),
-            self.spec_num_tokens if self.block_decode_active else 0,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._decode_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
-
     def _decode_views(self, bs: int) -> MSADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers; one
         builder for capture and refresh, cached per bs — pointer-stable."""
         metadata = self._decode_views_by_bs.get(bs)
         if metadata is None:
             if self.block_decode_active:
-                rows = bs * self.spec_num_tokens
+                expanded_bs = bs * self.block_decode_expansion
                 metadata = MSADecodeMetadata(
-                    page_table=self.page_table_buf[:rows],
-                    seq_lens=self.seq_lens_buf[:rows],
+                    page_table=self.page_table_buf[:expanded_bs],
+                    seq_lens=self.seq_lens_buf[:expanded_bs],
                 )
             else:
                 metadata = MSADecodeMetadata(
@@ -268,8 +247,8 @@ class MSAAttnBackend(PagedAttentionBackend):
         del num_extends
         if self.block_decode_active:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block rows. Under replay the block-end seq_lens
-            # are re-derived inside the captured graph
+            # spec_num_tokens block positions. Under replay the block-end
+            # seq_lens are re-derived inside the captured graph
             # (fill_block_decode_seq_lens); eager fills them here.
             spec = self.spec_num_tokens
             self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(

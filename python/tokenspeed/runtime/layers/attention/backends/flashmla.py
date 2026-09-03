@@ -200,9 +200,6 @@ class FlashMLABackend(PagedAttentionBackend):
         self.forward_decode_metadata: FlashMLADecodeMetadata | None = None
         self.forward_prefill_metadata: _PrefillMetadata | None = None
         self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, FlashMLADecodeMetadata] = {}
         # FlashMLA builds its tile schedule lazily inside the FIRST
         # flash_mla_with_kvcache call (from that call's cache_seqlens) and then
         # freezes it on the FlashMLASchedMeta object: later calls keep the
@@ -384,22 +381,6 @@ class FlashMLABackend(PagedAttentionBackend):
     # CUDA graph (decode only, any q_len)
     # ------------------------------------------------------------------
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        # The router hands this leaf [bs, max_num_pages] tables (context_len
-        # already carries the spec verify overshoot); null page 0 is the
-        # padding contract's dereferenceable dummy.
-        self.page_table_buf = torch.zeros(
-            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        # Own the persistent cache_seqlens buffer the captured decode kernel reads
-        self.seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
-        # Buffers were (re)allocated: cached per-bs views must rebuild.
-        self._decode_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
-
     def _decode_views(self, bs: int) -> FlashMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -462,14 +443,20 @@ class FlashMLABackend(PagedAttentionBackend):
         previous step's lengths."""
         self._write_decode_seq_lens(seq_lens.shape[0], seq_lens)
 
+    @property
+    def block_decode_expansion(self) -> int:
+        """One entry per request even under block decode: ``forward_decode``
+        repeats it across the block's queries at forward time."""
+        return 1
+
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.
 
         A block drafter runs its multi-token pass inside the captured graph and
-        writes the per-request block-end length here (one row per request; the
-        block's ``draft_query_width`` queries share it, non-causal).
-        ``forward_decode`` repeats each row across the block's queries, so the
-        graph keeps ``bs`` rows — mirrors ``TRTLLMMLABackend``.
+        writes the per-request block-end length here (one entry per request;
+        the block's ``draft_query_width`` queries share it, non-causal).
+        ``forward_decode`` repeats each entry across the block's queries, so
+        the graph keeps ``bs`` entries — mirrors ``TRTLLMMLABackend``.
         """
         if not self.draft_block_decode:
             raise RuntimeError("Block decode sequence lengths require DFLASH mode.")

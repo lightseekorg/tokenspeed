@@ -110,7 +110,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
 
-        # Block draft: rows expand per block position; see block_decode_active.
+        # Block draft: one decode metadata entry per block position; see
+        # block_decode_expansion.
         self.draft_block_decode = bool(config.draft_block_decode)
 
         # MLA dimensions
@@ -165,9 +166,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.forward_decode_metadata: CuteDSLMLADecodeMetadata | None = None
         self.forward_prefill_metadata: CuteDSLMLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
-        self._decode_views_by_bs: dict[int, CuteDSLMLADecodeMetadata] = {}
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""
@@ -224,7 +222,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
             )
-        # Target mixed/idle batches carry decode rows whose metadata this
+        # Target mixed/idle batches carry decode requests whose metadata this
         # init must cover; the same in-place refresh serves them. A draft's
         # decode metadata instead comes from the wrapper's refresh after this
         # init (the unified draft contract).
@@ -305,20 +303,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int) -> None:
-        # Own the cache-seqlens buffer; every refresh copies the live lengths
-        # in. Block decode records spec_num_tokens rows per request.
-        rows = max_bs * (self.spec_num_tokens if self.block_decode_active else 1)
-        self.seq_lens_buf = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self.page_table_buf = torch.zeros(
-            (rows, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        self._decode_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
-
     def _decode_views(self, bs: int) -> CuteDSLMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -329,11 +313,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         if metadata is not None:
             return metadata
         if self.block_decode_active:
-            rows = bs * self.spec_num_tokens
+            expanded_bs = bs * self.block_decode_expansion
             metadata = CuteDSLMLADecodeMetadata(
-                page_table=self.page_table_buf[:rows],
+                page_table=self.page_table_buf[:expanded_bs],
                 max_seq_len_k=self.max_context_len,
-                seq_lens_k=self.seq_lens_buf[:rows],
+                seq_lens_k=self.seq_lens_buf[:expanded_bs],
                 num_extends=0,
                 q_len_per_req=1,
             )
@@ -361,21 +345,21 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         for_graph_replay: bool = False,
     ) -> None:
         metadata = self._decode_views(bs)
-        # The cached view bakes num_extends=0; a mixed round's decode rows
-        # start after the extend rows, so publish this round's split.
+        # The cached view bakes num_extends=0; a mixed round's decode requests
+        # start after the extend requests, so publish this round's split.
         metadata.num_extends = num_extends
         if self.block_decode_active:
-            # Replicate each request's page table across its block rows. Under
-            # replay the lengths come from fill_block_decode_seq_lens, inside
-            # the graph; eager has no in-graph writer, so fill here (and the
-            # capture seeding needs the same safe baseline).
+            # Replicate each request's page table across its block positions.
+            # Under replay the lengths come from fill_block_decode_seq_lens,
+            # inside the graph; eager has no in-graph writer, so fill here (and
+            # the capture seeding needs the same safe baseline).
             spec = self.spec_num_tokens
-            width = self.page_table_buf.shape[1]
-            rows = self.page_table_buf[: bs * spec].view(bs, spec, width)
-            cols = min(page_table.shape[1], width)
-            rows[:, :, :cols].copy_(page_table[:bs, None, :cols])
-            if cols < width:
-                rows[:, :, cols:].zero_()
+            max_num_pages = self.page_table_buf.shape[1]
+            replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
+            num_pages = min(page_table.shape[1], max_num_pages)
+            replicated[:, :, :num_pages].copy_(page_table[:bs, None, :num_pages])
+            if num_pages < max_num_pages:
+                replicated[:, :, num_pages:].zero_()
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = metadata
@@ -384,10 +368,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
-        # bounds access by seq_lens). Padded (and idle) rows are already null
-        # pages in the router table.
-        cols = min(page_table.shape[1], self.page_table_buf.shape[1])
-        self.page_table_buf[:bs, :cols].copy_(page_table[:bs, :cols])
+        # bounds access by seq_lens). Padded (and idle) requests are already
+        # null pages in the router table.
+        num_pages = min(page_table.shape[1], self.page_table_buf.shape[1])
+        self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs, :num_pages])
         self.forward_decode_metadata = metadata
 
     # ---- Forward: Decode ----

@@ -44,14 +44,14 @@ Its extend inputs are one required, keyword-only bundle on every node —
 runner-facing (`base.py`: router, V4, Mamba/KDA, composites) and leaf
 (`paged.py`) alike: `extend_seq_lens`, `extend_seq_lens_cpu`,
 `extend_prefix_lens`, `extend_prefix_lens_cpu` are plain `torch.Tensor`
-(`[>= num_extends]` rows; empty, never `None`, when there are no extend
-rows) and `extend_with_prefix` is a plain `bool`. No default values: the
-runner passes the `[:num_extends]` slices of its input buffers on every
-call (the idle replay passes the empty `[:0]` slices), so a node that reads
-a field can never see a silently-defaulted one. This is deliberate — a
-`= False` default once hid `extend_with_prefix` being swallowed by a
-composite's `**kwargs`, and FlashMLA planned a ragged prefill for a
-prefix-cached batch.
+(`[>= num_extends]` entries; empty, never `None`, when there are no
+extend requests) and `extend_with_prefix` is a plain `bool`. No default
+values: the runner passes the `[:num_extends]` slices of its input buffers
+on every call (the idle replay passes the empty `[:0]` slices), so a node
+that reads a field can never see a silently-defaulted one. This is
+deliberate — a `= False` default once hid `extend_with_prefix` being
+swallowed by a composite's `**kwargs`, and FlashMLA planned a ragged prefill
+for a prefix-cached batch.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
@@ -65,10 +65,11 @@ path, not a fallback.
 
 ### Padding contract
 
-`bs` is the row count being prepared (the padded graph batch under replay);
-`actual_bs` is the live-request count. Rows in `[actual_bs, bs)` are padding
-and must resolve to the null page 0 / dummy slot so they never touch a live
-request's cache. Eager passes `bs == actual_bs` (unpadded — no wasted FLOPs);
+`bs` is the request count being prepared (the padded graph batch under
+replay); `actual_bs` is the live-request count. Requests in `[actual_bs, bs)`
+are padding and must resolve to the null page 0 / dummy slot so they never
+touch a live request's cache. Eager passes `bs == actual_bs` (unpadded — no
+wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
 (`execute_idle_forward` calls `model_runner.forward(IDLE)` directly).
 
@@ -126,9 +127,11 @@ something the idle refresh cannot express:
 * **HybridLinearAttnBackend / MSAHybrid**: pure fan-out to their children so
   the real captures above are reached.
 
-A new backend implements `refresh_decode_metadata` + `init_cuda_graph_state`
-and inherits capture; a new override must name its kernel-imposed asymmetry
-here. Leaf capture/refresh signatures are pinned by
+A new backend implements `refresh_decode_metadata` and inherits both
+`init_cuda_graph_state` (the page-table / cache-seqlens pair, sized by
+`block_decode_expansion`; extend it for extra persistent state) and
+capture; a new override must name its kernel-imposed asymmetry here. Leaf
+capture/refresh signatures are pinned by
 `test_unified_decode_path.py::CaptureSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
@@ -159,12 +162,13 @@ NOWHERE else — the same two steps in every round:
   `draft_seq_lens_buf` (freshly seeded from the batch seq_lens);
 * **extend/mixed round**: draft prefill init reading the accepted-prefix
   seq_lens view (never the mutable draft buffer), then the same draft refresh
-  with plain 1-token rows — deliberately NOT the packed verify width, which
-  would take V4's packed-decode arm and clobber `forward_prefill_metadata`.
+  with one token per request — deliberately NOT the packed verify width,
+  which would take V4's packed-decode arm and clobber
+  `forward_prefill_metadata`.
 
 Backends' `init_forward_metadata` must NOT double-fill draft decode metadata
 as a side effect (the deleted `is_extend() and self.is_draft` arms); the
-mixed/idle decode arms that remain serve the target's decode rows only.
+mixed/idle decode arms that remain serve the target's decode requests only.
 Drafters republish their in-loop seq_lens edits explicitly each step via
 `advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
 (vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
@@ -180,18 +184,20 @@ that safe is the slot discipline: init writes prefill-slot metadata, refresh
 writes decode-slot metadata, and forwards read the slot matching their mode
 (`forward_prefill_metadata` / `forward_decode_metadata`; Inkling's conv
 wrapper mirrors this with `conv_prefill_metadata` / `conv_decode_metadata`).
-A round that runs no decode steps (vanilla MTP re-runs prompt rows as EXTEND
-depths) leaves the refreshed decode slot unread; a block drafter (DFLASH)
-re-runs the same refresh inside each block-decode step, overwriting it. A
+A round that runs no decode steps (vanilla MTP re-runs prompt requests as
+EXTEND depths) leaves the refreshed decode slot unread; a block drafter
+(DFLASH) re-runs the same refresh inside each block-decode step, overwriting
+it. A
 backend that lets one call clobber the other slot's metadata is in breach —
 that, not drafter special-casing, is the invariant to fix.
 
 **V4's packed-draft deviation (documented):** a V4 draft's packed verify
 round legitimately writes BOTH slots at its end — the bs*N packed views ride
 the prefill slot (the step-0 shape carrier; `_select_decode_metadata`
-resolves them there through a DECODE-mode-gated fallback), and the bs-row
-step views own the decode slot. Capture and replay refresh reach that state
-through the SAME publisher (`_publish_draft_round`), so replay reproduces
+resolves them there through a DECODE-mode-gated fallback), and the
+per-request step views own the decode slot. Capture and replay refresh reach
+that state through the SAME publisher (`_publish_draft_round`), so replay
+reproduces
 capture's slot end state by construction — the pointer guard's capture-end
 snapshot verifies it. Slot writes exist only in the three publishers; the
 `forward_deepseek_v4_*` read paths thread resolved metadata as parameters
@@ -218,9 +224,10 @@ pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
 ### Non-speculative serving is the N == 1 case, not a second path
 
-One sampling rule for every batch: **prefill rows sample, decode rows
-verify** (`ModelExecutor._run_sampling`). The decode candidate window is
-always `[num_decodes, output_length]` (`_decode_candidates`, a persistent
+One sampling rule for every batch: **prefill requests sample, decode
+requests verify** (`ModelExecutor._run_sampling`). The decode candidate
+window is always `[num_decodes, output_length]` (`_decode_candidates`, a
+persistent
 `input_ids_buf` view): column 0 the last verified token, columns 1.. the
 draft candidates. Without a drafter, `output_length == 1` — a one-column
 window that accepts nothing and resolves to exactly one sampled token
@@ -292,17 +299,18 @@ Consumers take their own groups by positive claim
 (`cache_consumer_families`); extra groups ride through untouched.
 
 Inside the router, `GroupTableStacks` holds the
-`[G, max_bs, stack_max_num_pages]` kernel-page table stack (each group's row
-expanded to its leaf's `kernel_page_size` and padded to the leaf's
+`[G, max_bs, stack_max_num_pages]` kernel-page table stack (each group's
+table expanded to its leaf's `kernel_page_size` and padded to the leaf's
 `max_num_pages`; the stack's column count is the widest group's) and the
 `[G, max_bs * N]` decode write-location stack. Both are allocated once and
 refilled in place: leaves copy their view out, while the decode write-slot
 views, the block drafters' `draft_history_view` and the QSA indexer's group
 tables read the stack storage inside captured graphs. The fill is one expand
 launch per group with plain scalar arguments (scheduler block count, source
-stride, live rows) — no device-side metadata tensor, because the per-step
-pinned staging + H2D it would need lands on the bs=1 latency path; padding
-rows (`[actual_bs, bs)`) and each group's column tail resolve to null page 0.
+stride, live requests) — no device-side metadata tensor, because the
+per-step pinned staging + H2D it would need lands on the bs=1 latency path;
+padding requests (`[actual_bs, bs)`) and each group's column tail resolve to
+null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 depend on the views sharing one storage. The slot math lives in
 `write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
@@ -333,9 +341,12 @@ each refresh; they do not alias router storage. A single-group model is a
 router with one leaf; there is no single-table special case anywhere.
 
 The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
-`block_decode_active` (spec verify geometry as a clamp floor), FlashMLA's
-`for_graph_replay` tile-schedule swap, and the MLA family's `num_extends`
-decode-row slicing (`override_num_extends`).
+`block_decode_active` (spec verify geometry as a clamp floor),
+`block_decode_expansion` (whether block decode materializes one metadata
+entry per block position, or the leaf repeats one per request at forward
+time — FlashMLA, TRT-LLM MLA), FlashMLA's `for_graph_replay` tile-schedule
+swap, and the MLA family's `num_extends` decode-request slicing
+(`override_num_extends`).
 
 One side channel exists beyond the table: `set_request_slots(req_pool_indices)`,
 a no-op by default, which the router calls on every leaf after each
@@ -357,10 +368,11 @@ buffer; `fill_input_buffers` takes no table.
   stacks (`[sum(extend_seq_lens)]`, request-major); `write_locations(layer,
   EXTEND)` returns exactly that span.
 * **Decode / verify**: `refresh_decode_metadata` publishes the token-major
-  `[rows * N]` window views (`decode_write_locations`, pointer-stable per
+  `[bs * N]` window views (`decode_write_locations`, pointer-stable per
   bs — the graph records them through the leaves' KV writes, and the
   pointer guard walks this slot). A MIXED round's draft refresh sets
-  `_decode_row_offset = num_extends` so DECODE reads skip the extend rows.
+  `_decode_request_offset = num_extends` so DECODE reads skip the extend
+  requests.
 * **Draft steps**: the drafters declare each step's window, the router owns
   the math and the address-stable storage. `publish_draft_step_locations(
   cache_start, n)` computes the window over the location stack (the same
@@ -381,7 +393,7 @@ buffer; `fill_input_buffers` takes no table.
   `set_mla_kv_buffer`, V4 group writes, QSA) fetch
   `ctx.attn_backend.write_locations(layer, mode)` immediately before the
   write. A model path that writes multiple mode windows in one shot (the
-  MLA draft's step-0 full-row write) concatenates the EXTEND span and the
+  MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
   DECODE window — eager-only, MIXED rounds never run under a captured
   graph. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
@@ -419,9 +431,10 @@ down to the router and V4).
 ## Regression gates
 
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
-  replay refresh produce identical live rows over the same buffers; lazy
-  above-ladder views are pointer-stable; the graph_ptr_guard walk reports a
-  rebound tensor by path and pins every tensor under the slots; FlashMLA's
+  replay refresh produce identical live-request contents over the same
+  buffers; lazy above-ladder views are pointer-stable; the graph_ptr_guard
+  walk reports a rebound tensor by path and pins every tensor under the
+  slots; FlashMLA's
   tile schedule stays off the views (capture keeps its object alive, replay
   refresh leaves it alone, eager refresh and every drafter seq_lens edit
   bind a fresh one, in-graph edits keep theirs alive); leaf capture/refresh

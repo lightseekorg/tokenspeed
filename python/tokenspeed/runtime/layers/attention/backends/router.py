@@ -51,6 +51,9 @@ import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    PagedAttentionBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     CacheGroupGeometry,
     learn_cache_group_geometry,
@@ -58,9 +61,6 @@ from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
 from tokenspeed.runtime.layers.attention.backends.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
-)
-from tokenspeed.runtime.layers.attention.backends.paged import (
-    PagedAttentionBackend,
 )
 
 if TYPE_CHECKING:
@@ -75,8 +75,8 @@ class DraftHistoryView:
 
     Attributes:
         table: ``[max_bs, stack_max_num_pages]`` contiguous kernel-page table
-            (the router's stack row; address-stable for the graph's
-            lifetime).
+            (one group's table in the router's stack; address-stable for the
+            graph's lifetime).
         page_size: Tokens per kernel page.
         max_tokens: Per-request token capacity of the group's own columns.
     """
@@ -117,8 +117,8 @@ class CacheGroupRouter(AttentionBackend):
         is_draft: Whether this is the draft side (selects the draft-hook
             behavior; write locations are router-owned on both sides).
         spec_num_tokens: Verify width ``N`` (1 without speculation); the
-            target's decode write window and the location stack's row
-            capacity.
+            target's decode write window and the location stack's
+            per-request capacity.
         device: Buffer device.
         """
         self._leaf_factory = leaf_factory
@@ -134,7 +134,7 @@ class CacheGroupRouter(AttentionBackend):
         # refreshed in place) and the extend slot (fresh per round).
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
-        self._decode_row_offset = 0
+        self._decode_request_offset = 0
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
 
     def bind(
@@ -303,8 +303,8 @@ class CacheGroupRouter(AttentionBackend):
 
     def decode_window_locations(self) -> torch.Tensor:
         """The full-history group's current decode write window view
-        (``[decode_rows * tokens_per_req]``, address-stable; a MIXED round's
-        extend rows are skipped). DFLASH reads the TARGET router's verify
+        (``[decode_bs * tokens_per_req]``, address-stable; a MIXED round's
+        extend requests are skipped). DFLASH reads the TARGET router's verify
         window through this to copy target-aligned KV into the draft cache
         (the pools share one page-id space)."""
         published = self.decode_write_locations
@@ -312,8 +312,8 @@ class CacheGroupRouter(AttentionBackend):
             raise RuntimeError("decode window requested before any decode refresh")
         gid = self.group_ids[self._draft_history_index()]
         locs = published.by_group[gid]
-        if self._decode_row_offset:
-            locs = locs[self._decode_row_offset * published.tokens_per_req :]
+        if self._decode_request_offset:
+            locs = locs[self._decode_request_offset * published.tokens_per_req :]
         return locs
 
     def extend_span_locations(self) -> torch.Tensor:
@@ -327,10 +327,10 @@ class CacheGroupRouter(AttentionBackend):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the rows the forward covers.
+        """This layer's KV write slots for the requests the forward covers.
 
         Decode (and the decode half of a MIXED round) returns the token-major
-        ``[rows * N]`` window view over the location stack; extend returns the
+        ``[bs * N]`` window view over the location stack; extend returns the
         ``[sum(extend_seq_lens)]`` span computed at ``init_forward_metadata``.
         """
         self._leaf_for(layer)
@@ -342,8 +342,8 @@ class CacheGroupRouter(AttentionBackend):
                     "decode write locations requested before any decode refresh"
                 )
             locs = published.by_group[gid]
-            if self._decode_row_offset:
-                locs = locs[self._decode_row_offset * published.tokens_per_req :]
+            if self._decode_request_offset:
+                locs = locs[self._decode_request_offset * published.tokens_per_req :]
             return locs
         if self._extend_write_locations is None:
             raise RuntimeError(
@@ -386,10 +386,10 @@ class CacheGroupRouter(AttentionBackend):
         """Extend / mixed / idle-warmup metadata for every leaf.
 
         Expands each group's raw table into the stack, computes the extend
-        write spans (and, for a MIXED round, the decode rows' verify window),
-        then hands every leaf its ``[bs, max_num_pages]`` kernel page table.
-        ``extend_with_prefix`` (some extend row continues a cached or
-        chunked prefix) travels with the extend lengths: leaves size their
+        write spans (and, for a MIXED round, the decode requests' verify
+        window), then hands every leaf its ``[bs, max_num_pages]`` kernel page
+        table. ``extend_with_prefix`` (some extend request continues a cached
+        or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged.
         """
         del kwargs
@@ -398,21 +398,22 @@ class CacheGroupRouter(AttentionBackend):
                 "decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend/mixed/idle ({forward_mode})"
             )
-        live_rows = 0 if forward_mode.is_idle() else bs
-        self._check_live_delivery(live_rows, block_tables)
-        self.stacks.fill(bs, live_rows, block_tables)
+        live_bs = 0 if forward_mode.is_idle() else bs
+        self._check_live_delivery(live_bs, block_tables)
+        self.stacks.fill(bs, live_bs, block_tables)
         self._extend_write_locations = None
-        self._decode_row_offset = 0
+        self._decode_request_offset = 0
         if forward_mode.is_extend_or_mixed() and num_extends > 0:
             total = int(sum(int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()))
             self._extend_write_locations = self.stacks.extend_locations(
                 extend_prefix_lens[:num_extends], extend_seq_lens[:num_extends], total
             )
         if forward_mode.is_mixed():
-            # The decode rows follow the extend rows; their verify window is
-            # the same math as a pure decode over every row, sliced.
+            # The decode requests follow the extend requests; their verify
+            # window is the same math as a pure decode over every request,
+            # sliced.
             self._refresh_decode_locations(bs, seq_lens)
-            self._decode_row_offset = num_extends
+            self._decode_request_offset = num_extends
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata(
                 bs,
@@ -450,9 +451,10 @@ class CacheGroupRouter(AttentionBackend):
             )
         self._check_live_delivery(actual_bs, block_tables)
         self.stacks.fill(bs, actual_bs, block_tables)
-        # The window covers every row; DECODE reads skip the extend rows a
-        # MIXED round's draft refresh carries (num_extends is 0 on targets).
-        self._decode_row_offset = num_extends
+        # The window covers every request; DECODE reads skip the extend
+        # requests a MIXED round's draft refresh carries (num_extends is 0 on
+        # targets).
+        self._decode_request_offset = num_extends
         self._refresh_decode_locations(bs, seq_lens)
         for gid, leaf in self.leaves.items():
             leaf.refresh_decode_metadata(
@@ -484,7 +486,7 @@ class CacheGroupRouter(AttentionBackend):
                 f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
             )
         self.stacks.fill(bs, 0, block_tables)
-        self._decode_row_offset = 0
+        self._decode_request_offset = 0
         self._refresh_decode_locations(bs, seq_lens)
         for gid, leaf in self.leaves.items():
             leaf.init_forward_metadata_capture_cuda_graph(
@@ -521,7 +523,7 @@ class CacheGroupRouter(AttentionBackend):
         so their kernels record this table's address at capture; the router
         owns the storage and its refresh rewrites it in place each round.
 
-        The tensor is the FULL contiguous stack row
+        The tensor is the group's FULL contiguous table in the stack
         (``[max_bs, stack_max_num_pages]``, batch-ordered): the slot kernels
         assume row-major contiguity. Columns past the group's own
         ``max_num_pages`` are null pages by the fill contract and resolve to
@@ -592,7 +594,7 @@ class CacheGroupRouter(AttentionBackend):
         # Window positions run cache_start .. cache_start+n-1; the decode
         # kernel derives them as end-n .. end-1, so feed end = start + n.
         self.stacks.compute_decode_locations(bs, cache_start + num_tokens, num_tokens)
-        self._decode_row_offset = 0
+        self._decode_request_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
         return self.stacks.decode_locs[i, : bs * num_tokens]

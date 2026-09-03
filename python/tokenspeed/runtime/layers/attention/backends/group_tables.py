@@ -29,9 +29,9 @@ stack of kernel page tables — group ``g`` expanded to its leaf's
 stack of decode write slots derived from those tables. Both fills are one
 launch for every group (the bridge uploads all groups into one packed
 buffer, so the unpack reads it directly); the padding contract is uniform:
-rows past the live batch and columns past a group's table are 0, the
-zero-initialized dummy page, safe to dereference and never a live request's
-cache.
+request rows past the live batch and page columns past a group's
+``max_num_pages`` are 0, the zero-initialized dummy page, safe to
+dereference and never a live request's cache.
 
 The stacks are allocated once (``init_cuda_graph_state``) and refilled in
 place. Leaves copy their ``[bs, max_num_pages]`` view into their own
@@ -66,7 +66,7 @@ class GroupTableSpec:
         block_granularity: Tokens per scheduler block (raw table unit).
         kernel_page_size: Tokens per kernel page of the consuming leaf; must
             divide ``block_granularity``.
-        max_num_pages: Kernel pages per row the leaf reads
+        max_num_pages: Kernel pages per request the leaf reads
             (``leaf.max_num_pages``).
     """
 
@@ -89,20 +89,21 @@ class GroupTableSpec:
 @triton.jit(do_not_specialize=["num_blocks", "src_stride_b", "actual_bs"])
 def _unpack_group_kernel(
     src_ptr,  # this group's raw table [>= actual_bs, num_blocks] int32
-    dst_ptr,  # this group's stack rows [max_bs, stack_max_num_pages] int32
-    num_blocks,  # scheduler blocks per raw row (the source column count)
+    dst_ptr,  # this group's stack [max_bs, stack_max_num_pages] int32
+    num_blocks,  # scheduler blocks per request (the raw table's column count)
     src_stride_b,
     ratio,  # kernel pages per scheduler block
-    max_num_pages,  # kernel pages per row the leaf reads
+    max_num_pages,  # kernel pages per request the leaf reads
     dst_stride_b,
     stack_max_num_pages,  # the stack's column count (widest group)
     actual_bs,
     BLOCK_COLS: tl.constexpr,
 ):
-    """Expand one group's raw block table into its kernel-page stack rows.
+    """Expand one group's raw block table into its kernel-page stack, one
+    request per row.
 
     One launch per group with plain scalar arguments: the per-step values
-    (block count, source stride, live rows) change every step, and hosting
+    (block count, source stride, live requests) change every step, and hosting
     them in a device-side metadata tensor would cost a pinned staging
     allocation plus an H2D copy on the latency-critical bs=1 refresh path.
     ``do_not_specialize`` keeps those varying scalars from triggering
@@ -118,15 +119,15 @@ def _unpack_group_kernel(
         # contract's tail: always the null page 0, never expansion residue
         # (the slot kernels clamp at the stack's column count, so they can
         # read them).
-        in_row = live & (block < num_blocks) & (col < max_num_pages)
+        in_table = live & (block < num_blocks) & (col < max_num_pages)
         raw = tl.load(
-            src_ptr + b.to(tl.int64) * src_stride_b + block, mask=in_row, other=0
+            src_ptr + b.to(tl.int64) * src_stride_b + block, mask=in_table, other=0
         )
         # Holes and ragged padding (id <= 0) collapse onto the dummy page 0;
         # a real block expands to its ratio consecutive kernel pages.
         page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
         page = tl.where(raw > 0, page, 0)
-        vals = tl.where(in_row, page, 0)
+        vals = tl.where(in_table, page, 0)
         tl.store(
             dst_ptr + b * dst_stride_b + col,
             vals.to(tl.int32),
@@ -223,9 +224,10 @@ class GroupTableStacks:
         kernel pages and padded.
 
         Args:
-            bs: Rows to prepare (the padded graph batch, or ``actual_bs``).
-            actual_bs: Live rows; ``block_tables`` rows past it are ignored
-                and stack rows ``[actual_bs, bs)`` are zeroed.
+            bs: Requests to prepare (the padded graph batch, or ``actual_bs``).
+            actual_bs: Live requests; ``block_tables`` requests past it are
+                ignored and the stack's requests ``[actual_bs, bs)`` are
+                zeroed.
             block_tables: ``group_id -> [>= actual_bs, num_blocks]`` int32
                 raw scheduler tables covering every routed group (the
                 router's ``_check_live_delivery`` guards a live batch's dict).
@@ -237,8 +239,9 @@ class GroupTableStacks:
         if bs == 0:
             return
         if actual_bs == 0:
-            # Idle / warmup: no live rows to read — every row is the null
-            # page, whatever placeholder (or nothing) was delivered.
+            # Idle / warmup: no live requests to read — every request's row
+            # is the null page, whatever placeholder (or nothing) was
+            # delivered.
             self.tables[:, :bs].zero_()
             return
         srcs = [block_tables[gid] for gid in self.group_ids]
@@ -250,8 +253,8 @@ class GroupTableStacks:
                 )
             if src.shape[0] < actual_bs:
                 raise RuntimeError(
-                    f"cache group {gid!r} table has {src.shape[0]} rows for a live "
-                    f"batch of {actual_bs}"
+                    f"cache group {gid!r} table has {src.shape[0]} request rows for "
+                    f"a live batch of {actual_bs}"
                 )
         if self.tables.is_cuda:
             stack_max_num_pages = self.tables.shape[2]

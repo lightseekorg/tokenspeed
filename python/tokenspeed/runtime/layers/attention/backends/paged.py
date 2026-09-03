@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -57,18 +57,21 @@ class PagedAttentionBackend(ABC):
     """One cache group's paged attention kernels and their metadata.
 
     Persistent decode state is leaf-owned: ``init_cuda_graph_state`` allocates
-    the ``[rows, max_num_pages]`` page-table buffer and the ``[rows]``
-    cache-seqlens buffer a captured graph records, and every
-    ``refresh_decode_metadata`` copies the router-supplied table and lengths
-    into them in place. Extend metadata is rebuilt per round from the
-    supplied table (never graph-recorded; the prefill graph breaks at
-    attention).
+    the page-table buffer (``[entries, max_num_pages]``) and the cache-seqlens
+    buffer (``[entries]``) a captured graph records, where ``entries`` is
+    ``max_bs * block_decode_expansion`` — one metadata entry per request,
+    materialized per block position under block decode (see
+    :attr:`block_decode_expansion`) — and every ``refresh_decode_metadata``
+    copies the router-supplied table and lengths into them in place. Extend
+    metadata is rebuilt per round from the supplied table (never
+    graph-recorded; the prefill graph breaks at attention).
     """
 
     # Static CUDA-graph capability of this leaf class (see support.py).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
-    # Whether a block draft (DFLASH/DSpark) expands decode rows to
-    # spec_num_tokens per request; set from config by leaves that support it.
+    # Whether a block draft (DFLASH/DSpark) runs its whole non-causal block
+    # in one decode forward (see block_decode_active / block_decode_expansion);
+    # set from config by leaves that support it.
     draft_block_decode: bool = False
     # PD layerwise transfer counter, installed by the router; the MLA
     # leaves record the step inside their chunked prefill.
@@ -116,6 +119,11 @@ class PagedAttentionBackend(ABC):
         self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.head_dim = spec.head_dim
         self.cache_pool: CachePool | None = None
+        # Persistent decode buffers (``init_cuda_graph_state``) and the cached
+        # per-bs metadata views over them (each leaf's ``_decode_views``).
+        self.page_table_buf: torch.Tensor | None = None
+        self.seq_lens_buf: torch.Tensor | None = None
+        self._decode_views_by_bs: dict[int, Any] = {}
 
     # ------------------------------------------------------------------
     # Static shape / lifecycle
@@ -138,29 +146,68 @@ class PagedAttentionBackend(ABC):
 
     @property
     def verify_floor(self) -> int:
-        """Minimum per-row cache seq_len decode metadata must present.
+        """Minimum per-request cache seq_len decode metadata must present.
 
-        The target's verify window spans ``seq - N .. seq - 1`` so its rows
-        need ``seq_len >= N``; plain decode and drafts have floor 1, where the
-        clamp is the identity.
+        The target's verify window spans ``seq - N .. seq - 1`` so its
+        requests need ``seq_len >= N``; plain decode and drafts have floor 1,
+        where the clamp is the identity.
         """
         return self.spec_num_tokens if not self.is_draft else 1
 
     @property
     def block_decode_active(self) -> bool:
-        """DFLASH/DSpark block draft: spec_num_tokens decode rows per request."""
+        """DFLASH/DSpark block draft: every decode forward runs a whole
+        non-causal block of ``spec_num_tokens`` positions per request."""
         return self.draft_block_decode and self.spec_num_tokens > 1
+
+    @property
+    def block_decode_expansion(self) -> int:
+        """Decode metadata entries materialized per request in the persistent
+        buffers.
+
+        ``spec_num_tokens`` under block decode: one entry per block position,
+        because the block is non-causal (all positions share the block-end
+        length) and the drafter rewrites those lengths in-graph
+        (:meth:`fill_block_decode_seq_lens`), so they must exist as storage.
+        Otherwise 1: plain decode and a vanilla MTP draft have one position
+        per request, and target verify derives its causal per-position
+        lengths at forward time from the request's single entry. Leaves that
+        keep one entry per request even under block decode (FlashMLA,
+        TRT-LLM MLA: they repeat it across the block's queries at forward
+        time) override this to 1 together with ``fill_block_decode_seq_lens``.
+        """
+        return self.spec_num_tokens if self.block_decode_active else 1
 
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
 
-    @abstractmethod
     def init_cuda_graph_state(self, max_bs: int) -> None:
-        """Allocate the persistent decode buffers for up to ``max_bs`` rows
-        (``max_bs * spec_num_tokens`` under block decode). Runs
+        """Allocate the persistent decode buffers for
+        ``max_bs * block_decode_expansion`` metadata entries. Runs
         unconditionally at wrapper construction, enforce-eager included: the
-        unified refresh serves eager decode from the same buffers."""
+        unified refresh serves eager decode from the same buffers. A leaf
+        with more persistent decode state extends this (``super()`` first).
+        """
+        entries = max_bs * self.block_decode_expansion
+        # The router hands this leaf [bs, max_num_pages] tables (context_len
+        # already carries the spec-verify overshoot); null page 0 is the
+        # padding contract's dereferenceable dummy.
+        self.page_table_buf = torch.zeros(
+            (entries, self.max_num_pages), dtype=torch.int32, device=self.device
+        )
+        # Own the cache-seqlens buffer; every refresh copies the live lengths
+        # in, so graph state never depends on a shared mutable tensor. Under
+        # block decode the drafter fills it in-graph; seed the block width so
+        # any pre-broadcast read stays in range.
+        self.seq_lens_buf = torch.full(
+            (entries,),
+            self.spec_num_tokens if self.block_decode_active else 0,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Buffers were (re)allocated: cached per-bs views must rebuild.
+        self._decode_views_by_bs = {}
 
     @abstractmethod
     def init_forward_metadata(
@@ -181,16 +228,17 @@ class PagedAttentionBackend(ABC):
         """Build extend/mixed (or idle warmup) metadata.
 
         Args:
-            bs: Rows in the batch (extend rows first, then any decode rows).
-            num_extends: Leading extend rows; ``bs`` for a pure extend.
+            bs: Requests in the batch (extend requests first, then any decode
+                requests).
+            num_extends: Leading extend requests; ``bs`` for a pure extend.
             seq_lens: ``[>= bs]`` total cache lengths after this step.
             page_table: ``[bs, max_num_pages]`` kernel page table,
-                batch-ordered and padded (row i is batch position i).
+                batch-ordered and padded (request i is batch position i).
             forward_mode: EXTEND, MIXED or IDLE; a DECODE call is a contract
                 violation (decode metadata is :meth:`refresh_decode_metadata`).
             extend_*: ``[>= num_extends]`` per-request new-token / prefix
                 lengths with their pinned host mirrors (empty on idle warmup).
-            extend_with_prefix: Whether any extend row continues a cached or
+            extend_with_prefix: Whether any extend request continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero);
                 leaves that size ragged-vs-paged prefill metadata read it.
         """
@@ -211,17 +259,17 @@ class PagedAttentionBackend(ABC):
         Copies ``seq_lens`` (clamped to :attr:`verify_floor`) and
         ``page_table`` into the persistent buffers in place and points
         ``forward_decode_metadata`` at the pointer-stable per-bs views over
-        them. Rows in ``[actual_bs, bs)`` are padding (already null pages in
+        them. Requests in ``[actual_bs, bs)`` are padding (already null pages in
         ``page_table``, seq_len 1 in ``seq_lens``); ``actual_bs == 0`` is the
         idle replay and the capture seeding.
 
         Args:
-            bs: Rows to prepare (the padded graph batch under replay).
-            actual_bs: Live rows.
+            bs: Requests to prepare (the padded graph batch under replay).
+            actual_bs: Live requests.
             seq_lens: ``[>= bs]`` live cache lengths.
             page_table: ``[bs, max_num_pages]`` kernel page table for these
-                rows, batch-ordered and padded.
-            num_extends: Leading extend rows of a MIXED round whose decode
+                requests, batch-ordered and padded.
+            num_extends: Leading extend requests of a MIXED round whose decode
                 half this refresh describes; 0 for pure decode.
             for_graph_replay: A graph is in play (live replay or the capture
                 seeding). Branch on it only for graph-mechanics asymmetries
@@ -244,21 +292,23 @@ class PagedAttentionBackend(ABC):
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
-        spec_num_tokens decode rows (uniform, non-causal). Leaves whose
-        kernel takes one row per request override with the bs-row form."""
-        spec = self.spec_num_tokens
-        self.decode_seq_lens_buffer[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
+        ``block_decode_expansion`` materialized entries (uniform, non-causal),
+        clamped to the block width and the context limit."""
+        expansion = self.block_decode_expansion
+        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
+            block_seq_lens[:bs]
+            .clamp(self.spec_num_tokens, self.max_context_len)
+            .unsqueeze(1)
         )
 
     @property
-    @abstractmethod
     def decode_seq_lens_buffer(self) -> torch.Tensor:
         """The persistent cache-seqlens buffer decode metadata views."""
+        return self.seq_lens_buf
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
-        """Temporarily override the decode-row slice discriminator (MLA
+        """Temporarily override the decode-request slice discriminator (MLA
         family: drafter step 0 slices ``[num_extends:]``, step 1+ ``[0:]``).
         Default no-op for leaves with separate prefill/decode slots."""
         yield

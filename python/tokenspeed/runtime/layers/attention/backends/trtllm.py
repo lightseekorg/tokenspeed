@@ -44,10 +44,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
-from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.backends.paged import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -119,10 +119,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
         # per decode forward and needs non-causal (block-diffusion) attention.
-        # Instead of a non-causal mask, expand each request into spec_num_tokens
-        # single-query rows sharing the SAME block-end seq_len, so each row
-        # attends over the whole block; target verify and plain decode are
-        # untouched.
+        # Instead of a non-causal mask, materialize one single-query decode
+        # metadata entry per block position (block_decode_expansion), all
+        # sharing the SAME block-end seq_len, so each block position attends
+        # over the whole block; target verify and plain decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
         # Separate slots for prefill-kernel vs decode-kernel forward paths:
@@ -131,14 +131,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata: TRTLLMMHAMetadata | None = None
         self.forward_decode_metadata: TRTLLMMHAMetadata | None = None
 
-        self.page_table_buf: torch.Tensor | None = None
-        self.seq_lens_buf: torch.Tensor | None = None
         # KV seqlens clamped to >= spec_num_tokens for the MTP verify path.
-        # Padded decode rows have seq_len=1; with q_len=spec_num_tokens they'd
-        # hit an empty causal span and the kernel returns NaN.
+        # Padded decode requests have seq_len=1; with q_len=spec_num_tokens
+        # they'd hit an empty causal span and the kernel returns NaN.
         self.spec_cache_seqlens_buf: torch.Tensor | None = None
         self._cu_seqlens_by_bs: dict[int, torch.Tensor] = {}
-        self._decode_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
         self._verify_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
 
     def support_kv_cache_prewrite(
@@ -213,28 +210,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
-        rows = max_bs * (self.spec_num_tokens if self.block_decode_active else 1)
-        self.page_table_buf = torch.zeros(
-            (rows, self.max_num_pages), dtype=torch.int32, device=self.device
-        )
-        # Own the cache-seqlens buffer; under block decode the drafter fills
-        # it in-graph (fill_block_decode_seq_lens), so seed a valid baseline.
-        self.seq_lens_buf = torch.full(
-            (rows,),
-            self.spec_num_tokens if self.block_decode_active else 0,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        super().init_cuda_graph_state(max_bs)
         self.spec_cache_seqlens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self._cu_seqlens_by_bs = {}
-        self._decode_views_by_bs = {}
         self._verify_views_by_bs = {}
-
-    @property
-    def decode_seq_lens_buffer(self) -> torch.Tensor:
-        return self.seq_lens_buf
 
     def _uniform_cu_seqlens(self, bs: int, stride: int) -> torch.Tensor:
         """Cached ``arange(0, bs*stride+1, stride)`` (pointer-stable per bs)."""
@@ -248,16 +229,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         return cu
 
     def _decode_views(self, bs: int) -> TRTLLMMHAMetadata:
-        """Single-token decode slot views (block decode: the expanded rows)."""
+        """Single-token decode slot views (block decode: one per block
+        position)."""
         metadata = self._decode_views_by_bs.get(bs)
         if metadata is None:
             if self.block_decode_active:
-                rows = bs * self.spec_num_tokens
+                expanded_bs = bs * self.block_decode_expansion
                 metadata = TRTLLMMHAMetadata(
-                    cache_seqlens_int32=self.seq_lens_buf[:rows],
+                    cache_seqlens_int32=self.seq_lens_buf[:expanded_bs],
                     max_seq_len_q=1,
-                    cu_seqlens_q=self._uniform_cu_seqlens(rows, 1),
-                    page_table=self.page_table_buf[:rows],
+                    cu_seqlens_q=self._uniform_cu_seqlens(expanded_bs, 1),
+                    page_table=self.page_table_buf[:expanded_bs],
                 )
             else:
                 metadata = TRTLLMMHAMetadata(
@@ -297,8 +279,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         del num_extends
         if self.block_decode_active:
             # DFLASH draft block: replicate the page table to each request's
-            # block rows. Under replay the seq_lens are re-derived in-graph;
-            # eager (and the capture seeding) fills them here.
+            # block positions. Under replay the seq_lens are re-derived
+            # in-graph; eager (and the capture seeding) fills them here.
             spec = self.spec_num_tokens
             self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(
                 page_table[:bs, None, :]
@@ -320,12 +302,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 out=self.spec_cache_seqlens_buf[:bs],
             )
             self.forward_prefill_metadata = self._verify_views(bs)
-
-    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        spec = self.spec_num_tokens
-        self.seq_lens_buf[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
-        )
 
     # ------------------------------------------------------------------
     # KV cache helpers
@@ -424,7 +400,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         if self.block_decode_active:
             # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
-            # single-query rows, so use the decode slot directly. Inferring
+            # single-query entries, so use the decode slot directly. Inferring
             # q_len_per_req from q.shape[0]//bs would be spec_num_tokens and
             # wrongly pick the verify slot.
             metadata = self.forward_decode_metadata

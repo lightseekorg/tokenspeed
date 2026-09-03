@@ -34,7 +34,7 @@ call and answers the model's ``forward``. Three kinds of node implement it:
 
 ``block_tables`` is always a complete mapping — the runner synthesizes
 placeholder tables for capture, idle and warmup — so no implementation
-carries a "no tables" arm. Padding is the consumer's job: rows in
+carries a "no tables" arm. Padding is the consumer's job: requests in
 ``[actual_bs, bs)`` are dummies it must route to the null page itself.
 """
 
@@ -169,8 +169,9 @@ class AttentionBackend(ABC):
         DECODE call here is a contract violation.
 
         Args:
-            bs: Rows in the batch (extend rows first, then decode rows).
-            num_extends: Leading extend rows.
+            bs: Requests in the batch (extend requests first, then decode
+                requests).
+            num_extends: Leading extend requests.
             req_pool_indices: ``[>= bs]`` request-pool slots.
             seq_lens: ``[>= bs]`` total cache lengths after this step.
             forward_mode: EXTEND, MIXED or IDLE.
@@ -208,17 +209,17 @@ class AttentionBackend(ABC):
         refreshes before the same forward the graph recorded).
 
         Args:
-            bs: Rows to prepare (the padded capture batch under replay);
+            bs: Requests to prepare (the padded capture batch under replay);
                 eager passes ``bs == actual_bs``.
-            actual_bs: Live rows; ``[actual_bs, bs)`` are padding the node
+            actual_bs: Live requests; ``[actual_bs, bs)`` are padding the node
                 routes to the null page. ``0`` is the idle replay / capture
                 seeding.
             req_pool_indices: ``[>= bs]`` request-pool slots.
-            seq_lens: ``[>= bs]`` live cache lengths (padding rows hold 1).
+            seq_lens: ``[>= bs]`` live cache lengths (padding requests hold 1).
             forward_mode: A decode mode.
             block_tables: ``group_id -> [>= actual_bs, cols]`` raw scheduler
                 tables for every published group (placeholders when idle).
-            num_extends: Leading extend rows of a MIXED round whose decode
+            num_extends: Leading extend requests of a MIXED round whose decode
                 half this refresh describes; 0 for pure decode.
             for_graph_replay: A graph is in play (live replay or capture
                 seeding). Branch on it only for graph-mechanics asymmetries.
@@ -262,10 +263,11 @@ class AttentionBackend(ABC):
         without per-request decode lengths ignore it."""
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
-        """Vanilla MTP re-anchors the draft rows to the committed frontier."""
+        """Vanilla MTP re-anchors the draft requests to the committed frontier."""
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """DFLASH: broadcast block-end lengths to the block's decode rows."""
+        """DFLASH: broadcast block-end lengths to each request's materialized
+        decode entries."""
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
@@ -316,7 +318,7 @@ class AttentionBackend(ABC):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the rows the forward covers —
+        """This layer's KV write slots for the requests the forward covers —
         the one accessor for writers outside the backend (fused RoPE
         prewrite, model-side MLA cache writes)."""
         raise NotImplementedError(

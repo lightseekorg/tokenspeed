@@ -132,12 +132,14 @@ def test_expansion_floors_at_the_block_width() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_graph_buffers_are_sized_for_the_expanded_rows() -> None:
+def test_graph_buffers_are_sized_by_the_block_decode_expansion() -> None:
     backend = _backend(spec_num_tokens=8)
     backend.init_cuda_graph_state(max_bs=4)
 
-    assert backend.page_table_buf.shape == (32, 4)
-    assert backend.seq_lens_buf.shape == (32,)
+    assert backend.block_decode_expansion == 8
+    assert backend.page_table_buf.shape == (4 * backend.block_decode_expansion, 4)
+    assert backend.seq_lens_buf.shape == (4 * backend.block_decode_expansion,)
+    assert _backend(draft_block_decode=False).block_decode_expansion == 1
 
 
 def test_graph_capture_records_expanded_metadata() -> None:
