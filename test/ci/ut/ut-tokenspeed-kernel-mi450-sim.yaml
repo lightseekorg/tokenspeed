@@ -122,10 +122,6 @@ env:
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-explicit-bm128]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[prefill-default]
 
-    # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
-    # https://github.com/ROCm/rocm-systems/issues/10793
-    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_prefill_checkpoint_taps_and_fp8
-
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
