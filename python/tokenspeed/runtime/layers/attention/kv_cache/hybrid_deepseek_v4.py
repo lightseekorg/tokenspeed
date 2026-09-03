@@ -74,18 +74,9 @@ class DeepseekV4CacheMetadata:
     page_size: int
     page_table: torch.Tensor
     block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
-    # Per-sliding-group [num_reqs] int32 base logical-page offset that
-    # accompanies each compact per-group table. Consumers index sliding tables as
-    # logical_page - base_offset; full-history groups omit the key (base 0).
-    block_table_base_offsets: dict[str, torch.Tensor] = field(default_factory=dict)
     swa_page_table: torch.Tensor | None = None
-    swa_base_logical_page: torch.Tensor | None = None
     compressor_state_block_tables: dict[int, torch.Tensor] = field(default_factory=dict)
-    compressor_state_base_logical_pages: dict[int, torch.Tensor] = field(
-        default_factory=dict
-    )
     indexer_state_block_table: torch.Tensor | None = None
-    indexer_state_base_logical_page: torch.Tensor | None = None
     decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
         default_factory=dict
     )
@@ -147,17 +138,6 @@ class DeepseekV4CacheMetadata:
                 rounding_mode="floor",
             )
             offsets = compressed_pos % kv_cache_block_size
-            base_offsets = self.block_table_base_offsets.get(
-                v4_compressed_kv_group_id(compress_ratio)
-            )
-            if base_offsets is not None:
-                page_indices = (
-                    page_indices
-                    - base_offsets.to(
-                        device=page_indices.device,
-                        dtype=torch.int64,
-                    )[req_idx]
-                )
             page_ids = _safe_page_ids(page_table, req_idx, page_indices)
             valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
                 positions,
@@ -253,17 +233,6 @@ class DeepseekV4CacheMetadata:
         if page_table is self.page_table:
             page_ids = page_table[req_idx, page_indices.long()].to(torch.int64)
         else:
-            base_offsets = self.block_table_base_offsets.get(
-                v4_compressed_kv_group_id(compress_ratio)
-            )
-            if base_offsets is not None:
-                page_indices = (
-                    page_indices
-                    - base_offsets.to(
-                        device=page_indices.device,
-                        dtype=torch.int64,
-                    )[req_idx]
-                )
             page_ids = _safe_page_ids(page_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
         valid_slots = (page_ids >= 0) & _compressed_boundary_mask(

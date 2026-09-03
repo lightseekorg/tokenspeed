@@ -44,7 +44,6 @@ def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
                 ],
                 dtype=torch.int32,
             ),
-            swa_base_logical_page=None,
         ),
     )
     ctx = SimpleNamespace(
@@ -67,7 +66,6 @@ def test_deepseek_v4_swa_slot_mapping_prefers_draft_prefill_metadata():
             ],
             dtype=torch.int32,
         ),
-        swa_base_logical_page=None,
     )
     decode_metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -106,7 +104,6 @@ def test_deepseek_v4_swa_slot_mapping_masks_invalid_and_overflow_slots():
                 ],
                 dtype=torch.int32,
             ),
-            swa_base_logical_page=None,
         ),
         is_valid_token=torch.tensor([True, True, False, True]),
     )
@@ -137,7 +134,6 @@ def test_deepseek_v4_swa_slot_mapping_fails_closed_without_capacity():
                 ],
                 dtype=torch.int32,
             ),
-            swa_base_logical_page=None,
         ),
     )
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
@@ -168,7 +164,6 @@ def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata
                 ],
                 dtype=torch.int32,
             ),
-            swa_base_logical_page=None,
         ),
     )
     ctx = SimpleNamespace(

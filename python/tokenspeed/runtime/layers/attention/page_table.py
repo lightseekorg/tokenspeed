@@ -134,17 +134,14 @@ def group_slot_mapping_from_raw(
     block_table: torch.Tensor,
     rows_per_page: int,
     entry_stride_tokens: int = 1,
-    base_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-token write slots over one group's raw table — the same
     ``table[req, pos // P] * P + pos % P`` invariant as the router's stacked
     math (``backends/write_locations.py``), generalized for arbitrary
-    positions, entry strides (one entry per ``entry_stride_tokens``,
-    compressed groups) and per-request base page offsets (sliding /
-    compacted tables index ``logical_page - base``). Invalid coordinates
-    yield the ``-1`` sentinel — the masked-scatter cache-insert kernels skip
-    them — rather than slot 0, because these writes target group buffers
-    with no reserved dummy page.
+    positions and entry strides (one entry per ``entry_stride_tokens``,
+    compressed groups). Invalid coordinates yield the ``-1`` sentinel — the
+    masked-scatter cache-insert kernels skip them — rather than slot 0,
+    because these writes target group buffers with no reserved dummy page.
     """
     if rows_per_page <= 0:
         raise ValueError(f"rows_per_page must be > 0, got {rows_per_page}")
@@ -159,21 +156,7 @@ def group_slot_mapping_from_raw(
         positions.numel(),
         "request indices",
     )
-    table_page = logical_page
-    if base_offsets is not None:
-        req_i64 = req_indices.to(torch.int64)
-        rows = int(base_offsets.shape[0])
-        if rows <= 0:
-            table_page = logical_page.new_full(logical_page.shape, -1)
-        else:
-            valid_req = (req_i64 >= 0) & (req_i64 < rows)
-            safe_req = req_i64.clamp(0, rows - 1)
-            base = base_offsets.to(
-                device=logical_page.device,
-                dtype=torch.int64,
-            )[safe_req]
-            table_page = torch.where(valid_req, logical_page - base, -1)
-    page_ids = safe_page_ids(block_table, req_indices, table_page)
+    page_ids = safe_page_ids(block_table, req_indices, logical_page)
     slots = page_ids * rows_per_page + offsets
     return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
 

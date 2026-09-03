@@ -2433,28 +2433,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be a positive integer"):
                 cache_layout.bind(capacity)
 
-    def test_deepseek_v4_group_slot_mapping_consumes_compact_base_offsets(self):
-        slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([128, 129, 192, 64], dtype=torch.int64),
-            req_indices=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
-            block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
-            rows_per_page=64,
-            base_offsets=torch.tensor([2, 1], dtype=torch.int32),
-        )
-
-        self.assertTrue(torch.equal(slots, torch.tensor([640, 641, -1, 1280])))
-
     def test_deepseek_v4_group_slot_mapping_expands_per_request_indices(self):
         slots = _group_slot_mapping_from_raw(
             positions=torch.tensor([0, 1, 2, 64, 65, 66], dtype=torch.int64),
             req_indices=torch.tensor([0, 1], dtype=torch.int32),
             block_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
             rows_per_page=64,
-            base_offsets=torch.tensor([0, 1], dtype=torch.int32),
         )
 
         self.assertTrue(
-            torch.equal(slots, torch.tensor([640, 641, 642, 1280, 1281, 1282]))
+            torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
         )
 
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
