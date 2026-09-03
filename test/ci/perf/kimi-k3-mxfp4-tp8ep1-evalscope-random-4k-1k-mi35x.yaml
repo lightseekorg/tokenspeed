@@ -21,6 +21,10 @@ api_version: ci.tokenspeed.io/v1
 # CPU-only test/runtime/test_kimi_k3_moe_fork_warmup.py, which is narrower --
 # it pins the call site, not the stream behaviour. Run this job by hand when
 # touching the MoE stream fork, the A8W4 SiTU kernel, or graph capture.
+#
+# Being manual is why the tokenizer defect below went unnoticed for so long: a
+# cold-runner failure in a job nobody runs on a schedule looks like bad luck the
+# one time someone does run it.
 name: perf-kimi-k3-mxfp4-tp8ep1-random-4k-1k-mi35x
 type: perf
 workflow_stage: model-test
@@ -74,13 +78,24 @@ perf:
     # Keep the load generator aligned with the version used to establish the
     # perf_reference below; EvalScope 1.10 changed its metric semantics.
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.9.1'
+  # EvalScope resolves remote tokenizer paths through ModelScope even when the
+  # dataset source is Hugging Face, so materialize the HF tokenizer locally.
+  # Passing the remote ID instead depends on a warm ModelScope cache. Observed
+  # on a cold runner as "Couldn't instantiate the backend tokenizer", raised
+  # inside modelscope's AutoTokenizer patcher partway through the run with the
+  # server already healthy and serving; a re-run minutes later passed against
+  # the now warm cache, so it reads as flaky while being a real cold-start
+  # dependency. The tp8ep8 sibling has materialized the tokenizer since it was
+  # written; this job was missed.
   command: >-
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
     OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-ep1-mi35x-perf &&
+    TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
+    /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&
     echo "==================================================" &&
     echo ">>> input=4k output=1k conc=1" &&
@@ -90,7 +105,8 @@ perf:
     --url "$URL"
     --api openai
     --dataset random
-    --tokenizer-path moonshotai/Kimi-K3
+    --data-source huggingface
+    --tokenizer-path "$TOKENIZER_PATH"
     --min-prompt-length 4096
     --max-prompt-length 4096
     --prefix-length 0
@@ -116,15 +132,25 @@ report:
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
 #
-# PROVISIONAL -- these have not been established on this runner. They are set
-# deliberately loose so the job reports rather than gates while it settles, and
-# should be replaced by the documented convention (rounded down from the median
-# of the three most recent passing runs) once there are three.
+# PROVISIONAL. Set from a single run on the CI runner -- 75.64 tps/user and
+# 9.16 tps/gpu -- so replace it with the documented convention (median of the
+# three most recent passing runs, rounded down) once there are three.
 #
-# The starting point is a hand measurement on an 8x MI355X box: EP1 sustained
-# 53.98 tok/s at concurrency 1 against EP8's 73.84 on the same commit. EP1 is
-# expected to be SLOWER here -- its advantage is at batch (it overtook EP8 by
-# ~28% at concurrency 16) and concurrency 1 is its worst case. Do not copy the
-# tp8ep8 reference into this file.
+# 65/7.8 is deliberately well under that measurement. With perf_threshold 0.9
+# the gate trips below 58.5, some 23% under the observed value, against the
+# 3.5% spread across the tp8ep8 job's own three reference runs. The previous
+# 45/5.4 predated the symmetric MoE tail reduction (#1353, via #1358) and the
+# fused input projection (#1358) and would now pass a 40% regression.
+#
+# The note this replaces said tp8ep1 is expected to be slower than tp8ep8 at
+# concurrency 1, citing a pre-fusion hand measurement of 53.98 against 73.84.
+# That is no longer true and should not be carried forward: tp8ep1 now leads at
+# every concurrency measured -- 77.59 against 73.89 at concurrency 1 on an 8x
+# MI355X box, and 75.64 tps/user here against the tp8ep8 job's own reference of
+# 65.
+#
+# Still do not copy the tp8ep8 reference wholesale in future. The two jobs run
+# different server configurations, not just a different MoE placement; the match
+# at 65/7.8 is a coincidence of the current numbers rather than an invariant.
 perf_reference:
-  1: [45, 5.4]
+  1: [65, 7.8]
