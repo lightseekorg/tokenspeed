@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single source of truth for the gfx950 A4W4 CDNA4 MXFP4 scale layout.
+"""Single source of truth for the gfx950 CDNA4 block-scale layout.
 
 Both scale producers and consumers must agree on the CDNA4 MXFP4 scale-swizzle
 parameters and byte permutation:
@@ -26,9 +26,9 @@ parameters and byte permutation:
 * B-scales (weights): swizzled at load time by the weight preprocessor
   (``mxfp4_gfx950_preprocess._swizzle_mxfp4`` via
   :func:`swizzle_cdna4_mxfp4_scale`).
-* A-scales (activations): emitted in token order by the MXFP4 activation
-  quantizer and re-gathered into sorted-route order by
-  ``mxfp4.scale.gather_package_cdna4_scale``.
+* A-scales (activations): MXFP4 quantization emits token-order scales that
+  ``mxfp4.scale.gather_package_cdna4_scale`` reorders; the EP8 MXFP8 quantizer
+  emits the same swizzle directly in sorted-route order.
 * Consumers: the package stage kernels (``prefill_stage1/2``,
   ``decode_stage1/2``) address the scales with the matching CDNA4 MFMA scale
   layout (``gl.amd.cdna4.get_mfma_scale_layout``).
@@ -81,7 +81,7 @@ MXFP4_BLOCK = 32
 CDNA4_SCALE_N_BLOCK = 32
 CDNA4_SCALE_K_BLOCK = 8
 
-# MFMA non-K dimension used by the a4w4 stage kernels
+# MFMA non-K dimension used by the block-scaled stage kernels
 # (``v_mfma_scale_f32_16x16x128_f8f6f4``). The scale swizzle below is fixed to
 # this shape.
 MFMA_NONK_DIM = 16

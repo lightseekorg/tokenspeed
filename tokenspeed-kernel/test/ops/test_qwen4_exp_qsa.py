@@ -21,8 +21,10 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.ops.attention.cuda.dsa_topk import has_ragged_decode_topk
 from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
@@ -898,9 +900,70 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         )
 
 
-def test_qwen4_exp_qsa_block_topk_logits_radix_matches_stream(device: str) -> None:
-    # 70400 blocks exceed the DSA radix threshold (65536 columns), so the
-    # logits path exercises the radix selection pipeline here.
+def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
+    device: str, monkeypatch
+) -> None:
+    rows, heads, head_dim, page_size = 2, 4, 16, 64
+    block_topk = 512
+    pages_per_request = 2
+    num_blocks = pages_per_request * page_size
+    query = torch.randn(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
+    key_cache = torch.randn(
+        3 * page_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    page_table = torch.tensor([[1, 2], [2, 1]], device=device, dtype=torch.int32)
+    requests = torch.arange(rows, device=device, dtype=torch.long)
+    complete_blocks = torch.tensor([100, 40], device=device, dtype=torch.int32)
+    workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+    calls = {}
+
+    def fake_radix_topk(logits, out, topk, *, lengths, workspace, max_seq_len):
+        calls.update(
+            logits=logits,
+            topk=topk,
+            lengths=lengths,
+            workspace=workspace,
+            max_seq_len=max_seq_len,
+        )
+        out.fill_(7)
+
+    monkeypatch.setattr(qsa_ops, "_is_nvidia", True)
+    monkeypatch.setattr(qsa_ops, "has_ragged_decode_topk", lambda: True)
+    monkeypatch.setattr(qsa_ops, "ragged_decode_topk", fake_radix_topk)
+    monkeypatch.setattr(
+        qsa_ops,
+        "triton_topk_from_logits",
+        lambda *args, **kwargs: pytest.fail("unexpected Triton top-k fallback"),
+    )
+
+    actual = qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        requests,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        solution="logits",
+        persistent_topk_workspace=workspace,
+        enable_pdl=False,
+    )
+
+    assert torch.equal(actual, torch.full_like(actual, 7))
+    assert calls["logits"].shape == (rows, num_blocks)
+    assert calls["topk"] == block_topk
+    assert calls["lengths"] is complete_blocks
+    assert calls["workspace"] is workspace
+    assert calls["max_seq_len"] == num_blocks
+
+
+def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
+    device: str,
+) -> None:
+    if not has_ragged_decode_topk():
+        pytest.skip("persistent radix top-k is unavailable")
+    # 70400 blocks exercise the long-row persistent radix path. The second
+    # row is shorter than top-k and verifies ragged -1 padding.
     torch.manual_seed(43)
     rows, heads, head_dim, page_size = 2, 4, 16, 64
     block_topk = 512
@@ -918,9 +981,8 @@ def test_qwen4_exp_qsa_block_topk_logits_radix_matches_stream(device: str) -> No
         dtype=torch.int32,
     )
     requests = torch.arange(rows, device=device, dtype=torch.long)
-    complete_blocks = torch.tensor(
-        [num_blocks, 70000], device=device, dtype=torch.int32
-    )
+    complete_blocks = torch.tensor([num_blocks, 300], device=device, dtype=torch.int32)
+    workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
     kwargs = dict(page_size=page_size, block_topk=block_topk)
     stream = qwen4_exp_qsa_block_topk(
@@ -933,13 +995,13 @@ def test_qwen4_exp_qsa_block_topk_logits_radix_matches_stream(device: str) -> No
         requests,
         complete_blocks,
         solution="logits",
+        persistent_topk_workspace=workspace,
         **kwargs,
     )
 
     scores_per_row = _block_topk_reference_scores(
         query, key_cache, page_table, requests, complete_blocks, page_size, num_blocks
     )
-    n_cols_padded = 1 << (max(num_blocks, block_topk) - 1).bit_length()
     for row in range(rows):
         expected_len = min(block_topk, int(complete_blocks[row]), num_blocks)
         scores = scores_per_row[row]
@@ -947,19 +1009,18 @@ def test_qwen4_exp_qsa_block_topk_logits_radix_matches_stream(device: str) -> No
         got_logits = sorted(int(v) for v in logits[row] if v >= 0)
         assert len(got_stream) == expected_len
         assert len(got_logits) == expected_len
-        # The radix-select merge breaks fp32 score ties by candidate order
-        # inside the kernel, which host references cannot reconstruct, so
-        # the stream path is verified through its score multiset (still
-        # exact: tied blocks carry identical scores).
+        # The streaming and persistent selectors may break equal-score ties
+        # differently, so compare the selected score multisets.
         got_scores = sorted((float(scores[int(i)]) for i in got_stream), reverse=True)
         ref_scores = sorted(
             (float(v) for v in torch.topk(scores, expected_len).values.tolist()),
             reverse=True,
         )
         assert got_scores == ref_scores
-        assert got_logits == sorted(
-            _expected_logits_ids(scores, expected_len, n_cols_padded)
+        got_logits_scores = sorted(
+            (float(scores[int(i)]) for i in got_logits), reverse=True
         )
+        assert got_logits_scores == ref_scores
 
 
 def test_qwen4_exp_qsa_selected_tokens_matches_torch(device: str) -> None:

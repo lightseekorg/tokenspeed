@@ -245,6 +245,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
         W_PRESHUFFLED=w2_preshuffled,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
+        EXPERT_START=0, NUM_LOCAL_EXPERTS=n_experts,
         num_warps=1,
     )
     # fmt: on
@@ -345,10 +346,14 @@ def _warp_decode_stage1_coop_compute(
     """
     N = 2 * i_dim
     off_n = pid_n * BLOCK_N
+    valid = (token < M) & (expert >= 0)
+    # Inactive EP routes still instantiate the asynchronous descriptors. Use a
+    # valid local base address while their X/store masks suppress all results.
+    safe_expert = gl.where(valid, expert, 0)
     # Keep base offsets int32 (buffer_load_to_shared requires int32/uint32
     # offsets); expert * stride fits int32 for GPT-OSS shapes.
-    w_base_offset = expert * stride_we
-    ws_base_offset = expert * stride_wse
+    w_base_offset = safe_expert * stride_we
+    ws_base_offset = safe_expert * stride_wse
 
     cfg = MoEConfig(
         BLOCK_M,
@@ -385,7 +390,6 @@ def _warp_decode_stage1_coop_compute(
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
 
-    valid = (token < M) & (expert >= 0)
     # One decode token per CTA: row 0 of the BLOCK_M tile carries the token,
     # the remaining rows are clamped/masked (buffer OOB -> 0 in LDS).
     rows_m = gl.where(offs_xm == 0, token, gl.zeros_like(offs_xm))
@@ -503,7 +507,7 @@ def _warp_decode_stage1_coop_compute(
         bias_offs = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, cfg.acc_layout))
         bias_mask = bias_offs < N
         bias = gl.load(
-            w13_bias + expert.to(gl.int64) * N + bias_offs,
+            w13_bias + safe_expert.to(gl.int64) * N + bias_offs,
             mask=bias_mask,
             other=0.0,
         )
@@ -704,6 +708,8 @@ def _warp_decode_precomputed_situ_stage1_kernel(
     HAS_BIAS: gl.constexpr,
     SITU_BETA: gl.constexpr,
     SITU_LINEAR_BETA: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
 ):
     """Route-direct FP8xMXFP4 W13 with fused SiTU and FP8 store."""
     pid = gl.program_id(axis=0)
@@ -717,6 +723,12 @@ def _warp_decode_precomputed_situ_stage1_kernel(
         mask=token < M,
         other=-1,
     ).to(gl.int32)
+    expert -= EXPERT_START
+    expert = gl.where(
+        (expert >= 0) & (expert < NUM_LOCAL_EXPERTS),
+        expert,
+        -1,
+    )
     _warp_decode_stage1_coop_compute(
         token,
         slot,
@@ -945,6 +957,8 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
     SPLIT_TOPK: gl.constexpr = False,
 ):
     """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output.
@@ -1019,12 +1033,13 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
             expert = gl.load(
                 TopkIds + pid_token * TOPK + slot, mask=pid_token < M, other=-1
             )
+            expert -= EXPERT_START
             gate = gl.load(
                 TopkWeights + pid_token * TOPK + slot,
                 mask=pid_token < M,
                 other=0.0,
             ).to(gl.float32)
-            if expert >= 0:
+            if (expert >= 0) & (expert < NUM_LOCAL_EXPERTS):
                 row = pid_token * TOPK + slot
                 x_row_off = row.to(gl.int64) * stride_xm
                 w_expert_off = expert.to(gl.int64) * stride_we

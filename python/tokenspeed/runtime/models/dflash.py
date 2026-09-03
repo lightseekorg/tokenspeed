@@ -33,9 +33,7 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -54,6 +52,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class DFlashAttention(nn.Module):
+    cache_group_id = FULL_ATTENTION
+
     def __init__(
         self,
         config,
@@ -363,6 +363,8 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
+    decoder_layer_cls = DFlashDecoderLayer
+
     def __init__(
         self,
         config,
@@ -376,7 +378,7 @@ class DFlashDraftModel(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
-                DFlashDecoderLayer(
+                self.decoder_layer_cls(
                     config=config,
                     mapping=mapping,
                     layer_id=i,
