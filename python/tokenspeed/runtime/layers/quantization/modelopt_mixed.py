@@ -55,7 +55,7 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
-from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config, Nvfp4W4A16Config
 from tokenspeed.runtime.layers.quantization.utils import (
     modelopt_block_scale_to_2d,
     should_exclude_quant_module,
@@ -70,7 +70,9 @@ _MOE_WEIGHT_DTYPES = {
 
 _FP8_PB_WO_BLOCK_SIZE = [128, 128]
 
-_SUPPORTED_QUANT_ALGOS = frozenset({"NVFP4", "MXFP8", "FP8_PB_WO"})
+_SUPPORTED_QUANT_ALGOS = frozenset(
+    {"NVFP4", "W4A16_NVFP4", "MXFP8", "FP8", "FP8_PB_WO"}
+)
 
 # FP8_PB_WO runtime routing. A module keeps FP8 weights (w8a8 blockwise,
 # TRT-LLM's FP8_BLOCK_SCALES alias) if its weight either flows through
@@ -108,6 +110,8 @@ _FP8_PB_WO_DEQUANT_LEAVES = frozenset(
 _FUSED_PROJECTION_SHARDS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_qkvzba": ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
 }
 
 
@@ -144,6 +148,15 @@ class ModelOptMixedConfig(QuantizationConfig):
         self.nvfp4_config = Nvfp4Config(
             kv_cache_quant_algo=kv_cache_quant_algo,
             group_size=group_size,
+        )
+        self.nvfp4_a16_config = Nvfp4W4A16Config(
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+        )
+        self.fp8_static_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="static",
+            weight_block_size=None,
         )
         # FP8_PB_WO aliases to FP8_BLOCK_SCALES (TRT-LLM precedent): the
         # DeepSeek-style w8a8 blockwise path with float32 128x128 scales.
@@ -207,7 +220,7 @@ class ModelOptMixedConfig(QuantizationConfig):
                 unknown.add(algo)
                 continue
             quantized_layers[name] = algo
-            if algo == "NVFP4" and group_size is None:
+            if algo in ("NVFP4", "W4A16_NVFP4") and group_size is None:
                 group_size = int(info.get("group_size", 16))
         if unknown:
             raise ValueError(
@@ -217,7 +230,9 @@ class ModelOptMixedConfig(QuantizationConfig):
 
         return cls(
             quantized_layers=quantized_layers,
-            exclude_modules=section.get("exclude_modules", []),
+            exclude_modules=(
+                section.get("exclude_modules") or section.get("ignore") or []
+            ),
             kv_cache_quant_algo=section.get("kv_cache_quant_algo"),
             group_size=group_size if group_size is not None else 16,
         )
@@ -294,6 +309,13 @@ class ModelOptMixedConfig(QuantizationConfig):
 
         return None
 
+    def is_quantized_layer(self, prefix: str) -> bool:
+        """Whether a runtime module prefix resolves to a non-excluded algorithm."""
+        return (
+            not should_exclude_quant_module(prefix, self.exclude_modules)
+            and self._resolve_quant_algo(prefix) is not None
+        )
+
     def _fp8_pb_wo_leaf_route(self, module_name: str) -> str:
         """Route an FP8_PB_WO module: ``"dequant"`` (bf16 at load) or ``"w8a8"``."""
         leaf = module_name.rsplit(".", 1)[-1]
@@ -314,6 +336,7 @@ class ModelOptMixedConfig(QuantizationConfig):
         from tokenspeed.runtime.layers.dense import (
             Fp8LinearMethod,
             Nvfp4LinearMethod,
+            Nvfp4W4A16LinearMethod,
             UnquantizedLinearMethod,
         )
 
@@ -324,8 +347,12 @@ class ModelOptMixedConfig(QuantizationConfig):
             return UnquantizedLinearMethod()
         if algo == "MXFP8":
             return Fp8LinearMethod(self.mxfp8_config)
+        if algo == "FP8":
+            return Fp8LinearMethod(self.fp8_static_config)
         if algo == "NVFP4":
             return Nvfp4LinearMethod(self.nvfp4_config)
+        if algo == "W4A16_NVFP4":
+            return Nvfp4W4A16LinearMethod(self.nvfp4_a16_config)
         if algo == "FP8_PB_WO":
             if self._fp8_pb_wo_leaf_route(prefix) == "dequant":
                 # Raw-consumed weight: block-dequantized to bf16 by

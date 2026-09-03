@@ -1,10 +1,12 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3 + DSpark speculative decoding. Deliberately a separate job from
+# Kimi-K3 + EAGLE3 speculative decoding. Deliberately a separate job from
 # perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x, which tracks pure-target K3
 # performance and must stay speculator-free (Issue #879).
-name: perf-kimi-k3-dspark-mxfp4-tp8ep8-random-4k-1k-mi35x
+name: perf-kimi-k3-eagle3-mxfp4-tp8ep8-random-4k-1k-mi35x
 type: perf
+workflow_stage: model-test
 triggers:
+  - per-commit
   - manual
 runner:
   labels:
@@ -14,16 +16,20 @@ env:
 install:
   - bash test/ci_system/install_deps_rocm.sh
 # --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
-# ones and OOM at this memory fraction. Decode graphs are what speculative
-# decoding rides on, and all four batch buckets capture cleanly.
+# one and OOM at this memory fraction. Decode graphs are what speculative
+# decoding rides on, and the batch-1 bucket captures cleanly.
 server:
   command: >-
     ts serve
     --model moonshotai/Kimi-K3
     --served-model-name kimi-k3
-    --speculative-algorithm DSPARK
-    --speculative-draft-model-path Inferact/Kimi-K3-DSpark
-    --speculative-num-draft-tokens 8
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+    --eagle3-layers-to-capture 2,46,90
     --tp 8
     --ep-size 8
     --attention-backend mla
@@ -61,14 +67,14 @@ perf:
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
-    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-dspark-mi35x-perf &&
+    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-eagle3-mi35x-perf &&
     TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
     /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&
     echo "==================================================" &&
-    echo ">>> DSpark input=4k output=1k conc=1" &&
+    echo ">>> EAGLE3 input=4k output=1k conc=1" &&
     echo "==================================================" &&
     /tmp/evalscope-perf/bin/evalscope perf
     --model "$MODEL"
@@ -95,34 +101,16 @@ perf:
     PERF_STATUS=$?;
     python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
     PARSE_STATUS=$?;
-    echo "=== DSpark speculative decoding metrics ===";
+    echo "=== EAGLE3 speculative decoding metrics ===";
     curl -s http://127.0.0.1:21000/metrics | grep -E 'spec_|accept|draft' || true;
     if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
     exit "$PARSE_STATUS"
 report:
   github_step_summary: true
 perf_threshold: 0.9
-# Values are [Latency (tps/user), Throughput (tps/gpu)].
-#
-# Measured on 8x MI355X with bf16 weights and decode graphs, alongside a
-# speculator-free control in the identical configuration:
-#   DSpark   TPOT 39.28 ms -> 25.46 tps/user, 3.13 tps/gpu
-#   no spec  TPOT 21.51 ms -> 46.49 tps/user, 5.66 tps/gpu
-#
-# At concurrency 1 speculation is a NET LOSS here, by about 1.8x, and that is
-# expected rather than a defect: an accept length of ~2.6 cuts target forwards
-# by 2.6x, but each forward costs roughly 4.7x more because Kimi-K3 routes 16 of
-# 896 experts per token. One token activates 16 experts; verifying eight
-# activates far more than 8x16, so the grouped MoE GEMM grows superlinearly.
-# The same speculator is 2.27x FASTER on the AIME26 gate at concurrency 16,
-# where the expert set is already saturated and the extra verify tokens are
-# nearly free (see the sibling eval config).
-#
-# The reference below is therefore DSpark's own concurrency-1 number, so this
-# job tracks regressions in the speculative path. Do NOT read it against the
-# pure-target tracker's 43.05 / 5.26: that is MXFP4 on MI350X, and comparing
-# across quantization and hardware is how a non-existent regression gets
-# reported. Concurrency 1 is also the wrong operating point to judge DSpark by;
-# a higher-concurrency job is the one worth adding next.
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from three
+# consecutive 8x MI350X runs, which measured 161.29 / 18.80-18.82. This tracks
+# EAGLE3 independently from the pure-target control and is about 6x the prior
+# DSpark reference (25.4 / 3.1).
 perf_reference:
-  1: [25.4, 3.1]
+  1: [161, 18.8]

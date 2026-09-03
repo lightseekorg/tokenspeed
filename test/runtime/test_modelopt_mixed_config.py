@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import tokenspeed_kernel
 import torch
+from torch import nn
 
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
 _RENAMES = (("language_model.", ""),)
 
@@ -80,6 +85,124 @@ def test_from_config_rejects_unknown_algo():
                 {"language_model.model.layers.3.mlp.up_proj": {"quant_algo": "INT8"}}
             )
         )
+
+
+def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: False,
+    )
+    config = _renamed_config(
+        {
+            "language_model.model.layers.5.mlp.up_proj": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16,
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="SM100/SM103.*FlashInfer"):
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.layers.5.mlp.up_proj",
+        )
+
+
+def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
+    from tokenspeed.runtime.layers.dense import Nvfp4W4A16LinearMethod
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: True,
+    )
+    quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
+    model = BaseCausalLM.__new__(BaseCausalLM)
+    nn.Module.__init__(model)
+    model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
+
+    lm_head = model.resolve_lm_head(
+        SimpleNamespace(
+            tie_word_embeddings=False,
+            hidden_size=32,
+            vocab_size=64,
+        ),
+        quant_config,
+        prefix="",
+    )
+
+    assert isinstance(lm_head, ReplicatedLinear)
+    assert isinstance(lm_head.quant_method, Nvfp4W4A16LinearMethod)
+    assert lm_head.weight.dtype == torch.uint8
+    assert lm_head.weight.shape == (64, 16)
+
+
+def test_qwen35_w4a16_and_static_fp8_routing(monkeypatch):
+    monkeypatch.setattr(
+        tokenspeed_kernel,
+        "has_flashinfer_cute_dsl_nvfp4_a16",
+        lambda: True,
+    )
+
+    from tokenspeed.runtime.layers.dense import (
+        Fp8LinearMethod,
+        Nvfp4W4A16LinearMethod,
+    )
+
+    config = ModelOptMixedConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quant_method": "modelopt",
+            "ignore": ["mtp*", "mtp.layers.0*"],
+            "quantized_layers": {
+                "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                    "quant_algo": "FP8"
+                },
+                "model.language_model.layers.0.linear_attn.in_proj_z": {
+                    "quant_algo": "FP8"
+                },
+                "model.language_model.layers.0.mlp.gate_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "model.language_model.layers.0.mlp.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+            },
+        }
+    )
+    # Qwen3_5ForConditionalGeneration declares no quant_module_name_replacements:
+    # resolve_model keeps the "model.language_model" scope and attention layers
+    # keep "self_attn", so runtime quant-lookup prefixes equal the checkpoint
+    # quantized_layers keys verbatim. Apply nothing.
+
+    assert config.exclude_modules == ["mtp*", "mtp.layers.0*"]
+    assert config.group_size == 16
+    assert config.fp8_static_config.activation_scheme == "static"
+    assert config.fp8_static_config.weight_block_size is None
+    assert isinstance(
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.language_model.layers.0.mlp.gate_up_proj",
+        ),
+        Nvfp4W4A16LinearMethod,
+    )
+    assert isinstance(
+        config.get_quant_method(
+            torch.nn.Linear(1, 1),
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz",
+        ),
+        Fp8LinearMethod,
+    )
+    assert config.is_quantized_layer(
+        "model.language_model.layers.0.linear_attn.in_proj_qkv"
+    )
+    assert not config.is_quantized_layer(
+        "model.language_model.layers.0.linear_attn.in_proj_b"
+    )
 
 
 # Layer 4 mimics a Kimi-K3 MLA layer, layer 6 a KDA layer (realistic

@@ -79,6 +79,7 @@ from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
     fp8_linear,
+    has_flashinfer_cute_dsl_nvfp4_a16,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -88,6 +89,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     mm,
     prepare_fp8_linear,
+    prepare_nvfp4_a16_weights,
     warmup_prepared_fp8_linears,
 )
 from tokenspeed_kernel.ops.hyperconnection import (
@@ -133,6 +135,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
@@ -142,6 +145,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
     # hyperconnection
     "gated_residual_combine",

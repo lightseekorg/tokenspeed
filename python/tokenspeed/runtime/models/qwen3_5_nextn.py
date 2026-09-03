@@ -208,6 +208,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     config.hidden_size,
                     config.vocab_size,
                     bias=False,
+                    quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
             else:
@@ -242,6 +243,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

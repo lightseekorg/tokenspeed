@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Package-prefill activation-scale gather for the gfx950 A4W4 MoE package.
+"""Package-prefill activation-scale gather for the gfx950 MXFP4-weight package.
 
 The MXFP4 quantizer emits CDNA4-swizzled, token-order activation scales, but the
 package stage kernels need those same bytes in sorted-route row order. This

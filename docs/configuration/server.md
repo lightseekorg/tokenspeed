@@ -195,6 +195,12 @@ startup rather than silently drafting a wrong-width block. A checkpoint with
 `block_size: 8` therefore wants `--speculative-num-draft-tokens 8
 --speculative-num-steps 7`.
 
+A checkpoint whose architecture is `DFlash2DraftModel` uses the same `DFLASH`
+launch method. TokenSpeed selects its grouped-convolution and candidate-selector
+runtime from the checkpoint architecture; no separate algorithm flag is needed.
+Draft proposals greedily follow the selector's transition-conditioned path,
+independent of the target sampling backend.
+
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft
 follows it. Any sliding window the draft checkpoint declares is an attention
