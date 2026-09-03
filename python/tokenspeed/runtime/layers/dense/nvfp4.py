@@ -292,6 +292,10 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
         layer.alpha = layer.weight_scale_2
 
     def apply(self, layer, x, bias=None):
+        if x.dtype is not torch.bfloat16:
+            raise ValueError(
+                f"FlashInfer CuTe-DSL W4A16 requires BF16 input, got {x.dtype}"
+            )
         return tokenspeed_kernel.mm(
             x,
             layer.weight,
