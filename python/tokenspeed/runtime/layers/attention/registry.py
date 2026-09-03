@@ -126,10 +126,8 @@ def _cache_storage_report(
     fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
-    arena = getattr(pool, "arena", None)
-    plan = getattr(arena, "plan", None)
-    if plan is None:
-        raise RuntimeError("cache pool has no memory plan; every pool is LCM-planned")
+    arena = pool.arena
+    plan = arena.plan
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
@@ -217,12 +215,6 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
-
-# Aliases for backward compatibility with server_args choices
-_BACKEND_ALIASES = {
-    "trtllm_mha": "trtllm",
-}
-
 _DSPARK_DRAFT_ARCHITECTURE = "DeepseekV4ForCausalLMDSpark"
 
 
@@ -293,8 +285,7 @@ def _check_pd_support(
             "draft cache is not transferable"
         )
     if (target.is_inkling or (draft is not None and draft.is_inkling)) and (
-        has_draft_model
-        or getattr(server_args, "speculative_algorithm", None) is not None
+        has_draft_model or server_args.speculative_algorithm is not None
     ):
         raise NotImplementedError(
             "Inkling PD supports target-only decoding; speculative/draft "
@@ -359,8 +350,10 @@ def _has_state_layers(config: AttnConfig) -> bool:
     """The plan actually carries recurrent state (hybrid arch + state labels)."""
     if config.component(LinearAttnConfig) is None:
         return False
-    layer_types = getattr(config.component(SoftmaxAttnConfig), "layer_types", ())
-    return any(layer_type in STATE_LAYER_TYPES for layer_type in layer_types)
+    return any(
+        layer_type in STATE_LAYER_TYPES
+        for layer_type in config.component(SoftmaxAttnConfig).layer_types
+    )
 
 
 def _resolve_cache_family(
@@ -406,15 +399,12 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
 
 def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     if name is None:
-        candidates = [_get_default_backend_name(arch)]
-        for candidate in candidates:
-            entry = _BACKEND_REGISTRY.get(candidate)
-            if entry is not None and arch in entry[0]:
-                return entry[1]
+        entry = _BACKEND_REGISTRY.get(_get_default_backend_name(arch))
+        if entry is not None and arch in entry[0]:
+            return entry[1]
         raise ValueError(
             f"No backend supports arch {arch}. Available: {list(_BACKEND_REGISTRY)}"
         )
-    name = _BACKEND_ALIASES.get(name, name)
     entry = _BACKEND_REGISTRY.get(name)
     if entry is None:
         raise ValueError(
@@ -622,9 +612,7 @@ def _resolve_hybrid_full_backend_name(
     has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
-    name = _BACKEND_ALIASES.get(requested_name, requested_name)
-    if name == "hybrid_linear_attn":
-        name = None
+    name = None if requested_name == "hybrid_linear_attn" else requested_name
     if has_cache_plan and is_dsa and name is None:
         return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
@@ -663,8 +651,8 @@ def _create_hybrid_linear_attn_backend(
     hf_config = model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
-    # Create the full attention backend for standard MHA layers.
-    # Use user's original choice if provided, otherwise auto-select.
+    # The paged full-attention router (MHA, MLA or DSA leaves by arch): the
+    # user's original choice if provided, otherwise auto-selected.
     full_attn_backend = _create_attn_backend_with_name(
         full_attn_backend_name,
         model_config.attention_arch,
@@ -682,11 +670,8 @@ def _create_hybrid_linear_attn_backend(
     # The linear component's presence decides whether this model actually
     # has any linear / mamba layers. A draft model on a hybrid-GDN target
     # (e.g. MTP on Qwen3.5) shares the same architecture class as the
-    # target but commonly ships with *zero* mamba layers — in that case
-    # we skip the mamba backend entirely so that its
-    # ``init_forward_metadata_*`` hooks do not run (they would otherwise
-    # touch a zero-sized pool on the same persistent state_indices_list
-    # as the target, which breaks the captured CUDA graph).
+    # target but commonly ships with *zero* mamba layers; such a view has no
+    # state groups to consume, so the router alone serves it.
     linear_attn = config.component(LinearAttnConfig)
 
     if linear_attn is None:
@@ -697,7 +682,7 @@ def _create_hybrid_linear_attn_backend(
         )
         return full_attn_backend
 
-    kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
+    kda_backend = server_args.kda_backend.strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
         linear_attn_backend = KdaAttnBackend(

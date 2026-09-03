@@ -562,9 +562,9 @@ and never touches packing. No refactor needed here.
 ### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; `expand_page_table` (`attention/page_table.py`) is the single
-expansion primitive; state attention and KV share one plan/arena/`CacheBlock`
-view, mirrored by the host tier. Specifically:
+leaking it; the router's `GroupTableStacks` fill (`backends/group_tables.py`)
+is the single expansion primitive; state attention and KV share one
+plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 
 * No magic `prefix_granularity == 128` branches: the constraint is named
   `MXFP8_KV_SCALE_TILE_TOKENS`, defined in `recipes/plan.py` beside the scale

@@ -42,7 +42,6 @@ from test.runtime.conftest import MLA_KV_LORA_RANK as _KV_LORA_RANK
 from test.runtime.conftest import MLA_LATENT_DIM as _LATENT_DIM
 from test.runtime.conftest import MLA_QK_ROPE_DIM as _QK_ROPE_DIM
 from test.runtime.conftest import make_kimi_pool as _make_pool
-from test.runtime.conftest import mla_layer_id as _mla_layer_id
 from test.runtime.conftest import requires_cuda
 
 from ci_system.ci_register import register_cuda_ci
@@ -167,20 +166,16 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     from tokenspeed.runtime.layers.attention.backends.flashmla import (
         _per_token_slot_table,
     )
-    from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 
     pool = _make_pool("cuda", usable_pages=6)
     page_size = pool.arena.prefix_granularity
     backend = _make_flashmla_backend(pool)
 
-    # The leaf consumes the KERNEL-page table (router expansion); build it
-    # the same way the router's stacks do.
+    # The leaf consumes the KERNEL-page table the router's stacks expand.
     logical_table = torch.tensor([[3, 5]], device="cuda", dtype=torch.int32)
-    table = expand_page_table(
-        logical_table,
-        block_granularity=page_size,
-        kernel_page_size=_KERNEL_PAGE,
-    )
+    stacks = _stacks_for(backend, pool)
+    stacks.fill(1, 1, {_FULL: logical_table})
+    table = stacks.table(_FULL, 1)
 
     # Per-token slot table: token t -> table[0, t // p] * p + t % p, which by
     # the expansion invariant equals the logical-table slot. Position

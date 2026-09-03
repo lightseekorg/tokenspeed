@@ -277,6 +277,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
             prefix_granularity=64,
             kernel_page_size=None,
             max_cudagraph_capture_size=4,
+            chunked_prefill_size=8192,
+            disaggregation_mode="null",
             kv_cache_quant_method="none",
             speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
@@ -284,6 +286,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
         )
         model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(),
             context_len=4096,
             num_attention_heads=16,
             num_key_value_heads=8,

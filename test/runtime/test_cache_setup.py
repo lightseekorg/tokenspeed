@@ -109,7 +109,6 @@ def _msa_config() -> AttnConfig:
         sparse_layer_ids=frozenset({1}),
         index_head_dim=4,
         index_n_heads=1,
-        index_block_size=64,
         index_topk_blocks=1,
         index_init_blocks=1,
         index_local_blocks=1,

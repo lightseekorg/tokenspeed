@@ -212,9 +212,8 @@ def model_wide_kwargs(
         max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
         max_graph_bs=server_args.max_cudagraph_capture_size,
-        max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
-        pd_disaggregation_enabled=getattr(server_args, "disaggregation_mode", "null")
-        != "null",
+        max_scheduled_tokens=server_args.chunked_prefill_size,
+        pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
     )

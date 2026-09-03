@@ -406,7 +406,6 @@ def causal_conv1d_fn(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    metadata=None,
     validate_data=False,
     **kwargs,
 ):
@@ -455,29 +454,20 @@ def causal_conv1d_fn(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    args = None
     out = torch.empty_like(x)
-    if metadata is not None:
-        cu_seqlen = metadata.cu_seqlen
-        nums_dict = metadata.nums_dict
-        args = nums_dict
-        batch_ptr = metadata.batch_ptr
-        token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+    seq_lens_cpu = kwargs.get("seq_lens_cpu")
+    if seq_lens_cpu is not None:
+        seqlens = np.asarray(seq_lens_cpu)
     else:
-        seq_lens_cpu = kwargs.get("seq_lens_cpu")
-        if seq_lens_cpu is not None:
-            seqlens = np.asarray(seq_lens_cpu)
-        else:
-            seqlens = np.diff(query_start_loc.to("cpu"))
-        args = seqlens
-        MAX_NUM_PROGRAMS = 1024
+        seqlens = np.diff(query_start_loc.to("cpu"))
+    MAX_NUM_PROGRAMS = 1024
 
-        batch_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking which seq-idx the Triton program is handling
-        token_chunk_offset_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+    batch_ptr = torch.full(
+        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+    )  # tracking which seq-idx the Triton program is handling
+    token_chunk_offset_ptr = torch.full(
+        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
+    )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -538,64 +528,36 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    if metadata is None:
+    def num_program(META, seqlens):
+        nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
+        tot = int(nums.sum())
 
-        def num_program(META, seqlens):
-            nums = -(-seqlens // META["BLOCK_M"])  # ceil-div, numpy array
-            tot = int(nums.sum())
+        mlist = np.repeat(np.arange(len(nums)), nums)
+        # offsetlist[i] = local chunk index within its sequence
+        offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
+        mlist_len = mlist.shape[0]
 
-            mlist = np.repeat(np.arange(len(nums)), nums)
-            # offsetlist[i] = local chunk index within its sequence
-            offsetlist = np.arange(tot) - np.repeat(np.cumsum(nums) - nums, nums)
-            mlist_len = mlist.shape[0]
+        if META["batch_ptr"].nelement() < mlist_len:
+            newlen = mlist_len + 1
+            META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
+            META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
 
-            if META["batch_ptr"].nelement() < mlist_len:
-                newlen = mlist_len + 1
-                META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
+        combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
+        combined_cpu = torch.from_numpy(combined_np).pin_memory()
+        META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
+        META["token_chunk_offset_ptr"][:mlist_len].copy_(
+            combined_cpu[1], non_blocking=True
+        )
 
-            combined_np = np.stack([mlist, offsetlist]).astype(np.int32, copy=False)
-            combined_cpu = torch.from_numpy(combined_np).pin_memory()
-            META["batch_ptr"][:mlist_len].copy_(combined_cpu[0], non_blocking=True)
-            META["token_chunk_offset_ptr"][:mlist_len].copy_(
-                combined_cpu[1], non_blocking=True
-            )
-
-            META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-            META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-                META["x_ptr"].device
-            )
-            return tot
-
-    else:
-
-        def num_program(META, nums_dict):
-            tot = nums_dict[META["BLOCK_M"]]["tot"]
-
-            mlist = nums_dict[META["BLOCK_M"]]["mlist"]
-            mlist_len = nums_dict[META["BLOCK_M"]]["mlist_len"]
-
-            offsetlist = nums_dict[META["BLOCK_M"]]["offsetlist"]
-
-            if nums_dict[META["BLOCK_M"]]["batch_ptr"] is not None:
-                META["batch_ptr"] = nums_dict[META["BLOCK_M"]]["batch_ptr"]
-                META["token_chunk_offset_ptr"] = nums_dict[META["BLOCK_M"]][
-                    "token_chunk_offset_ptr"
-                ]
-            else:
-                if META["batch_ptr"].nelement() < mlist_len:
-                    newlen = mlist_len + 1
-                    META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                    META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-                if META["batch_ptr"].nelement() >= mlist_len:
-                    META["batch_ptr"][0:mlist_len].copy_(mlist)
-                    META["token_chunk_offset_ptr"][0:mlist_len].copy_(offsetlist)
-            return tot
+        META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
+        META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
+            META["x_ptr"].device
+        )
+        return tot
 
     def grid(META):
         return (
-            num_program(META, args),
+            num_program(META, seqlens),
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
@@ -951,7 +913,6 @@ def causal_conv1d_update(
     intermediate_conv_window: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
-    metadata=None,
     validate_data=False,
 ):
     """
