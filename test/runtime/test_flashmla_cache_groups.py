@@ -108,7 +108,7 @@ def _stacks_for(backend, pool, max_bs: int = 4) -> GroupTableStacks:
                 group_id=_FULL,
                 block_granularity=pool.arena.prefix_granularity,
                 kernel_page_size=backend.kernel_page_size,
-                width=backend.max_num_pages,
+                max_num_pages=backend.max_num_pages,
             )
         ],
         max_bs=max_bs,

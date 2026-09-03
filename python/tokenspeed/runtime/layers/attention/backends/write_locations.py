@@ -28,9 +28,9 @@ per request in q/k/v token order. Null and hole pages (id <= 0) and positions
 past the table route to slot 0, the zero-initialized dummy page that never
 aliases a live request.
 
-Every function takes the stacked ``[G, rows, W]`` table the router fills
-(``group_tables.GroupTableStacks``) so all groups' locations come from one
-launch. CUDA tensors run the triton kernels; CPU tensors take the torch path
+Every function takes the stacked ``[G, max_bs, max_num_pages]`` table the
+router fills (``group_tables.GroupTableStacks``) so all groups' locations
+come from one launch. CUDA tensors run the triton kernels; CPU tensors take the torch path
 (unit tests), which is the reference the kernels are pinned against.
 
 The token-shaped sibling — arbitrary positions over one group's raw table,
@@ -46,43 +46,43 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["num_rows", "tokens_per_req"])
+@triton.jit(do_not_specialize=["num_tokens", "tokens_per_req"])
 def _decode_locs_kernel(
-    tables_ptr,  # [G, rows, W] int32
+    tables_ptr,  # [G, max_bs, max_num_pages] int32
     page_sizes_ptr,  # [G] int32
     seq_lens_ptr,  # [bs] int32
     out_ptr,  # [G, cap] int32
     stride_g,
     stride_b,
-    width,
+    max_num_pages,
     out_stride_g,
-    num_rows,  # bs * tokens_per_req
+    num_tokens,  # bs * tokens_per_req
     tokens_per_req,
     BLOCK: tl.constexpr,
 ):
     g = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
-    rows = start + tl.arange(0, BLOCK)
-    mask = rows < num_rows
-    req = rows // tokens_per_req
-    t = rows % tokens_per_req
+    tok = start + tl.arange(0, BLOCK)  # token-major index into out[g]
+    mask = tok < num_tokens
+    req = tok // tokens_per_req
+    step = tok % tokens_per_req
     seq_len = tl.load(seq_lens_ptr + req, mask=mask, other=1).to(tl.int64)
-    pos = tl.maximum(seq_len - tokens_per_req + t, 0)
+    pos = tl.maximum(seq_len - tokens_per_req + step, 0)
     page_size = tl.load(page_sizes_ptr + g).to(tl.int64)
     page_idx = pos // page_size
-    overflow = page_idx >= width
-    page_idx = tl.minimum(page_idx, width - 1)
+    overflow = page_idx >= max_num_pages
+    page_idx = tl.minimum(page_idx, max_num_pages - 1)
     page = tl.load(
         tables_ptr + g * stride_g + req * stride_b + page_idx, mask=mask, other=0
     ).to(tl.int64)
     loc = page * page_size + pos % page_size
     loc = tl.where(overflow | (page <= 0), 0, loc)
-    tl.store(out_ptr + g * out_stride_g + rows, loc.to(tl.int32), mask=mask)
+    tl.store(out_ptr + g * out_stride_g + tok, loc.to(tl.int32), mask=mask)
 
 
-@triton.jit(do_not_specialize=["width"])
+@triton.jit(do_not_specialize=["max_num_pages"])
 def _extend_locs_kernel(
-    tables_ptr,  # [G, rows, W] int32
+    tables_ptr,  # [G, max_bs, max_num_pages] int32
     page_sizes_ptr,  # [G] int32
     prefix_lens_ptr,  # [bs] int32
     extend_lens_ptr,  # [bs] int32
@@ -90,7 +90,7 @@ def _extend_locs_kernel(
     out_ptr,  # [G, total] int32
     stride_g,
     stride_b,
-    width,
+    max_num_pages,
     out_stride_g,
     BLOCK: tl.constexpr,
 ):
@@ -105,8 +105,8 @@ def _extend_locs_kernel(
         mask = offs < num_new
         pos = prefix + offs
         page_idx = pos // page_size
-        overflow = page_idx >= width
-        page_idx = tl.minimum(page_idx, width - 1)
+        overflow = page_idx >= max_num_pages
+        page_idx = tl.minimum(page_idx, max_num_pages - 1)
         page = tl.load(
             tables_ptr + g * stride_g + req * stride_b + page_idx,
             mask=mask,
@@ -132,11 +132,12 @@ def _decode_positions(seq_lens: torch.Tensor, tokens_per_req: int) -> torch.Tens
 def _gather_slots(
     table: torch.Tensor, req: torch.Tensor, pos: torch.Tensor, page_size: int
 ) -> torch.Tensor:
-    """Torch reference of the slot rule for one group's ``[rows, W]`` table."""
-    width = table.shape[1]
+    """Torch reference of the slot rule for one group's
+    ``[max_bs, max_num_pages]`` table."""
+    max_num_pages = table.shape[1]
     page_idx = pos // page_size
-    overflow = page_idx >= width
-    page = table[req, page_idx.clamp_max(width - 1)].to(torch.int64)
+    overflow = page_idx >= max_num_pages
+    page = table[req, page_idx.clamp_max(max_num_pages - 1)].to(torch.int64)
     loc = page * page_size + pos % page_size
     return torch.where(overflow | (page <= 0), torch.zeros_like(loc), loc).to(
         torch.int32
@@ -155,27 +156,29 @@ def decode_write_locations(
     write slots.
 
     Args:
-        tables: ``[G, rows >= bs, W]`` int32 stacked kernel page tables.
+        tables: ``[G, max_bs >= bs, max_num_pages]`` int32 stacked kernel page
+            tables.
         page_sizes: ``[G]`` int32 kernel page size per group.
         seq_lens: ``[>= bs]`` int32 lengths including the newest token(s);
             request ``b`` writes positions ``seq_lens[b] - n .. seq_lens[b] - 1``.
         out: ``[G, cap]`` int32 destination, ``cap >= bs * tokens_per_req``;
             filled token-major per request (the verify layout).
-        bs: Rows to compute (padded rows read seq_len 1 and land on slot 0).
+        bs: Requests to compute (padded requests read seq_len 1 and land on
+            slot 0).
         tokens_per_req: Trailing window width ``n``.
     """
     n = max(int(tokens_per_req), 1)
-    num_rows = bs * n
-    if num_rows == 0 or tables.shape[0] == 0:
+    num_tokens = bs * n
+    if num_tokens == 0 or tables.shape[0] == 0:
         return
-    if out.shape[1] < num_rows:
+    if out.shape[1] < num_tokens:
         raise RuntimeError(
             f"decode write-location buffer holds {out.shape[1]} slots per group, "
-            f"need {num_rows} (bs={bs}, tokens_per_req={n})"
+            f"need {num_tokens} (bs={bs}, tokens_per_req={n})"
         )
     if tables.is_cuda:
         block = 128
-        grid = (tables.shape[0], triton.cdiv(num_rows, block))
+        grid = (tables.shape[0], triton.cdiv(num_tokens, block))
         _decode_locs_kernel[grid](
             tables,
             page_sizes,
@@ -185,7 +188,7 @@ def decode_write_locations(
             tables.stride(1),
             tables.shape[2],
             out.stride(0),
-            num_rows,
+            num_tokens,
             n,
             BLOCK=block,
         )
@@ -193,7 +196,7 @@ def decode_write_locations(
     pos = _decode_positions(seq_lens[:bs], n)
     req = torch.arange(bs, device=tables.device).repeat_interleave(n)
     for g in range(tables.shape[0]):
-        out[g, :num_rows] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))
+        out[g, :num_tokens] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))
 
 
 def extend_write_locations(
@@ -207,7 +210,8 @@ def extend_write_locations(
     token order (request-major, ``cu_extend_seq_lens`` layout).
 
     Args:
-        tables: ``[G, rows >= bs, W]`` int32 stacked kernel page tables.
+        tables: ``[G, max_bs >= bs, max_num_pages]`` int32 stacked kernel page
+            tables.
         page_sizes: ``[G]`` int32 kernel page size per group.
         extend_prefix_lens: ``[bs]`` int32 cached prefix per request.
         extend_seq_lens: ``[bs]`` int32 new tokens per request.

@@ -346,7 +346,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                     "full_attention",
                     block_granularity=128,
                     kernel_page_size=64,
-                    width=max_num_pages,
+                    max_num_pages=max_num_pages,
                 )
             ],
             max_bs=1,
@@ -375,7 +375,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                     "full_attention",
                     block_granularity=128,
                     kernel_page_size=64,
-                    width=130,
+                    max_num_pages=130,
                 )
             ],
             max_bs=1,

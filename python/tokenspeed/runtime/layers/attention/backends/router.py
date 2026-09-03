@@ -74,8 +74,9 @@ class DraftHistoryView:
     """The full-history table as the draft chain's write-location source.
 
     Attributes:
-        table: ``[max_bs, Wmax]`` contiguous kernel-page table (the router's
-            stack row; address-stable for the graph's lifetime).
+        table: ``[max_bs, stack_max_num_pages]`` contiguous kernel-page table
+            (the router's stack row; address-stable for the graph's
+            lifetime).
         page_size: Tokens per kernel page.
         max_tokens: Per-request token capacity of the group's own columns.
     """
@@ -238,7 +239,7 @@ class CacheGroupRouter(AttentionBackend):
                 group_id=gid,
                 block_granularity=self.geometry.granularity_of(gid),
                 kernel_page_size=leaf.kernel_page_size,
-                width=leaf.max_num_pages,
+                max_num_pages=leaf.max_num_pages,
             )
             for gid, leaf in self.leaves.items()
         ]
@@ -520,10 +521,11 @@ class CacheGroupRouter(AttentionBackend):
         so their kernels record this table's address at capture; the router
         owns the storage and its refresh rewrites it in place each round.
 
-        The tensor is the FULL contiguous stack row (``[max_bs, Wmax]``,
-        batch-ordered): the slot kernels assume row-major contiguity.
-        Columns past the group's own width are null pages by the fill
-        contract and resolve to the dummy slot 0; ``max_tokens`` is the
+        The tensor is the FULL contiguous stack row
+        (``[max_bs, stack_max_num_pages]``, batch-ordered): the slot kernels
+        assume row-major contiguity. Columns past the group's own
+        ``max_num_pages`` are null pages by the fill contract and resolve to
+        the dummy slot 0; ``max_tokens`` is the
         group's real per-request capacity, the bound block drafters clamp
         their prefix against.
         """
@@ -561,9 +563,9 @@ class CacheGroupRouter(AttentionBackend):
         bs = cache_start.shape[0]
         steps = torch.arange(num_tokens, dtype=torch.int64)
         pos = cache_start.to(torch.int64).unsqueeze(1) + steps
-        width = view.table.shape[1]
-        page_idx = (pos // view.page_size).clamp_max(width - 1)
-        overflow = (pos // view.page_size) >= width
+        max_num_pages = view.table.shape[1]
+        page_idx = (pos // view.page_size).clamp_max(max_num_pages - 1)
+        overflow = (pos // view.page_size) >= max_num_pages
         pages = view.table[:bs].to(torch.int64).gather(1, page_idx)
         locs = pages * view.page_size + pos % view.page_size
         locs = torch.where(overflow | (pages <= 0), torch.zeros_like(locs), locs)

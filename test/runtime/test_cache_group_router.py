@@ -44,7 +44,7 @@ class WriteLocationMathTest(unittest.TestCase):
     """The slot rule over stacked tables, on CPU (the reference)."""
 
     def _tables(self, device="cpu"):
-        # Two groups, kernel pages 4 and 2, three rows, width 6.
+        # Two groups, kernel pages 4 and 2, three rows, max_num_pages 6.
         tables = torch.tensor(
             [
                 [[7, 8, 9, 0, 0, 0], [3, 0, 5, 6, 0, 0], [0, 0, 0, 0, 0, 0]],
@@ -97,7 +97,7 @@ class WriteLocationMathTest(unittest.TestCase):
 
     def test_positions_past_the_table_route_to_the_dummy_slot(self):
         tables, page_sizes = self._tables()
-        seq_lens = torch.tensor([40], dtype=torch.int32)  # page index 9 > width 6
+        seq_lens = torch.tensor([40], dtype=torch.int32)  # page index 9 >= 6 pages
         out = torch.zeros((2, 4), dtype=torch.int32)
         decode_write_locations(
             tables, page_sizes, seq_lens, out, bs=1, tokens_per_req=1
@@ -107,12 +107,12 @@ class WriteLocationMathTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_fused_kernels_match_the_reference(self):
         torch.manual_seed(0)
-        g, bs, width = 3, 17, 40
-        tables = torch.randint(0, 50, (g, bs, width), dtype=torch.int32)
-        tables[:, :, width - 5 :] = 0  # trailing nulls
+        g, bs, max_num_pages = 3, 17, 40
+        tables = torch.randint(0, 50, (g, bs, max_num_pages), dtype=torch.int32)
+        tables[:, :, max_num_pages - 5 :] = 0  # trailing nulls
         tables[1, 3, 2] = -1  # a ragged hole
         page_sizes = torch.tensor([1, 4, 16], dtype=torch.int32)
-        seq_lens = torch.randint(1, width * 4, (bs,), dtype=torch.int32)
+        seq_lens = torch.randint(1, max_num_pages * 4, (bs,), dtype=torch.int32)
         for n in (1, 4):
             ref = torch.zeros((g, bs * n), dtype=torch.int32)
             decode_write_locations(tables, page_sizes, seq_lens, ref, bs, n)
@@ -134,8 +134,12 @@ class WriteLocationMathTest(unittest.TestCase):
 class GroupTableStacksTest(unittest.TestCase):
     def _stacks(self, device="cpu", max_bs=4):
         specs = [
-            GroupTableSpec(FULL, block_granularity=4, kernel_page_size=4, width=3),
-            GroupTableSpec(SWA, block_granularity=4, kernel_page_size=2, width=6),
+            GroupTableSpec(
+                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+            ),
+            GroupTableSpec(
+                SWA, block_granularity=4, kernel_page_size=2, max_num_pages=6
+            ),
         ]
         return GroupTableStacks(
             specs, max_bs=max_bs, max_tokens_per_req=2, device=device
@@ -628,9 +632,8 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         view = router.draft_history_view()
         self.assertEqual(view.page_size, 4)  # FULL leaf kernel page
-        self.assertEqual(
-            view.max_tokens, 3 * 2 * 4
-        )  # 3 raw cols * ratio 1... width 6? recompute below
+        # FULL leaf: max_num_pages = ceil(context_len 24 / kernel page 4) = 6.
+        self.assertEqual(view.max_tokens, 6 * 4)
         out = torch.zeros(4, dtype=torch.int32)
         router.draft_write_locations_uniform(
             out, cache_start=torch.tensor([4, 7], dtype=torch.int32), num_tokens=2

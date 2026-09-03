@@ -71,7 +71,7 @@ def _kernel_page_table(
     prefix_granularity: int,
     device,
     *,
-    width: int,
+    max_num_pages: int,
 ):
     """Hand-built kernel-page table padded to the leaf's ``max_num_pages``:
     each logical page expands to its ratio consecutive kernel pages; -1 holes
@@ -85,7 +85,7 @@ def _kernel_page_table(
                 row.extend(page * ratio + k for k in range(ratio))
             else:
                 row.extend(0 for _ in range(ratio))
-        row.extend(0 for _ in range(width - len(row)))
+        row.extend(0 for _ in range(max_num_pages - len(row)))
         rows.append(row)
     return torch.tensor(rows, device=device, dtype=torch.int32)
 
@@ -105,7 +105,7 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
                 group_id=_FULL,
                 block_granularity=pool.arena.prefix_granularity,
                 kernel_page_size=backend.kernel_page_size,
-                width=backend.max_num_pages,
+                max_num_pages=backend.max_num_pages,
             )
         ],
         max_bs=max(bs, 4),
@@ -350,7 +350,10 @@ def test_decode_grouped_matches_single_table_and_reference(
     # Single-table arm: byte-equivalent hand-built kernel-page table.
     single_table_backend = backend_factory()
     page_table = _kernel_page_table(
-        logical_rows, page_size, "cuda", width=single_table_backend.max_num_pages
+        logical_rows,
+        page_size,
+        "cuda",
+        max_num_pages=single_table_backend.max_num_pages,
     )
     _refresh_decode(single_table_backend, page_table, seq_lens_cpu)
     single_table_md = single_table_backend.forward_decode_metadata
@@ -430,7 +433,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
             logical_rows,
             page_size,
             "cuda",
-            width=single_table_backend.max_num_pages,
+            max_num_pages=single_table_backend.max_num_pages,
         ),
         prefix,
         extend,

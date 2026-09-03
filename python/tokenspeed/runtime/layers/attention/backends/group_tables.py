@@ -22,20 +22,22 @@
 
 ``GroupTableStacks`` turns the bridge's raw per-group block tables (scheduler
 pages of each group's ``block_granularity``, batch-ordered, ``-1`` ragged
-padding, ``0`` null holes) into one ``[G, max_bs, Wmax]`` stack of kernel page
-tables — group ``g`` expanded to its leaf's ``kernel_page_size`` and padded
-to the leaf's ``max_num_pages`` — plus the ``[G, max_bs * N]`` stack of
-decode write slots derived from those tables. Both fills are one launch for
-every group (the bridge uploads all groups into one packed buffer, so the
-unpack reads it directly); the padding contract is uniform: rows past the
-live batch and columns past a group's table are 0, the zero-initialized
-dummy page, safe to dereference and never a live request's cache.
+padding, ``0`` null holes) into one ``[G, max_bs, stack_max_num_pages]``
+stack of kernel page tables — group ``g`` expanded to its leaf's
+``kernel_page_size`` and padded to the leaf's ``max_num_pages``;
+``stack_max_num_pages`` is the widest group's — plus the ``[G, max_bs * N]``
+stack of decode write slots derived from those tables. Both fills are one
+launch for every group (the bridge uploads all groups into one packed
+buffer, so the unpack reads it directly); the padding contract is uniform:
+rows past the live batch and columns past a group's table are 0, the
+zero-initialized dummy page, safe to dereference and never a live request's
+cache.
 
 The stacks are allocated once (``init_cuda_graph_state``) and refilled in
-place. Leaves copy their ``[bs, W_g]`` view into their own graph-recorded
-buffers, but three consumers read the stack storage directly inside captured
-graphs and so pin its address: the decode write-slot views the router
-publishes, the full-history table the block drafters get from
+place. Leaves copy their ``[bs, max_num_pages]`` view into their own
+graph-recorded buffers, but three consumers read the stack storage directly
+inside captured graphs and so pin its address: the decode write-slot views
+the router publishes, the full-history table the block drafters get from
 ``draft_history_view``, and the per-group tables the QSA indexer takes from
 ``table()``.
 """
@@ -64,13 +66,14 @@ class GroupTableSpec:
         block_granularity: Tokens per scheduler block (raw table unit).
         kernel_page_size: Tokens per kernel page of the consuming leaf; must
             divide ``block_granularity``.
-        width: Kernel pages per row the leaf reads (``leaf.max_num_pages``).
+        max_num_pages: Kernel pages per row the leaf reads
+            (``leaf.max_num_pages``).
     """
 
     group_id: str
     block_granularity: int
     kernel_page_size: int
-    width: int
+    max_num_pages: int
 
     @property
     def ratio(self) -> int:
@@ -83,23 +86,23 @@ class GroupTableSpec:
         return self.block_granularity // self.kernel_page_size
 
 
-@triton.jit(do_not_specialize=["cols", "src_stride_b", "actual_bs"])
+@triton.jit(do_not_specialize=["num_blocks", "src_stride_b", "actual_bs"])
 def _unpack_group_kernel(
-    src_ptr,  # this group's raw table [>= actual_bs, cols] int32
-    dst_ptr,  # this group's stack rows [max_bs, Wmax] int32
-    cols,
+    src_ptr,  # this group's raw table [>= actual_bs, num_blocks] int32
+    dst_ptr,  # this group's stack rows [max_bs, stack_max_num_pages] int32
+    num_blocks,  # scheduler blocks per raw row (the source column count)
     src_stride_b,
-    ratio,
-    width,
+    ratio,  # kernel pages per scheduler block
+    max_num_pages,  # kernel pages per row the leaf reads
     dst_stride_b,
-    wmax,
+    stack_max_num_pages,  # the stack's column count (widest group)
     actual_bs,
-    BLOCK_W: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
 ):
     """Expand one group's raw block table into its kernel-page stack rows.
 
     One launch per group with plain scalar arguments: the per-step values
-    (column count, source stride, live rows) change every step, and hosting
+    (block count, source stride, live rows) change every step, and hosting
     them in a device-side metadata tensor would cost a pinned staging
     allocation plus an H2D copy on the latency-critical bs=1 refresh path.
     ``do_not_specialize`` keeps those varying scalars from triggering
@@ -107,31 +110,36 @@ def _unpack_group_kernel(
     """
     b = tl.program_id(0)  # grid == padded bs
     live = b < actual_bs
-    w_off = tl.arange(0, BLOCK_W)
-    for w0 in range(0, wmax, BLOCK_W):
-        w = w0 + w_off
-        src_col = w // ratio
-        # Columns past this group's own width are the padding contract's
-        # tail: always the null page 0, never expansion residue (the slot
-        # kernels clamp at the stack's wmax, so they can read them).
-        in_row = live & (src_col < cols) & (w < width)
+    col_off = tl.arange(0, BLOCK_COLS)
+    for col0 in range(0, stack_max_num_pages, BLOCK_COLS):
+        col = col0 + col_off
+        block = col // ratio
+        # Columns past this group's own max_num_pages are the padding
+        # contract's tail: always the null page 0, never expansion residue
+        # (the slot kernels clamp at the stack's column count, so they can
+        # read them).
+        in_row = live & (block < num_blocks) & (col < max_num_pages)
         raw = tl.load(
-            src_ptr + b.to(tl.int64) * src_stride_b + src_col, mask=in_row, other=0
+            src_ptr + b.to(tl.int64) * src_stride_b + block, mask=in_row, other=0
         )
         # Holes and ragged padding (id <= 0) collapse onto the dummy page 0;
-        # a real page expands to its ratio consecutive kernel pages.
-        page = tl.maximum(raw, 0).to(tl.int64) * ratio + w % ratio
+        # a real block expands to its ratio consecutive kernel pages.
+        page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
         page = tl.where(raw > 0, page, 0)
         vals = tl.where(in_row, page, 0)
-        tl.store(dst_ptr + b * dst_stride_b + w, vals.to(tl.int32), mask=w < wmax)
+        tl.store(
+            dst_ptr + b * dst_stride_b + col,
+            vals.to(tl.int32),
+            mask=col < stack_max_num_pages,
+        )
 
 
 class GroupTableStacks:
     """Stacked kernel page tables and decode write slots for a router's groups.
 
     Attributes:
-        tables: ``[G, max_bs, Wmax]`` int32 kernel page tables, group-major in
-            ``group_ids`` order.
+        tables: ``[G, max_bs, stack_max_num_pages]`` int32 kernel page
+            tables, group-major in ``group_ids`` order.
         decode_locs: ``[G, max_bs * max_tokens_per_req]`` int32 decode write
             slots (token-major per request) refreshed by
             :meth:`compute_decode_locations`; the router publishes per-bs
@@ -155,13 +163,13 @@ class GroupTableStacks:
         self._specs = {spec.group_id: spec for spec in groups}
         self._index = {gid: i for i, gid in enumerate(self.group_ids)}
         self._ratios = tuple(spec.ratio for spec in groups)
-        self._widths = tuple(spec.width for spec in groups)
+        self._max_num_pages = tuple(spec.max_num_pages for spec in groups)
         self.max_bs = int(max_bs)
         self.max_tokens_per_req = max(int(max_tokens_per_req), 1)
         g = len(groups)
-        wmax = max(self._widths)
+        stack_max_num_pages = max(self._max_num_pages)
         self.tables = torch.zeros(
-            (g, self.max_bs, wmax), dtype=torch.int32, device=device
+            (g, self.max_bs, stack_max_num_pages), dtype=torch.int32, device=device
         )
         self.decode_locs = torch.zeros(
             (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int32, device=device
@@ -180,7 +188,7 @@ class GroupTableStacks:
     def group_capacity_tokens(self, group_id: str) -> int:
         """Per-request token capacity of one group's own columns."""
         i = self._index[group_id]
-        return self._widths[i] * self._specs[group_id].kernel_page_size
+        return self._max_num_pages[i] * self._specs[group_id].kernel_page_size
 
     def group_kernel_page_size(self, group_id: str) -> int:
         """One group's kernel page size from the host-side spec (the device
@@ -188,9 +196,9 @@ class GroupTableStacks:
         return int(self._specs[group_id].kernel_page_size)
 
     def table(self, group_id: str, bs: int) -> torch.Tensor:
-        """``[bs, W_g]`` kernel page table view of one group."""
+        """``[bs, max_num_pages]`` kernel page table view of one group."""
         i = self._index[group_id]
-        return self.tables[i, :bs, : self._widths[i]]
+        return self.tables[i, :bs, : self._max_num_pages[i]]
 
     def decode_locations(
         self, group_id: str, bs: int, tokens_per_req: int
@@ -218,9 +226,9 @@ class GroupTableStacks:
             bs: Rows to prepare (the padded graph batch, or ``actual_bs``).
             actual_bs: Live rows; ``block_tables`` rows past it are ignored
                 and stack rows ``[actual_bs, bs)`` are zeroed.
-            block_tables: ``group_id -> [>= actual_bs, cols]`` int32 raw
-                scheduler tables covering every routed group (the router's
-                ``_check_live_delivery`` guards a live batch's dict).
+            block_tables: ``group_id -> [>= actual_bs, num_blocks]`` int32
+                raw scheduler tables covering every routed group (the
+                router's ``_check_live_delivery`` guards a live batch's dict).
         """
         if bs < actual_bs or actual_bs < 0:
             raise RuntimeError(f"need 0 <= actual_bs <= bs, got {actual_bs=} {bs=}")
@@ -246,8 +254,8 @@ class GroupTableStacks:
                     f"batch of {actual_bs}"
                 )
         if self.tables.is_cuda:
-            wmax = self.tables.shape[2]
-            block_w = 128 if wmax >= 128 else 64
+            stack_max_num_pages = self.tables.shape[2]
+            block_cols = 128 if stack_max_num_pages >= 128 else 64
             for i, src in enumerate(srcs):
                 if src.stride(1) != 1:
                     src = src.contiguous()
@@ -257,11 +265,11 @@ class GroupTableStacks:
                     src.shape[1],
                     src.stride(0),
                     self._ratios[i],
-                    self._widths[i],
+                    self._max_num_pages[i],
                     self.tables.stride(1),
-                    wmax,
+                    stack_max_num_pages,
                     actual_bs,
-                    BLOCK_W=block_w,
+                    BLOCK_COLS=block_cols,
                 )
             return
         self._fill_torch(bs, actual_bs, srcs)
@@ -273,19 +281,21 @@ class GroupTableStacks:
         (``fill`` handles the idle case before dispatching here)."""
         for i, src in enumerate(srcs):
             dst = self.tables[i, :bs]
-            width = self._widths[i]
+            max_num_pages = self._max_num_pages[i]
             ratio = self._ratios[i]
-            cols = min(src.shape[1], -(-width // ratio))
-            live = src[:actual_bs, :cols].clamp_min(0)
+            # Only the scheduler blocks whose expansion lands inside the
+            # leaf's max_num_pages are read.
+            num_blocks = min(src.shape[1], -(-max_num_pages // ratio))
+            live = src[:actual_bs, :num_blocks].clamp_min(0)
             if ratio != 1:
                 offsets = torch.arange(ratio, dtype=live.dtype, device=live.device)
                 live = (live.unsqueeze(-1) * ratio + offsets).reshape(actual_bs, -1)
                 live = torch.where(
                     live >= ratio, live, torch.zeros_like(live)
                 )  # page 0 stays 0 across its ratio slots
-            cols = min(live.shape[1], width)
-            dst[:actual_bs, :cols].copy_(live[:, :cols])
-            dst[:actual_bs, cols:].zero_()
+            num_pages = min(live.shape[1], max_num_pages)
+            dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
+            dst[:actual_bs, num_pages:].zero_()
             dst[actual_bs:bs].zero_()
 
     def compute_decode_locations(

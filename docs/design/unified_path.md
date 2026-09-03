@@ -286,16 +286,21 @@ group — the persistent decode buffers would otherwise serve stale pages.
 Consumers take their own groups by positive claim
 (`cache_consumer_families`); extra groups ride through untouched.
 
-Inside the router, `GroupTableStacks` holds the `[G, max_bs, Wmax]`
-kernel-page table stack and the `[G, max_bs * N]` decode write-location
-stack — scratch the leaves copy from, not graph-recorded storage. The fill
-is one expand launch per group with plain scalar arguments (column count,
-source stride, live rows) — no device-side metadata tensor, because the
-per-step pinned staging + H2D it would need lands on the bs=1 latency
-path; padding rows (`[actual_bs, bs)`) and each group's column tail resolve
-to null page 0. The bridge's `{gid: view}` dict is the router's input; the
-router does not depend on the views sharing one storage. The slot math lives in `write_locations.py` as pure functions with one
-invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
+Inside the router, `GroupTableStacks` holds the
+`[G, max_bs, stack_max_num_pages]` kernel-page table stack (each group's row
+expanded to its leaf's `kernel_page_size` and padded to the leaf's
+`max_num_pages`; the stack's column count is the widest group's) and the
+`[G, max_bs * N]` decode write-location stack. Both are allocated once and
+refilled in place: leaves copy their view out, while the decode write-slot
+views, the block drafters' `draft_history_view` and the QSA indexer's group
+tables read the stack storage inside captured graphs. The fill is one expand
+launch per group with plain scalar arguments (scheduler block count, source
+stride, live rows) — no device-side metadata tensor, because the per-step
+pinned staging + H2D it would need lands on the bs=1 latency path; padding
+rows (`[actual_bs, bs)`) and each group's column tail resolve to null page 0.
+The bridge's `{gid: view}` dict is the router's input; the router does not
+depend on the views sharing one storage. The slot math lives in
+`write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
 raw-table locations bit for bit.
 
