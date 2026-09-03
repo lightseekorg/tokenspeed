@@ -164,6 +164,92 @@ class AboveLadderDecodeTest(_RouterCase):
         self.assertIs(md2, md)
 
 
+class FlashMLATileScheduleTest(_TorchCase):
+    """FlashMLA's kernel freezes its tile schedule on the first call against
+    a sched-meta object, so the step's object is kernel-owned scratch held on
+    the backend — never a field of the pointer-stable decode views, so the
+    graph_ptr_guard has nothing to exempt."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from tokenspeed.runtime.layers.attention.backends import flashmla
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs tokenspeed_kernel: {exc}")
+        from unittest import mock
+
+        self.flashmla = flashmla
+        # The kernel package's factory returns (FlashMLASchedMeta, None); the
+        # lifecycle under test never looks inside the object.
+        patcher = mock.patch.object(
+            flashmla, "get_mla_metadata", lambda: (SimpleNamespace(), None)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        torch = self.torch
+        leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
+        leaf.spec_num_tokens = 1
+        leaf.is_draft = False
+        leaf.draft_block_decode = False
+        leaf.max_num_pages = MAX_NUM_PAGES
+        leaf.max_context_len = MAX_NUM_PAGES * flashmla.PAGE_SIZE
+        leaf.kernel_page_size = flashmla.PAGE_SIZE
+        leaf.device = "cpu"
+        leaf.forward_decode_metadata = None
+        leaf._decode_tile_metadata = None
+        leaf._decode_tile_metadata_keepalive = []
+        leaf.init_cuda_graph_state(MAX_DECODE_BS)
+        self.leaf = leaf
+        self.seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
+        self.table = torch.zeros((LADDER_BS, MAX_NUM_PAGES), dtype=torch.int32)
+
+    def test_views_carry_no_schedule_and_the_guard_sees_none(self):
+        from tokenspeed.runtime.execution.graph_ptr_guard import (
+            snapshot_graph_metadata,
+        )
+
+        self.leaf.init_forward_metadata_capture_cuda_graph(
+            LADDER_BS, self.seq, self.table
+        )
+        md = self.leaf.forward_decode_metadata
+        self.assertFalse(hasattr(md, "flashmla_metadata"))
+        self.assertIsNotNone(self.leaf._decode_tile_metadata)
+        paths = set(snapshot_graph_metadata(self.leaf))
+        self.assertEqual(
+            paths,
+            {
+                "FlashMLABackend.forward_decode_metadata.page_table",
+                "FlashMLABackend.forward_decode_metadata.seq_lens_k",
+            },
+        )
+
+    def test_capture_installs_a_kept_alive_schedule_that_replay_leaves_alone(self):
+        self.leaf.init_forward_metadata_capture_cuda_graph(
+            LADDER_BS, self.seq, self.table
+        )
+        captured = self.leaf._decode_tile_metadata
+        self.assertIn(captured, self.leaf._decode_tile_metadata_keepalive)
+        # A second variant's capture at the same bs records its own object.
+        self.leaf.init_forward_metadata_capture_cuda_graph(
+            LADDER_BS, self.seq, self.table
+        )
+        self.assertIsNot(self.leaf._decode_tile_metadata, captured)
+        self.assertIn(captured, self.leaf._decode_tile_metadata_keepalive)
+        current = self.leaf._decode_tile_metadata
+        self.leaf.refresh_decode_metadata(
+            LADDER_BS, 2, self.seq, self.table, for_graph_replay=True
+        )
+        self.assertIs(self.leaf._decode_tile_metadata, current)
+
+    def test_eager_refresh_takes_a_fresh_schedule_every_step(self):
+        self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
+        first = self.leaf._decode_tile_metadata
+        self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
+        self.assertIsNot(self.leaf._decode_tile_metadata, first)
+        self.assertEqual(self.leaf._decode_tile_metadata_keepalive, [])
+
+
 class DefaultCaptureTest(_RouterCase):
     """The default capture (idle fill + leaf idle refresh) over a real
     router: it binds the same cached per-bs views a refresh binds, seeds
