@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 # Keep the pure target as a manual control; the matching EAGLE3 configuration
-# is the per-commit Kimi-K3 AIME26 gate.
+# is a manual control too. The per-commit Kimi-K3 AIME26 gate is the EAGLE3 job
+# at the tp8ep1 placement, so both arms of tp8ep8 are now run by hand.
 name: eval-kimi-k3-mxfp4-tp8ep8-aime26-amd
 type: eval
 workflow_stage: model-test

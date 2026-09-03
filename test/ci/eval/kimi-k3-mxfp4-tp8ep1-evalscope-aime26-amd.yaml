@@ -7,9 +7,12 @@ api_version: ci.tokenspeed.io/v1
 # output buffer, and the model emitted repetition loops and wrong arithmetic
 # while EP8 stayed clean.
 #
-# Manual, matching the non-DSpark tp8ep8 eval: the per-commit signal for this
-# placement is the cheaper perf job, which catches startup and graph-capture
-# regressions without the full AIME26 budget.
+# Manual, matching the speculator-free tp8ep8 eval. This placement carries two
+# per-commit signals of its own -- the cheaper perf job, which catches startup
+# and graph-capture regressions without the full AIME26 budget, and the EAGLE3
+# tp8ep1 eval, which additionally exercises the speculator. Neither gates on an
+# accuracy score, so this job remains the deliberate by-hand accuracy check for
+# the placement.
 name: eval-kimi-k3-mxfp4-tp8ep1-aime26-amd
 type: eval
 workflow_stage: model-test

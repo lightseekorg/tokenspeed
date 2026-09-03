@@ -107,11 +107,12 @@ report:
 # not admit 26/30, because 26/30 = 0.8667 is below it, and lands on the 47.2%
 # row rather than the 27.0% one. Pick k first, then write k/30 to four places.
 #
-# Inheriting the tp8ep8 twin's 0.90 would fail almost half of all PRs. The same
-# arithmetic applies to that twin, which gates commits today at 0.90 with
-# roughly a 1-in-8 false-failure rate; fixing that means more problems per run
-# and is out of scope here. Those numbers come from the DSpark predecessor, so
-# re-derive them from this job's own history before setting any bar.
+# Inheriting the tp8ep8 twin's 0.90 would fail almost half of all PRs. That twin
+# keeps its 0.90 and becomes a manual control in this change, so the bar stops
+# gating anything; it was running at roughly a 1-in-8 false-failure rate while
+# it did. Making a 30-problem bar dependable needs more problems per run, which
+# is out of scope here. The numbers above come from the DSpark predecessor of
+# this job, so re-derive them from its own history before setting any bar.
 #
 # On whether A8W4 costs accuracy at all: measured on GSM8K (1319 greedy
 # problems) and GPQA-Diamond, tp8ep1 sat 0.5 and 3.0 points below tp8ep8, both
