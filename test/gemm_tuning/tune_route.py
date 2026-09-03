@@ -79,6 +79,9 @@ SHAPE_SETS = {
         # Table keys on exact M; sweep the routed range with no holes.
         list(range(1, 33)),
     ),
+    # Qwen3.8-Flash-Next BF16 shapes observed at UnquantizedLinearMethod across
+    # the FP8/NVFP4 and MTP3/MTP7 serving configurations. Each TP set is tuned
+    # independently because tensor-parallel projections change both N and K.
     "qwen38_next_tp4": (
         [
             (512, 2560, 0, "mlp_gate"),
@@ -91,7 +94,20 @@ SHAPE_SETS = {
             (2560, 2560, 0, "n2560_k2560"),
             (12800, 2560, 0, "n12800_k2560"),
         ],
-        [1, 2, 4, 8],
+        list(range(1, 33)),
+    ),
+    "qwen38_next_tp2": (
+        [
+            (512, 2560, 0, "n512_k2560"),
+            (640, 2560, 0, "n640_k2560"),
+            (2560, 320, 0, "n2560_k320"),
+            (2560, 2560, 0, "n2560_k2560"),
+            (2560, 3072, 0, "n2560_k3072"),
+            (6656, 2560, 0, "n6656_k2560"),
+            (8240, 2560, 0, "n8240_k2560"),
+            (12800, 2560, 0, "n12800_k2560"),
+        ],
+        list(range(1, 33)),
     ),
 }
 SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]

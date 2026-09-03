@@ -66,6 +66,7 @@ import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -231,6 +232,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
+        "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 3,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
     }
@@ -2462,15 +2464,15 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             None,
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
         (
             8,
             3072,
             "gluon",
-            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
-            "validate_linear_mxfp4_moe_weights",
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
     ],
 )
@@ -2544,6 +2546,93 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
         registry.clear_cache()
 
     assert plan["apply_kernel_name"] == kernel_name
+
+
+def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=8,
+            ispp=3072,
+            internal_activation_dtype="input",
+            with_bias=True,
+            solution="gluon",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert plan["apply_kernel_name"] != kernel_name
+
+
+def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @dataclass
+    class FakeTensor:
+        shape: tuple[int, ...]
+        dtype: torch.dtype
+        is_cuda: bool = True
+
+        def is_contiguous(self) -> bool:
+            return True
+
+    def fake_tensor(dtype: torch.dtype, *shape: int) -> FakeTensor:
+        return FakeTensor(shape, dtype)
+
+    tensors = (
+        fake_tensor(torch.bfloat16, 896, 7168),
+        fake_tensor(torch.bfloat16, 3584, 7168),
+        fake_tensor(torch.bfloat16, 1536, 7168),
+        fake_tensor(torch.bfloat16, 7168, 768),
+        fake_tensor(torch.uint8, 112, 6144, 1792),
+        fake_tensor(torch.uint8, 112, 6144, 112),
+        fake_tensor(torch.uint8, 112, 7168, 1536),
+        fake_tensor(torch.uint8, 112, 7168, 96),
+    )
+    plan = {"apply_kernel_name": "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"}
+    monkeypatch.setattr(
+        _moe_latent_decode,
+        "select_kernel",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+        *tensors,
+        plan,
+        topk=16,
+        linear_clamp=None,
+    )
+    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+        *tensors,
+        plan,
+        topk=16,
+        linear_clamp=25.0,
+    )
+    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+        *tensors,
+        plan,
+        topk=16,
+    )
+
+    a16_plan = {"apply_kernel_name": "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"}
+    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+        *tensors,
+        a16_plan,
+        topk=16,
+    )
 
 
 def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(

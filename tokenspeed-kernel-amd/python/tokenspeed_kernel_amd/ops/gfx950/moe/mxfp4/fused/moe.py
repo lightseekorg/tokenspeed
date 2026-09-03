@@ -173,8 +173,14 @@ def gluon_mxfp4_fp8_precomputed_situ(
     shared_input: torch.Tensor | None = None,
     shared_weight: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    expert_start: int = 0,
+    global_num_experts: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-    """Run route-direct SiTU decode or the block-ragged SiTU prefill path."""
+    """Run route-direct SiTU decode or block-ragged SiTU prefill.
+
+    ``expert_start`` and ``global_num_experts`` describe a contiguous local EP
+    shard. Global top-k IDs outside that shard contribute zero to this rank.
+    """
     if (
         hidden_states.ndim != 2
         or hidden_states.shape[0] <= 0
@@ -209,6 +215,8 @@ def gluon_mxfp4_fp8_precomputed_situ(
                 "shared down fusion requires contiguous colocated BF16 "
                 "[M, 768] input and [7168, 768] weight"
             )
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
     if M > 16:
         if fuse_shared_down:
             return None
@@ -233,11 +241,12 @@ def gluon_mxfp4_fp8_precomputed_situ(
             swiglu_limit=0.0,
             swiglu_beta=0.0,
             situ_linear_beta=float(situ_linear_beta),
+            expert_start=expert_start,
+            global_num_experts=global_num_experts,
+            out=out,
+            activation_format="e4m3",
         )
-        if result is None or out is None:
-            return result
-        out.copy_(result)
-        return out
+        return result
 
     w13_raw = _extract_gluon_raw_w(w13_weight)
     w2_raw = _extract_gluon_raw_w(w2_weight)
@@ -257,6 +266,15 @@ def gluon_mxfp4_fp8_precomputed_situ(
     ):
         return None
 
+    num_local_experts = int(w13_raw.shape[0])
+    if global_num_experts is None:
+        global_num_experts = num_local_experts
+    if (
+        global_num_experts < num_local_experts
+        or expert_start + num_local_experts > global_num_experts
+    ):
+        raise ValueError("local expert range exceeds global expert count")
+
     two_i = int(w13_raw.shape[2])
     if two_i % 2 or int(getattr(w13_raw, "original_k_pk", 0)) * 2 != D:
         return None
@@ -265,8 +283,10 @@ def gluon_mxfp4_fp8_precomputed_situ(
     if int(getattr(w2_raw, "original_k_pk", 0)) * 2 != i_dim or N != D:
         return None
 
-    topk_ids = topk_ids.to(torch.int32)
-    topk_weights = topk_weights.to(torch.float32)
+    # Tiny-M kernels index routing tensors as flat [M * TOPK] arrays. Preserve
+    # that contract when the caller supplies an otherwise valid strided view.
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.to(torch.float32).contiguous()
     x_fp8, x_scale = _dynamic_fp8_quantize(hidden_states)
     inter_scale = _situ_intermediate_scale(
         hidden_states.device, float(situ_beta * situ_linear_beta)
@@ -281,9 +301,10 @@ def gluon_mxfp4_fp8_precomputed_situ(
         tuple(out.shape) != (M, N)
         or out.dtype != out_dtype
         or out.device != hidden_states.device
-        or not out.is_contiguous()
+        or out.stride(1) != 1
+        or out.stride(0) < N
     ):
-        raise ValueError("SiTU output must be a contiguous colocated [M, N] tensor")
+        raise ValueError("SiTU output must be a row-major colocated [M, N] tensor")
     if fuse_shared_down:
         if shared_out is None:
             shared_out = torch.empty(
@@ -344,6 +365,8 @@ def gluon_mxfp4_fp8_precomputed_situ(
         HAS_BIAS=False,
         SITU_BETA=float(situ_beta),
         SITU_LINEAR_BETA=float(situ_linear_beta),
+        EXPERT_START=expert_start,
+        NUM_LOCAL_EXPERTS=num_local_experts,
         num_warps=num_warps,
     )
 
@@ -385,6 +408,8 @@ def gluon_mxfp4_fp8_precomputed_situ(
         HAS_BIAS=False,
         SPLIT_K=1,
         SPLIT_TOPK=True,
+        EXPERT_START=expert_start,
+        NUM_LOCAL_EXPERTS=num_local_experts,
         num_warps=stage2_num_warps,
     )
     reduce_block_n = 256
@@ -1044,12 +1069,18 @@ def _maybe_gluon_package_mxfp4_prefill(
     swiglu_limit: float,
     swiglu_beta: float,
     situ_linear_beta: float | None = None,
+    expert_start: int = 0,
+    global_num_experts: int | None = None,
+    out: torch.Tensor | None = None,
+    force_reduce: bool | None = None,
+    activation_format: str = "e2m1",
 ) -> torch.Tensor | None:
-    """Dispatch into the dedicated gfx950 A4W4 block-ragged prefill package.
+    """Dispatch into the dedicated gfx950 block-ragged prefill package.
 
-    Routing top-k and activation quantization reuse the shared MXFP4
-    implementation; the block-aligned sort and both stage GEMMs are the
-    dedicated package kernels, launched directly.
+    The package supports E2M1 or E4M3 block-scaled activations with MXFP4
+    weights. The block-aligned sort and both stage GEMMs are launched directly.
+    ``expert_start`` lets an EP rank consume global route IDs while sorting only
+    its contiguous local expert range.
 
     Selection is automatic: this returns ``None`` (so the caller falls back to
     the reference path) unless the batch is large enough
@@ -1060,6 +1091,11 @@ def _maybe_gluon_package_mxfp4_prefill(
         return None
     if out_dtype != torch.bfloat16:
         return None
+    if activation_format not in ("e2m1", "e4m3"):
+        raise ValueError(
+            "package prefill activation_format must be e2m1 or e4m3, "
+            f"got {activation_format}"
+        )
     package_w13 = getattr(w13_weight, "gluon_package_prefill_weight", None)
     package_w13_scale = getattr(w13_weight, "gluon_package_prefill_scale", None)
     package_w2 = getattr(w2_weight, "gluon_package_prefill_weight", None)
@@ -1146,6 +1182,18 @@ def _maybe_gluon_package_mxfp4_prefill(
     topk_weights = topk_weights.to(torch.float32).contiguous()
     n_tokens = int(hidden_states.shape[0])
     n_experts = int(package_w13.shape[0])
+    if global_num_experts is None:
+        global_num_experts = n_experts
+    if (
+        global_num_experts < n_experts
+        or expert_start < 0
+        or expert_start + n_experts > global_num_experts
+    ):
+        raise ValueError("local expert range exceeds global expert count")
+    if force_reduce is None:
+        # EP ranks own only a fraction of each token's routes. Combining those
+        # sparse local contributions atomically avoids the full top-k scratch.
+        force_reduce = global_num_experts == n_experts and expert_start == 0
     hidden_dim = int(hidden_states.shape[1])
     inter_dim = int(package_w13.shape[1]) // 2
     if (
@@ -1165,15 +1213,24 @@ def _maybe_gluon_package_mxfp4_prefill(
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
         invoke_gluon_mxfp4_moe_stage2_1x2,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
+        quantize_mxfp8_sorted_routes,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
         gather_package_cdna4_scale,
     )
 
-    sort_block_m = _select_package_prefill_block_m(
-        n_tokens,
-        top_k,
-        n_experts,
-    )
+    if activation_format == "e4m3":
+        # With EP8, each rank sees only about two of Kimi-K3's sixteen routes
+        # per token. A 32-row expert tile avoids doubling the sorted padding at
+        # sparse prefill sizes; denser prefills amortize the 64-row tile.
+        sort_block_m = 32 if n_tokens <= 2048 else 64
+    else:
+        sort_block_m = _select_package_prefill_block_m(
+            n_tokens,
+            top_k,
+            global_num_experts,
+        )
     # The stable, chunked sort preserves source-token locality for the stage-1
     # activation gather while keeping all metadata on the current stream.
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out = (
@@ -1184,28 +1241,42 @@ def _maybe_gluon_package_mxfp4_prefill(
             hidden_dim,
             out_dtype,
             sort_block_m,
+            expert_start=expert_start,
+            out=out,
         )
     )
 
-    # Stage 1: quantize the hidden state, gather its scale into sorted-route
-    # order, and run the package gate/up MFMA with fused SwiGLU.
-    q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
-    stage1_scale = gather_package_cdna4_scale(
-        q_hidden_scale,
-        sorted_ids,
-        source_rows=n_tokens,
-        cols=hidden_dim,
-        top_k=top_k,
-        flatten_topk=False,
-    )
+    # Stage 1 consumes route-sorted activations. E4M3 quantization gathers and
+    # quantizes directly into that order; the existing E2M1 path preserves its
+    # token-order quantize plus scale-gather contract.
+    input_sorted = activation_format == "e4m3"
+    if input_sorted:
+        q_hidden, stage1_scale = quantize_mxfp8_sorted_routes(
+            hidden_states,
+            sorted_ids,
+            num_valid_ids,
+        )
+    else:
+        q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
+        stage1_scale = gather_package_cdna4_scale(
+            q_hidden_scale,
+            sorted_ids,
+            source_rows=n_tokens,
+            cols=hidden_dim,
+            top_k=top_k,
+            flatten_topk=False,
+        )
     stage2_k = int(package_w2.shape[2]) * 2
     stage2_k_scale = stage2_k // MXFP4_BLOCK
     stage2_scale_rows = triton.cdiv(int(sorted_ids.shape[0]), 32) * 32
-    # Stage 1 writes the activated intermediate directly as sorted MXFP4,
-    # including the zero K-padding required by the physical W2 shard.
+    # Stage 1 writes the activated intermediate directly in the selected
+    # sorted block-scaled format, including the zero K-padding required by W2.
+    intermediate_format = activation_format
+    inter_div = 1 if intermediate_format == "e4m3" else 2
+    inter_dtype = torch.float8_e4m3fn if intermediate_format == "e4m3" else torch.uint8
     q_inter = torch.empty(
-        (sorted_ids.shape[0], stage2_k // 2),
-        dtype=torch.uint8,
+        (sorted_ids.shape[0], stage2_k // inter_div),
+        dtype=inter_dtype,
         device=hidden_states.device,
     )
     stage2_scale = torch.empty(
@@ -1235,6 +1306,10 @@ def _maybe_gluon_package_mxfp4_prefill(
         output_quantized=True,
         out_scale=stage2_scale,
         output_k=stage2_k,
+        a_format=activation_format,
+        output_format=intermediate_format,
+        input_sorted=input_sorted,
+        source_tokens=n_tokens,
     )
 
     # Both stages consume the same route blocking so the lower-padding choice
@@ -1261,8 +1336,9 @@ def _maybe_gluon_package_mxfp4_prefill(
         b_gdot128=True,
         block_m=stage2_block_m,
         sort_block_m=stage2_block_m,
-        force_reduce=True,
+        force_reduce=force_reduce,
         input_sorted=True,
+        a_format=intermediate_format,
     )
     return out
 
