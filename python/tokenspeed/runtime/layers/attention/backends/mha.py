@@ -122,6 +122,8 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # (kv_cache.recipes.publish) plus the replay
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
+    # Every kernel call site forwards layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None

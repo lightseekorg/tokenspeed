@@ -234,6 +234,10 @@ class InklingAttnBackend(AttentionBackend):
         return self.inner.uses_cache_groups
 
     @property
+    def supports_layer_sliding_window(self):
+        return self.inner.supports_layer_sliding_window
+
+    @property
     def consumes_cache_metadata(self) -> bool:
         # Inherited would also work today, but only via a __getattr__ fallthrough.
         return self.inner.consumes_cache_metadata

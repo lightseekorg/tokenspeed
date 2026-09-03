@@ -112,6 +112,8 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # Per-group tables route reads and writes by layer.group_id, so fields
     # sharing a physical plan location (for example GPT-OSS SWA/full) are safe.
     uses_cache_groups: bool = True
+    # Both kernel call sites forward layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).
     table_tail_pad: int = 0

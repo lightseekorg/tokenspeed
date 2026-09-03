@@ -35,11 +35,16 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dflash2 import (
     DFlash2,
     _walk_greedy_path,
 )
+
+# Imported for its register_backend() side effects on _BACKEND_REGISTRY.
+from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.models.dflash import DFlashAttention
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
@@ -144,6 +149,55 @@ def test_candidate_unary_logits_are_promoted_to_fp32() -> None:
         unary_logits.sort(dim=-1).values,
         torch.tensor([[3.0, 4.0]], dtype=torch.float32),
     )
+
+
+# Backend names, spelled as --drafter-attention-backend takes them, whose
+# kernel call sites forward layer.sliding_window_size.
+_WINDOW_AWARE_BACKENDS = frozenset(
+    ("mha", "fa3", "fa4", "triton", "flashinfer", "trtllm", "mla", "gluon")
+)
+
+
+def _window_validator(*windows: int, supported: bool, backend: str) -> DFlash:
+    """A DFlash stub whose draft layers carry the given window_lefts."""
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList()
+    for window in windows:
+        attention = torch.nn.Module()
+        attention.sliding_window_size = window
+        model.layers.append(attention)
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = model
+    drafter.attn_backend = SimpleNamespace(supports_layer_sliding_window=supported)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(drafter_attention_backend=backend)
+    )
+    return drafter
+
+
+def test_only_the_documented_backends_apply_per_layer_sliding_windows() -> None:
+    claiming = {
+        name
+        for name, (_, backend_cls) in _BACKEND_REGISTRY.items()
+        if backend_cls.supports_layer_sliding_window
+    }
+
+    assert claiming == _WINDOW_AWARE_BACKENDS & set(_BACKEND_REGISTRY)
+
+
+def test_a_sliding_window_draft_rejects_a_backend_that_drops_the_window() -> None:
+    drafter = _window_validator(4095, -1, supported=False, backend="tokenspeed_mla")
+
+    with pytest.raises(ValueError, match="tokenspeed_mla.*ignores per-layer"):
+        drafter._validate_draft_attention_window()
+
+
+def test_draft_attention_window_validation_accepts_the_served_combinations() -> None:
+    honoured = _window_validator(4095, -1, supported=True, backend="mla")
+    unwindowed = _window_validator(-1, -1, supported=False, backend="mla")
+
+    honoured._validate_draft_attention_window()
+    unwindowed._validate_draft_attention_window()
 
 
 @pytest.mark.parametrize("block_size", (6, 8))

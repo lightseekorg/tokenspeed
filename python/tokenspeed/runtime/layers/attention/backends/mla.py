@@ -107,6 +107,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
 
     supports_mla_projected_value_decode = True
+    # Decode forwards layer.sliding_window_size as window_left.
+    supports_layer_sliding_window: bool = True
 
     def __init__(self, config: AttnConfig, spec: MLAConfig):
         super().__init__(config, spec)

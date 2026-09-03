@@ -98,6 +98,9 @@ class AttentionBackend(ABC):
     _cache_contract_bound: bool = False
     uses_padded_decode_token_mask: bool = False
     supports_mla_projected_value_decode: bool = False
+    # This backend forwards each layer's ``sliding_window_size`` to its kernels.
+    # Left False, a declared window silently widens to full-history attention.
+    supports_layer_sliding_window: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 
