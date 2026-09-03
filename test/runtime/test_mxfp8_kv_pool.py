@@ -329,7 +329,6 @@ def _make_config(prefix_granularity: int):
         kernel_page_size=prefix_granularity,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         kv_cache_quant_method="none",
         components=(spec,),
     )

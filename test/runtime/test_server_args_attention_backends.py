@@ -177,7 +177,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
             context_len=65536,
             kernel_page_size=64,
             max_bs=8,
-            max_graph_bs=8,
             components=(spec,),
         )
 
@@ -326,7 +325,6 @@ class TestPagedRouterNameResolution(unittest.TestCase):
             kernel_page_size=64,
             context_len=256,
             max_bs=2,
-            max_graph_bs=2,
             kv_cache_quant_method="none",
             components=(spec,),
         )

@@ -90,7 +90,6 @@ def _make_flashmla_backend(
         kernel_page_size=_KERNEL_PAGE,
         context_len=8 * pool.arena.prefix_granularity,
         max_bs=8,
-        max_graph_bs=8,
         kv_cache_quant_method="",
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         is_draft=is_draft,

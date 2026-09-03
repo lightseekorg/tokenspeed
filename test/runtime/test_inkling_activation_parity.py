@@ -205,7 +205,6 @@ class _Harness:
             kernel_page_size=PAGE_SIZE,
             context_len=1024,
             max_bs=4,
-            max_graph_bs=4,
             kv_cache_quant_method="none",
             components=(spec,),
         )

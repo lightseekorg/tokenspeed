@@ -286,7 +286,6 @@ def backend_factory(cuda_env, gpu_pool):
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
-            max_graph_bs=8,
             kv_cache_quant_method="",
             components=(spec,),
         )

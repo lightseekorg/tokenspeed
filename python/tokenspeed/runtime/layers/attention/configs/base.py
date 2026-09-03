@@ -146,8 +146,6 @@ class AttnConfig:
     # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
-    max_graph_bs: int
-    max_scheduled_tokens: int = 0
     # True iff server_args.disaggregation_mode != "null"; cache recipes use
     # it to stamp transfer policies onto the cache group specs.
     pd_disaggregation_enabled: bool = False
@@ -211,8 +209,6 @@ def model_wide_kwargs(
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
-        max_graph_bs=server_args.max_cudagraph_capture_size,
-        max_scheduled_tokens=server_args.chunked_prefill_size,
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,

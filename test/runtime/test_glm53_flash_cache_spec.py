@@ -82,7 +82,6 @@ def _recipe(
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=16,
-        max_graph_bs=16,
         pd_disaggregation_enabled=pd_disaggregation_enabled,
         speculative_num_steps=2 if draft_layers else 0,
         speculative_num_draft_tokens=3 if draft_layers else 1,

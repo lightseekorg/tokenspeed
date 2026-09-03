@@ -130,7 +130,6 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
         prefix_granularity=64,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
         components=(spec,),

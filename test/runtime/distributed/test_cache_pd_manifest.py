@@ -635,7 +635,6 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         prefix_granularity=16,
         context_len=256,
         max_bs=4,
-        max_graph_bs=4,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=True,
         components=(spec,),

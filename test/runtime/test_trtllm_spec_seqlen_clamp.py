@@ -55,7 +55,6 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         kernel_page_size=PAGE,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         kv_cache_quant_method="none",
         speculative_num_steps=3,
         speculative_num_draft_tokens=SPEC_NUM_TOKENS,

@@ -62,8 +62,6 @@ def _model_wide_kwargs(**overrides) -> dict:
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
-        max_graph_bs=2,
-        max_scheduled_tokens=128,
     )
     kwargs.update(overrides)
     return kwargs

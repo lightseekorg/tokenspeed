@@ -397,7 +397,6 @@ def _qsa_router(
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
-        max_graph_bs=max_bs,
         speculative_num_draft_tokens=spec,
         components=(component,),
     )
@@ -1561,7 +1560,6 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         context_len=1024,
-        max_graph_bs=2,
         max_bs=2,
         prefix_granularity=64,
         kernel_page_size=64,
