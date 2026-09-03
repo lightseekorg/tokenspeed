@@ -1221,10 +1221,11 @@ def test_without_a_mailbox_no_width_gathers(
     """The column split is taken only where the mailbox is, at every width.
 
     Without the fabric the gather falls back to a buffer-and-permute over
-    NCCL, which at a full prefill chunk costs 239us against the replicated
-    projection's 224us -- so the split is a loss everywhere on such a machine,
-    not only below some crossover. The old dispatch gathered above 1280
-    because that width was measured on hardware that has the fabric.
+    NCCL, which under graph replay costs 254us at a full prefill chunk
+    against the replicated projection's 226us -- so the split is a loss
+    everywhere on such a machine, not only below some crossover. The old
+    dispatch gathered above 1280 because that width was measured on hardware
+    that has the fabric.
     """
     world, out, k = 4, 16, 8
     torch.manual_seed(0)

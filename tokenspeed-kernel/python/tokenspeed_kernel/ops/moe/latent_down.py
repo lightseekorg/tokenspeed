@@ -466,7 +466,12 @@ class KimiK3LatentDownOp:
         Reachability is a local probe -- visible device count, this host's
         fabric -- so ranks can disagree, and the ones that say yes would block
         in the rendezvous while the ones that say no walk away. The vote is the
-        agreement point, and every rank reaches it unconditionally.
+        agreement point, and the one thing above it that does not return a
+        reason is the fabric lookup, which raises on a map that was never
+        gathered. Ranks that raise there never reach the reduction, so if the
+        map is missing on only some of them the rest wait here. Gathering
+        happens once at distributed init, which is why that state is a harness
+        bug rather than something to negotiate.
         """
         key = cls._verdict_key(
             group, hidden_size, latent_size, tp_size, layer_count, pool_depth, max_m
