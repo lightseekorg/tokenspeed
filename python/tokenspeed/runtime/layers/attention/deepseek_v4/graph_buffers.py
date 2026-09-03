@@ -50,18 +50,19 @@ class DeepseekV4GraphBuffers:
     """Storage plus per-shape views for V4's unified decode path.
 
     Attributes:
-        max_bs: Ladder-top batch size the buffers are sized for.
+        max_bs: Row capacity — the runner's max decode bs, never the capture
+            ladder (docs/design/unified_path.md, "Buffer sizing").
         max_tokens_per_req: Widest packed verify width (spec window).
         page_table: ``[max_bs, max_num_pages]`` base full-history table.
-        req_pool_indices / seq_lens / query_lens: ``[max_bs]`` row state.
+        seq_lens / query_lens: ``[max_bs]`` row state.
         query_start_loc: ``[max_bs + 1]`` cumulative query offsets.
         token_to_req: ``[max_bs * max_tokens_per_req]`` token-major owner map.
         is_valid_token: same shape; the CUDA-graph padding mask
             (True = live token).
         query_start_by_width / token_to_req_by_width: per-width constant
             tables, precomputed so a packed refresh is copy-only.
-        block_tables / base_offsets: per-group persistent tables (allocated
-            by the backend's contract configuration through
+        block_tables: per-group persistent tables (allocated by the
+            backend's contract configuration through
             :meth:`allocate_group_tables`).
     """
 
@@ -80,7 +81,6 @@ class DeepseekV4GraphBuffers:
         self.page_table = torch.zeros(
             (max_bs, max_num_pages), dtype=torch.int32, device=device
         )
-        self.req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32, device=device)
         self.seq_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
         self.query_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
         self.query_start_loc = torch.arange(
@@ -98,29 +98,16 @@ class DeepseekV4GraphBuffers:
                 width
             )
         self.block_tables: dict[str, torch.Tensor] = {}
-        self.base_offsets: dict[str, torch.Tensor] = {}
         # Per-(bs, tokens_per_req) metadata views — the single builder's cache.
         self._views: dict[tuple[int, int], DeepseekV4ForwardMetadata] = {}
 
-    def owns_view(self, metadata: DeepseekV4ForwardMetadata) -> bool:
-        """Whether ``metadata`` is one of this object's cached views (identity)."""
-        return any(metadata is view for view in self._views.values())
-
-    def allocate_group_tables(
-        self,
-        group_widths: dict[str, int],
-        sliding_group_ids: frozenset[str] | set[str],
-    ) -> None:
+    def allocate_group_tables(self, group_widths: dict[str, int]) -> None:
         """Allocate the per-group persistent tables from the backend-resolved
         widths (the backend owns the contract math; this owns the storage)."""
         for gid, max_pages in group_widths.items():
             self.block_tables[gid] = torch.zeros(
                 (self.max_bs, max_pages), dtype=torch.int32, device=self.device
             )
-            if gid in sliding_group_ids:
-                self.base_offsets[gid] = torch.zeros(
-                    (self.max_bs,), dtype=torch.int32, device=self.device
-                )
 
     # ------------------------------------------------------------------
     # The single per-shape view builder
@@ -151,7 +138,6 @@ class DeepseekV4GraphBuffers:
             metadata.forward_mode = forward_mode
             return metadata
         metadata = DeepseekV4ForwardMetadata(
-            req_pool_indices=self.req_pool_indices[:bs],
             seq_lens=self.seq_lens[:bs],
             query_lens=self.query_lens[:bs],
             query_start_loc=self.query_start_loc[: bs + 1],
@@ -160,7 +146,6 @@ class DeepseekV4GraphBuffers:
                 page_size=kernel_page_size,
                 page_table=self.page_table[:bs, :max_num_pages],
                 block_tables={},
-                block_table_base_offsets={},
             ),
             is_valid_token=self.is_valid_token[:total_tokens],
             seq_lens_cpu=None,
@@ -195,9 +180,8 @@ class DeepseekV4GraphBuffers:
             return max(1, width)
         return 1
 
-    def write_batch(self, bs: int, req_pool_indices, seq_lens) -> None:
-        """Copy this round's row state into the persistent buffers."""
-        self.req_pool_indices[:bs].copy_(req_pool_indices[:bs])
+    def write_batch(self, bs: int, seq_lens: torch.Tensor) -> None:
+        """Copy this round's row lengths into the persistent buffer."""
         self.seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
 
     def fill_packed_rows(self, *, bs: int, actual_bs: int, tokens_per_req: int) -> int:
@@ -256,29 +240,4 @@ class DeepseekV4GraphBuffers:
                         table[:active_rows, :cols].to(torch.int32)
                     )
             out[group_id] = buf[:bs]
-        return out
-
-    def refresh_base_offsets(
-        self,
-        bs: int,
-        base_offsets: dict[str, torch.Tensor],
-        *,
-        actual_bs: int | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Refresh persistent sliding-group base offsets; missing keys fall
-        back to 0. Returns the ``[:bs]`` views keyed by gid."""
-        active_rows = bs if actual_bs is None else actual_bs
-        out: dict[str, torch.Tensor] = {}
-        for gid, buf in self.base_offsets.items():
-            buf[:bs].fill_(0)
-            src = base_offsets.get(gid)
-            if src is not None and active_rows > 0:
-                rows = int(src.shape[0])
-                if rows < active_rows:
-                    raise RuntimeError(
-                        "DeepSeek V4 CUDA-graph replay base-offsets row count "
-                        f"{rows} < actual_bs={active_rows} for group {gid!r}"
-                    )
-                buf[:active_rows].copy_(src[:active_rows].to(torch.int32))
-            out[gid] = buf[:bs]
         return out

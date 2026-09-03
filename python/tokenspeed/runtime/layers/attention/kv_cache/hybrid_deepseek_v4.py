@@ -43,44 +43,21 @@ logger = get_colorful_logger(__name__)
 
 def _split_block_tables_into_v4_metadata(
     block_tables: dict[str, torch.Tensor],
-    block_table_base_offsets: dict[str, torch.Tensor] | None = None,
-) -> tuple[
-    torch.Tensor | None,
-    dict[int, torch.Tensor],
-    torch.Tensor | None,
-    torch.Tensor | None,
-    dict[int, torch.Tensor],
-    torch.Tensor | None,
-]:
-    """Split the cache-group dict into V4-named tables + per-sliding-group offsets.
+) -> tuple[torch.Tensor | None, dict[int, torch.Tensor], torch.Tensor | None]:
+    """Split the cache-group dict into V4-named tables.
 
-    Returns (swa, {ratio: compressor_state}, indexer_state, swa_base,
-    {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
-    are ignored. Base offsets are None / missing when the input lacks them.
+    Returns (swa, {ratio: compressor_state}, indexer_state). Unknown group
+    ids are ignored.
     """
-    offsets = block_table_base_offsets or {}
     swa = block_tables.get(V4_SWA_KV_GROUP_ID)
     indexer_state = block_tables.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
-    swa_base = offsets.get(V4_SWA_KV_GROUP_ID)
-    indexer_state_base = offsets.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
     compressor_state: dict[int, torch.Tensor] = {}
-    compressor_state_base: dict[int, torch.Tensor] = {}
     for gid, table in block_tables.items():
         ratio = parse_v4_compressor_state_group_id(gid)
         if ratio is None:
             continue
         compressor_state[ratio] = table
-        base = offsets.get(gid)
-        if base is not None:
-            compressor_state_base[ratio] = base
-    return (
-        swa,
-        compressor_state,
-        indexer_state,
-        swa_base,
-        compressor_state_base,
-        indexer_state_base,
-    )
+    return swa, compressor_state, indexer_state
 
 
 def _compressed_boundary_mask(
@@ -128,14 +105,6 @@ class DeepseekV4CacheMetadata:
                 f"KV group {v4_compressed_kv_group_id(compress_ratio)!r}"
             )
         return table
-
-    @staticmethod
-    def safe_page_ids(
-        block_table: torch.Tensor,
-        req_indices: torch.Tensor,
-        page_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        return _safe_page_ids(block_table, req_indices, page_indices)
 
     def _update_decode_compressed_slot_mapping(
         self,
@@ -315,20 +284,19 @@ class DeepseekV4CacheMetadata:
 
 
 class HybridDeepseekV4TokenToKVPool(CachePool):
-    """DeepSeek V4 fp8_ds_mla cache pool.
+    """DeepSeek V4 fp8_ds_mla cache pool: one layer window over the arena.
 
-    TokenSpeed keeps SWA, compressed, compressor-state, and CSA indexer caches
-    in dedicated per-group paged pools (see CacheGroup* on the scheduler
-    side and the V4 recipe here), keeping ordinary MLA models on
-    their existing single-pool contract. The ``indexer_kv_buffer`` shares its
-    page table and page-count budget with the ``v4.c{ratio}a.compressed_kv``
-    group rather than owning a separate group of its own.
+    The SWA, compressed-KV, compressor-state and CSA indexer-state caches are
+    each a cache group of the one shared arena (the V4 recipe declares them;
+    the scheduler addresses them as ``CacheGroup``s), and this view binds
+    their planes per layer. The ``indexer_kv_buffer`` shares its page table
+    and page-count budget with the ``v4.c{ratio}a.compressed_kv`` group
+    rather than owning a separate group of its own.
     """
 
     def __init__(
         self,
         arena: CacheArena,
-        model_dtype: torch.dtype,
         layout: DeepseekV4CacheLayout,
         layer_num: int,
         rank: int,
@@ -349,23 +317,22 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         plan = self.arena.plan
         prefix_granularity = self.arena.prefix_granularity
-        self.model_dtype = model_dtype
-        self.layout = layout
         self.layer_num = layer_num
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.arena.cache_group_specs
         }
         self.requires_page_zeroing = True
 
-        def _group_rows(group_id: str, default: int) -> int:
+        def _group_rows(group_id: str) -> int:
             spec = self._cache_group_specs_by_id.get(group_id)
-            return int(spec.rows_per_page) if spec is not None else int(default)
+            if spec is None:
+                raise RuntimeError(
+                    f"DeepSeek V4 cache pool: the arena publishes no {group_id!r} "
+                    f"group (published: {sorted(self._cache_group_specs_by_id)})"
+                )
+            return int(spec.rows_per_page)
 
-        self.swa_block_size = _group_rows(
-            V4_SWA_KV_GROUP_ID,
-            V4_KERNEL_BLOCK_ROWS,
-        )
-        self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
+        self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID)
         self.compressed_block_sizes = tuple(
             layout.storage_block_size(ratio) if ratio > 1 else prefix_granularity
             for ratio in layout.layer_ratio
@@ -380,21 +347,14 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.compressor_state_block_sizes = tuple(
             (
-                _group_rows(v4_compressor_state_group_id(ratio), prefix_granularity)
+                _group_rows(v4_compressor_state_group_id(ratio))
                 if ratio > 1
                 else prefix_granularity
             )
             for ratio in layout.layer_ratio
         )
         self.indexer_state_block_sizes = tuple(
-            (
-                _group_rows(
-                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                    layout.compressor_state_block_size(ratio),
-                )
-                if ratio == 4
-                else 0
-            )
+            _group_rows(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID) if ratio == 4 else 0
             for ratio in layout.layer_ratio
         )
         self._bind_layer_planes()

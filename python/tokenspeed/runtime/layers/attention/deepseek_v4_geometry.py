@@ -106,28 +106,6 @@ def deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim: int) -> int:
     ) + deepseek_v4_indexer_mxfp4_scale_dim(index_head_dim)
 
 
-def deepseek_v4_indexer_mxfp4_layout_from_row_bytes(
-    row_bytes: int,
-) -> tuple[int, int, int]:
-    row_bytes = int(row_bytes)
-    value_bytes_per_block = DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2
-    bytes_per_block = value_bytes_per_block + DEEPSEEK_V4_MXFP4_SCALE_BYTES
-    if row_bytes % bytes_per_block != 0:
-        raise ValueError(
-            f"MXFP4 indexer row bytes must be value+scale aligned, got {row_bytes}"
-        )
-    num_blocks = row_bytes // bytes_per_block
-    value_bytes = num_blocks * value_bytes_per_block
-    scale_bytes = num_blocks * DEEPSEEK_V4_MXFP4_SCALE_BYTES
-    index_head_dim = num_blocks * DEEPSEEK_V4_MXFP4_BLOCK_SIZE
-    if deepseek_v4_indexer_mxfp4_scale_dim(index_head_dim) != scale_bytes:
-        raise ValueError(
-            f"invalid MXFP4 indexer row bytes {row_bytes} for "
-            f"index_head_dim={index_head_dim}"
-        )
-    return index_head_dim, value_bytes, scale_bytes
-
-
 def deepseek_v4_indexer_fp8_scale_bytes(index_head_dim: int) -> int:
     index_head_dim = int(index_head_dim)
     if index_head_dim % DEEPSEEK_V4_FP8_INDEXER_BLOCK_SIZE != 0:

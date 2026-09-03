@@ -22,30 +22,21 @@
 
 A V4 MTP draft alternates two row shapes each round: the packed bs*N verify
 step (step 0, served by the GraphBuffers views) and the plain bs-row steps
-1+ that this object serves. Historically the plain-step metadata was a
-per-round allocated-or-mutated object living in two homes at once (a per-bs
-graph cache AND a "current" pointer), and the eager prep could find the
-graph-cached object through the second home and rebind tensor fields on it —
-feeding the recorded draft kernels stale addresses (the Kimi-K2.5 /
-V4-MTP first-request crashes).
-
-Structural fix: the plain-step metadata becomes one pointer-stable view per
-bs, exactly like the unified decode path's per-bs views. ``prepare`` and
-``advance`` are copy-only plus the sanctioned ``cache``-slot swap — no arm
-ever rebinds a tensor field, so there is nothing a captured graph could have
-recorded that a later round can invalidate, on the graph path and the eager
-path alike (they are the same object).
+1+ that this object serves. The plain-step metadata is one pointer-stable
+view per bs, exactly like the unified decode path's per-bs views. ``prepare``
+and ``advance`` are copy-only plus the sanctioned ``cache``-slot swap — no
+arm ever rebinds a tensor field, so there is nothing a captured graph could
+have recorded that a later round can invalidate, on the graph path and the
+eager path alike (they are the same object).
 
 Storage-sharing rules with :class:`DeepseekV4GraphBuffers` (request-major
 row state is safe to share, token-major packed state is NOT):
 
-* ``req_pool_indices`` — shared (``graph.req_pool_indices``): per-request,
-  written by every refresh/capture before ``prepare`` runs.
 * ``query_start_loc`` / ``token_to_req_indices`` — shared width-1 constant
   arange tables (``graph.query_start_by_width[1]`` etc.), never mutated.
-* ``seq_lens`` — OWN buffer: ``advance`` runs ``add_(1)`` inside the
-  recorded graph; ``graph.seq_lens`` carries the packed step's lengths and
-  must not move underneath it.
+* ``seq_lens`` — OWN buffer: ``advance`` records a ``copy_`` of the
+  drafter's lengths into it inside the graph; ``graph.seq_lens`` carries the
+  packed step's lengths and must not move underneath it.
 * ``is_valid_token`` — OWN buffer: the per-request gather of the packed
   token-major mask; sharing ``graph.is_valid_token`` would alias rows with
   wrong values.
@@ -89,7 +80,6 @@ class DeepseekV4DraftRounds:
             return metadata
         graph = self._graph
         metadata = DeepseekV4ForwardMetadata(
-            req_pool_indices=graph.req_pool_indices[:bs],
             seq_lens=self.step_seq_lens[:bs],
             query_lens=self._step_query_lens[:bs],
             query_start_loc=graph.query_start_by_width[1][: bs + 1],
@@ -112,7 +102,7 @@ class DeepseekV4DraftRounds:
         (the guard-exempt slot); returns the views for the backend to run
         the indexer/slot-mapping refresh hooks over and publish.
         """
-        bs = prefill_metadata.req_pool_indices.numel()
+        bs = prefill_metadata.seq_lens.numel()
         metadata = self.step_views(bs)
         metadata.cache = prefill_metadata.cache
         self.step_seq_lens[:bs].copy_(base_seq_lens[:bs])
@@ -129,16 +119,11 @@ class DeepseekV4DraftRounds:
         self.current = metadata
         return metadata
 
-    def advance(
-        self, seq_lens: torch.Tensor | None = None
-    ) -> DeepseekV4ForwardMetadata:
+    def advance(self, seq_lens: torch.Tensor) -> DeepseekV4ForwardMetadata:
         """Advance the live step metadata to the next draft step in place."""
         metadata = self.current
         if metadata is None:
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
-        if seq_lens is None:
-            metadata.seq_lens.add_(1)
-        else:
-            metadata.seq_lens.copy_(seq_lens[: metadata.seq_lens.numel()])
+        metadata.seq_lens.copy_(seq_lens[: metadata.seq_lens.numel()])
         metadata.forward_mode = ForwardMode.DECODE
         return metadata

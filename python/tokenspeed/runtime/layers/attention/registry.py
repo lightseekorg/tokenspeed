@@ -768,7 +768,6 @@ def _wrap_inkling_backend(
         conv_pool,
         conv_columns=conv_columns,
         spec_num_tokens=spec_tokens,
-        is_draft=is_draft,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
     return backend, conv_pool

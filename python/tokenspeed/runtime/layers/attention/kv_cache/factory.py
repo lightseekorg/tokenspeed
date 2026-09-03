@@ -122,7 +122,6 @@ def create_cache_pool(
             raise TypeError("DeepSeek V4 cache spec is missing pool options")
         return HybridDeepseekV4TokenToKVPool(
             arena,
-            model_dtype=config.dtype,
             layout=options.layout,
             layer_num=num_layers,
             rank=rank,

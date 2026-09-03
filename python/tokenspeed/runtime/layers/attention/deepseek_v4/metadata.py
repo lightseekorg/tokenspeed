@@ -126,7 +126,6 @@ class DeepseekV4SparseIndexerMetadata:
 
 @dataclass
 class DeepseekV4ForwardMetadata:
-    req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     query_lens: torch.Tensor
     query_start_loc: torch.Tensor
@@ -152,7 +151,7 @@ class DeepseekV4ForwardMetadata:
     num_prefill_tokens: int = 0
 
     def decode_req_count(self) -> int:
-        return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))
+        return max(0, int(self.seq_lens.shape[0]) - int(self.num_prefill_reqs))
 
     def decode_token_count(self) -> int:
         return max(

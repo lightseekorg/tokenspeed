@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Hybrid linear attention backend for Qwen3.5 GDN models."""
+"""Recurrent-state attention backend: Qwen3.5 GDN, the KDA base (Kimi-K3,
+GLM-5.3) and Qwen4-exp build on it."""
 
 from __future__ import annotations
 
@@ -76,34 +77,6 @@ if TYPE_CHECKING:
 
 # Default cache group id carrying GDN/Mamba state pages.
 _STATE_GROUP_ID = LINEAR_ATTENTION
-
-
-def _mask_fresh_initial_state(
-    recurrent_state: torch.Tensor,
-    has_initial_states: torch.Tensor | None,
-) -> torch.Tensor:
-    """Zero the initial recurrent state of sequences that have no history.
-
-    On the cache-group path a fresh sequence's ``state_in`` block is freshly
-    allocated from the shared BlockPool and may carry a previous tenant's
-    bytes (the slabs alias every cache group, so those bytes can be fp8 MLA
-    latents that reinterpret as huge/NaN fp32) — the recurrent kernels have
-    no per-sequence has_initial_state gate, so mask here.
-
-    Args:
-        recurrent_state: ``[B, ...]`` gathered per-sequence initial states.
-        has_initial_states: ``[B]`` bool, True where the sequence resumes
-            real history (prefix hit / later chunk). None means every
-            sequence is fresh.
-
-    Returns:
-        The masked initial state (zeros for fresh sequences).
-    """
-    if has_initial_states is None:
-        return torch.zeros_like(recurrent_state)
-    mask = has_initial_states.to(recurrent_state.device, torch.bool)
-    mask = mask.view(-1, *([1] * (recurrent_state.dim() - 1)))
-    return torch.where(mask, recurrent_state, torch.zeros_like(recurrent_state))
 
 
 @dataclass(frozen=True)
@@ -267,9 +240,10 @@ def _prepare_gdn_decode_state_path(
 
     FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
     kernels guard negative reads and writes for both FP32 and BF16 state. The
-    FlashInfer BF16 path instead redirects padding to row 0, which is a live,
-    scheduler-owned row in the single-table Mamba pool. Until that kernel supports a
-    padding mask, route BF16 state through Triton and keep ``-1`` unchanged.
+    FlashInfer BF16 path instead redirects padding to row 0 — the arena's
+    reserved null page, which must stay zero for every fresh-state read.
+    Until that kernel supports a padding mask, route BF16 state through
+    Triton and keep ``-1`` unchanged.
     """
     solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
     return initial_state_indices, output_state_indices, solution
@@ -314,7 +288,6 @@ def _build_cu_extend_seq_lens_cpu(
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_output_indices: torch.Tensor | None = None
-    extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
     # Host int64 prefix sum of extend_seq_lens_cpu, equal to
     # query_start_loc's contents; built once per extend batch (mirroring
@@ -346,7 +319,6 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
-    _replay_active: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -355,16 +327,15 @@ class MambaAttnBackend(AttentionBackend):
         self.query_start_loc_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
-        self.speculative_num_draft_tokens = getattr(
-            config, "speculative_num_draft_tokens", 0
-        )
+        self.speculative_num_draft_tokens = config.speculative_num_draft_tokens
         self.kv_pool = None
         self.state_paging_active = False
         self._checkpoint_granularity = 1
         self._state_group_ids: tuple[str, ...] = ()
-        # CUDA-graph buffers: one persistent dual-index
-        # (state_in/state_out) [bs] buffer per state group and captured batch
-        # size. Values are keyed by group ID and indexed by ``bs - 1``.
+        # CUDA-graph buffers: one persistent dual-index (state_in/state_out)
+        # [bs] buffer per state group for every bs up to max_decode_bs (the
+        # runner sizes them, never the capture ladder). Values are keyed by
+        # group ID and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         linear_attn = config.component(LinearAttnConfig)
@@ -521,7 +492,7 @@ class MambaAttnBackend(AttentionBackend):
         """Lazily allocate graph-stable verify scratch and replay inputs."""
         max_bs = max(len(self.query_start_loc_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
-        scratch = getattr(self, "_verify_scratch", None)
+        scratch = self._verify_scratch
         if scratch is not None and next(iter(scratch.values()))[0].shape[0] >= (
             rows_needed
         ):
@@ -748,7 +719,7 @@ class MambaAttnBackend(AttentionBackend):
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""
-        ctx = getattr(self, "_verify_commit_ctx", None)
+        ctx = self._verify_commit_ctx
         if ctx is None:
             return
         committed, tables, draft_token_num, read_pages_by_group = ctx
@@ -960,7 +931,6 @@ class MambaAttnBackend(AttentionBackend):
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
-            extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             state_in_blocks_by_group=state_in_blocks_by_group,
@@ -1085,20 +1055,17 @@ class MambaAttnBackend(AttentionBackend):
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
-        del kwargs
+        del req_pool_indices, kwargs
         real_bs = actual_bs
         num_padding = bs - actual_bs
-        req_pool_indices = req_pool_indices[:bs]
 
         is_target_verify = (
-            forward_mode is not None
-            and forward_mode.is_decode_or_idle()
+            forward_mode.is_decode_or_idle()
             and not self.is_draft
             and self.spec_num_tokens > 1
         )
         is_draft_extend = (
-            forward_mode is not None
-            and forward_mode.is_decode_or_idle()
+            forward_mode.is_decode_or_idle()
             and self.is_draft
             and self.spec_num_tokens > 1
         )
@@ -1624,18 +1591,13 @@ class MambaAttnBackend(AttentionBackend):
         # from seq_len carried in kwargs.
         q_len_per_req = seq_len // bs if bs > 0 else 1
         is_target_verify = (
-            forward_mode is not None
-            and forward_mode.is_decode_or_idle()
-            and not self.is_draft
-            and q_len_per_req > 1
+            forward_mode.is_decode_or_idle() and not self.is_draft and q_len_per_req > 1
         )
 
         query_start_loc = self.forward_metadata.query_start_loc
 
         if is_target_verify:
-            draft_token_num = kwargs.get(
-                "draft_token_num", self.speculative_num_draft_tokens
-            )
+            draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
             output_indices = self.forward_metadata.mamba_output_indices
             state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
@@ -1700,12 +1662,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_out_long,
             )
             conv_cache_indices = state_out_blocks
-            extend_prefix_lens = kwargs.get("extend_prefix_lens")
-            if extend_prefix_lens is None:
-                extend_prefix_lens = self.forward_metadata.extend_prefix_lens
-            extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
-            if extend_seq_lens_cpu is None:
-                extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
+            extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
             num_real_tokens = seq_len

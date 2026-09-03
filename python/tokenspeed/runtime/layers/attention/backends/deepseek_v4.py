@@ -48,9 +48,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    V4_KERNEL_BLOCK_ROWS,
     first_v4_compressed_kv_group_id,
-    v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -62,20 +60,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
+from tokenspeed.runtime.layers.attention.page_table import safe_page_ids
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
-
-
-def _compressed_block_table_base_offsets(
-    metadata: DeepseekV4ForwardMetadata,
-    compress_ratio: int,
-) -> torch.Tensor | None:
-    return metadata.cache.block_table_base_offsets.get(
-        v4_compressed_kv_group_id(compress_ratio)
-    )
 
 
 def _decode_positions_from_metadata(
@@ -127,11 +117,6 @@ def _refresh_decode_indexer_plan_cache(
             compress_ratio,
             cache_block_size,
         )
-        block_table_base_offsets = (
-            _compressed_block_table_base_offsets(metadata, compress_ratio)
-            if page_table is not metadata.cache.page_table
-            else None
-        )
         rows = int(page_table.shape[0]) if page_table.ndim >= 1 else 0
         cols = int(page_table.shape[1]) if page_table.ndim >= 2 else 0
         if rows <= 0 or cols <= 0:
@@ -163,7 +148,6 @@ def _refresh_decode_indexer_plan_cache(
             max_blocks=max_blocks,
             out_context_lens=plan.context_lens,
             out_block_tables=plan.page_table,
-            block_table_base_offsets=block_table_base_offsets,
         )
         if metadata.is_valid_token is not None:
             valid = metadata.is_valid_token[:num_tokens].to(
@@ -260,19 +244,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"positive multiple of kernel_page_size "
                 f"({self.kernel_page_size}), got {config.prefix_granularity}"
             )
-        self.swa_storage_rows = int(
-            spec.sliding_window_tokens
-            if spec.sliding_window_tokens is not None
-            else V4_KERNEL_BLOCK_ROWS * 2
-        )
         self.context_len = config.context_len
-        prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)
-        if prefill_chunk_size is None:
-            prefill_chunk_size = global_server_args_dict.get(
-                "deepseek_v4_prefill_chunk_size",
-                DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
-            )
-        self.prefill_chunk_size = max(1, int(prefill_chunk_size))
+        self.prefill_chunk_size = max(
+            1,
+            int(
+                global_server_args_dict.get(
+                    "deepseek_v4_prefill_chunk_size",
+                    DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE,
+                )
+            ),
+        )
         self.max_num_pages = max(
             1,
             (self.context_len + self.kernel_page_size - 1) // self.kernel_page_size,
@@ -292,10 +273,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         self._swa_window_size = 0
         self._swa_block_size = 0
-        self.speculative_num_steps = getattr(config, "speculative_num_steps", 0) or 0
-        self.speculative_num_draft_tokens = (
-            getattr(config, "speculative_num_draft_tokens", 0) or 0
-        )
+        self.speculative_num_steps = int(config.speculative_num_steps)
+        self.speculative_num_draft_tokens = int(config.speculative_num_draft_tokens)
         # Plain-step draft metadata views; built by init_cuda_graph_state
         # for draft instances only (see DeepseekV4DraftRounds).
         self.draft_rounds: DeepseekV4DraftRounds | None = None
@@ -318,9 +297,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         cache_group_specs=(),
         cache_group_page_counts=None,
-    ) -> tuple[tuple[object, ...], dict[str, int]]:
+    ) -> tuple[CacheGroupSpec, ...]:
         specs = tuple(cache_group_specs or ())
-        group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
+        group_ids = tuple(spec.group_id for spec in specs)
         if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
             raise RuntimeError(
                 "DeepSeek V4 cache group specs must use nonempty string IDs"
@@ -380,7 +359,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._expected_cache_group_ids = group_ids
         self._cache_group_raw_tokens_per_page = raw_tokens_per_page
         self._cache_group_max_page_ids = max_page_ids
-        return specs, page_counts
+        return specs
 
     def configure_runtime(self, **kwargs) -> None:
         self._configure_cache_group_contract(
@@ -712,6 +691,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        num_tokens: int,
         **kwargs,
     ) -> None:
         if forward_mode.is_decode():
@@ -721,16 +701,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "extend/mixed/idle"
             )
         dsv4_reset_attention_state()
-        block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
-        num_tokens_arg = kwargs.pop("num_tokens", None)
-        positions = kwargs.get("positions")
-        if num_tokens_arg is not None:
-            num_tokens = int(num_tokens_arg)
-        elif isinstance(positions, torch.Tensor):
-            num_tokens = int(positions.numel())
-        else:
-            num_tokens = bs
-        del kwargs
+        del req_pool_indices, kwargs
+        num_tokens = int(num_tokens)
         device = seq_lens.device
         # Batch-ordered base page table for ratio<=1 (uncompressed/SWA) indexer
         # layers, which have no dedicated group: the first (smallest-ratio)
@@ -740,22 +712,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             base_group_id = first_v4_compressed_kv_group_id(block_tables)
             if base_group_id is not None:
                 base_page_table = block_tables[base_group_id]
-            if self._expected_cache_group_ids is not None:
-                block_tables = self._prepare_cache_group_tables(
-                    block_tables,
-                    bs=bs,
-                    actual_bs=bs,
-                    seq_lens=seq_lens,
-                    device=device,
-                    phase="eager",
-                )
-            # Without a published group contract (warmup placeholders, unit
-            # fixtures) the named tables are accepted as-is.
+            block_tables = self._prepare_cache_group_tables(
+                block_tables,
+                bs=bs,
+                actual_bs=bs,
+                seq_lens=seq_lens,
+                device=device,
+                phase="extend",
+            )
         elif bs > 0 and self._expected_cache_group_ids:
             raise RuntimeError(
-                "DeepSeek V4 eager metadata is missing live cache group tables"
+                "DeepSeek V4 extend metadata is missing live cache group tables"
             )
-        req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
 
         # Per-request query lengths, on device and as a host mirror: the
@@ -851,28 +819,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             str(gid): table[:bs].to(device=device, dtype=torch.int32)
             for gid, table in block_tables.items()
         }
-        base_offsets_on_device: dict[str, torch.Tensor] = {}
-        for gid, off in block_table_base_offsets.items():
-            if not isinstance(off, torch.Tensor):
-                raise TypeError(
-                    "DeepSeek V4 block_table_base_offsets values "
-                    f"must be torch.Tensor, got {type(off).__name__} for "
-                    f"group_id={gid!r}"
-                )
-            base_offsets_on_device[str(gid)] = off[:bs].to(
-                device=device, dtype=torch.int32
-            )
         (
             swa_page_table,
             compressor_state_block_tables,
             indexer_state_block_table,
-            swa_base,
-            compressor_state_base,
-            indexer_state_base,
-        ) = _split_block_tables_into_v4_metadata(
-            block_tables,
-            base_offsets_on_device,
-        )
+        ) = _split_block_tables_into_v4_metadata(block_tables)
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
         num_prefill_tokens = sum(prefill_query_lens)
         if num_prefill_reqs == bs:
@@ -883,14 +834,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         else:
             metadata_tokens = sum(int(value) for value in query_lens_cpu.tolist())
-            output_size = num_tokens
-            if num_tokens_arg is None and not isinstance(positions, torch.Tensor):
-                output_size = metadata_tokens
-            if (
-                forward_mode.is_mixed()
-                and num_tokens_arg is not None
-                and metadata_tokens != num_tokens
-            ):
+            if forward_mode.is_mixed() and metadata_tokens != num_tokens:
                 raise RuntimeError(
                     "DeepSeek V4 mixed metadata token count mismatch: "
                     f"query_lens describe {metadata_tokens} tokens, packed input "
@@ -899,7 +843,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             token_to_req = torch.repeat_interleave(
                 req_ids,
                 query_lens.clamp_min(0),
-                output_size=output_size,
+                output_size=num_tokens,
             )
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
@@ -909,16 +853,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
-            block_table_base_offsets=base_offsets_on_device,
             swa_page_table=swa_page_table,
-            swa_base_logical_page=swa_base,
             compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base,
             indexer_state_block_table=indexer_state_block_table,
-            indexer_state_base_logical_page=indexer_state_base,
         )
         metadata = DeepseekV4ForwardMetadata(
-            req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             query_lens=query_lens,
             query_start_loc=query_start_loc,
@@ -984,7 +923,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
             block_table=swa_page_table,
-            block_table_base_offsets=cache_metadata.swa_base_logical_page,
             window_size=window_size,
             block_size=block_size,
             is_valid_token=metadata.is_valid_token,
@@ -1006,22 +944,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compress_ratio: int,
         block_size: int,
         topk_indices: torch.Tensor | None,
-        metadata: DeepseekV4ForwardMetadata | None = None,
+        metadata: DeepseekV4ForwardMetadata,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if compress_ratio <= 1:
             return None, None
-        if metadata is None:
-            metadata = self.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 decode requires forward metadata")
         num_tokens = positions.numel()
         req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         page_table = metadata.cache.compressed_page_table(compress_ratio, block_size)
-        block_table_base_offsets = (
-            _compressed_block_table_base_offsets(metadata, compress_ratio)
-            if page_table is not metadata.cache.page_table
-            else None
-        )
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
@@ -1031,20 +960,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
-            topk_local = topk_indices
-            if block_table_base_offsets is not None:
-                base_slots = block_table_base_offsets.to(
-                    device=topk_indices.device,
-                    dtype=torch.int64,
-                )[req_idx] * int(block_size)
-                topk_i64 = topk_indices.to(torch.int64)
-                topk_local = torch.where(
-                    topk_i64 >= 0,
-                    topk_i64 - base_slots[:, None],
-                    topk_i64,
-                ).to(topk_indices.dtype)
             indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
-                topk_indices=topk_local,
+                topk_indices=topk_indices,
                 token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
                 block_table=page_table,
                 block_size=block_size,
@@ -1089,22 +1006,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         safe_local = torch.where(valid, local, torch.zeros_like(local))
         pages = torch.div(safe_local, block_size, rounding_mode="floor")
-        if block_table_base_offsets is not None:
-            pages = (
-                pages
-                - block_table_base_offsets.to(
-                    device=pages.device,
-                    dtype=torch.int64,
-                )[
-                    req_idx
-                ][:, None]
-            )
         page_offsets = safe_local % block_size
-        page_ids = metadata.cache.safe_page_ids(
-            page_table,
-            req_idx[:, None],
-            pages.long(),
-        )
+        page_ids = safe_page_ids(page_table, req_idx[:, None], pages.long())
         slots = page_ids * block_size + page_offsets
         indices_2d = torch.where(
             valid & (page_ids >= 0),
@@ -1131,7 +1034,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         compress_ratio: int,
         width: int,
         token_to_req_indices: torch.Tensor | None = None,
-        block_table_base_offsets: torch.Tensor | None = None,
         compressed_block_size: int = 1,
         compressed_table_capacity: int | None = None,
     ) -> torch.Tensor:
@@ -1154,7 +1056,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             width=width,
             out=out,
             token_to_req_indices=token_to_req_indices,
-            block_table_base_offsets=block_table_base_offsets,
             compressed_block_size=compressed_block_size,
             compressed_table_capacity=compressed_table_capacity,
         )
@@ -1285,8 +1186,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_decode_reqs = metadata.decode_req_count()
         num_decode_tokens = metadata.decode_token_count()
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
-        # Slices travel as parameters; the slots are never touched mid-call
-        # (the save/restore dance was a mutation on a read path).
+        # Slices travel as parameters; the slots are never touched mid-call.
         if num_prefill_tokens > 0:
             prefill_metadata = self._metadata_slice(
                 metadata,
@@ -1362,12 +1262,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         window_size: int,
         head_dim: int,
         topk_indices: torch.Tensor | None,
-        metadata: DeepseekV4ForwardMetadata | None = None,
+        metadata: DeepseekV4ForwardMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if metadata is None:
-            metadata = self.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
@@ -1405,11 +1301,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
-            compressed_base_offsets = (
-                _compressed_block_table_base_offsets(metadata, compress_ratio)
-                if compressed_page_table is not cache_metadata.page_table
-                else None
-            )
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
@@ -1419,7 +1310,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 seq_lens=compressed_lens,
                 gather_lens=None,
                 block_table=compressed_page_table,
-                block_table_base_offsets=compressed_base_offsets,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1430,7 +1320,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 seq_lens=metadata.seq_lens,
                 gather_lens=gather_lens,
                 block_table=swa_page_table,
-                block_table_base_offsets=cache_metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
                 max_gather_len=max_gather_len,
@@ -1445,7 +1334,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=topk_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
-                block_table_base_offsets=compressed_base_offsets,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
             )
@@ -1467,11 +1355,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
-            compressed_base_offsets = (
-                _compressed_block_table_base_offsets(metadata, compress_ratio)
-                if compressed_page_table is not cache_metadata.page_table
-                else None
-            )
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
@@ -1481,7 +1364,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 seq_lens=compressed_lens,
                 gather_lens=None,
                 block_table=compressed_page_table,
-                block_table_base_offsets=compressed_base_offsets,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1492,7 +1374,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             seq_lens=metadata.seq_lens,
             gather_lens=gather_lens,
             block_table=swa_page_table,
-            block_table_base_offsets=cache_metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
             max_gather_len=max_gather_len,
@@ -1503,7 +1384,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio=compress_ratio,
                 width=self._dense_compressed_indices_width(compress_ratio),
                 token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                block_table_base_offsets=compressed_base_offsets,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
             )
@@ -1517,7 +1397,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=dense_compressed_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
-                block_table_base_offsets=compressed_base_offsets,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
             )
@@ -1602,19 +1481,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             key: table[req_start:req_end]
             for key, table in cache_metadata.block_tables.items()
         }
-        block_table_base_offsets = {
-            key: offsets[req_start:req_end]
-            for key, offsets in (cache_metadata.block_table_base_offsets.items())
-        }
         compressor_state_block_tables = {
             key: table[req_start:req_end]
             for key, table in cache_metadata.compressor_state_block_tables.items()
-        }
-        compressor_state_base_logical_pages = {
-            key: offsets[req_start:req_end]
-            for key, offsets in (
-                cache_metadata.compressor_state_base_logical_pages.items()
-            )
         }
         query_lens = metadata.query_lens[req_start:req_end]
         req_count = max(0, req_end - req_start)
@@ -1629,32 +1498,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             page_size=cache_metadata.page_size,
             page_table=cache_metadata.page_table[req_start:req_end],
             block_tables=block_tables,
-            block_table_base_offsets=block_table_base_offsets,
             swa_page_table=(
                 cache_metadata.swa_page_table[req_start:req_end]
                 if cache_metadata.swa_page_table is not None
                 else None
             ),
-            swa_base_logical_page=(
-                cache_metadata.swa_base_logical_page[req_start:req_end]
-                if cache_metadata.swa_base_logical_page is not None
-                else None
-            ),
             compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base_logical_pages,
             indexer_state_block_table=(
                 cache_metadata.indexer_state_block_table[req_start:req_end]
                 if cache_metadata.indexer_state_block_table is not None
                 else None
             ),
-            indexer_state_base_logical_page=(
-                cache_metadata.indexer_state_base_logical_page[req_start:req_end]
-                if cache_metadata.indexer_state_base_logical_page is not None
-                else None
-            ),
         )
         return DeepseekV4ForwardMetadata(
-            req_pool_indices=metadata.req_pool_indices[req_start:req_end],
             seq_lens=metadata.seq_lens[req_start:req_end],
             query_lens=query_lens,
             query_start_loc=query_start_loc,
@@ -1696,12 +1552,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         softmax_scale: float,
         attn_sink: torch.Tensor,
         topk_indices: torch.Tensor | None,
-        metadata: DeepseekV4ForwardMetadata | None = None,
+        metadata: DeepseekV4ForwardMetadata,
     ) -> torch.Tensor:
-        if metadata is None:
-            metadata = self.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
                 q_padded = q.contiguous()
@@ -1873,7 +1725,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             device=self.device,
         )
         self.draft_rounds = DeepseekV4DraftRounds(self.graph) if self.is_draft else None
-        specs, _ = self._configure_cache_group_contract(
+        specs = self._configure_cache_group_contract(
             cache_group_specs,
             cache_group_page_counts,
         )
@@ -1891,12 +1743,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             for spec, gid in zip(specs, group_ids, strict=True)
         }
-        sliding_gids = frozenset(
-            gid
-            for spec, gid in zip(specs, group_ids, strict=True)
-            if str(getattr(spec, "retention", "")) == "sliding_window"
-        )
-        self.graph.allocate_group_tables(group_widths, sliding_gids)
+        self.graph.allocate_group_tables(group_widths)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1907,11 +1754,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ):
         dsv4_reset_attention_state()
+        del req_pool_indices
         block_tables = kwargs.pop("block_tables", None) or {}
-        block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
-        if forward_mode is not None and not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
             )
@@ -1920,9 +1767,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         else:
             num_tokens = int(num_tokens_arg)
         tokens_per_req = self.graph.tokens_per_req(bs, num_tokens)
-        is_packed_decode = (
-            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
-        )
+        is_packed_decode = forward_mode.is_decode() and num_tokens != bs
         self.graph.fill_packed_rows(
             bs=bs,
             actual_bs=bs,
@@ -1934,16 +1779,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 capture_seq_lens,
                 torch.full_like(capture_seq_lens, tokens_per_req),
             )
-        self.graph.req_pool_indices[:bs].copy_(req_pool_indices[:bs])
-        self.graph.seq_lens[:bs].copy_(capture_seq_lens)
-        metadata_forward_mode = forward_mode
-        is_decode = (
-            metadata_forward_mode is not None and metadata_forward_mode.is_decode()
-        )
-        offsets_on_device = {
-            str(gid): off.to(device=self.device, dtype=torch.int32)
-            for gid, off in block_table_base_offsets.items()
-        }
+        self.graph.write_batch(bs, capture_seq_lens)
         metadata_block_tables = self._prepare_cache_group_tables(
             block_tables,
             bs=bs,
@@ -1955,21 +1791,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             phase="capture",
             output_buffers=self.graph.block_tables,
         )
-        metadata_base_offsets = self.graph.refresh_base_offsets(
-            bs,
-            offsets_on_device,
-        )
         (
             swa_page_table,
             compressor_state_block_tables,
             indexer_state_block_table,
-            swa_base,
-            compressor_state_base,
-            indexer_state_base,
-        ) = _split_block_tables_into_v4_metadata(
-            metadata_block_tables,
-            metadata_base_offsets,
-        )
+        ) = _split_block_tables_into_v4_metadata(metadata_block_tables)
         # The single builder: every tensor field of the view is a fixed slice
         # assigned at construction; per-round state travels on the cache slot
         # (guard-exempt) swapped below.
@@ -1978,25 +1804,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             tokens_per_req,
             kernel_page_size=self.kernel_page_size,
             max_num_pages=self.max_num_pages,
-            forward_mode=metadata_forward_mode,
+            forward_mode=forward_mode,
         )
         metadata.cache = DeepseekV4CacheMetadata(
             page_size=self.kernel_page_size,
             page_table=self.graph.page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
-            block_table_base_offsets=metadata_base_offsets,
             swa_page_table=swa_page_table,
-            swa_base_logical_page=swa_base,
             compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base,
             indexer_state_block_table=indexer_state_block_table,
-            indexer_state_base_logical_page=indexer_state_base,
             decode_compressed_slot_mappings=(
                 metadata.cache.decode_compressed_slot_mappings
             ),
         )
-        metadata.seq_lens_cpu = None
-        metadata.query_lens_cpu = None
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
                 metadata,
@@ -2004,10 +1824,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             self._publish_draft_round(metadata, self.draft_rounds.current)
             return
-        if is_decode:
-            self._publish_decode(metadata)
-        else:
-            self.forward_metadata = metadata
+        self._publish_decode(metadata)
 
     def refresh_decode_metadata(
         self,
@@ -2017,21 +1834,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         *,
         forward_mode: ForwardMode,
-        block_table: torch.Tensor | None = None,
         num_extends: int = 0,
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
         dsv4_reset_attention_state()
+        del req_pool_indices
         block_tables = kwargs.pop("block_tables", None) or {}
-        block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         if actual_bs < 0 or actual_bs > bs:
             raise RuntimeError(
                 f"DeepSeek V4 decode actual_bs={actual_bs} must be within 0..{bs}"
             )
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
-        if forward_mode is not None and not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 decode refresh not supported for {forward_mode}"
             )
@@ -2040,10 +1856,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         else:
             num_tokens = int(num_tokens_arg)
         tokens_per_req = self.graph.tokens_per_req(bs, num_tokens)
-        is_packed_decode = (
-            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
-        )
-        total_tokens = self.graph.fill_packed_rows(
+        is_packed_decode = forward_mode.is_decode() and num_tokens != bs
+        self.graph.fill_packed_rows(
             bs=bs,
             actual_bs=actual_bs,
             tokens_per_req=tokens_per_req,
@@ -2058,7 +1872,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             forward_mode=forward_mode,
         )
-        self.graph.write_batch(bs, req_pool_indices, seq_lens)
+        self.graph.write_batch(bs, seq_lens)
         # Base page table for ratio<=1 indexer layers: the first (smallest-ratio)
         # compressed-KV full-history group's batch-ordered table.
         base_page_table = None
@@ -2080,22 +1894,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
-        offsets_on_device = {
-            str(gid): off.to(device=self.device, dtype=torch.int32)
-            for gid, off in block_table_base_offsets.items()
-        }
         # actual_bs == 0 replays only ever carry capture/idle placeholder
         # tables; those must go through the refresh path below, never the
         # live-table prepare path.
         if actual_bs > 0 and block_tables and not self._expected_cache_group_ids:
-            # No published group contract (warmup placeholders, unit
-            # fixtures): accept the named tables as-is, like the former
-            # eager path did.
+            # An empty published contract (a backend whose pool declares no
+            # cache groups) has no persistent group tables to fill; the
+            # delivered tables are bound as-is.
             metadata_block_tables = {
                 str(group_id): table.to(device=self.device, dtype=torch.int32)
                 for group_id, table in block_tables.items()
             }
-            metadata_base_offsets = offsets_on_device
         elif actual_bs > 0 and block_tables:
             metadata_block_tables = self._prepare_cache_group_tables(
                 block_tables,
@@ -2103,13 +1912,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 actual_bs=actual_bs,
                 seq_lens=seq_lens,
                 device=seq_lens.device,
-                phase="replay",
+                phase="decode",
                 output_buffers=self.graph.block_tables,
             )
-            metadata_base_offsets = {}
         elif actual_bs > 0 and self._expected_cache_group_ids:
             raise RuntimeError(
-                "DeepSeek V4 replay is missing live cache group tables; "
+                "DeepSeek V4 decode refresh is missing live cache group tables; "
                 "capture placeholders cannot be reused"
             )
         else:
@@ -2122,40 +1930,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 actual_bs=actual_bs,
                 pad_value=-1,
             )
-            metadata_base_offsets = self.graph.refresh_base_offsets(
-                bs,
-                offsets_on_device,
-                actual_bs=actual_bs,
-            )
         (
             swa_page_table,
             compressor_state_block_tables,
             indexer_state_block_table,
-            swa_base,
-            compressor_state_base,
-            indexer_state_base,
-        ) = _split_block_tables_into_v4_metadata(
-            metadata_block_tables,
-            metadata_base_offsets,
-        )
-        metadata_forward_mode = forward_mode
-        is_decode = (
-            metadata_forward_mode is not None and metadata_forward_mode.is_decode()
-        )
-        metadata.forward_mode = metadata_forward_mode
-        metadata.token_to_req_indices = self.graph.token_to_req[:total_tokens]
-        metadata.is_valid_token = self.graph.is_valid_token[:total_tokens]
+        ) = _split_block_tables_into_v4_metadata(metadata_block_tables)
+        is_decode = forward_mode.is_decode()
         metadata.cache = DeepseekV4CacheMetadata(
             page_size=self.kernel_page_size,
             page_table=self.graph.page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
-            block_table_base_offsets=metadata_base_offsets,
             swa_page_table=swa_page_table,
-            swa_base_logical_page=swa_base,
             compressor_state_block_tables=compressor_state_block_tables,
-            compressor_state_base_logical_pages=compressor_state_base,
             indexer_state_block_table=indexer_state_block_table,
-            indexer_state_base_logical_page=indexer_state_base,
             decode_compressed_slot_mappings=(
                 metadata.cache.decode_compressed_slot_mappings
             ),
@@ -2172,7 +1959,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             and is_decode
             and self.is_draft
             and self.forward_prefill_metadata is not None
-            and self.forward_prefill_metadata.req_pool_indices.numel() == bs
+            and self.forward_prefill_metadata.seq_lens.numel() == bs
         ):
             # The extend round's plain-row draft refresh (unified draft
             # contract step two): rebuild the draft's step-1+ decode metadata
@@ -2183,12 +1970,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 self.forward_prefill_metadata,
                 seq_lens[:bs].clone(),
             )
-        if (
-            metadata_forward_mode is not None
-            and metadata_forward_mode.is_decode()
-            and self._swa_window_size > 0
-            and self._swa_block_size > 0
-        ):
+        if is_decode and self._swa_window_size > 0 and self._swa_block_size > 0:
             self._update_decode_swa_metadata(
                 metadata,
                 window_size=self._swa_window_size,
@@ -2208,10 +1990,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if is_packed_decode and self.is_draft:
             self._publish_draft_round(metadata, self.draft_rounds.current)
             return
-        if is_decode:
-            self._publish_decode(metadata)
-        else:
-            self.forward_metadata = metadata
+        self._publish_decode(metadata)
 
     def publish_draft_step_locations(self, cache_start, num_tokens):
         """No-op by design: V4's KV writes derive from its own per-group
@@ -2222,7 +2001,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         del cache_start, num_tokens
         return None
 
-    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         if self.draft_rounds is None or self.forward_prefill_metadata is None:
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
         metadata = self.draft_rounds.advance(seq_lens)

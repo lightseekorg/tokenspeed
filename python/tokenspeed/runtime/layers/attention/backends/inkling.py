@@ -31,20 +31,21 @@ rejected speculative rows are overwritten when their positions recur.
   sized by the request-pool capacity and indexed by ``req_pool_indices``
   (rank-local, 1-based, stable for a request's lifetime, reused only after
   completion — the same indices the dense KV path already uses).
-* ``InklingAttnBackend`` wraps the plain ``MHAAttnBackend``: every attention
+* ``InklingAttnBackend`` wraps the dense ``CacheGroupRouter``: every attention
   call is delegated unchanged, while ``init_forward_metadata`` additionally
   derives the conv metadata (``InklingConvMetadata``) the model's sconv modules
   consume.
 
-Prefix caching is supported when the conv state is fully paged (kvconv +
-hiddenconv groups): cache-hit restores replay the conv columns from the
-layers' own K/V slots. A fresh prefill still runs with
-``has_initial_state=False`` so a reused slot's stale rolling state is ignored
+The conv state is paged (kvconv + hiddenconv checkpoint groups), so prefix
+caching holds unconditionally: cache-hit restores replay the conv columns
+from the layers' own K/V slots, and a fresh prefill runs with
+``has_initial_state=False`` so a reused slot's previous contents are ignored
 and overwritten.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import torch
@@ -64,9 +65,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
 
 # Matches the runtime causal_conv1d kernels' padded-slot sentinel.
 PAD_SLOT_ID = -1
@@ -104,7 +102,8 @@ class InklingConvMetadata:
     # Target decode graphs keep endpoint restoration captured. This mask is
     # armed for exactly the first decode after a successful remote transfer.
     remote_restore_mask: torch.Tensor | None = None
-    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]}; None -> no paged groups.
+    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]},
+    # populated by every metadata build.
     col_block_table: dict[str, torch.Tensor] | None = None
 
 
@@ -129,11 +128,8 @@ class InklingConvStatePool:
         dtype: torch.dtype,
         device: torch.device | str,
     ):
-        self.num_layers = num_layers
         self.num_slots = num_slots
-        self.conv_dim = conv_dim
         self.kernel_size = kernel_size
-        self.ring_size = ring_size
         self.conv_state = torch.zeros(
             (num_layers, num_slots, ring_size, conv_dim),
             dtype=dtype,
@@ -172,7 +168,6 @@ class InklingAttnBackend(AttentionBackend):
         *,
         conv_columns: dict,
         spec_num_tokens: int = 1,
-        is_draft: bool = False,
         enable_layerwise_cache_ready: bool = False,
     ):
         # Deliberately skip AttentionBackend.__init__: the wrapper mirrors inner via __getattr__.
@@ -194,7 +189,6 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_decode_metadata: InklingConvMetadata | None = None
         # Spec decoding: >1 means decode rounds carry this many tokens/request (verify / catch-up).
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
-        self.conv_is_draft = is_draft
         self.enable_layerwise_cache_ready = enable_layerwise_cache_ready
         # Persistent spec conv metadata buffers for CUDA graphs; sized in init_cuda_graph_state.
         self._graph_spec_qsl: torch.Tensor | None = None
@@ -261,7 +255,7 @@ class InklingAttnBackend(AttentionBackend):
         self,
         cache_indices: torch.Tensor,
         *,
-        out: torch.Tensor | None = None,
+        out: torch.Tensor,
     ) -> torch.Tensor:
         slots = cache_indices.to(torch.int64)
         valid = (slots > 0) & (slots < self.conv_pool.num_slots)
@@ -270,8 +264,6 @@ class InklingAttnBackend(AttentionBackend):
         restore = pending & valid
         # Invalid/padded rows clamp to a sentinel slot but must not consume it.
         self.conv_pool.remote_restore_pending[safe_slots] = pending & ~valid
-        if out is None:
-            return restore
         out.copy_(restore)
         return out
 
@@ -400,6 +392,7 @@ class InklingAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         *,
+        block_tables: Mapping[str, torch.Tensor],
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
@@ -418,8 +411,9 @@ class InklingAttnBackend(AttentionBackend):
                 "Inkling decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
-        # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
-        group_tables = kwargs.get("block_tables") or {}
+        # The conv groups are state-family, so the inner router builds no leaf
+        # for them; this wrapper reads them straight out of block_tables.
+        group_tables = block_tables
         extend_total = int(sum(extend_seq_lens_cpu[:bs].tolist()))
         # In-bucket extends must use armed PFG statics: captured sconv kernels baked their addresses.
         pfg_total = -1
@@ -449,6 +443,7 @@ class InklingAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             forward_mode,
+            block_tables=block_tables,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_prefix_lens=extend_prefix_lens,
@@ -558,7 +553,7 @@ class InklingAttnBackend(AttentionBackend):
         """Re-anchor the k-row conv metadata and the inner backend's
         seq_lens/write locs to end at ``frontier`` ([bs] int32). Accept-
         dependent, so pure tensor ops — recomputed per graph replay; the
-        next round's ``init_forward_metadata`` resets."""
+        next round's decode refresh rebuilds ``conv_decode_metadata``."""
         self.inner.update_draft_forward_metadata(frontier)
         # Paged bridges ride through: the in-kernel publish resolves pages
         # by position, so boundaries rewritten by the re-anchored rows are
@@ -840,13 +835,6 @@ class InklingAttnBackend(AttentionBackend):
             max_num_tokens: Largest captured token bucket (sizes ``seq_idx``;
                 extends beyond it run eager and skip the static route).
             max_bs: Request capacity; also the PAD request row index.
-
-        Raises:
-            RuntimeError: When any conv site still runs the rolling-state
-                path — its cache-update grid is batch-shaped, which a
-                token-bucket graph cannot serve for other batch sizes. The
-                caller treats this as capture failure and (world-agreed)
-                degrades to eager prefill.
         """
         geo = self.conv_columns
         device = self.conv_pool.conv_state.device
@@ -976,6 +964,7 @@ class InklingAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         *,
         forward_mode: ForwardMode,
+        block_tables: Mapping[str, torch.Tensor],
         num_extends: int = 0,
         for_graph_replay: bool = False,
         **kwargs,
@@ -986,6 +975,7 @@ class InklingAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             forward_mode=forward_mode,
+            block_tables=block_tables,
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
             **kwargs,
@@ -996,9 +986,8 @@ class InklingAttnBackend(AttentionBackend):
         if actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
-        group_tables = kwargs.get("block_tables") or {}
         for g, buf in self._graph_col_tables.items():
-            src = group_tables.get(g)
+            src = block_tables.get(g)
             if src is None:
                 raise RuntimeError(
                     f"paged sconv decode: no {g!r} table in block_tables"

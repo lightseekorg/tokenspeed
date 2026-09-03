@@ -953,25 +953,36 @@ def test_kda_cache_pool_component_views_end_to_end(
         assert ssm[0].abs().max().item() == 0.0
 
 
-def test_mask_fresh_initial_state_zeroes_recycled_bytes() -> None:
+def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> None:
     """Fresh sequences must not inherit a recycled page's stale bytes as
-    their initial recurrent state: only rows with real history keep the
-    gathered state."""
+    their initial recurrent state: only the row that resumes real history
+    keeps the gathered snapshot, and no row reads physical page 0."""
     from tokenspeed.runtime.layers.attention.backends.mamba import (
-        _mask_fresh_initial_state,
+        _prepare_cache_prefill_state_inputs,
     )
 
-    stale = torch.full((3, 2, 4, 4), float("nan"))
-    stale[1] = 7.0  # the one resuming row carries a real (finite) snapshot
+    # Pages 1, 3, 4 are freshly allocated working pages still carrying a
+    # previous tenant's bytes; page 2 is a real (finite) snapshot.
+    ssm_states = torch.full((5, 2, 4, 4), float("nan"))
+    ssm_states[0] = 0.0
+    ssm_states[2] = 7.0
+    conv_states = torch.arange(5, dtype=torch.float32).view(5, 1, 1).expand(5, 3, 2)
+    conv_states = conv_states.clone()
+    state_in = torch.tensor([0, 2, 0], dtype=torch.int32)
+    state_out = torch.tensor([1, 3, 4], dtype=torch.int64)
 
-    # None => every sequence fresh => all zeros.
-    out = _mask_fresh_initial_state(stale, None)
-    assert (out == 0).all()
+    recurrent_state, has_initial_state = _prepare_cache_prefill_state_inputs(
+        conv_states, ssm_states, state_in, state_out
+    )
 
-    has_init = torch.tensor([False, True, False])
-    out = _mask_fresh_initial_state(stale, has_init)
-    assert (out[0] == 0).all() and (out[2] == 0).all()
-    assert (out[1] == 7.0).all()
+    assert has_initial_state.tolist() == [False, True, False]
+    assert (recurrent_state[0] == 0).all() and (recurrent_state[2] == 0).all()
+    assert (recurrent_state[1] == 7.0).all()
+    # The resumed row copies its snapshot's conv page into its working page;
+    # fresh rows keep their own working page and never touch page 0.
+    assert (conv_states[3] == 2.0).all()
+    assert (conv_states[1] == 1.0).all() and (conv_states[4] == 4.0).all()
+    assert (conv_states[0] == 0.0).all()
 
 
 if __name__ == "__main__":

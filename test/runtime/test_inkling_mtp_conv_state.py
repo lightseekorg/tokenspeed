@@ -64,14 +64,20 @@ class TestInklingCacheContract(unittest.TestCase):
 
         backend.mark_remote_cache_ready(2)
         mask = backend._consume_remote_restore_mask(
-            torch.tensor([2, 3, -1], dtype=torch.int32)
+            torch.tensor([2, 3, -1], dtype=torch.int32),
+            out=torch.zeros(3, dtype=torch.bool),
         )
         self.assertEqual(mask.tolist(), [True, False, False])
-        self.assertFalse(backend._consume_remote_restore_mask(torch.tensor([2])).item())
+        one = torch.zeros(1, dtype=torch.bool)
+        self.assertFalse(
+            backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
+        )
 
         backend.mark_remote_cache_ready(2)
         backend.prepare_remote_cache_slots([2])
-        self.assertFalse(backend._consume_remote_restore_mask(torch.tensor([2])).item())
+        self.assertFalse(
+            backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
+        )
 
     def test_non_aligned_endpoint_checkpoint_round_trip(self):
         from tokenspeed.runtime.layers.attention.backends.inkling import (
