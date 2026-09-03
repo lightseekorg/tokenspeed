@@ -104,6 +104,10 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     return fabric_allocation_supported(torch.cuda.current_device())
 
 
+# sm100 and up may attempt the multicast path; sm90 lacks the fabric handles.
+_MULTICAST_MIN_ARCH = 10
+
+
 def multicast_backend_unavailable_reason(
     group: dist.ProcessGroup | None = None,
 ) -> str | None:
@@ -120,9 +124,14 @@ def multicast_backend_unavailable_reason(
     platform = current_platform()
     if not platform.is_nvidia:
         return f"{platform.vendor} does not carry the NVLS multicast path"
-    # Only sm100 is measured; sm90 lacks the fabric handles this mailbox needs.
-    if platform.arch_version.major < 10:
-        return f"compute capability {platform.arch_version.major}, below 10"
+    # Whether to attempt the path. Deliberately not the same number as
+    # latent_down's _MULTICAST_VALIDATED_ARCH, which decides whether a failure
+    # to rendezvous is a broken machine: a later architecture should get to try.
+    if platform.arch_version.major < _MULTICAST_MIN_ARCH:
+        return (
+            f"compute capability {platform.arch_version.major}, "
+            f"below {_MULTICAST_MIN_ARCH}"
+        )
     try:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401

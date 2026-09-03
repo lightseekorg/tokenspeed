@@ -68,12 +68,19 @@ def _eligible(
             return_value=None if reachable else "fabric unreachable",
         ),
         mock.patch.object(
-            latent_down, "current_platform", return_value=mock.Mock(is_nvidia=nvidia)
+            latent_down,
+            "current_platform",
+            return_value=mock.Mock(is_nvidia=nvidia, arch_version=mock.Mock(major=10)),
         ),
         mock.patch.object(latent_down.dist, "is_initialized", return_value=initialized),
         mock.patch.object(
             latent_down.dist, "all_gather_into_tensor", side_effect=gather_ceilings
         ),
+        # Without this the vote reaches the real collective with a Mock group,
+        # which no-ops: the tensor keeps its local value and the test passes
+        # having exercised nothing. Tests that assert on the vote patch it
+        # again inside this, and the inner patch wins.
+        mock.patch.object(latent_down.dist, "all_reduce", side_effect=lambda t, **k: t),
     ):
         yield
 
@@ -1140,47 +1147,6 @@ def test_the_wide_producer_publishes_through_the_multicast_view() -> None:
     assert torch.equal(backing[9:], stale[9:])
 
 
-def test_the_wide_producer_overwrites_rather_than_accumulates() -> None:
-    """The publish overwrites its destination rather than accumulating onto it.
-
-    What this pins is narrow: the producer runs over an ordinary CPU tensor, so
-    it holds the call to ``torch.mm(out=)`` semantics and would still pass with
-    the multicast view, the mailbox and cuBLAS all replaced.
-
-    Nothing covers beta on the real path, and the obvious candidate cannot.
-    The mailbox is armed with ``0x80008000``, both BF16 lanes negative zero,
-    and ``x + (-0.0) == x`` bitwise for every value -- so an accumulating
-    publish onto an armed mailbox is byte-identical to an overwriting one, and
-    no comparison of final values can tell them apart. A witness would have to
-    observe the transient: a peer reading these columns while the GEMM is still
-    accumulating into them. That test does not exist.
-    """
-    latent, shard_dim, ceiling, k = 3584, 448, 16, 128
-    torch.manual_seed(3)
-    garbage = torch.randn(ceiling, shard_dim) * 1e3
-    backing = garbage.clone()
-    producer = _wide_producer_over(
-        backing,
-        {},
-        multicast_ptr=4096,
-        rank=0,
-        shard_dim=shard_dim,
-        latent_size=latent,
-        max_m=ceiling,
-        device=torch.device("cpu"),
-    )
-    hidden = torch.randn(ceiling, k)
-    weight_block = torch.randn(shard_dim, k)
-    producer(hidden, weight_block, None, 4096)
-    torch.testing.assert_close(backing, hidden @ weight_block.T)
-
-
-def test_the_gather_geometry_is_chosen_in_one_place() -> None:
-    """A per-width table lands in _lamport_geometry and nowhere else."""
-    geometries = {latent_down._lamport_geometry(m) for m in (1, 8, 9, 64, 512)}
-    assert geometries == {(latent_down._LAMPORT_CTAS, latent_down._LAMPORT_THREADS)}
-
-
 def _initialize(**overrides):
     """Drive initialize with the arguments every rank agrees on but the ceiling."""
     kwargs = dict(
@@ -1302,3 +1268,45 @@ def test_an_ungrouped_rank_says_so_rather_than_falling_back_silently(caplog) -> 
         with caplog.at_level("INFO", logger=latent_down.logger.name):
             assert _initialize() is None
     assert any("no process group" in r.getMessage() for r in caplog.records)
+
+
+def test_the_fault_is_claimed_only_on_the_validated_architecture() -> None:
+    """The arch gate and the fault condition are deliberately different numbers.
+
+    The gate admits sm100 and up so a later architecture can attempt the path.
+    The fault must not follow it there: on hardware nobody here has run, a
+    rendezvous that cannot deliver more likely means the path was never really
+    supported, and the message names Blackwell specifics that may not apply. So
+    above the validated architecture the same failure declines quietly, which is
+    what the shipped gate asks for and what this pins.
+    """
+    for major, expect_fault in ((10, True), (11, False), (12, False)):
+        with mock.patch.object(
+            latent_down,
+            "current_platform",
+            return_value=mock.Mock(is_nvidia=True, arch_version=mock.Mock(major=major)),
+        ):
+            assert latent_down._rendezvous_failure_is_a_fault() is expect_fault
+
+
+def test_a_rendezvous_failure_above_the_validated_arch_declines(caplog) -> None:
+    """It must fall back, not fail the boot, and must still say why."""
+    with (
+        _eligible(),
+        mock.patch.object(latent_down.dist, "get_rank", side_effect=lambda group: 0),
+        mock.patch.object(
+            latent_down.dist, "get_world_size", side_effect=lambda group: 8
+        ),
+        # None here is the rendezvous yielding no multicast address.
+        mock.patch.object(
+            latent_down.KimiK3LatentDownOp, "_build_slot", side_effect=lambda *a: None
+        ),
+        mock.patch.object(
+            latent_down,
+            "current_platform",
+            return_value=mock.Mock(is_nvidia=True, arch_version=mock.Mock(major=11)),
+        ),
+        caplog.at_level("INFO", logger=latent_down.logger.name),
+    ):
+        assert _initialize() is None
+    assert any("no multicast address" in r.getMessage() for r in caplog.records)

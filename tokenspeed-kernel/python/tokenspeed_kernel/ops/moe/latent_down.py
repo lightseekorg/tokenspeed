@@ -68,6 +68,28 @@ _BF16_BYTES = 2
 logger = logging.getLogger(__name__)
 # Reasons already reported; the decline repeats per MoE block and says nothing new.
 _DECLINED: set[str] = set()
+# The architecture whose fabric semantics are validated here, and so the only
+# one where failing to rendezvous means a broken machine rather than an
+# unsupported one. Deliberately NOT latent_tail's _MULTICAST_MIN_ARCH: that
+# decides whether to attempt the path and admits later architectures, this
+# decides whether to fail a boot over the attempt and must not. They agree
+# today and are separate numbers because they answer different questions.
+_MULTICAST_VALIDATED_ARCH = 10
+
+
+def _rendezvous_failure_is_a_fault() -> bool:
+    """Whether a rendezvous that yielded nothing means the machine is broken.
+
+    On hardware nobody here has run, a rendezvous that cannot deliver is far
+    likelier to mean the path was never really supported than that the fabric
+    failed -- and the message we would print names Blackwell specifics that may
+    not even apply there. So above the validated architecture this declines,
+    which is the pre-existing behaviour and what the shipped gate asks for.
+    """
+    platform = current_platform()
+    return (
+        platform.is_nvidia and platform.arch_version.major == _MULTICAST_VALIDATED_ARCH
+    )
 
 
 def _fabric_fault_message(reason: str) -> str:
@@ -190,6 +212,10 @@ class _MulticastVaGemm:
         """
         published = self._block[: hidden_states.shape[0]]
         # Overwrites rather than accumulates, so a word transitions once a round.
+        # Untested, and not cheaply testable: the mailbox is armed with negative
+        # zero in both BF16 lanes, and adding that is the identity bitwise, so an
+        # accumulating publish is byte-identical to this one. A witness would
+        # have to catch a peer reading these columns mid-accumulation.
         torch.mm(hidden_states, weight_block.t(), out=published)
         return mailbox
 
@@ -385,9 +411,10 @@ class KimiK3LatentDownOp:
             )
         slot = cls._pools[key]
         if slot is None:
-            raise RuntimeError(
-                _fabric_fault_message("the rendezvous returned no multicast address")
-            )
+            reason = "the rendezvous returned no multicast address"
+            if not _rendezvous_failure_is_a_fault():
+                return _decline(reason)
+            raise RuntimeError(_fabric_fault_message(reason))
         arm_mailbox(slot.mailbox)
         return cls(slot, shard_dim, rank, max_m)
 

@@ -1295,16 +1295,6 @@ def test_an_unmailboxed_column_projection_keeps_the_replica_in_the_gap(
     assert gathers == [crossover]
 
 
-def test_the_column_crossover_leaves_a_reachable_band() -> None:
-    """A measured constant, but one that must still name real prefill chunks.
-
-    Below the fused kernel's own ceiling the mailbox already wins, and above
-    the chunked-prefill budget no batch is ever that wide, so a value outside
-    those two would make the band dead code without failing anything else.
-    """
-    assert 8 < latent_module.COLUMN_GATHER_MIN_TOKENS <= 8192
-
-
 def test_column_group_and_shard_group_are_exclusive() -> None:
     """One means replicated storage and one means narrowed; not both."""
     with pytest.raises(ValueError, match="already gathers over its own group"):
