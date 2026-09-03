@@ -166,9 +166,11 @@ class AboveLadderDecodeTest(_RouterCase):
 
 class FlashMLATileScheduleTest(_TorchCase):
     """FlashMLA's kernel freezes its tile schedule on the first call against
-    a sched-meta object, so the step's object is kernel-owned scratch held on
-    the backend — never a field of the pointer-stable decode views, so the
-    graph_ptr_guard has nothing to exempt."""
+    a sched-meta object (a request that has since crossed a page boundary
+    loses its newest page), so the object is bound to one seq_lens value and
+    every seq_lens write a kernel call follows renews it. It is kernel-owned
+    scratch held on the backend — never a field of the pointer-stable decode
+    views, so the graph_ptr_guard has nothing to exempt."""
 
     def setUp(self):
         super().setUp()
@@ -248,6 +250,49 @@ class FlashMLATileScheduleTest(_TorchCase):
         self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
         self.assertIsNot(self.leaf._decode_tile_metadata, first)
         self.assertEqual(self.leaf._decode_tile_metadata_keepalive, [])
+
+    def test_draft_seq_lens_edits_renew_the_schedule(self):
+        """Chain steps, the step-0 accept correction and block fills all
+        rewrite seq_lens under a live schedule; each must bind a fresh one."""
+        torch = self.torch
+        self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
+        step0 = self.leaf._decode_tile_metadata
+
+        self.leaf.advance_draft_forward_metadata(self.seq + 1)
+        step1 = self.leaf._decode_tile_metadata
+        self.assertIsNot(step1, step0)
+        torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], self.seq + 1)
+
+        self.leaf.draft_block_decode = True
+        self.leaf.spec_num_tokens = 2
+        self.leaf.fill_block_decode_seq_lens(LADDER_BS, self.seq + 3)
+        self.assertIsNot(self.leaf._decode_tile_metadata, step1)
+        torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], self.seq + 3)
+        # Eager edits: nothing recorded, nothing to keep alive.
+        self.assertEqual(self.leaf._decode_tile_metadata_keepalive, [])
+
+    def test_in_graph_seq_lens_edits_keep_their_schedule_alive(self):
+        from unittest import mock
+
+        torch = self.torch
+        self.leaf.init_forward_metadata_capture_cuda_graph(
+            LADDER_BS, self.seq, self.table
+        )
+        captured = self.leaf._decode_tile_metadata
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ),
+        ):
+            self.leaf.advance_draft_forward_metadata(self.seq + 1)
+        in_graph = self.leaf._decode_tile_metadata
+        self.assertIsNot(in_graph, captured)
+        # Both the capture seed and the recorded chain step outlive the round:
+        # the graph replays their schedule-builds against these objects.
+        self.assertEqual(
+            self.leaf._decode_tile_metadata_keepalive, [captured, in_graph]
+        )
 
 
 class DefaultCaptureTest(_RouterCase):

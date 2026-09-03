@@ -88,9 +88,13 @@ default capture (which runs the idle-refresh arm). Two sanctioned branches
 on it exist:
 
 * FlashMLA's tile schedule: flash_mla freezes its schedule on the first
-  kernel call against a `FlashMLASchedMeta`, so eager refresh must swap in a
-  fresh sched-meta each step, while the captured graph re-runs the recorded
-  schedule-build against the live seq_lens buffer.
+  kernel call against a `FlashMLASchedMeta` (a request that has since
+  crossed a page boundary loses its newest page), so the object is bound to
+  one seq_lens value: eager refresh and every drafter seq_lens edit
+  (`advance_draft_forward_metadata`, `fill_block_decode_seq_lens`) bind a
+  fresh one, while a replay refresh leaves the slot alone — the captured
+  graph re-runs the recorded schedule-builds, one per edit, against the live
+  seq_lens buffer. The object lives on the backend, not on the decode views.
 * DFLASH block-arm seeding (`not for_graph_replay or actual_bs == 0`): the
   drafter's recorded `fill_block_decode_seq_lens` rewrites the block-end
   lengths inside every replay, so only eager steps and the capture-time
@@ -400,8 +404,9 @@ down to the router and V4).
   above-ladder views are pointer-stable; the graph_ptr_guard walk reports a
   rebound tensor by path and pins every tensor under the slots; FlashMLA's
   tile schedule stays off the views (capture keeps its object alive, replay
-  refresh leaves it alone, eager takes a fresh one per step); leaf
-  capture/refresh signature conformance.
+  refresh leaves it alone, eager refresh and every drafter seq_lens edit
+  bind a fresh one, in-graph edits keep theirs alive); leaf capture/refresh
+  signature conformance.
 * `test/runtime/test_deepseek_v4_config.py` — a V4 replay refresh leaves
   every address the capture recorded in place under the guard, the `cache`
   slot's group tables included, for the target's packed views and the

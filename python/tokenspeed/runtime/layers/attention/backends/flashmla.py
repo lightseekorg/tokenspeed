@@ -205,17 +205,16 @@ class FlashMLABackend(PagedAttentionBackend):
         self._decode_views_by_bs: dict[int, FlashMLADecodeMetadata] = {}
         # FlashMLA builds its tile schedule lazily inside the FIRST
         # flash_mla_with_kvcache call (from that call's cache_seqlens) and then
-        # freezes it on the FlashMLASchedMeta object. So a sched object must not
-        # be reused across calls whose cache_seqlens differ, or the kernel keeps
-        # attending the stale (first-seen) sequence length. The current step's
-        # object lives here, on the backend, not on the decode views: it is
-        # kernel-owned per-step scratch, not an address the refresh keeps for
-        # a graph. Eager refresh takes a fresh one every step; capture installs
-        # a dedicated one so the schedule build is recorded into the graph and
-        # recomputed from the live cache_seqlens buffer on each replay (which
-        # never reads this slot). Strong refs to every sched captured into a
-        # graph, so none is GC'd while its graph is alive (multiple sampling
-        # variants may capture the same bs).
+        # freezes it on the FlashMLASchedMeta object: later calls keep the
+        # frozen page range, and a request whose seq_len has since crossed a
+        # page boundary silently loses its newest page. So the object is bound
+        # to one seq_lens value: every write into seq_lens_buf that a kernel
+        # call will follow renews it (_renew_decode_tile_metadata). It lives
+        # here, on the backend, not on the decode views: kernel-owned per-step
+        # scratch, not an address the refresh keeps for a graph. Under capture
+        # the recorded schedule-build re-runs from the live buffer on every
+        # replay (which never reads this slot); strong refs keep every sched a
+        # graph recorded alive for the graph's lifetime.
         self._decode_tile_metadata: object | None = None
         self._decode_tile_metadata_keepalive: list[object] = []
 
@@ -272,28 +271,30 @@ class FlashMLABackend(PagedAttentionBackend):
         finally:
             self.forward_decode_metadata.num_extends = prev
 
-    def _new_eager_tile_metadata(self):
-        """Return a fresh (uninitialized) FlashMLASchedMeta for one eager decode.
+    def _renew_decode_tile_metadata(self, *, for_graph: bool) -> None:
+        """Bind a fresh (uninitialized) FlashMLASchedMeta for the seq_lens just
+        written; the next kernel call builds its schedule from them.
 
-        FlashMLA freezes its tile schedule from the FIRST kernel call's
-        cache_seqlens, so eager decode must hand the kernel a fresh object every
-        step — reusing one would keep attending the first step's sequence length.
-        The object itself is cheap; the schedule build happens inside the kernel.
-        """
-        return get_mla_metadata()[0]
-
-    def _capture_decode_tile_metadata(self, bs: int):
-        """Return the FlashMLASchedMeta to record into the CUDA graph for ``bs``.
-
-        Must be called *inside* graph capture: a fresh (uninitialized) object is
-        created so the schedule build is captured and re-executed from the live
-        cache_seqlens buffer on every replay. The object is kept alive for the
-        lifetime of the graph that recorded it (a graph replays the recorded
-        schedule-build kernel against this object's tensors).
+        Args:
+            for_graph: The next kernel call is recorded into a CUDA graph
+                (capture seeding, or an in-graph seq_lens edit under capture).
+                The graph replays the recorded schedule-build against this
+                object's tensors, so it is kept alive for the graph's lifetime.
+                Eager objects are dropped with the step.
         """
         tile_metadata = get_mla_metadata()[0]
-        self._decode_tile_metadata_keepalive.append(tile_metadata)
-        return tile_metadata
+        if for_graph:
+            self._decode_tile_metadata_keepalive.append(tile_metadata)
+        self._decode_tile_metadata = tile_metadata
+
+    def _write_decode_seq_lens(self, bs: int, seq_lens: torch.Tensor) -> None:
+        """An in-graph-capable seq_lens rewrite (drafter hooks): copy the rows
+        into the persistent buffer and renew the schedule they invalidate."""
+        self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        self._renew_decode_tile_metadata(
+            for_graph=torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
 
     def _init_prefill_metadata(
         self,
@@ -421,14 +422,12 @@ class FlashMLABackend(PagedAttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self, bs: int, seq_lens: torch.Tensor, page_table: torch.Tensor
     ) -> None:
-        # The one sanctioned capture-only asymmetry: flash_mla freezes its
-        # tile schedule on the first kernel call against a sched-meta, so
-        # capture installs a dedicated object whose schedule-build the graph
-        # records (kept alive for the graph's lifetime); eager refresh swaps
-        # in a fresh one per step instead. The refresh super() runs seeds the
-        # seq_lens the recorded schedule-build reads.
+        # The one sanctioned capture-only asymmetry: the refresh super() runs
+        # seeds the seq_lens, and the schedule the graph records is built
+        # against a dedicated object kept alive for the graph's lifetime;
+        # eager refresh renews per step instead.
         super().init_forward_metadata_capture_cuda_graph(bs, seq_lens, page_table)
-        self._decode_tile_metadata = self._capture_decode_tile_metadata(bs)
+        self._renew_decode_tile_metadata(for_graph=True)
 
     def refresh_decode_metadata(
         self,
@@ -449,13 +448,19 @@ class FlashMLABackend(PagedAttentionBackend):
         # Copy the router-resolved kernel page table into the persistent buffer.
         self.page_table_buf[:bs, : page_table.shape[1]].copy_(page_table[:bs])
         metadata.num_extends = num_extends
-        # flash_mla freezes its tile schedule on the first kernel call against
-        # a sched-meta, so eager installs a FRESH object per step, while
-        # replay leaves the slot alone — the graph re-runs its recorded
-        # schedule-build and never reads it from Python.
+        # Replay leaves the schedule slot alone: the graph re-runs its recorded
+        # schedule-build against the live seq_lens and never reads the slot
+        # from Python. Eager renews for the seq_lens just written.
         if not for_graph_replay:
-            self._decode_tile_metadata = self._new_eager_tile_metadata()
+            self._renew_decode_tile_metadata(for_graph=False)
         self.forward_decode_metadata = metadata
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        """A drafter's per-step seq_lens edit (chain step, step-0 accept
+        correction, MTP re-anchor): republish the rows and renew the schedule
+        — the step's kernel call must not inherit a schedule frozen on the
+        previous step's lengths."""
+        self._write_decode_seq_lens(seq_lens.shape[0], seq_lens)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.
@@ -468,8 +473,8 @@ class FlashMLABackend(PagedAttentionBackend):
         """
         if not self.draft_block_decode:
             raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
-        self.seq_lens_buf[:bs].copy_(
-            block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
+        self._write_decode_seq_lens(
+            bs, block_seq_lens.clamp(self.spec_num_tokens, self.max_context_len)
         )
 
     # ------------------------------------------------------------------
