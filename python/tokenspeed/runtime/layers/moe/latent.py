@@ -449,12 +449,21 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
         It reaches that kernel only on NVIDIA, with a 2-D bf16 tensor gathered
         on the last dim; anything else, and any group the fabric cannot map,
-        falls back to the NCCL backend's allocate-gather-transpose. That
-        fallback is not a near-equivalent: measured on 8 ranks over two hosts
-        it costs 345us at 1280 tokens against 77us for the replicated
-        projection, because a cross-host gather of 9MB is latency-bound long
-        before it is bandwidth-bound. Which is why a projection that cannot
-        narrow does not take this route at all.
+        falls back to the NCCL backend's allocate-gather-transpose, and that
+        fallback loses to the replica at every width. Measured under graph
+        replay on 8 ranks over two hosts, with the route witnessed rather than
+        assumed -- nccl 33 calls and rsag 0 with the probe declined, the
+        reverse with it live:
+
+            m       no fabric (nccl)      with fabric (rsag)
+            1280    37.2 rep / 76.8 col   37.7 rep / 35.6 col
+            4096   111.4     / 121.5     111.5     /  72.6
+            8192   226.0     / 254.0     224.5     / 142.8
+
+        Which is why a projection that cannot narrow does not take this route
+        at all. An earlier eager measurement here put the no-fabric gap at
+        4.5x rather than 2.1x; it timed host submission inside the interval,
+        and the two arms submit different amounts of Python.
 
         Returns:
             The full-width projection. **It may alias the backend's workspace**,
