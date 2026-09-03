@@ -35,7 +35,7 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
-_HOST_CACHE_BLOCK_SIZE = 4096
+HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -45,6 +45,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 
 __all__ = [
+    "HOST_CACHE_TRANSFER_CHUNK_BYTES",
     "compute_group_decode_locs",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
@@ -56,7 +57,8 @@ __all__ = [
     "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_sf_interleaved",
-    "transfer_cache_ranges",
+    "transfer_cache_blocks",
+    "wait_layer_ready",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
@@ -72,92 +74,300 @@ __all__ = [
 
 
 @triton.jit
-def _transfer_cache_ranges_kernel(
+def _copy_geometry_slice(
     buffer_addresses_ptr,
-    ranges_ptr,
-    num_ranges,
-    num_chunks,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    geometry_offset,
+    num_geometry_rows,
+    host_lcm_block_bytes,
+    pid,
+    nprogs,
     NUM_DEVICE_BUFFERS: tl.constexpr,
     DIRECTION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    work_items = num_ranges * num_chunks
+    host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
+    for row_delta in tl.range(0, num_geometry_rows):
+        row_offset = (geometry_offset + row_delta) * 8
+        group_index = tl.load(geometry_ptr + row_offset)
+        device_buffer_index = tl.load(geometry_ptr + row_offset + 1)
+        device_zero = tl.load(geometry_ptr + row_offset + 2)
+        device_stride = tl.load(geometry_ptr + row_offset + 3)
+        host_block_bytes = tl.load(geometry_ptr + row_offset + 4)
+        host_field_offset = tl.load(geometry_ptr + row_offset + 5)
+        packing = tl.load(geometry_ptr + row_offset + 6)
+        payload_bytes = tl.load(geometry_ptr + row_offset + 7)
+
+        group_start = tl.load(group_offsets_ptr + group_index)
+        group_end = tl.load(group_offsets_ptr + group_index + 1)
+        num_chunks = (payload_bytes + BLOCK_SIZE - 1) // BLOCK_SIZE
+        group_work_items = (group_end - group_start) * num_chunks
+        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
+
+        for work_id in tl.range(pid, group_work_items, nprogs):
+            pair_index = group_start + work_id // num_chunks
+            chunk_index = work_id % num_chunks
+            device_block_id = tl.load(block_pairs_ptr + pair_index * 2)
+            host_block_id = tl.load(block_pairs_ptr + pair_index * 2 + 1)
+            host_zero_based = host_block_id - 1
+            host_parent = host_zero_based // packing
+            host_child = host_zero_based % packing
+            device_offset = device_zero + device_block_id * device_stride
+            host_offset = (
+                host_parent * host_lcm_block_bytes
+                + host_child * host_block_bytes
+                + host_field_offset
+            )
+            byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = byte_offsets < payload_bytes
+            device_ptr = tl.cast(
+                device_address + device_offset,
+                tl.pointer_type(tl.uint8),
+            )
+            host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
+            if DIRECTION == 0:
+                values = tl.load(
+                    device_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(
+                    host_ptr + byte_offsets,
+                    values,
+                    mask=mask,
+                    cache_modifier=".cs",
+                )
+            else:
+                values = tl.load(
+                    host_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(device_ptr + byte_offsets, values, mask=mask)
+
+
+@triton.jit
+def _gpu_acq_rel_fence(dummy_ptr):
+    tl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; mov.s32 $0, 0;",
+        "=r,l",
+        [dummy_ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _arrive_and_signal_layer(count_ptr, flag_ptr, last_cta_index):
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %pleader;
+            .reg .pred %plast;
+            .reg .b32 %tidx;
+            .reg .s32 %old;
+            mov.u32 %tidx, %tid.x;
+            setp.eq.u32 %pleader, %tidx, 0;
+            mov.s32 %old, -1;
+            @%pleader atom.acq_rel.gpu.global.add.s32 %old, [$1], 1;
+            setp.eq.s32 %plast, %old, $3;
+            and.pred %plast, %plast, %pleader;
+            @%plast st.release.gpu.global.s32 [$2], 1;
+            mov.s32 $0, 0;
+        }
+        """,
+        "=r,l,l,r",
+        [count_ptr, flag_ptr, last_cta_index],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
+    tl.debug_barrier()
+    _gpu_acq_rel_fence(count_ptr)
+    _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
+
+
+@triton.jit
+def _transfer_cache_blocks_kernel(
+    buffer_addresses_ptr,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    num_geometry_rows,
+    geometry_offset,
+    host_lcm_block_bytes,
+    layer_slices_ptr,
+    layer_ready_flags_ptr,
+    layer_cta_counts_ptr,
+    num_layers,
+    NUM_DEVICE_BUFFERS: tl.constexpr,
+    DIRECTION: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SIGNAL_LAYERS: tl.constexpr,
+):
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
-    for work_id in tl.range(pid, work_items, nprogs):
-        range_id = work_id // num_chunks
-        chunk_id = work_id - range_id * num_chunks
-        range_offset = range_id * 4
-        device_buffer_index = tl.load(ranges_ptr + range_offset)
-        device_offset = tl.load(ranges_ptr + range_offset + 1)
-        host_offset = tl.load(ranges_ptr + range_offset + 2)
-        num_bytes = tl.load(ranges_ptr + range_offset + 3)
-        byte_offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
-        host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
-        device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
-        host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-        mask = byte_offsets < num_bytes
-        if DIRECTION == 0:
-            values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(
-                host_ptr + byte_offsets,
-                values,
-                mask=mask,
-                cache_modifier=".cs",
+    if SIGNAL_LAYERS:
+        for layer_index in tl.range(0, num_layers):
+            slice_offset = tl.load(layer_slices_ptr + layer_index * 2)
+            slice_rows = tl.load(layer_slices_ptr + layer_index * 2 + 1)
+            _copy_geometry_slice(
+                buffer_addresses_ptr,
+                geometry_ptr,
+                block_pairs_ptr,
+                group_offsets_ptr,
+                slice_offset,
+                slice_rows,
+                host_lcm_block_bytes,
+                pid,
+                nprogs,
+                NUM_DEVICE_BUFFERS,
+                DIRECTION,
+                BLOCK_SIZE,
             )
-        else:
-            values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(device_ptr + byte_offsets, values, mask=mask)
+            _signal_layer_ready(
+                layer_cta_counts_ptr + layer_index,
+                layer_ready_flags_ptr + layer_index,
+                nprogs,
+            )
+        return
+    _copy_geometry_slice(
+        buffer_addresses_ptr,
+        geometry_ptr,
+        block_pairs_ptr,
+        group_offsets_ptr,
+        geometry_offset,
+        num_geometry_rows,
+        host_lcm_block_bytes,
+        pid,
+        nprogs,
+        NUM_DEVICE_BUFFERS,
+        DIRECTION,
+        BLOCK_SIZE,
+    )
 
 
-def transfer_cache_ranges(
-    address_table: torch.Tensor,
-    range_table: torch.Tensor,
-    direction: int,
-    *,
-    num_ranges: int,
-    max_bytes: int,
-    num_device_buffers: int,
-    grid_cap: int | None = None,
-) -> None:
-    """Copy prepared Host-cache ranges with a capped grid-stride launch.
+@triton.jit
+def _ld_acquire_i32(ptr):
+    return tl.inline_asm_elementwise(
+        "ld.acquire.gpu.global.s32 $0, [$1];",
+        "=r,l",
+        [ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_layer_ready_kernel(flag_ptr, layer_index):
+    pending = _ld_acquire_i32(flag_ptr + layer_index)
+    while pending == 0:
+        pending = _ld_acquire_i32(flag_ptr + layer_index)
+
+
+def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
+    """Spin on the current stream until ``flags[layer_index]`` is released.
 
     Args:
-        address_table: Device ``uint64`` table of device-buffer pointers
-            followed by the mapped Host pointer.
-        range_table: Device ``int64`` rows
-            ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
-        direction: ``0`` for device-to-Host and ``1`` for Host-to-device.
-        num_ranges: Valid leading rows in ``range_table``.
-        max_bytes: Largest ``num_bytes`` among those rows.
-        num_device_buffers: Count of device pointers in ``address_table``.
-        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP`` (64).
+        flags: Device int32 per-layer completion flags.
+        layer_index: Consumer-local layer to wait for.
+    """
+
+    if flags.dtype != torch.int32 or flags.ndim != 1:
+        raise ValueError("flags must be a 1-D int32 tensor")
+    if not 0 <= int(layer_index) < flags.numel():
+        raise IndexError(f"layer_index {layer_index} outside [0, {flags.numel()})")
+    _wait_layer_ready_kernel[(1,)](flags, int(layer_index), num_warps=1)
+
+
+def transfer_cache_blocks(
+    address_table: torch.Tensor,
+    geometry_table: torch.Tensor,
+    block_pairs: torch.Tensor,
+    group_offsets: torch.Tensor,
+    direction: int,
+    *,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    host_lcm_block_bytes: int,
+    work_items: int,
+    num_device_buffers: int,
+    grid_cap: int | None = None,
+    layer_ready_flags: torch.Tensor | None = None,
+    layer_slices: torch.Tensor | None = None,
+    layer_cta_counts: torch.Tensor | None = None,
+) -> None:
+    """Copy compact Host blocks using prepared static and dynamic metadata.
+
+    Args:
+        address_table: Device pointers followed by the mapped Host pointer.
+        geometry_table: Static int64 field rows.
+        block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
+        group_offsets: Valid group bucket offsets, with ``num_groups + 1`` entries.
+        direction: ``0`` for Device-to-Host and ``1`` for Host-to-Device.
+        geometry_offset: First static field row for this layer.
+        num_geometry_rows: Number of field rows for this layer.
+        host_lcm_block_bytes: Byte stride between compact Host LCM blocks.
+        work_items: Largest block/chunk work count among this layer's fields.
+        num_device_buffers: Count of Device pointers in ``address_table``.
+        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
+        layer_ready_flags: Optional per-layer completion flags. When set, one
+            grid copies every ``layer_slices`` row and release-stores each flag.
+        layer_slices: Device ``(offset, num_rows)`` table matching ``flags``.
+        layer_cta_counts: Device arrival counters, one int32 per layer.
 
     Returns:
-        None; the copy is enqueued on the current device stream.
+        None; copies are enqueued on the current device stream.
     """
 
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
-    if num_ranges <= 0:
+    signal_layers = layer_ready_flags is not None
+    if signal_layers:
+        if layer_slices is None or layer_cta_counts is None:
+            raise ValueError("layered transfer requires layer slices and CTA counts")
+        if layer_ready_flags.dtype != torch.int32 or layer_ready_flags.ndim != 1:
+            raise ValueError("layer_ready_flags must be a 1-D int32 tensor")
+        if layer_slices.ndim != 2 or layer_slices.shape[1] != 2:
+            raise ValueError("layer_slices must have shape (num_layers, 2)")
+        if layer_cta_counts.dtype != torch.int32 or layer_cta_counts.ndim != 1:
+            raise ValueError("layer_cta_counts must be a 1-D int32 tensor")
+        if (
+            layer_ready_flags.numel() != layer_slices.shape[0]
+            or layer_cta_counts.numel() != layer_slices.shape[0]
+        ):
+            raise ValueError("layer ready tables must cover the same layers")
+    elif work_items <= 0 or num_geometry_rows <= 0:
         return
-    block_size = _HOST_CACHE_BLOCK_SIZE
-    num_chunks = triton.cdiv(max_bytes, block_size)
-    work_items = num_ranges * num_chunks
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
     if cap <= 0:
         raise ValueError("grid_cap must be positive")
-    grid = (min(cap, work_items),)
-    _transfer_cache_ranges_kernel[grid](
+    grid = (max(1, min(cap, work_items if work_items > 0 else 1)),)
+    unused = geometry_table
+    _transfer_cache_blocks_kernel[grid](
         address_table,
-        range_table,
-        num_ranges,
-        num_chunks,
+        geometry_table,
+        block_pairs,
+        group_offsets,
+        num_geometry_rows,
+        geometry_offset,
+        host_lcm_block_bytes,
+        layer_slices if signal_layers else unused,
+        layer_ready_flags if signal_layers else unused,
+        layer_cta_counts if signal_layers else unused,
+        int(layer_slices.shape[0]) if signal_layers else 0,
         NUM_DEVICE_BUFFERS=num_device_buffers,
         DIRECTION=direction,
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
+        SIGNAL_LAYERS=signal_layers,
         num_warps=8,
     )
 
