@@ -215,6 +215,26 @@ def test_kimi_k3_amd_gates_use_eagle3():
         assert task["triggers"] == ["manual"]
 
 
+def test_qwen35_agentic_perf_uses_explicit_greedy_sampling():
+    path = PERF_CONFIG_DIR / "qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    perf_tokens = shlex.split(task["perf"]["command"])
+    extra_args = [
+        json.loads(perf_tokens[index + 1])
+        for index, token in enumerate(perf_tokens)
+        if token == "--extra-args"
+    ]
+
+    assert flag_value(server_tokens, "--sampling-backend") == "greedy"
+    assert extra_args == [
+        {"ignore_eos": True, "temperature": 0.0},
+        {"ignore_eos": True, "temperature": 0.0},
+    ]
+    assert task["perf_threshold"] == 0.9
+    assert task["perf_reference"] == {1: [580, 4500]}
+
+
 def test_kvv_configs_use_pinned_upstream_and_local_api():
     for filename, (benchmark, max_tokens) in KVV_CONFIGS.items():
         path = EVAL_CONFIG_DIR / filename

@@ -13,6 +13,8 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 server:
+  # The reference used greedy sampling, so keep this temperature-0 benchmark
+  # on the explicit greedy path.
   command: >-
     ts serve
     --disable-kvstore
@@ -24,6 +26,7 @@ server:
     --mamba-ssm-dtype float32
     --moe-backend flashinfer_trtllm
     --draft-moe-backend flashinfer_cutlass
+    --sampling-backend greedy
     --trust-remote-code
     --attention-backend trtllm
     --chunked-prefill-size 2048
@@ -66,7 +69,7 @@ perf:
     --parallel 1
     --dataset-offset 68
     --outputs-dir "$WARMUP_DIR"
-    --extra-args '{"ignore_eos": true}' &&
+    --extra-args '{"ignore_eos": true, "temperature": 0.0}' &&
     set +e &&
     /tmp/evalscope-perf/bin/evalscope perf
     --model nvidia/Qwen3.5-397B-A17B-NVFP4
@@ -79,7 +82,7 @@ perf:
     --number 2
     --parallel 1
     --outputs-dir "$OUTPUTS_DIR"
-    --extra-args '{"ignore_eos": true}'
+    --extra-args '{"ignore_eos": true, "temperature": 0.0}'
     --no-timestamp;
     PERF_STATUS=$?;
     if [ -d "$OUTPUTS_DIR/Qwen3.5-397B-A17B-NVFP4" ]; then
