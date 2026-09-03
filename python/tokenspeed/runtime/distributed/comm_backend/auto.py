@@ -47,6 +47,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
+    # Not lru_cache: the capture path returns a verdict it must not memoise.
     _REACHABLE: dict[Group, bool] = {}
 
     def __init__(self):
