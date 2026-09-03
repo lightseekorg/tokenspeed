@@ -72,6 +72,7 @@ See ``forward_thread.py`` for the capture contract each closure must satisfy.
 from __future__ import annotations
 
 import contextlib
+import copy
 import enum
 import os
 from collections import deque
@@ -82,14 +83,110 @@ from typing import Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.execution.cudagraph_memory import (
+    PROBE_CAPTURES_PER_FAMILY,
+    CudagraphProbe,
+    CudagraphProbeConfig,
+    measure_cudagraph_reserve,
+    probe_batch,
+)
+from tokenspeed.runtime.execution.memory_delta import (
+    MemoryDeltaObserver,
+    memory_delta_observer,
+)
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
     PlannedForward,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import ProbeBatch
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _build_cudagraph_probe(
+    config: CudagraphProbeConfig, observer: MemoryDeltaObserver
+) -> CudagraphProbe:
+    """Build an executor over a minimal arena, capturing a few graphs per family."""
+    batch = probe_batch(config)
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        get_batch_sizes_to_capture,
+    )
+    from tokenspeed.runtime.execution.factory import (
+        ModelExecutorConfig,
+        create_model_executor,
+    )
+    from tokenspeed.runtime.execution.prefill_graph import get_prefill_token_buckets
+    from tokenspeed.runtime.layers.attention.registry import create_attn_components
+
+    (
+        attn_backend,
+        token_to_kv_pool,
+        draft_attn_backend,
+        draft_token_to_kv_pool,
+        _cache_storage,
+    ) = create_attn_components(
+        config.server_args,
+        config.model_config,
+        config.gpu_id,
+        config.global_rank,
+        config.gpu_memory,
+        config.server_args.enable_memory_saver,
+        config.draft_model_config,
+        decode_input_tokens=config.decode_input_tokens,
+        overlap_schedule_depth=config.overlap_schedule_depth,
+        probe_batch=batch,
+    )
+    if token_to_kv_pool.arena.plan.num_lcm_blocks < 1:
+        raise RuntimeError(
+            "CUDA-graph probe arena allocated no parent blocks, so the recipe "
+            f"ignored the {batch} the probe asked it to hold"
+        )
+
+    executor_config = ModelExecutorConfig.from_server_args(
+        server_args=config.server_args,
+        model_config=config.model_config,
+        max_req_pool_size=config.max_batch_size + 1,
+        gpu_id=config.gpu_id,
+        global_rank=config.global_rank,
+        prefix_granularity=token_to_kv_pool.arena.prefix_granularity,
+        overlap_schedule_depth=config.overlap_schedule_depth,
+    )
+    decode_entries = get_batch_sizes_to_capture(executor_config)
+    prefill_entries = get_prefill_token_buckets(executor_config)
+
+    probe_config = copy.copy(executor_config)
+    probe_config.cudagraph_capture_sizes = sorted(decode_entries, reverse=True)[
+        :PROBE_CAPTURES_PER_FAMILY
+    ]
+    probe_config.prefill_graph_capture_sizes = sorted(prefill_entries, reverse=True)[
+        :PROBE_CAPTURES_PER_FAMILY
+    ]
+
+    executor = create_model_executor(
+        server_args=config.server_args,
+        config=probe_config,
+        model_runner=config.target,
+        draft_model_runner=config.draft,
+        attn_backend=attn_backend,
+        token_to_kv_pool=token_to_kv_pool,
+        draft_attn_backend=draft_attn_backend,
+        draft_token_to_kv_pool=draft_token_to_kv_pool,
+        memory_observer=observer,
+    )
+
+    # Counts follow PrefillGraph/CudaGraphWrapper disable rules, not the ladder.
+    entry_counts = {
+        "prefill": 0 if executor.prefill_graph.disable else len(prefill_entries),
+        "decode": (
+            0
+            if executor.forward_step.disable
+            else len(decode_entries) * len(executor.forward_step.graph_variants)
+        ),
+    }
+
+    return CudagraphProbe(executor=executor, entry_counts=entry_counts)
 
 
 @dataclass(frozen=True)
@@ -670,6 +767,35 @@ def build_device_side(
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
 
+    graph_reserve_bytes = 0
+    # enforce_eager disables both graph families, so a probe would capture
+    # nothing; disable_prefill_graph leaves the decode pools to project.
+    if (
+        not server_args.disable_cudagraph_memory_reserve
+        and not server_args.enforce_eager
+    ):
+        probe_config = CudagraphProbeConfig(
+            server_args=server_args,
+            model_config=model_config,
+            draft_model_config=draft_model_config,
+            target=target,
+            draft=draft,
+            gpu_id=gpu_id,
+            global_rank=global_rank,
+            gpu_memory=min_per_gpu_mem,
+            overlap_schedule_depth=overlap_schedule_depth,
+            decode_input_tokens=decode_input_tokens,
+            max_batch_size=max_batch_size,
+        )
+        observer = memory_delta_observer(
+            record=True,
+            device_module=torch.get_device_module(server_args.device),
+            gpu_id=gpu_id,
+        )
+        graph_reserve_bytes = measure_cudagraph_reserve(
+            probe_config, observer, _build_cudagraph_probe(probe_config, observer)
+        )
+
     (
         attn_backend,
         token_to_kv_pool,
@@ -686,6 +812,7 @@ def build_device_side(
         draft_model_config,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        graph_reserve_bytes=graph_reserve_bytes,
     )
 
     cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)

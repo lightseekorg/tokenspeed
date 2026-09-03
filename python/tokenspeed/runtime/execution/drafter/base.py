@@ -87,6 +87,18 @@ class BaseDrafter:
                 speculates for.
         """
 
+    def unwire_target(self, target_model: torch.nn.Module) -> None:
+        """Undo :meth:`wire_target` so a discarded drafter leaves nothing behind.
+
+        The CUDA-graph memory probe builds a drafter it throws away before the
+        KV cache is sized. Anything this drafter installed on the shared target
+        outlives the throw-away and keeps the drafter, and its buffers, out of
+        that sizing. Subclasses that install callbacks or buffers override this.
+
+        Args:
+            target_model: The same module :meth:`wire_target` was given.
+        """
+
     @abstractmethod
     def get_candidates(
         self,

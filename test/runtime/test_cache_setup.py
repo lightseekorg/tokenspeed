@@ -1,5 +1,13 @@
+import os
+import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+
+# CI registration (parsed via AST, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import pytest
 import torch
@@ -606,6 +614,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import tokenspeed.runtime.layers.attention.registry as registry
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import ProbeBatch
 
     monkeypatch.setattr(
         registry,
@@ -638,7 +647,117 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             rank=0,
             gpu_memory=0,
             draft_model_config=draft,
+            graph_reserve_bytes=0,
         )
+
+
+def test_create_attn_components_resolves_identically_when_called_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed.runtime.layers.attention.registry as registry
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import ProbeBatch
+
+    config = _mla_config()
+    memory_plan = SimpleNamespace(
+        prefix_granularity=64,
+        num_lcm_blocks=1,
+        lcm_block_bytes=128,
+        groups=(),
+    )
+    spec = SimpleNamespace(
+        memory_plan=memory_plan,
+        token_capacity=64,
+        layer_types=("full_attention",),
+    )
+    cache_setup = SimpleNamespace(
+        spec=spec,
+        num_draft_layers=0,
+        num_target_layers=1,
+        cache_budget_bytes=128,
+        fixed_workspace_bytes=0,
+    )
+    mapping = SimpleNamespace(world_size=1, world_group=None, has_pp=False, rank=3)
+    server_args = SimpleNamespace(
+        attention_backend="tokenspeed_mla",
+        drafter_attention_backend=None,
+        disaggregation_mode=None,
+        speculative_algorithm=None,
+        gpu_memory_utilization=0.9,
+        mapping=mapping,
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=("KimiK3ForConditionalGeneration",),
+        )
+    )
+    backend = SimpleNamespace(set_cache_pool=lambda pool: None)
+    pool = SimpleNamespace()
+    cache_storage: dict[str, int] = {"allocated_bytes": 128}
+    generated_args: list[SimpleNamespace] = []
+    full_backend_inputs: list[str | None] = []
+
+    def create_config(
+        args: SimpleNamespace,
+        model: SimpleNamespace,
+        is_draft: bool = False,
+    ) -> AttnConfig:
+        generated_args.append(args)
+        return config
+
+    def resolve_full_backend(name: str | None, **kwargs: object) -> str:
+        full_backend_inputs.append(name)
+        return "tokenspeed_mla"
+
+    monkeypatch.setattr(registry, "_create_attn_config", create_config)
+    monkeypatch.setattr(
+        registry, "_resolve_hybrid_full_backend_name", resolve_full_backend
+    )
+    monkeypatch.setattr(registry, "prepare_cache_setup", lambda **kwargs: cache_setup)
+    monkeypatch.setattr(
+        registry, "_validate_lcm_page_size", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        registry, "create_cache_arena", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        registry,
+        "_create_target_components",
+        lambda **kwargs: (backend, pool),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_create_draft_components",
+        lambda **kwargs: (None, None),
+    )
+    monkeypatch.setattr(registry, "_prepare_verify_workspace", lambda **kwargs: None)
+    monkeypatch.setattr(
+        registry, "_cache_storage_report", lambda **kwargs: cache_storage
+    )
+    first = registry.create_attn_components(
+        server_args,
+        model_config,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+        probe_batch=ProbeBatch(requests=1, tokens=1),
+    )
+    second = registry.create_attn_components(
+        server_args,
+        model_config,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+        probe_batch=ProbeBatch(requests=1, tokens=1),
+    )
+
+    assert first == second
+    assert server_args.mapping is mapping
+    assert server_args.mapping.rank == 3
+    assert [args.attention_backend for args in generated_args] == [
+        "hybrid_linear_attn",
+        "hybrid_linear_attn",
+    ]
+    assert full_backend_inputs == ["tokenspeed_mla", "tokenspeed_mla"]
 
 
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:

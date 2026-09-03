@@ -269,6 +269,11 @@ class DFlash(BaseDrafter):
         )
         self._wire_aux_hidden_stream(target_model)
 
+    def unwire_target(self, target_model) -> None:
+        target_model.set_dflash_layers_to_capture(
+            self.target_layer_ids, incremental_callback=None, slot_bufs=None
+        )
+
     def _wire_aux_hidden_stream(self, target_model) -> None:
         """Tell the target which residual stream the draft was trained on."""
         stream = _resolve_aux_hidden_stream(self.model.config)

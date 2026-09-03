@@ -50,6 +50,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
@@ -335,7 +336,9 @@ class ModelExecutor:
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
-    ):
+        *,
+        memory_observer: MemoryDeltaObserver,
+    ) -> None:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
@@ -566,9 +569,9 @@ class ModelExecutor:
         workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
-            self.forward_step.capture()
+            self.forward_step.capture(memory_observer)
         if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
+            self.prefill_graph.capture(self.forward_step, memory_observer)
 
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
@@ -601,6 +604,10 @@ class ModelExecutor:
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
+
+    def shutdown(self) -> None:
+        """Stop the owned forward thread during explicit executor teardown."""
+        self.forward_thread.shutdown()
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
