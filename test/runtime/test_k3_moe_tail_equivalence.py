@@ -464,6 +464,9 @@ def test_fused_tail_matches_reference(m):
     )
 
     rank, dev = _setup()
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+    gather_fabric_map()
     if not _agreed(
         latent_tail_supported(
             tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16

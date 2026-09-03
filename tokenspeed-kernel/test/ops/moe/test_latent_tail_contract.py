@@ -315,6 +315,8 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
             fabric.torch.distributed,
             "all_gather",
             side_effect=AssertionError("must not gather from dispatch"),
+        ), mock.patch.object(
+            fabric.torch.distributed, "get_world_size", return_value=8
         ):
             with pytest.raises(RuntimeError, match="never gathered"):
                 fabric.group_has_fabric([0, 1])

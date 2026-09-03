@@ -238,6 +238,9 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
         "all_gather",
         lambda *args, **kw: pytest.fail("a missing map must not start a collective"),
     )
+    # Without this the lazy path would die in get_world_size first and the
+    # stub above would never be reached -- a guard that cannot fire.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
 
     with pytest.raises(RuntimeError, match="never gathered"):
         fabric.group_has_fabric((0, 1))
