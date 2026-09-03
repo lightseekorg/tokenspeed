@@ -62,8 +62,8 @@ InputProjector = Callable[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
-# Narrowest batch whose column shard plus its gather beats the replicated projection.
-COLUMN_GATHER_MIN_TOKENS = 1280
+# Widest batch the down mailbox claims; above it the column gather takes over.
+DOWN_MAILBOX_MAX_TOKENS = 1280
 
 
 def _marlin_moe_available() -> bool:
@@ -321,48 +321,30 @@ class Kimi3LatentProjection(ReplicatedLinear):
     It covers the widths the op claims -- the decode graph's captures.
 
     With ``column_group`` the projection splits the same output columns over
-    the group *without* narrowing what it stores: this rank's rows are a view
-    of the full-width weight, and one all-gather concatenates the blocks. That
-    is the difference from ``shard_group``, which also narrows storage and so
-    cannot coexist with a multicast op that needs the full weight to slice.
-    Storage costs a replica either way, and past a measured width the
-    ``(tp-1)/tp`` of the GEMM each rank drops more than pays for the gather;
-    below it the projection stays replicated and no collective runs at all.
-    Measured on GB300 TP8 under graph replay with cold weights: replicated
-    wins through 896 tokens, the two are inside their own spread at 1024 and
-    1152, and the shard wins from 1280 (-7 to -9 percent) out to -40 percent
-    at a full 8152-token prefill chunk. The gate sits at the first width that
-    wins reproducibly rather than the first that wins once.
+    the group and one all-gather concatenates the blocks. It is taken only
+    where a mailbox exists, which is to say only where the fabric can map
+    symmetric memory, and it narrows storage the same way ``shard_group``
+    does. That coupling is deliberate. Without the fabric the gather falls
+    back to a buffer-and-permute over NCCL, which at a full 8152-token chunk
+    costs 239us against the 224us of the replicated projection it would be
+    replacing -- so on such a machine the split is a loss at every width, and
+    the projection stays replicated throughout.
 
-    The gather also wins eager, so the width does not depend on whether the
-    chunk was captured. Measured host-in-the-loop, replicated against the
-    shard: 35.8/34.0 at 1280, 64.3/53.8 at 2048, 101.8/78.7 at 4096 and
-    208.9/138.6 at 8192. An earlier reading put the eager crossover past
-    4096 and had this gate coupled to ``prefill_graph_max_tokens``; that
-    measurement was superseded and the coupling with it, so a deployment
-    whose chunks exceed the capture ceiling needs nothing done here.
+    Where the fabric is there, the split pays from the mailbox ceiling
+    upward: measured on GB300 TP8 under graph replay with cold weights, the
+    shard wins from 1280 by 7 to 9 percent out to 40 percent at 8152, and the
+    fused NVLink gather writes the final layout for 135us where the buffer
+    path needs 239us. It wins eager as well -- 64.3/53.8 at 2048, 101.8/78.7
+    at 4096, 208.9/138.6 at 8192 -- so the width does not depend on whether
+    the chunk was captured, and a deployment whose chunks exceed the capture
+    ceiling needs nothing done here.
 
-    1280 is itself a capture bucket in that ladder, so the gate cannot
-    bisect one: a captured chunk is wholly below it or wholly at or above
-    it, and 1153..1280 pads up onto the gate, into the arm that wins.
-
-    This width is a floor, not the boundary. The mailbox is asked first and
-    claims everything up to its own ceiling, which the caller sets to this
-    same constant rather than deriving from the capture ladder, so the two
-    meet with no gap: 1280 takes the mailbox and 1281 the gather. A caller
-    that raised the ceiling would move the buckets just above here onto the
-    mailbox -- which the sweep behind this number did not cover, since it
-    measured the gather there.
-
-    ``get_is_cuda_graph_phase`` cannot decide the two regimes apart, which
+    ``get_is_cuda_graph_phase`` cannot decide those two regimes apart, which
     is worth knowing because it reads as though it could. Its only setters
     are the decode wrapper's capture and its comm prewarm, and the executor
     runs prefill capture as a later statement, after that capture has
     already restored the flag -- so it is False throughout prefill capture.
-    Nothing here keys on it, and nothing should: with the shard winning in
-    both regimes there is no threshold for it to select between, and a
-    reader who assumes it distinguishes them will mis-attribute anything
-    measured across the two.
+    Nothing here keys on it, and nothing should.
     """
 
     def __init__(
@@ -444,53 +426,56 @@ class Kimi3LatentProjection(ReplicatedLinear):
         )
 
     def _gather_shards(self, local: torch.Tensor) -> torch.Tensor:
-        """Concatenate every rank's column block into the full width.
+        """Concatenate every rank's column block into the full output width.
 
-        Deliberately not the backend's own last-dim gather, which the column
-        band below uses: that would move this projection onto a symmetric
+        Two routes, chosen by which group this instance was given; they are
+        mutually exclusive at every construction site and a caller never picks.
+
+        ``shard_group`` gathers into a ``[tp, tokens, shard]`` buffer and
+        permutes it by hand, deliberately not asking the backend for the
+        last-dim layout: that would move this projection onto a symmetric
         memory path it has never been measured on, and would rendezvous a
         second workspace sized to the full hidden width.
+
+        ``column_group`` asks the backend for that layout instead, and only
+        where storage narrowed: a full-width projection already holds every
+        column and has nothing to concatenate. The NCCL
+        backend does the same buffer-and-permute, so nothing is lost where the
+        fabric has no symmetric memory; where it does, the fused NVLink gather
+        writes the final layout and skips the copy -- at 8152 tokens 135us this
+        way against 239us through the buffer, either side of the 224us it
+        replaces.
+
+        Returns:
+            The full-width projection. **It may alias the backend's workspace**,
+            which the next gather reuses -- measured same-address across
+            consecutive calls. Read it on the issuing stream before gathering
+            again. The contract is stated for both routes even though only the
+            column one can alias, because a caller that had to know which route
+            it got would be the branch this method exists to remove.
         """
-        if self.shard_group is None:
+        if self.shard_group is not None:
+            num_tokens, shard = local.shape
+            stacked = torch.empty(
+                (self.shard_size, num_tokens, shard),
+                dtype=local.dtype,
+                device=local.device,
+            )
+            all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
+            return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
+        if not self.narrowed or self.column_group is None:
             return local
-        num_tokens, shard = local.shape
-        stacked = torch.empty(
-            (self.shard_size, num_tokens, shard),
-            dtype=local.dtype,
-            device=local.device,
-        )
-        all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
-        return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
-
-    def _gather_columns(self, local: torch.Tensor) -> torch.Tensor:
-        """Concatenate the column blocks by asking the backend for that layout.
-
-        The NCCL backend gathers into a ``[tp, tokens, shard]`` buffer and
-        permutes it, which is what ``_gather_shards`` does by hand, so nothing
-        is lost where the fabric has no symmetric memory. Where it does, the
-        fused NVLink gather writes the final layout and skips the copy: at
-        8152 tokens the gathered projection is 135us this way against 239us
-        through the buffer, either side of the 224us it replaces.
-
-        The backend hands back its own workspace, so the result aliases the
-        next call's: measured same-address across consecutive calls. Every
-        consumer here reads it on the issuing stream before the next gather,
-        which is what makes that safe.
-        """
         return all_gather(local.contiguous(), self.column_group, dim=-1)
 
     @property
     def weight_block(self) -> torch.Tensor:
-        """This rank's weight rows: the stored tensor, or a view of it.
+        """This rank's weight rows, which narrowed storage already holds.
 
-        ``shard_group`` already narrowed storage to them; ``column_group``
-        keeps the full width, so the block is a row view the same way the
-        multicast producer takes one.
+        Both sharding routes narrow, and a projection that did not narrow never
+        reaches here: without a mailbox the column path is not taken at all, so
+        there is no full-width tensor left to slice.
         """
-        if self.narrowed:
-            return self.weight
-        start, width = self.shard_slice
-        return self.weight[start : start + width]
+        return self.weight
 
     def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's ``output_size/tp`` columns, ungathered.
@@ -534,11 +519,8 @@ class Kimi3LatentProjection(ReplicatedLinear):
         num_tokens = hidden_states.shape[0]
         if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
             return self.multicast_down(hidden_states, self._multicast_block()), None
-        if self.column_group is not None:
-            # Narrowed storage has no full width to fall back on, so zero comes here.
-            if num_tokens >= COLUMN_GATHER_MIN_TOKENS or self.narrowed:
-                return self._gather_columns(self.project_shard(hidden_states)), None
-            return self._project_replicated(hidden_states), None
+        if self.narrowed and self.column_group is not None:
+            return self._gather_shards(self.project_shard(hidden_states)), None
         return self._gather_shards(self._project_replicated(hidden_states)), None
 
     def forward_add3(
@@ -595,9 +577,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             norm_weight=norm_weight,
             eps=eps,
         )
-        if self.shard_group is not None:
-            return self._gather_shards(local)
-        return self._gather_columns(local)
+        return self._gather_shards(local)
 
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:

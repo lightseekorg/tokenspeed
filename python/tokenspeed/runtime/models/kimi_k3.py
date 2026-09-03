@@ -117,7 +117,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
-    COLUMN_GATHER_MIN_TOKENS,
+    DOWN_MAILBOX_MAX_TOKENS,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
@@ -1558,7 +1558,7 @@ class KimiLinearMoE(nn.Module):
                 layer_count=moe_block_count,
                 model_scope=model_scope,
                 # The gate itself, so mailbox and gather meet by construction.
-                max_m=COLUMN_GATHER_MIN_TOKENS,
+                max_m=DOWN_MAILBOX_MAX_TOKENS,
             )
             if self._shard_latent_projections
             else None

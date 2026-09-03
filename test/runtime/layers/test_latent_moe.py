@@ -1172,65 +1172,6 @@ def test_column_group_keeps_the_weight_full_width(
         assert proj.weight.shape == (out, k)
         torch.testing.assert_close(proj.weight.data, full)
         assert proj.shard_slice == (rank * rows, rows)
-        assert proj.weight_block.data_ptr() == proj.weight[rank * rows].data_ptr()
-        torch.testing.assert_close(
-            proj.weight_block, full[rank * rows : (rank + 1) * rows]
-        )
-
-
-def test_column_group_gathers_above_the_crossover(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Above the crossover each rank computes one block and they concatenate."""
-    world, out, k = 4, 16, 8
-    tokens = latent_module.COLUMN_GATHER_MIN_TOKENS
-    rows = out // world
-    torch.manual_seed(0)
-    full = torch.randn(out, k)
-    x = torch.randn(tokens, k)
-
-    def stripe(r):
-        return x @ full[r * rows : (r + 1) * rows].T
-
-    for rank in range(world):
-        ran: list[int] = []
-
-        def gather_all(local, group, dim=-1, _rank=rank, _ran=ran):
-            # Check this rank's own block first: a gather that ignored it
-            # would pass with the column offsets broken.
-            assert group == tuple(range(world)) and dim == -1
-            torch.testing.assert_close(local, stripe(_rank))
-            _ran.append(local.shape[1])
-            return torch.cat([stripe(r) for r in range(world)], dim=-1)
-
-        monkeypatch.setattr(latent_module, "all_gather", gather_all)
-        proj = _column_projection(monkeypatch, world, rank, out, k)
-        proj.weight_loader(proj.weight, full)
-        got, _ = proj(x)
-        # The stub reproduces the replicated answer, so only this pins the arm.
-        assert ran == [rows]
-        assert got.shape == (tokens, out)
-        torch.testing.assert_close(got, x @ full.T)
-
-
-def test_column_group_stays_replicated_below_the_crossover(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Below it the gather costs more than the columns saved, so none runs."""
-    world, out, k = 4, 16, 8
-    tokens = latent_module.COLUMN_GATHER_MIN_TOKENS - 1
-    torch.manual_seed(0)
-    full = torch.randn(out, k)
-    monkeypatch.setattr(
-        latent_module,
-        "all_gather",
-        lambda *a, **kw: pytest.fail("no gather below the crossover"),
-    )
-    proj = _column_projection(monkeypatch, world, 2, out, k)
-    proj.weight_loader(proj.weight, full)
-    x = torch.randn(tokens, k)
-    got, _ = proj(x)
-    torch.testing.assert_close(got, x @ full.T)
 
 
 def _gather_recorder(monkeypatch, world, gathers):
@@ -1254,7 +1195,7 @@ def test_a_narrowed_column_projection_never_reaches_the_replica(
     is below the gate and would otherwise return a block-wide empty tensor.
     """
     world, out, k = 4, 16, 8
-    crossover = latent_module.COLUMN_GATHER_MIN_TOKENS
+    crossover = latent_module.DOWN_MAILBOX_MAX_TOKENS
     torch.manual_seed(0)
     full = torch.randn(out, k)
     calls: list = []
@@ -1274,25 +1215,35 @@ def test_a_narrowed_column_projection_never_reaches_the_replica(
     assert gathers == [9, crossover - 1, crossover, 0]
 
 
-def test_an_unmailboxed_column_projection_keeps_the_replica_in_the_gap(
+def test_without_a_mailbox_no_width_gathers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without a mailbox the gap is real, and the replica is what fills it."""
+    """The column split is taken only where the mailbox is, at every width.
+
+    Without the fabric the gather falls back to a buffer-and-permute over
+    NCCL, which at a full prefill chunk costs 239us against the replicated
+    projection's 224us -- so the split is a loss everywhere on such a machine,
+    not only below some crossover. The old dispatch gathered above 1280
+    because that width was measured on hardware that has the fabric.
+    """
     world, out, k = 4, 16, 8
-    crossover = latent_module.COLUMN_GATHER_MIN_TOKENS
     torch.manual_seed(0)
     full = torch.randn(out, k)
-    gathers: list[int] = []
-    _gather_recorder(monkeypatch, world, gathers)
-    proj = _column_projection(monkeypatch, world, 1, out, k)
+    monkeypatch.setattr(
+        latent_module,
+        "all_gather",
+        lambda *a, **kw: pytest.fail("no gather without a mailbox"),
+    )
+    proj = _column_projection(monkeypatch, world, 2, out, k)
     proj.weight_loader(proj.weight, full)
     assert not proj.narrowed and proj.weight.shape == (out, k)
 
-    got, _ = proj(torch.randn(9, k))
-    # The replica is what makes this width full width without a gather.
-    assert got.shape == (9, out) and gathers == []
-    proj(torch.randn(crossover, k))
-    assert gathers == [crossover]
+    ceiling = latent_module.DOWN_MAILBOX_MAX_TOKENS
+    for tokens in (9, ceiling - 1, ceiling, ceiling + 1):
+        x = torch.randn(tokens, k)
+        got, _ = proj(x)
+        assert got.shape == (tokens, out)
+        torch.testing.assert_close(got, x @ full.T)
 
 
 def test_column_group_and_shard_group_are_exclusive() -> None:

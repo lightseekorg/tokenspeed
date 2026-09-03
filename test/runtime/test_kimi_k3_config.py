@@ -305,9 +305,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertEqual(wired["model_scope"], "scope-under-test")
         # The mailbox is sized to the gate itself, so the two meet by
         # construction and no width falls back to the replica between them.
-        from tokenspeed.runtime.layers.moe.latent import COLUMN_GATHER_MIN_TOKENS
+        from tokenspeed.runtime.layers.moe.latent import DOWN_MAILBOX_MAX_TOKENS
 
-        self.assertEqual(wired["max_m"], COLUMN_GATHER_MIN_TOKENS)
+        self.assertEqual(wired["max_m"], DOWN_MAILBOX_MAX_TOKENS)
         get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
         self.assertFalse(layer.execution_plan.join_moe_reduce)
 
