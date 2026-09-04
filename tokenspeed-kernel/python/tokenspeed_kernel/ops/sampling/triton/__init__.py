@@ -33,6 +33,7 @@ from .min_p import (
 )
 from .penalties import accumulate_counts_inplace, apply_penalties_logit_bias_inplace
 from .probability import min_p_renorm_prob
+from .spec_path import dflash2_greedy_path
 from .topk_topp import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     gumbel_sample_top_k_top_p_from_pools,
@@ -52,6 +53,7 @@ __all__ = [
     "gumbel_sample_top_p_parallel_from_pools",
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",
+    "dflash2_greedy_path",
     "min_p_renorm_prob",
     "apply_penalties_logit_bias_inplace",
     "accumulate_counts_inplace",
