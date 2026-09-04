@@ -273,7 +273,7 @@ def store_global_u32(
 def store_lamport_sentinel_128(
     pointer: cute.Pointer,
     *,
-    sentinel: cutlass.Constexpr[int] = NEG_ZERO_F32_BITS,
+    sentinel: cutlass.Constexpr[int],
     loc=None,
     ip=None,
 ) -> None:
@@ -520,7 +520,7 @@ def sanitize_negative_zero(packed):
 
 
 @cute.jit
-def fragment_is_dirty(packed, sentinel: cutlass.Constexpr[int] = NEG_ZERO_F32_BITS):
+def fragment_is_dirty(packed, sentinel: cutlass.Constexpr[int]):
     """Bit-exact upstream sentinel check: one comparison per 32-bit word.
 
     Args:

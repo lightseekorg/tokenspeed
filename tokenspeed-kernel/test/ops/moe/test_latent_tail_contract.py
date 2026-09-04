@@ -122,28 +122,54 @@ def test_lamport_copy_releases_successors_before_rearming() -> None:
     assert release < cleanup
 
 
+def _parameters_with_defaults(args: ast.arguments) -> list:
+    """Every parameter of one signature, paired with its default or None."""
+    positional = list(args.posonlyargs) + list(args.args)
+    padding = [None] * (len(positional) - len(args.defaults))
+    return list(zip(positional, padding + list(args.defaults))) + list(
+        zip(args.kwonlyargs, args.kw_defaults)
+    )
+
+
 def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     """These mailboxes keep 0x80000000; only the down projection's overrides it.
 
     The word is a compile-time parameter of primitives two paths share, and the
     other path is the down projection's, which owns a different one. Nothing on
-    one GPU can run the early exit, so what is checked is that the tail and the
-    early exit still reach these primitives without an argument, and that the
-    argument they therefore get is the upstream word.
+    one GPU can run the early exit, so what is checked is that neither
+    primitive defaults the word, and that the tail and the early exit name the
+    upstream one at every call site.
     """
     package = Path(__file__).parents[3] / "python/tokenspeed_kernel"
     primitives = (
         package / "thirdparty/cute_dsl/latent_moe_tail/primitives.py"
     ).read_text()
     assert "NEG_ZERO_F32_BITS = 0x80000000" in primitives
-    assert primitives.count("sentinel: cutlass.Constexpr[int] = NEG_ZERO_F32_BITS") == 2
+    sentinels = {
+        node.name: default
+        for node in ast.walk(ast.parse(primitives))
+        if isinstance(node, ast.FunctionDef)
+        for arg, default in _parameters_with_defaults(node.args)
+        if arg.arg == "sentinel"
+    }
+    assert set(sentinels) == {"store_lamport_sentinel_128", "fragment_is_dirty"}
+    assert all(default is None for default in sentinels.values())
 
     early_exit = (
         package
         / "thirdparty/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py"
     ).read_text()
-    assert early_exit.count("store_lamport_sentinel_128(clear_ptr)") == 2
-    assert early_exit.count("fragment_is_dirty(remote)") == 2
+    armed = "store_lamport_sentinel_128(clear_ptr, sentinel=NEG_ZERO_F32_BITS)"
+    assert early_exit.count(armed) == 2
+    early_imports = {
+        alias.asname or alias.name
+        for node in ast.walk(ast.parse(early_exit))
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "NEG_ZERO_F32_BITS" in early_imports
+    checked = "fragment_is_dirty(remote, sentinel=NEG_ZERO_F32_BITS)"
+    assert early_exit.count(checked) == 2
     assert early_exit.count("fill_(-0x80000000)") == 1
 
     # Each mailbox names its own: the down projection's producers cannot all
