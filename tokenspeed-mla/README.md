@@ -158,6 +158,11 @@ What it supports:
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
 - `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
+- `window_left` bounds each block row's history: row `i` sees keys
+  `[max(0, K - q_len - window_left + i), k_bound)`, the whole `q_len` block plus
+  `window_left` tokens of context. The kernel starts its KV walk at the window
+  rather than at key 0, so cost tracks the window, not the cache. `-1` (the
+  default) is full history and compiles the same kernel it always did.
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 

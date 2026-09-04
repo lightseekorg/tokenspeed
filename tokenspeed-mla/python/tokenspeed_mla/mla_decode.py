@@ -158,6 +158,7 @@ def _get_compiled_mla_kernel(
     causal_mask: bool = True,
     num_heads: int = 128,
     seq_len_q: int = 1,
+    window_left: int = -1,  # sliding-window span; -1 compiles the full-history kernel
     cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
@@ -207,6 +208,7 @@ def _get_compiled_mla_kernel(
     kernel_kwargs["is_causal"] = causal_mask
     kernel_kwargs["num_heads"] = num_heads
     kernel_kwargs["seq_len_q"] = seq_len_q
+    kernel_kwargs["window_left"] = window_left
     if is_fp8:
         # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
@@ -366,6 +368,7 @@ def tokenspeed_mla_decode(
     out: Optional[torch.Tensor] = None,
     is_var_seq: bool = True,
     causal_mask: bool = True,
+    window_left: int = -1,
     enable_pdl: bool = False,
     return_lse: bool = False,  # also return log-sum-exp (DCP cross-rank merge)
     causal_seqs: Optional[
@@ -413,6 +416,14 @@ def tokenspeed_mla_decode(
     causal_mask : bool
         Whether to enable causal masking in the CuTe DSL kernel.
         Currently this is effective for the FP8 kernel path.
+    window_left : int
+        Sliding-window span, or -1 (default) for full history. When
+        non-negative, query row ``i`` of the ``q_len`` block attends to keys
+        ``[max(0, K - q_len - window_left + i), k_bound)`` -- the whole block
+        plus ``window_left`` tokens of history, which is the mask a block
+        drafter's ``sliding_attention`` layers declare. The window is part of
+        the kernel cache key and folds away at compile time, so ``-1`` compiles
+        and runs exactly the kernel it did before this argument existed.
     enable_pdl : bool
         When True, enables Programmatic Dependent Launch (PDL) on the
         underlying CuTe DSL decode kernel. Tokenspeed callers wire this from
@@ -481,6 +492,12 @@ def tokenspeed_mla_decode(
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if window_left >= 0:
+        # No request can read past its own window, so the split heuristic sizes
+        # itself from the window rather than from the longest cached sequence.
+        max_seq_len = min(max_seq_len, window_left + q_len)
     is_fp8 = q_dtype == torch.float8_e4m3fn
     compute_capability = torch.cuda.get_device_capability(query.device)
     mma_qk_tiler_mn, _ = select_mla_decode_tilers(
@@ -620,6 +637,7 @@ def tokenspeed_mla_decode(
         causal_mask=causal_mask,
         num_heads=H,
         seq_len_q=q_len,
+        window_left=window_left,
         cp_world=cp_world,
         use_pdl=enable_pdl,
         return_lse=return_lse,

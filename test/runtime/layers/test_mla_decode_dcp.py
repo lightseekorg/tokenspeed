@@ -15,7 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Decode-context-parallel (DCP) support for the MLA decode kernel.
+"""Masking options of the MLA decode kernel: DCP and the sliding window.
 
 Under DCP each rank holds a strided ``1/cp_world`` slice of the KV context
 (local key ``c`` is global position ``c*cp_world + rank``). The kernel gained
@@ -28,6 +28,12 @@ partials via their LSE weights reproduces the ``cp_world=1`` full-context output
 A wrong strided mask makes a slice's partial wrong; a wrong LSE makes the merge
 weights wrong -- either breaks the reconstruction. Keys are skewed by parity so
 the merge weight is far from 0.5, which makes the (log2) LSE scaling load-bearing.
+
+``window_left`` is the other bound the kernel takes: it moves the low edge of
+each block row's visible range, and the kernel both masks it and starts its
+KV walk there. Wrong by a tile and a draft silently attends to keys its
+training mask never showed it, so the test asserts against an explicit
+per-row slice rather than against a second kernel configuration.
 """
 
 from __future__ import annotations
@@ -72,6 +78,8 @@ def _decode(
     dtype,
     *,
     causal_seqs=None,
+    causal_mask=True,
+    window_left=-1,
     cp_world=1,
     cp_rank=0,
     lse=False,
@@ -90,6 +98,8 @@ def _decode(
         softmax_scale=1.0 / (D**0.5),
         output_scale=1.0,
         return_lse=lse,
+        causal_mask=causal_mask,
+        window_left=window_left,
         causal_seqs=causal_seqs,
         cp_world=cp_world,
         cp_rank=cp_rank,
@@ -240,3 +250,45 @@ def test_dcp_requires_causal_seqs():
 
     with pytest.raises(ValueError, match="causal_seqs"):
         _decode(query, cache, bt, L, ws, dtype, cp_world=2)
+
+
+def _windowed_reference(query, keys, n, window_left, causal_mask):
+    """Per-row slice of the visible keys, softmaxed in fp32."""
+    q, k = query.float()[0], keys.float()[:n]
+    out = torch.empty(Q, H, KV_LORA, device="cuda")
+    for row in range(Q):
+        low = 0 if window_left < 0 else max(0, n - Q - window_left + row)
+        high = n - (Q - 1) + row if causal_mask else n
+        weights = torch.softmax((q[row] @ k[low:high].T) / (D**0.5), dim=-1)
+        out[row] = weights @ k[low:high, :KV_LORA]
+    return out.unsqueeze(0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("causal_mask", [False, True])
+# 32 leaves only the last KV tiles alive, 320 keeps most of the cache with the
+# low edge inside it, and 4096 opens the window past the cache entirely.
+@pytest.mark.parametrize("window_left", [-1, 32, 320, 4096])
+def test_sliding_window_matches_a_per_row_masked_reference(
+    dtype, causal_mask, window_left
+):
+    torch.manual_seed(6)
+    n, tol = 600, 6e-2 if dtype == torch.float8_e4m3fn else 2e-2
+    ws = _workspace()
+    query = (torch.randn(1, Q, H, D, device="cuda") / 8).to(dtype)
+    keys = (torch.randn(n, D, device="cuda") / 8).to(dtype)
+    cache, bt = _paged(keys, dtype)
+
+    out = _decode(
+        query,
+        cache,
+        bt,
+        n,
+        ws,
+        dtype,
+        causal_mask=causal_mask,
+        window_left=window_left,
+    ).float()
+
+    expected = _windowed_reference(query, keys, n, window_left, causal_mask)
+    assert (out - expected).abs().max() < tol * expected.abs().max()
