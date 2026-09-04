@@ -563,6 +563,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
+        # This memo contains live per-forward page-table translations. Clear it
+        # before the first eager QSA break so graph replay cannot retain rows
+        # from an earlier scheduler step.
+        ctx.qsa_forward_metadata = None
         bind_qwen4_exp_side_state(
             ctx.attn_backend,
             self.ple_layers,

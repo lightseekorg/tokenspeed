@@ -463,9 +463,8 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
 
     indexer._metadata = lambda ctx: metadata
     indexer._decode_query_lengths = lambda ctx, total_tokens: None
-    indexer._logical_layout = lambda *args, **kwargs: (logical, requests, 1)
-    indexer._project_qk = lambda hidden, positions: (
-        torch.zeros((2, 1, 1)),
+    indexer._project_qk_raw = lambda hidden: (
+        torch.zeros((2, 1)),
         torch.ones((2, 1, 1)),
     )
 
@@ -478,12 +477,21 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     indexer._full_backend = lambda ctx: backend
     indexer._backend_group_page_size = lambda *args: 64
     indexer._page_table_expansion = lambda *args: 1
-    indexer._group_cache_locs = lambda *args: (
-        cache_locs,
-        cache_locs,
-        torch.ones(2, dtype=torch.int32),
+    prepared = SimpleNamespace(
+        logical_positions=logical,
+        request_indices=requests,
+        qsa_locs=cache_locs,
+        recent_locs=cache_locs,
+        complete_blocks=torch.ones(2, dtype=torch.int32),
+        write_mask=None,
     )
-    indexer._write_and_compress = lambda *args, **kwargs: updates.append((args, kwargs))
+    indexer._prepare_forward_metadata = lambda *args, **kwargs: prepared
+
+    def write_and_compress(*args, **kwargs):
+        updates.append((args, kwargs))
+        return torch.zeros((2, 1, 1))
+
+    indexer._write_and_compress = write_and_compress
 
     selections = []
     indexer._select_slots = lambda *args, **kwargs: (
@@ -504,6 +512,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     torch.testing.assert_close(ctx.dsa_decode_topk, rows)
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
+    assert updates[0][1]["query"] is not None
     assert len(selections) == 1
 
     def fail_selection(*args, **kwargs):
@@ -520,6 +529,119 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         ("fields", 3),
     ]
     assert len(updates) == 2
+    assert updates[1][1]["query"] is None
+
+
+def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) -> None:
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.compressed_token_page_size = 256
+    indexer.recent_page_size = 64
+    indexer.compress_ratio = 4
+    ctx = SimpleNamespace(bs=2, num_extends=0, qsa_forward_metadata=None)
+    metadata = SimpleNamespace(seq_lens=torch.tensor([8, 12], dtype=torch.int32))
+    outputs = (
+        torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]),
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+        torch.arange(8, dtype=torch.int32),
+        torch.arange(8, dtype=torch.int32),
+        torch.tensor([1, 1, 1, 2, 2, 2, 2, 3], dtype=torch.int32),
+        torch.ones(8, dtype=torch.bool),
+    )
+    launches = []
+
+    def prepare(*args, **kwargs):
+        launches.append((args, kwargs))
+        kwargs["draft_logical_positions"].fill_(torch.iinfo(torch.int64).min)
+        return outputs
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer."
+        "qwen4_exp_qsa_prepare_metadata",
+        prepare,
+    )
+    page_table = torch.ones((2, 4), dtype=torch.int32)
+    first_tags = torch.zeros((2, 4), dtype=torch.int64)
+    second_tags = torch.zeros_like(first_tags)
+
+    first = indexer._prepare_forward_metadata(
+        ctx,
+        metadata,
+        8,
+        4,
+        page_table,
+        1,
+        page_table,
+        1,
+        accept_lengths=torch.ones(2, dtype=torch.int32),
+        reset_draft_tags=first_tags,
+    )
+    second = indexer._prepare_forward_metadata(
+        ctx,
+        metadata,
+        8,
+        4,
+        page_table,
+        1,
+        page_table,
+        1,
+        accept_lengths=torch.ones(2, dtype=torch.int32),
+        reset_draft_tags=second_tags,
+    )
+
+    assert second is first
+    assert len(launches) == 1
+    assert torch.all(first_tags == torch.iinfo(torch.int64).min)
+    assert torch.all(second_tags == torch.iinfo(torch.int64).min)
+
+
+def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
+    indexer = object.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.recent_page_size = 64
+    indexer.compress_ratio = 4
+    indexer.compressed_token_page_size = 256
+    indexer.k_layernorm = SimpleNamespace(
+        gemma_weight=torch.ones(8), variance_epsilon=1e-6
+    )
+    indexer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.ones((32, 8)),
+        is_neox_style=True,
+        mrope_section=None,
+        mrope_interleaved=False,
+    )
+    indexer._fields = lambda pool: (
+        torch.empty((2, 4, 1, 8)),
+        torch.empty((2, 64, 1, 8)),
+        torch.empty((2, 3), dtype=torch.int64),
+    )
+    compression_calls = []
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer."
+        "qwen4_exp_qsa_compress_and_store",
+        lambda *args, **kwargs: compression_calls.append((args, kwargs)),
+    )
+
+    def fail_recent_write(*args, **kwargs):
+        raise AssertionError("pure target verification must not launch recent-write")
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer." "qwen4_exp_qsa_recent_write",
+        fail_recent_write,
+    )
+    logical = torch.arange(4, dtype=torch.int64)
+    indexer._write_and_compress(
+        torch.randn(4, 1, 8),
+        logical,
+        logical,
+        torch.zeros(4, dtype=torch.int64),
+        (256 + logical).to(torch.int32),
+        (64 + logical).to(torch.int32),
+        object(),
+        recent_request_limit=0,
+    )
+
+    assert len(compression_calls) == 1
 
 
 def test_qwen4_exp_nextn_compacts_context_topk_for_mtp_decode() -> None:
@@ -631,35 +753,6 @@ def test_qwen4_exp_qsa_rebuilds_layout_after_mtp_prefill_row_gather() -> None:
     assert lengths == 1
     torch.testing.assert_close(logical.cpu(), torch.tensor([22]))
     torch.testing.assert_close(requests.cpu(), torch.tensor([0]))
-
-
-def test_qwen4_exp_qsa_draft_write_mask_keeps_only_accepted_prefix() -> None:
-    ctx = SimpleNamespace(
-        bs=3,
-        num_extends=1,
-        accept_lengths=torch.tensor([0, 2, 1]),
-    )
-    seq_lens = torch.tensor([3, 14, 23])
-    lengths = torch.tensor([3, 4, 4])
-    logical = torch.tensor([0, 1, 2, 10, 11, 12, 13, 19, 20, 21, 22])
-    requests = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
-    recent_locs = torch.ones_like(logical, dtype=torch.int32)
-
-    actual = QSAIndexer._draft_accepted_write_mask(
-        ctx,
-        seq_lens,
-        lengths,
-        logical,
-        requests,
-        recent_locs,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        torch.tensor(
-            [True, True, True, True, True, False, False, True, False, False, False]
-        ),
-    )
 
 
 def _qsa_cache_test_indexer(device: str = "cuda"):

@@ -82,6 +82,10 @@ class ForwardContext:
     dsa_swa_slot_mapping: torch.Tensor | None = None
     dsa_compressor_slot_cache: Any | None = None
 
+    # QSA logical/cache-row metadata is layer-invariant and shared by every
+    # full-attention layer in one model forward.
+    qsa_forward_metadata: Any | None = None
+
 
 @contextmanager
 def report_collective_sizing(

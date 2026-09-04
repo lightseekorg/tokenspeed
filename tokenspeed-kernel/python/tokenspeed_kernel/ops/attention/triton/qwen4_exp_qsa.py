@@ -457,6 +457,257 @@ def qwen4_exp_qsa_logical_layout(
 
 
 @triton.jit
+def _qwen4_exp_qsa_prepare_metadata_kernel(
+    seq_lens,
+    query_lengths,
+    qsa_page_table,
+    recent_page_table,
+    positions,
+    requests,
+    qsa_locs,
+    recent_locs,
+    complete_blocks,
+    write_mask,
+    accept_lengths,
+    draft_logical_positions,
+    uniform_len,
+    qsa_expansion,
+    qsa_page_size,
+    recent_expansion,
+    recent_page_size,
+    num_extends,
+    stride_seq_b,
+    stride_len_b,
+    stride_qsa_pt_b,
+    stride_recent_pt_b,
+    stride_accept_b,
+    stride_dlp_r,
+    stride_dlp_s,
+    HAS_UNIFORM: tl.constexpr,
+    HAS_ACCEPT_MASK: tl.constexpr,
+    RESET_DRAFT_TAGS: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    RESET_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    if HAS_UNIFORM:
+        length = tl.full((), uniform_len, tl.int64)
+        start = request.to(tl.int64) * uniform_len
+    else:
+        length = tl.load(query_lengths + request * stride_len_b).to(tl.int64)
+        start = tl.zeros((), dtype=tl.int64)
+        for other in range(0, request):
+            start += tl.load(query_lengths + other * stride_len_b).to(tl.int64)
+
+    if RESET_DRAFT_TAGS:
+        reset_offsets = tl.arange(0, RESET_BLOCK)
+        tl.store(
+            draft_logical_positions
+            + request * stride_dlp_r
+            + reset_offsets * stride_dlp_s,
+            tl.full((RESET_BLOCK,), -9223372036854775808, tl.int64),
+            mask=reset_offsets < COMPRESS_RATIO,
+        )
+
+    base = tl.load(seq_lens + request * stride_seq_b).to(tl.int64) - length
+    accepted = tl.zeros((), dtype=tl.int64)
+    if HAS_ACCEPT_MASK:
+        accepted = tl.load(accept_lengths + request * stride_accept_b).to(tl.int64)
+    for offset in range(0, length, BLOCK):
+        row_offsets = offset + tl.arange(0, BLOCK)
+        mask = row_offsets < length
+        rows = start + row_offsets
+        logical = base + row_offsets
+        valid = logical >= 0
+        safe_logical = tl.maximum(logical, 0)
+
+        tl.store(positions + rows, logical, mask=mask)
+        tl.store(
+            requests + rows,
+            tl.full((BLOCK,), request, tl.int64),
+            mask=mask,
+        )
+        tl.store(
+            complete_blocks + rows,
+            ((logical + 1) // COMPRESS_RATIO).to(tl.int32),
+            mask=mask,
+        )
+
+        qsa_columns = safe_logical // qsa_page_size
+        qsa_pages = tl.load(
+            qsa_page_table + request * stride_qsa_pt_b + qsa_columns * qsa_expansion,
+            mask=mask & valid,
+            other=0,
+        ).to(tl.int64)
+        qsa_pages = qsa_pages // qsa_expansion
+        qsa_values = qsa_pages * qsa_page_size + safe_logical % qsa_page_size
+        qsa_valid = valid & (qsa_pages > 0)
+        tl.store(
+            qsa_locs + rows,
+            tl.where(qsa_valid, qsa_values, 0).to(tl.int32),
+            mask=mask,
+        )
+
+        recent_columns = safe_logical // recent_page_size
+        recent_pages = tl.load(
+            recent_page_table
+            + request * stride_recent_pt_b
+            + recent_columns * recent_expansion,
+            mask=mask & valid,
+            other=0,
+        ).to(tl.int64)
+        recent_pages = recent_pages // recent_expansion
+        recent_values = (
+            recent_pages * recent_page_size + safe_logical % recent_page_size
+        )
+        recent_valid = valid & (recent_pages > 0)
+        tl.store(
+            recent_locs + rows,
+            tl.where(recent_valid, recent_values, 0).to(tl.int32),
+            mask=mask,
+        )
+        if HAS_ACCEPT_MASK:
+            accepted_row = (request < num_extends) | (row_offsets < accepted)
+            tl.store(
+                write_mask + rows,
+                recent_valid & accepted_row,
+                mask=mask,
+            )
+
+
+def qwen4_exp_qsa_prepare_metadata(
+    seq_lens: torch.Tensor,
+    query_lengths: torch.Tensor | int,
+    total_tokens: int,
+    qsa_page_table: torch.Tensor,
+    qsa_expansion: int,
+    qsa_page_size: int,
+    recent_page_table: torch.Tensor,
+    recent_expansion: int,
+    recent_page_size: int,
+    compress_ratio: int,
+    *,
+    accept_lengths: torch.Tensor | None = None,
+    num_extends: int = 0,
+    draft_logical_positions: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Build all per-forward QSA row metadata in one launch.
+
+    The kernel expands request lengths, maps both QSA cache groups, derives
+    complete compressed-block counts, and optionally emits the accepted draft
+    write mask. Draft scratch tags may be invalidated in the same request CTA
+    so the first MTP step needs no separate fill launch.
+
+    Args:
+        seq_lens: Sequence length per request.
+        query_lengths: Per-request row counts or one uniform Python integer.
+        total_tokens: Total flattened query rows.
+        qsa_page_table: Compressed-cache page table at consumer granularity.
+        qsa_expansion: Consumer pages per compressed logical page.
+        qsa_page_size: Logical tokens covered by a compressed page.
+        recent_page_table: Recent-cache page table at consumer granularity.
+        recent_expansion: Consumer pages per recent logical page.
+        recent_page_size: Logical tokens covered by a recent page.
+        compress_ratio: Raw tokens represented by one compressed key.
+        accept_lengths: Optional accepted verify width per request.
+        num_extends: Requests before this index are non-speculative extends.
+        draft_logical_positions: Optional request-local draft tags to reset.
+
+    Returns:
+        Logical positions, request ids, compressed-cache locations,
+        recent-cache locations, complete-block counts, and an optional boolean
+        accepted-write mask, all with one entry per flattened query row.
+    """
+
+    batch = seq_lens.shape[0]
+    device = seq_lens.device
+    outputs = (
+        torch.empty((total_tokens,), dtype=torch.int64, device=device),
+        torch.empty((total_tokens,), dtype=torch.int64, device=device),
+        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+    )
+    write_mask = (
+        None
+        if accept_lengths is None
+        else torch.empty((total_tokens,), dtype=torch.bool, device=device)
+    )
+    if not total_tokens or not batch:
+        return (*outputs, write_mask)
+    if isinstance(query_lengths, int):
+        uniform_len = int(query_lengths)
+        lengths_arg = seq_lens
+        stride_len_b = 0
+        has_uniform = True
+        if uniform_len * batch != total_tokens:
+            raise ValueError("uniform QSA query length does not match total tokens")
+    else:
+        if query_lengths.shape[0] < batch:
+            raise ValueError("QSA query lengths need one entry per request")
+        uniform_len = 0
+        lengths_arg = query_lengths
+        stride_len_b = query_lengths.stride(0)
+        has_uniform = False
+    if accept_lengths is None:
+        accept_arg = seq_lens
+        stride_accept_b = 0
+    else:
+        if accept_lengths.shape[0] < batch:
+            raise ValueError("QSA accept lengths need one entry per request")
+        accept_arg = accept_lengths
+        stride_accept_b = accept_lengths.stride(0)
+    if draft_logical_positions is None:
+        draft_arg = outputs[0]
+        stride_dlp_r = stride_dlp_s = 0
+    else:
+        if draft_logical_positions.shape != (batch, compress_ratio):
+            raise ValueError("QSA draft logical tags have invalid shape")
+        draft_arg = draft_logical_positions
+        stride_dlp_r = draft_logical_positions.stride(0)
+        stride_dlp_s = draft_logical_positions.stride(1)
+    mask_arg = outputs[0] if write_mask is None else write_mask
+    _qwen4_exp_qsa_prepare_metadata_kernel[(batch,)](
+        seq_lens,
+        lengths_arg,
+        qsa_page_table,
+        recent_page_table,
+        *outputs,
+        mask_arg,
+        accept_arg,
+        draft_arg,
+        uniform_len,
+        qsa_expansion,
+        qsa_page_size,
+        recent_expansion,
+        recent_page_size,
+        num_extends,
+        seq_lens.stride(0),
+        stride_len_b,
+        qsa_page_table.stride(0),
+        recent_page_table.stride(0),
+        stride_accept_b,
+        stride_dlp_r,
+        stride_dlp_s,
+        HAS_UNIFORM=has_uniform,
+        HAS_ACCEPT_MASK=write_mask is not None,
+        RESET_DRAFT_TAGS=draft_logical_positions is not None,
+        COMPRESS_RATIO=compress_ratio,
+        RESET_BLOCK=triton.next_power_of_2(compress_ratio),
+        BLOCK=128,
+    )
+    return (*outputs, write_mask)
+
+
+@triton.jit
 def _qwen4_exp_qsa_group_cache_locs_kernel(
     logical_positions,
     request_indices,
@@ -632,6 +883,9 @@ def qwen4_exp_qsa_complete_blocks(
 @triton.jit
 def _qwen4_exp_qsa_compress_and_store_kernel(
     token_k,
+    query,
+    query_norm_weight,
+    query_output,
     logical_positions,
     request_indices,
     recent_locs,
@@ -646,9 +900,15 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     draft_raw_cache,
     draft_logical_positions,
     draft_position_cache,
+    staged_k,
+    staged_positions,
+    staged_logical,
+    staged_recent,
     head_dim,
     rotary_dim,
     norm_epsilon,
+    query_norm_epsilon,
+    stage_verify_start,
     recent_page_size,
     compress_ratio,
     compressed_token_page_size,
@@ -658,6 +918,10 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     section2,
     stride_k_n,
     stride_k_d,
+    stride_q_n,
+    stride_q_d,
+    stride_qo_n,
+    stride_qo_h,
     stride_raw_p,
     stride_raw_s,
     stride_raw_d,
@@ -673,9 +937,19 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     stride_dlp_r,
     stride_dlp_s,
     stride_dpc_r,
+    stride_sk_r,
+    stride_sk_s,
+    stride_sk_d,
+    stride_sp_r,
+    stride_sl_r,
+    stride_sl_s,
     COMPRESS_RATIO: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    HAS_QUERY: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     HAS_DRAFT: tl.constexpr,
+    STAGE_VERIFY: tl.constexpr,
+    STAGE_DRAFT: tl.constexpr,
     HAS_SECTIONS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
@@ -693,6 +967,118 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     request = tl.load(request_indices + row).to(tl.int64)
     recent_loc = tl.load(recent_locs + row).to(tl.int64)
     page = tl.maximum(recent_loc, 0) // recent_page_size
+
+    if HAS_QUERY:
+        query_axes = tl.arange(0, 4)
+        query_axis_mask = query_axes < 3
+        query_positions = tl.load(
+            position_values + row * stride_pv_n + query_axes * stride_pv_a,
+            mask=query_axis_mask,
+            other=0,
+        )
+        query_p0 = tl.sum(tl.where(query_axes == 0, query_positions, 0))
+        query_p1 = tl.sum(tl.where(query_axes == 1, query_positions, 0))
+        query_p2 = tl.sum(tl.where(query_axes == 2, query_positions, 0))
+        if HAS_SECTIONS:
+            if INTERLEAVED:
+                query_axis = tl.where(
+                    (half_offsets % 3 == 1) & (half_offsets < 3 * section1),
+                    1,
+                    tl.where(
+                        (half_offsets % 3 == 2) & (half_offsets < 3 * section2),
+                        2,
+                        0,
+                    ),
+                )
+            else:
+                query_axis = tl.where(
+                    half_offsets < section0,
+                    0,
+                    tl.where(half_offsets < section0 + section1, 1, 2),
+                )
+            query_selected_positions = tl.where(
+                query_axis == 0,
+                query_p0,
+                tl.where(query_axis == 1, query_p1, query_p2),
+            )
+        else:
+            query_selected_positions = tl.where(half_mask, query_p0, 0)
+        query_cos = tl.load(
+            cos_sin_cache + query_selected_positions * stride_cs_n + half_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query_sin = tl.load(
+            cos_sin_cache
+            + query_selected_positions * stride_cs_n
+            + half
+            + half_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query_weight_first = tl.load(
+            query_norm_weight + half_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query_weight_second = tl.load(
+            query_norm_weight + second_offsets,
+            mask=half_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query_weight_pass = tl.load(
+            query_norm_weight + dim_offsets,
+            mask=pass_mask,
+            other=0.0,
+        ).to(tl.float32)
+        for head in tl.static_range(NUM_QUERY_HEADS):
+            query_head = query + row * stride_q_n + head * head_dim * stride_q_d
+            query_first = tl.load(
+                query_head + half_offsets * stride_q_d,
+                mask=half_mask,
+                other=0.0,
+            ).to(tl.float32)
+            query_second = tl.load(
+                query_head + second_offsets * stride_q_d,
+                mask=half_mask,
+                other=0.0,
+            ).to(tl.float32)
+            query_pass = tl.load(
+                query_head + dim_offsets * stride_q_d,
+                mask=pass_mask,
+                other=0.0,
+            ).to(tl.float32)
+            query_squares = (
+                tl.sum(query_first * query_first, axis=0)
+                + tl.sum(query_second * query_second, axis=0)
+                + tl.sum(query_pass * query_pass, axis=0)
+            )
+            query_scale = 1.0 / tl.sqrt(query_squares / head_dim + query_norm_epsilon)
+            query_norm_first = query_first * query_scale * query_weight_first
+            query_norm_second = query_second * query_scale * query_weight_second
+            query_rotated_first = (
+                query_norm_first * query_cos - query_norm_second * query_sin
+            )
+            query_rotated_second = (
+                query_norm_second * query_cos + query_norm_first * query_sin
+            )
+            query_out = query_output + row * stride_qo_n + head * stride_qo_h
+            query_out_dtype = query_output.dtype.element_ty
+            tl.store(
+                query_out + half_offsets,
+                query_rotated_first.to(query_out_dtype),
+                mask=half_mask,
+            )
+            tl.store(
+                query_out + second_offsets,
+                query_rotated_second.to(query_out_dtype),
+                mask=half_mask,
+            )
+            tl.store(
+                query_out + dim_offsets,
+                (query_pass * query_scale * query_weight_pass).to(query_out_dtype),
+                mask=pass_mask,
+            )
 
     # Gather the compression group and average its raw keys. Members still
     # present in the current batch come from the input keys; older members
@@ -894,6 +1280,57 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
+    if STAGE_VERIFY or STAGE_DRAFT:
+        # Compression has consumed the old raw/draft ring before any staged
+        # value can alias it. The PDL-dependent score kernel needs neither
+        # staging destination, so these stores remain in the producer tail.
+        if STAGE_DRAFT:
+            tl.debug_barrier()
+        staged_values = tl.load(
+            token_k + row * stride_k_n + dim_offsets * stride_k_d,
+            mask=dim_offsets < head_dim,
+            other=0.0,
+        )
+        staged_position_values = tl.load(
+            position_values + row * stride_pv_n + axes * stride_pv_a,
+            mask=axis_mask,
+            other=0,
+        )
+        if STAGE_VERIFY:
+            if row >= stage_verify_start:
+                staged_row = row - stage_verify_start
+                tl.store(
+                    staged_k + staged_row * head_dim + dim_offsets,
+                    staged_values.to(staged_k.dtype.element_ty),
+                    mask=dim_offsets < head_dim,
+                )
+                tl.store(
+                    staged_positions + staged_row * 3 + axes,
+                    staged_position_values,
+                    mask=axis_mask,
+                )
+                tl.store(staged_logical + staged_row, position)
+                tl.store(staged_recent + staged_row, recent_loc.to(tl.int32))
+        if STAGE_DRAFT and recent_loc > 0:
+            staged_slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
+            tl.store(
+                staged_k
+                + request * stride_sk_r
+                + staged_slot * stride_sk_s
+                + dim_offsets * stride_sk_d,
+                staged_values.to(staged_k.dtype.element_ty),
+                mask=dim_offsets < head_dim,
+            )
+            tl.store(
+                staged_logical + request * stride_sl_r + staged_slot * stride_sl_s,
+                position,
+            )
+            if staged_slot == 0:
+                tl.store(
+                    staged_positions + request * stride_sp_r + axes,
+                    staged_position_values,
+                    mask=axis_mask,
+                )
 
 
 def qwen4_exp_qsa_compress_and_store(
@@ -920,7 +1357,15 @@ def qwen4_exp_qsa_compress_and_store(
     draft_logical_positions: torch.Tensor | None = None,
     draft_position_cache: torch.Tensor | None = None,
     enable_pdl: bool = False,
-) -> None:
+    query: torch.Tensor | None = None,
+    query_norm_weight: torch.Tensor | None = None,
+    query_norm_epsilon: float | None = None,
+    num_query_heads: int | None = None,
+    stage_verify_buffers: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None,
+    stage_draft: bool = False,
+) -> torch.Tensor | None:
     """Pool, normalize, rotate, and scatter compressed QSA keys in one kernel.
 
     Each row gathers its compression group from current-batch keys, optional
@@ -962,20 +1407,58 @@ def qwen4_exp_qsa_compress_and_store(
             draft groups, shaped ``[requests, 3]``.
         enable_pdl: Allow the follow-up raw-key write kernel to launch early
             on NVIDIA GPUs; the dependent kernel still waits for this grid.
+        query: Optional raw projected queries shaped
+            ``[rows, num_query_heads * head_dim]``. When present, query
+            normalization and RoPE share this compression launch.
+        query_norm_weight: Gemma RMSNorm weight for ``query``.
+        query_norm_epsilon: RMSNorm epsilon for ``query``.
+        num_query_heads: Query heads packed into each projected row.
+        stage_verify_buffers: Optional contiguous K, position, logical-position,
+            and recent-location destinations for target verification.
+        stage_draft: Store each row into the supplied request-local draft
+            scratch after compression has consumed its previous contents.
 
     Returns:
-        None.
+        Normalized and rotated query rows when ``query`` is provided;
+        otherwise ``None``.
     """
 
     rows = logical_positions.shape[0]
-    if not rows:
-        return
     rotary_dim = cos_sin_cache.shape[-1]
     if rotary_dim % 2:
         raise ValueError("Qwen4-Exp QSA compression needs an even rotary dimension")
     head_dim = token_k.shape[-1]
     if rotary_dim > head_dim:
         raise ValueError("Qwen4-Exp QSA index head is narrower than the rotary dim")
+    query_args = (
+        query,
+        query_norm_weight,
+        query_norm_epsilon,
+        num_query_heads,
+    )
+    has_query = any(value is not None for value in query_args)
+    if has_query and not all(value is not None for value in query_args):
+        raise ValueError("Qwen4-Exp QSA fused query preparation needs all arguments")
+    if has_query:
+        if (
+            query.ndim != 2
+            or query.shape != (rows, int(num_query_heads) * head_dim)
+            or query_norm_weight.shape != (head_dim,)
+        ):
+            raise ValueError("Qwen4-Exp QSA fused query has invalid shapes")
+        query_output = torch.empty(
+            (rows, int(num_query_heads), head_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        query = token_k
+        query_norm_weight = norm_weight
+        query_norm_epsilon = 0.0
+        num_query_heads = 0
+        query_output = token_k
+    if not rows:
+        return query_output if has_query else None
     draft_buffers = (
         draft_raw_cache,
         draft_logical_positions,
@@ -996,6 +1479,45 @@ def qwen4_exp_qsa_compress_and_store(
         draft_raw_cache = raw_cache
         draft_logical_positions = logical_positions
         draft_position_cache = position_cache
+    if stage_verify_buffers is not None and stage_draft:
+        raise ValueError("QSA cannot stage target verification and draft rows together")
+    if stage_draft and not has_draft:
+        raise ValueError("QSA draft staging requires all draft scratch buffers")
+    if stage_verify_buffers is not None:
+        staged_k, staged_positions, staged_logical, staged_recent = stage_verify_buffers
+        staged_rows = staged_logical.numel()
+        expected_numels = (
+            staged_rows * head_dim,
+            staged_rows * 3,
+            staged_rows,
+            staged_rows,
+        )
+        if staged_rows > rows:
+            raise ValueError("QSA verify staging has more rows than its sources")
+        for staged, expected_numel in zip(
+            stage_verify_buffers, expected_numels, strict=True
+        ):
+            if staged.numel() != expected_numel or not staged.is_contiguous():
+                raise ValueError("QSA verify staging buffers have invalid shapes")
+        if (
+            staged_k.dtype != token_k.dtype
+            or staged_positions.dtype != position_values.dtype
+            or staged_logical.dtype != logical_positions.dtype
+            or staged_recent.dtype != recent_locs.dtype
+        ):
+            raise ValueError("QSA verify staging buffers have invalid dtypes")
+    elif stage_draft:
+        staged_rows = 0
+        staged_k = draft_raw_cache
+        staged_positions = draft_position_cache
+        staged_logical = draft_logical_positions
+        staged_recent = recent_locs
+    else:
+        staged_rows = 0
+        staged_k = token_k
+        staged_positions = position_values
+        staged_logical = logical_positions
+        staged_recent = recent_locs
     if write_mask is None:
         write_mask = recent_locs
     # ``token_k`` is usually a strided view of the QK projection output; the
@@ -1004,6 +1526,9 @@ def qwen4_exp_qsa_compress_and_store(
     use_pdl = _is_nvidia and enable_pdl
     _qwen4_exp_qsa_compress_and_store_kernel[(rows,)](
         token_k,
+        query,
+        query_norm_weight,
+        query_output,
         logical_positions,
         request_indices,
         recent_locs,
@@ -1018,9 +1543,15 @@ def qwen4_exp_qsa_compress_and_store(
         draft_raw_cache,
         draft_logical_positions,
         draft_position_cache,
+        staged_k,
+        staged_positions,
+        staged_logical,
+        staged_recent,
         head_dim,
         rotary_dim,
         float(norm_epsilon),
+        float(query_norm_epsilon),
+        rows - staged_rows,
         recent_page_size,
         compress_ratio,
         compressed_token_page_size,
@@ -1030,6 +1561,10 @@ def qwen4_exp_qsa_compress_and_store(
         0 if sections is None else int(sections[2]),
         token_k.stride(0),
         token_k.stride(-1),
+        query.stride(0),
+        query.stride(-1),
+        query_output.stride(0),
+        query_output.stride(1),
         raw_cache.stride(0),
         raw_cache.stride(1),
         raw_cache.stride(-1),
@@ -1045,9 +1580,19 @@ def qwen4_exp_qsa_compress_and_store(
         draft_logical_positions.stride(0),
         draft_logical_positions.stride(1) if has_draft else 0,
         draft_position_cache.stride(0),
+        staged_k.stride(0),
+        staged_k.stride(1),
+        staged_k.stride(-1),
+        staged_positions.stride(0),
+        staged_logical.stride(0),
+        staged_logical.stride(1) if staged_logical.ndim > 1 else 0,
         COMPRESS_RATIO=compress_ratio,
+        NUM_QUERY_HEADS=int(num_query_heads),
+        HAS_QUERY=has_query,
         HAS_WRITE_MASK=write_mask is not recent_locs,
         HAS_DRAFT=has_draft,
+        STAGE_VERIFY=stage_verify_buffers is not None,
+        STAGE_DRAFT=stage_draft,
         HAS_SECTIONS=sections is not None,
         INTERLEAVED=interleaved,
         BLOCK_HALF=triton.next_power_of_2(max(rotary_dim // 2, 1)),
@@ -1055,6 +1600,7 @@ def qwen4_exp_qsa_compress_and_store(
         ENABLE_PDL=use_pdl,
         **({"launch_pdl": True} if use_pdl else {}),
     )
+    return query_output if has_query else None
 
 
 @triton.jit
@@ -2633,6 +3179,7 @@ __all__ = [
     "qwen4_exp_qsa_logical_layout",
     "qwen4_exp_qsa_mqa_scores",
     "qwen4_exp_qsa_norm_rope",
+    "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_rope",
     "qwen4_exp_qsa_selected_slots",
