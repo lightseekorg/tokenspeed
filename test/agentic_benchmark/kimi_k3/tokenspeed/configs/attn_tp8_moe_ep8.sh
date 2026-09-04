@@ -24,6 +24,8 @@ exec ts serve \
     --mm-encoder-tp-mode data \
     --disable-kvstore \
     --enable-cache-report \
+    --reasoning-parser passthrough \
+    --tool-call-parser passthrough \
     --host 0.0.0.0 \
     --port 8000 \
     --engine-startup-timeout 7200
