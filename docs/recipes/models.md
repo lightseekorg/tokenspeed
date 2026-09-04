@@ -225,6 +225,9 @@ lets that write overlap the draft forward and accumulate as the target
 produces each captured layer. The server logs at INFO which of those paths it
 took, and why when it declined one.
 Draft proposals greedily follow the selector's transition-conditioned path.
+Candidate selection takes each vocabulary shard's local top-k and gathers only
+those, instead of gathering whole logits rows, whenever the head's shards carry
+no padding or added tokens.
 A request's `temperature`, `top_k` and `top_p` are applied by the target's
 verification step, never by the proposal, so the served distribution is the
 target's whatever the drafter proposed.
