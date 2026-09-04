@@ -363,3 +363,28 @@ def test_dflash_sink_folds_the_taps_and_writes_the_kv_once():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_incremental_capture_writers_check_the_sink_is_armed() -> None:
+    """A target may only hand a tap over when the drafter armed the sink.
+
+    The drafter installs itself only for a round it can overlap -- decode-only
+    rows, fused writer, not graph warmup -- so an unarmed round must not reach
+    it: the slots hold one decode block and an extend forward's rows do not
+    fit. Each target model carries its own copy of the capture loop, so the
+    check has to hold in every copy; one that drops it runs fine until the
+    first prefill wide enough to overflow a slot.
+    """
+    import pathlib as _pathlib
+
+    models = _pathlib.Path(factory.__file__).parent.parent / "models"
+    writers = [
+        path for path in models.rglob("*.py") if "on_target_capture(" in path.read_text()
+    ]
+    assert writers, "no target model hands taps to the drafter's capture sink"
+    unguarded = [
+        path.name
+        for path in writers
+        if "target_capture_sink is not None" not in path.read_text()
+    ]
+    assert not unguarded, unguarded

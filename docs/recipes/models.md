@@ -219,7 +219,11 @@ Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
 `--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
 candidate selector are enabled automatically from the draft architecture. On
 GPU each convolution runs as a single fused Triton kernel; the torch node graph
-stays as the CPU reference.
+stays as the CPU reference. An MLA DFlash2 draft also writes its context KV
+through one stacked projection plus one fused norm/RoPE/scatter launch, which
+lets that write overlap the draft forward and accumulate as the target
+produces each captured layer. The server logs at INFO which of those paths it
+took, and why when it declined one.
 Draft proposals greedily follow the selector's transition-conditioned path.
 A request's `temperature`, `top_k` and `top_p` are applied by the target's
 verification step, never by the proposal, so the served distribution is the

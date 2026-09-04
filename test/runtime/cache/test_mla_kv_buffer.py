@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.embedding import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
+    mla_latent_norm_rope_scatter,
     set_mla_kv_buffer_triton,
 )
 
@@ -799,3 +800,54 @@ def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
 
     assert _bitwise_equal(query_strided, query_packed)
     assert _bitwise_equal(kv_strided[packed_loc], kv_packed[packed_loc])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox):
+    """The DFlash MLA context write folds three steps into one launch."""
+    torch.manual_seed(0)
+    n_layers, n_loc, n_slots, eps_value = 3, 12, 64, 1e-6
+    latent = torch.randn(
+        n_loc, n_layers, TOTAL_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.randn(n_layers, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    eps = torch.full((n_layers,), eps_value, device="cuda")
+    cos_sin = torch.randn(256, ROPE_DIM, device="cuda", dtype=torch.float32)
+    positions = torch.randint(256, (n_loc,), device="cuda")
+    loc = torch.randperm(n_slots, device="cuda")[:n_loc].to(torch.int32)
+    sentinel = torch.full(
+        (n_slots, TOTAL_DIM), 7.5, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    buffers = [sentinel.clone() for _ in range(n_layers)]
+
+    mla_latent_norm_rope_scatter(
+        latent,
+        norm_weight,
+        eps,
+        cos_sin,
+        positions,
+        loc,
+        torch.tensor([b.data_ptr() for b in buffers], dtype=torch.int64, device="cuda"),
+        buffers[0].stride(0),
+        dtype,
+        is_neox=is_neox,
+    )
+
+    tolerance = 0.08 if dtype == torch.float8_e4m3fn else 0.02
+    for layer in range(n_layers):
+        nope = latent[:, layer, :NOPE_DIM].float()
+        normed = nope * torch.rsqrt(nope.pow(2).mean(-1, keepdim=True) + eps_value)
+        rope = _rotate_rope_reference(
+            latent[:, layer, NOPE_DIM:].float().unsqueeze(1),
+            cos_sin,
+            positions,
+            is_neox,
+        ).squeeze(1)
+        expected = sentinel.float()
+        expected[loc.long()] = torch.cat(
+            (normed * norm_weight[layer].float(), rope), dim=-1
+        )
+        torch.testing.assert_close(
+            buffers[layer].float(), expected, atol=tolerance, rtol=tolerance
+        )
