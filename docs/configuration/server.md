@@ -545,7 +545,7 @@ for the online variant.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
-| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
+| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (vendored [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) kernels: one fused Triton pipeline per step; `top_k=-1` is realized as bounded top-128 truncation; bf16 logits ranked at bf16 resolution, fp32 logits sampled exactly among the top-128 candidates; kernel configs from a table measured on Blackwell, no startup tuning; see the `--sampling-backend` help for its memory cost). |
 | `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but

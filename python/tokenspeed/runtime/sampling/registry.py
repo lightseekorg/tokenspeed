@@ -77,6 +77,8 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         return True
     if backend_name == "triton_full":
         return True
+    if backend_name == "sonic":
+        return platform.is_nvidia
     if backend_name == "ascend_full":
         if not platform.is_npu:
             return False
@@ -105,6 +107,7 @@ def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]
         flashinfer_full as _ff,
     )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 

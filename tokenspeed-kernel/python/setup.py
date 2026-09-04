@@ -1132,6 +1132,11 @@ setup(
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],
+        # Vendored sonic-sampler: its license and provenance.
+        "tokenspeed_kernel.thirdparty.sonic": [
+            "LICENSE",
+            "README.md",
+        ],
         # Optional JIT adapter for fused AllGather quantization.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",

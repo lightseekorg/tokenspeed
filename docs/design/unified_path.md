@@ -1041,7 +1041,10 @@ Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
 pool-indexed sampling route serves them, which is exactly what the captured
 graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
-pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
+pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
+`sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
+greedy pick lies within one bf16 ulp of the maximum -- and realize `top_k=-1`
+as bounded top-128 truncation, by `test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
@@ -1082,8 +1085,11 @@ window that accepts nothing and resolves to exactly one sampled token
 through the same pool kernels, `accept_length == 1`
 (`test_decode_verify_n1_equivalence.py`; Triton and FlashInfer's
 `per-request` stream use the same draw in `sample()` and `verify(N=1)`;
-FlashInfer's legacy `batch` stream retains the coin route). `future_input_map` is `[pool, output_length]` for
-the same reason: single-token decode is a width-1 candidate window.
+FlashInfer's legacy `batch` stream retains the coin route; `sonic` resolves
+the width-1 window through its single-step kernel, bitwise equal to
+`sample()`, pinned by `test_sonic_backend.py`). `future_input_map` is
+`[pool, output_length]` for the same reason: single-token decode is a width-1
+candidate window.
 
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
 to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
@@ -1187,8 +1193,11 @@ the contract: ordering, masking, supported configurations and cost.
 persistent output buffers, on eager and replay alike. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends return separate token and length buffers and take the
-executor's two-copy path (`get_packed_output_d2h` returns None).
+Triton backends and `sonic` return separate token and length buffers and
+take the executor's two-copy path (`get_packed_output_d2h` returns None).
+The stop conditions cut the returned accept lengths in place (0 for a stopped
+request), so a backend whose decode rows return a buffer of ones refills it on
+every call, as `sonic` and FlashInfer do.
 
 ### Logits capture state follows the tensor's device
 
