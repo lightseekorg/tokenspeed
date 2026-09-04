@@ -32,8 +32,11 @@ allocation, so the probe lives here instead of being duplicated per consumer.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import logging
+import socket
 from collections.abc import Sequence
+from pathlib import Path
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -42,6 +45,7 @@ __all__ = [
     "fabric_allocation_supported",
     "gather_fabric_map",
     "group_has_fabric",
+    "group_host_span",
 ]
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,7 @@ _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 
 _probe_cache: dict[int, bool] = {}
 _fabric_map: list[bool] | None = None
+_host_map: list[int] | None = None
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -181,8 +186,31 @@ def fabric_allocation_supported(device_index: int) -> bool:
     return cached
 
 
+def _host_identity() -> int:
+    """An id every rank on one host computes identically, and no other host does.
+
+    The boot id is the host's, not the container's: a launcher that gives each
+    worker its own UTS namespace hands them all the same hostname, so hostnames
+    would merge two machines into one and skip the fabric test that keeps a
+    group off a rendezvous it cannot complete. Hostname is the last resort.
+    """
+    name = ""
+    for path in ("/proc/sys/kernel/random/boot_id", "/etc/machine-id"):
+        try:
+            name = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if name:
+            break
+    if not name:
+        name = socket.gethostname()
+    digest = hashlib.blake2b(name.encode(), digest_size=8).digest()
+    # Signed 64-bit, because the gather carries it in an int64 tensor.
+    return int.from_bytes(digest, "big") >> 1
+
+
 def gather_fabric_map() -> list[bool]:
-    """Gather and cache every world rank's fabric-allocation verdict.
+    """Gather and cache every world rank's fabric-allocation verdict and host.
 
     Fabric handles are an NVIDIA concept, so off NVIDIA the answer is no for
     every rank and is filled in without a collective. Deciding that here rather
@@ -197,28 +225,33 @@ def gather_fabric_map() -> list[bool]:
     the ones that entered would wait out the NCCL timeout. The caller it
     replaced read a server argument, which was uniform; this reads the machine.
     """
-    global _fabric_map
+    global _fabric_map, _host_map
 
     if _fabric_map is not None:
         return _fabric_map
 
+    world_size = torch.distributed.get_world_size()
     if not current_platform().is_nvidia:
-        _fabric_map = [False] * torch.distributed.get_world_size()
+        # No fabric to map, so every rank is its own host and every span declines.
+        _fabric_map = [False] * world_size
+        _host_map = list(range(world_size))
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
     local = torch.tensor(
-        [fabric_allocation_supported(device.index)], dtype=torch.bool, device=device
+        [int(fabric_allocation_supported(device.index)), _host_identity()],
+        dtype=torch.int64,
+        device=device,
     )
-    gathered = [
-        torch.empty_like(local) for _ in range(torch.distributed.get_world_size())
-    ]
+    gathered = [torch.empty_like(local) for _ in range(world_size)]
     torch.distributed.all_gather(gathered, local, group=torch.distributed.group.WORLD)
-    _fabric_map = [bool(value.item()) for value in gathered]
+    _fabric_map = [bool(value[0].item()) for value in gathered]
+    _host_map = [int(value[1].item()) for value in gathered]
     logger.info(
-        "fabric allocation available on %s/%s ranks",
+        "fabric allocation available on %s/%s ranks across %s hosts",
         sum(_fabric_map),
         len(_fabric_map),
+        len(set(_host_map)),
     )
     return _fabric_map
 
@@ -239,3 +272,20 @@ def group_has_fabric(ranks: Sequence[int]) -> bool:
             "distributed initialization before any reachability gate"
         )
     return all(_fabric_map[rank] for rank in ranks)
+
+
+def group_host_span(ranks: Sequence[int]) -> int | None:
+    """How many distinct hosts ``ranks`` occupy, or ``None`` if never gathered.
+
+    Placement is read from the map rather than divided out of the visible device
+    count: a job running fewer workers than a host has GPUs puts two hosts inside
+    one ``rank // device_count`` window, and a group called node-local that way
+    skips the fabric test and hangs in the rendezvous instead of declining.
+
+    ``None`` rather than a raise, because the caller is a gate that declines what
+    it cannot establish. ``group_has_fabric`` raises because by the time it is
+    asked, the decision to consult the map has already been taken.
+    """
+    if _host_map is None:
+        return None
+    return len({_host_map[rank] for rank in ranks})

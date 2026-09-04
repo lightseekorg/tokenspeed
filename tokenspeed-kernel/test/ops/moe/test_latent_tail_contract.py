@@ -206,9 +206,10 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
         ([6, 7, 8], 8, True),
         ([7, 8, 9, 10, 11, 12, 13], 8, True),
         (list(range(8)), 4, True),
-        # The same eight ranks on either side of the divisor: node-local at
-        # eight a host, spanning at four. An implementation that ignored the
-        # divisor would pass every row above and fail this one.
+        # The same eight ranks on either side of the boundary: node-local at
+        # eight a host, spanning at four. Every row runs with eight visible
+        # devices, so a gate dividing by the device count answers "one host"
+        # for this row and the one above alike, and only one of them is right.
         (list(range(8)), 8, False),
     ],
 )
@@ -219,8 +220,8 @@ def test_the_probe_is_skipped_only_within_one_host_window(
 
     ``[6, 7, 8]`` at eight devices a host is contiguous and starts on a
     multiple of its own width while still living on two hosts. What decides it
-    is whether every rank falls in the same host-sized window. Skipping the
-    probe on a spanning group admits one the fabric may not map, and such a
+    is which host each rank sits on, which the gathered map records. Skipping
+    the probe on a spanning group admits one the fabric may not map, and such a
     group hangs inside the rendezvous rather than falling back; probing a
     node-local one declines a group that works over plain NVLink.
     """
@@ -239,20 +240,25 @@ def test_the_probe_is_skipped_only_within_one_host_window(
         assert group is asked, f"queried {group!r} instead of the caller's group"
         return ranks
 
-    with (
-        mock.patch.object(tail.dist, "is_initialized", return_value=True),
-        mock.patch.object(
-            tail.dist, "get_process_group_ranks", side_effect=only_this_group
-        ),
-        mock.patch.object(torch.cuda, "device_count", return_value=per_host),
-        mock.patch.object(torch.cuda, "current_device", return_value=0),
-        mock.patch.object(
-            fabric,
-            "group_has_fabric",
-            side_effect=lambda group_ranks: seen.append(list(group_ranks)) or False,
-        ),
-    ):
-        assert tail.multicast_reachable(asked) is not probed
+    saved = fabric._host_map
+    fabric._host_map = [rank // per_host for rank in range(max(ranks) + 1)]
+    try:
+        with (
+            mock.patch.object(tail.dist, "is_initialized", return_value=True),
+            mock.patch.object(
+                tail.dist, "get_process_group_ranks", side_effect=only_this_group
+            ),
+            mock.patch.object(torch.cuda, "device_count", return_value=8),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(
+                fabric,
+                "group_has_fabric",
+                side_effect=lambda group_ranks: seen.append(list(group_ranks)) or False,
+            ),
+        ):
+            assert tail.multicast_reachable(asked) is not probed
+    finally:
+        fabric._host_map = saved
     assert bool(seen) is probed
     if probed:
         assert seen == [ranks]
@@ -272,34 +278,62 @@ def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
     import tokenspeed_kernel.ops.moe.latent_tail as tail
 
     seen: list[list[int]] = []
-    with (
-        mock.patch.object(tail.dist, "is_initialized", return_value=True),
-        mock.patch.object(
-            tail.dist, "get_process_group_ranks", return_value=list(range(8))
-        ),
-        mock.patch.object(torch.cuda, "device_count", return_value=per_host),
-        mock.patch.object(torch.cuda, "current_device", return_value=0),
-        mock.patch.object(
-            fabric,
-            "group_has_fabric",
-            side_effect=lambda ranks: seen.append(list(ranks)) or False,
-        ),
-    ):
-        assert tail.multicast_reachable() is not probed
+    saved = fabric._host_map
+    fabric._host_map = [rank // per_host for rank in range(8)]
+    try:
+        # Uninitialised, ``dist.group.WORLD`` is None, so a gate that forwards
+        # None unchanged is indistinguishable from one that resolves the world
+        # group. ``WORLD`` is a property on the metaclass, so give it a value
+        # there and the two become different arguments.
+        world = mock.Mock(name="WORLD")
+        with (
+            mock.patch.object(type(tail.dist.group), "WORLD", world),
+            mock.patch.object(tail.dist, "is_initialized", return_value=True),
+            mock.patch.object(
+                tail.dist, "get_process_group_ranks", return_value=list(range(8))
+            ) as ranks_of,
+            mock.patch.object(torch.cuda, "device_count", return_value=8),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(
+                fabric,
+                "group_has_fabric",
+                side_effect=lambda ranks: seen.append(list(ranks)) or False,
+            ),
+        ):
+            assert tail.multicast_reachable() is not probed
+            # Passing ``None`` straight through reads the same here and
+            # raises in real torch, so the argument is the assertion.
+            ranks_of.assert_called_once_with(world)
+    finally:
+        fabric._host_map = saved
     assert bool(seen) is probed
 
 
-def test_no_visible_device_declines_rather_than_dividing_by_zero() -> None:
-    """Both directions matter: the permissive answer also passed before."""
+def test_an_ungathered_map_declines_rather_than_guessing_placement() -> None:
+    """Both directions matter: the permissive answer also passed before.
+
+    Without the map there is nothing to place ranks with, and the gate cannot
+    reach for the device count instead -- that is the divisor this replaced.
+    Declining costs a fallback; admitting costs the rendezvous it hangs in.
+    """
     from unittest import mock
 
+    import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.moe.latent_tail as tail
 
-    with (
-        mock.patch.object(tail.dist, "is_initialized", return_value=True),
-        mock.patch.object(torch.cuda, "device_count", return_value=0),
-    ):
-        assert tail.multicast_reachable(mock.Mock()) is False
+    saved = fabric._host_map
+    fabric._host_map = None
+    try:
+        with (
+            mock.patch.object(tail.dist, "is_initialized", return_value=True),
+            mock.patch.object(
+                tail.dist, "get_process_group_ranks", return_value=list(range(8))
+            ),
+            mock.patch.object(torch.cuda, "device_count", return_value=8),
+        ):
+            assert tail.multicast_reachable(mock.Mock()) is False
+    finally:
+        fabric._host_map = saved
 
 
 def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
@@ -333,8 +367,131 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
         ):
             assert fabric.gather_fabric_map() == [False] * 8
             assert fabric.group_has_fabric([0, 1]) is False
+            # Distinct hosts, so every span declines rather than being admitted
+            # as node-local on a platform that has no fabric to map.
+            assert fabric.group_host_span([0, 1]) == 2
     finally:
         fabric._fabric_map = None
+        fabric._host_map = None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gather needs a device")
+def test_the_gather_keeps_every_rank_its_own_host() -> None:
+    """Losing the host id in transit makes the whole world look like one host.
+
+    That is the permissive direction: every group then reads node-local, skips
+    the fabric test, and the rendezvous hangs -- the failure the map exists to
+    prevent. Setting the map by hand, as the gate tests do, cannot see this.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    def two_hosts(gathered, local, group=None):
+        # Rank zero gets its own payload back, so what the gather *packs* is
+        # checked and not only what it decodes: a call site packing a constant
+        # leaves every decoded host identical and nothing else would see it.
+        assert local[1].item() == 100, "the host id never reached the payload"
+        gathered[0].copy_(local)
+        for rank, slot in enumerate(gathered[1:], start=1):
+            slot.copy_(torch.tensor([1, 100 + rank // 2], dtype=torch.int64))
+
+    fabric._fabric_map = None
+    fabric._host_map = None
+    try:
+        with (
+            mock.patch.object(
+                fabric, "current_platform", return_value=mock.Mock(is_nvidia=True)
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "get_world_size", return_value=4
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "all_gather", side_effect=two_hosts
+            ),
+            mock.patch.object(fabric, "fabric_allocation_supported", return_value=True),
+            mock.patch.object(
+                fabric, "_host_identity", return_value=100
+            ) as host_identity,
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            assert fabric.gather_fabric_map() == [True] * 4
+            # The value alone is satisfied by a literal 100 at the call site;
+            # this pins that the packed word came from the function.
+            host_identity.assert_called_once_with()
+            assert fabric.group_host_span([0, 1]) == 1
+            assert fabric.group_host_span([0, 2]) == 2
+    finally:
+        fabric._fabric_map = None
+        fabric._host_map = None
+
+
+def test_the_host_id_is_stable_across_processes() -> None:
+    """A salted hash gives each rank a different id for the same host.
+
+    ``hash()`` is seeded per process, so ranks on one host would look like as
+    many hosts as there are ranks. Every group would then span, the path would
+    decline everywhere instead of hanging anywhere, and nothing would fail --
+    which is the failure that hides longest.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from tokenspeed_kernel.ops.communication.fabric import _host_identity
+
+    here = _host_identity()
+    # int64 is what the gather carries it in; a wider id would wrap to another
+    # host's value and merge two machines.
+    assert 0 <= here < 2**63
+
+    elsewhere = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tokenspeed_kernel.ops.communication.fabric import _host_identity;"
+            "print(_host_identity())",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "PYTHONHASHSEED": "12345"},
+    ).stdout.strip()
+    assert int(elsewhere) == here, "the host id depends on the process hash seed"
+
+
+def test_two_hosts_do_not_share_one_identity() -> None:
+    """Stability alone is satisfied by a constant, which merges every host.
+
+    A constant id is the permissive direction again: one host, no fabric test,
+    and the rendezvous the map exists to keep the group out of.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    identities = []
+    for boot in ("11111111-1111-1111-1111-111111111111", "22222222-2222"):
+        with mock.patch.object(fabric.Path, "read_text", return_value=boot):
+            identities.append(fabric._host_identity())
+    assert len(set(identities)) == 2
+
+
+def test_a_high_digest_bit_still_fits_the_gathered_int64() -> None:
+    """Asserting the range on this host's own digest is a coin flip.
+
+    Half of all digests leave the top bit clear, so dropping the reduction
+    passes wherever the test happens to run and fails later on a host whose
+    digest does not.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    with mock.patch.object(
+        fabric.hashlib, "blake2b", return_value=mock.Mock(digest=lambda: b"\xff" * 8)
+    ):
+        assert fabric._host_identity() < 2**63
 
 
 def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
@@ -352,12 +509,15 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
     saved = fabric._fabric_map
     fabric._fabric_map = None
     try:
-        with mock.patch.object(
-            fabric.torch.distributed,
-            "all_gather",
-            side_effect=AssertionError("must not gather from dispatch"),
-        ), mock.patch.object(
-            fabric.torch.distributed, "get_world_size", return_value=8
+        with (
+            mock.patch.object(
+                fabric.torch.distributed,
+                "all_gather",
+                side_effect=AssertionError("must not gather from dispatch"),
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "get_world_size", return_value=8
+            ),
         ):
             with pytest.raises(RuntimeError, match="never gathered"):
                 fabric.group_has_fabric([0, 1])

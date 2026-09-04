@@ -98,27 +98,31 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     Size alone does not establish node-locality, and neither does alignment to
     the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
     and starts on a multiple of three while still living on two hosts. What
-    decides it is whether every rank falls in the same host-sized window, which
-    is the test the other two reachability gates already use -- only the divisor
-    differs, since this package sees the device count rather than the launcher's
-    placement.
+    decides it is which host each rank sits on, which the world map records
+    beside the fabric verdict. Nothing is divided out of the visible device
+    count here: a job running fewer workers than a host has GPUs puts two hosts
+    inside one such window, and the group would skip the fabric test entirely.
 
-    Fabric verdicts for spanning groups come from the world map gathered at
-    distributed initialization, so every rank makes the same local decision.
+    Both terms come from the map gathered at distributed initialization, so
+    every rank makes the same local decision, and a map never gathered declines
+    rather than guessing at placement.
     """
     import torch.distributed as dist
-    from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+    from tokenspeed_kernel.ops.communication.fabric import (
+        group_has_fabric,
+        group_host_span,
+    )
 
     if not dist.is_initialized():
-        return False
-    per_host = torch.cuda.device_count()
-    if per_host <= 0:
         return False
     # ``None`` is the default group and has to be tested like any other.
     ranks = dist.get_process_group_ranks(
         group if group is not None else dist.group.WORLD
     )
-    if len({rank // per_host for rank in ranks}) <= 1:
+    span = group_host_span(ranks)
+    if span is None:
+        return False
+    if span <= 1:
         return True
     return group_has_fabric(ranks)
 
