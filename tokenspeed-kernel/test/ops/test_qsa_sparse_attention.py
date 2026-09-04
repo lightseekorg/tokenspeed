@@ -30,6 +30,7 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
+    _FlashInferQSASparseRunner,
     get_flashinfer_qsa_sparse_runner,
 )
 
@@ -371,6 +372,13 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         (0.5, 0.25) if cache_dtype is torch.float8_e4m3fn else (None, None)
     )
     runner = get_flashinfer_qsa_sparse_runner(q.device)
+    plan = runner.plan(
+        q,
+        k_cache,
+        v_cache,
+        width,
+        softmax_scale=scale,
+    )
 
     first = qsa_sparse_attention(
         q,
@@ -384,7 +392,6 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         override=None,
         solution="flashinfer",
     )
-    planned = runner.plan_count
     selected[:, :256] = torch.randint(
         1, cache_slots, (rows, 256), dtype=torch.int32, device=device
     )
@@ -403,7 +410,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         solution="flashinfer",
     )
 
-    assert runner.plan_count == planned
+    assert runner.plan(q, k_cache, v_cache, width, softmax_scale=scale) is plan
     assert torch.isfinite(first).all()
     torch.testing.assert_close(
         second.float(),
@@ -419,6 +426,40 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         rtol=3.5e-2,
         atol=3.5e-2,
     )
+
+
+def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version < ArchVersion(8, 0):
+        pytest.skip("FlashInfer FA2 QSA requires NVIDIA Ampere or newer")
+    pytest.importorskip("flashinfer.sparse")
+
+    rows, width, head_dim = 4, 33, 64
+    q = torch.randn(rows, 4, head_dim, dtype=torch.bfloat16, device=device)
+    cache = torch.randn(64, 1, head_dim, dtype=torch.bfloat16, device=device)
+    runner = _FlashInferQSASparseRunner(q.device)
+
+    one = runner.plan(
+        q[:1],
+        cache,
+        cache,
+        width,
+        softmax_scale=0.125,
+        metadata_capacity_rows=rows,
+    )
+    fixed_buffer_ptr = one.indices.data_ptr()
+    assert one.indices.untyped_storage().nbytes() >= rows * width * 4
+    four = runner.plan(q, cache, cache, width, softmax_scale=0.125)
+    assert four.indices.data_ptr() == fixed_buffer_ptr
+
+    two = runner.plan(q[:2], cache, cache, width, softmax_scale=0.125)
+    assert two.indices.data_ptr() == fixed_buffer_ptr
+    assert four.wrapper._int_workspace_buffer.numel() < 8 * 1024 * 1024
+    assert four.wrapper._pin_memory_int_workspace_buffer.numel() == 0
+
+    again = runner.plan(q[:1], cache, cache, width, softmax_scale=0.125)
+    assert again is one
+    assert again.indices.data_ptr() == fixed_buffer_ptr
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -450,6 +491,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_supports_graph_replay(
     kwargs = {
         "scale": scale,
         "max_seqlen_q": 1,
+        "metadata_capacity_rows": 2,
         "k_scale": k_scale,
         "v_scale": v_scale,
         "override": None,
@@ -461,6 +503,20 @@ def test_qsa_sparse_attention_flashinfer_fa2_supports_graph_replay(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+
+    # Replan the mutable runner for another row count. The directly captured
+    # plan must keep its own pointer-stable storage for later replay.
+    other_q = torch.randn(2, 6, 256, device=device, dtype=torch.bfloat16)
+    other_selected = torch.randint(
+        1, cache_slots, (2, width), device=device, dtype=torch.int32
+    )
+    qsa_sparse_attention(
+        other_q,
+        k_cache,
+        v_cache,
+        other_selected,
+        **kwargs,
+    )
 
     replay_query = torch.randn_like(q)
     q.copy_(replay_query)

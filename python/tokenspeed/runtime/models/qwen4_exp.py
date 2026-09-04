@@ -437,7 +437,6 @@ class Qwen4ExpAttentionDecoderLayer(
 
             self.indexer = QSAIndexer(
                 config=config,
-                mapping=mapping,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("indexer", prefix),

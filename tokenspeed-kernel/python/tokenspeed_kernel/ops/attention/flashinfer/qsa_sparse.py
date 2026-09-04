@@ -130,7 +130,41 @@ _FP8_SIGNATURE = format_signature(
 )
 
 
-def _flashinfer_fa2_qsa_sparse_attention(
+@register_kernel(
+    "attention",
+    "qsa_sparse_attention",
+    name="flashinfer_fa2_qsa_sparse_attention",
+    solution="flashinfer",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(8, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset({_BF16_SIGNATURE}),
+    traits={
+        "head_dim": _SUPPORTED_HEAD_DIMS,
+        "value_head_dim": _SUPPORTED_HEAD_DIMS,
+    },
+    priority=Priority.PERFORMANT,
+    tags={"fallback", "fa2", "sparse"},
+)
+@register_kernel(
+    "attention",
+    "qsa_sparse_attention",
+    name="flashinfer_fa2_fp8_qsa_sparse_attention",
+    solution="flashinfer",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset({_FP8_SIGNATURE}),
+    traits={
+        "head_dim": _SUPPORTED_HEAD_DIMS,
+        "value_head_dim": _SUPPORTED_HEAD_DIMS,
+    },
+    priority=Priority.PERFORMANT,
+    tags={"fallback", "fa2", "fp8", "sparse"},
+)
+def flashinfer_fa2_qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -138,9 +172,12 @@ def _flashinfer_fa2_qsa_sparse_attention(
     *,
     scale: float,
     max_seqlen_q: int,
+    metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
+    """Run the BF16 or FP8-cache NVIDIA QSA fallback with FlashInfer FA2."""
+
     del max_seqlen_q  # Each selected-slot row is an independent FA2 query row.
 
     runner = get_flashinfer_qsa_sparse_runner(q.device)
@@ -150,6 +187,7 @@ def _flashinfer_fa2_qsa_sparse_attention(
         v_cache,
         selected_slots.shape[1],
         softmax_scale=scale,
+        metadata_capacity_rows=metadata_capacity_rows,
     )
     use_pdl = pdl_enabled()
     _prepare_flashinfer_qsa_metadata(
@@ -169,91 +207,4 @@ def _flashinfer_fa2_qsa_sparse_attention(
     )
 
 
-@register_kernel(
-    "attention",
-    "qsa_sparse_attention",
-    name="flashinfer_fa2_qsa_sparse_attention",
-    solution="flashinfer",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(8, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset({_BF16_SIGNATURE}),
-    traits={
-        "head_dim": _SUPPORTED_HEAD_DIMS,
-        "value_head_dim": _SUPPORTED_HEAD_DIMS,
-    },
-    priority=Priority.PERFORMANT,
-    tags={"fallback", "fa2", "sparse"},
-)
-def flashinfer_fa2_qsa_sparse_attention(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    selected_slots: torch.Tensor,
-    *,
-    scale: float,
-    max_seqlen_q: int,
-    k_scale: float | torch.Tensor | None,
-    v_scale: float | torch.Tensor | None,
-) -> torch.Tensor:
-    """Run the portable NVIDIA QSA fallback with FlashInfer FA2."""
-
-    return _flashinfer_fa2_qsa_sparse_attention(
-        q,
-        k_cache,
-        v_cache,
-        selected_slots,
-        scale=scale,
-        max_seqlen_q=max_seqlen_q,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-
-
-@register_kernel(
-    "attention",
-    "qsa_sparse_attention",
-    name="flashinfer_fa2_fp8_qsa_sparse_attention",
-    solution="flashinfer",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset({_FP8_SIGNATURE}),
-    traits={
-        "head_dim": _SUPPORTED_HEAD_DIMS,
-        "value_head_dim": _SUPPORTED_HEAD_DIMS,
-    },
-    priority=Priority.PERFORMANT,
-    tags={"fallback", "fa2", "fp8", "sparse"},
-)
-def flashinfer_fa2_fp8_qsa_sparse_attention(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    selected_slots: torch.Tensor,
-    *,
-    scale: float,
-    max_seqlen_q: int,
-    k_scale: float | torch.Tensor | None,
-    v_scale: float | torch.Tensor | None,
-) -> torch.Tensor:
-    """Run the FP8-cache QSA fallback with FlashInfer FA2."""
-
-    return _flashinfer_fa2_qsa_sparse_attention(
-        q,
-        k_cache,
-        v_cache,
-        selected_slots,
-        scale=scale,
-        max_seqlen_q=max_seqlen_q,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
-
-
-__all__ = [
-    "flashinfer_fa2_fp8_qsa_sparse_attention",
-    "flashinfer_fa2_qsa_sparse_attention",
-]
+__all__ = ["flashinfer_fa2_qsa_sparse_attention"]

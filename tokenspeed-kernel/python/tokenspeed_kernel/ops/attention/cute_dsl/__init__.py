@@ -27,15 +27,10 @@ from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
 from tokenspeed_kernel.registry import error_fn
 
 try:
-    from tokenspeed_kernel.ops.attention.cute_dsl.qsa_sparse import (
-        cute_dsl_blackwell_qsa_sparse_attention,
-    )
-
-    HAS_QSA_SPARSE = True
+    import tokenspeed_kernel.ops.attention.cute_dsl.qsa_sparse  # noqa: F401
 except ImportError:
     # Keep importing the attention package when CuTe DSL is unavailable.
-    cute_dsl_blackwell_qsa_sparse_attention = error_fn
-    HAS_QSA_SPARSE = False
+    pass
 
 try:
     from tokenspeed_kernel.ops.attention.cute_dsl import rel_mha
@@ -72,11 +67,9 @@ __all__ = [
     "FlashAttentionDecodeSm100Bias",
     "FlashAttentionForwardCombine",
     "FlashAttentionForwardSm100",
-    "HAS_QSA_SPARSE",
     "HAS_REL_MHA",
     "ShearingBias",
     "create_mxfp8_scale_factor_tensor",
-    "cute_dsl_blackwell_qsa_sparse_attention",
     "cute_dsl_decode_topk",
     "has_cute_dsl_decode_topk",
     "rel_decode",

@@ -62,21 +62,13 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     @cached_property
     def _text_config(self):
-        return getattr(
-            self.model_config.hf_config,
-            "text_config",
-            self.model_config.hf_config,
-        )
+        return self.model_config.hf_text_config
 
     @cached_property
     def _draft_text_config(self):
         if self.draft_model_config is None:
             return None
-        return getattr(
-            self.draft_model_config.hf_config,
-            "text_config",
-            self.draft_model_config.hf_config,
-        )
+        return self.draft_model_config.hf_text_config
 
     @property
     @override

@@ -37,206 +37,6 @@ _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
-@triton.heuristics(
-    {
-        "BLOCK_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_H": lambda args: triton.next_power_of_2(args["num_heads"]),
-    }
-)
-@triton.jit
-def _qwen4_exp_qsa_mqa_scores_kernel(
-    query,
-    key_cache,
-    key_slots,
-    valid_counts,
-    output,
-    num_heads,
-    head_dim,
-    stride_q_n,
-    stride_q_h,
-    stride_q_d,
-    stride_k_n,
-    stride_k_d,
-    stride_s_n,
-    stride_s_k,
-    stride_vc_n,
-    stride_o_n,
-    stride_o_k,
-    NUM_KEYS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    key_block = tl.program_id(1)
-    key_offsets = key_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    head_offsets = tl.arange(0, BLOCK_H)
-    dim_offsets = tl.arange(0, BLOCK_D)
-    head_mask = head_offsets < num_heads
-    dim_mask = dim_offsets < head_dim
-    key_mask = key_offsets < tl.load(valid_counts + row * stride_vc_n)
-    slots = tl.load(
-        key_slots + row * stride_s_n + key_offsets * stride_s_k,
-        mask=key_offsets < NUM_KEYS,
-        other=0,
-    ).to(tl.int64)
-    query_values = tl.load(
-        query
-        + row * stride_q_n
-        + head_offsets[:, None] * stride_q_h
-        + dim_offsets[None, :] * stride_q_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-    key_values = tl.load(
-        key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
-        mask=dim_mask[:, None] & key_mask[None, :],
-        other=0.0,
-    )
-    scores = tl.dot(query_values, key_values, out_dtype=tl.float32)
-    scores = tl.maximum(scores, 0.0)
-    scores = tl.sum(tl.where(head_mask[:, None], scores, 0.0), axis=0)
-    # Every key column is stored, so the invalid tail carries -inf in-kernel
-    # instead of relying on a separate fill of the output buffer.
-    scores = tl.where(key_mask, scores, -float("inf"))
-    tl.store(
-        output + row * stride_o_n + key_offsets * stride_o_k,
-        scores,
-        mask=key_offsets < NUM_KEYS,
-    )
-
-
-def qwen4_exp_qsa_mqa_scores(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    key_slots: torch.Tensor,
-    valid_counts: torch.Tensor,
-) -> torch.Tensor:
-    """Score compressed QSA keys with the weight-free MQA indexer."""
-
-    if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA scoring expects rank-three Q and K tensors")
-    if key_cache.shape[1] != 1 or query.shape[2] != key_cache.shape[2]:
-        raise ValueError("Qwen4-Exp QSA scoring requires one matching KV index head")
-    if key_slots.ndim != 2 or key_slots.shape[0] != query.shape[0]:
-        raise ValueError("Qwen4-Exp QSA key slots must have one row per query")
-    rows, num_keys = key_slots.shape
-    # The scoring kernel writes every column including the -inf invalid
-    # tail, so the buffer starts uninitialized.
-    output = torch.empty((rows, num_keys), dtype=torch.float32, device=query.device)
-    if rows == 0 or num_keys == 0:
-        return output
-    # Strided reads and in-kernel casts keep the launch free of host-side
-    # copy/cast kernels; ``.to`` only enforces the device.
-    key_slots = key_slots.to(device=query.device)
-    valid_counts = valid_counts.to(device=query.device)
-    _qwen4_exp_qsa_mqa_scores_kernel[(rows, triton.cdiv(num_keys, 64))](
-        query,
-        key_cache,
-        key_slots,
-        valid_counts,
-        output,
-        query.shape[1],
-        query.shape[2],
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        key_cache.stride(0),
-        key_cache.stride(2),
-        key_slots.stride(0),
-        key_slots.stride(1),
-        valid_counts.stride(0),
-        output.stride(0),
-        output.stride(1),
-        NUM_KEYS=num_keys,
-        BLOCK_N=64,
-        num_warps=4,
-        num_stages=2,
-    )
-    return output
-
-
-@triton.jit
-def _qwen4_exp_qsa_logical_layout_kernel(
-    seq_lens,
-    query_lengths,
-    positions,
-    requests,
-    uniform_len,
-    stride_seq_b,
-    stride_len_b,
-    HAS_UNIFORM: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0)
-    if HAS_UNIFORM:
-        length = tl.full((), uniform_len, tl.int64)
-        start = request.to(tl.int64) * uniform_len
-    else:
-        length = tl.load(query_lengths + request * stride_len_b).to(tl.int64)
-        start = tl.zeros((), dtype=tl.int64)
-        for other in range(0, request):
-            start += tl.load(query_lengths + other * stride_len_b).to(tl.int64)
-    base = tl.load(seq_lens + request * stride_seq_b).to(tl.int64) - length
-    for offset in range(0, length, BLOCK):
-        slots = offset + tl.arange(0, BLOCK)
-        mask = slots < length
-        rows = start + slots
-        values = base + slots
-        tl.store(positions + rows, values, mask=mask)
-        tl.store(requests + rows, tl.full((BLOCK,), request, tl.int64), mask=mask)
-
-
-def qwen4_exp_qsa_logical_layout(
-    seq_lens: torch.Tensor,
-    query_lengths: torch.Tensor | int,
-    total_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand per-request sequence geometry into per-token layout vectors.
-
-    One kernel replaces the repeat-interleave/cumsum chain used to derive
-    logical positions and request ids for flattened batches.
-
-    Args:
-        seq_lens: Cached sequence length per request.
-        query_lengths: Tokens contributed by each request in this step,
-            either a per-request tensor (read in place, any int dtype) or a
-            Python int when every request contributes the same length.
-        total_tokens: Number of flattened token rows to materialize.
-
-    Returns:
-        ``(positions, requests)`` int64 tensors shaped ``[total_tokens]``.
-    """
-
-    device = seq_lens.device
-    positions = torch.empty((total_tokens,), dtype=torch.int64, device=device)
-    requests = torch.empty((total_tokens,), dtype=torch.int64, device=device)
-    batch = seq_lens.shape[0]
-    if total_tokens and batch:
-        if isinstance(query_lengths, int):
-            uniform_len = int(query_lengths)
-            lengths_arg = seq_lens
-            stride_len_b = 0
-            has_uniform = True
-        else:
-            uniform_len = 0
-            lengths_arg = query_lengths
-            stride_len_b = query_lengths.stride(0)
-            has_uniform = False
-        _qwen4_exp_qsa_logical_layout_kernel[(batch,)](
-            seq_lens,
-            lengths_arg,
-            positions,
-            requests,
-            uniform_len,
-            seq_lens.stride(0),
-            stride_len_b,
-            HAS_UNIFORM=has_uniform,
-            BLOCK=128,
-        )
-    return positions, requests
-
-
 @triton.jit
 def _qwen4_exp_qsa_prepare_metadata_kernel(
     seq_lens,
@@ -248,24 +48,19 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     qsa_locs,
     recent_locs,
     complete_blocks,
-    write_mask,
-    accept_lengths,
     draft_logical_positions,
     uniform_len,
     qsa_expansion,
     qsa_page_size,
     recent_expansion,
     recent_page_size,
-    num_extends,
     stride_seq_b,
     stride_len_b,
     stride_qsa_pt_b,
     stride_recent_pt_b,
-    stride_accept_b,
     stride_dlp_r,
     stride_dlp_s,
     HAS_UNIFORM: tl.constexpr,
-    HAS_ACCEPT_MASK: tl.constexpr,
     RESET_DRAFT_TAGS: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     RESET_BLOCK: tl.constexpr,
@@ -292,9 +87,6 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         )
 
     base = tl.load(seq_lens + request * stride_seq_b).to(tl.int64) - length
-    accepted = tl.zeros((), dtype=tl.int64)
-    if HAS_ACCEPT_MASK:
-        accepted = tl.load(accept_lengths + request * stride_accept_b).to(tl.int64)
     for offset in range(0, length, BLOCK):
         row_offsets = offset + tl.arange(0, BLOCK)
         mask = row_offsets < length
@@ -348,13 +140,6 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
             tl.where(recent_valid, recent_values, 0).to(tl.int32),
             mask=mask,
         )
-        if HAS_ACCEPT_MASK:
-            accepted_row = (request < num_extends) | (row_offsets < accepted)
-            tl.store(
-                write_mask + rows,
-                recent_valid & accepted_row,
-                mask=mask,
-            )
 
 
 def qwen4_exp_qsa_prepare_metadata(
@@ -369,8 +154,6 @@ def qwen4_exp_qsa_prepare_metadata(
     recent_page_size: int,
     compress_ratio: int,
     *,
-    accept_lengths: torch.Tensor | None = None,
-    num_extends: int = 0,
     draft_logical_positions: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -378,14 +161,12 @@ def qwen4_exp_qsa_prepare_metadata(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor | None,
 ]:
     """Build all per-forward QSA row metadata in one launch.
 
     The kernel expands request lengths, maps both QSA cache groups, derives
-    complete compressed-block counts, and optionally emits the accepted draft
-    write mask. Draft scratch tags may be invalidated in the same request CTA
-    so the first MTP step needs no separate fill launch.
+    complete compressed-block counts, and optionally invalidates draft scratch
+    tags in the same request CTA so the first MTP step needs no separate fill.
 
     Args:
         seq_lens: Sequence length per request.
@@ -398,14 +179,12 @@ def qwen4_exp_qsa_prepare_metadata(
         recent_expansion: Consumer pages per recent logical page.
         recent_page_size: Logical tokens covered by a recent page.
         compress_ratio: Raw tokens represented by one compressed key.
-        accept_lengths: Optional accepted verify width per request.
-        num_extends: Requests before this index are non-speculative extends.
         draft_logical_positions: Optional request-local draft tags to reset.
 
     Returns:
         Logical positions, request ids, compressed-cache locations,
-        recent-cache locations, complete-block counts, and an optional boolean
-        accepted-write mask, all with one entry per flattened query row.
+        recent-cache locations and complete-block counts, all with one entry
+        per flattened query row.
     """
 
     batch = seq_lens.shape[0]
@@ -417,13 +196,8 @@ def qwen4_exp_qsa_prepare_metadata(
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
     )
-    write_mask = (
-        None
-        if accept_lengths is None
-        else torch.empty((total_tokens,), dtype=torch.bool, device=device)
-    )
     if not total_tokens or not batch:
-        return (*outputs, write_mask)
+        return outputs
     if isinstance(query_lengths, int):
         uniform_len = int(query_lengths)
         lengths_arg = seq_lens
@@ -438,14 +212,6 @@ def qwen4_exp_qsa_prepare_metadata(
         lengths_arg = query_lengths
         stride_len_b = query_lengths.stride(0)
         has_uniform = False
-    if accept_lengths is None:
-        accept_arg = seq_lens
-        stride_accept_b = 0
-    else:
-        if accept_lengths.shape[0] < batch:
-            raise ValueError("QSA accept lengths need one entry per request")
-        accept_arg = accept_lengths
-        stride_accept_b = accept_lengths.stride(0)
     if draft_logical_positions is None:
         draft_arg = outputs[0]
         stride_dlp_r = stride_dlp_s = 0
@@ -455,167 +221,31 @@ def qwen4_exp_qsa_prepare_metadata(
         draft_arg = draft_logical_positions
         stride_dlp_r = draft_logical_positions.stride(0)
         stride_dlp_s = draft_logical_positions.stride(1)
-    mask_arg = outputs[0] if write_mask is None else write_mask
     _qwen4_exp_qsa_prepare_metadata_kernel[(batch,)](
         seq_lens,
         lengths_arg,
         qsa_page_table,
         recent_page_table,
         *outputs,
-        mask_arg,
-        accept_arg,
         draft_arg,
         uniform_len,
         qsa_expansion,
         qsa_page_size,
         recent_expansion,
         recent_page_size,
-        num_extends,
         seq_lens.stride(0),
         stride_len_b,
         qsa_page_table.stride(0),
         recent_page_table.stride(0),
-        stride_accept_b,
         stride_dlp_r,
         stride_dlp_s,
         HAS_UNIFORM=has_uniform,
-        HAS_ACCEPT_MASK=write_mask is not None,
         RESET_DRAFT_TAGS=draft_logical_positions is not None,
         COMPRESS_RATIO=compress_ratio,
         RESET_BLOCK=triton.next_power_of_2(compress_ratio),
         BLOCK=128,
     )
-    return (*outputs, write_mask)
-
-
-@triton.jit
-def _qwen4_exp_qsa_group_cache_locs_kernel(
-    logical_positions,
-    request_indices,
-    qsa_page_table,
-    qsa_expansion,
-    qsa_page_size,
-    recent_page_table,
-    recent_expansion,
-    recent_page_size,
-    qsa_locs,
-    recent_locs,
-    complete_blocks,
-    compress_ratio,
-    rows,
-    stride_qsa_pt_b,
-    stride_recent_pt_b,
-    BLOCK: tl.constexpr,
-):
-    block = tl.program_id(0)
-    row_ids = block * BLOCK + tl.arange(0, BLOCK)
-    mask = row_ids < rows
-    positions = tl.load(logical_positions + row_ids, mask=mask, other=0).to(tl.int64)
-    requests = tl.load(request_indices + row_ids, mask=mask, other=0).to(tl.int64)
-    valid = positions >= 0
-    safe_positions = tl.maximum(positions, 0)
-    # Complete compressed blocks before each row ride along for free: both
-    # outputs are per-row functions of the same logical position vector.
-    counts = (positions + 1) // compress_ratio
-    tl.store(complete_blocks + row_ids, counts.to(tl.int32), mask=mask)
-    # Compressed group: the backend page table is stored at consumer
-    # granularity, so undo the expansion inline (entry ``col * expansion``
-    # holds ``expansion`` consumer pages of one logical page).
-    qsa_columns = safe_positions // qsa_page_size
-    qsa_pages = tl.load(
-        qsa_page_table + requests * stride_qsa_pt_b + qsa_columns * qsa_expansion,
-        mask=mask & valid,
-        other=0,
-    ).to(tl.int64)
-    qsa_pages = qsa_pages // qsa_expansion
-    qsa_values = qsa_pages * qsa_page_size + safe_positions % qsa_page_size
-    tl.store(
-        qsa_locs + row_ids,
-        tl.where(valid & (qsa_pages > 0), qsa_values, 0).to(tl.int32),
-        mask=mask,
-    )
-    # Recent raw group, same expansion reversal with its own geometry.
-    recent_columns = safe_positions // recent_page_size
-    recent_pages = tl.load(
-        recent_page_table
-        + requests * stride_recent_pt_b
-        + recent_columns * recent_expansion,
-        mask=mask & valid,
-        other=0,
-    ).to(tl.int64)
-    recent_pages = recent_pages // recent_expansion
-    recent_values = recent_pages * recent_page_size + safe_positions % recent_page_size
-    tl.store(
-        recent_locs + row_ids,
-        tl.where(valid & (recent_pages > 0), recent_values, 0).to(tl.int32),
-        mask=mask,
-    )
-
-
-def qwen4_exp_qsa_group_cache_locs(
-    logical_positions: torch.Tensor,
-    request_indices: torch.Tensor,
-    qsa_page_table: torch.Tensor,
-    qsa_expansion: int,
-    qsa_page_size: int,
-    recent_page_table: torch.Tensor,
-    recent_expansion: int,
-    recent_page_size: int,
-    compress_ratio: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Map flattened token positions into both QSA cache groups at once.
-
-    Reads the backend page tables at consumer granularity and reverses the
-    logical-to-kernel expansion in-kernel, so no reconstructed page table is
-    materialized. The per-row complete compressed-block counts share the
-    same position vector, so they are fused into this single launch instead
-    instead of requiring a separate complete-block-count launch.
-
-    Args:
-        logical_positions: Absolute logical position per token row.
-        request_indices: Owning request id per token row.
-        qsa_page_table: Compressed-group page table shaped
-            ``[requests, max_pages]`` at consumer granularity.
-        qsa_expansion: Consumer pages covered by one compressed logical page.
-        qsa_page_size: Logical tokens covered by one compressed page.
-        recent_page_table: Recent-group page table shaped
-            ``[requests, max_pages]`` at consumer granularity.
-        recent_expansion: Consumer pages covered by one recent logical page.
-        recent_page_size: Logical tokens covered by one recent page.
-        compress_ratio: Tokens grouped into one compressed block; used for
-            the fused complete-block counts.
-
-    Returns:
-        ``(qsa_locs, recent_locs, complete_blocks)`` int32 slot vectors plus
-        int32 complete-block counts; rows with negative positions or
-        unallocated pages map to zero.
-    """
-
-    rows = logical_positions.shape[0]
-    device = logical_positions.device
-    qsa_locs = torch.empty((rows,), dtype=torch.int32, device=device)
-    recent_locs = torch.empty((rows,), dtype=torch.int32, device=device)
-    complete_blocks = torch.empty((rows,), dtype=torch.int32, device=device)
-    if rows:
-        _qwen4_exp_qsa_group_cache_locs_kernel[(triton.cdiv(rows, 256),)](
-            logical_positions,
-            request_indices,
-            qsa_page_table,
-            qsa_expansion,
-            qsa_page_size,
-            recent_page_table,
-            recent_expansion,
-            recent_page_size,
-            qsa_locs,
-            recent_locs,
-            complete_blocks,
-            compress_ratio,
-            rows,
-            qsa_page_table.stride(0),
-            recent_page_table.stride(0),
-            BLOCK=256,
-        )
-    return qsa_locs, recent_locs, complete_blocks
+    return outputs
 
 
 @triton.jit
@@ -2272,173 +1902,10 @@ def qwen4_exp_qsa_selected_slots(
     return output
 
 
-@triton.jit
-def _qwen4_exp_qsa_rope_kernel(
-    inputs,
-    positions,
-    cos_sin_cache,
-    outputs,
-    rotary_dim,
-    num_heads,
-    head_dim,
-    section0,
-    section1,
-    section2,
-    stride_x_n,
-    stride_x_h,
-    stride_x_d,
-    stride_p_axis,
-    stride_p_row,
-    stride_c_n,
-    stride_o_n,
-    stride_o_h,
-    POS_3D: tl.constexpr,
-    HAS_SECTIONS: tl.constexpr,
-    INTERLEAVED: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    half = rotary_dim // 2
-    p0 = tl.load(positions + row * stride_p_row).to(tl.int64)
-    if POS_3D:
-        p1 = tl.load(positions + stride_p_axis + row * stride_p_row).to(tl.int64)
-        p2 = tl.load(positions + 2 * stride_p_axis + row * stride_p_row).to(tl.int64)
-    else:
-        p1 = p0
-        p2 = p0
-    dim_offsets = tl.arange(0, BLOCK_D)
-    half_mask = dim_offsets < half
-    if HAS_SECTIONS:
-        if INTERLEAVED:
-            axis = tl.where(
-                (dim_offsets % 3 == 1) & (dim_offsets < 3 * section1),
-                1,
-                tl.where((dim_offsets % 3 == 2) & (dim_offsets < 3 * section2), 2, 0),
-            )
-        else:
-            axis = tl.where(
-                dim_offsets < section0,
-                0,
-                tl.where(dim_offsets < section0 + section1, 1, 2),
-            )
-        selected_positions = tl.where(axis == 0, p0, tl.where(axis == 1, p1, p2))
-    else:
-        selected_positions = tl.where(half_mask, p0, 0)
-    cos = tl.load(
-        cos_sin_cache + selected_positions * stride_c_n + dim_offsets,
-        mask=half_mask,
-        other=0.0,
-    ).to(tl.float32)
-    sin = tl.load(
-        cos_sin_cache + selected_positions * stride_c_n + half + dim_offsets,
-        mask=half_mask,
-        other=0.0,
-    ).to(tl.float32)
-    pass_mask = (dim_offsets >= rotary_dim) & (dim_offsets < head_dim)
-    for head in range(0, num_heads):
-        input_row = inputs + row * stride_x_n + head * stride_x_h
-        output_row = outputs + row * stride_o_n + head * stride_o_h
-        first = tl.load(
-            input_row + dim_offsets * stride_x_d, mask=half_mask, other=0.0
-        ).to(tl.float32)
-        second = tl.load(
-            input_row + (half + dim_offsets) * stride_x_d,
-            mask=half_mask,
-            other=0.0,
-        ).to(tl.float32)
-        tl.store(
-            output_row + dim_offsets,
-            (first * cos - second * sin).to(outputs.dtype.element_ty),
-            mask=half_mask,
-        )
-        tl.store(
-            output_row + half + dim_offsets,
-            (second * cos + first * sin).to(outputs.dtype.element_ty),
-            mask=half_mask,
-        )
-        passthrough = tl.load(
-            input_row + dim_offsets * stride_x_d, mask=pass_mask, other=0.0
-        )
-        tl.store(output_row + dim_offsets, passthrough, mask=pass_mask)
-
-
-def qwen4_exp_qsa_rope(
-    inputs: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    sections: tuple[int, ...] | None = None,
-    interleaved: bool = False,
-) -> torch.Tensor:
-    """Apply neox-style RoPE to indexer tensors in one fused kernel.
-
-    Args:
-        inputs: Tensor shaped ``[tokens, heads, head_dim]``; strided views are
-            read in place.
-        positions: Token positions shaped ``[tokens]`` or ``[3, tokens]`` for
-            multimodal section selection; any integer dtype and layout is
-            read in place.
-        cos_sin_cache: Fused cos/sin table shaped
-            ``[max_positions, rotary_dim]``.
-        sections: Optional multimodal section sizes selecting the position
-            axis per rotary half-dimension.
-        interleaved: Whether multimodal sections are interleaved by axis.
-
-    Returns:
-        Rotated tensor with the same shape and dtype as ``inputs``.
-    """
-
-    if inputs.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA RoPE expects rank-three tensors")
-    rotary_dim = cos_sin_cache.shape[-1]
-    if rotary_dim % 2:
-        raise ValueError("Qwen4-Exp QSA RoPE needs an even rotary dimension")
-    tokens, num_heads, head_dim = inputs.shape
-    # Strided reads with in-kernel casts keep the launch free of host-side
-    # copy/cast kernels; the output is freshly allocated and contiguous.
-    outputs = torch.empty(inputs.shape, dtype=inputs.dtype, device=inputs.device)
-    if not tokens:
-        return outputs
-    if positions.ndim == 2:
-        stride_p_axis = positions.stride(0)
-    else:
-        stride_p_axis = 0
-    stride_p_row = positions.stride(-1)
-    _qwen4_exp_qsa_rope_kernel[(tokens,)](
-        inputs,
-        positions,
-        cos_sin_cache,
-        outputs,
-        rotary_dim,
-        num_heads,
-        head_dim,
-        0 if sections is None else int(sections[0]),
-        0 if sections is None else int(sections[1]),
-        0 if sections is None else int(sections[2]),
-        inputs.stride(0),
-        inputs.stride(1),
-        inputs.stride(2),
-        stride_p_axis,
-        stride_p_row,
-        cos_sin_cache.stride(0),
-        outputs.stride(0),
-        outputs.stride(1),
-        POS_3D=positions.ndim == 2,
-        HAS_SECTIONS=sections is not None,
-        INTERLEAVED=interleaved,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        num_warps=4,
-    )
-    return outputs
-
-
 __all__ = [
     "qwen4_exp_qsa_block_topk",
     "qwen4_exp_qsa_compress_and_store",
-    "qwen4_exp_qsa_group_cache_locs",
-    "qwen4_exp_qsa_logical_layout",
-    "qwen4_exp_qsa_mqa_scores",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
-    "qwen4_exp_qsa_rope",
     "qwen4_exp_qsa_selected_slots",
 ]

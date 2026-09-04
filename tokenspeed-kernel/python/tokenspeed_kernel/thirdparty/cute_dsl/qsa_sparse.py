@@ -54,6 +54,15 @@ cpy_dice = (None,) + mma_dice  # (CPY, #CPY_MMA, #CPY_M, #CPY_K)
 warp_threads = 32
 warpgroup_warps = 4
 warpgroup_threads = 128
+_NUM_HEADS = 6
+_HEAD_DIM = 256
+_GROUPED_HEAD_TILE = 8
+_CONVERT_WARPGROUPS = 2
+_SELECTED_WIDTH = 2051
+_SMALL_MAX_ROWS = 8
+_SMALL_NUM_SPLITS = 8
+_LARGE_NUM_SPLITS = 4
+_COMPILED_KERNELS = {}
 
 # Math helpers
 log2_e = math.log2(math.e)  # change exponential base
@@ -124,23 +133,8 @@ def copy_gmem_to_smem_u128(smem_ptr, gmem_ptr, *, loc=None, ip=None):
 
 
 class MixedInputFusedMultiHeadAttentionDecode:
-    def __init__(
-        self,
-        headdim,
-        block_scaledim,  # headdim per scale factor; scale factor shape is (batches, heads_k, seqlen, headdim / block_scaledim)
-        grouped_head_tile,  # GQA packing tile size, can be less than group size
-        convert_warpgroups=1,  # Multiple warpgroups striding on convert stages
-        kv_splits=4,
-    ):
-        self.headdim = headdim
-        self.grouped_head_tile = grouped_head_tile
-        self.block_scaledim = block_scaledim
-        self.scaledim = headdim // block_scaledim
-        self.convert_warpgroups = convert_warpgroups
+    def __init__(self, kv_splits):
         self.kv_splits = kv_splits
-
-        assert headdim % block_scaledim == 0
-        assert grouped_head_tile % 8 == 0 and 0 < grouped_head_tile <= 32
 
         warpgroup_id = 0
 
@@ -148,9 +142,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
         warpgroup_id += 1
 
         self.cvt_warpgroup_ids = tuple(
-            range(warpgroup_id, warpgroup_id + convert_warpgroups)
+            range(warpgroup_id, warpgroup_id + _CONVERT_WARPGROUPS)
         )
-        warpgroup_id += convert_warpgroups
+        warpgroup_id += _CONVERT_WARPGROUPS
 
         # Why 2 MMA+TMA warps when not MMA bound?
         # Less register pressure per warp promotes concise SASS
@@ -159,28 +153,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # and less register pressure gives more realloc flexibility
         self.mma_kq_warp_id = warpgroup_id * warpgroup_warps + 0
         self.mma_vp_warp_id = warpgroup_id * warpgroup_warps + 1
-        self.tma_kv_warp_id = warpgroup_id * warpgroup_warps + 2
         self.tma_qo_warp_id = warpgroup_id * warpgroup_warps + 3
-        self.mma_tma_warpgroup_id = warpgroup_id
         warpgroup_id += 1
 
         self.threads_per_cta = warpgroup_id * warpgroup_threads
 
-        self.use_reg_reconfig = grouped_head_tile > 16
-        max_regs_per_wg_thread = 64 * 1024 // warpgroup_threads  # 64K regs per SM
-        self.mma_tma_regs = 72
-        self.cvt_regs = 112
-        self.softmax_regs = (
-            max_regs_per_wg_thread
-            - self.mma_tma_regs
-            - self.cvt_regs * convert_warpgroups
-        )
-        self.softmax_regs = max(128, min(256, self.softmax_regs))
-        assert (
-            self.mma_tma_regs + self.softmax_regs + self.cvt_regs * convert_warpgroups
-        ) <= max_regs_per_wg_thread or not self.use_reg_reconfig
-
-        self.bs_stages = 2
         self.sp_stages = 2
         self.o_stages = 1
         self.kv_ring_stages = 2
@@ -334,16 +311,15 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
         # Block tile sets the granularity at which threadblocks consume work
         blk_tile_s = 128
-        blk_tile_h = self.grouped_head_tile
-        blk_tile_d = self.headdim
+        blk_tile_h = _GROUPED_HEAD_TILE
+        blk_tile_d = _HEAD_DIM
         blk_tile_shd = (blk_tile_s, blk_tile_h, blk_tile_d)
 
         # MMA tile sets the granularity at which TMAs + MMAs are issued
         mma_tile_m = 128
-        mma_tile_n = self.grouped_head_tile
-        mma_tile_k = 128 if self.headdim % 128 == 0 else 64
+        mma_tile_n = _GROUPED_HEAD_TILE
+        mma_tile_k = 128
         mma_tile_mnk = (mma_tile_m, mma_tile_n, mma_tile_k)
-        assert self.headdim % mma_tile_k == 0
 
         # GEMM1: (S_K, H_R, D, (H_K, B))
         tiled_mma_kq = sm100_utils.make_trivial_tiled_mma(
@@ -373,19 +349,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.q_stages = blk_tile_d // mma_tile_k
 
         # Perf heuristics
-        cap_kv_stages = k_iter.dtype.width >= 8
-        max_cvt_stages = 4 if self.grouped_head_tile == 32 and mma_tile_k == 128 else 8
-        max_kv_stages = 8 if mma_tile_k == 128 else 14
-
         # Calculate KV tmem stages
         tmem_alloc_cols = mma_tile_n * self.sp_stages
         tmem_alloc_cols += mma_tile_n * self.o_stages * (blk_tile_d // mma_tile_m)
         tmem_capacity = 512
         cvt_stage_cols = mma_tile_k * mma_dtype.width // 32
         self.cvt_stages = (tmem_capacity - tmem_alloc_cols) // cvt_stage_cols
-        self.cvt_stages = (
-            min(self.cvt_stages, max_cvt_stages) if cap_kv_stages else self.cvt_stages
-        )
+        self.cvt_stages = min(self.cvt_stages, 8)
 
         tmem_alloc_cols += self.cvt_stages * cvt_stage_cols
         self.tmem_alloc_cols = 2 ** math.ceil(
@@ -396,9 +366,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.mbarrier_reserved_bytes = 768
         smem_alloc_bits = self.mbarrier_reserved_bytes * 8
         smem_alloc_bits += mma_tile_n * acc_dtype.width  # colmax
-        smem_alloc_bits += (
-            self.scaledim * blk_tile_s * self.bs_stages * mma_dtype.width
-        )  # block scale
         smem_alloc_bits += mma_tile_n * warpgroup_warps * acc_dtype.width  # colsum
         smem_alloc_bits += (
             mma_tile_n * mma_tile_k * self.q_stages * mma_dtype.width
@@ -408,14 +375,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
         )  # P
 
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        kv_smem_dtype = cutlass.Int8 if k_iter.dtype.width < 8 else k_iter.dtype
+        kv_smem_dtype = k_iter.dtype
         self.kv_stages = (smem_capacity * 8 - smem_alloc_bits) // (
             mma_tile_m * mma_tile_k * kv_smem_dtype.width
         )
-        self.kv_stages = (
-            min(self.kv_stages, max_kv_stages) if cap_kv_stages else self.kv_stages
-        )
-        assert self.kv_stages >= self.kv_ring_stages * self.convert_warpgroups
+        self.kv_stages = min(self.kv_stages, 8)
+        assert self.kv_stages >= self.kv_ring_stages * _CONVERT_WARPGROUPS
 
         ##############################
         # TMA creation
@@ -427,7 +392,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
             q_iter,
             cute.make_ordered_layout(shape=(h_r, d, (h_k, b)), order=(1, 0, (2, 3))),
         )
-        assert k_iter.dtype is not q_iter.dtype or k_iter.dtype is cutlass.BFloat16
         assert v_iter.dtype is k_iter.dtype
 
         # (MMA, MMA_M/N, MMA_K, Stages)
@@ -552,7 +516,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Alias types
         mma_dtype = q_dtype
         acc_dtype = o_dtype
-        kv_smem_dtype = cutlass.Int8 if k_dtype.width < 8 else k_dtype
+        kv_smem_dtype = k_dtype
 
         # Shapes for MMA tile indexing (Read TMA partition for example)
         blk_tile_s, blk_tile_h, blk_tile_d = blk_tile_shd
@@ -620,7 +584,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         tma_group = elect_one_cooperative
         cvt_group = warpgroup_cooperative
         cvt_groups = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, warpgroup_threads * self.convert_warpgroups
+            pipeline.Agent.Thread, warpgroup_threads * _CONVERT_WARPGROUPS
         )
         softmax_group = warpgroup_cooperative
 
@@ -789,10 +753,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # TMA Q Dispatch
         ##############################
         elif warp_idx == self.tma_qo_warp_id:
-            # Free registers
-            if cutlass.const_expr(self.use_reg_reconfig):
-                cute.arch.setmaxregister_decrease(self.mma_tma_regs)
-
             gQ = cute.local_tile(
                 mQ,
                 tiler=(blk_tile_h, blk_tile_d),
@@ -820,26 +780,16 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Convert Dispatch
         ##############################
         elif warpgroup_idx in self.cvt_warpgroup_ids:
-            # Free registers
-            if cutlass.const_expr(self.use_reg_reconfig):
-                cute.arch.setmaxregister_decrease(self.cvt_regs)
-
             # Intermediate convert type
             cvt_type = cutlass.Float32
-            if cutlass.const_expr(
-                mma_dtype is cutlass.BFloat16
-                and (k_dtype in (cutlass.Int4, cutlass.Int8) or k_dtype is mma_dtype)
-            ):
+            if cutlass.const_expr(k_dtype is cutlass.BFloat16):
                 cvt_type = mma_dtype
 
-            # Initialize for multiple warpgroups if necessary
-            convert_phase = 0
-            if cutlass.const_expr(self.convert_warpgroups > 1):
-                assert tiles_dk % self.convert_warpgroups == 0
-                assert (tiles_dm * tiles_sk) % self.convert_warpgroups == 0
-                convert_phase = warpgroup_idx % self.convert_warpgroups
-                for _ in cutlass.range(convert_phase):
-                    cvt_producer.advance()
+            assert tiles_dk % _CONVERT_WARPGROUPS == 0
+            assert (tiles_dm * tiles_sk) % _CONVERT_WARPGROUPS == 0
+            convert_phase = warpgroup_idx % _CONVERT_WARPGROUPS
+            for _ in cutlass.range(convert_phase):
+                cvt_producer.advance()
             cvt_load_nbar = pipeline.NamedBarrier(
                 barrier_id=4 + convert_phase, num_threads=warpgroup_threads
             )
@@ -860,7 +810,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
             else:
                 smem_load_op_k = cute.nvgpu.warp.LdMatrix8x16x8bOp(
                     num_matrices=4,
-                    unpack_bits=(k_dtype.width if k_dtype.width < 8 else None),
                 )
                 smem_load_atom_k = cute.make_copy_atom(smem_load_op_k, kv_smem_dtype)
 
@@ -891,7 +840,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
                     transpose=True,
                     num_matrices=2,
-                    unpack_bits=(v_dtype.width if v_dtype.width < 8 else None),
                 )
                 smem_load_atom_v = cute.make_copy_atom(smem_load_op_v, kv_smem_dtype)
 
@@ -928,9 +876,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             for s in cutlass.range(prefetch_iters + iters_s):
                 if s < iters_s:
                     # Convert and scale K
-                    for _ in cutlass.range(
-                        tiles_dk // self.convert_warpgroups, unroll=2
-                    ):
+                    for _ in cutlass.range(tiles_dk // _CONVERT_WARPGROUPS, unroll=2):
                         # Issue the next logical K-or-V item before
                         # consuming K_s. One pending cp.async group overlaps
                         # its latency with conversion and UMMA.
@@ -942,7 +888,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 kv_split_idx + kv_splits,
                                 convert_phase * mma_tile_k,
                                 sKV_vector_address,
-                                self.convert_warpgroups + convert_phase,
+                                _CONVERT_WARPGROUPS + convert_phase,
                                 warpgroup_tidx,
                                 lane_idx,
                                 kv_smem_dtype,
@@ -963,7 +909,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.arch.cp_async_wait_group(1)
                         k_smem_stage = convert_phase
                         if s > 0:
-                            k_smem_stage = self.convert_warpgroups + convert_phase
+                            k_smem_stage = _CONVERT_WARPGROUPS + convert_phase
                         cvt_load_nbar.arrive_and_wait()
 
                         tKrK = cute.make_rmem_tensor(tKrK_shape, kv_smem_dtype)
@@ -975,16 +921,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tKrK,
                         )
                         cute.arch.fence_view_async_shared()
-
-                        # Sign extend unpacked int4 to int8
-                        if cutlass.const_expr(k_dtype is cutlass.Int4):
-                            tKrK_unpacked_i4_vec = tKrK.load().maybe_downcast()
-                            tKrK_i8_vec = cute.arch.sext_unpacked_i4_i8_intrinsic(
-                                tKrK_unpacked_i4_vec, cute.size(tKrK_shape)
-                            )
-                            tKrK.store(
-                                cute.TensorSSA(tKrK_i8_vec, tKrK_shape, cutlass.Int8)
-                            )
 
                         tKrK_ssa = tKrK.load().to(cvt_type).to(mma_dtype)
                         tKrK_cvt.store(tKrK_ssa.reshape(tKrK_cvt_shape))
@@ -999,13 +935,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cvt_handle.commit()
 
                         # Advance again for multiple warpgroups
-                        for _ in cutlass.range_constexpr(self.convert_warpgroups - 1):
+                        for _ in cutlass.range_constexpr(_CONVERT_WARPGROUPS - 1):
                             cvt_producer.advance()
 
                 if s >= prefetch_iters:
                     # Convert and scale V
                     for _ in cutlass.range(
-                        tiles_dm * tiles_sk // self.convert_warpgroups, unroll=2
+                        tiles_dm * tiles_sk // _CONVERT_WARPGROUPS, unroll=2
                     ):
                         # V_(s-1) is resident/in flight. Refill the other
                         # ring slot with K_(s+1), or the final V item.
@@ -1018,7 +954,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     kv_split_idx + (s + 1) * kv_splits,
                                     convert_phase * mma_tile_k,
                                     sKV_vector_address,
-                                    self.convert_warpgroups + convert_phase,
+                                    _CONVERT_WARPGROUPS + convert_phase,
                                     warpgroup_tidx,
                                     lane_idx,
                                     kv_smem_dtype,
@@ -1031,7 +967,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     kv_split_idx + s * kv_splits,
                                     convert_phase * mma_tile_m,
                                     sKV_vector_address,
-                                    self.convert_warpgroups + convert_phase,
+                                    _CONVERT_WARPGROUPS + convert_phase,
                                     warpgroup_tidx,
                                     lane_idx,
                                     kv_smem_dtype,
@@ -1041,7 +977,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             cute.arch.cp_async_wait_group(0)
                         v_smem_stage = convert_phase
                         if s == iters_s:
-                            v_smem_stage = self.convert_warpgroups + convert_phase
+                            v_smem_stage = _CONVERT_WARPGROUPS + convert_phase
                         cvt_load_nbar.arrive_and_wait()
 
                         tVrV = cute.make_rmem_tensor(tVrV_shape, kv_smem_dtype)
@@ -1053,16 +989,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tVrV,
                         )
                         cute.arch.fence_view_async_shared()
-
-                        # Sign extend unpacked int4 to int8
-                        if cutlass.const_expr(v_dtype is cutlass.Int4):
-                            tVrV_unpacked_i4_vec = tVrV.load().maybe_downcast()
-                            tVrV_i8_vec = cute.arch.sext_unpacked_i4_i8_intrinsic(
-                                tVrV_unpacked_i4_vec, cute.size(tVrV_shape)
-                            )
-                            tVrV.store(
-                                cute.TensorSSA(tVrV_i8_vec, tVrV_shape, cutlass.Int8)
-                            )
 
                         tVrV_ssa = tVrV.load().to(cvt_type).to(mma_dtype)
                         tVrV_cvt.store(tVrV_ssa.reshape(tVrV_cvt_shape))
@@ -1077,17 +1003,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cvt_handle.commit()
 
                         # Advance again for multiple warpgroups
-                        for _ in cutlass.range_constexpr(self.convert_warpgroups - 1):
+                        for _ in cutlass.range_constexpr(_CONVERT_WARPGROUPS - 1):
                             cvt_producer.advance()
 
         ##############################
         # MMA KQ Dispatch
         ##############################
         elif warp_idx == self.mma_kq_warp_id:
-            # Free registers
-            if cutlass.const_expr(self.use_reg_reconfig):
-                cute.arch.setmaxregister_decrease(self.mma_tma_regs)
-
             # Setup mma descriptors
             tBsQ_desc = thrblk_mma_kq.make_fragment_B(tBsQ)
 
@@ -1134,10 +1056,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # MMA VP Dispatch
         ##############################
         elif warp_idx == self.mma_vp_warp_id:
-            # Free registers
-            if cutlass.const_expr(self.use_reg_reconfig):
-                cute.arch.setmaxregister_decrease(self.mma_tma_regs)
-
             # Setup mma descriptors
             tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
             tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
@@ -1193,10 +1111,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Softmax + Correction Dispatch
         ##############################
         elif warpgroup_idx == self.softmax_warpgroup_id:
-            # Alloc registers
-            if cutlass.const_expr(self.use_reg_reconfig):
-                cute.arch.setmaxregister_increase(self.softmax_regs)
-
             # Construct tiled copies
             tmem_op_width = 32
             tmem_op_repeat = tcgen05.Repetition(
@@ -1578,15 +1492,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         return
 
 
-_NUM_HEADS = 6
-_HEAD_DIM = 256
-_SELECTED_WIDTH = 2051
-_SMALL_MAX_ROWS = 8
-_SMALL_NUM_SPLITS = 8
-_LARGE_NUM_SPLITS = 4
-_COMPILED_KERNELS = {}
-
-
 def _to_tvm_meta(tensor: torch.Tensor, assumed_align: int = 16) -> cute.Tensor:
     """Create one compile-time tensor descriptor for direct Torch TVM FFI."""
 
@@ -1630,13 +1535,7 @@ def _compile_kernel(
     )
     small_batch = query.shape[0] <= _SMALL_MAX_ROWS
     kv_splits = _SMALL_NUM_SPLITS if small_batch else _LARGE_NUM_SPLITS
-    fmha = MixedInputFusedMultiHeadAttentionDecode(
-        headdim=_HEAD_DIM,
-        block_scaledim=_HEAD_DIM,
-        grouped_head_tile=8,
-        convert_warpgroups=2,
-        kv_splits=kv_splits,
-    )
+    fmha = MixedInputFusedMultiHeadAttentionDecode(kv_splits)
     fmha.problem_shape = problem_shape
     return cute.compile(
         fmha,
@@ -1699,17 +1598,10 @@ def kernel(
     )
     scale_qs = float(scale) * _scalar(k_scale, 1.0)
     scale_o = _scalar(v_scale, 1.0)
-    problem_shape = (
-        query.shape[0],
-        _NUM_HEADS,
-        1,
-        key_cache.shape[0],
-        _HEAD_DIM,
-    )
     cache_key = (
         query.device.index,
-        problem_shape,
-        max_seqlen_q,
+        query.shape[0],
+        key_cache.shape[0],
         key_cache.dtype,
         _SMALL_NUM_SPLITS if query.shape[0] <= _SMALL_MAX_ROWS else _LARGE_NUM_SPLITS,
         tuple(selected_slots.stride()),

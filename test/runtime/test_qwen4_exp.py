@@ -554,7 +554,6 @@ def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
     )
     indexer = QSAIndexer(
         config,
-        mapping=SimpleNamespace(),
         layer_id=0,
         quant_config=None,
         prefix="model.layers.0.attn",
@@ -700,7 +699,6 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         torch.arange(8, dtype=torch.int32),
         torch.arange(8, dtype=torch.int32),
         torch.tensor([1, 1, 1, 2, 2, 2, 2, 3], dtype=torch.int32),
-        None,
     )
     launches = []
 
@@ -809,100 +807,23 @@ def test_qwen4_exp_nextn_compacts_context_topk_for_mtp_decode() -> None:
     torch.testing.assert_close(decode_topk, rows[[2, 5]])
 
 
-@_requires_cuda
-def test_qwen4_exp_qsa_expands_mtp_layout_and_cache_locations() -> None:
-    device = "cuda"
-    indexer = object.__new__(QSAIndexer)
-    metadata = SimpleNamespace(
-        cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
-    )
-    query_lengths = torch.full((2,), 4, dtype=torch.long, device=device)
+@pytest.mark.parametrize(
+    ("mode", "force_uniform"),
+    [(ForwardMode.DECODE, False), (ForwardMode.EXTEND, True)],
+)
+def test_qwen4_exp_qsa_uses_compacted_decode_width(
+    mode: ForwardMode, force_uniform: bool
+) -> None:
+    ctx = SimpleNamespace(bs=1, forward_mode=mode)
 
-    logical, requests, lengths = indexer._logical_layout(
-        metadata,
-        total_tokens=8,
-        bs=2,
-        query_lengths=query_lengths,
+    assert (
+        QSAIndexer._decode_query_lengths(
+            ctx,
+            total_tokens=1,
+            force_uniform=force_uniform,
+        )
+        == 1
     )
-    # Compressed pages arrive expanded 4x at consumer granularity (logical
-    # pages 3 and 7 become entries 12 and 28); the recent table is already
-    # at logical granularity. Complete-block counts ride along in the same
-    # fused launch.
-    qsa_locs, recent_locs, complete_blocks = indexer._group_cache_locs(
-        logical,
-        requests,
-        torch.tensor([[12], [28]], dtype=torch.int32, device=device),
-        4,
-        256,
-        torch.tensor([[3], [7]], dtype=torch.int32, device=device),
-        1,
-        256,
-        4,
-    )
-
-    expected = torch.tensor(
-        [772, 773, 774, 775, 1800, 1801, 1802, 1803], dtype=torch.int32
-    )
-    torch.testing.assert_close(lengths.cpu(), query_lengths.cpu())
-    torch.testing.assert_close(logical.cpu(), torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]))
-    torch.testing.assert_close(requests.cpu(), torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]))
-    torch.testing.assert_close(qsa_locs.cpu(), expected)
-    torch.testing.assert_close(recent_locs.cpu(), expected)
-    torch.testing.assert_close(
-        complete_blocks.cpu(),
-        torch.tensor([1, 1, 1, 2, 2, 2, 2, 3], dtype=torch.int32),
-    )
-
-
-@_requires_cuda
-def test_qwen4_exp_qsa_ignores_stale_prefill_lengths_during_draft_decode() -> None:
-    device = "cuda"
-    indexer = object.__new__(QSAIndexer)
-    ctx = SimpleNamespace(bs=1, forward_mode=ForwardMode.DECODE)
-    metadata = SimpleNamespace(
-        cache_seqlens_int32=torch.tensor([24], dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.tensor([0, 23], dtype=torch.int32, device=device),
-    )
-
-    query_lengths = indexer._decode_query_lengths(ctx, total_tokens=1)
-    logical, requests, lengths = indexer._logical_layout(
-        metadata,
-        total_tokens=1,
-        bs=1,
-        query_lengths=query_lengths,
-    )
-
-    assert lengths == 1
-    torch.testing.assert_close(logical.cpu(), torch.tensor([23]))
-    torch.testing.assert_close(requests.cpu(), torch.tensor([0]))
-
-
-@_requires_cuda
-def test_qwen4_exp_qsa_rebuilds_layout_after_mtp_prefill_row_gather() -> None:
-    device = "cuda"
-    indexer = object.__new__(QSAIndexer)
-    ctx = SimpleNamespace(bs=1, forward_mode=ForwardMode.EXTEND)
-    metadata = SimpleNamespace(
-        cache_seqlens_int32=torch.tensor([23], dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.tensor([0, 23], dtype=torch.int32, device=device),
-    )
-
-    query_lengths = indexer._decode_query_lengths(
-        ctx,
-        total_tokens=1,
-        force_uniform=True,
-    )
-    logical, requests, lengths = indexer._logical_layout(
-        metadata,
-        total_tokens=1,
-        bs=1,
-        query_lengths=query_lengths,
-    )
-
-    assert lengths == 1
-    torch.testing.assert_close(logical.cpu(), torch.tensor([22]))
-    torch.testing.assert_close(requests.cpu(), torch.tensor([0]))
 
 
 def test_qwen4_exp_qsa_draft_write_mask_keeps_only_accepted_prefix() -> None:
@@ -1065,7 +986,6 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         indexer._position_values(seed_position),
         seed_position,
         1,
-        reset=True,
     )
 
     for value in range(3, 8):
@@ -1591,7 +1511,11 @@ def test_qwen4_exp_qsa_fuses_fp8_kv_store(
     torch.nn.Module.__init__(indexer)
     page_size = 16
     backend = SimpleNamespace(
-        stacks=SimpleNamespace(group_kernel_page_size=lambda group_id: page_size)
+        stacks=SimpleNamespace(
+            group_kernel_page_size=lambda group_id: page_size,
+            max_bs=8,
+            max_tokens_per_req=4,
+        )
     )
 
     k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
@@ -1649,6 +1573,7 @@ def test_qwen4_exp_qsa_fuses_fp8_kv_store(
 
     assert output.shape == (1, 8)
     assert len(sparse_attention_calls) == 1
+    assert sparse_attention_calls[0][-1]["metadata_capacity_rows"] == 32
     if expect_fused:
         assert pool_store_calls == []
         assert len(fused_store_calls) == 1
@@ -1736,6 +1661,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(text_config=text_config),
+        hf_text_config=text_config,
         num_attention_layers=2,
     )
     softmax = MHAConfig(

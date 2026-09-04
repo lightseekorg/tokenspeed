@@ -31,8 +31,6 @@ from tokenspeed_kernel.ops.attention import qsa_sparse_attention
 from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_compress_and_store,
-    qwen4_exp_qsa_group_cache_locs,
-    qwen4_exp_qsa_logical_layout,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_selected_slots,
@@ -41,7 +39,6 @@ from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_valid_rows,
@@ -79,7 +76,6 @@ class _QSAForwardMetadata:
 
     total_tokens: int
     batch_size: int
-    query_lengths: torch.Tensor | int
     logical_positions: torch.Tensor
     request_indices: torch.Tensor
     qsa_locs: torch.Tensor
@@ -94,7 +90,6 @@ class QSAIndexer(nn.Module):
     def __init__(
         self,
         config,
-        mapping: Mapping,
         layer_id: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -124,9 +119,8 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
-        self.compressed_page_size = QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE
         self.compressed_token_page_size = (
-            self.compressed_page_size * self.compress_ratio
+            QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE * self.compress_ratio
         )
         self.recent_page_size = QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE
         self.block_topk = self.token_topk // self.compress_ratio
@@ -151,7 +145,6 @@ class QSAIndexer(nn.Module):
         )
         self.q_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
-        self.mapping = mapping
         # Draft QSA indexers can publish step-0 top-k through backend scratch
         # and reuse the target-aligned rows on later MTP steps.
         self.share_topk_for_mtp_iteration = False
@@ -228,25 +221,6 @@ class QSAIndexer(nn.Module):
             return total_tokens // bs
         raise RuntimeError("QSA could not infer query lengths")
 
-    def _logical_layout(
-        self,
-        metadata,
-        total_tokens: int,
-        bs: int,
-        query_lengths: torch.Tensor | int | None = None,
-    ):
-        seq_lens = self._seq_lens(metadata)[:bs]
-        if query_lengths is None:
-            lengths = self._query_lengths(metadata, total_tokens, bs)
-        elif isinstance(query_lengths, int):
-            lengths = query_lengths
-        else:
-            lengths = query_lengths[:bs]
-        positions, requests = qwen4_exp_qsa_logical_layout(
-            seq_lens, lengths, total_tokens
-        )
-        return positions, requests, lengths
-
     @staticmethod
     def _decode_query_lengths(
         ctx: ForwardContext,
@@ -266,32 +240,6 @@ class QSAIndexer(nn.Module):
                 "Qwen4-Exp QSA decode rows must be divisible by batch size"
             )
         return total_tokens // ctx.bs
-
-    @staticmethod
-    def _group_cache_locs(
-        logical_positions: torch.Tensor,
-        request_indices: torch.Tensor,
-        qsa_page_table: torch.Tensor,
-        qsa_expansion: int,
-        qsa_page_size: int,
-        recent_page_table: torch.Tensor,
-        recent_expansion: int,
-        recent_page_size: int,
-        compress_ratio: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map flattened token positions into both QSA cache fields at once."""
-
-        return qwen4_exp_qsa_group_cache_locs(
-            logical_positions,
-            request_indices,
-            qsa_page_table,
-            qsa_expansion,
-            qsa_page_size,
-            recent_page_table,
-            recent_expansion,
-            recent_page_size,
-            compress_ratio,
-        )
 
     def _prepare_forward_metadata(
         self,
@@ -330,17 +278,10 @@ class QSAIndexer(nn.Module):
             else query_lengths
         )
         seq_lens = self._seq_lens(metadata)[: ctx.bs]
-        # Uniform decode rows are request-grouped, so one request CTA expands
-        # the layout, maps both cache groups and derives complete-block counts.
-        if isinstance(lengths, int):
-            (
-                logical,
-                requests,
-                qsa_locs,
-                recent_locs,
-                complete_blocks,
-                _,
-            ) = qwen4_exp_qsa_prepare_metadata(
+        # One request CTA expands the row layout, maps both cache groups and
+        # derives complete-block counts for uniform and ragged batches alike.
+        logical, requests, qsa_locs, recent_locs, complete_blocks = (
+            qwen4_exp_qsa_prepare_metadata(
                 seq_lens,
                 lengths,
                 total_tokens,
@@ -353,27 +294,10 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 draft_logical_positions=reset_draft_tags,
             )
-        else:
-            logical, requests = qwen4_exp_qsa_logical_layout(
-                seq_lens, lengths, total_tokens
-            )
-            qsa_locs, recent_locs, complete_blocks = self._group_cache_locs(
-                logical,
-                requests,
-                qsa_page_table,
-                qsa_expansion,
-                self.compressed_token_page_size,
-                recent_page_table,
-                recent_expansion,
-                self.recent_page_size,
-                self.compress_ratio,
-            )
-            if reset_draft_tags is not None:
-                reset_draft_tags.fill_(_DRAFT_INVALID_POSITION)
+        )
         result = _QSAForwardMetadata(
             total_tokens=total_tokens,
             batch_size=ctx.bs,
-            query_lengths=lengths,
             logical_positions=logical,
             request_indices=requests,
             qsa_locs=qsa_locs,
@@ -443,32 +367,6 @@ class QSAIndexer(nn.Module):
         )
         return values.reshape(3, -1).T
 
-    def _write_recent_cache(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        logical_positions: torch.Tensor | None,
-        request_indices: torch.Tensor,
-        recent_locs: torch.Tensor,
-        write_mask: torch.Tensor,
-        raw: torch.Tensor,
-        position_cache: torch.Tensor,
-    ) -> None:
-        """Write one request's latest compression window into its cache page."""
-
-        qwen4_exp_qsa_recent_write(
-            token_k,
-            logical_positions,
-            request_indices,
-            recent_locs,
-            position_values,
-            raw,
-            position_cache,
-            self.recent_page_size,
-            self.compress_ratio,
-            write_mask=write_mask,
-        )
-
     def _verify_scratch_buffers(
         self,
         token_k: torch.Tensor,
@@ -503,8 +401,6 @@ class QSAIndexer(nn.Module):
         position_values: torch.Tensor,
         logical_positions: torch.Tensor | None,
         bs: int,
-        *,
-        reset: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the request-local raw-key ring for one draft MTP round."""
 
@@ -522,8 +418,6 @@ class QSAIndexer(nn.Module):
                 ),
             )
             self._draft_scratch[key] = scratch
-        elif reset:
-            scratch[2].fill_(_DRAFT_INVALID_POSITION)
         return scratch
 
     @staticmethod
@@ -580,15 +474,17 @@ class QSAIndexer(nn.Module):
         request_indices = torch.arange(bs, device=accepted.device).repeat_interleave(
             width
         )
-        self._write_recent_cache(
+        qwen4_exp_qsa_recent_write(
             token_k.reshape(-1, 1, self.index_head_dim),
-            position_values.reshape(-1, 3),
             logical_positions.reshape(-1),
             request_indices,
             recent_locs.reshape(-1),
-            write_mask.reshape(-1),
+            position_values.reshape(-1, 3),
             raw,
             position_cache,
+            self.recent_page_size,
+            self.compress_ratio,
+            write_mask=write_mask.reshape(-1),
         )
 
     def _write_and_compress(
@@ -1010,12 +906,8 @@ class QSAIndexer(nn.Module):
             q.shape[0],
             force_uniform=ctx.draft_narrowing is not None,
         )
-        fp8_dtypes = (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-            torch.float8_e4m3fnuz,
-            torch.float8_e5m2fnuz,
-        )
+        is_fp8_cache = k_cache.dtype == torch.float8_e4m3fn
+        router = self._full_backend(ctx)
         output = qsa_sparse_attention(
             q,
             k_cache,
@@ -1023,14 +915,17 @@ class QSAIndexer(nn.Module):
             selected_slots,
             scale=attention_layer.scaling,
             max_seqlen_q=(query_lengths if isinstance(query_lengths, int) else 1),
+            metadata_capacity_rows=max(
+                q.shape[0], router.stacks.max_bs * router.stacks.max_tokens_per_req
+            ),
             k_scale=(
                 (1.0 if attention_layer.k_scale is None else attention_layer.k_scale)
-                if k_cache.dtype in fp8_dtypes
+                if is_fp8_cache
                 else None
             ),
             v_scale=(
                 (1.0 if attention_layer.v_scale is None else attention_layer.v_scale)
-                if v_cache.dtype in fp8_dtypes
+                if is_fp8_cache
                 else None
             ),
             override=None,

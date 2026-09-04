@@ -30,12 +30,8 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     _qwen4_exp_qsa_stream_block_topk_kernel,
     qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_compress_and_store,
-    qwen4_exp_qsa_group_cache_locs,
-    qwen4_exp_qsa_logical_layout,
-    qwen4_exp_qsa_mqa_scores,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
-    qwen4_exp_qsa_rope,
     qwen4_exp_qsa_selected_slots,
 )
 
@@ -45,100 +41,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_qwen4_exp_qsa_mqa_scores_matches_torch(device: str) -> None:
-    torch.manual_seed(17)
-    rows, heads, head_dim, keys = 3, 4, 32, 40
-    query = torch.randn(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
-    key_cache = torch.randn(64, 1, head_dim, device=device, dtype=torch.bfloat16)
-    key_slots = torch.randint(1, 64, (rows, keys), device=device, dtype=torch.int32)
-    valid_counts = torch.tensor([5, 23, keys], device=device, dtype=torch.int32)
-
-    actual = qwen4_exp_qsa_mqa_scores(query, key_cache, key_slots, valid_counts)
-    gathered = key_cache[key_slots.long(), 0]
-    expected = torch.relu(
-        torch.einsum("mhd,mnd->mhn", query.float(), gathered.float())
-    ).sum(dim=1)
-    columns = torch.arange(keys, device=device).unsqueeze(0)
-    expected.masked_fill_(columns >= valid_counts.unsqueeze(1), -float("inf"))
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_qsa_logical_layout_matches_torch(device: str) -> None:
-    seq_lens = torch.tensor([8, 12, 5], device=device, dtype=torch.int32)
-    query_lengths = torch.tensor([4, 3, 5], device=device, dtype=torch.long)
-    total_tokens = int(query_lengths.sum())
-
-    positions, requests = qwen4_exp_qsa_logical_layout(
-        seq_lens, query_lengths, total_tokens
-    )
-
-    request_ids = torch.arange(3, device=device)
-    expected_requests = torch.repeat_interleave(
-        request_ids, query_lengths, output_size=total_tokens
-    )
-    cumulative = torch.cumsum(query_lengths, dim=0)
-    row_starts = torch.repeat_interleave(
-        cumulative - query_lengths, query_lengths, output_size=total_tokens
-    )
-    offsets = torch.arange(total_tokens, device=device) - row_starts
-    expected_positions = (seq_lens.long() - query_lengths)[expected_requests] + offsets
-
-    torch.testing.assert_close(positions, expected_positions)
-    torch.testing.assert_close(requests, expected_requests)
-
-    # Uniform scalar lengths must reproduce the same layout without any
-    # lengths tensor (the decode fast path).
-    uniform_seq_lens = torch.tensor([8, 12], device=device, dtype=torch.int32)
-    uniform_positions, uniform_requests = qwen4_exp_qsa_logical_layout(
-        uniform_seq_lens, 4, 8
-    )
-    torch.testing.assert_close(
-        uniform_positions, torch.tensor([4, 5, 6, 7, 8, 9, 10, 11], device=device)
-    )
-    torch.testing.assert_close(
-        uniform_requests, torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], device=device)
-    )
-
-
-def test_qwen4_exp_qsa_group_cache_locs_matches_torch(device: str) -> None:
-    positions = torch.tensor([3, 16, 5, -1, 20, 21], device=device, dtype=torch.long)
-    requests = torch.tensor([0, 0, 0, 1, 1, 1], device=device, dtype=torch.long)
-    # QSA table at consumer granularity with a 2x expansion: logical pages
-    # [[2, 0, 7], [5, 9, 1]] stored as page id * expansion + sub-page index.
-    qsa_logical = torch.tensor([[2, 0, 7], [5, 9, 1]], device=device, dtype=torch.int32)
-    qsa_expanded = (qsa_logical.repeat_interleave(2, dim=1) * 2) + torch.arange(
-        6, device=device
-    ) % 2
-    recent_table = torch.tensor(
-        [[3, 1, 6, 2, 8, 4], [6, 0, 2, 9, 3, 1]], device=device, dtype=torch.int32
-    )
-
-    qsa_locs, recent_locs, complete_blocks = qwen4_exp_qsa_group_cache_locs(
-        positions, requests, qsa_expanded, 2, 8, recent_table, 1, 4, 4
-    )
-
-    safe = positions.clamp_min(0)
-    qsa_pages = qsa_logical[requests, safe // 8].long()
-    expected_qsa = qsa_pages * 8 + safe % 8
-    expected_qsa = torch.where((positions >= 0) & (qsa_pages > 0), expected_qsa, 0)
-    recent_pages = recent_table[requests, safe // 4].long()
-    expected_recent = recent_pages * 4 + safe % 4
-    expected_recent = torch.where(
-        (positions >= 0) & (recent_pages > 0), expected_recent, 0
-    )
-
-    torch.testing.assert_close(qsa_locs, expected_qsa.to(torch.int32))
-    torch.testing.assert_close(recent_locs, expected_recent.to(torch.int32))
-    torch.testing.assert_close(complete_blocks, ((positions + 1) // 4).to(torch.int32))
-
-
-def test_qwen4_exp_qsa_prepare_metadata_matches_separate_kernels(
-    device: str,
+@pytest.mark.parametrize("query_lengths", [4, [3, 4, 5]])
+def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
+    device: str, query_lengths: int | list[int]
 ) -> None:
     seq_lens = torch.tensor([3, 14, 23], device=device, dtype=torch.int32)
-    query_lengths = torch.tensor([3, 4, 4], device=device, dtype=torch.int64)
-    total_tokens = int(query_lengths.sum())
+    if not isinstance(query_lengths, int):
+        query_lengths = torch.tensor(query_lengths, device=device, dtype=torch.int64)
+    total_tokens = (
+        query_lengths * seq_lens.shape[0]
+        if isinstance(query_lengths, int)
+        else int(query_lengths.sum())
+    )
     ratio = 4
     qsa_page_size = 8
     qsa_expansion = 2
@@ -153,7 +67,6 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_separate_kernels(
     recent_table = torch.arange(2, 2 + 3 * 6, device=device, dtype=torch.int32).reshape(
         3, 6
     )
-    accepted = torch.tensor([0, 2, 1], device=device, dtype=torch.int32)
     draft_tags = torch.arange(3 * ratio, device=device, dtype=torch.int64).reshape(
         3, ratio
     )
@@ -169,37 +82,55 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_separate_kernels(
         1,
         recent_page_size,
         ratio,
-        accept_lengths=accepted,
-        num_extends=1,
         draft_logical_positions=draft_tags,
     )
-    expected_positions, expected_requests = qwen4_exp_qsa_logical_layout(
-        seq_lens, query_lengths, total_tokens
+    lengths = (
+        torch.full_like(seq_lens, query_lengths, dtype=torch.int64)
+        if isinstance(query_lengths, int)
+        else query_lengths
     )
-    expected_locs = qwen4_exp_qsa_group_cache_locs(
+    request_ids = torch.arange(seq_lens.shape[0], device=device)
+    expected_requests = torch.repeat_interleave(
+        request_ids, lengths, output_size=total_tokens
+    )
+    cumulative = torch.cumsum(lengths, dim=0)
+    row_starts = torch.repeat_interleave(
+        cumulative - lengths, lengths, output_size=total_tokens
+    )
+    row_offsets = torch.arange(total_tokens, device=device) - row_starts
+    expected_positions = (seq_lens.long() - lengths)[expected_requests] + row_offsets
+    safe_positions = expected_positions.clamp_min(0)
+    qsa_pages = (
+        qsa_table[
+            expected_requests,
+            (safe_positions // qsa_page_size) * qsa_expansion,
+        ].long()
+        // qsa_expansion
+    )
+    expected_qsa = qsa_pages * qsa_page_size + safe_positions % qsa_page_size
+    expected_qsa = torch.where(
+        (expected_positions >= 0) & (qsa_pages > 0), expected_qsa, 0
+    ).to(torch.int32)
+    recent_pages = recent_table[
+        expected_requests, safe_positions // recent_page_size
+    ].long()
+    expected_recent = (
+        recent_pages * recent_page_size + safe_positions % recent_page_size
+    )
+    expected_recent = torch.where(
+        (expected_positions >= 0) & (recent_pages > 0), expected_recent, 0
+    ).to(torch.int32)
+    expected_blocks = ((expected_positions + 1) // ratio).to(torch.int32)
+
+    references = (
         expected_positions,
         expected_requests,
-        qsa_table,
-        qsa_expansion,
-        qsa_page_size,
-        recent_table,
-        1,
-        recent_page_size,
-        ratio,
+        expected_qsa,
+        expected_recent,
+        expected_blocks,
     )
-    row_offsets = torch.cat(
-        [torch.arange(int(length), device=device) for length in query_lengths]
-    )
-    expected_mask = (expected_requests < 1) | (
-        row_offsets < accepted.long().index_select(0, expected_requests)
-    )
-    expected_mask &= expected_locs[1] > 0
-
-    torch.testing.assert_close(actual[0], expected_positions)
-    torch.testing.assert_close(actual[1], expected_requests)
-    for value, reference in zip(actual[2:5], expected_locs, strict=True):
+    for value, reference in zip(actual, references, strict=True):
         torch.testing.assert_close(value, reference)
-    torch.testing.assert_close(actual[5], expected_mask)
     torch.testing.assert_close(
         draft_tags,
         torch.full_like(draft_tags, torch.iinfo(torch.int64).min),
@@ -237,6 +168,24 @@ def _ref_compress_pool(
     current_first = position_values[safe_source[:, 0]]
     first = torch.where(from_current[:, :1], current_first, cached_first)
     return pooled, first
+
+
+def _ref_rope(tensor, positions, cos_sin_cache, rotary_dim, sections=None):
+    if positions.ndim == 2 and sections is None:
+        positions = positions[0]
+    cos, sin = cos_sin_cache[positions.long()].chunk(2, dim=-1)
+    if positions.ndim == 2:
+        cos = torch.cat(
+            [part[axis] for axis, part in enumerate(cos.split(sections, -1))], dim=-1
+        )
+        sin = torch.cat(
+            [part[axis] for axis, part in enumerate(sin.split(sections, -1))], dim=-1
+        )
+    first, second = tensor[..., :rotary_dim].chunk(2, dim=-1)
+    cos = cos.unsqueeze(-2).to(tensor.dtype)
+    sin = sin.unsqueeze(-2).to(tensor.dtype)
+    rotated = torch.cat((first * cos - second * sin, second * cos + first * sin), -1)
+    return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
 
 
 def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
@@ -1209,87 +1158,6 @@ def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def _ref_rope(tensor, positions, cos_sin_cache, rotary_dim, sections=None):
-    if positions.ndim == 2 and sections is None:
-        positions = positions[0]
-    cos_sin = cos_sin_cache[positions.long()]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    if positions.ndim == 2:
-        cos = torch.cat(
-            [part[axis] for axis, part in enumerate(cos.split(sections, -1))], dim=-1
-        )
-        sin = torch.cat(
-            [part[axis] for axis, part in enumerate(sin.split(sections, -1))], dim=-1
-        )
-    rotary = tensor[..., :rotary_dim]
-    passthrough = tensor[..., rotary_dim:]
-    cos_t = cos.unsqueeze(-2).to(tensor.dtype)
-    sin_t = sin.unsqueeze(-2).to(tensor.dtype)
-    first, second = torch.chunk(rotary, 2, dim=-1)
-    rotated = torch.cat(
-        (first * cos_t - second * sin_t, second * cos_t + first * sin_t), dim=-1
-    )
-    return torch.cat((rotated, passthrough), dim=-1)
-
-
-def test_qwen4_exp_qsa_rope_matches_torch(device: str) -> None:
-    torch.manual_seed(7)
-    rotary_dim, head_dim, heads = 32, 40, 3
-    cos_sin_cache = torch.randn(64, rotary_dim, device=device, dtype=torch.float32)
-    tensor = torch.randn(5, heads, head_dim, device=device, dtype=torch.bfloat16)
-    positions = torch.randint(0, 64, (5,), device=device)
-
-    actual = qwen4_exp_qsa_rope(tensor, positions, cos_sin_cache)
-    expected = _ref_rope(tensor, positions, cos_sin_cache, rotary_dim)
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_qsa_rope_matches_mrope_sections(device: str) -> None:
-    torch.manual_seed(13)
-    rotary_dim, head_dim, heads = 32, 32, 2
-    sections = (4, 6, 6)
-    cos_sin_cache = torch.randn(48, rotary_dim, device=device, dtype=torch.float32)
-    tensor = torch.randn(4, heads, head_dim, device=device, dtype=torch.bfloat16)
-    positions = torch.randint(0, 48, (3, 4), device=device)
-
-    actual = qwen4_exp_qsa_rope(tensor, positions, cos_sin_cache, sections=sections)
-    expected = _ref_rope(tensor, positions, cos_sin_cache, rotary_dim, sections)
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-    axis0 = qwen4_exp_qsa_rope(tensor, positions, cos_sin_cache)
-    expected_axis0 = _ref_rope(tensor, positions, cos_sin_cache, rotary_dim)
-
-    torch.testing.assert_close(axis0, expected_axis0, rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_qsa_mqa_scores_reads_strided_inputs(device: str) -> None:
-    torch.manual_seed(31)
-    rows, heads, head_dim, keys = 3, 4, 32, 40
-    wide = torch.randn(rows, heads, 2 * head_dim, device=device, dtype=torch.bfloat16)
-    query = wide[:, :, :head_dim]
-    key_cache = torch.randn(64, 1, head_dim, device=device, dtype=torch.bfloat16)
-    # Int64 row slices of wider grids exercise strided slot reads, in-kernel
-    # casts, and the strided valid-counts load without any host-side copy.
-    slot_grid = torch.randint(1, 64, (rows, 2, keys), device=device, dtype=torch.int64)
-    key_slots = slot_grid[:, 1]
-    counts_grid = torch.randint(
-        1, keys + 1, (rows, 2), device=device, dtype=torch.int64
-    )
-    valid_counts = counts_grid[:, 1]
-
-    actual = qwen4_exp_qsa_mqa_scores(query, key_cache, key_slots, valid_counts)
-    gathered = key_cache[key_slots, 0]
-    expected = torch.relu(
-        torch.einsum("mhd,mnd->mhn", query.float(), gathered.float())
-    ).sum(dim=1)
-    columns = torch.arange(keys, device=device).unsqueeze(0)
-    expected.masked_fill_(columns >= valid_counts.unsqueeze(1), -float("inf"))
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
 def test_qwen4_exp_qsa_block_topk_reads_strided_query(device: str) -> None:
     torch.manual_seed(53)
     rows, heads, head_dim, page_size = 3, 4, 16, 64
@@ -1418,23 +1286,3 @@ def test_qwen4_exp_qsa_recent_write_reads_strided_token_k(device: str) -> None:
     raw, positions = run(token_k, True)
     torch.testing.assert_close(raw, expected_raw)
     torch.testing.assert_close(positions, expected_positions)
-
-
-def test_qwen4_exp_qsa_rope_reads_strided_inputs(device: str) -> None:
-    torch.manual_seed(71)
-    rotary_dim, head_dim, heads = 32, 40, 2
-    cos_sin_cache = torch.randn(64, rotary_dim, device=device, dtype=torch.float32)
-    # ``[tokens, heads, 2 * head_dim]`` sliced on the last dim keeps a
-    # non-unit element stride across every access in the kernel.
-    wide = torch.randn(5, heads, 2 * head_dim, device=device, dtype=torch.bfloat16)
-    tensor = wide[:, :, :head_dim]
-    assert not tensor.is_contiguous()
-    grid = torch.randint(0, 64, (2, 5, 2), device=device, dtype=torch.int32)
-    positions = grid[:, :, 1]
-    assert not positions.is_contiguous()
-
-    actual = qwen4_exp_qsa_rope(tensor, positions, cos_sin_cache)
-    packed = qwen4_exp_qsa_rope(
-        tensor.contiguous(), positions.contiguous().long(), cos_sin_cache
-    )
-    torch.testing.assert_close(actual, packed, rtol=2e-2, atol=2e-2)

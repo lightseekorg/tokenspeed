@@ -77,6 +77,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     *,
     scale: float,
     max_seqlen_q: int,
+    metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
@@ -93,6 +94,8 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         scale: Softmax scale applied to query-key scores.
         max_seqlen_q: Uniform query-token count per request; 1 for decode and
             ``spec_num_tokens`` for compact speculative decode.
+        metadata_capacity_rows: Ignored because this implementation is
+            workspace-free.
         k_scale: Scalar key-cache descale, folded into ``scale``.
         v_scale: Scalar value-cache descale, applied to the output.
 
@@ -106,6 +109,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     four-way path retains its rank-zero combine.
     """
 
+    del metadata_capacity_rows  # The workspace-free specialization has no metadata.
     return _cute_dsl_qsa_sparse_attention(
         q,
         k_cache,
