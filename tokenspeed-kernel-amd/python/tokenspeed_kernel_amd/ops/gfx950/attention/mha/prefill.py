@@ -62,6 +62,9 @@ class AttentionConfig:
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
+    ENABLE_SKIP_SOFTMAX: gl.constexpr
+    DEFER_V_LOAD: gl.constexpr
+    DYNAMIC_SCHED: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -91,6 +94,9 @@ class AttentionConfig:
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
+        DYNAMIC_SCHED,
         KV_DTYPE,
         q_strides,
         k_strides,
@@ -133,6 +139,9 @@ class AttentionConfig:
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
+        self.ENABLE_SKIP_SOFTMAX = gl.constexpr(ENABLE_SKIP_SOFTMAX)
+        self.DEFER_V_LOAD = gl.constexpr(DEFER_V_LOAD)
+        self.DYNAMIC_SCHED = gl.constexpr(DYNAMIC_SCHED)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -167,6 +176,7 @@ class AttentionProgram:
     q_start: gl.tensor
     q_head: gl.tensor
     kv_head: gl.tensor
+    log2_threshold: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -183,6 +193,7 @@ class AttentionProgram:
         q_start,
         q_head,
         kv_head,
+        log2_threshold,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -196,6 +207,7 @@ class AttentionProgram:
         self.q_start = q_start
         self.q_head = q_head
         self.kv_head = kv_head
+        self.log2_threshold = log2_threshold
 
     @gluon.jit
     def initialize_from_state(
@@ -210,6 +222,7 @@ class AttentionProgram:
         seq_len,
         query_block,
         q_head,
+        log2_threshold,
     ):
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
         q_start = query_block * cfg.BLOCK_M
@@ -226,6 +239,7 @@ class AttentionProgram:
             q_start,
             q_head,
             kv_head,
+            log2_threshold,
         )
 
     @gluon.jit
@@ -367,24 +381,48 @@ class AttentionProgram:
 
         row_max = max(qk, 1)
         m_new = maximum(m_i, row_max)
-        m_new_scaled = m_new * cfg.SM_SCALE
-        if HAS_INVALID:
-            invalid = m_new == -float("inf")
-            m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
 
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
-        p = gl.exp2(qk_shifted)
-        m_diff = m_i * cfg.SM_SCALE - m_new_scaled
-        if HAS_INVALID:
-            m_diff = gl.where(invalid, 0.0, m_diff)
+        # Skip softmax: a row can be skipped when its max score falls more
+        # than log2_threshold below the running max so far (m_i). We compare
+        # against m_i rather than m_new (which already includes this block)
+        # because using m_new would make the difference 0, and every row
+        # would look skippable, on any row where this block sets the new
+        # max. We only skip the whole block when every row in it can be
+        # skipped.
+        if cfg.ENABLE_SKIP_SOFTMAX:
+            skip = (row_max - m_i) * cfg.SM_SCALE < self.log2_threshold
+            all_skip = gl.sum(skip.to(gl.int32), axis=0) == cfg.BLOCK_M
+            # Keeps l_i and acc on the m_i scale, which is what lets the update
+            # be elided. Exact for threshold <= 1; above that a voting row can
+            # outscore m_i and the dropped max is part of the approximation.
+            if all_skip:
+                m_new = m_i
+        else:
+            all_skip = False
 
-        alpha = gl.exp2(m_diff)
-        l_ij = gl.sum(p, axis=1)
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, cfg.p_layout)
-        return p, m_new, l_i, acc
+        p = gl.zeros(
+            [cfg.BLOCK_M, cfg.BLOCK_N],
+            dtype=self.q_ptr.dtype.element_ty,
+            layout=cfg.p_layout,
+        )
+        if not all_skip:
+            m_new_scaled = m_new * cfg.SM_SCALE
+            if HAS_INVALID:
+                invalid = m_new == -float("inf")
+                m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
+
+            qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+            p_f32 = gl.exp2(qk_shifted)
+            m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+            if HAS_INVALID:
+                m_diff = gl.where(invalid, 0.0, m_diff)
+
+            alpha = gl.exp2(m_diff)
+            l_ij = gl.sum(p_f32, axis=1)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+            p = gl.convert_layout(p_f32.to(self.q_ptr.dtype.element_ty), cfg.p_layout)
+        return p, m_new, l_i, acc, all_skip
 
     @gluon.jit
     def apply_sinks(self, l_i, m_i, sink_log2):
@@ -442,6 +480,7 @@ class ProgramScheduler:
     q_head: gl.tensor
     q_slot: gl.tensor
     q_cycles_per_batch_group: gl.tensor
+    counter_ptr: gl.tensor
     batch_slots: gl.constexpr
     q_slots: gl.constexpr
 
@@ -458,6 +497,7 @@ class ProgramScheduler:
         q_head,
         q_slot,
         q_cycles_per_batch_group,
+        counter_ptr,
         batch_slots,
         q_slots,
     ):
@@ -471,11 +511,14 @@ class ProgramScheduler:
         self.q_head = q_head
         self.q_slot = q_slot
         self.q_cycles_per_batch_group = q_cycles_per_batch_group
+        self.counter_ptr = counter_ptr
         self.batch_slots = gl.constexpr(batch_slots)
         self.q_slots = gl.constexpr(q_slots)
 
     @gluon.jit
-    def create(cfg, batch_size, max_seqlen_q, swizzled_order: gl.constexpr):
+    def create(
+        cfg, batch_size, max_seqlen_q, counter_ptr, swizzled_order: gl.constexpr
+    ):
         num_q_blocks = (max_seqlen_q + cfg.BLOCK_M - 1) // cfg.BLOCK_M
 
         start_pid = gl.program_id(axis=0)
@@ -496,17 +539,33 @@ class ProgramScheduler:
             num_batch_groups: gl.constexpr = (
                 cfg.BATCH_SIZE + batch_slots - 1
             ) // batch_slots
-            total_work = num_batch_groups * q_cycles_per_batch_group
 
             active_slots: gl.constexpr = batch_slots * cfg.N_HEADS * q_slots
-            slot_valid = logical_pid < active_slots
+
+            # DYNAMIC_SCHED replaces the static slot assignment with a global
+            # ticket counter, so a workgroup drawing cheap items keeps drawing
+            # instead of idling.
+            if cfg.DYNAMIC_SCHED:
+                # Padded up to a whole number of head groups, so the tail group
+                # decodes past the real heads and get_program drops those.
+                group_size: gl.constexpr = cfg.DYNAMIC_SCHED
+                n_groups: gl.constexpr = (
+                    cfg.BATCH_SIZE * cfg.N_HEADS + group_size - 1
+                ) // group_size
+                total_work = n_groups * group_size * num_q_blocks
+                work = gl.atomic_add(counter_ptr, 1, sem="relaxed", scope="gpu")
+                slot_valid = logical_pid >= 0
+            else:
+                total_work = num_batch_groups * q_cycles_per_batch_group
+                zero = logical_pid - logical_pid
+                work = zero
+                slot_valid = logical_pid < active_slots
+
             safe_pid = gl.where(slot_valid, logical_pid, 0)
             q_slot = safe_pid % q_slots
             head_batch_slot = safe_pid // q_slots
             q_head = head_batch_slot % cfg.N_HEADS
             batch_slot = head_batch_slot // cfg.N_HEADS
-            zero = logical_pid - logical_pid
-            work = zero
         else:
             total_work = batch_size * cfg.N_HEADS * num_q_blocks
             zero = logical_pid - logical_pid
@@ -530,6 +589,7 @@ class ProgramScheduler:
             q_head,
             q_slot,
             q_cycles_per_batch_group,
+            counter_ptr,
             batch_slots,
             q_slots,
         )
@@ -542,7 +602,14 @@ class ProgramScheduler:
     def advance(self):
         cfg = self.cfg
         if self.swizzled_order:
-            next_work = self.work + 1
+            if cfg.DYNAMIC_SCHED:
+                # At the end of the iteration, so the increment overlaps the
+                # tile just issued.
+                next_work = gl.atomic_add(
+                    self.counter_ptr, 1, sem="relaxed", scope="gpu"
+                )
+            else:
+                next_work = self.work + 1
         else:
             next_work = self.work + cfg.NUM_BLOCKS
         return ProgramScheduler(
@@ -556,6 +623,7 @@ class ProgramScheduler:
             self.q_head,
             self.q_slot,
             self.q_cycles_per_batch_group,
+            self.counter_ptr,
             self.batch_slots,
             self.q_slots,
         )
@@ -570,9 +638,61 @@ class ProgramScheduler:
         sink_ptr,
         lse_ptr,
         cu_seqlens_ptr,
+        log2_threshold,
     ):
         cfg = self.cfg
-        if self.swizzled_order:
+        if self.swizzled_order and cfg.DYNAMIC_SCHED:
+            # Decode which ticket this workgroup drew. No workgroup owns a
+            # fixed item, so any workgroup can pick up any (batch, head,
+            # query block) tile.
+            #
+            # Query blocks are issued in descending order, since causal
+            # masking makes later blocks more expensive and the last tile
+            # still running sets the total time. This also makes the q-slot
+            # swizzle below unnecessary.
+            #
+            # DYNAMIC_SCHED is not an on/off flag; it is the number of heads
+            # grouped together. The launcher sets it to N_HEADS / N_KV_HEADS,
+            # since query heads in the same group already share one KV head,
+            # so grouping them costs no extra memory footprint.
+            GROUP: gl.constexpr = cfg.DYNAMIC_SCHED
+            per_group = GROUP * self.num_q_blocks
+            ticket = self.work
+            group = ticket // per_group
+            within = ticket - group * per_group
+            qb_index = within // GROUP
+            head_in_group = within - qb_index * GROUP
+            query_block = self.num_q_blocks - 1 - qb_index
+            flat_head = group * GROUP + head_in_group
+            q_head = flat_head % cfg.N_HEADS
+            batch = flat_head // cfg.N_HEADS
+            valid = (
+                (flat_head < cfg.BATCH_SIZE * cfg.N_HEADS)
+                & (query_block >= 0)
+                & (query_block < self.num_q_blocks)
+            )
+
+            safe_batch = gl.where(valid, batch, 0)
+            seq_base = gl.load(cu_seqlens_ptr + safe_batch)
+            seq_end = gl.load(cu_seqlens_ptr + safe_batch + 1)
+            seq_len = seq_end - seq_base
+            program = AttentionProgram.initialize_from_state(
+                cfg,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                output_ptr,
+                sink_ptr,
+                lse_ptr,
+                seq_base,
+                seq_len,
+                gl.where(valid, query_block, 0),
+                q_head,
+                log2_threshold,
+            )
+            return program, valid & (program.q_start < program.seq_len)
+
+        elif self.swizzled_order:
             q_cycle_global = self.work
             batch_group = q_cycle_global // self.q_cycles_per_batch_group
             q_cycle = q_cycle_global - batch_group * self.q_cycles_per_batch_group
@@ -607,6 +727,7 @@ class ProgramScheduler:
                 seq_len,
                 query_block,
                 self.q_head,
+                log2_threshold,
             )
             return program, valid & (program.q_start < program.seq_len)
 
@@ -630,6 +751,7 @@ class ProgramScheduler:
                 seq_len,
                 query_block,
                 q_head,
+                log2_threshold,
             )
             return program, program.q_start < program.seq_len
 
@@ -715,22 +837,37 @@ def process_attention_tile(
 
     for _ in range(0, main_end):
         program.issue_load_k(k_offsets, k_smem)
-        program.issue_load_v(v_offsets, v_smem)
+        if cfg.DEFER_V_LOAD:
+            async_copy.wait_group(0)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
 
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+            if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+                program.issue_load_v(v_offsets, v_smem)
+                async_copy.wait_group(0)
+                v = program.shared_load_v(v_smem)
+                acc = program.compute_pv(p, v, acc)
+        else:
+            program.issue_load_v(v_offsets, v_smem)
 
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
+
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+                acc = program.compute_pv(p, v, acc)
 
         k_offsets = program.update_k_offsets(k_offsets)
         v_offsets = program.update_v_offsets(v_offsets)
         offs_n = offs_n + cfg.BLOCK_N
 
     # The main loop handles prefix tiles; the two boundary tiles are causal.
+    # DEFER_V_LOAD does not apply: diagonal tiles are almost never fully
+    # skipped, so V is co-issued with K here.
     boundary_start = main_end * cfg.BLOCK_N
     k_offsets, offs_n = program.make_k_offsets(boundary_start)
     v_offsets = program.make_v_offsets(boundary_start)
@@ -742,11 +879,12 @@ def process_attention_tile(
     k = program.shared_load_k(k_smem)
     qk = program.compute_qk(q, k)
     qk = gl.where(boundary_mask0, qk, -float("inf"))
-    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
 
     async_copy.wait_group(0)
     v = program.shared_load_v(v_smem)
-    acc = program.compute_pv(p, v, acc)
+    if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+        acc = program.compute_pv(p, v, acc)
 
     boundary_start = boundary_start + cfg.BLOCK_N
     k_offsets, offs_n = program.make_k_offsets(boundary_start)
@@ -759,11 +897,12 @@ def process_attention_tile(
     k = program.shared_load_k(k_smem)
     qk = program.compute_qk(q, k)
     qk = gl.where(boundary_mask1, qk, -float("inf"))
-    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
 
     async_copy.wait_group(0)
     v = program.shared_load_v(v_smem)
-    acc = program.compute_pv(p, v, acc)
+    if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+        acc = program.compute_pv(p, v, acc)
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2)
     program.store_lse(l_i, m_i)
@@ -780,6 +919,8 @@ def process_sliding_attention_tile(
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
 ):
+    # The launcher forces DEFER_V_LOAD off here: too few KV tiles for the
+    # saved traffic to cover the cost of deferring.
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
@@ -812,11 +953,12 @@ def process_sliding_attention_tile(
         k = program.shared_load_k(k_smem)
         qk = program.compute_qk(q, k)
         qk = gl.where(valid, qk, -float("inf"))
-        p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+        p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
 
         async_copy.wait_group(0)
         v = program.shared_load_v(v_smem)
-        acc = program.compute_pv(p, v, acc)
+        if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+            acc = program.compute_pv(p, v, acc)
         kv_start = kv_start + cfg.BLOCK_N
 
         mask_n = mask_n + cfg.BLOCK_N
@@ -845,6 +987,7 @@ def _mha_prefill(
     output_ptr,
     sink_ptr,
     lse_ptr,
+    sched_counter_ptr,
     Q_STRIDE_T: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -867,6 +1010,10 @@ def _mha_prefill(
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
+    ENABLE_SKIP_SOFTMAX: gl.constexpr,
+    DEFER_V_LOAD: gl.constexpr,
+    DYNAMIC_SCHED: gl.constexpr,
+    log2_threshold,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -881,6 +1028,9 @@ def _mha_prefill(
         HAS_LSE,
         -1,
         IS_FP8,
+        ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
+        DYNAMIC_SCHED,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -897,7 +1047,9 @@ def _mha_prefill(
         cfg.v_smem_layout,
     )
 
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, True)
+    scheduler = ProgramScheduler.create(
+        cfg, BATCH_SIZE, max_seqlen_q, sched_counter_ptr, True
+    )
     mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
     mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     boundary_mask0 = mask_offs_n[None, :] <= mask_offs_m[:, None]
@@ -912,6 +1064,7 @@ def _mha_prefill(
             sink_ptr,
             lse_ptr,
             cu_seqlens_ptr,
+            log2_threshold,
         )
         if active:
             if program.seq_len < cfg.BLOCK_N:
@@ -933,6 +1086,7 @@ def _mha_prefill_sliding(
     output_ptr,
     sink_ptr,
     lse_ptr,
+    sched_counter_ptr,
     Q_STRIDE_T: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -955,6 +1109,10 @@ def _mha_prefill_sliding(
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
+    ENABLE_SKIP_SOFTMAX: gl.constexpr,
+    DEFER_V_LOAD: gl.constexpr,
+    DYNAMIC_SCHED: gl.constexpr,
+    log2_threshold,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -969,6 +1127,9 @@ def _mha_prefill_sliding(
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
+        DYNAMIC_SCHED,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -985,7 +1146,9 @@ def _mha_prefill_sliding(
         cfg.v_smem_layout,
     )
 
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, False)
+    scheduler = ProgramScheduler.create(
+        cfg, BATCH_SIZE, max_seqlen_q, sched_counter_ptr, False
+    )
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -995,6 +1158,7 @@ def _mha_prefill_sliding(
             sink_ptr,
             lse_ptr,
             cu_seqlens_ptr,
+            log2_threshold,
         )
         if active:
             if program.seq_len < cfg.BLOCK_N:
@@ -1017,6 +1181,7 @@ class LaunchConfig(NamedTuple):
     max_seqlen: int
     window_left: int
     grid: tuple[int, ...]
+    log2_threshold: float
 
 
 def get_config(
@@ -1027,6 +1192,7 @@ def get_config(
     max_seqlen: int,
     window_left: int,
     softmax_scale: float | None,
+    skip_softmax_threshold: float,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -1039,6 +1205,11 @@ def get_config(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     sm_scale = softmax_scale * _INV_LN2_VALUE
+    log2_threshold = (
+        math.log(skip_softmax_threshold) * _INV_LN2_VALUE
+        if skip_softmax_threshold > 0.0
+        else 0.0
+    )
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -1051,6 +1222,7 @@ def get_config(
         max_seqlen=max_seqlen,
         window_left=window_left,
         grid=(512,),
+        log2_threshold=log2_threshold,
     )
 
 
@@ -1066,7 +1238,32 @@ def gluon_mha_prefill_gfx950(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    skip_softmax_threshold: float = 0.0,
+    defer_v_load: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Causal MHA prefill for gfx950, optionally with skip-softmax sparsity.
+
+    Args:
+        skip_softmax_threshold: a K/V block is skipped only when every row
+            in the query tile has exp(block_max_score - running_max) below
+            this threshold; if even one row misses, the block runs normally
+            and its result is exact. The skip rate depends on the score
+            distribution and must be calibrated per model and sequence
+            length. 0.0 (default) is exact dense attention. A nonzero value
+            also switches the persistent scheduler to the dynamic work
+            counter, which is needed for the skipped work to actually save
+            wall-clock time.
+        defer_v_load: only load V for blocks that are not skipped, so a
+            skipped block costs no V traffic either. Applies to the causal
+            main loop only: the sliding-window kernel and the two boundary
+            tiles always load V together with K. Output is bit-identical
+            either way. Off by default, since the different load order has
+            a fixed cost that only pays off at high sparsity.
+
+    Returns:
+        The attention output with the same shape as ``q``, or
+        ``(output, lse)`` when ``return_lse`` is set.
+    """
     total_tokens, n_heads, _ = q.shape
     config = get_config(
         q=q,
@@ -1075,7 +1272,9 @@ def gluon_mha_prefill_gfx950(
         max_seqlen=max_seqlen,
         window_left=window_left,
         softmax_scale=softmax_scale,
+        skip_softmax_threshold=skip_softmax_threshold,
     )
+    enable_skip_softmax = skip_softmax_threshold > 0.0
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
@@ -1089,7 +1288,27 @@ def gluon_mha_prefill_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    kernel = _mha_prefill_sliding if config.window_left >= 0 else _mha_prefill
+    is_sliding = config.window_left >= 0
+    # The sliding kernel ignores DEFER_V_LOAD; normalize it off so it does not
+    # compile a second, identical variant.
+    defer_v_load = defer_v_load and not is_sliding
+
+    # Tied to the threshold rather than a separate option: it rebalances the
+    # imbalance skip-softmax creates, and costs about 2% with no sparsity to
+    # earn it back. The sliding kernel is not persistent, so it gains nothing.
+    # See ProgramScheduler.get_program for why the group size is the GQA ratio.
+    dynamic_sched = (
+        config.n_heads // config.n_kv_heads
+        if enable_skip_softmax and not is_sliding
+        else 0
+    )
+    # Starts at zero: every ticket is drawn from it, including each
+    # workgroup's first.
+    sched_counter = (
+        torch.zeros(1, device=q.device, dtype=torch.int32) if dynamic_sched else q
+    )
+
+    kernel = _mha_prefill_sliding if is_sliding else _mha_prefill
     kernel[config.grid](
         q,
         k,
@@ -1098,6 +1317,7 @@ def gluon_mha_prefill_gfx950(
         output,
         sink_arg,
         lse_arg,
+        sched_counter,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -1120,6 +1340,10 @@ def gluon_mha_prefill_gfx950(
         has_lse,
         config.window_left,
         is_fp8,
+        enable_skip_softmax,
+        defer_v_load,
+        dynamic_sched,
+        config.log2_threshold,
         num_warps=config.num_warps,
     )
     if return_lse:
