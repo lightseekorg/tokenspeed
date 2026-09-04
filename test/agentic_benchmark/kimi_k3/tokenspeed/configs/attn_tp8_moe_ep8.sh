@@ -22,7 +22,6 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
-    --disable-kvstore \
     --enable-cache-report \
     --reasoning-parser passthrough \
     --tool-call-parser passthrough \
