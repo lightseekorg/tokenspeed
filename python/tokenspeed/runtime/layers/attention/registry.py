@@ -235,6 +235,7 @@ class _AttnSideProfile:
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
     is_dsa_kda: bool
+    is_qsa: bool
     is_inkling: bool
     is_deepseek_v4: bool
     is_dspark: bool
@@ -252,6 +253,7 @@ def _resolve_attn_side(
 ) -> _AttnSideProfile:
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None) or []
+    text_config = getattr(hf_config, "text_config", hf_config)
     is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     return _AttnSideProfile(
@@ -261,6 +263,8 @@ def _resolve_attn_side(
         is_kda=is_dsa_kda
         or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
         is_dsa_kda=is_dsa_kda,
+        is_qsa=is_qwen4_exp(hf_config)
+        and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
         # The DSpark draft resolves as a V4 architecture but has no paged
         # attention config of its own; it must not take the V4 branches.
@@ -341,6 +345,7 @@ def _resolve_full_attn_backend_name(
             hybrid_request,
             is_kda=profile.is_kda,
             is_dsa=profile.is_dsa_kda,
+            is_qsa=profile.is_qsa,
             has_cache_plan=True,
         )
     return softmax_attn.backend_name
@@ -609,10 +614,19 @@ def _resolve_hybrid_full_backend_name(
     *,
     is_kda: bool,
     is_dsa: bool,
+    is_qsa: bool,
     has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
     name = None if requested_name == "hybrid_linear_attn" else requested_name
+    if has_cache_plan and is_qsa:
+        if name is not None:
+            logger.warning(
+                "Qwen4-Exp QSA pins its sparse dispatch to the qsa backend; "
+                "ignoring explicit attention backend %r",
+                requested_name,
+            )
+        return "qsa"
     if has_cache_plan and is_dsa and name is None:
         return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
@@ -947,6 +961,16 @@ def _prepare_verify_workspace(
             config.max_bs,
             int(server_args.speculative_num_draft_tokens),
         )
+        full_preallocate = getattr(
+            getattr(backend, "full_attn_backend", None),
+            "preallocate_verify_workspace",
+            None,
+        )
+        if full_preallocate is not None:
+            actual_bytes += full_preallocate(
+                config.max_bs,
+                int(server_args.speculative_num_draft_tokens),
+            )
     elif is_inkling:
         model_name = "Inkling"
         actual_bytes = backend.fixed_workspace_bytes()

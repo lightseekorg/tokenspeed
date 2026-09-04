@@ -95,9 +95,24 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
+        **kwargs,
     ) -> torch.Tensor:
+        topk_indices = kwargs.pop("topk_indices", None)
+        if kwargs:
+            raise TypeError(
+                f"unexpected Qwen4-Exp draft attention args: {sorted(kwargs)}"
+            )
         if ctx.draft_narrowing is None:
-            return super()._attn(q, k, v, gate, ctx)
+            if topk_indices is None:
+                return super()._attn(q, k, v, gate, ctx)
+            return super()._attn(
+                q,
+                k,
+                v,
+                gate,
+                ctx,
+                topk_indices=topk_indices,
+            )
         from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
         # The live rows attend over the accepted prefix, not the verify window.
@@ -105,31 +120,27 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
-        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        output = self.attn(
-            q,
-            k,
-            v,
-            decode_ctx,
-            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-        )
+        if topk_indices is None:
+            decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
+            output = self.attn(
+                q,
+                k,
+                v,
+                decode_ctx,
+                record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+            )
+        else:
+            topk_indices = topk_indices.index_select(0, ctx.gather_ids)
+            output = self.attn(
+                q,
+                k,
+                v,
+                ctx,
+                topk_indices=topk_indices,
+            )
         if gate is not None:
             sigmoid_mul(output, gate)
         return output
-
-    def _qsa_attention(self, **kwargs) -> torch.Tensor:
-        ctx = kwargs["ctx"]
-        if ctx.draft_narrowing is None:
-            return super()._qsa_attention(**kwargs)
-        # The indexer published the accepted prefix once its verify-window
-        # layout was done; the sparse attention reads it for the live rows.
-        kwargs["q"] = kwargs["q"].index_select(0, ctx.gather_ids)
-        kwargs["selected_slots"] = kwargs["selected_slots"].index_select(
-            0, ctx.gather_ids
-        )
-        if kwargs["gate"] is not None:
-            kwargs["gate"] = kwargs["gate"].index_select(0, ctx.gather_ids)
-        return super()._qsa_attention(**kwargs)
 
     def forward(self, *args, **kwargs):
         ctx = kwargs["ctx"]

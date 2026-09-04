@@ -137,17 +137,22 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return ratios.pop()
 
     @cached_property
+    def _qsa_target_layers(self) -> tuple[tuple[int, int], ...]:
+        """Target-side QSA layers (id, index width); verify staging is target-only."""
+        if getattr(self._text_config, "indexer_n_heads", None) is None:
+            return ()
+        index_dim = int(self._text_config.indexer_head_dim)
+        return tuple(
+            (layer_id, index_dim)
+            for layer_id, layer_type in enumerate(self.target_layer_types)
+            if layer_type == FULL_ATTENTION
+        )
+
+    @cached_property
     def _qsa_layers(self) -> tuple[tuple[int, int], ...]:
         """Return global layer ids and index widths for target and draft QSA."""
 
-        layers = []
-        if getattr(self._text_config, "indexer_n_heads", None) is not None:
-            index_dim = int(self._text_config.indexer_head_dim)
-            layers.extend(
-                (layer_id, index_dim)
-                for layer_id, layer_type in enumerate(self.target_layer_types)
-                if layer_type == FULL_ATTENTION
-            )
+        layers = list(self._qsa_target_layers)
         if (
             self._draft_text_config is not None
             and getattr(self._draft_text_config, "indexer_n_heads", None) is not None
@@ -203,6 +208,30 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         for layer_id, index_dim in self._qsa_layers:
             add_layer(layer_id, index_dim)
         return tuple(compressed_fields), tuple(recent_fields)
+
+    @override
+    def workspace_bytes(self) -> int:
+        """GDN verify staging plus the QSA verify staging side-set."""
+        return super().workspace_bytes() + self._qsa_staging_bytes()
+
+    def _qsa_staging_bytes(self) -> int:
+        """QSA target-verify staging, in closed form.
+
+        Mirrors ``QSAAttnBackend.preallocate_verify_workspace``: one
+        layer-major key buffer (model dtype) plus the three shared tensors
+        (int64 positions, int64 logical positions, int32 recent locations),
+        sized once for the verify batch bound and the single verify width.
+        """
+        layers = self._qsa_target_layers
+        width = int(self.attn_config.speculative_num_draft_tokens)
+        if not layers or not self.num_draft_layers or width <= 1:
+            return 0
+        capacity = int(self.attn_config.max_bs)
+        index_dim = layers[0][1]
+        dtype_bytes = torch.empty((), dtype=self.attn_config.dtype).element_size()
+        key_bytes = len(layers) * capacity * width * index_dim * dtype_bytes
+        shared_bytes = capacity * width * ((3 + 1) * 8 + 4)
+        return key_bytes + shared_bytes
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:

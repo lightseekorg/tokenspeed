@@ -136,6 +136,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.cache_pool = cache_pool
         for backend in self.child_backends():
             backend.set_cache_pool(cache_pool)
+            if hasattr(backend, "commit_after_mtp_verify"):
+                self.register_speculative_state_backend(backend)
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
