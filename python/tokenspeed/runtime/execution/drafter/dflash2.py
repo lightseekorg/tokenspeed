@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling.triton import dflash2_greedy_path
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -30,13 +31,13 @@ from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsPro
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 
-def _walk_greedy_path(
+def _greedy_path_torch(
     candidate_ids: torch.Tensor,
     scores: torch.Tensor,
     anchor_token_ids: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Greedily walk a fixed DFlash2 lattice without host-side tensor reads."""
+    """Torch reference for the walk; CUDA batches take the Triton kernel."""
     batch_size, num_steps, top_k = candidate_ids.shape
     out[:, 0].copy_(anchor_token_ids)
     previous = torch.zeros(batch_size, dtype=torch.int64, device=candidate_ids.device)
@@ -50,6 +51,18 @@ def _walk_greedy_path(
         token = torch.gather(candidate_ids[:, step], 1, previous[:, None]).squeeze(1)
         out[:, step + 1].copy_(token)
     return out
+
+
+def _walk_greedy_path(
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Greedily walk a fixed DFlash2 lattice without host-side tensor reads."""
+    if scores.is_cuda:
+        return dflash2_greedy_path(candidate_ids, scores, anchor_token_ids, out)
+    return _greedy_path_torch(candidate_ids, scores, anchor_token_ids, out)
 
 
 class DFlash2(DFlash):
