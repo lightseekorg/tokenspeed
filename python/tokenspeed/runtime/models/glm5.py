@@ -429,9 +429,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if seq_lens is not None:
             limits.append(max(0, int(seq_lens.shape[0]) - num_extends))
 
-        block_tables = getattr(metadata, "block_kv_indices", None)
-        if block_tables is not None:
-            limits.append(max(0, int(block_tables.shape[0]) - num_extends))
+        page_table = getattr(metadata, "page_table", None)
+        if page_table is not None:
+            limits.append(max(0, int(page_table.shape[0]) - num_extends))
 
         return min(limits)
 
@@ -500,7 +500,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         logical_num_tokens: int | None = None,
     ) -> GlmDsaDecodeTopK | None:
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if metadata is None or metadata.block_kv_indices is None:
+        if metadata is None or metadata.page_table is None:
             return None
         num_tokens = indexer_output.query.shape[0]
         if logical_num_tokens is None:
@@ -524,7 +524,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if seq_lens.numel() == 0:
             return None
 
-        page_table = metadata.block_kv_indices[
+        page_table = metadata.page_table[
             num_extends : num_extends + decode_window.num_reqs
         ]
         topk = self.index_topk
@@ -612,7 +612,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         num_prefill_tokens: int,
     ) -> GlmDsaPrefillTopK | None:
-        cached = ctx.dsa_prefill_topk
+        cached = ctx.attn_backend.sparse_topk.prefill
         if (
             isinstance(cached, GlmDsaPrefillTopK)
             and cached.row_starts is not None
@@ -772,7 +772,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -801,6 +800,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
+
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
@@ -822,11 +822,38 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         decode_start = decode_window.start
         decode_end = decode_window.end
 
+        # The round's KV write slots, by sub-mode: the extend span for the
+        # prefill rows, the decode rows' verify window behind them. The
+        # indexer's full-round index_k write consumes the concatenation
+        # (eager-only here: this break never runs inside a captured graph).
+        backend = ctx.attn_backend
+        # The forward's shared top-k: an indexer layer publishes, "shared"
+        # layers (and the MTP head reusing the target's) consume.
+        shared_topk = backend.sparse_topk
+        prefill_locs = (
+            backend.write_locations(self.attn_mqa, ForwardMode.EXTEND)
+            if num_prefill_tokens > 0
+            else None
+        )
+        decode_locs = (
+            backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            if num_decode_tokens > 0
+            else None
+        )
+        if prefill_locs is not None and decode_locs is not None:
+            out_cache_loc = torch.cat((prefill_locs, decode_locs))
+        elif prefill_locs is not None:
+            out_cache_loc = prefill_locs
+        elif decode_locs is not None:
+            out_cache_loc = decode_locs
+        else:
+            out_cache_loc = torch.empty(0, dtype=torch.int64, device=q_norm.device)
+
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
             and (
-                (num_prefill_tokens > 0 and ctx.dsa_prefill_topk is None)
-                or (num_decode_tokens > 0 and ctx.dsa_decode_topk is None)
+                (num_prefill_tokens > 0 and shared_topk.prefill is None)
+                or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
         if should_compute_indexer:
@@ -838,13 +865,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 indexer_output.key,
             )
             if ctx.num_extends > 0:
-                ctx.dsa_prefill_topk = self._compute_prefill_topk_indices(
+                shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
                     ctx,
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                ctx.dsa_decode_topk = self._compute_decode_topk_indices(
+                shared_topk.decode = self._compute_decode_topk_indices(
                     indexer_output,
                     ctx,
                 )
@@ -864,7 +891,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            if ctx.dsa_prefill_topk is None:
+            if shared_topk.prefill is None:
                 raise RuntimeError(
                     "GLM DSA sparse prefill requires computed top-k indices."
                 )
@@ -873,9 +900,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 q[:num_prefill_tokens],
                 latent_cache[:num_prefill_tokens],
                 prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
+                prefill_locs,
                 attn_output[:num_prefill_tokens],
-                prefill_topk=ctx.dsa_prefill_topk,
+                prefill_topk=shared_topk.prefill,
             )
 
         if num_decode_tokens > 0:
@@ -886,12 +913,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-            if ctx.dsa_decode_topk is None:
+            if shared_topk.decode is None:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
             topk_indices, topk_lens = self._slice_decode_topk(
-                ctx.dsa_decode_topk,
+                shared_topk.decode,
                 decode_start,
                 decode_end,
             )
@@ -900,13 +927,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 q[decode_start:decode_end],
                 latent_cache[decode_start:decode_end],
                 decode_ctx,
-                out_cache_loc[decode_start:decode_end],
+                decode_locs,
                 attn_output[decode_start:decode_end],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
 
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
@@ -974,7 +1001,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             Q,
             K,
             ctx,
-            out_cache_loc,
             output,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
@@ -985,7 +1011,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         Q,
         K,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
@@ -999,7 +1024,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             K,
             K[..., : self.kv_lora_rank] if K is not None else None,
             ctx,
-            out_cache_loc,
             save_kv_cache=need_save_kv,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
@@ -1106,7 +1130,6 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1121,10 +1144,9 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            if ctx.accept_lengths is not None:
+            if ctx.draft_narrowing is not None:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx

@@ -13,7 +13,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.backends import mla as mla_backend
+from tokenspeed.runtime.layers.attention.backends.paged import mla as mla_backend
 
 
 def _run_mla_decode(

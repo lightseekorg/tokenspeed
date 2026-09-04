@@ -29,9 +29,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheMemoryPlan,
     cache_field_layer_id,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    MXFP8_KV_SCALE_TILE_TOKENS,
+    cache_field_plane,
 )
 
 if TYPE_CHECKING:
@@ -122,13 +120,6 @@ class CacheTransferSchema:
             )
 
 
-def _text_config(model_config: ModelConfig):
-    text_config = getattr(model_config, "hf_text_config", None)
-    if text_config is not None:
-        return text_config
-    return getattr(model_config.hf_config, "text_config", model_config.hf_config)
-
-
 def _source_model(
     layer_id: int,
     *,
@@ -153,7 +144,6 @@ def _partition_for_field(
     *,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
-    prefix_granularity: int,
     inkling_layers: frozenset[int],
 ) -> CacheFieldPartition | None:
     layer_id = cache_field_layer_id(field.field_id)
@@ -162,7 +152,7 @@ def _partition_for_field(
         model_config=model_config,
         draft_model_config=draft_model_config,
     )
-    suffix = field.field_id.split(".", 2)[2]
+    suffix = cache_field_plane(field.field_id)
 
     if layer_id in inkling_layers:
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
@@ -181,11 +171,9 @@ def _partition_for_field(
     if suffix in ("k", "v"):
         return CacheFieldPartition(1, source_model.num_key_value_heads)
     if suffix in ("k_scale", "v_scale"):
-        # Tiled mxfp8 scales are head-major; per-token scales are token-major.
-        axis = 0 if prefix_granularity == MXFP8_KV_SCALE_TILE_TOKENS else 1
-        return CacheFieldPartition(axis, source_model.num_key_value_heads)
+        return CacheFieldPartition(0, source_model.num_key_value_heads)
 
-    text_config = _text_config(source_model)
+    text_config = source_model.hf_text_config
     if suffix in ("conv", "ssm") and hasattr(text_config, "linear_num_key_heads"):
         key_width = text_config.linear_key_head_dim * text_config.linear_num_key_heads
         value_width = (
@@ -222,7 +210,7 @@ def build_cache_transfer_schema(
     inkling_layers = frozenset(
         cache_field_layer_id(field.field_id)
         for field in plan.fields
-        if field.field_id.split(".", 2)[-1].startswith("kvconv_")
+        if cache_field_plane(field.field_id).startswith("kvconv_")
     )
     fields = []
     for field in plan.fields:
@@ -230,7 +218,6 @@ def build_cache_transfer_schema(
             field,
             model_config=model_config,
             draft_model_config=draft_model_config,
-            prefix_granularity=plan.prefix_granularity,
             inkling_layers=inkling_layers,
         )
         if partition is not None:

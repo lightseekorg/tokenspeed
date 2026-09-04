@@ -40,9 +40,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
@@ -52,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
@@ -61,6 +59,24 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     """Qwen4-Exp GDN cache plus model-owned PLE and QSA groups."""
 
     family = "qwen4_exp"
+
+    @cached_property
+    def _text_config(self):
+        return getattr(
+            self.model_config.hf_config,
+            "text_config",
+            self.model_config.hf_config,
+        )
+
+    @cached_property
+    def _draft_text_config(self):
+        if self.draft_model_config is None:
+            return None
+        return getattr(
+            self.draft_model_config.hf_config,
+            "text_config",
+            self.draft_model_config.hf_config,
+        )
 
     @property
     @override

@@ -52,8 +52,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class DFlashAttention(nn.Module):
-    cache_group_id = FULL_ATTENTION
-
     def __init__(
         self,
         config,
@@ -127,15 +125,14 @@ class DFlashAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=sliding_window,
-            group_id=self.cache_group_id,
+            sliding_window_size=_get_dflash_layer_sliding_window(config, layer_id),
+            group_id=get_dflash_layer_cache_group_id(config, layer_id),
         )
 
     def _apply_qk_norm(
@@ -152,7 +149,6 @@ class DFlashAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -170,6 +166,9 @@ class DFlashAttention(nn.Module):
         )
         k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
         v_cache = v.view(-1, self.num_kv_heads, self.head_dim)
+        # Model-side pool write: slots come from the backend (the drafter
+        # publishes each step's window before the forward).
+        out_cache_loc = ctx.attn_backend.write_locations(self.attn, ctx.forward_mode)
         if ctx.token_to_kv_pool.dtype == torch.float8_e4m3fn:
             k_buf, v_buf = ctx.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
             fused_fp8_set_kv_buffer(
@@ -196,7 +195,6 @@ class DFlashAttention(nn.Module):
             None,
             None,
             ctx,
-            out_cache_loc,
             save_kv_cache=False,
         )
         if len(attn_output.size()) == 3:
@@ -308,7 +306,6 @@ class DFlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if ctx.forward_mode.is_idle():
@@ -337,7 +334,6 @@ class DFlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
 
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
@@ -446,7 +442,6 @@ class DFlashDraftModel(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         kv_sync_event=None,
@@ -469,7 +464,6 @@ class DFlashDraftModel(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 residual=residual,
             )
 
@@ -555,6 +549,20 @@ def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
             "DFLASH config.layer_types must be a sequence of attention type strings."
         )
     return layer_types
+
+
+def get_dflash_layer_cache_group_id(config: Any, layer_id: int) -> str:
+    """The cache group a draft layer's KV lives in: its ``layer_types`` label.
+
+    The merged cache plan groups draft layers by the draft config's own
+    ``layer_types`` (single window, so the published group id is the bare
+    label) and falls back to the full-history group when the config carries
+    no labels.
+    """
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return FULL_ATTENTION
+    return str(layer_types[layer_id])
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> int | None:

@@ -53,7 +53,7 @@ from tokenspeed.runtime.multimodal.embedder import (
     pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import (
@@ -109,7 +109,6 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -129,7 +128,6 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )
@@ -291,7 +289,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         *,
         max_metadata_sequences_per_batch: int | None = None,
         metadata_sequence_budget_from_encoder_output_budget: bool = False,
-    ) -> EncoderCudaGraphWrapper:
+    ) -> EncoderForwardStepRunner:
         adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
             pre_encode=self.pre_encode,
@@ -303,7 +301,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
-        return EncoderCudaGraphWrapper(
+        return EncoderForwardStepRunner(
             adapter=adapter,
             budget_range=(64, 4096),
             max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
@@ -333,7 +331,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -350,7 +347,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
         ):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
         input_embeds, model_kwargs = self.multimodal_embedder.apply(
             input_ids=input_ids,
@@ -363,7 +360,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

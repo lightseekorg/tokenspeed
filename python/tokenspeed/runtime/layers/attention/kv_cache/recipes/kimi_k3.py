@@ -40,7 +40,6 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -55,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupDeclaration,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -88,10 +88,9 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- layer vocabulary ----
 
-    @cached_property
+    @property
     def _text_config(self):
-        hf_config = self.model_config.hf_config
-        return getattr(hf_config, "text_config", hf_config)
+        return self.model_config.hf_text_config
 
     @cached_property
     def target_group_ids(self) -> tuple[str, ...]:
@@ -122,8 +121,9 @@ class KimiK3Recipe(CacheRecipe):
             or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
         ):
             raise ValueError(
-                "93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
-                f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+                f"{_KIMI_K3_LAYERS}-layer Kimi-K3 requires "
+                f"{_KIMI_K3_KDA_LAYERS} KDA and {_KIMI_K3_MLA_LAYERS} MLA "
+                f"layers, got {len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
         if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
             raise ValueError(
@@ -380,14 +380,6 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
-
-    @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
-        token_limit = self.token_limit
-        if token_limit is None:
-            return num_lcm_blocks
-        return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

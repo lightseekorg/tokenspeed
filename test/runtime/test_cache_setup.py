@@ -62,8 +62,6 @@ def _model_wide_kwargs(**overrides) -> dict:
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
-        max_graph_bs=2,
-        max_scheduled_tokens=128,
     )
     kwargs.update(overrides)
     return kwargs
@@ -109,7 +107,6 @@ def _msa_config() -> AttnConfig:
         sparse_layer_ids=frozenset({1}),
         index_head_dim=4,
         index_n_heads=1,
-        index_block_size=64,
         index_topk_blocks=1,
         index_init_blocks=1,
         index_local_blocks=1,
@@ -143,6 +140,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
+                pd_disaggregation_enabled=False,
                 spec=SimpleNamespace(sliding_window_tokens=windows),
             ),
             draft_model_config=None,

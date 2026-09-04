@@ -33,10 +33,19 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
+    write_dsv4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    DEEPSEEK_V4_FP8_MAX,
+    DEEPSEEK_V4_FP8_QUANT_BLOCK,
+    DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_fp8_scale_bytes,
+    deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_nope_dim,
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
 )
@@ -45,13 +54,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_indexer_cache_insert,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q_mxfp4,
-    dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
     read_deepseek_v4_indexer_fp8_cache,
-    read_deepseek_v4_indexer_mxfp4_cache,
     save_deepseek_v4_compressor_state,
-    write_deepseek_v4_indexer_fp8_cache,
-    write_deepseek_v4_indexer_mxfp4_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _mask_invalid_graph_tokens,
@@ -159,6 +164,237 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
     )
     return table[(nibbles & 0x7).long()] * torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
+
+
+# Torch references for the dsv4 cache kernels below; they mirror the cache
+# layouts the runtime geometry declares and exist only to check the kernels.
+def _indexer_mxfp4_layout_from_cache(
+    cache_2d: torch.Tensor,
+    block_size: int,
+) -> tuple[int, int, int]:
+    if cache_2d.dim() != 2:
+        raise ValueError(f"cache_2d must be 2-D, got {tuple(cache_2d.shape)}")
+    row_bytes = cache_2d.shape[1] // block_size
+    if cache_2d.shape[1] % block_size != 0:
+        raise ValueError(
+            "MXFP4 indexer cache row size must match value+scale layout, "
+            f"got cache shape {tuple(cache_2d.shape)} and block_size={block_size}"
+        )
+    return deepseek_v4_indexer_mxfp4_layout_from_row_bytes(row_bytes)
+
+
+def _fp8_e4m3_pow2_bytes(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = max(float(block.detach().abs().max()) / DEEPSEEK_V4_FP8_MAX, 1.0e-10)
+    scale = 2.0 ** math.ceil(math.log2(scale))
+    scaled = torch.clamp(block / scale, -DEEPSEEK_V4_FP8_MAX, DEEPSEEK_V4_FP8_MAX)
+    return scaled.to(torch.float8_e4m3fn).view(torch.uint8), block.new_tensor(scale)
+
+
+def dequantize_deepseek_v4_fp8_ds_mla_cache(
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+    *,
+    head_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Dequantize DeepSeek V4 `fp8_ds_mla` rows selected by global slots."""
+
+    nope_dim = deepseek_v4_nope_dim(head_dim, rope_dim)
+    token_stride = deepseek_v4_swa_token_stride(head_dim, rope_dim)
+    scale_dim = deepseek_v4_swa_scale_dim(head_dim, rope_dim)
+    min_stride = block_size * (token_stride + scale_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    out_shape = (slot_mapping.numel(), head_dim)
+    if slot_mapping.numel() == 0:
+        return torch.empty(out_shape, device=cache_2d.device, dtype=torch.bfloat16)
+
+    num_nope_blocks = nope_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK
+
+    slots = slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * token_stride
+    scale_base = block_size * token_stride + pos * scale_dim
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(token_stride, device=cache_2d.device, dtype=torch.int64)[None, :]
+    )
+    row_bytes = cache_2d[pages[:, None], value_offsets]
+    nope = row_bytes[:, :nope_dim].contiguous().view(torch.float8_e4m3fn)
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(num_nope_blocks, device=cache_2d.device, dtype=torch.int64)[
+            None, :
+        ]
+    )
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
+    scales = scales.float().repeat_interleave(DEEPSEEK_V4_FP8_QUANT_BLOCK, dim=1)
+
+    rope = row_bytes[:, nope_dim:token_stride].contiguous()
+    out = torch.cat([nope.float() * scales, rope.view(torch.bfloat16).float()], dim=1)
+    out = out.to(torch.bfloat16)
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
+
+
+def write_deepseek_v4_indexer_fp8_cache(
+    index_k: torch.Tensor,
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> None:
+    """Write FP8 indexer keys using `[values | fp32 scale]` page layout."""
+
+    if index_k.dim() != 2:
+        raise ValueError(f"index_k must be [tokens, dim], got {tuple(index_k.shape)}")
+    index_head_dim = int(index_k.shape[-1])
+    scale_bytes = deepseek_v4_indexer_fp8_scale_bytes(index_head_dim)
+    row_bytes = deepseek_v4_indexer_fp8_row_bytes(index_head_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    min_stride = block_size * row_bytes
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    num_actual = min(slot_mapping.numel(), index_k.shape[0])
+    for token_idx in range(num_actual):
+        slot = int(slot_mapping[token_idx].item())
+        if slot < 0:
+            continue
+        page = slot // block_size
+        pos = slot % block_size
+        # Row-index the 2-D cache (strided-view safe) instead of computing
+        # page * stride(0) offsets into reshape(-1).
+        page_row = cache_2d[page]
+        value_base = pos * index_head_dim
+        scale_base = block_size * index_head_dim + pos * scale_bytes
+        q_bytes, scale = _fp8_e4m3_pow2_bytes(index_k[token_idx].float())
+        page_row[value_base : value_base + index_head_dim].copy_(q_bytes)
+        page_row[scale_base : scale_base + scale_bytes].copy_(
+            scale.reshape(1).view(torch.uint8)
+        )
+
+
+def write_deepseek_v4_indexer_mxfp4_cache(
+    index_k: torch.Tensor,
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> None:
+    """Write MXFP4 indexer keys using the `[values | ue8m0 scales]` layout."""
+
+    if index_k.dim() != 2:
+        raise ValueError(f"index_k must be [tokens, dim], got {tuple(index_k.shape)}")
+    index_head_dim = int(index_k.shape[-1])
+    row_bytes = deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    min_stride = block_size * row_bytes
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    num_actual = min(slot_mapping.numel(), index_k.shape[0])
+    if num_actual == 0:
+        return
+    if not index_k.is_cuda:
+        raise ValueError(
+            "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA tensors."
+        )
+    valid = torch.ones(num_actual, device=index_k.device, dtype=torch.bool)
+    write_dsv4_indexer_mxfp4_cache_cuda(
+        index_k[:num_actual],
+        cache_2d,
+        slot_mapping[:num_actual],
+        valid,
+        block_size,
+    )
+
+
+def read_deepseek_v4_indexer_mxfp4_cache(
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """Dequantize MXFP4 indexer cache rows selected by `slot_mapping`."""
+
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    index_head_dim, value_bytes, scale_bytes = _indexer_mxfp4_layout_from_cache(
+        cache_2d, block_size
+    )
+    min_stride = block_size * (value_bytes + scale_bytes)
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    out_shape = (slot_mapping.numel(), index_head_dim)
+    if slot_mapping.numel() == 0:
+        return torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
+
+    slots = slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * value_bytes
+    scale_base = block_size * value_bytes + pos * scale_bytes
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(
+            value_bytes,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    packed = cache_2d[pages[:, None], value_offsets]
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(
+            scale_bytes,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
+    byte_scales = scales.float().repeat_interleave(
+        DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2, dim=1
+    )
+
+    even = _e2m1_values(packed & 0xF) * byte_scales
+    odd = _e2m1_values(packed >> 4) * byte_scales
+    out = torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
+    out[:, 0::2] = even
+    out[:, 1::2] = odd
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
 
 
 def _mxfp4_bytes_and_scales(

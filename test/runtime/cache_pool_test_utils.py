@@ -20,7 +20,6 @@ def specs_for_layers(
     group_ids,
     prefix_granularity,
     sliding_window_tokens=None,
-    page_sizes=None,
     pd_disaggregation_enabled=False,
 ):
     """The group specs a layer vocabulary produces.
@@ -36,7 +35,6 @@ def specs_for_layers(
             group_ids=group_ids,
             sliding_window_tokens=sliding_window_tokens,
             prefix_granularity=prefix_granularity,
-            page_sizes=page_sizes,
             pd_disaggregation_enabled=pd_disaggregation_enabled,
             fields_for_layer=lambda layer_id, group_id, occurrence: (
                 CacheFieldSpec(
@@ -193,6 +191,10 @@ def make_mha_memory_plan(
     """An MHA plan the way the recipe builds one: group, pack, bind."""
     if size % prefix_granularity:
         raise ValueError("test pool size must be divisible by prefix_granularity")
+    # Resolve the labels the way a recipe does: one per layer, full-history
+    # when the caller declares none.
+    if not layer_types:
+        layer_types = ("full_attention",) * layer_num
     group_ids = make_layer_group_ids(
         layer_num=layer_num,
         layer_types=layer_types,

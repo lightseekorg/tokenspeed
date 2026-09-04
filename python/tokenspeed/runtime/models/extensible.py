@@ -55,7 +55,6 @@ class InputProcessorBase(nn.Module):
         input_ids: Tensor,
         positions: Tensor,
         ctx: ForwardContext,
-        out_cache_loc: Tensor,
         input_embeds: Tensor = None,
     ) -> Tensor:
         if input_embeds is not None:
@@ -171,20 +170,16 @@ class ExtensibleLM(nn.Module):
         ctx: ForwardContext,
         input_ids: Tensor,
         positions: Tensor,
-        out_cache_loc: Tensor,
         input_embeds: Tensor = None,
     ) -> LogitsProcessorOutput:
         # input processor: get input hidden states
-        input_embeds = self.input_processor(
-            input_ids, positions, ctx, out_cache_loc, input_embeds
-        )
+        input_embeds = self.input_processor(input_ids, positions, ctx, input_embeds)
 
         # base model forward
         out_hidden_states, _ = self.base_lm.model(
             input_ids=None,
             positions=positions,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             input_embeds=input_embeds,
         )
 

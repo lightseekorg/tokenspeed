@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen4-Exp cache identifiers and logical page geometry.
+"""Qwen4-Exp cache group ids, field ids and rows-per-page constants.
 
 This module is deliberately weight-free. Cache recipes, attention backends,
 and model layers share this contract without importing model code or QSA

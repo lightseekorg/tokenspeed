@@ -4,7 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "Optional pull request number or URL; blank runs latest main"
+        description: "Optional pull request number or URL; mutually exclusive with commit"
+        required: false
+        default: ""
+        type: string
+      commit:
+        description: "Optional full commit SHA; blank uses pr or latest main"
         required: false
         default: ""
         type: string
@@ -32,7 +37,7 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml
-          - test/ci/eval/kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
+          - test/ci/eval/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
@@ -99,7 +104,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -119,11 +124,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ inputs.pr }}
+          COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
-          if [ -z "$PR" ]; then
-            sha=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+
+          trim() {
+            local value=$1
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "$value"
+          }
+
+          PR=$(trim "$PR")
+          COMMIT=$(trim "$COMMIT")
+          COMMIT=${COMMIT,,}
+
+          if [ -n "$PR" ] && [ -n "$COMMIT" ]; then
+            echo "Set only one of pr or commit" >&2
+            exit 2
+          fi
+
+          if [ -n "$COMMIT" ]; then
+            [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "Invalid commit SHA: expected exactly 40 hexadecimal characters" >&2
+              exit 2
+            }
+            # Manual dispatch is restricted to users with repository write
+            # access. Require an immutable SHA, but intentionally allow an
+            # unmerged commit so testing does not require a pull request.
+            if ! data=$(gh api "repos/${{ github.repository }}/commits/$COMMIT"); then
+              echo "Commit not found in ${{ github.repository }}: $COMMIT" >&2
+              exit 2
+            fi
+            sha=$(jq -r .sha <<< "$data")
+            [[ "$sha" == "$COMMIT" ]] || {
+              echo "Resolved commit does not match requested SHA: $COMMIT" >&2
+              exit 2
+            }
+            link=$(jq -r .html_url <<< "$data")
+            mode=commit
+            # A manually selected commit may contain unmerged tokenspeed-mla
+            # changes, so always use its in-tree package.
+            install_mla=1
+          elif [ -z "$PR" ]; then
+            if ! sha=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha); then
+              echo "Failed to resolve latest main" >&2
+              exit 2
+            fi
             link="https://github.com/${{ github.repository }}/commit/$sha"
+            mode=main
             install_mla=0
           else
             number=${PR##*/}
@@ -131,9 +180,13 @@ jobs:
               echo "Invalid pull request: $PR" >&2
               exit 2
             }
-            data=$(gh api "repos/${{ github.repository }}/pulls/$number")
+            if ! data=$(gh api "repos/${{ github.repository }}/pulls/$number"); then
+              echo "Pull request not found: $PR" >&2
+              exit 2
+            fi
             sha=$(jq -r .head.sha <<< "$data")
             link=$(jq -r .html_url <<< "$data")
+            mode=pr
             if gh api "repos/${{ github.repository }}/pulls/$number/files" \
               --paginate --jq '.[].filename' | grep -q '^tokenspeed-mla/'; then
               install_mla=1
@@ -147,6 +200,7 @@ jobs:
             echo "### K8s Dispatch"
             echo
             echo "- Source: [$link]($link)"
+            echo "- Mode: $mode"
             echo "- Commit: \`$sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

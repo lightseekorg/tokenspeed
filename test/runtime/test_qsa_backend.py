@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.qsa import bind_qsa_indexers
+from tokenspeed.runtime.layers.attention.backends.state.qsa import bind_qsa_indexers
 
 
 class _TestAttentionBackend:

@@ -57,7 +57,6 @@ class MSAConfig(SoftmaxAttnConfig):
 
     index_head_dim: int = 0
     index_n_heads: int = 0
-    index_block_size: int = 0
     index_topk_blocks: int = 0
     index_init_blocks: int = 0
     index_local_blocks: int = 0
@@ -111,7 +110,6 @@ class MSAConfig(SoftmaxAttnConfig):
             sliding_window_tokens=None,
             index_head_dim=int(text_config.index_head_dim),
             index_n_heads=int(text_config.index_n_heads),
-            index_block_size=text_config.index_block_size,
             index_topk_blocks=int(text_config.index_topk_blocks),
             index_init_blocks=int(getattr(text_config, "index_init_blocks", 0)),
             index_local_blocks=int(text_config.index_local_blocks),

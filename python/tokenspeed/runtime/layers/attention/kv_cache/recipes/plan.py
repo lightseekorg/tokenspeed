@@ -29,8 +29,6 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
-import torch
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         CacheGroupSpec,
@@ -124,8 +122,8 @@ MXFP8_KV_SCALE_TILE_TOKENS = 128
 MXFP8_SCALE_BLOCK_SIZE = 32
 
 
-def cache_field_layer_id(field_id: str) -> int:
-    """Return the owning model layer encoded in a cache field ID."""
+def _split_cache_field_id(field_id: str) -> tuple[int, str]:
+    """Split ``layer.<id>.<plane>`` into its owning layer and plane name."""
     parts = field_id.split(".", 2)
     if len(parts) != 3 or parts[0] != "layer":
         raise ValueError(f"cache field {field_id!r} is not owned by a model layer")
@@ -135,7 +133,17 @@ def cache_field_layer_id(field_id: str) -> int:
         raise ValueError(f"cache field {field_id!r} has an invalid layer id") from exc
     if layer_id < 0:
         raise ValueError(f"cache field {field_id!r} has an invalid layer id")
-    return layer_id
+    return layer_id, parts[2]
+
+
+def cache_field_layer_id(field_id: str) -> int:
+    """Return the owning model layer encoded in a cache field ID."""
+    return _split_cache_field_id(field_id)[0]
+
+
+def cache_field_plane(field_id: str) -> str:
+    """Return the per-layer plane name a cache field ID carries after its layer."""
+    return _split_cache_field_id(field_id)[1]
 
 
 @dataclass(frozen=True)
@@ -458,7 +466,7 @@ def mxfp8_kv_scale_fields(
         scale_dim,
         scale_dim,
     )
-    dtype = cache_dtype_name(torch.float8_e8m0fnu)
+    dtype = cache_dtype_name("float8_e8m0fnu")
     return tuple(
         CacheFieldSpec(
             f"layer.{layer_id}.{plane}_scale",

@@ -48,7 +48,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 

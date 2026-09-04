@@ -217,6 +217,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         kwargs.pop("size")
         kwargs.pop("prefix_granularity")
         kwargs.pop("enable_memory_saver")
+        kwargs.pop("layer_types", None)
         arena, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
         self.arena = arena
         return pool
@@ -431,7 +432,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             layer_num=1,
             rank=0,
             cache_group_specs=_specs_for_layers(
-                layer_types=(),
+                layer_types=("full_attention",),
                 group_ids=("full_attention",),
                 sliding_window_tokens=None,
                 prefix_granularity=4,
@@ -589,7 +590,6 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             head_dim=2,
             layer_num=2,
             rank=0,
-            layer_types=("linear_attention", "full_attention"),
         )
         return pool
 

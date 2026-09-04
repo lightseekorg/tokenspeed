@@ -93,7 +93,6 @@ def kimi_recipe(
         kv_cache_quant_method=None,
         prefix_granularity=128,
         max_bs=max_bs,
-        max_graph_bs=max_bs,
         # K3's per-group demand reads the scheduler's concurrency through
         # CacheRecipe.scheduler_limits, context length included.
         context_len=context_len,
@@ -114,9 +113,7 @@ def kimi_recipe(
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(text_config=text_config)
-        ),
+        model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,
         draft_model_config=(
             SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None
@@ -228,6 +225,15 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
         forward_op, device=device, contract=contract, num_requests=bs
     )
     return metadata, forward_op
+
+
+def block_tables_for(contract, tables, device, *, filler_page: int = 1):
+    """The bridge-shaped per-group dict for a contract: packed storage,
+    contract order, missing groups filled with one filler page per row."""
+    metadata, forward_op = cache_metadata_for(
+        contract, tables, device, filler_page=filler_page
+    )
+    return dict(metadata.tables(active_forward_op=forward_op))
 
 
 def full_attention_metadata_for(pool, full_table_np, device):

@@ -52,6 +52,23 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
         advance(seq_lens)
 
 
+@dataclass(frozen=True)
+class AcceptedPrefixPublisher:
+    """Eagle's :class:`DraftNarrowing` for the step-0 forward.
+
+    ``frontier`` is the round's accepted frontier per request (the target's
+    lengths for prompt rows, ``valid_cache_len + accept_len`` for decode
+    rows). Publishing copies it into the backend's own seq-lens buffers
+    through the drafter hook, so it is in-graph safe and idempotent.
+    """
+
+    attn_backend: AttentionBackend
+    frontier: torch.Tensor
+
+    def publish_accepted_prefix(self) -> None:
+        self.attn_backend.advance_draft_forward_metadata(self.frontier)
+
+
 @dataclass
 class EagleDraftInput:
     input_num_tokens: int
@@ -79,7 +96,6 @@ class Eagle(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner,
-        cache_view=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -93,7 +109,6 @@ class Eagle(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -114,13 +129,6 @@ class Eagle(BaseDrafter):
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
-
-        # Persistent output buffer for the draft step's compute_out_cache_loc.
-        self.draft_out_cache_loc_buf = torch.empty(
-            (self.input_buffers.max_bs * (spec_num_steps - 1),),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -145,23 +153,33 @@ class Eagle(BaseDrafter):
             )
         )
 
-    def _attach_dsa_topk(
-        self,
-        ctx: ForwardContext,
-        dsa_topk: DsaTopKState,
-    ) -> None:
-        if not self._model_shares_mtp_topk():
-            return
-        ctx.dsa_prefill_topk, ctx.dsa_decode_topk = dsa_topk
+    def _attach_dsa_topk(self, dsa_topk: DsaTopKState) -> None:
+        """Hand the draft backend the top-k this step reuses -- or nothing.
 
-    def _extract_dsa_topk(
-        self,
-        ctx: ForwardContext,
-        dsa_topk: DsaTopKState,
-    ) -> DsaTopKState:
+        Always written: the draft backend's share is per forward, and the
+        drafter, not a metadata refresh, is what separates its steps."""
+        share = self.attn_backend.sparse_topk
+        # QSA row geometry belongs to one model invocation. Draft steps reuse
+        # the selected slots below, but must rebuild their new row layout.
+        share.qsa_metadata = None
+        if self._model_shares_mtp_topk():
+            share.prefill, share.decode = dsa_topk
+        else:
+            share.clear()
+
+    def _extract_dsa_topk(self, dsa_topk: DsaTopKState) -> DsaTopKState:
         if not self._model_shares_mtp_topk():
             return dsa_topk
-        return ctx.dsa_prefill_topk, ctx.dsa_decode_topk
+        share = self.attn_backend.sparse_topk
+        return share.prefill, share.decode
+
+    def _target_dsa_topk(self, base_ctx: ForwardContext) -> DsaTopKState:
+        """The target's last indexer layer left its selection on the target
+        backend; the MTP head that shares it starts from there."""
+        if not self._model_shares_mtp_topk():
+            return (None, None)
+        share = base_ctx.attn_backend.sparse_topk
+        return share.prefill, share.decode
 
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
@@ -221,11 +239,34 @@ class Eagle(BaseDrafter):
 
         return input_ids, gather_ids
 
+    def _accepted_frontier(
+        self,
+        bs: int,
+        draft_input: EagleDraftInput,
+    ) -> torch.Tensor:
+        """Per-request accepted frontier after this round's verify: the
+        target's lengths for prompt rows, ``valid_cache_len + accept_len``
+        for decode rows (the verify window minus the rejected tail). Step 0
+        attends over it from the live rows; step ``i >= 1`` writes at
+        ``frontier + i - 1`` and attends over ``frontier + i``."""
+        num_extends = draft_input.num_extends
+        frontier = self.input_buffers.seq_lens_buf[:bs].clone()
+        if bs > num_extends:
+            req_pool_indices = self.input_buffers.req_pool_indices_buf[num_extends:bs]
+            frontier[num_extends:] = (
+                self.runtime_states.valid_cache_lengths.index_select(
+                    0, req_pool_indices
+                )
+                + draft_input.accept_lengths[num_extends:]
+            )
+        return frontier
+
     @nvtx_range("draft_first_step", color="purple")
     def _run_first_step(
         self,
         bs: int,
         draft_input: EagleDraftInput,
+        narrowing: AcceptedPrefixPublisher,
     ) -> tuple[LogitsProcessorOutput, DsaTopKState]:
 
         buffers = self.input_buffers
@@ -249,8 +290,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_seq_lens_buf=self.draft_seq_lens_buf,
-            accept_lengths=draft_input.accept_lengths,
+            draft_narrowing=narrowing,
         )
 
         dsa_topk = draft_input.dsa_topk
@@ -266,17 +306,16 @@ class Eagle(BaseDrafter):
             dsa_topk = prepare_dsa_topk(dsa_topk, gather_ids)
         else:
             dsa_topk = (None, None)
-        self._attach_dsa_topk(ctx, dsa_topk)
+        self._attach_dsa_topk(dsa_topk)
 
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
             positions=buffers.positions_buf[:input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
-        dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
+        dsa_topk = self._extract_dsa_topk(dsa_topk)
         if compute_dsa_topk_first_step and prepare_dsa_topk is not None:
             dsa_topk = prepare_dsa_topk(
                 dsa_topk,
@@ -294,29 +333,13 @@ class Eagle(BaseDrafter):
         logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
         dsa_topk: DsaTopKState,
+        frontier: torch.Tensor,
     ) -> None:
-        num_extends = draft_input.num_extends
-        num_decodes = bs - num_extends
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        cache_start = self.input_buffers.seq_lens_buf[:bs].clone()
-        # Step 1's write position uses vc+accept_length after target verify so
-        # rotary/cache metadata stay on the accepted prefix, not rejected tail.
-        if num_decodes > 0:
-            cache_start[num_extends:] = (
-                self.runtime_states.valid_cache_lengths.index_select(
-                    0, req_pool_indices[num_extends:]
-                )
-                + draft_input.accept_lengths[num_extends:]
-            )
+        # Step 1 writes at the accepted frontier (vc + accept_length after the
+        # target's verify) so rotary/cache metadata stay on the accepted
+        # prefix, not the rejected tail.
+        cache_start = frontier
 
-        # Write cache slots for steps 1..N-1.
-        cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
-        self.cache_view.out_cache_loc_uniform(
-            out=cache_locs,
-            cache_start=cache_start,
-            num_tokens=self.spec_num_steps - 1,
-        )
-        cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
@@ -349,14 +372,20 @@ class Eagle(BaseDrafter):
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
             )
-            self._attach_dsa_topk(ctx, dsa_topk)
+            self._attach_dsa_topk(dsa_topk)
 
-            out_cache_loc = cache_locs[:, i - 1].contiguous()
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
             _advance_draft_forward_metadata_if_supported(
                 ctx.attn_backend,
                 draft_seq_lens,
+            )
+            # Publish this step's one write slot per request (the chain's
+            # advancing position, seq_len - 1): step i writes position
+            # cache_start + (i - 1).
+            self.attn_backend.publish_draft_step_locations(
+                cache_start=positions,
+                num_tokens=1,
             )
 
             with nvtx_range("draft_forward", color="red"):
@@ -364,11 +393,10 @@ class Eagle(BaseDrafter):
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids),
                     positions=positions,
-                    out_cache_loc=out_cache_loc,
                     captured_hidden_states=logits_output.hidden_states,
                     spec_step_idx=i,
                 )
-                dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
+                dsa_topk = self._extract_dsa_topk(dsa_topk)
 
             with nvtx_range("draft_sample", color="yellow"):
                 if logits_output.next_token_ids is not None:
@@ -384,22 +412,6 @@ class Eagle(BaseDrafter):
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)
     # ------------------------------------------------------------------
-
-    @override
-    def get_candidates(
-        self,
-        base_ctx: ForwardContext,
-    ) -> torch.Tensor | None:
-        num_extends = base_ctx.num_extends
-        num_decodes = base_ctx.bs - num_extends
-        if num_decodes == 0:
-            return None
-
-        num_decode_tokens = num_decodes * self.spec_num_tokens
-        num_prefill_tokens = base_ctx.input_num_tokens - num_decode_tokens
-        return self.input_buffers.input_ids_buf[
-            num_prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
 
     @override
     def draft(
@@ -438,12 +450,16 @@ class Eagle(BaseDrafter):
         if self.spec_num_steps > 0:
             next_tokens[:, 1:] = next_tokens[:, :1]
 
-        # Seed the draft attn backend's aliased seq_lens for the first step.
-        self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
+        # The runner refreshed the draft decode metadata over the target's
+        # post-verify lengths (vc + N). Step 0 narrows to the live rows, whose
+        # context is the accepted frontier; the model publishes it through
+        # this handle at the moment it switches to those rows.
+        frontier = self._accepted_frontier(bs, draft_input)
+        narrowing = AcceptedPrefixPublisher(self.attn_backend, frontier)
 
         # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
-        logits_output, dsa_topk = self._run_first_step(bs, draft_input)
+        logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
 
         if logits_output.next_token_ids is not None:
             draft_ids = logits_output.next_token_ids
@@ -477,6 +493,7 @@ class Eagle(BaseDrafter):
                 logits_output,
                 draft_input,
                 dsa_topk,
+                frontier,
             )
         return next_tokens
 
@@ -500,7 +517,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=base_ctx.global_num_tokens,
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
-            dsa_topk=(base_ctx.dsa_prefill_topk, base_ctx.dsa_decode_topk),
+            dsa_topk=self._target_dsa_topk(base_ctx),
         )
 
         # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.

@@ -26,7 +26,6 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
-from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
@@ -43,7 +42,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         **kwargs,
     ):
         self.index_head_dim = int(index_head_dim)
-        self.index_k_row_bytes = dsa_index_k_row_bytes(self.index_head_dim)
         super().__init__(*args, **kwargs)
 
     layer_plane_bindings: ClassVar[dict[str, str]] = {
@@ -68,14 +66,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        self._set_index_k_buffer(layer_id, loc, index_k)
-
-    def _set_index_k_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-    ) -> None:
         buf = self.index_k_buffer[layer_id]
         index_k_fp8, index_k_scale = quantize_fp8_with_scale(
             index_k,

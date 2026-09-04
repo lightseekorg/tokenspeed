@@ -29,7 +29,7 @@ def _inert_publish(bs, dim, rows=3):
 
 class TestInklingCacheContract(unittest.TestCase):
     def test_wrapper_consumes_history_and_checkpoint_state(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
         )
 
@@ -45,7 +45,7 @@ class TestInklingCacheContract(unittest.TestCase):
         )
 
     def test_remote_restore_pending_is_consumed_once_and_cleared_on_reuse(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvStatePool,
         )
@@ -54,7 +54,6 @@ class TestInklingCacheContract(unittest.TestCase):
             num_layers=1,
             num_slots=5,
             conv_dim=2,
-            kernel_size=4,
             ring_size=5,
             dtype=torch.float32,
             device="cpu",
@@ -64,17 +63,23 @@ class TestInklingCacheContract(unittest.TestCase):
 
         backend.mark_remote_cache_ready(2)
         mask = backend._consume_remote_restore_mask(
-            torch.tensor([2, 3, -1], dtype=torch.int32)
+            torch.tensor([2, 3, -1], dtype=torch.int32),
+            out=torch.zeros(3, dtype=torch.bool),
         )
         self.assertEqual(mask.tolist(), [True, False, False])
-        self.assertFalse(backend._consume_remote_restore_mask(torch.tensor([2])).item())
+        one = torch.zeros(1, dtype=torch.bool)
+        self.assertFalse(
+            backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
+        )
 
         backend.mark_remote_cache_ready(2)
         backend.prepare_remote_cache_slots([2])
-        self.assertFalse(backend._consume_remote_restore_mask(torch.tensor([2])).item())
+        self.assertFalse(
+            backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
+        )
 
     def test_non_aligned_endpoint_checkpoint_round_trip(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvMetadata,
         )
@@ -136,7 +141,7 @@ class TestInklingConvRingState(unittest.TestCase):
     LAYERS = 3
 
     def _make_pool(self):
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingConvStatePool,
         )
 
@@ -144,7 +149,6 @@ class TestInklingConvRingState(unittest.TestCase):
             num_layers=self.LAYERS,
             num_slots=self.BS + 2,
             conv_dim=self.DIM,
-            kernel_size=self.W,
             ring_size=self.R,
             dtype=torch.float32,
             device="cuda",
@@ -165,7 +169,7 @@ class TestInklingConvRingState(unittest.TestCase):
         """Instance-level registration API: idempotent re-register with the
         same buffers, error on changed storage. (Regression: an orphaned
         @staticmethod once unbound this method and broke server startup.)"""
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
         )
 
@@ -702,7 +706,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         same frontier for its seq_lens/write-loc re-anchor."""
         from types import SimpleNamespace
 
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvMetadata,
         )
@@ -715,7 +719,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         )
         table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
         qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
-        backend.conv_metadata = InklingConvMetadata(
+        backend.conv_decode_metadata = InklingConvMetadata(
             query_start_loc=qsl,
             cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
             has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
@@ -727,7 +731,7 @@ class TestCheckpointMetadata(unittest.TestCase):
 
         backend.update_draft_forward_metadata(frontier)
 
-        md = backend.conv_metadata
+        md = backend.conv_decode_metadata
         self.assertEqual(md.query_start_loc.tolist(), [0, k], "same k-row chunk")
         self.assertEqual(md.seq_lens.tolist(), [130], "chunk end at the frontier")
         self.assertIsNotNone(md.col_block_table)
@@ -735,38 +739,27 @@ class TestCheckpointMetadata(unittest.TestCase):
         self.assertEqual(len(inner_calls), 1)
         self.assertEqual(inner_calls[0].tolist(), [130])
 
-    def test_update_draft_forward_metadata_recomputes_group_locs(self):
-        """The mixin hook must replace seq_lens with the frontier and point
-        the grouped write locs at the k positions ending there."""
-        from tokenspeed.runtime.layers.attention.backends.cache_groups import (
-            CacheGroupsMixin,
-        )
-        from tokenspeed.runtime.layers.attention.backends.mha import (
+    def test_update_draft_forward_metadata_reanchors_seq_lens(self):
+        """The MTP re-anchor must replace the leaf's decode seq_lens with the
+        committed frontier (the drafter supplies its own write locations)."""
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
             MHADecodeMetadata,
         )
 
-        class _Host(CacheGroupsMixin):
-            pass
-
-        host = _Host()
+        host = MHAAttnBackend.__new__(MHAAttnBackend)
         host.kernel_page_size = 2
         host.spec_num_tokens = 4
-        host.group_block_granularities = {"g": 2}
-        table = torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda")
+        host.seq_lens_buf = torch.tensor([8], dtype=torch.int32, device="cuda")
         host.forward_decode_metadata = MHADecodeMetadata(
-            page_table=None,
-            seq_lens=torch.tensor([8], dtype=torch.int32, device="cuda"),
-            page_tables={"g": table},
-            out_cache_locs={"g": torch.zeros(4, dtype=torch.int32, device="cuda")},
+            page_table=torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda"),
+            seq_lens=host.seq_lens_buf[:1],
         )
         frontier = torch.tensor([6], dtype=torch.int32, device="cuda")
 
-        host.update_draft_forward_metadata(frontier)
+        host.advance_draft_forward_metadata(frontier)
 
-        md = host.forward_decode_metadata
-        self.assertEqual(md.seq_lens.tolist(), [6])
-        # Positions 2..5 with page size 2 over table row [7, 8, 9].
-        self.assertEqual(md.out_cache_locs["g"].tolist(), [16, 17, 18, 19])
+        self.assertEqual(host.forward_decode_metadata.seq_lens.tolist(), [6])
 
 
 if __name__ == "__main__":
