@@ -91,7 +91,17 @@ def _wire_draft_to_target_model(
     )
     if DrafterImpl.shares_target_embed_head:
         embed, head = model_runner.model.get_embed_and_head()
-        draft_model_runner.model.set_embed_and_head(embed, head)
+        draft_model = draft_model_runner.model
+        module_setter = getattr(type(draft_model), "set_embed_and_head_module", None)
+        if module_setter is not None:
+            lm_head = getattr(model_runner.model, "lm_head", None)
+            if lm_head is None:
+                raise ValueError(
+                    "Draft model requires the target's complete lm_head module."
+                )
+            module_setter(draft_model, embed, lm_head)
+        else:
+            draft_model.set_embed_and_head(embed, head)
     if server_args.speculative_algorithm == "EAGLE3" and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"
     ):

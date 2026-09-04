@@ -45,7 +45,6 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 
 __all__ = [
-    "compute_group_decode_locs",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -61,7 +60,6 @@ __all__ = [
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
-    "unpack_group_tables",
     "zero_byte_ranges",
 ]
 
@@ -289,9 +287,9 @@ def copy_state_rows(
         src_addresses: CUDA uint64 ``[num_layers]`` base addresses of the
             source slabs (address of row 0).
         dst_addresses: CUDA uint64 ``[num_layers]`` destination base addresses.
-        src_rows: CUDA int64 ``[num_layers * rows_per_layer]`` source row ids,
-            layer-major. A negative id zero-fills its destination row.
-        dst_rows: CUDA int64 tensor, same layout, destination row ids.
+        src_rows: CUDA int32 or int64 ``[num_layers * rows_per_layer]`` source
+            row ids, layer-major. A negative id zero-fills its destination row.
+        dst_rows: CUDA int32 or int64 tensor, same layout, destination row ids.
         row_bytes: Byte width of the copied row payload (divisible by 4).
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
             source slabs in int32 units (``stride_bytes // 4``).
@@ -309,8 +307,9 @@ def copy_state_rows(
         raise ValueError("src_rows must hold rows_per_layer ids per layer")
     if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
         raise ValueError("slab address tables must have dtype torch.uint64")
-    if src_rows.dtype != torch.int64 or dst_rows.dtype != torch.int64:
-        raise ValueError("row id tensors must have dtype torch.int64")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
     if (
         src_row_strides.dtype != torch.int64
         or dst_row_strides.dtype != torch.int64
@@ -604,21 +603,25 @@ def _set_mla_kv_buffer_per_loc_kernel(
         mask=loc_mask[:, None],
     )
 
-    rope_offs = tl.arange(0, rope_dim)
-    src_rope = tl.load(
-        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
-        mask=loc_mask[:, None],
-    )
-    if SANITIZE:
-        src_rope = src_rope.to(tl.float32)
-        src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
-        src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
-        src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
-    tl.store(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
-        src_rope,
-        mask=loc_mask[:, None],
-    )
+    if rope_dim > 0:
+        rope_offs = tl.arange(0, rope_dim)
+        src_rope = tl.load(
+            cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+            mask=loc_mask[:, None],
+        )
+        if SANITIZE:
+            src_rope = src_rope.to(tl.float32)
+            src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
+            src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
+            src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
+        tl.store(
+            kv_buffer_ptr
+            + locs[:, None] * buffer_stride
+            + nope_dim
+            + rope_offs[None, :],
+            src_rope,
+            mask=loc_mask[:, None],
+        )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -2143,175 +2146,6 @@ def quantize_mxfp8_rows(
         **kwargs,
     )
     return data, sf
-
-
-@triton.jit
-def _compute_group_decode_locs_kernel(
-    tab_ptr,  # [G, max_bs, Wmax] int32 stacked group tables
-    ps_ptr,  # [G] int32 page size per group
-    seq_ptr,  # [bs] int32 current lengths (incl. the newest token)
-    out_ptr,  # [G, >= bs*N] int32 write locs (token-major per request)
-    stride_g,
-    stride_b,
-    out_stride_g,
-    num_rows,  # bs * N live output rows per group
-    N,  # tokens per request
-    BLOCK_B: tl.constexpr,
-):
-    """All groups' decode write locs in one launch. Row i = b*N + t maps to
-    position seq[b] - N + t (clamped at 0 for graph-padded rows, which
-    dereference the dummy page harmlessly): loc = table[g, b, pos//ps] * ps
-    + pos % ps. N = 1 is plain decode (pos = seq-1); N > 1 is the spec
-    verify layout. Replaces the per-group python gather/mul/mod chains
-    between graph replays."""
-    g = tl.program_id(0)
-    i = tl.program_id(1) * BLOCK_B + tl.arange(0, BLOCK_B)
-    mask = i < num_rows
-    b = i // N
-    t = i - b * N
-    ps = tl.load(ps_ptr + g).to(tl.int64)
-    seq = tl.load(seq_ptr + b, mask=mask, other=1).to(tl.int64)
-    pos = tl.maximum(seq - N + t, 0)
-    col = pos // ps
-    page = tl.load(tab_ptr + g * stride_g + b * stride_b + col, mask=mask, other=0).to(
-        tl.int64
-    )
-    # Negative pages (-1 column-tail pad / holes) route to dummy page 0, never a negative slot.
-    loc = tl.maximum(page, 0) * ps + pos % ps
-    tl.store(out_ptr + g * out_stride_g + i, loc.to(tl.int32), mask=mask)
-
-
-def compute_group_decode_locs(
-    tables: torch.Tensor,
-    page_sizes: torch.Tensor,
-    seq_lens: torch.Tensor,
-    out: torch.Tensor,
-    bs: int,
-    tokens_per_req: int = 1,
-) -> None:
-    """Fused per-group decode write-loc computation over stacked tables.
-
-    Args:
-        tables: [G, max_bs, Wmax] int32 stacked per-group page tables.
-        page_sizes: [G] int32 tokens-per-page per group.
-        seq_lens: [bs] int32 lengths including the newest token.
-        out: [G, cap] int32 destination, cap >= bs * tokens_per_req; rows
-            [:, : bs * tokens_per_req] written token-major per request
-            (request b's tokens at b*N .. b*N + N - 1, the spec verify
-            layout).
-        bs: live batch size.
-        tokens_per_req: write locs per request; token t of request b lands
-            at position seq_lens[b] - tokens_per_req + t (clamped at 0).
-    """
-    g = tables.shape[0]
-    num_rows = bs * tokens_per_req
-    assert out.shape[0] >= g and out.shape[1] >= num_rows
-    BLOCK_B = 128
-    grid = (g, (num_rows + BLOCK_B - 1) // BLOCK_B)
-    _compute_group_decode_locs_kernel[grid](
-        tables,
-        page_sizes,
-        seq_lens,
-        out,
-        tables.stride(0),
-        tables.stride(1),
-        out.stride(0),
-        num_rows,
-        tokens_per_req,
-        BLOCK_B=BLOCK_B,
-    )
-
-
-@triton.jit
-def _unpack_group_tables_kernel(
-    src_ptr,  # packed int32 device buffer (bridge upload)
-    meta_ptr,  # [G, 3] int32: (src element offset, cols, page ratio) per group
-    dst_ptr,  # [G, max_bs, Wmax] int32 stacked graph tables
-    stride_g,
-    stride_b,
-    wmax,
-    actual_bs,
-    TAIL_PAD: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    """Fill every group's graph-table rows from the packed upload in one
-    launch: row (g, b < actual_bs) gets src[off_g + b*cols_g : +cols_g]
-    followed by a TAIL_PAD tail up to Wmax; padded rows b >= actual_bs
-    (grid axis 1 covers the padded batch size) are written all-0 (the
-    flat dummy-page row contract). Replaces the per-group D2D copy +
-    tail fill (+ F.pad row padding) per decode step."""
-    g = tl.program_id(0)
-    b = tl.program_id(1)  # grid axis 1 is exactly bs, no bounds check needed
-    off = tl.load(meta_ptr + g * 3).to(tl.int64)
-    cols = tl.load(meta_ptr + g * 3 + 1).to(tl.int64)
-    ratio = tl.load(meta_ptr + g * 3 + 2).to(tl.int64)
-    w_off = tl.arange(0, BLOCK_W)
-    real = b < actual_bs
-    for w0 in range(0, wmax, BLOCK_W):
-        w = w0 + w_off
-        src_col = w // ratio
-        in_row = (src_col < cols) & real
-        vals = tl.load(
-            src_ptr + off + b * cols + src_col,
-            mask=in_row & (w < wmax),
-            other=0,
-        )
-        vals = tl.where(
-            ratio == 1,
-            vals,
-            tl.maximum(vals, 0) * ratio + w % ratio,
-        )
-        vals = tl.where(in_row, vals, tl.where(real, TAIL_PAD, 0))
-        tl.store(
-            dst_ptr + g * stride_g + b * stride_b + w,
-            vals,
-            mask=w < wmax,
-        )
-
-
-def unpack_group_tables(
-    src: torch.Tensor,
-    meta: torch.Tensor,
-    dst: torch.Tensor,
-    bs: int,
-    actual_bs: int | None = None,
-    tail_pad: int = -1,
-) -> None:
-    """Unpack the bridge's packed table upload into the stacked graph
-    buffers (all groups, one launch).
-
-    Args:
-        src: 1-D int32 device buffer holding every group's rows
-            back-to-back (rows x cols per group).
-        meta: [G, 3] int32 device tensor of
-            (element offset, logical columns, kernel pages per logical page).
-            A ratio greater than one expands page ``p`` to
-            ``p * ratio + [0, ratio)`` while unpacking.
-        dst: [G, max_bs, Wmax] int32 stacked destination.
-        bs: rows to fill per group (padded batch size).
-        actual_bs: live batch size; rows [actual_bs, bs) are written all-0
-            (the flat dummy-page row contract). Defaults to bs (no padded
-            rows).
-        tail_pad: value for columns past the group's width.
-    """
-    g, _, wmax = dst.shape
-    if bs == 0 or g == 0:
-        return
-    if actual_bs is None:
-        actual_bs = bs
-    BLOCK_W = 128 if wmax >= 128 else 64
-    grid = (g, bs)
-    _unpack_group_tables_kernel[grid](
-        src,
-        meta,
-        dst,
-        dst.stride(0),
-        dst.stride(1),
-        wmax,
-        actual_bs,
-        TAIL_PAD=tail_pad,
-        BLOCK_W=BLOCK_W,
-    )
 
 
 # GLM-5 DSA block-split index-K scatter

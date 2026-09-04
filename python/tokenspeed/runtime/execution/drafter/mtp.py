@@ -238,7 +238,6 @@ class Mtp(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner,
-        cache_view=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -252,7 +251,6 @@ class Mtp(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -274,14 +272,6 @@ class Mtp(BaseDrafter):
         # draft metadata init (it copies the round's live lengths in; on
         # EXTEND this buffer also serves as the draft prefill seq_lens).
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
-
-        # Persistent output buffer for the frontier window's cache write
-        # locations (k rows per request).
-        self.draft_out_cache_loc_buf = torch.empty(
-            (self.input_buffers.max_bs * spec_num_tokens,),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -362,9 +352,9 @@ class Mtp(BaseDrafter):
             (positions + (accept_lengths.unsqueeze(-1) - k)).clamp_min(0).reshape(-1)
         )
 
-        out_cache_loc = self.draft_out_cache_loc_buf[: bs * k]
-        self.cache_view.out_cache_loc_uniform(
-            out=out_cache_loc,
+        # Every depth rewrites the same re-anchored k-window ending at the
+        # committed frontier; publish it once, the model fetches per step.
+        self.attn_backend.publish_draft_step_locations(
             cache_start=(frontier - k).clamp_min(0),
             num_tokens=k,
         )
@@ -404,7 +394,6 @@ class Mtp(BaseDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
-                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_frontier_forward", color="red"):
@@ -412,7 +401,6 @@ class Mtp(BaseDrafter):
                     ctx=ctx,
                     input_ids=input_ids.view(-1),
                     positions=step_positions,
-                    out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                 )
@@ -453,7 +441,7 @@ class Mtp(BaseDrafter):
     ) -> None:
         """Depths 0..steps-1 over an EXTEND round's ragged prompt rows.
 
-        Every depth d runs the SAME rows — same positions, out_cache_loc
+        Every depth d runs the SAME rows — same positions, write window
         and metadata (the KV and conv pools are layer-indexed) — consuming
         inputs shifted d+1 within each request and the previous depth's
         FULL rows as chain hiddens, sampling at the request-last rows.
@@ -486,7 +474,6 @@ class Mtp(BaseDrafter):
             input_ids, input_lengths, last_row=gather_ids
         )
         positions = buffers.positions_buf[:input_num_tokens]
-        out_cache_loc = buffers.out_cache_loc_buf[:input_num_tokens]
         # FULL per-row hiddens chain between depths; logits stay gathered.
         capture_mode = (
             CaptureHiddenMode.FULL
@@ -514,7 +501,6 @@ class Mtp(BaseDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
-                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_extend_forward", color="red"):
@@ -522,7 +508,6 @@ class Mtp(BaseDrafter):
                     ctx=ctx,
                     input_ids=step_ids,
                     positions=positions,
-                    out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                 )
@@ -536,16 +521,6 @@ class Mtp(BaseDrafter):
     # ------------------------------------------------------------------
 
     @override
-    def get_candidates(
-        self,
-        base_ctx: ForwardContext,
-    ) -> torch.Tensor | None:
-        if base_ctx.num_extends > 0:
-            return None
-        return self.input_buffers.input_ids_buf[: base_ctx.input_num_tokens].reshape(
-            base_ctx.bs, self.spec_num_tokens
-        )
-
     @override
     def draft(
         self,

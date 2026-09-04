@@ -35,7 +35,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         def __init__(self, hidden_states):
             self.hidden_states = hidden_states
 
-        def __call__(self, positions, prefix_sum, ctx, out_cache_loc, block_residual):
+        def __call__(self, positions, prefix_sum, ctx, block_residual):
             return (
                 _post_layer_attnres_reference(prefix_sum, self.hidden_states),
                 block_residual,
@@ -71,7 +71,6 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
             torch.tensor([0, 1]),
             positions=None,
             ctx=None,
-            out_cache_loc=None,
         )
 
     # IDs are one-based completed-layer IDs.  IDs 2 and 3 select the

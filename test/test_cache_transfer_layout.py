@@ -47,6 +47,15 @@ def _field(field_id: str, *, stride: int = 64, payload: int = 48):
     )
 
 
+def _single_group_layout(buffer, *fields):
+    return CacheTransferLayout(
+        10,
+        (CacheGroupLayout("full", 16, fields),),
+        (buffer,),
+        tuple((field.field_id,) for field in fields),
+    )
+
+
 def test_cache_field_layer_id_parses_layer_owned_field():
     assert cache_field_layer_id("layer.12.k") == 12
 
@@ -320,24 +329,42 @@ def test_target_and_draft_layouts_must_share_one_arena():
 
 def test_aliased_target_and_draft_layout_is_transferred_once():
     buffer = object()
-    target = CacheTransferLayout(
-        num_lcm_blocks=10,
-        groups=(CacheGroupLayout("full", 16, (_field("layer.0.k"),)),),
-        buffers=(buffer,),
-        consumers=(("layer.0.k",),),
-    )
-    draft = CacheTransferLayout(
-        num_lcm_blocks=10,
-        groups=target.groups,
-        buffers=(buffer,),
-        consumers=target.consumers,
-    )
+    target = _single_group_layout(buffer, _field("layer.0.k"))
+    draft = _single_group_layout(buffer, _field("layer.0.k"))
 
     combined = combine_cache_transfer_layouts(target, draft)
 
     assert combined.buffers == (buffer,)
     assert combined.groups[0].fields == (_field("layer.0.k"),)
     assert combined.consumers == (("layer.0.k",),)
+
+
+def test_merged_owner_keeps_aliased_field_on_target():
+    buffer = object()
+    target = _single_group_layout(buffer, _field("layer.0.k"), _field("layer.1.k"))
+    draft = _single_group_layout(buffer, _field("layer.1.k"))
+
+    combined = combine_cache_transfer_layouts(target, draft)
+
+    assert combined.buffers == (buffer,)
+    assert combined.groups == target.groups
+    assert combined.consumers == (("layer.0.k",), ("layer.1.k",), ())
+
+
+@pytest.mark.parametrize(
+    ("draft_fields", "error"),
+    (
+        ((_field("layer.1.k", stride=96),), "conflicting layouts"),
+        ((_field("layer.1.k"), _field("layer.2.k")), "ambiguous overlapping"),
+    ),
+)
+def test_invalid_target_draft_field_overlap_is_rejected(draft_fields, error):
+    buffer = object()
+    target = _single_group_layout(buffer, _field("layer.0.k"), _field("layer.1.k"))
+    draft = _single_group_layout(buffer, *draft_fields)
+
+    with pytest.raises(ValueError, match=error):
+        combine_cache_transfer_layouts(target, draft)
 
 
 def test_draft_layout_must_use_target_block_geometry():

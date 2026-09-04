@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -12,13 +13,13 @@ from tokenspeed_kernel.ops import attention as attention_ops
 from tokenspeed_kernel.ops.attention import (
     KdaPrefillResult,
     _attention_format_signature,
-    kda_fused_paged_decode,
-    kda_fused_paged_verify,
     kda_paged_decode,
     kda_paged_prefill,
     kda_recurrent_layout,
-    kda_replay_commit,
     kda_replay_commit_supported,
+    try_kda_fused_paged_decode,
+    try_kda_fused_paged_verify,
+    try_kda_replay_commit,
 )
 from tokenspeed_kernel.platform import Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -192,7 +193,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
 
     monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
     tensor = torch.empty(1, dtype=torch.bfloat16)
-    result = kda_fused_paged_verify(
+    result = try_kda_fused_paged_verify(
         tensor,
         tensor,
         tensor,
@@ -217,6 +218,8 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "paged_state": True,
         "store_states": store_states,
         "recurrent_layout": recurrent_layout,
+        "num_heads": 1,
+        "head_dim": 1,
     }
     assert selected == expected
 
@@ -349,12 +352,44 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
         assert kda_replay_commit_supported(torch.bfloat16)
         assert kda_replay_commit_supported(torch.float16)
         assert not kda_replay_commit_supported(torch.float32)
-        batched = attention_ops.kda_resolve_batched_replay_commit()
+        batched = attention_ops.resolve_kda_batched_replay_commit()
         assert batched is not None
         assert batched.name == "triton_nvidia_kda_batched_replay_commit"
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_batched_replay_call_contract() -> None:
+    """The selected all-layer replay accepts the runtime's explicit group map."""
+    kernel = attention_ops.resolve_kda_batched_replay_commit()
+    if kernel is None:
+        pytest.skip("batched KDA replay is unavailable")
+
+    parameters = signature(kernel.impl).parameters
+    assert "group_indices" in parameters
+    assert "layers_per_group" not in parameters
+
+    tensor = torch.empty(0)
+    signature(kernel.impl).bind(
+        descriptors=tensor,
+        group_indices=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        accepted_length=tensor,
+        draft_token_num=1,
+        num_heads=1,
+        head_dim=128,
+        f_a_dim=1,
+        qkv_stride=1,
+        conv_stride=1,
+        f_a_stride=1,
+        beta_stride=1,
+        state_stride=1,
+        gate_stride=1,
+        conv_width=4,
+        lower_bound=-5.0,
+    )
 
 
 def test_kda_split_verify_registration_traits() -> None:
@@ -414,7 +449,7 @@ def test_kda_decode_and_replay_select_layout_trait(
         cu_seqlens=torch.empty(2),
         recurrent_layout=recurrent_layout,
     )
-    kda_replay_commit(
+    try_kda_replay_commit(
         *([tensor] * 9),
         state_pool=tensor,
         state_out=tensor,
@@ -428,6 +463,8 @@ def test_kda_decode_and_replay_select_layout_trait(
     )
     assert selected[0]["recurrent_layout"] == recurrent_layout
     assert selected[1]["recurrent_layout"] == recurrent_layout
+    assert selected[1]["num_heads"] == 1
+    assert selected[1]["head_dim"] == 1
 
 
 def test_nvidia_kda_pool_matches_the_reference_recurrence() -> None:
@@ -863,7 +900,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
             (history[..., 1], history[..., 2], current), dim=-1
         ).reshape(3 * projection_width, 3)
 
-    result = kda_fused_paged_decode(
+    result = try_kda_fused_paged_decode(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -920,7 +957,7 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
         lambda *_args, **_kwargs: CoreOnlyKernel(),
     )
     tensor = torch.empty(1, dtype=torch.bfloat16)
-    result = kda_fused_paged_decode(
+    result = try_kda_fused_paged_decode(
         tensor,
         tensor,
         tensor,
@@ -955,7 +992,7 @@ def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
 
     tensor = torch.empty(1, dtype=torch.bfloat16)
     conv_weights = torch.empty(1, 5, dtype=torch.bfloat16)
-    result = kda_fused_paged_decode(
+    result = try_kda_fused_paged_decode(
         tensor,
         conv_weights,
         tensor,

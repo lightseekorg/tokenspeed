@@ -95,6 +95,7 @@ def _moe_sorting_stage1_kernel(
     num_experts: gl.constexpr,
     numel: gl.constexpr,
     tokens_per_program: gl.constexpr,
+    EXPERT_START: gl.constexpr,
     ROUTE_BLOCK: gl.constexpr,
     EXPERT_PAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -112,7 +113,12 @@ def _moe_sorting_stage1_kernel(
     route = gl.arange(0, ROUTE_BLOCK, layout=route_layout)
     idx = pid * tokens_per_program + route
     valid = (route < tokens_per_program) & (idx < numel)
-    expert_id = gl.load(topk_ids_ptr + idx, mask=valid, other=num_experts)
+    expert_id = gl.load(
+        topk_ids_ptr + idx,
+        mask=valid,
+        other=EXPERT_START + num_experts,
+    )
+    expert_id -= EXPERT_START
     valid &= (expert_id >= 0) & (expert_id < num_experts)
     safe_expert = gl.where(valid, expert_id, num_experts)
     histogram = gl.histogram(
@@ -207,6 +213,7 @@ def _moe_sorting_stage4_kernel(
     numel: gl.constexpr,
     tokens_per_program: gl.constexpr,
     TOPK: gl.constexpr,
+    EXPERT_START: gl.constexpr,
     ROUTE_BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -242,7 +249,8 @@ def _moe_sorting_stage4_kernel(
         route = gl.arange(0, ROUTE_BLOCK, layout=route_layout)
         idx = pid * tokens_per_program + route
         valid = (route < tokens_per_program) & (idx < numel)
-        expert_id = gl.load(topk_ids_ptr + idx, mask=valid, other=0)
+        expert_id = gl.load(topk_ids_ptr + idx, mask=valid, other=EXPERT_START)
+        expert_id -= EXPERT_START
         valid &= (expert_id >= 0) & (expert_id < num_experts)
         safe_expert = gl.where(valid, expert_id, 0)
         one = gl.full([ROUTE_BLOCK], 1, gl.int32, layout=route_layout)
@@ -269,6 +277,9 @@ def gluon_moe_sorting(
     model_dim: int,
     out_dtype: torch.dtype,
     block_size: int,
+    *,
+    expert_start: int = 0,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Block-aligned expert sort producing sorted routing metadata.
 
@@ -277,13 +288,15 @@ def gluon_moe_sorting(
     contract).
 
     Args:
-        topk_ids: ``(M, TOPK)`` int32 expert assignments. ``-1`` entries are
-            treated as unrouted and skipped.
+        topk_ids: ``(M, TOPK)`` int32 expert assignments. IDs outside the
+            contiguous local expert range are treated as unrouted and skipped.
         topk_weights: ``(M, TOPK)`` float32 routing weights, same layout.
-        num_experts: total number of experts ``E``.
+        num_experts: number of local experts ``E`` represented by this sort.
         model_dim: hidden dim of the ``out`` buffer.
         out_dtype: dtype of the ``out`` buffer (bf16 in production).
         block_size: per-expert padding granularity ``B`` (the stage BLOCK_M).
+        expert_start: global ID of local expert zero.
+        out: optional preallocated ``(M, model_dim)`` output buffer.
 
     Returns:
         ``(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out)``
@@ -297,6 +310,8 @@ def gluon_moe_sorting(
     numel = M * topk
     E = int(num_experts)
     B = int(block_size)
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
 
     # Only experts receiving at least one route contribute a padding block.
     # Bounding that count by min(E, routes) avoids scaling activation-sized
@@ -320,7 +335,18 @@ def gluon_moe_sorting(
     # ``out`` does not need zeroing: stage2's reduce epilogue overwrites every
     # token row, and its small-M atomic epilogue zeroes ``out`` itself. Zeroing
     # here would redundantly clear up to tens of MB at large M.
-    out = torch.empty((M, model_dim), dtype=out_dtype, device=device)
+    if out is None:
+        out = torch.empty((M, model_dim), dtype=out_dtype, device=device)
+    elif (
+        tuple(out.shape) != (M, model_dim)
+        or out.dtype != out_dtype
+        or out.device != device
+        or out.stride(1) != 1
+        or out.stride(0) < model_dim
+    ):
+        raise ValueError(
+            "MoE output must be a row-major, colocated (M, model_dim) tensor"
+        )
 
     # Keep route chunks at a practical vector width. The chunk prefix scan
     # preserves their source order even when there are fewer experts than
@@ -343,6 +369,7 @@ def gluon_moe_sorting(
         E,
         numel,
         tokens_per_program,
+        EXPERT_START=int(expert_start),
         ROUTE_BLOCK=route_block,
         EXPERT_PAD=expert_pad,
         NUM_WARPS=_SCAN_NUM_WARPS,
@@ -381,6 +408,7 @@ def gluon_moe_sorting(
         numel,
         tokens_per_program,
         int(topk),
+        EXPERT_START=int(expert_start),
         ROUTE_BLOCK=route_block,
         NUM_WARPS=_SCAN_NUM_WARPS,
         num_warps=_SCAN_NUM_WARPS,

@@ -25,15 +25,8 @@ class MSATokenToKVPool(MHATokenToKVPool):
         head_dim: int,
         layer_num: int,
         rank: int,
-        index_head_dim: int,
-        index_dtype: torch.dtype,
-        indexed_layer_ids: frozenset[int],
-        layer_types: tuple[str, ...] = (),
         field_layer_offset: int = 0,
     ) -> None:
-        self.index_head_dim = index_head_dim
-        self.index_dtype = index_dtype
-        self.indexed_layer_ids = frozenset(indexed_layer_ids)
         super().__init__(
             arena,
             dtype,
@@ -41,7 +34,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
             head_dim=head_dim,
             layer_num=layer_num,
             rank=rank,
-            layer_types=layer_types,
             field_layer_offset=field_layer_offset,
         )
 

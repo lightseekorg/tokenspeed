@@ -62,11 +62,13 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
     all_reduce,
+    can_acquire_all_reduce_outputs,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -499,6 +501,9 @@ class TailPlan:
         lane: Pre-materialized fused-lane buffer, or None; when set the
             experts kernel writes its routed partial into
             ``lane[:, :routed_hidden]`` and the shared experts into the rest.
+        symm_outputs: Producer-direct (routed, shared) views of symmetric
+            memory, or None. When set the producers write into these and the
+            tail reduces the pair in place; ``lane`` is None in that case.
         routed_in_fork: Whether the routed partial must be reduced and
             projected inside the fork (SEPARATE_REDUCE overlap).
         split_shared_rs: Start the shared ReduceScatter on the auxiliary
@@ -508,6 +513,7 @@ class TailPlan:
     tier: "K3MoETailTier"
     defer_finalize: bool = False
     lane: torch.Tensor | None = None
+    symm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
     routed_in_fork: bool = False
     split_shared_rs: bool = False
 
@@ -529,6 +535,39 @@ def _tail_finalize_top_k(
     if execution_plan.fused_moe_ar and experts_supports_deferred_finalize:
         return top_k
     return None
+
+
+def _acquire_symm_join_outputs(
+    *, mapping, routed_hidden: int, hidden_size: int, like, enabled: bool
+):
+    """Acquire the routed/shared pair from symmetric memory, or None.
+
+    Returns two consecutive views of the Iris input buffer -- not fresh
+    allocations -- so the producers write where the reduction already reads and
+    the pointers stay put across graph capture.
+
+    The pair matters, not just the memory: ``AutoBackend.all_reduce`` only
+    consults ``can_reduce_outputs`` on its tuple branch, so a single
+    concatenated operand can never reach the symmetric kernel however it was
+    allocated. This is the shape ``latent_moe_expert_shared_all_reduce`` uses
+    for EP-only layouts.
+
+    Collective in the same sense the acquire is: every rank of the MoE TP x EP
+    group reaches this with rank-uniform shapes, so none can disagree about
+    whether the pair exists.
+    """
+    if not enabled or mapping.moe.tp_ep_size <= 1 or like is None:
+        return None
+    if like.ndim != 2:
+        return None
+    num_tokens = like.shape[0]
+    if num_tokens <= 0:
+        return None
+    shapes = ((num_tokens, routed_hidden), (num_tokens, hidden_size))
+    group = mapping.moe.tp_ep_group
+    if not can_acquire_all_reduce_outputs(shapes, like, group):
+        return None
+    return acquire_all_reduce_outputs(shapes, like, group)
 
 
 class K3MoeTailComm:
@@ -666,16 +705,32 @@ class K3MoeTailComm:
                 ),
             )
         # Shard mode splits the joined reduction, so it cannot use the packed lane.
-        lane = allreduce_fusion_lane(
-            hidden_states,
-            self.routed_hidden + self.hidden_size,
-            enabled=(
-                tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
-            ),
+        lane_enabled = (
+            tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
+        )
+        # Preferred: the producers write straight into symmetric memory and the
+        # join reduces them there. Falls back to the packed lane, which holds
+        # ordinary memory the collective has to stage first.
+        symm_outputs = _acquire_symm_join_outputs(
+            mapping=self.mapping,
+            routed_hidden=self.routed_hidden,
+            hidden_size=self.hidden_size,
+            like=hidden_states,
+            enabled=lane_enabled,
+        )
+        lane = (
+            None
+            if symm_outputs is not None
+            else allreduce_fusion_lane(
+                hidden_states,
+                self.routed_hidden + self.hidden_size,
+                enabled=lane_enabled,
+            )
         )
         return TailPlan(
             tier=tier,
             lane=lane,
+            symm_outputs=symm_outputs,
             routed_in_fork=tier is K3MoETailTier.SEPARATE_REDUCE,
         )
 
@@ -764,6 +819,7 @@ class K3MoeTailComm:
                 shared_partial,
                 prefix_sum,
                 plan.lane,
+                plan.symm_outputs,
                 num_tokens,
                 hidden_size,
             )
@@ -953,6 +1009,7 @@ class K3MoeTailComm:
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
         lane: torch.Tensor | None,
+        symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
@@ -961,7 +1018,13 @@ class K3MoeTailComm:
                 routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
             )
         return self._tail_fused_lane_ar_replicated(
-            routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+            routed_out,
+            shared_partial,
+            prefix_sum,
+            lane,
+            symm_outputs,
+            num_tokens,
+            hidden_size,
         )
 
     def _tail_fused_lane_ar_sharded(
@@ -987,6 +1050,7 @@ class K3MoeTailComm:
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
         lane: torch.Tensor | None,
+        symm_outputs: tuple[torch.Tensor, torch.Tensor] | None,
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
@@ -994,6 +1058,7 @@ class K3MoeTailComm:
             routed_out,
             shared_partial,
             lane=lane,
+            symm_outputs=symm_outputs,
             routed_hidden=self.routed_hidden,
             routed_norm=self.routed_norm,
             group=self.mapping.moe.tp_ep_group,

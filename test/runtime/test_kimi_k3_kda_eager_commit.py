@@ -8,14 +8,14 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
-from test.runtime.conftest import cache_metadata_for as _metadata_for
+from test.runtime.conftest import block_tables_for as _tables_for
 from test.runtime.conftest import kimi_recipe as _kimi_recipe
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from types import SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
@@ -51,6 +51,9 @@ class _Harness:
         )
         self.backend = KdaAttnBackend(config, spec)
         self.backend.set_kv_pool(self.pool)
+        # The persistent decode buffers exist from construction, as at the
+        # wrapper (the verify refresh below writes into them).
+        self.backend.init_cuda_graph_state(config.max_bs)
         if eager_replay and not self.backend._replay_active:
             pytest.skip("KDA replay commit kernel unavailable")
         if not eager_replay:
@@ -88,14 +91,14 @@ class _Harness:
             group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
             for group_id in _STATE_GROUPS
         }
-        metadata, op = _metadata_for(self.contract, tables, DEV)
-        self.backend.init_forward_metadata(
-            bs=bs,
-            req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+        delivered = _tables_for(self.contract, tables, DEV)
+        self.backend.refresh_decode_metadata(
+            bs,
+            bs,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
-            cache_metadata=metadata,
-            forward_batch=op,
+            block_tables=delivered,
         )
 
     def forward(self, inputs, bs):
@@ -192,7 +195,6 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     seq_lens = [8 + T] * len(rpis)
     bs = len(rpis)
 
-    captured.backend.init_cuda_graph_state(captured.backend.max_bs)
     warm_inputs = captured.inputs(bs, 211)
     captured.prepare_metadata(rpis, pages, seq_lens)
     captured.forward(warm_inputs, bs)
@@ -238,15 +240,16 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
             for group_id in _STATE_GROUPS
         }
-        metadata, op = _metadata_for(captured.contract, tables, DEV)
+        delivered = _tables_for(captured.contract, tables, DEV)
         seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
-        captured.backend.init_forward_metadata_replay_cuda_graph(
+        captured.backend.refresh_decode_metadata(
+            bs,
             bs,
             req_pool_indices,
             seq_lens_tensor,
-            ForwardMode.DECODE,
-            cache_metadata=metadata,
-            forward_batch=op,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=delivered,
         )
         replay_inputs = captured.inputs(bs, 227 + round_index)
         for name, value in replay_inputs.items():
@@ -271,15 +274,16 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
         for group_id in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(captured.contract, tables, DEV)
+    delivered = _tables_for(captured.contract, tables, DEV)
     seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
-    captured.backend.init_forward_metadata_replay_cuda_graph(
+    captured.backend.refresh_decode_metadata(
+        bs,
         bs,
         req_pool_indices,
         seq_lens_tensor,
-        ForwardMode.DECODE,
-        cache_metadata=metadata,
-        forward_batch=op,
+        forward_mode=ForwardMode.DECODE,
+        for_graph_replay=True,
+        block_tables=delivered,
     )
     replay_inputs = captured.inputs(bs, 251)
     for name, value in replay_inputs.items():
@@ -360,6 +364,31 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     harness.prepare_metadata([0], pages, [8 + T])
     harness.forward(harness.inputs(1, 712), 1)
     assert harness.backend._batched_replay_ready
+
+
+def test_uneven_state_groups_bind_batched_replay():
+    """Replay uses each layer's cache group instead of equal-size partitions."""
+    harness = _Harness(eager_replay=True)
+    first_group, second_group = _STATE_GROUPS[:2]
+    moved_layer = next(
+        layer_id
+        for layer_id in harness.layer_ids
+        if harness.pool.state_group_by_layer[layer_id] == second_group
+    )
+    harness.pool.state_group_by_layer[moved_layer] = first_group
+    harness.backend.set_kv_pool(harness.pool)
+
+    pages = {group: [2] for group in _STATE_GROUPS}
+    harness.prepare_metadata([0], pages, [8 + T])
+    harness.forward(harness.inputs(1, 713), 1)
+
+    expected = [
+        harness.backend._replay_group_rows[harness.pool.state_group_by_layer[layer_id]]
+        for layer_id in harness.layer_ids
+    ]
+    assert harness.backend._batched_replay_ready
+    assert harness.backend._replay_group_indices.tolist() == expected
+    assert expected.count(0) != expected.count(1)
 
 
 def test_verify_scratch_cannot_grow_after_preallocation():

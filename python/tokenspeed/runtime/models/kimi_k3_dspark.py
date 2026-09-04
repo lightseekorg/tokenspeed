@@ -86,7 +86,6 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         if q.size(0) == 0:
             return q.new_empty((0, self.num_local_heads * self.v_head_dim))
@@ -105,6 +104,11 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
 
             decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
 
+        # The drafter publishes each block step's write window before this
+        # forward; the backend serves it as the DECODE window.
+        out_cache_loc = ctx.attn_backend.write_locations(
+            self.attn_mqa, ForwardMode.DECODE
+        )
         Q, K = self.forward_absorb_qkv_proj(
             q, latent_cache, positions, decode_ctx, out_cache_loc
         )
@@ -234,7 +238,6 @@ class K3DSparkDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -253,7 +256,6 @@ class K3DSparkDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.comm_manager,
         )
         hidden_states, residual = self._norm_with_allreduce(
@@ -428,7 +430,6 @@ class K3DSparkModel(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         kv_sync_event=None,
@@ -462,7 +463,6 @@ class K3DSparkModel(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 residual=residual,
             )
 

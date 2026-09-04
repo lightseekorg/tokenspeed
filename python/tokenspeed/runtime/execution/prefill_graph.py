@@ -26,7 +26,7 @@ the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Capture borrows the decode
-:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`'s
+:class:`~tokenspeed.runtime.execution.forward_step.ForwardStepRunner`'s
 stream; buckets share one private mempool, deliberately not the decode graphs'
 pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a simple
@@ -74,7 +74,7 @@ from tokenspeed.runtime.utils.common import (
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -204,7 +204,6 @@ class PrefillGraph:
         token_to_kv_pool: KV pool the dummy batch points at (reserved dummy slot).
         input_buffers: The shared static input buffers the graphs read from.
         config: Model-executor config (buckets, DP/world topology, device).
-        page_table: Request page table; row 0 backs the dummy capture request.
         drafter: If present, aux-hidden capture (EAGLE3/MTP) is baked into the
             captured graphs.
     """
@@ -216,9 +215,9 @@ class PrefillGraph:
         token_to_kv_pool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
-        page_table: torch.Tensor | None,
         drafter=None,
         num_warmup: int = 3,
+        graph_supported: bool = True,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
         # Multimodal seam: models whose multimodal path is embeds-only expose
@@ -236,7 +235,6 @@ class PrefillGraph:
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
-        self.page_table = page_table
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
@@ -245,6 +243,9 @@ class PrefillGraph:
         self.disable = (
             config.enforce_eager
             or config.disable_prefill_graph
+            # Backend-declared restriction (cuda_graph_support), resolved by
+            # ModelExecutor over the backend tree at startup.
+            or not graph_supported
             or not self.capture_buckets
             or self.inner_model is None
             or self._embed_tokens is None
@@ -271,7 +272,7 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
+    def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
@@ -302,17 +303,17 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
-        # Seam: backends alloc static buffers or refuse capture; kept outside inference mode (in-place refresh).
-        init_pfg_state = getattr(self.attn_backend, "init_prefill_graph_state", None)
-        if init_pfg_state is not None:
-            init_pfg_state(
-                max_num_tokens=max(self.capture_buckets),
-                max_bs=int(self.page_table.shape[0]),
-            )
+        # Seam: backends alloc static buffers or refuse capture; kept
+        # outside inference mode (in-place refresh). Base default: no-op.
+        self.attn_backend.init_prefill_graph_state(
+            max_num_tokens=max(self.capture_buckets),
+            max_bs=int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper)
 
-    def _capture_all_buckets(self, decode_wrapper: CudaGraphWrapper | None) -> None:
+    def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
         rank = self.config.global_rank
         buckets = sorted(self.capture_buckets, reverse=True)
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
@@ -345,7 +346,7 @@ class PrefillGraph:
             )
 
     def _capture_bucket(
-        self, bucket: int, decode_wrapper: CudaGraphWrapper | None
+        self, bucket: int, decode_wrapper: ForwardStepRunner | None
     ) -> None:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
@@ -364,9 +365,10 @@ class PrefillGraph:
         """Run the inner model over the leading ``num_tokens`` of the static buffers.
 
         ``num_tokens`` is the padded bucket size; the padded tail [real:bucket] is
-        already scrubbed to safe values (embeds=0, positions=0,
-        out_cache_loc=dummy_kv_slot) by :meth:`_land_input_embeds` and
-        ``InputBuffers.fill_input_buffers``. The embedding is NOT part of the
+        already scrubbed to safe values (embeds=0, positions=0) by
+        :meth:`_land_input_embeds` and ``InputBuffers.fill_input_buffers``;
+        the backends' extend write spans cover only the real tokens, so
+        padded rows never write KV. The embedding is NOT part of the
         graph: the inner model starts from the static input-embeds buffer, so a
         replay can take precomputed (e.g. merged multimodal) embeddings.
         """
@@ -379,7 +381,6 @@ class PrefillGraph:
             ib.input_ids_buf[:num_tokens],
             positions,
             self._ctx,
-            ib.out_cache_loc_buf[:num_tokens],
             input_embeds=self._input_embeds_buf[:num_tokens],
         )
 
@@ -403,27 +404,19 @@ class PrefillGraph:
         backend sizes its own per-request tables from
         (``BaseAttnConfig.context_len`` is the model context plus
         ``spec_context_pad``), so a row sized from it covers any column a
-        consumer can derive, and consumers addressing kernel pages expand
-        from this grain at their own mapping point. The width is a property
-        of the group's published spec, not of the kernel that reads it, which
-        is why no per-backend knob is needed.
-
-        Two mapping points consume these tables and they do not agree on the
-        grain: ``CacheGroupsMixin._kernel_page_tables`` expands with the
-        group's own ``block_granularity``, while ``CacheBatchMetadata
-        .kernel_table`` -- the one the MLA targets take -- expands with the
-        contract-wide ``prefix_granularity``. A row sized here in the group's
-        grain is correct at the second point only while the two coincide,
-        which holds for every history group any pool reaching it publishes
-        today. A recipe publishing a coarser history grain would put the
-        reserved null block inside the live range.
+        consumer can derive: rows travel in the group's raw scheduler grain,
+        and kernel-page expansion happens at the one conversion point (the
+        router's table stacks; V4's bespoke metadata build). The width is
+        a property of the group's published
+        spec, not of the kernel that reads it, which is why no per-backend
+        knob is needed.
 
         Deliberately NOT ``compute_max_logical_pages_for_capture``: that
         helper answers the decode question, where a row describes live cache
         history, so a sliding group is bounded by its window. Capture derives
         a write column per position of the extend it fabricates
-        (``_compute_extend_group_out_cache_locs``, ``(prefix + new - 1) //
-        grain``) with no window bound, so a window-sized row underflows.
+        (``extend_out_cache_locs``, ``(prefix + new - 1) // grain``)
+        with no window bound, so a window-sized row underflows.
         Trying the helper here made Inkling capture die with "extend write
         locations out of table bounds" -- its ``sliding_attention_0`` row was
         6 columns against the 63 the bucket needed.
@@ -433,12 +426,13 @@ class PrefillGraph:
         runtime check for that (``_gather_state_block_indices``) is gated on
         ``TOKENSPEED_CACHE_DEBUG``, so a regression here would be silent --
         ``test_each_capture_row_gets_its_own_block`` is the guard.
+
+        An empty dict (a pool publishing no groups: unit fixtures, warmup
+        before binding) skips the cache-metadata kwargs downstream.
         """
-        if not self.attn_backend.consumes_cache_metadata:
-            return {}
         # ALL groups, state included: hybrid wrappers forward the dict to the
-        # mamba child, which requires its state group; KV children shed state
-        # groups themselves (_shed_state_groups).
+        # mamba child, which requires its state group; KV children keep only
+        # the families they declared (_consumed_group_tables).
         out = {}
         extent = max(1, int(self.config.physical_context_len))
         # Built on the host: make_dummy_batch's only use of these is
@@ -494,7 +488,6 @@ class PrefillGraph:
         seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
         seq_lens_gpu = seq_lens_cpu.to(self.config.device)
         ib.input_ids_buf[:num_tokens].fill_(1)
-        ib.out_cache_loc_buf[:num_tokens].fill_(ib.dummy_kv_slot)
         ib.positions_buf[:num_tokens].copy_(
             torch.cat([torch.arange(l, device=self.config.device) for l in seq_lens])
         )
@@ -506,8 +499,6 @@ class PrefillGraph:
         ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
         ib.extend_prefix_lens_buf[:bs].zero_()
         ib.extend_prefix_lens_cpu[:bs].zero_()
-        # Dummy requests' pages -> page 0 (valid memory).
-        self.page_table[:bs].zero_()
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -526,27 +517,18 @@ class PrefillGraph:
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
-        extra_metadata_kwargs: dict = {}
+        # Every backend gets the same kwargs; V4 reads num_tokens/positions
+        # for its packed rows, the others absorb them via **kwargs.
+        extra_metadata_kwargs: dict = {
+            "num_tokens": num_tokens,
+            "positions": ib.positions_buf[:num_tokens],
+        }
         group_tables = self._dummy_group_tables(bs)
-        if self.attn_backend.needs_group_block_tables:
-            # The wrapper used to supply block_tables here too, but every
-            # backend that asks for group tables also consumes cache metadata,
-            # so group_tables below always replaced them -- a device
-            # allocation per bucket that was thrown away every time. Checked
-            # rather than assumed: the two flags are independent by design
-            # (see AttentionBackend). Both backends that reach here today
-            # would refuse the empty dict loudly on their own, so this is
-            # defence for a future pairing -- and a raise, not an assert,
-            # because assert is stripped under -O.
-            if not group_tables:
-                raise RuntimeError(
-                    f"{type(self.attn_backend).__name__} sets "
-                    "needs_group_block_tables but publishes no cache "
-                    "metadata, so capture has no group tables to give it"
-                )
-            extra_metadata_kwargs["num_tokens"] = num_tokens
-            extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         if group_tables:
+            # Route the dummy tables through the same bridge packer live
+            # batches use: one packed device storage, contract order and
+            # bounds validated (the router's packed unpack and V4's
+            # packed-storage checks both key on that layout).
             arrays = {
                 group_id: table.cpu().numpy()
                 for group_id, table in group_tables.items()
@@ -561,20 +543,18 @@ class PrefillGraph:
             group_tables = dict(
                 cache_metadata.tables(active_forward_op=dummy_forward_op)
             )
-            extra_metadata_kwargs["cache_metadata"] = cache_metadata
-            extra_metadata_kwargs["forward_batch"] = dummy_forward_op
             extra_metadata_kwargs["block_tables"] = group_tables
         self.attn_backend.init_forward_metadata(
             bs=bs,
             num_extends=bs,
             req_pool_indices=ib.req_pool_indices_buf[:bs],
             seq_lens=ib.seq_lens_buf[:bs],
-            page_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=ib.extend_seq_lens_buf[:bs],
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
+            extend_with_prefix=False,
             **extra_metadata_kwargs,
         )
         return ctx
@@ -627,7 +607,6 @@ class PrefillGraph:
         if num_tokens < bucket:
             ib = self.input_buffers
             ib.input_ids_buf[num_tokens:bucket].fill_(1)
-            ib.out_cache_loc_buf[num_tokens:bucket].fill_(ib.dummy_kv_slot)
             if self.config.model_is_mrope:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
@@ -653,7 +632,7 @@ class PrefillGraph:
         split itself, while the captured token-shaped compute is uniform over
         all rows (pure decode is the decode graph's job). Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
-        draft first-step row narrowing (keyed on ``accept_lengths``) and the
+        draft first-step row narrowing (``draft_narrowing``) and the
         ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
         different values falls back to eager rather than silently dropping the
         reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
@@ -668,7 +647,7 @@ class PrefillGraph:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return None
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None

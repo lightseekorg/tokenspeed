@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -40,6 +41,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
     _force_deterministic_rsag,
@@ -124,7 +126,6 @@ class DFlash(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner | None = None,
-        cache_view=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -137,7 +138,6 @@ class DFlash(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -190,19 +190,12 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.cache_view is None:
-            raise ValueError("Native DFLASH requires a staged cache view.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
         max_bs = self.input_buffers.max_bs
         self.draft_seq_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
-        )
-        self.draft_out_cache_loc_buf = torch.empty(
-            (max_bs * self.draft_query_width,),
-            dtype=torch.int32,
-            device=self.device,
         )
         # None means probed-and-unavailable; unset means not probed yet.
         self._dist_argmax_state: object = _UNSET
@@ -257,16 +250,7 @@ class DFlash(BaseDrafter):
                 "DFLASH requires the target model to support "
                 "set_dflash_layers_to_capture."
             )
-        incr_callback = None
-        incr_slot_bufs = None
-        if self._incremental_proj_enabled:
-            incr_callback = self._on_capture_slot_ready
-            incr_slot_bufs = self._incr_slot_bufs
-        target_model.set_dflash_layers_to_capture(
-            self.target_layer_ids,
-            incremental_callback=incr_callback,
-            slot_bufs=incr_slot_bufs,
-        )
+        target_model.set_dflash_layers_to_capture(self.target_layer_ids)
         self._wire_aux_hidden_stream(target_model)
 
     def _wire_aux_hidden_stream(self, target_model) -> None:
@@ -525,7 +509,15 @@ class DFlash(BaseDrafter):
         lengths[base_ctx.num_extends :] = self.spec_num_tokens
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
+        # The TARGET round's write vector, from the target router (the pools
+        # share one page-id space): the extend span for prefill rows, the
+        # verify window behind it for decode rows — the same token order the
+        # hidden states arrive in.
+        target_backend = base_ctx.attn_backend
+        cache_locs = target_backend.decode_window_locations()
+        if base_ctx.num_extends > 0:
+            cache_locs = torch.cat((target_backend.extend_span_locations(), cache_locs))
+        cache_locs = cache_locs[: base_ctx.input_num_tokens]
 
         decode_only = base_ctx.num_extends == 0
         if (
@@ -815,27 +807,64 @@ class DFlash(BaseDrafter):
             logger.warning("DFLASH incremental projection init failed: %s", e)
             self._incremental_proj_enabled = False
 
-    def _prepare_incremental_proj(
-        self, num_tokens: int, positions: torch.Tensor, cache_locs: torch.Tensor
-    ) -> None:
-        self._incr_num_tokens = num_tokens
-        self._incr_positions = positions
-        self._incr_cache_locs = cache_locs
-        self._incremental_kv_write_done = False
-        self._incr_acc_buf[:num_tokens].zero_()
-        self.target_language_model.model._dflash_incr_active = True
+    def _overlap_allowed(self, ctx: ForwardContext) -> bool:
+        """Whether this round's draft KV write may run on the aux stream
+        alongside the target / the draft: decode-only rows (the target's
+        verify window is the round's full write vector), the fused writer,
+        and not the graph warmup phase — capture-only auxiliary branches warm
+        serially there and are recorded only under capture."""
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        return (
+            ctx.num_extends == 0
+            and self._fused_kv_enabled
+            and self._kv_aux_stream is not None
+            and (capturing or not get_is_cuda_graph_phase())
+        )
 
-    def _on_capture_slot_ready(self, capture_idx: int, num_tokens: int) -> None:
+    @override
+    def prepare_target_forward(self, ctx: ForwardContext) -> None:
+        """Arm the incremental projection for a round the draft will overlap
+        with the target: the target hands each captured tap to
+        :meth:`on_target_capture` as it is produced, so the draft's KV is
+        written under the target's remaining layers and ``run`` finds it done.
+        Everything the sink needs is fixed here, for this forward only.
+        """
+        self._incremental_kv_write_done = False
+        if not (self._incremental_proj_enabled and self._overlap_allowed(ctx)):
+            return
+        num_tokens = ctx.input_num_tokens
+        self._incr_num_tokens = num_tokens
+        self._incr_positions = self.input_buffers.positions_buf[:num_tokens]
+        self._incr_cache_locs = ctx.attn_backend.decode_window_locations()[:num_tokens]
+        self._incr_acc_buf[:num_tokens].zero_()
+        ctx.target_capture_sink = self
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        """Fold tap ``capture_idx`` into the draft's projection on the aux
+        stream (``fc`` over the concatenated taps is the sum of per-tap
+        GEMMs); the last tap completes the KV write and records the join
+        event the draft forward waits on."""
+        num_tokens = hidden.shape[0]
+        if num_tokens != self._incr_num_tokens:
+            raise RuntimeError(
+                f"DFLASH target capture {capture_idx} carries {num_tokens} rows, "
+                f"but this forward was armed for {self._incr_num_tokens}"
+            )
+        # Own the rows before the aux stream reads them: the target frees or
+        # rewrites its activation as its layers proceed.
+        slot = self._incr_slot_bufs[capture_idx][:num_tokens]
+        slot.copy_(hidden)
         event = self._incr_capture_events[capture_idx]
         event.record(torch.cuda.current_stream())
 
         with torch.cuda.stream(self._kv_aux_stream):
             self._kv_aux_stream.wait_event(event)
-            hidden = self._incr_slot_bufs[capture_idx][:num_tokens]
             acc = self._incr_acc_buf[:num_tokens]
             torch.addmm(
                 acc,
-                hidden,
+                slot,
                 self._incr_sub_weights_t[capture_idx],
                 beta=1.0,
                 alpha=1.0,
@@ -956,17 +985,6 @@ class DFlash(BaseDrafter):
             ]
         return current
 
-    def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
-        num_extends = base_ctx.num_extends
-        num_decodes = base_ctx.bs - num_extends
-        if num_decodes == 0:
-            return None
-        num_decode_tokens = num_decodes * self.spec_num_tokens
-        num_prefill_tokens = base_ctx.input_num_tokens - num_decode_tokens
-        return self.input_buffers.input_ids_buf[
-            num_prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
-
     def draft(self, current_tokens: torch.Tensor) -> torch.Tensor:
         return self._draft_native(current_tokens)
 
@@ -986,18 +1004,11 @@ class DFlash(BaseDrafter):
         # NOTE: callers (run/_run_overlap) write current_tokens directly into
         # block_ids_buf[:bs, 0] before invoking _draft_native
         block_positions = self.block_positions_buf[:bs]
-        cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         if not prepared:
             torch.add(
                 prefix_lens.unsqueeze(1),
                 self.block_offsets,
                 out=block_positions,
-            )
-
-            self.cache_view.out_cache_loc_uniform(
-                out=cache_locs,
-                cache_start=prefix_lens,
-                num_tokens=self.draft_query_width,
             )
 
         is_capturing = (
@@ -1007,20 +1018,28 @@ class DFlash(BaseDrafter):
         # MLA backends slice the entire block out of their decode metadata.
         metadata_num_extends = 0 if self.attention_kind == "kimi_mla" else bs
         if not is_capturing:
-            self.attn_backend.init_forward_metadata(
-                bs=bs,
-                num_extends=metadata_num_extends,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_after,
-                page_table=self.cache_view.table,
+            # Same unified refresh the wrapper's decode path uses; a captured
+            # graph instead re-derives the block-end seq_lens in-graph.
+            self.attn_backend.refresh_decode_metadata(
+                bs,
+                bs,
+                req_pool_indices,
+                seq_lens_after,
                 forward_mode=ForwardMode.DECODE,
-                extend_seq_lens=None,
-                extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
-                extend_prefix_lens=None,
-                extend_prefix_lens_cpu=None,
+                block_tables=self.round_block_tables,
+                num_extends=metadata_num_extends,
             )
         else:
             self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)
+        # The block's write window (draft_query_width slots per request at
+        # prefix..prefix+width-1). Published AFTER the refresh: the refresh
+        # republishes the verify-shaped window, and the draft model's
+        # write_locations fetch must see the block window instead. In-graph:
+        # one fused launch over the router's address-stable location stack.
+        self.attn_backend.publish_draft_step_locations(
+            cache_start=prefix_lens,
+            num_tokens=self.draft_query_width,
+        )
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -1040,7 +1059,6 @@ class DFlash(BaseDrafter):
                 ctx=ctx,
                 input_ids=flat_ids,
                 positions=block_positions.reshape(-1),
-                out_cache_loc=cache_locs,
                 captured_hidden_states=None,
                 input_embeds=input_embeds,
                 kv_sync_event=kv_sync_event,
@@ -1082,21 +1100,10 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            get_is_cuda_graph_phase,
-        )
-
-        decode_only = base_ctx.num_extends == 0
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        can_overlap = (
-            decode_only
-            and self._fused_kv_enabled
-            and self._kv_aux_stream is not None
-            and (capturing or not get_is_cuda_graph_phase())
-        )
-        if can_overlap:
+        # The same gate prepare_target_forward armed the incremental
+        # projection under, so _run_overlap's "already written" check can
+        # only ever see this round's result.
+        if self._overlap_allowed(base_ctx):
             return self._run_overlap(
                 base_ctx, logits_output, output_tokens, accept_lengths
             )
@@ -1106,23 +1113,18 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         current_tokens = self.block_ids_buf[:bs, 0]
         if base_ctx.num_extends == 0:
-            draft_cache_locs = self.draft_out_cache_loc_buf[
-                : bs * self.draft_query_width
-            ]
-            max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
+            history = self.attn_backend.draft_history_view()
+            max_draft_prefix = history.max_tokens - self.draft_query_width
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                page_table=self.cache_view.table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
-                out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.cache_view.kernel_page_size,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1153,30 +1155,29 @@ class DFlash(BaseDrafter):
 
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
+        history = self.attn_backend.draft_history_view()
+        max_draft_prefix = history.max_tokens - self.draft_query_width
 
         current_tokens = self.block_ids_buf[:bs, 0]
-        draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         dflash_prepare_decode(
             output_tokens=output_tokens,
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            page_table=self.cache_view.table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
-            out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.cache_view.kernel_page_size,
             max_draft_prefix=max_draft_prefix,
         )
 
         if not self._incremental_kv_write_done:
             # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
             positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-            cache_locs = self.input_buffers.out_cache_loc_buf[
+            # Decode-only path (see can_overlap): the target router's verify
+            # window is the round's full write vector.
+            cache_locs = base_ctx.attn_backend.decode_window_locations()[
                 : base_ctx.input_num_tokens
             ]
             main_stream = torch.cuda.current_stream()

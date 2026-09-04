@@ -29,7 +29,9 @@ if not torch.cuda.is_available():
 
 from tokenspeed_kernel.ops.attention import (  # noqa: E402
     kda_replay_commit_supported,
+    resolve_kda_batched_replay_commit,
 )
+from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 #: The registry entries behind the probe and the no-store fused verify are
 #: vendor-gated (NVIDIA today); direct Triton-kernel tests below run anywhere.
@@ -53,9 +55,10 @@ LOWER_BOUND = -5.0
 DEV = "cuda"
 
 
-def _window(n, t, pages=32, seed=0):
+def _window(n, t, pages=32, seed=0, num_heads=HV):
     """A draft window of ``t`` positions for ``n`` requests, plus the pools."""
     g = torch.Generator(device="cpu").manual_seed(seed)
+    projection_width = num_heads * K
 
     def rnd(*shape, dtype=torch.bfloat16, scale=1.0):
         return (torch.randn(*shape, generator=g, dtype=torch.float32) * scale).to(
@@ -63,16 +66,18 @@ def _window(n, t, pages=32, seed=0):
         )
 
     return dict(
-        qkv_raw=rnd(n * t, 3 * P),
-        conv_w=rnd(3 * P, 4, scale=0.3).contiguous(),
-        conv_pool=rnd(pages, 3 * P, 3),
+        qkv_raw=rnd(n * t, 3 * projection_width),
+        conv_w=rnd(3 * projection_width, 4, scale=0.3).contiguous(),
+        conv_pool=rnd(pages, 3 * projection_width, 3),
         f_a=rnd(n * t, D_FA),
-        w_fb=rnd(P, D_FA, scale=0.05).contiguous(),
-        beta=rnd(n * t, HV),
-        A_log=rnd(HV, dtype=torch.float32, scale=0.5),
-        dt_bias=rnd(P, dtype=torch.float32),
-        h_pool=rnd(pages, HV, K, V, dtype=torch.float32),
-        gate_scratch=torch.empty(n * t, P, device=DEV, dtype=torch.float32),
+        w_fb=rnd(projection_width, D_FA, scale=0.05).contiguous(),
+        beta=rnd(n * t, num_heads),
+        A_log=rnd(num_heads, dtype=torch.float32, scale=0.5),
+        dt_bias=rnd(projection_width, dtype=torch.float32),
+        h_pool=rnd(pages, num_heads, K, V, dtype=torch.float32),
+        gate_scratch=torch.empty(
+            n * t, projection_width, device=DEV, dtype=torch.float32
+        ),
         read_indices=torch.arange(1, n + 1, device=DEV, dtype=torch.int32),
     )
 
@@ -124,7 +129,7 @@ def _batched_descriptor(xs):
     return torch.tensor(addresses, dtype=torch.uint64, device=DEV)
 
 
-def _batched_static_args(x, layers_per_group):
+def _batched_static_args(x):
     return dict(
         qkv_stride=x["qkv_raw"].stride(0),
         conv_stride=x["conv_pool"].stride(0),
@@ -133,7 +138,6 @@ def _batched_static_args(x, layers_per_group):
         state_stride=x["h_pool"].stride(0),
         gate_stride=x["gate_scratch"].stride(0),
         conv_width=x["conv_w"].shape[1],
-        layers_per_group=layers_per_group,
         lower_bound=LOWER_BOUND,
     )
 
@@ -174,6 +178,7 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             (layers, n, (conv_dim + block_size - 1) // block_size)
         ](
             _batched_descriptor(xs),
+            torch.arange(layers, device=DEV, dtype=torch.int32),
             reads,
             writes,
             accepted,
@@ -182,7 +187,6 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             STRIDE_QKV=xs[0]["qkv_raw"].stride(0),
             STRIDE_CONV=xs[0]["conv_pool"].stride(0),
             CONV_DIM=conv_dim,
-            LAYERS_PER_GROUP=1,
             BLOCK=block_size,
             num_warps=min(8, max(1, block_size // 128)),
         )
@@ -194,7 +198,7 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
 
 def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     """One launch matches the layer loop; a wrong descriptor must be detected."""
-    layers, n, t = 4, 5, 4
+    layers, n, t = 5, 5, 4
     source = [_window(n, t, seed=100 + layer) for layer in range(layers)]
     loop = []
     writes = torch.stack(
@@ -207,7 +211,8 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         torch.int32
     )
     accepted = torch.tensor([0, t, 1, 3, 2], device=DEV, dtype=torch.int32)
-    groups = [0, 0, 1, 1]
+    groups = [0, 0, 0, 1, 1]
+    group_indices = torch.tensor(groups, device=DEV, dtype=torch.int32)
     for x, group in zip(source, groups, strict=True):
         local = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
         local["read_indices"] = reads[group]
@@ -222,6 +227,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     descriptors = _batched_descriptor(batched)
     batched_recurrent_kda_replay_commit(
         descriptors,
+        group_indices,
         reads,
         writes,
         accepted,
@@ -229,7 +235,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(batched[0], layers_per_group=2),
+        **_batched_static_args(batched[0]),
     )
     for expected, actual in zip(loop, batched, strict=True):
         accepted_rows = torch.cat(
@@ -260,6 +266,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     bad[2, 1] = negative[1]["conv_w"].data_ptr()
     batched_recurrent_kda_replay_commit(
         bad,
+        group_indices,
         reads,
         writes,
         accepted,
@@ -267,11 +274,77 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(negative[0], layers_per_group=2),
+        **_batched_static_args(negative[0]),
     )
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="AMD CDNA4 is required for GFX950 KDA replay execution",
+)
+def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
+    """The GFX950 all-layer launch honors each descriptor's cache-group row."""
+    layers, n, t, pages, num_heads = 5, 2, 8, 10, 12
+    groups = [0, 0, 0, 1, 1]
+    source = [
+        _window(n, t, pages=pages, seed=500 + layer, num_heads=num_heads)
+        for layer in range(layers)
+    ]
+    projection_width = num_heads * K
+    for layer in source:
+        layer["gate_scratch"] = layer["qkv_raw"][:, :projection_width].clone()
+    batched = [
+        {name: value.clone() for name, value in layer.items()} for layer in source
+    ]
+    per_layer = [
+        {name: value.clone() for name, value in layer.items()} for layer in source
+    ]
+    reads = torch.tensor([[1, 2], [3, 4]], device=DEV, dtype=torch.int32)
+    writes = torch.tensor([[5, 6], [7, 8]], device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
+    kernel = resolve_kda_batched_replay_commit()
+    assert kernel is not None
+    assert kernel.name == "gluon_kda_fused_replay_gfx950"
+
+    def launch(xs, group_indices, read_indices, write_indices):
+        kernel(
+            descriptors=_batched_descriptor(xs),
+            group_indices=group_indices,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted,
+            draft_token_num=t,
+            num_heads=num_heads,
+            head_dim=K,
+            f_a_dim=D_FA,
+            **_batched_static_args(xs[0]),
+        )
+
+    launch(
+        batched,
+        torch.tensor(groups, device=DEV, dtype=torch.int32),
+        reads,
+        writes,
+    )
+    for layer, group in zip(per_layer, groups, strict=True):
+        launch(
+            [layer],
+            torch.zeros(1, device=DEV, dtype=torch.int32),
+            reads[group : group + 1],
+            writes[group : group + 1],
+        )
+    torch.cuda.synchronize()
+
+    for actual, expected in zip(batched, per_layer, strict=True):
+        torch.testing.assert_close(
+            actual["conv_pool"], expected["conv_pool"], atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            actual["h_pool"], expected["h_pool"], atol=0.0, rtol=0.0
         )
 
 
@@ -350,6 +423,7 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         x["read_indices"] = reads[group]
     batched_recurrent_kda_replay_commit(
         _batched_descriptor(batched),
+        torch.tensor(groups, device=DEV, dtype=torch.int32),
         reads,
         writes,
         accepted_tensor,
@@ -357,7 +431,7 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(batched[0], layers_per_group=23),
+        **_batched_static_args(batched[0]),
     )
     for expected, actual in zip(loop, batched, strict=True):
         torch.testing.assert_close(

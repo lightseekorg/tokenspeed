@@ -15,12 +15,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    _should_update_mamba_state_after_mtp_verify,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
 VOCAB = 32
@@ -350,52 +346,25 @@ def test_proposals_are_valid_token_ids() -> None:
 # --------------------------------------------------------------------------
 
 
-class _BackendWithCommit:
-    def update_mamba_state_after_mtp_verify(self, accept_lengths, model):
-        return None
-
-
-class _BackendWithoutCommit:
-    pass
-
-
-def test_kda_commit_fires_for_a_dspark_drafter() -> None:
+def test_kda_commit_is_a_base_no_op_hook() -> None:
     """K3's recurrent state must be committed after a DSpark verify too.
 
-    The hook keys on the backend, not the algorithm, so DSpark inherits it --
-    this test is what keeps that true if the predicate ever grows an
-    algorithm check.
+    The runner calls update_mamba_state_after_mtp_verify unconditionally
+    after every drafted decode round (no hasattr probe, no algorithm check):
+    the hook keys on the backend override, stateless backends inherit the
+    base no-op. This keeps DSpark covered if the call site ever grows an
+    algorithm check, and keeps stateless backends safe without a guard.
     """
-    assert _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.DECODE,
+    from tokenspeed.runtime.layers.attention.backends.base import (
+        AttentionBackend,
     )
 
+    class _StatelessBackend(AttentionBackend):
+        def init_forward_metadata(self, *args, **kwargs):
+            pass
 
-def test_kda_commit_is_skipped_without_a_drafter() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=None,
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
-
-
-def test_kda_commit_is_skipped_on_a_stateless_backend() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithoutCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
-
-
-def test_kda_commit_is_skipped_outside_decode() -> None:
-    """Prefill writes state inline; there is no verify to commit."""
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.EXTEND,
-    )
+    backend = _StatelessBackend.__new__(_StatelessBackend)
+    assert backend.update_mamba_state_after_mtp_verify(None) is None
 
 
 class _ShardIndices:

@@ -31,8 +31,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     MXFP8_KV_SCALE_TILE_TOKENS,
+    MXFP8_SCALE_BLOCK_SIZE,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -53,7 +54,6 @@ class MHATokenToKVPool(CachePool):
         layer_num: int,
         rank: int,
         *,
-        layer_types: tuple[str, ...] = (),
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
@@ -84,7 +84,6 @@ class MHATokenToKVPool(CachePool):
         self._kv_alloc_head_count = (
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
-        self._layer_types = tuple(layer_types or ())
         self._bind_layer_planes()
 
         k_size, v_size = self.get_kv_size_bytes()
@@ -113,10 +112,10 @@ class MHATokenToKVPool(CachePool):
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
 
-        Fields are allocated ``(rows, head_num, head_dim)`` at the max head
-        count; a layer serving fewer heads reinterprets the same bytes as
-        ``rows * (head_num / heads_l)`` rows of ``heads_l`` heads (full
-        layers: 2x the token rows per slot — the zero-padding contract).
+        A layer serving fewer heads than the field's planned head count
+        reinterprets the same bytes as proportionally more rows of
+        ``heads_l`` heads; a field planned at the layer's own head count is
+        served as is.
         """
         if self._layer_kv_head_counts is None:
             return buf
@@ -210,20 +209,15 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     K/V plus per-token scale tensors (producer: ``quantize_mxfp8``); the
     bf16 per-tensor-scale paths of the base class do not apply.
 
-    Scale layout follows what the FA4 blockscaled kernel consumes:
-    page_size 128 stores scales interleaved in the BlockScaledBasicChunk
-    atom ([num_pages, heads, 32, 4, 4], written via
-    ``store_sf_interleaved``); any other page size stores them flat
-    ([slots, heads, head_dim // 32]).
+    Scales live in the page-major interleaved layout the FA4 blockscaled
+    kernel consumes -- ``(num_pages, heads, page_tokens // 128, 32, sf, sf)``
+    BlockScaledBasicChunk atoms written via ``store_sf_interleaved`` -- the
+    one shape ``plan.mxfp8_kv_scale_fields`` declares.
 
     When the plan aliases fields, data and scale views remain layer-local
     Python objects while addressing the same physical bytes.
     """
 
-    MXFP8_SCALE_BLOCK_SIZE = 32
-
-    # Scale planes stay page-major: the blockscaled kernels read them in the
-    # interleaved layout the plan already gives them.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **MHATokenToKVPool.layer_plane_bindings,
         "k_scale": "k_scale_buffer",
@@ -231,40 +225,63 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     }
 
     def _bind_layer_planes(self) -> None:
-        if self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE:
-            raise ValueError("MXFP8 head_dim must be divisible by 32")
+        if self.head_dim % MXFP8_SCALE_BLOCK_SIZE:
+            raise ValueError(
+                f"MXFP8 head_dim must be divisible by {MXFP8_SCALE_BLOCK_SIZE}"
+            )
         # These writes go through dtype-aware kernels, so the fp8 view the
         # plan hands out is the one to keep for input reinterpretation too.
         self.store_dtype = torch.float8_e4m3fn
         super()._bind_layer_planes()
+        for layer_id in range(self.layer_num):
+            for plane in (self.k_scale_buffer[layer_id], self.v_scale_buffer[layer_id]):
+                if plane is not None:
+                    self._check_scale_plane(plane, layer_id)
+
+    def _check_scale_plane(self, plane: torch.Tensor, layer_id: int) -> None:
+        """Reject a scale plane the layer's interleaved view cannot factor."""
+        sf_dim = self.head_dim // MXFP8_SCALE_BLOCK_SIZE
+        heads_l = self._layer_heads_per_rank(layer_id)
+        if (
+            plane.ndim != 6
+            or plane.shape[3:] != (32, sf_dim, sf_dim)
+            or (plane.shape[1] * plane.shape[2]) % heads_l
+        ):
+            raise ValueError(
+                f"layer {layer_id} mxfp8 scale plane {tuple(plane.shape)} is not "
+                f"the interleaved (pages, heads, tiles, 32, {sf_dim}, {sf_dim}) "
+                f"layout for {heads_l} served heads"
+            )
 
     def _layer_page_tokens(self, layer_id: int) -> int:
-        """Tokens represented by one page id for this layer."""
-        # Byte-uniform slots factor one id through the layer's head count.
+        """Tokens one page id spans in this layer's view.
+
+        The plan fixes how many head columns and 128-token tiles a page
+        holds; a layer serving fewer heads than its planned columns folds
+        the spare columns into further token rows of the same page.
+        """
+        planned_heads, planned_tiles = self.k_scale_buffer[layer_id].shape[1:3]
         heads_l = self._layer_heads_per_rank(layer_id)
-        return self.arena.kv_page_size * self.head_num // heads_l
+        return planned_heads * planned_tiles * MXFP8_KV_SCALE_TILE_TOKENS // heads_l
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
+        """(num_ids, heads_l, k_l, 32, sf, sf) view over a layer's SF slots
         (the paged interleaved layout the blockscaled kernels consume)."""
         heads_l = self._layer_heads_per_rank(layer_id)
         k_l = self._layer_page_tokens(layer_id) // MXFP8_KV_SCALE_TILE_TOKENS
-        sf_dim = self.head_dim // self.MXFP8_SCALE_BLOCK_SIZE
+        sf_dim = self.head_dim // MXFP8_SCALE_BLOCK_SIZE
         return buf.view(buf.shape[0], heads_l, k_l, 32, sf_dim, sf_dim)
 
     def get_kv_scale_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """(k_scale, v_scale) buffers for the blockscaled attention kernel.
-
-        Returns the per-layer scale views consumed by the attention kernel.
-        """
+        """(k_scale, v_scale) views for the blockscaled attention kernel."""
         k_sf = self.k_scale_buffer[layer_id]
         v_sf = self.v_scale_buffer[layer_id]
-        if self._layer_kv_head_counts is not None:
-            return (
-                self._layer_scale_view(k_sf, layer_id),
-                self._layer_scale_view(v_sf, layer_id),
-            )
-        return k_sf, v_sf
+        if k_sf is None or v_sf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV scales")
+        return (
+            self._layer_scale_view(k_sf, layer_id),
+            self._layer_scale_view(v_sf, layer_id),
+        )
 
     def set_kv_buffer(
         self,
@@ -274,7 +291,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         cache_v: torch.Tensor,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
-        layer_id_override: int | None = None,
     ):
         assert (
             cache_k.dtype == self.store_dtype
@@ -282,9 +298,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         assert (
             k_scale is not None and v_scale is not None
         ), "MXFP8 pool requires per-token e8m0 scale tensors"
-        layer_id = (
-            layer_id_override if layer_id_override is not None else layer.layer_id
-        )
+        layer_id = layer.layer_id
         # Byte views: triton can't mask-fill fp8; locs are per-layer view rows (target the served view)
         store_kv_cache(
             cache_k.view(torch.uint8),
@@ -293,26 +307,13 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
             loc,
         )
-        if self._layer_kv_head_counts is not None:
-            page_tokens = self._layer_page_tokens(layer_id)
-            store_sf_interleaved(
-                k_scale,
-                self.k_scale_buffer[layer_id],
-                loc,
-                page_size=page_tokens,
-            )
-            store_sf_interleaved(
-                v_scale,
-                self.v_scale_buffer[layer_id],
-                loc,
-                page_size=page_tokens,
-            )
-        elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
-            store_sf_interleaved(k_scale, self.k_scale_buffer[layer_id], loc)
-            store_sf_interleaved(v_scale, self.v_scale_buffer[layer_id], loc)
-        else:
-            self.k_scale_buffer[layer_id][loc] = k_scale
-            self.v_scale_buffer[layer_id][loc] = v_scale
+        page_tokens = self._layer_page_tokens(layer_id)
+        store_sf_interleaved(
+            k_scale, self.k_scale_buffer[layer_id], loc, page_size=page_tokens
+        )
+        store_sf_interleaved(
+            v_scale, self.v_scale_buffer[layer_id], loc, page_size=page_tokens
+        )
 
     def quantize_and_set_kv_buffer(
         self,
@@ -320,26 +321,17 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         loc: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer_id_override: int | None = None,
     ) -> bool:
         """Fused per-token quantize + data store + SF scatter (one launch).
 
         Bit-identical to quantize_mxfp8 + set_kv_buffer (parity-tested) and
-        keeps the store inside the PDL chain. Returns False when the layout
-        has no interleaved-SF path (page not a 128 multiple) — the caller
-        falls back to the split path.
+        keeps the store inside the PDL chain. Returns False when the fused
+        kernel has no variant for this head_dim -- the caller falls back to
+        the split path.
         """
-        layer_id = (
-            layer_id_override if layer_id_override is not None else layer.layer_id
-        )
-        if self._layer_kv_head_counts is not None:
-            page_tokens = self._layer_page_tokens(layer_id)
-        elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
-            page_tokens = MXFP8_KV_SCALE_TILE_TOKENS
-        else:
-            return False
         if self.head_dim != 128:
             return False
+        layer_id = layer.layer_id
         quantize_store_kv_mxfp8(
             k,
             v,
@@ -348,7 +340,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self.k_scale_buffer[layer_id],
             self.v_scale_buffer[layer_id],
             loc,
-            page_tokens=page_tokens,
+            page_tokens=self._layer_page_tokens(layer_id),
         )
         return True
 

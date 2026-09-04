@@ -11,8 +11,8 @@ def _make_model(num_layers: int = 8):
     model.layers = [object() for _ in range(num_layers)]
     model.layers_to_capture = []
     model._dflash_capture_idx_map = {}
-    model._dflash_incremental_callback = None
-    model._dflash_slot_bufs = None
+    # The setter re-marks the AttnRes consumers; the stub has no layers to mark.
+    model._refresh_dflash_capture_fallback = lambda: None
     return model
 
 

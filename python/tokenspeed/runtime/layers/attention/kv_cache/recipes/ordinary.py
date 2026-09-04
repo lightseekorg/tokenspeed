@@ -37,7 +37,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -50,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
+    CacheGroupDeclaration,
     hybrid_slab_group_size,
     layer_group_ids,
 )
@@ -75,31 +75,28 @@ class OrdinaryRecipe(CacheRecipe):
         if self.draft_attn_config is None:
             return ids
         if self.draft_attn_config.prefix_granularity != self.prefix_granularity:
-            raise ValueError("target and draft cache page sizes must match")
+            raise ValueError("target and draft prefix granularities must match")
         return ids + _config_group_ids(self.draft_attn_config, self.num_draft_layers)
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
-        """Merged labels, or empty when they cannot align per layer.
+        """Merged labels, target then draft, always one per layer.
 
-        A NextN draft inherits the target hf_config's ``layer_types`` (one
-        draft layer against 61 target labels), so misaligned labels degrade to
-        full-history rather than mislabeling a group.
+        A side whose config labels cannot align per layer resolves to
+        full-history rather than mislabeling a group: plain MLA/DSA configs
+        declare no labels at all, and a NextN draft inherits the target
+        hf_config's ``layer_types`` (one draft layer against 61 target
+        labels).
         """
         target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
         if len(target) != self.num_target_layers:
-            target = ()
+            target = (FULL_ATTENTION,) * self.num_target_layers
         if self.draft_attn_config is None:
-            return target if target else ()
-        draft = tuple(
-            getattr(
-                self.draft_attn_config.component(SoftmaxAttnConfig), "layer_types", ()
-            )
-        )
+            return target
+        draft = tuple(self.draft_attn_config.component(SoftmaxAttnConfig).layer_types)
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
-        merged = target + draft
-        return merged if len(merged) == len(self.group_ids) else ()
+        return target + draft
 
     # ---- geometry ----
 
@@ -154,17 +151,19 @@ class OrdinaryRecipe(CacheRecipe):
             )
         # Every group packs one CacheBlock per parent, so a parent spans the
         # identity grain and profiled bytes/token size it directly.
-        page_size = self.prefix_granularity
+        parent_tokens = self.prefix_granularity
         return self._capped_parents(
-            self.cache_budget_bytes // (bytes_per_token * page_size) - 1,
-            parent_tokens=page_size,
+            self._budgeted_parents(
+                self.cache_budget_bytes, bytes_per_token * parent_tokens
+            ),
+            parent_tokens=parent_tokens,
         )
 
 
 def _storage_layers(config, num_layers: int) -> int:
     spec = config.component(SoftmaxAttnConfig)
     group_size = hybrid_slab_group_size(
-        getattr(spec, "layer_types", None),
+        spec.layer_types,
         sliding_window_tokens=spec.sliding_window_tokens,
     )
     return group_size if group_size is not None else num_layers

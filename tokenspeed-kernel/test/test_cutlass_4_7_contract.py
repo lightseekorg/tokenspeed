@@ -31,6 +31,6 @@ from tokenspeed_kernel.thirdparty.msa.cute.src.common import utils as msa_utils
 def test_cutlass_4_7_dependency_contract() -> None:
     assert "use_cp" in inspect.signature(gdn_prefill.chunk_gated_delta_rule).parameters
     assert callable(cute.compile)
-    assert not hasattr(cute.compile, "__getitem__")
+    assert callable(cute.compile[()])
     assert hasattr(cute.arch, "sub_packed_f32x2")
     assert callable(msa_utils.ex2_emulation_2)

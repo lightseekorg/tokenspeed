@@ -79,6 +79,85 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
     )
 
 
+def run_k8s_resolve_source_script(
+    tmp_path: Path,
+    *,
+    pr: str = "",
+    commit: str = "",
+    pr_files: str = "README.md",
+) -> tuple[subprocess.CompletedProcess[str], str, str, str]:
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Resolve source"
+    )
+    script = step["run"].replace("${{ github.repository }}", "lightseekorg/tokenspeed")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "gh-calls"
+    output = tmp_path / "github-output"
+    summary = tmp_path / "step-summary"
+    gh = bin_dir / "gh"
+    gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$GH_CALLS"
+endpoint=${2:-}
+case "$endpoint" in
+  repos/lightseekorg/tokenspeed/commits/main)
+    printf '%s\\n' "$GH_MAIN_SHA"
+    ;;
+  repos/lightseekorg/tokenspeed/commits/*)
+    printf '{"sha":"%s","html_url":"https://github.com/lightseekorg/tokenspeed/commit/%s"}\\n' \
+      "$GH_COMMIT_SHA" "$GH_COMMIT_SHA"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*/files)
+    printf '%s\\n' "$GH_PR_FILES"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*)
+    printf '{"head":{"sha":"%s"},"html_url":"https://github.com/lightseekorg/tokenspeed/pull/123"}\\n' \
+      "$GH_PR_SHA"
+    ;;
+  *)
+    echo "Unexpected gh call: $*" >&2
+    exit 1
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "GH_TOKEN": "test-token",
+        "GH_CALLS": str(calls),
+        "GH_MAIN_SHA": "1" * 40,
+        "GH_COMMIT_SHA": commit.strip().lower(),
+        "GH_PR_SHA": "2" * 40,
+        "GH_PR_FILES": pr_files,
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "PR": pr,
+        "COMMIT": commit,
+    }
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (
+        result,
+        output.read_text(encoding="utf-8") if output.exists() else "",
+        summary.read_text(encoding="utf-8") if summary.exists() else "",
+        calls.read_text(encoding="utf-8") if calls.exists() else "",
+    )
+
+
 def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
     paths = set()
     for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
@@ -109,6 +188,82 @@ def configured_yaml_choices(workflow_name: str) -> set[str]:
 def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert configured_yaml_choices("k8s-dispatch.yml") == eligible_config_paths(
         K8S_RUNNER_PREFIXES
+    )
+
+
+def test_k8s_dispatch_accepts_full_commit_sha(tmp_path):
+    requested = "A" * 40
+
+    result, output, summary, calls = run_k8s_resolve_source_script(
+        tmp_path, commit=f"  {requested}  "
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"sha={'a' * 40}" in output
+    assert "install_mla=1" in output
+    assert "- Mode: commit" in summary
+    assert f"api repos/lightseekorg/tokenspeed/commits/{'a' * 40}" in calls
+
+
+def test_k8s_dispatch_defaults_to_latest_main(tmp_path):
+    result, output, summary, calls = run_k8s_resolve_source_script(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert f"sha={'1' * 40}" in output
+    assert "install_mla=0" in output
+    assert "- Mode: main" in summary
+    assert "api repos/lightseekorg/tokenspeed/commits/main --jq .sha" in calls
+
+
+@pytest.mark.parametrize(
+    ("pr_files", "expected_install_mla"),
+    [("README.md", "0"), ("tokenspeed-mla/src/kernel.py", "1")],
+)
+def test_k8s_dispatch_preserves_pr_resolution(tmp_path, pr_files, expected_install_mla):
+    result, output, summary, calls = run_k8s_resolve_source_script(
+        tmp_path,
+        pr=" https://github.com/lightseekorg/tokenspeed/pull/123 ",
+        pr_files=pr_files,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"sha={'2' * 40}" in output
+    assert f"install_mla={expected_install_mla}" in output
+    assert "- Mode: pr" in summary
+    assert "api repos/lightseekorg/tokenspeed/pulls/123" in calls
+
+
+def test_k8s_dispatch_rejects_pr_and_commit_together(tmp_path):
+    result, output, _, calls = run_k8s_resolve_source_script(
+        tmp_path, pr="123", commit="a" * 40
+    )
+
+    assert result.returncode == 2
+    assert "Set only one of pr or commit" in result.stderr
+    assert output == ""
+    assert calls == ""
+
+
+@pytest.mark.parametrize("commit", ["a" * 39, "feature-branch", "a" * 41])
+def test_k8s_dispatch_rejects_non_full_commit_sha(tmp_path, commit):
+    result, output, _, calls = run_k8s_resolve_source_script(tmp_path, commit=commit)
+
+    assert result.returncode == 2
+    assert "expected exactly 40 hexadecimal characters" in result.stderr
+    assert output == ""
+    assert calls == ""
+
+
+def test_k8s_dispatch_commit_input_is_optional():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    commit_input = workflow_dispatch_inputs("k8s-dispatch.yml")["commit"]
+
+    assert commit_input["required"] is False
+    assert commit_input["default"] == ""
+    assert "full commit SHA" in commit_input["description"]
+    assert (
+        "${{ inputs.commit || inputs.pr || 'main' }}"
+        in workflow["concurrency"]["group"]
     )
 
 

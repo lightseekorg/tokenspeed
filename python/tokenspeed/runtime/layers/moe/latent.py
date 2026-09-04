@@ -48,7 +48,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
@@ -75,11 +75,30 @@ def _marlin_moe_available() -> bool:
     )
 
 
+def _produced_into(
+    partials: tuple[torch.Tensor, ...],
+    destinations: tuple[torch.Tensor, ...],
+) -> bool:
+    """Whether every partial really landed in its requested destination.
+
+    The producer-direct destinations are a request, not a guarantee: a producer
+    that cannot write in place returns its own tensor instead. Comparing
+    storage addresses is what distinguishes the two, and it has to hold for
+    *both* partials -- reducing a pair where only one side was produced in
+    place would silently drop the other one's contribution.
+    """
+    return all(
+        p.data_ptr() == d.data_ptr() and p.shape == d.shape
+        for p, d in zip(partials, destinations, strict=True)
+    )
+
+
 def kimi3_join_reduce_moe(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
     *,
     lane: torch.Tensor | None,
+    symm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
     routed_hidden: int,
     routed_norm: nn.Module | None,
     group: tuple[int, ...],
@@ -88,11 +107,16 @@ def kimi3_join_reduce_moe(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Join the routed/shared partials and reduce them, owning the strategy.
 
-    Three regimes, all element-wise identical:
+    Four regimes, all element-wise identical:
 
+    * Symmetric hit: the partials were produced straight into the collective's
+      symmetric heap, so the pair reduces in place with no staging copy at all.
+      This is the only regime that reaches the symmetric kernel -- the backend
+      decides on the tuple operand, so a single concatenated tensor cannot get
+      there however its memory was allocated.
     * Lane hit (decode batch=1): the partials were produced straight into the
       persistent fused lane, one one-shot reduce with an eligible norm
-      epilogue and zero copies.
+      epilogue and zero copies, but the collective stages them first.
     * Small partials: cat into one contiguous operand and take a single
       one-shot reduce; the copy is a couple of microseconds there.
     * Partials past the one-shot window (prefill-sized chunks): the cat would
@@ -100,6 +124,14 @@ def kimi3_join_reduce_moe(
       grouped NCCL launch reduces both tensors in place with the same
       single-launch latency -- so skip the join entirely.
     """
+
+    if symm_outputs is not None and _produced_into(
+        (routed_partial, shared_partial), symm_outputs
+    ):
+        routed_out, shared_out = all_reduce(symm_outputs, group=group)
+        if routed_norm is not None:
+            routed_out = routed_norm(routed_out)
+        return routed_out, shared_out
 
     if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
         fused = lane

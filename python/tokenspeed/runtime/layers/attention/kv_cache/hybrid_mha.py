@@ -42,8 +42,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 class HybridMHATokenToKVPool(MHATokenToKVPool):
     """MHA compute interface whose history and state share one buffer."""
 
-    def __init__(self, **kwargs):
-        layer_types = tuple(kwargs.get("layer_types", ()))
+    def __init__(self, *, layer_types: tuple[str, ...], **kwargs):
+        layer_types = tuple(layer_types)
         self._state_layer_ids = tuple(
             layer_id
             for layer_id, label in enumerate(layer_types)
@@ -73,16 +73,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             layer_id: (self._conv_state[layer_id], self._ssm_state[layer_id])
             for layer_id in self._state_layer_ids
         }
-
-    @property
-    def num_lcm_blocks(self) -> int:
-        return self.arena.plan.num_lcm_blocks
-
-    @property
-    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return [
-            self._state_buffers_by_layer[layer_id] for layer_id in self._state_layer_ids
-        ]
 
     @cached_property
     def state_group_by_layer(self) -> dict[int, str]:
@@ -126,6 +116,3 @@ class HybridMHATokenToKVPoolMXFP8(
         **HybridMHATokenToKVPool.layer_plane_bindings,
         **MHATokenToKVPoolMXFP8.layer_plane_bindings,
     }
-
-    def _layer_page_tokens(self, layer_id: int) -> int:
-        return self.arena.kv_page_size

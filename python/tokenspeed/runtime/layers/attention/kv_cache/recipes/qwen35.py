@@ -74,24 +74,6 @@ class QwenGDNRecipe(CacheRecipe):
 
     # ---- model geometry ----
 
-    @cached_property
-    def _text_config(self):
-        return getattr(
-            self.model_config.hf_config,
-            "text_config",
-            self.model_config.hf_config,
-        )
-
-    @cached_property
-    def _draft_text_config(self):
-        if self.draft_model_config is None:
-            return None
-        return getattr(
-            self.draft_model_config.hf_config,
-            "text_config",
-            self.draft_model_config.hf_config,
-        )
-
     @property
     @override
     def prefix_granularity(self) -> int:
@@ -222,7 +204,7 @@ class QwenGDNRecipe(CacheRecipe):
         if not self.num_draft_layers:
             return False
         if not (
-            getattr(self.server_args, "enable_replay_ssm", False)
+            self.server_args.enable_replay_ssm
             and int(self.server_args.speculative_num_draft_tokens) > 1
             and torch.device(self.attn_config.device).type == "cuda"
         ):

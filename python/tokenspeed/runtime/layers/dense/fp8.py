@@ -332,6 +332,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 A_scales=x_scale,
                 B_scales=weight_scale,
                 out_dtype=input.dtype,
+                quant="fp8",
             )
             if bias is not None:
                 output = output + bias

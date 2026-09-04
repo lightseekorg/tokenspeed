@@ -40,9 +40,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
@@ -52,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
