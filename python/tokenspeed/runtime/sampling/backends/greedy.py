@@ -142,22 +142,20 @@ class GreedySamplingBackend(SamplingBackend):
         self._sample_token_buf = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
-        # Pack predict + accept_length into one backing store so the executor
-        # can copy both results to the host with a single D2H transfer.
-        self._predict_max = config.max_bs * config.max_draft_tokens_per_req
-        self._output_pack_buf = torch.zeros(
-            (self._predict_max + config.max_bs,),
+        self._predict_buf = torch.zeros(
+            (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
             device=config.device,
         )
-        self._predict_buf = self._output_pack_buf[: self._predict_max]
-        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
         # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
         # (required by maybe_broadcast / NCCL).
         self._accept_index_buf = torch.zeros(
             (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
             device=config.device,
+        )
+        self._accept_length_buf = torch.zeros(
+            (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
     @nvtx_range("sampling:sample", color="yellow")
@@ -246,30 +244,6 @@ class GreedySamplingBackend(SamplingBackend):
             )
 
         return predict, accept_length
-
-    def get_packed_output_d2h(
-        self,
-        output_tokens: torch.Tensor,
-        output_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Copy greedy verify outputs to the host with one D2H transfer."""
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
-        ):
-            return None
-
-        num_tokens = output_tokens.numel()
-        num_lengths = output_lengths.numel()
-        # Copy through the accept-length suffix. The gap after the live token
-        # prefix is stale padding, but the saved launch is worth the tiny copy.
-        copy_size = self._predict_max + num_lengths
-        cpu_pack = torch.empty(copy_size, dtype=torch.int32, pin_memory=True)
-        cpu_pack.copy_(self._output_pack_buf[:copy_size], non_blocking=True)
-        return (
-            cpu_pack[:num_tokens].view(output_tokens.shape),
-            cpu_pack[self._predict_max : self._predict_max + num_lengths],
-        )
 
 
 register_backend("greedy", GreedySamplingBackend)
