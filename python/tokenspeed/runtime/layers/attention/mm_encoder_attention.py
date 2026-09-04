@@ -407,7 +407,6 @@ class MultimodalEncoderAttention(nn.Module):
             self._backend_fn is vision_attn_fa4
             and self.customized_position_embedding_applier is None
         )
-        self._copy_v_after_packed_qkv_rotary = False
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(
@@ -493,7 +492,6 @@ class MultimodalEncoderAttention(nn.Module):
                 self.head_size,
                 cos,
                 sin,
-                copy_v=self._copy_v_after_packed_qkv_rotary,
             )
         elif use_packed_qkv_complex_rotary:
             q, k, v = packed_qkv_complex_rotary(
@@ -503,7 +501,6 @@ class MultimodalEncoderAttention(nn.Module):
                 head,
                 self.head_size,
                 position_embeddings,
-                copy_v=self._copy_v_after_packed_qkv_rotary,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)

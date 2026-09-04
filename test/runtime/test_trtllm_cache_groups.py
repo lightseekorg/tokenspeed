@@ -1,10 +1,20 @@
+"""TRTLLM MHA leaf metadata under the unified decode path.
+
+The trtllm backend is now a pure ``PagedAttentionBackend`` leaf: the router
+owns group routing and write locations, and the leaf owns only its
+kernel-facing metadata. What is left to pin here is trtllm-specific: the
+two metadata slots (decode vs verify) and which one a refresh publishes,
+the verify slot's clamped ``spec_cache_seqlens_buf`` (padded rows replay at
+seq_len 1 and would hit an empty causal span -> NaN), pointer stability of
+the per-bs views, and the DFLASH block-decode row expansion. Group-routing
+coverage lives in test_cache_group_router.py.
+"""
+
 from __future__ import annotations
 
 import os
 import sys
 import unittest
-from types import SimpleNamespace
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,486 +24,188 @@ register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
 def _import_backend():
-    from tokenspeed.runtime.layers.attention.backends.trtllm import (
+    from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
         TRTLLMMHAAttnBackend,
-        TRTLLMMHAMetadata,
     )
 
-    return TRTLLMMHAAttnBackend, TRTLLMMHAMetadata
+    return TRTLLMMHAAttnBackend
 
 
-class TRTLLMCacheGroupsTest(unittest.TestCase):
-    """The trtllm backend consumes per-group tables through the shared
-    CacheGroupsMixin: table/write-loc selection routes by layer.group_id,
-    metadata drops the single-table single table on the grouped-cache path, and the CUDA-graph
-    buffers follow the capture/replay discipline."""
-
+class TRTLLMLeafMetadataTest(unittest.TestCase):
     def setUp(self):
         try:
-            self.Backend, self.Metadata = _import_backend()
+            self.Backend = _import_backend()
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         import torch
 
-        self.torch = torch
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    def _bare_backend(
+        self.torch = torch
+        self.ForwardMode = ForwardMode
+
+    def _leaf(
         self,
         *,
         page_size=64,
         max_num_pages=8,
         spec_num_tokens=1,
-        device="cpu",
-        groups=None,
+        is_draft=False,
+        draft_block_decode=False,
+        max_bs=4,
     ):
-        from cache_pool_test_utils import MinimalCacheView
-
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-            CacheGroupSpec,
-        )
-
-        # Bypass __init__: the paths under test read only these attributes.
-        # Capture/replay tests pass device="cuda" and declare their groups —
-        # replay write locs are triton-only (no python fallback).
+        # __new__ + attribute shell (workspace pool and kernels stay out);
+        # init_cuda_graph_state is the real allocator, so the buffers and
+        # per-bs view caches are exactly production's.
         b = self.Backend.__new__(self.Backend)
         b.kernel_page_size = page_size
-        b.group_block_granularities = dict(groups or {})
-        b.cache_pool = None
-        if groups:
-            b.cache_pool = MinimalCacheView.__new__(MinimalCacheView)
-            # The arena publishes the specs; the pool answers for them.
-            b.cache_pool.arena = SimpleNamespace()
-            b.cache_pool.arena.cache_group_specs = tuple(
-                CacheGroupSpec(
-                    group_id=group_id,
-                    retention="full_history",
-                    rows_per_page=group_page_size,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=None,
-                )
-                for group_id, group_page_size in groups.items()
-            )
         b.max_num_pages = max_num_pages
         b.max_context_len = page_size * max_num_pages
-        b.device = device
+        b.device = "cpu"
         b.spec_num_tokens = spec_num_tokens
-        b.is_draft = False
-        b.draft_block_decode = False
-        b.forward_decode_metadata = None
+        b.is_draft = is_draft
+        b.draft_block_decode = draft_block_decode
         b.forward_prefill_metadata = None
-        b.cuda_graph_prefill_metadata = {}
-        b.cuda_graph_decode_metadata = {}
-        b.spec_cache_seqlens_buf = self.torch.zeros(
-            8, dtype=self.torch.int32, device=device
-        )
+        b.forward_decode_metadata = None
+        b.init_cuda_graph_state(max_bs)
         return b
 
-    def _layer(self, group_id):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(group_id=group_id)
-
-    def test_select_page_table_routes_by_group(self):
-        b = self._bare_backend()
-        full = self.torch.tensor([[1, 2]], dtype=self.torch.int32)
-        swa = self.torch.tensor([[3, 0]], dtype=self.torch.int32)
-        meta = self.Metadata(
-            page_tables={"full_attention": full, "sliding_attention": swa}
+    def test_plain_decode_publishes_the_single_token_slot(self):
+        torch = self.torch
+        b = self._leaf()
+        seq_lens = torch.tensor([65, 3], dtype=torch.int32)
+        page_table = torch.tensor(
+            [[11, 12, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=torch.int32,
         )
-        self.assertIs(b._select_page_table(self._layer("full_attention"), meta), full)
-        self.assertIs(b._select_page_table(self._layer("sliding_attention"), meta), swa)
-
-    def test_expands_logical_group_pages_for_kernel_reads(self):
-        b = self._bare_backend(
-            groups={"full_attention": 128},
-            max_num_pages=6,
-        )
-        logical = {
-            "full_attention": self.torch.tensor([[3, 5, -1]], dtype=self.torch.int32)
-        }
-
-        kernel = b._kernel_page_tables(logical)
-
-        self.assertEqual(
-            kernel["full_attention"].tolist(),
-            [[6, 7, 10, 11, 0, 1]],
-        )
-
-    def test_binding_the_pool_learns_group_geometry_for_eager_metadata(self):
-        # One learner, one source: set_cache_pool runs on every path, so eager
-        # metadata sees the same geometry a captured graph would, and state
-        # groups land in state_group_ids rather than the span map.
-        from tokenspeed.runtime.execution import workspace
-        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-        from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-        from tokenspeed.runtime.utils.env import envs
-
-        spec = MHAConfig(
-            backend_name="trtllm",
-            num_attention_heads=4,
-            num_kv_heads=1,
-            head_dim=64,
-            attn_tp_size=1,
-        )
-        config = AttnConfig(
-            device="cpu",
-            dtype=self.torch.bfloat16,
-            kv_cache_dtype=self.torch.bfloat16,
-            prefix_granularity=64,
-            kernel_page_size=64,
-            context_len=256,
-            max_bs=1,
-            max_graph_bs=1,
-            kv_cache_quant_method="none",
-            components=(spec,),
-        )
-        with (
-            envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
-            mock.patch.object(workspace, "_pools", {}),
-        ):
-            backend = self.Backend(config, spec)
-
-        # Nothing is known before the pool arrives.
-        self.assertEqual(backend.group_block_granularities, {})
-        self.assertEqual(backend.state_group_ids, frozenset())
-
-        pool = SimpleNamespace(
-            arena=SimpleNamespace(
-                cache_group_specs=(
-                    SimpleNamespace(
-                        group_id="full_attention",
-                        family="history",
-                        block_granularity=128,
-                    ),
-                    SimpleNamespace(
-                        group_id="linear_attention_0",
-                        family="state",
-                        block_granularity=64,
-                    ),
-                )
-            )
-        )
-        backend.set_cache_pool(pool)
-
-        self.assertIs(backend.cache_pool, pool)
-        self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
-        self.assertEqual(backend.state_group_ids, frozenset({"linear_attention_0"}))
-
-    def test_build_page_table_keeps_single_table_direct_copy_path(self):
-        b = self._bare_backend(page_size=64, max_num_pages=4)
-        # Batch-ordered table: row i == batch position i.
-        page_table = self.torch.tensor([[3, 5, 7, 9]], dtype=self.torch.int32)
-        out = self.torch.empty((1, 4), dtype=self.torch.int32)
-
-        page_table = b._build_page_table(
-            1,
-            page_table,
-            out,
-        )
-
-        self.assertEqual(page_table.data_ptr(), out.data_ptr())
-        self.assertEqual(page_table.tolist(), [[3, 5, 7, 9]])
-
-    def test_eager_expands_per_group_table(self):
-        b = self._bare_backend(
-            page_size=64,
-            max_num_pages=4,
-            groups={"full_attention": 128},
-        )
-
-        b.init_forward_metadata(
-            bs=1,
-            req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
-            seq_lens=self.torch.tensor([129], dtype=self.torch.int32),
-            forward_mode=_DecodeMode(),
-            page_table=None,
-            block_tables={
-                "full_attention": self.torch.tensor([[3, 5]], dtype=self.torch.int32)
-            },
-        )
-
-        metadata = b.forward_decode_metadata
-        self.assertIsNone(metadata.page_table)
-        self.assertEqual(
-            metadata.page_tables["full_attention"].tolist(),
-            [[6, 7, 10, 11]],
-        )
-        self.assertEqual(metadata.out_cache_locs["full_attention"].tolist(), [10 * 64])
-
-    def test_select_out_cache_loc_routes_by_group(self):
-        b = self._bare_backend()
-        caller_loc = self.torch.tensor([7], dtype=self.torch.int32)
-        full_loc = self.torch.tensor([64], dtype=self.torch.int32)
-        meta_none = self.Metadata(out_cache_locs=None)
-        self.assertIs(
-            b._select_out_cache_loc(
-                self._layer("full_attention"), meta_none, caller_loc
-            ),
-            caller_loc,
-        )
-        meta = self.Metadata(out_cache_locs={"full_attention": full_loc})
-        self.assertIs(
-            b._select_out_cache_loc(self._layer("full_attention"), meta, caller_loc),
-            full_loc,
-        )
-
-    def test_public_prewrite_preserves_draft_chain_locations(self):
-        b = self._bare_backend(spec_num_tokens=4)
-        metadata_loc = self.torch.tensor([64], dtype=self.torch.int32)
-        caller_loc = self.torch.tensor([7, 8, 9, 10], dtype=self.torch.int32)
-        b.is_draft = True
-        b.forward_decode_metadata = self.Metadata(
-            out_cache_locs={"full_attention": metadata_loc}
-        )
-
-        got = b.select_out_cache_loc(
-            self._layer("full_attention"), caller_loc, _DecodeMode()
-        )
-
-        self.assertIs(got, caller_loc)
-
-    def test_decode_metadata_grouped_drops_single_table(self):
-        b = self._bare_backend()
-        bs = 2
-        seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
-        tables = {
-            "full_attention": self.torch.tensor(
-                [[11, 12], [13, -1]], dtype=self.torch.int32
-            ),
-            "sliding_attention": self.torch.tensor(
-                [[21, 22], [23, -1]], dtype=self.torch.int32
-            ),
-        }
-        locs = b._compute_decode_group_out_cache_locs(
-            tables, seq_lens, b.kernel_page_size
-        )
-        b._init_decode_metadata(
-            bs,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=seq_lens,
-            page_table=None,
-            group_page_tables=tables,
-            group_out_cache_locs=locs,
-        )
+        b.refresh_decode_metadata(2, 2, seq_lens, page_table)
         meta = b.forward_decode_metadata
-        self.assertIsNone(meta.page_table)
-        self.assertIs(meta.page_tables, tables)
-        # seq_len 65 -> page index 1, offset 0; seq_len 3 -> page 0, offset 2.
-        self.assertEqual(
-            meta.out_cache_locs["full_attention"].tolist(),
-            [12 * 64 + 0, 13 * 64 + 2],
-        )
-        self.assertEqual(
-            meta.out_cache_locs["sliding_attention"].tolist(),
-            [22 * 64 + 0, 23 * 64 + 2],
-        )
+        self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 3])
+        self.assertEqual(meta.max_seq_len_q, 1)
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 1, 2])
+        # The metadata views the persistent buffers the graph records.
+        self.assertEqual(meta.page_table.data_ptr(), b.page_table_buf.data_ptr())
+        self.assertEqual(meta.cache_seqlens_int32.data_ptr(), b.seq_lens_buf.data_ptr())
+        # Without speculation the verify slot stays untouched.
+        self.assertIsNone(b.forward_prefill_metadata)
 
-    def test_extend_metadata_grouped_drops_single_table(self):
-        b = self._bare_backend()
-        bs = 1
-        seq_lens = self.torch.tensor([66], dtype=self.torch.int32)
-        tables = {"full_attention": self.torch.tensor([[5, 6]], dtype=self.torch.int32)}
-        locs = b._compute_extend_group_out_cache_locs(
-            tables,
-            self.torch.tensor([64], dtype=self.torch.int32),
-            self.torch.tensor([2], dtype=self.torch.int32),
-            b.kernel_page_size,
+    def test_verify_slot_clamps_padded_rows_to_spec_floor(self):
+        torch = self.torch
+        b = self._leaf(spec_num_tokens=4)
+        seq_lens = torch.tensor([65, 1], dtype=torch.int32)  # row 1 is padding
+        page_table = torch.zeros((2, 8), dtype=torch.int32)
+        b.refresh_decode_metadata(2, 1, seq_lens, page_table, for_graph_replay=True)
+        # The decode slot keeps the raw lengths...
+        self.assertEqual(
+            b.forward_decode_metadata.cache_seqlens_int32.tolist(), [65, 1]
         )
-        b._init_extend_metadata(
-            bs,
-            req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
-            seq_lens=seq_lens,
-            page_table=None,
-            extend_seq_lens_cpu=self.torch.tensor([2], dtype=self.torch.int32),
-            group_page_tables=tables,
-            group_out_cache_locs=locs,
-        )
+        # ...while the verify slot reads the clamped buffer: q_len=4 against
+        # seq_len 1 would be an empty causal span (NaN), so >= spec.
         meta = b.forward_prefill_metadata
-        self.assertIsNone(meta.page_table)
-        self.assertIs(meta.page_tables, tables)
-        # New tokens at positions 64, 65 -> page 6, offsets 0 and 1.
         self.assertEqual(
-            meta.out_cache_locs["full_attention"].tolist(), [6 * 64, 6 * 64 + 1]
+            meta.cache_seqlens_int32.data_ptr(), b.spec_cache_seqlens_buf.data_ptr()
         )
-
-    def test_graph_capture_and_replay_discipline(self):
-        if not self.torch.cuda.is_available():
-            self.skipTest("replay write locs are triton-only (needs CUDA)")
-        gids = ("full_attention", "sliding_attention")
-        b = self._bare_backend(device="cuda", groups={g: 64 for g in gids})
-        max_bs, bs = 4, 2
-        b._init_group_graph_buffers(max_bs)
-        page_tables, out_cache_locs = b._capture_group_views(bs, gids)
-        self.assertEqual(set(page_tables), set(gids))
-        self.assertEqual(page_tables["full_attention"].shape, (bs, b.max_num_pages))
-
-        # Replay without tables must fail loudly (stale-table guard).
-        with self.assertRaisesRegex(RuntimeError, "stale page tables"):
-            b._replay_stale_guard(bs, None)
-        with self.assertRaisesRegex(RuntimeError, "missing captured groups"):
-            b._replay_stale_guard(bs, {"full_attention": self.torch.zeros((bs, 1))})
-
-        # Replay fill copies rows, pads column tails with the trtllm dummy
-        # page 0 (table_tail_pad), recomputes locs (fused triton).
-        seq_lens = self.torch.tensor([65, 1, 1, 1], dtype=self.torch.int32).cuda()
-        src = {
-            "full_attention": self.torch.tensor(
-                [[11, 12], [0, -1]], dtype=self.torch.int32
-            ),
-            "sliding_attention": self.torch.tensor(
-                [[21, 22], [0, -1]], dtype=self.torch.int32
-            ),
-        }
-        b._fill_group_graph_buffers(bs, src, seq_lens)
-        buf = b.cuda_graph_page_tables["full_attention"]
-        self.assertEqual(buf[0, :2].tolist(), [11, 12])
-        self.assertEqual(self.Backend.table_tail_pad, 0)
-        self.assertEqual(buf[0, 2:].tolist(), [0] * (b.max_num_pages - 2))
-        self.assertEqual(
-            b.cuda_graph_out_cache_locs["full_attention"][:bs].tolist(),
-            [12 * 64 + 0, 0 * 64 + 0],
-        )
-
-    def test_graph_replay_expands_scheduler_pages_before_kernel_reads(self):
-        if not self.torch.cuda.is_available():
-            self.skipTest("replay write locs are triton-only (needs CUDA)")
-        gid = "full_attention"
-        b = self._bare_backend(device="cuda", groups={gid: 128})
-        b._init_group_graph_buffers(max_bs=2)
-        seq_lens = self.torch.tensor([129, 1], dtype=self.torch.int32).cuda()
-        src = {
-            gid: self.torch.tensor(
-                [[3, 5], [0, -1]], dtype=self.torch.int32, device="cuda"
-            )
-        }
-
-        b._fill_group_graph_buffers(2, src, seq_lens)
-
-        table = b.cuda_graph_page_tables[gid]
-        self.assertEqual(table[0, :4].tolist(), [6, 7, 10, 11])
-        self.assertEqual(
-            b.cuda_graph_out_cache_locs[gid][:2].tolist(),
-            [10 * 64, 0],
-        )
-
-    def test_verify_metadata_expanded_write_locs(self):
-        # Target verify (spec N, not draft): [bs]-row per-group tables in the
-        # prefill slot + [bs*N] token-major write locs (single-table verify layout).
-        b = self._bare_backend(spec_num_tokens=4)
-        seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
-        tables = {
-            "full_attention": self.torch.tensor(
-                [[11, 12], [13, -1]], dtype=self.torch.int32
-            ),
-            "sliding_attention": self.torch.tensor(
-                [[21, 22], [23, -1]], dtype=self.torch.int32
-            ),
-        }
-        b.init_forward_metadata(
-            bs=2,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=seq_lens,
-            forward_mode=_DecodeMode(),
-            page_table=None,
-            block_tables=tables,
-        )
-        meta = b.forward_prefill_metadata
-        self.assertIsNone(meta.page_table)
-        self.assertIs(meta.page_tables, tables)
-        # req0 positions 61..64 (pages 11,11,11,12); req1 clamps 0,0,1,2 (page 13).
-        self.assertEqual(
-            meta.out_cache_locs["full_attention"].tolist(),
-            [11 * 64 + 61, 11 * 64 + 62, 11 * 64 + 63, 12 * 64 + 0]
-            + [13 * 64 + 0, 13 * 64 + 0, 13 * 64 + 1, 13 * 64 + 2],
-        )
-        self.assertEqual(
-            meta.out_cache_locs["sliding_attention"].tolist(),
-            [21 * 64 + 61, 21 * 64 + 62, 21 * 64 + 63, 22 * 64 + 0]
-            + [23 * 64 + 0, 23 * 64 + 0, 23 * 64 + 1, 23 * 64 + 2],
-        )
-        # KV seqlens clamped >= N so padded rows avoid empty causal spans.
         self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 4])
+        self.assertEqual(meta.max_seq_len_q, 4)
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 4, 8])
+        self.assertEqual(meta.page_table.data_ptr(), b.page_table_buf.data_ptr())
 
-    def test_verify_capture_replay_expanded_loc_views(self):
-        if not self.torch.cuda.is_available():
-            self.skipTest("replay write locs are triton-only (needs CUDA)")
-        b = self._bare_backend(
-            spec_num_tokens=4,
-            device="cuda",
-            groups={"full_attention": 64},
+    def test_per_bs_views_are_pointer_stable_across_refreshes(self):
+        torch = self.torch
+        b = self._leaf(spec_num_tokens=4)
+        seq_lens = torch.tensor([65, 3], dtype=torch.int32)
+        page_table = torch.zeros((2, 8), dtype=torch.int32)
+        b.refresh_decode_metadata(2, 2, seq_lens, page_table)
+        decode_first = b.forward_decode_metadata
+        verify_first = b.forward_prefill_metadata
+        b.refresh_decode_metadata(
+            2,
+            1,
+            torch.tensor([66, 1], dtype=torch.int32),
+            page_table,
+            for_graph_replay=True,
         )
-        max_bs, bs = 4, 2
-        b._init_group_graph_buffers(max_bs)
-        b.cuda_graph_cache_seqlens = self.torch.ones(
-            max_bs, dtype=self.torch.int32, device="cuda"
-        )
+        # Same objects, same tensors — a captured graph replays through them.
+        self.assertIs(b.forward_decode_metadata, decode_first)
+        self.assertIs(b.forward_prefill_metadata, verify_first)
+        self.assertEqual(decode_first.cache_seqlens_int32.tolist(), [66, 1])
+        self.assertEqual(verify_first.cache_seqlens_int32.tolist(), [66, 4])
+        # The capture seeding is the same idle refresh over the same views.
         b.init_forward_metadata_capture_cuda_graph(
-            bs,
-            req_pool_indices=self.torch.tensor(
-                [0, 1], dtype=self.torch.int32, device="cuda"
-            ),
-            seq_lens=b.cuda_graph_cache_seqlens[:bs],
-            forward_mode=_DecodeMode(),
-            cache_group_ids=("full_attention",),
+            2, torch.ones(2, dtype=torch.int32), page_table
         )
-        meta = b.cuda_graph_prefill_metadata[bs]
-        self.assertIsNone(meta.page_table)
-        self.assertEqual(meta.out_cache_locs["full_attention"].shape[0], bs * 4)
-        # Replay refreshes tables and recomputes [bs*N] locs from live lens.
-        b.cuda_graph_cache_seqlens[:bs] = self.torch.tensor(
-            [65, 1], dtype=self.torch.int32
-        )
-        src = {
-            "full_attention": self.torch.tensor(
-                [[11, 12], [0, -1]], dtype=self.torch.int32, device="cuda"
-            )
-        }
-        b.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=b.cuda_graph_cache_seqlens,
-            forward_mode=_DecodeMode(),
-            block_tables=src,
-        )
-        locs = b.cuda_graph_out_cache_locs["full_attention"][: bs * 4]
-        self.assertEqual(
-            locs.tolist(),
-            [11 * 64 + 61, 11 * 64 + 62, 11 * 64 + 63, 12 * 64 + 0] + [0, 0, 0, 0],
-        )
+        self.assertIs(b.forward_decode_metadata, decode_first)
 
-    def test_prewrite_metadata_routes_verify_to_prefill_slot(self):
-        b = self._bare_backend(spec_num_tokens=4)
-        prefill, decode = self.Metadata(), self.Metadata()
-        b.forward_prefill_metadata, b.forward_decode_metadata = prefill, decode
-        # Target verify is DECODE mode; its metadata lives in the prefill slot.
-        self.assertIs(b._prewrite_metadata(_DecodeMode()), prefill)
-        b.is_draft = True
-        self.assertIs(b._prewrite_metadata(_DecodeMode()), decode)
+    def test_block_decode_expands_rows_and_broadcasts_block_seq_lens(self):
+        torch = self.torch
+        spec = 4
+        b = self._leaf(
+            spec_num_tokens=spec, is_draft=True, draft_block_decode=True, max_bs=2
+        )
+        self.assertTrue(b.block_decode_active)
+        # init_cuda_graph_state sized the buffers for max_bs * spec rows.
+        self.assertEqual(b.page_table_buf.shape[0], 2 * spec)
+        page_table = torch.tensor(
+            [[11, 12, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=torch.int32,
+        )
+        block_ends = torch.tensor([66, 2], dtype=torch.int32)
+        b.refresh_decode_metadata(2, 2, block_ends, page_table)
+        meta = b.forward_decode_metadata
+        # Each request's table replicates to its spec rows...
+        self.assertEqual(meta.page_table.shape[0], 2 * spec)
+        self.assertTrue((meta.page_table[:spec] == page_table[0]).all())
+        self.assertTrue((meta.page_table[spec:] == page_table[1]).all())
+        # ...sharing the block-end seq_len (clamped to >= spec), one query
+        # row each (the non-causal block trick).
+        self.assertEqual(meta.cache_seqlens_int32.tolist(), [66] * spec + [4] * spec)
+        self.assertEqual(meta.max_seq_len_q, 1)
+        self.assertEqual(meta.cu_seqlens_q.tolist(), list(range(2 * spec + 1)))
+        # The drafter's in-graph rewrite lands in the same buffer.
+        b.fill_block_decode_seq_lens(2, torch.tensor([70, 8], dtype=torch.int32))
+        self.assertEqual(meta.cache_seqlens_int32.tolist(), [70] * spec + [8] * spec)
 
-    def test_with_dflash_asserts(self):
-        b = self._bare_backend(spec_num_tokens=4)
-        b.is_draft = True
-        b.draft_block_decode = True
-        tables = {"full_attention": self.torch.zeros((1, 1), dtype=self.torch.int32)}
-        with self.assertRaisesRegex(AssertionError, "DFLASH"):
+    def test_extend_metadata_reads_the_router_expanded_table(self):
+        torch = self.torch
+        b = self._leaf()
+        seq_lens = torch.tensor([66], dtype=torch.int32)
+        page_table = torch.tensor([[5, 6, 0, 0, 0, 0, 0, 0]], dtype=torch.int32)
+        b.init_forward_metadata(
+            1,
+            1,
+            seq_lens,
+            page_table,
+            self.ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor([2], dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([2], dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([64], dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.tensor([64], dtype=torch.int32),
+            extend_with_prefix=True,
+        )
+        meta = b.forward_prefill_metadata
+        self.assertEqual(meta.page_table.tolist(), page_table.tolist())
+        self.assertEqual(meta.cache_seqlens_int32.tolist(), [66])
+        self.assertEqual(meta.cu_seqlens_k.tolist(), [0, 66])
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 2])
+        self.assertEqual(meta.max_seq_len_q, 2)
+
+    def test_decode_mode_init_is_a_contract_violation(self):
+        torch = self.torch
+        b = self._leaf()
+        no_extends = torch.zeros(0, dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "refresh_decode_metadata"):
             b.init_forward_metadata(
-                bs=1,
-                req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
-                seq_lens=self.torch.tensor([1], dtype=self.torch.int32),
-                forward_mode=_DecodeMode(),
-                page_table=None,
-                block_tables=tables,
+                1,
+                0,
+                torch.ones(1, dtype=torch.int32),
+                torch.zeros((1, 8), dtype=torch.int32),
+                self.ForwardMode.DECODE,
+                extend_seq_lens=no_extends,
+                extend_seq_lens_cpu=no_extends,
+                extend_prefix_lens=no_extends,
+                extend_prefix_lens_cpu=no_extends,
+                extend_with_prefix=False,
             )
-
-
-class _DecodeMode:
-    """Minimal ForwardMode stand-in for the decode dispatch path."""
-
-    def is_extend_or_mixed(self):
-        return False
-
-    def is_mixed(self):
-        return False
 
 
 if __name__ == "__main__":

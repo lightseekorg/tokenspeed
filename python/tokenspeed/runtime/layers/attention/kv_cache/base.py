@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
@@ -28,6 +27,10 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+    cache_field_plane,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -36,25 +39,18 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_LAYER_FIELD = re.compile(r"^layer\.(\d+)\.(.+)$")
-
 
 def _layer_plane(
     field_id: str, first_layer: int, num_layers: int
 ) -> tuple[int, str] | None:
     """Split a planned field id into this view's local layer id and plane.
 
-    Returns None for fields outside the view's layer window, and for fields
-    that are not per-layer at all.
+    Returns None for fields outside the view's layer window.
     """
-    match = _LAYER_FIELD.match(field_id)
-    if match is None:
-        return None
-    global_layer = int(match.group(1))
-    local_layer = global_layer - first_layer
+    local_layer = cache_field_layer_id(field_id) - first_layer
     if not 0 <= local_layer < num_layers:
         return None
-    return local_layer, match.group(2)
+    return local_layer, cache_field_plane(field_id)
 
 
 def derive_state_groups_by_layer(
@@ -110,6 +106,39 @@ def derive_state_groups_by_layer(
     return mapping
 
 
+def derive_paged_group_ids(
+    arena: CacheArena, *, first_layer: int, num_layers: int
+) -> tuple[str, ...]:
+    """The history-family cache groups this view's layers deposit KV in.
+
+    Read back from the planned fields like the state mapping above: a
+    group counts when some per-layer field inside the view's layer window
+    is declared in it. This is the group set a ``CacheGroupRouter`` builds
+    one paged leaf for — a draft view over a shared arena sees only the
+    groups its own layers use, never the target's whole set.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+
+    Returns:
+        Sorted group ids, possibly empty (a view with no paged layers).
+    """
+    history = {
+        str(spec.group_id)
+        for spec in arena.cache_group_specs
+        if spec.family == "history"
+    }
+    found: set[str] = set()
+    for field in arena.plan.fields:
+        if _layer_plane(field.field_id, first_layer, num_layers) is None:
+            continue
+        if field.group_id in history:
+            found.add(str(field.group_id))
+    return tuple(sorted(found))
+
+
 class CachePool(ABC):
     """One model's typed layer window onto a shared cache arena.
 
@@ -154,6 +183,16 @@ class CachePool(ABC):
             dtype,
             self._field_layer_offset,
             rank,
+        )
+
+    @property
+    def paged_group_ids(self) -> tuple[str, ...]:
+        """History-family groups this view's layers write KV into (sorted);
+        the router builds one paged leaf per id."""
+        return derive_paged_group_ids(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
         )
 
     def _field_layer_id(self, layer_id: int) -> int:

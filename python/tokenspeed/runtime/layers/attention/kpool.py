@@ -356,11 +356,15 @@ class KPoolRuntime:
         metadata = backend.chunked_prefill_metadata
         index_table = backend.kpool_prefill_page_table(ctx.num_extends)
         index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
+        # The slots come from the backend's per-forward publication, not the
+        # prefill metadata: paged leaves' metadata carries no pool indices.
+        if self.req_pool_indices is None:
+            raise RuntimeError("DSA KPool prefill requires request-pool indices")
         self.prefill_plan = build_kpool_prefill_plan(
             prefix_lens_cpu=metadata.extend_prefix_lens_cpu[: ctx.num_extends],
             extend_lens_cpu=metadata.extend_seq_lens_cpu[: ctx.num_extends],
             index_block_table=index_table,
-            request_slots=metadata.req_pool_indices[: ctx.num_extends],
+            request_slots=self.req_pool_indices[: ctx.num_extends],
             kpool=self.pool_size,
             index_rows_per_page=index_cache.shape[1],
             token_capacity=token_capacity,

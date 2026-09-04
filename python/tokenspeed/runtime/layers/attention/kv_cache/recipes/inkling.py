@@ -37,7 +37,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -48,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )

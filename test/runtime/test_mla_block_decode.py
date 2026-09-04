@@ -1,12 +1,14 @@
-"""Non-causal block decode for the MLA draft attention backend.
+"""Non-causal block decode for the MLA draft attention leaf.
 
 DSpark drafts a whole block in one forward, and every block query must see the
 whole block -- including the positions after it. TokenSpeed gets that without a
 mask kernel: each request expands into ``spec_num_tokens`` single-query decode
 rows that share the block-end ``seq_len``, so the causal decode kernel's own
-mask admits the entire block. These tests pin the expansion and prove the
-resulting attention really is non-causal, using a case where the answer is
-dominated by a *future* token so a causal implementation cannot pass by luck.
+mask admits the entire block. The expansion lives inside the leaf's unified
+``refresh_decode_metadata`` (kernel-page tables arrive pre-expanded from the
+router). These tests pin the expansion and prove the resulting attention
+really is non-causal, using a case where the answer is dominated by a
+*future* token so a causal implementation cannot pass by luck.
 """
 
 from __future__ import annotations
@@ -24,11 +26,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.mla import (
-    MLAAttnBackend,
-    MLADecodeMetadata,
-)
+from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 
 
 def _backend(
@@ -45,86 +43,88 @@ def _backend(
     backend.is_draft = True
     backend.max_num_pages = max_num_pages
     backend.max_context_len = max_context_len
+    backend.kernel_page_size = 64
     backend.device = torch.device("cpu")
-    backend.decode_cuda_graph_metadata = {}
-    backend._cache_groups_bound = False
-    backend._cache_contract_bound = False
+    backend.forward_decode_metadata = None
+    backend._decode_views_by_bs = {}
     return backend
 
 
 # --------------------------------------------------------------------------
-# Row expansion
+# Row expansion (the leaf's unified refresh)
 # --------------------------------------------------------------------------
 
 
-def test_block_metadata_keeps_every_block_row() -> None:
-    """The drafter calls in with num_extends == bs by its own convention.
-
-    Carrying that into the block metadata slices away exactly the rows the
-    kernel needs, which it sees as an empty page table and a null pointer.
-    """
+def test_block_refresh_keeps_every_block_row() -> None:
+    """The block metadata carries one row per block position; nothing is
+    sliced away regardless of the round's num_extends discriminator."""
     backend = _backend(spec_num_tokens=8)
-    backend.kernel_page_size = 64
-    backend.max_context_len = 512
-    req_to_page = torch.arange(2 * 4, dtype=torch.int32).view(2, 4) + 1
+    backend.init_cuda_graph_state(max_bs=2)
+    page_table = torch.arange(2 * 4, dtype=torch.int32).view(2, 4) + 1
 
-    backend._init_decode_metadata(
-        bs=2,
-        num_extends=2,
-        req_pool_indices=torch.tensor([0, 1]),
-        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
-        page_table=req_to_page,
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([100, 200], dtype=torch.int32),
+        page_table,
     )
 
     metadata = backend.forward_decode_metadata
-    assert metadata.num_extends == 0
     assert metadata.page_table.shape[0] == 2 * 8
     assert metadata.seq_lens.shape[0] == 2 * 8
 
 
 def test_block_decode_is_off_without_the_flag() -> None:
-    assert not _backend(draft_block_decode=False)._block_decode_active
+    assert not _backend(draft_block_decode=False).block_decode_active
 
 
 def test_block_decode_is_off_for_a_single_token_window() -> None:
     """spec_num_tokens == 1 is ordinary decode, not a block."""
-    assert not _backend(spec_num_tokens=1)._block_decode_active
+    assert not _backend(spec_num_tokens=1).block_decode_active
 
 
 def test_expansion_gives_every_block_row_the_same_length() -> None:
     """The uniform length is what makes the block non-causal."""
     backend = _backend(spec_num_tokens=4)
+    backend.init_cuda_graph_state(max_bs=2)
     page_table = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
     seq_lens = torch.tensor([37, 51], dtype=torch.int32)
 
-    expanded_pt, expanded_sl = backend._expand_block_decode_metadata(
-        page_table, seq_lens, bs=2
-    )
+    backend.refresh_decode_metadata(2, 2, seq_lens, page_table)
 
-    assert expanded_pt.shape == (8, 4)
-    assert expanded_sl.tolist() == [37, 37, 37, 37, 51, 51, 51, 51]
+    metadata = backend.forward_decode_metadata
+    assert metadata.page_table.shape == (8, 4)
+    assert metadata.seq_lens.tolist() == [37, 37, 37, 37, 51, 51, 51, 51]
     # Each request's rows are contiguous and carry its own page table.
-    assert expanded_pt[:4].eq(page_table[0]).all()
-    assert expanded_pt[4:].eq(page_table[1]).all()
+    assert metadata.page_table[:4].eq(page_table[0]).all()
+    assert metadata.page_table[4:].eq(page_table[1]).all()
 
 
 def test_expansion_clamps_to_the_context_limit() -> None:
     """Without the clamp a near-limit request reads past the page table."""
     backend = _backend(spec_num_tokens=4, max_context_len=64)
-    page_table = torch.zeros((1, 4), dtype=torch.int32)
-    seq_lens = torch.tensor([9999], dtype=torch.int32)
+    backend.init_cuda_graph_state(max_bs=1)
 
-    _, expanded_sl = backend._expand_block_decode_metadata(page_table, seq_lens, bs=1)
-    assert expanded_sl.tolist() == [64, 64, 64, 64]
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([9999], dtype=torch.int32),
+        torch.zeros((1, 4), dtype=torch.int32),
+    )
+    assert backend.forward_decode_metadata.seq_lens.tolist() == [64, 64, 64, 64]
 
 
 def test_expansion_floors_at_the_block_width() -> None:
     backend = _backend(spec_num_tokens=8)
-    page_table = torch.zeros((1, 4), dtype=torch.int32)
-    seq_lens = torch.tensor([3], dtype=torch.int32)
+    backend.init_cuda_graph_state(max_bs=1)
 
-    _, expanded_sl = backend._expand_block_decode_metadata(page_table, seq_lens, bs=1)
-    assert expanded_sl.tolist() == [8] * 8
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([3], dtype=torch.int32),
+        torch.zeros((1, 4), dtype=torch.int32),
+    )
+    assert backend.forward_decode_metadata.seq_lens.tolist() == [8] * 8
 
 
 # --------------------------------------------------------------------------
@@ -132,22 +132,28 @@ def test_expansion_floors_at_the_block_width() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_graph_buffers_are_sized_for_the_expanded_rows() -> None:
+def test_graph_buffers_are_sized_by_the_block_decode_expansion() -> None:
     backend = _backend(spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
 
-    assert backend.cuda_graph_page_table.shape == (32, 4)
-    assert backend.cuda_graph_seq_lens.shape == (32,)
+    assert backend.block_decode_expansion == 8
+    assert backend.page_table_buf.shape == (4 * backend.block_decode_expansion, 4)
+    assert backend.seq_lens_buf.shape == (4 * backend.block_decode_expansion,)
+    assert _backend(draft_block_decode=False).block_decode_expansion == 1
 
 
 def test_graph_capture_records_expanded_metadata() -> None:
     backend = _backend(spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
-    backend._capture_block_decode_graph(bs=2, seq_lens=torch.tensor([10, 20]))
+    # Runner contract: capture is the idle refresh over the persistent
+    # buffers; capture seq_lens are seeded to spec_num_tokens.
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
+    )
 
-    metadata = backend.decode_cuda_graph_metadata[2]
+    metadata = backend.forward_decode_metadata
     assert metadata.page_table.shape == (16, 4)
     assert metadata.seq_lens.shape == (16,)
     # Seeded with a safe baseline; the real lengths arrive in-graph.
@@ -156,82 +162,74 @@ def test_graph_capture_records_expanded_metadata() -> None:
 
 def test_fill_block_decode_seq_lens_broadcasts_per_request() -> None:
     backend = _backend(spec_num_tokens=4)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
 
     backend.fill_block_decode_seq_lens(2, torch.tensor([31, 47], dtype=torch.int32))
-    assert backend.cuda_graph_seq_lens[:8].tolist() == [31, 31, 31, 31, 47, 47, 47, 47]
+    assert backend.seq_lens_buf[:8].tolist() == [31, 31, 31, 31, 47, 47, 47, 47]
 
 
 def test_fill_block_decode_seq_lens_clamps_to_context() -> None:
     backend = _backend(spec_num_tokens=4, max_context_len=64)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=1)
 
     backend.fill_block_decode_seq_lens(1, torch.tensor([9999], dtype=torch.int32))
-    assert backend.cuda_graph_seq_lens[:4].tolist() == [64] * 4
+    assert backend.seq_lens_buf[:4].tolist() == [64] * 4
 
 
 def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=3)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
-    backend._capture_block_decode_graph(bs=2, seq_lens=torch.tensor([10, 20]))
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        page_table=torch.zeros((2, 3), dtype=torch.int32),
+    )
 
     page_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([1, 2]),
-        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
-        page_table=page_table,
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([10, 20], dtype=torch.int32),
+        page_table,
+        for_graph_replay=True,
     )
 
-    table = backend.cuda_graph_page_table[:8]
+    table = backend.page_table_buf[:8]
     assert table[:4].eq(torch.tensor([1, 2, 3], dtype=torch.int32)).all()
     assert table[4:].eq(torch.tensor([4, 5, 6], dtype=torch.int32)).all()
-    # Lengths are the drafter's job, still at the capture baseline.
-    assert backend.cuda_graph_seq_lens[:8].tolist() == [4] * 8
+    # Lengths are the drafter's job (in-graph), still at the capture baseline.
+    assert backend.seq_lens_buf[:8].tolist() == [4] * 8
 
 
-def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
+def test_refresh_copies_published_kernel_pages_as_is() -> None:
+    """The router hands the leaf kernel pages; the leaf must copy them
+    verbatim (identity), never re-expand -- eager and replay alike."""
     backend = _backend(spec_num_tokens=4, max_num_pages=4)
-    backend._cache_contract_bound = True
-    backend._cache_groups_bound = True
-    backend.kernel_page_size = 64
     backend.init_cuda_graph_state(max_bs=1)
-    backend._capture_block_decode_graph(bs=1, seq_lens=torch.tensor([10]))
-
-    # ModelExecutor already expanded logical page 3 into kernel pages 6 and 7.
-    published = torch.tensor([[6, 7, 0, 1, 99]], dtype=torch.int32)
-    backend.init_forward_metadata_replay_cuda_graph(
+    backend.init_forward_metadata_capture_cuda_graph(
         bs=1,
-        req_pool_indices=torch.tensor([9]),
-        seq_lens=torch.tensor([10], dtype=torch.int32),
-        page_table=published,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        page_table=torch.zeros((1, 4), dtype=torch.int32),
     )
 
-    rows = backend.cuda_graph_page_table[:4]
-    assert rows.eq(published[0, :4]).all()
-
-
-def test_contract_draft_eager_does_not_expand_published_pages_twice() -> None:
-    backend = _backend(spec_num_tokens=4, max_num_pages=4)
-    backend._cache_contract_bound = True
-    backend._cache_groups_bound = True
-    backend.kernel_page_size = 64
-
-    published = torch.tensor([[6, 7, 0, 1, 99]], dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=1,
-        num_extends=0,
-        req_pool_indices=torch.tensor([9]),
-        seq_lens=torch.tensor([10], dtype=torch.int32),
-        page_table=published,
-        forward_mode=ForwardMode.DECODE,
+    # The router already expanded logical page 3 into kernel pages 6 and 7.
+    published = torch.tensor([[6, 7, 0, 1]], dtype=torch.int32)
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([10], dtype=torch.int32),
+        published,
+        for_graph_replay=True,
     )
+    assert backend.page_table_buf[:4].eq(published[0]).all()
 
-    rows = backend.forward_decode_metadata.page_table
-    assert rows.eq(published[0, :4]).all()
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([10], dtype=torch.int32),
+        published,
+    )
+    assert backend.forward_decode_metadata.page_table[0].eq(published[0]).all()
 
 
 # --------------------------------------------------------------------------
@@ -254,6 +252,19 @@ def _seqlen_mask(seq_lens: torch.Tensor, total_keys: int) -> torch.Tensor:
     return key_positions < seq_lens.unsqueeze(1)
 
 
+def _expanded_seq_lens(block: int, total: int) -> torch.Tensor:
+    """The block rows' uniform lengths as the refresh publishes them."""
+    backend = _backend(spec_num_tokens=block, max_context_len=1024)
+    backend.init_cuda_graph_state(max_bs=1)
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([total], dtype=torch.int32),
+        torch.zeros((1, 4), dtype=torch.int32),
+    )
+    return backend.forward_decode_metadata.seq_lens.clone()
+
+
 def test_uniform_seqlens_reproduce_non_causal_block_attention() -> None:
     """The expansion's mask equals a full non-causal block mask.
 
@@ -262,14 +273,8 @@ def test_uniform_seqlens_reproduce_non_causal_block_attention() -> None:
     """
     prefix, block = 5, 7
     total = prefix + block
-    backend = _backend(spec_num_tokens=block, max_context_len=1024)
 
-    _, expanded = backend._expand_block_decode_metadata(
-        torch.zeros((1, 4), dtype=torch.int32),
-        torch.tensor([total], dtype=torch.int32),
-        bs=1,
-    )
-    produced = _seqlen_mask(expanded, total)
+    produced = _seqlen_mask(_expanded_seq_lens(block, total), total)
 
     non_causal = torch.ones(block, total, dtype=torch.bool)
     assert torch.equal(produced, non_causal)
@@ -281,10 +286,7 @@ def test_uniform_seqlens_differ_from_the_causal_chain() -> None:
     total = prefix + block
     seq_lens = torch.tensor([total], dtype=torch.int32)
 
-    block_backend = _backend(spec_num_tokens=block, max_context_len=1024)
-    _, uniform = block_backend._expand_block_decode_metadata(
-        torch.zeros((1, 4), dtype=torch.int32), seq_lens, bs=1
-    )
+    uniform = _expanded_seq_lens(block, total)
     # The causal chain the target's verify path uses: offsets 1-N .. 0.
     causal = seq_lens.repeat_interleave(block) + torch.arange(1 - block, 1)
 
@@ -313,10 +315,7 @@ def test_future_token_dominates_only_under_the_non_causal_mask() -> None:
     queries[0, future_key_idx] = 50.0
 
     seq_lens = torch.tensor([total], dtype=torch.int32)
-    backend = _backend(spec_num_tokens=block, max_context_len=1024)
-    _, uniform = backend._expand_block_decode_metadata(
-        torch.zeros((1, 4), dtype=torch.int32), seq_lens, bs=1
-    )
+    uniform = _expanded_seq_lens(block, total)
     causal = seq_lens.repeat_interleave(block) + torch.arange(1 - block, 1)
 
     non_causal_out = _reference_attention(
@@ -340,15 +339,14 @@ def test_target_verify_keeps_the_unexpanded_causal_path() -> None:
     """draft_block_decode is draft-only; the target's verify must not expand."""
     backend = _backend(draft_block_decode=False, spec_num_tokens=8)
     backend.is_draft = False
-    assert not backend._block_decode_active
+    assert not backend.block_decode_active
 
 
 def test_graph_buffers_are_unexpanded_without_block_decode() -> None:
     backend = _backend(draft_block_decode=False, spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
-    assert backend.cuda_graph_page_table.shape == (4, 4)
-    assert backend.cuda_graph_seq_lens.shape == (4,)
+    assert backend.page_table_buf.shape == (4, 4)
+    assert backend.seq_lens_buf.shape == (4,)
 
 
 def test_attn_config_carries_the_block_decode_flag_defaulting_off() -> None:

@@ -134,7 +134,10 @@ def _make_mxfp4_module(
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     num_local_experts = 2
     num_experts = 16
@@ -163,6 +166,15 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
         )
         * 0.1
     )
+    if num_tokens == 2:
+        hidden_storage = torch.empty(
+            (num_tokens, 2 * latent_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        hidden_storage[:, ::2].copy_(hidden_states)
+        hidden_states = hidden_storage[:, ::2]
+        assert not hidden_states.is_contiguous()
     expert_ids = torch.arange(num_experts, dtype=torch.int32, device="cuda")
     topk_ids = torch.stack(
         [torch.roll(expert_ids, token) for token in range(num_tokens)]
@@ -204,6 +216,18 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     )
     assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
     tokenspeed_kernel.moe_process_weights(plan, module)
+    decode_calls = []
+    decode = gluon_mxfp4.gluon_a16w4_situ_warp_decode_ep_gfx950
+
+    def record_decode(*args, **kwargs):
+        decode_calls.append(int(args[0].shape[0]))
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gluon_mxfp4,
+        "gluon_a16w4_situ_warp_decode_ep_gfx950",
+        record_decode,
+    )
     output_storage = torch.empty(
         (num_tokens, latent_size + 7168),
         dtype=hidden_states.dtype,
@@ -243,6 +267,136 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     assert actual.dtype == torch.bfloat16
     assert actual.data_ptr() == output_storage.data_ptr()
     assert actual.stride() == (latent_size + 7168, 1)
+    assert decode_calls == ([] if num_tokens == 2 else [num_tokens])
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+
+def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+
+    generator = torch.Generator(device="cuda").manual_seed(20260903)
+    num_tokens, top_k = 1, 1
+    num_local_experts, num_experts = 1, 8
+    latent_size, intermediate_size = 2880, 3072
+    module, raw = _make_mxfp4_module(
+        num_experts=num_local_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    module.num_experts = num_experts
+    module.num_local_experts = num_local_experts
+    module.ep_size = 8
+    module.ep_rank = 0
+    hidden_states = 0.1 * torch.randn(
+        (num_tokens, latent_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32, device="cuda")
+    router_logits = torch.empty(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=8,
+        ispp=intermediate_size,
+        internal_activation_dtype="input",
+        solution="gluon",
+    )
+    tokenspeed_kernel.moe_process_weights(plan, module)
+
+    def reject_a16(*_args, **_kwargs):
+        raise AssertionError("unsupported hidden width must use the A8 fallback")
+
+    monkeypatch.setattr(
+        gluon_mxfp4,
+        "gluon_a16w4_situ_warp_decode_ep_gfx950",
+        reject_a16,
+    )
+    actual = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    expected = mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        activation_dtype=torch.bfloat16,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+
+def test_gdot_decode_accepts_padded_w2_scale_gfx950() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+        gluon_a16w4_situ_warp_decode_ep_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260903)
+    num_experts, latent_size, intermediate_size, top_k = 1, 256, 128, 1
+    module, raw = _make_mxfp4_module(
+        num_experts=num_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    hidden_states = 0.1 * torch.randn(
+        (1, latent_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights = torch.ones((1, top_k), dtype=torch.float32, device="cuda")
+    topk_ids = torch.zeros((1, top_k), dtype=torch.int32, device="cuda")
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
+
+    actual = gluon_a16w4_situ_warp_decode_ep_gfx950(
+        hidden_states,
+        module.w13_weight_triton_tensor,
+        module.w13_precision_config.b_mx_scale,
+        module.w2_weight_triton_tensor,
+        module.w2_precision_config.b_mx_scale,
+        topk_weights,
+        topk_ids,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    expected = mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        activation_dtype=torch.bfloat16,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
@@ -814,7 +968,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     torch.testing.assert_close(captured, eager, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 32])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 32, 64])
 def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
     num_tokens: int,
 ) -> None:
@@ -1099,10 +1253,13 @@ def test_stage1_quantized_output_rejects_partial_scale_panel_gfx950() -> None:
         )
 
 
-def test_package_prefill_supports_192_column_intermediate_padding_gfx950() -> None:
+def test_package_prefill_supports_192_column_intermediate_padding_gfx950(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp4_fp8_precomputed_situ,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
@@ -1140,6 +1297,19 @@ def test_package_prefill_supports_192_column_intermediate_padding_gfx950() -> No
     )
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
 
+    activation_formats = []
+    package_prefill = fused_moe._maybe_gluon_package_mxfp4_prefill
+
+    def record_activation_format(*args, **kwargs):
+        activation_formats.append(kwargs["activation_format"])
+        return package_prefill(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe,
+        "_maybe_gluon_package_mxfp4_prefill",
+        record_activation_format,
+    )
+
     actual = gluon_mxfp4_fp8_precomputed_situ(
         hidden_states,
         topk_weights,
@@ -1165,6 +1335,7 @@ def test_package_prefill_supports_192_column_intermediate_padding_gfx950() -> No
     )
 
     assert isinstance(actual, torch.Tensor)
+    assert activation_formats == ["e2m1"]
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
@@ -1248,7 +1419,11 @@ def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
     torch.testing.assert_close(block64, block128, atol=0.0, rtol=0.0)
 
 
-def test_ep_situ_package_prefill_matches_reference_gfx950() -> None:
+def test_ep_situ_package_prefill_matches_reference_gfx950(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
+
     generator = torch.Generator(device="cuda").manual_seed(20260830)
     num_tokens, top_k = 33, 16
     num_local_experts, num_experts = 2, 16
@@ -1308,6 +1483,19 @@ def test_ep_situ_package_prefill_matches_reference_gfx950() -> None:
     assert not output.is_contiguous()
     module._situ_output_buffer = output
 
+    activation_formats = []
+    package_prefill = fused_moe._maybe_gluon_package_mxfp4_prefill
+
+    def record_activation_format(*args, **kwargs):
+        activation_formats.append(kwargs["activation_format"])
+        return package_prefill(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe,
+        "_maybe_gluon_package_mxfp4_prefill",
+        record_activation_format,
+    )
+
     actual = tokenspeed_kernel.moe_apply(
         plan,
         hidden_states,
@@ -1339,6 +1527,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950() -> None:
     )
 
     assert actual.data_ptr() == output.data_ptr()
+    assert activation_formats == ["e4m3"]
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

@@ -54,8 +54,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.dsa import DSABackend
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -705,7 +704,6 @@ class Glm53FlashKDA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -737,7 +735,6 @@ class Glm53FlashKDA(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -970,22 +967,24 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        # The paged side is a CacheGroupRouter whose sole leaf is the DSA
+        # backend; the router forwards the single-group DSA surface (KPool
+        # runtime, page tables, metadata). The hybrid target wraps it behind
+        # its KDA sibling, the MTP draft (no KDA layers) hands it over bare.
         if isinstance(ctx.attn_backend, HybridLinearAttnBackend):
             dsa_backend = ctx.attn_backend.full_attn_backend
-        elif isinstance(ctx.attn_backend, DSABackend):
-            dsa_backend = ctx.attn_backend
         else:
-            raise TypeError(
-                "GLM-5.3-Flash sparse attention requires a DSA backend, got "
-                f"{type(ctx.attn_backend).__name__}."
-            )
+            dsa_backend = ctx.attn_backend
+        # Fails fast on a non-DSA leaf (no KPool runtime to require).
         kpool_runtime = dsa_backend.require_kpool_runtime()
+        # The forward's shared top-k: an indexer layer publishes, "shared"
+        # layers (and the MTP head reusing the target's) consume.
+        shared_topk = dsa_backend.sparse_topk
         kpool_runtime.ensure_prefill_plan(
             ctx,
             dsa_backend,
@@ -1061,8 +1060,8 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
             and (
-                (num_prefill_tokens > 0 and ctx.dsa_prefill_topk is None)
-                or (num_decode_tokens > 0 and ctx.dsa_decode_topk is None)
+                (num_prefill_tokens > 0 and shared_topk.prefill is None)
+                or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
         if should_compute_indexer:
@@ -1089,13 +1088,13 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                     q_len_per_req=decode_window.q_len_per_req,
                 )
             if ctx.num_extends > 0:
-                ctx.dsa_prefill_topk = self._compute_prefill_topk_indices(
+                shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
                     ctx,
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                ctx.dsa_decode_topk = self._compute_decode_topk_indices(
+                shared_topk.decode = self._compute_decode_topk_indices(
                     indexer_output,
                     ctx,
                     logical_num_tokens=logical_num_tokens,
@@ -1116,7 +1115,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                 input_num_tokens=q.shape[0],
                 forward_mode=ForwardMode.EXTEND,
             )
-            if ctx.dsa_prefill_topk is None:
+            if shared_topk.prefill is None:
                 raise RuntimeError(
                     "GLM-5.3-Flash sparse prefill requires computed top-k indices."
                 )
@@ -1125,9 +1124,12 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                 q,
                 latent_cache,
                 prefill_ctx,
-                out_cache_loc,
+                # The backend's extend span covers exactly the prefill rows;
+                # cache_num_tokens narrows the qkv-proj KV write to them
+                # while the sparse dispatch runs the full padded q.
+                dsa_backend.write_locations(self.attn_mqa, ForwardMode.EXTEND),
                 attn_output,
-                prefill_topk=ctx.dsa_prefill_topk,
+                prefill_topk=shared_topk.prefill,
                 cache_num_tokens=num_prefill_tokens,
             )
 
@@ -1139,12 +1141,12 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-            if ctx.dsa_decode_topk is None:
+            if shared_topk.decode is None:
                 raise RuntimeError(
                     "GLM-5.3-Flash sparse decode requires computed top-k indices."
                 )
             topk_indices, topk_lens = self._slice_decode_topk(
-                ctx.dsa_decode_topk,
+                shared_topk.decode,
                 decode_start,
                 decode_end,
             )
@@ -1153,13 +1155,14 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
                 q[decode_start:decode_end],
                 latent_cache[decode_start:decode_end],
                 decode_ctx,
-                out_cache_loc[decode_start:decode_end],
+                # The decode rows' verify window, exactly num_decode_tokens.
+                dsa_backend.write_locations(self.attn_mqa, ForwardMode.DECODE),
                 attn_output[decode_start:decode_end],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
 
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1352,7 +1355,6 @@ class Glm53FlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1384,10 +1386,9 @@ class Glm53FlashDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            if ctx.accept_lengths is not None:
+            if ctx.draft_narrowing is not None:
                 residual_streams = residual_streams.index_select(0, ctx.gather_ids)
             hidden_states, residual_streams = self.comm_manager.post_attn_comm(
                 hidden_states,
@@ -1440,10 +1441,9 @@ class Glm53FlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.comm_manager,
         )
-        if ctx.accept_lengths is not None:
+        if ctx.draft_narrowing is not None:
             residual = residual.index_select(0, ctx.gather_ids)
         hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
             hidden_states,
@@ -1515,7 +1515,6 @@ class Glm53FlashModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         hidden_states = (
@@ -1534,7 +1533,6 @@ class Glm53FlashModel(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
             )
         if self.config.mhc:
@@ -1860,7 +1858,6 @@ class Glm53FlashForConditionalGeneration(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         if self.language_model is None:
@@ -1879,7 +1876,6 @@ class Glm53FlashForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

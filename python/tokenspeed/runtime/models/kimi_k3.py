@@ -100,7 +100,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -163,7 +163,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-        EncoderCudaGraphWrapper,
+        EncoderForwardStepRunner,
     )
 
 logger = logging.getLogger(__name__)
@@ -571,7 +571,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
@@ -604,7 +603,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             q,
             latent_cache,
             ctx,
-            out_cache_loc,
             output_gate=gate if fuse_value_gate else None,
             absorbed_query=absorbed_query,
         )
@@ -1188,7 +1186,6 @@ class KimiLinearKDA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
@@ -1228,7 +1225,6 @@ class KimiLinearKDA(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -2230,7 +2226,6 @@ class KimiLinearDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one AttnRes launch on each side of the attention collective."""
@@ -2249,7 +2244,6 @@ class KimiLinearDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=h,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             comm_manager=self.comm_manager,
             attnres_partial_args=None,
         )
@@ -2329,7 +2323,6 @@ class KimiLinearDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._fused_attnres_graph_available(hidden_states, block_residual):
@@ -2337,7 +2330,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 block_residual,
             )
 
@@ -2445,7 +2437,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=h,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
             )
@@ -2606,8 +2597,8 @@ class KimiLinearModel(nn.Module):
         # ``set_dflash_layers_to_capture``; empty means no capture.
         self.layers_to_capture: list[int] = []
         self.dflash_aux_stream: str = "prefix"
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs = None
+        # Each capture layer's positional tap index (the draft concatenates
+        # taps in this order).
         self._dflash_capture_idx_map: dict[int, int] = {}
 
     def _refresh_dflash_capture_fallback(self) -> None:
@@ -2686,7 +2677,6 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_inbound: PPStageState | None = None,
         **kwargs,
@@ -2726,18 +2716,15 @@ class KimiLinearModel(nn.Module):
         for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
             layer = self.layers[layer_idx]
             prefix_sum, block_residual = layer(
-                positions, prefix_sum, ctx, out_cache_loc, block_residual
+                positions, prefix_sum, ctx, block_residual
             )
             if capture_dflash and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
                     layer_idx, prefix_sum, block_residual
                 )
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if self._dflash_slot_bufs is not None and capture_idx is not None:
-                    num_tokens = captured.shape[0]
-                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
-                    if self._dflash_incremental_callback is not None:
-                        self._dflash_incremental_callback(capture_idx, num_tokens)
+                if ctx.target_capture_sink is not None and capture_idx is not None:
+                    ctx.target_capture_sink.on_target_capture(capture_idx, captured)
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(captured)
             # Clone: the copy must survive the next layer's in-place residual writes.
@@ -2804,12 +2791,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture the K3 residual stream after each named target layer.
 
         DFLASH/DSpark checkpoints name 0-indexed completed-layer outputs. The
@@ -2833,8 +2815,6 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.model._dflash_capture_idx_map = {
             layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
         }
-        self.model._dflash_incremental_callback = incremental_callback
-        self.model._dflash_slot_bufs = slot_bufs
         self.model._refresh_dflash_capture_fallback()
 
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
@@ -3252,21 +3232,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
             raise AttributeError(
                 "Kimi-K3 encoder-only mode cannot capture target hidden states."
             )
-        self.language_model.set_dflash_layers_to_capture(
-            layer_ids,
-            incremental_callback=incremental_callback,
-            slot_bufs=slot_bufs,
-        )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
 
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
         if self.language_model is None:
@@ -3329,7 +3300,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
-    ) -> EncoderCudaGraphWrapper:
+    ) -> EncoderForwardStepRunner:
         return self.vision.make_encoder_cudagraph_wrapper(mapping)
 
     def make_encoder_cudagraph_wrappers(self, mapping: Mapping) -> dict:
@@ -3375,7 +3346,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         ctx: "ForwardContext",
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         if self.language_model is None:
@@ -3390,7 +3360,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 

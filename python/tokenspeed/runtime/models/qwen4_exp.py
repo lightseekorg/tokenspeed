@@ -38,7 +38,7 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     bind_qwen4_exp_side_state,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -151,7 +151,6 @@ class _Qwen4ExpRMSNormGated(nn.Module):
             return rmsnorm_fn(
                 x,
                 self.weight,
-                None,
                 z=z,
                 eps=self.eps,
                 norm_before_gate=True,
@@ -451,7 +450,6 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
         if self.indexer is not None:
@@ -463,11 +461,14 @@ class Qwen4ExpAttentionDecoderLayer(
                 gate=gate,
                 attention_layer=self.attn,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
+                # QSA writes the paged KV itself; slots come from the backend.
+                out_cache_loc=ctx.attn_backend.write_locations(
+                    self.attn, ctx.forward_mode
+                ),
                 topk_indices=topk_indices,
             )
         else:
-            attention_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
+            attention_output = self._attn(q, k, v, gate, ctx)
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -482,7 +483,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_ids: torch.Tensor,
         **kwargs,
     ):
@@ -491,7 +491,7 @@ class Qwen4ExpAttentionDecoderLayer(
         attention_output = (
             mixed
             if ctx.forward_mode.is_idle()
-            else self.self_attention(positions, mixed, ctx, out_cache_loc)
+            else self.self_attention(positions, mixed, ctx)
         )
         hidden_states = self._finish_attention(attention_output, residuals, ctx)
         return self._run_mlp(hidden_states, ctx), None
@@ -557,7 +557,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
@@ -579,7 +578,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     hidden_states=hidden_states,
                     residual=residual,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                     input_ids=input_ids,
                 )
             if (

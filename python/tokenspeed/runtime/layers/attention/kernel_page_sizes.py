@@ -41,8 +41,7 @@ TRTLLM_MLA_SUPPORTED_PAGE_SIZES = (32, 64)
 # tokenspeed-mla (CuteDSL) paged decode supports exactly these page sizes.
 TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES = (32, 64)
 
-# Flexible paged kernels: chosen defaults, not hardware constants.
-MHA_PAGE_SIZE = 64
+# Flexible paged kernel: a chosen default, not a hardware constant.
 MLA_PAGE_SIZE = 64
 
 # The MSA sparse-attention kernels register exactly one supported page size

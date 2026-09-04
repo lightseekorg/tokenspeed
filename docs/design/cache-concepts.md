@@ -564,24 +564,23 @@ and never touches packing. No refactor needed here.
   `page_table` concept exists only where paged-KV kernel tables exist, i.e.
   in Python.
 * The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
-  TRT-LLM MLA chunked-prefill metadata's `page_table`,
-  `_page_table_aliased`, inkling's `col_block_table` (conv state), and the
-  `CacheGroupsMixin` docstring. Third-party kernel keyword names
+  TRT-LLM MLA chunked-prefill metadata's `page_table`, inkling's
+  `col_block_table` (conv state), and the base-class group routing
+  docstrings. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state
   attention has no page table, so the shared call's keyword is absorbed unused
-  via `**kwargs`. And `input_buffer.py::fill_input_buffers` takes a
-  unit-neutral `out_loc_table`: the batch-ordered table `out_cache_loc`
-  derives from, which is the scheduler's full-history table on the target path
-  and the staged draft table on the drafter path.
+  via `**kwargs`. `input_buffer.py` carries no table at all anymore: KV write
+  locations are backend-owned (`write_locations`), so the runner's input prep
+  writes positions and seq_lens only.
 
-### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
+### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; `expand_page_table` (`attention/page_table.py`) is the single
-expansion primitive; state attention and KV share one plan/arena/`CacheBlock`
-view, mirrored by the host tier. Specifically:
+leaking it; the router's `GroupTableStacks` fill (`backends/group_tables.py`)
+is the single expansion primitive; state attention and KV share one
+plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 
 * No magic `prefix_granularity == 128` branches: the constraint is named
   `MXFP8_KV_SCALE_TILE_TOKENS`, defined in `recipes/plan.py` beside the scale
@@ -597,14 +596,40 @@ view, mirrored by the host tier. Specifically:
 * Spec geometry is shape-checked at construction: row geometry and
   `checkpoint_granularity` are mutually exclusive, both positive, and
   family-gated (`CacheGroupSpec.__post_init__`).
-
-Remaining known item (deliberate, separate project): the mapping *primitive*
-is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
-the MHA `CacheGroupsMixin` (eager plus two graph paths),
-`DraftPageStaging.publish`, and DeepSeek-V4's bespoke slot mapping — each
-with its own caching and validation, and the write-location math triplicated
-alongside. Consolidating them means touching every backend family at once;
-do it as its own milestone.
+* Group consumption is claimed positively, from one declaration: each
+  consumer takes exactly the delivered `block_tables` entries for the
+  groups it serves — the router builds one leaf per paged (history-family)
+  group of its bound pool view and fails a live batch missing any of them;
+  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
+  group ids. `cache_consumer_families` remains the boot-time coverage
+  declaration (`validate_scheduler_config`). Extra delivered groups ride
+  through untouched; a table for a group the bound pool never published
+  fails loudly.
+* The logical→physical conversion has ONE home per pool view:
+  `CacheGroupRouter` (`backends/router.py`) learns each group's
+  `block_granularity` and each leaf's `kernel_page_size` into one
+  `CacheGroupGeometry`, expands the bridge's raw block tables into
+  kernel-page stacks, and derives every KV write location — extend spans,
+  the decode/verify window, and the drafters' published step windows — from
+  those same tables (`backends/write_locations.py`, pure functions). Paged
+  leaves see kernel vocabulary only. The bridge's per-group table views
+  (`CacheBatchMetadata`) are the router's input — block vocabulary in,
+  kernel pages out, one expand launch per group. Models and the runner never
+  compute locations — `write_locations(layer, mode)` is the single accessor
+  (`unified_path.md`, "Write locations have one owner").
+* The slot *arithmetic* itself lives in the mapping layer in exactly two
+  spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
+  is page-size invariant): the router's stacked window/span math
+  (`backends/write_locations.py`, failing to slot 0 — the reserved dummy
+  page) and the token-shaped resolve
+  (`attention/page_table.py::group_slot_mapping_from_raw` +
+  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
+  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
+  a *composer*, not an owner: its SWA / compressor-state / indexer-state
+  writes call the shared token-shaped resolve over its delivered tables;
+  only the compression-boundary orchestration (per-ratio strides, boundary
+  masks, the fused dsv4 kernel) is V4-specific
+  (`kv_cache/hybrid_deepseek_v4.py`).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -663,6 +688,11 @@ do it as its own milestone.
   bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
   packing: the declaring group is positional, and packing is the layout's
   answer, so neither can be stated twice and disagree. ✓
+* The model side names the same ids: every `PagedAttention` layer carries a
+  mandatory `group_id`, checked against the pool's published specs at startup
+  (`validate_cache_group_ids`, single-group pools included), and backends
+  index their learned geometry by it with no fallback
+  (`CacheGroupGeometry.granularity_of` raises on unknown ids). ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

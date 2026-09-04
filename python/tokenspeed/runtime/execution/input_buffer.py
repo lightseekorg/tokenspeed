@@ -25,10 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
-from tokenspeed.runtime.execution.cache_loc_kernel import (
-    compute_out_cache_loc,
-    fused_decode_input_prep,
-)
+from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -53,15 +50,11 @@ class InputBuffers:
         self,
         max_bs: int,
         max_num_tokens: int,
-        page_size: int,
-        dummy_kv_slot: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
     ):
         self.device = device
-        self.page_size = page_size
         self.max_num_tokens = max_num_tokens
-        self.dummy_kv_slot = dummy_kv_slot
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
@@ -73,11 +66,12 @@ class InputBuffers:
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
             # expects for padded rows (input_ids=1, positions=0, req_pool=0,
-            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
-            # the active prefix [:total_tokens]; fill_input_buffers refreshes the
-            # padding tail [total_tokens:] back to these defaults every step,
-            # because a larger prior iter can leave stale values past the
-            # current prefix.
+            # seq_lens=1). Each iteration overwrites the active prefix
+            # [:total_tokens]; fill_input_buffers refreshes the padding tail
+            # [total_tokens:] back to these defaults every step, because a
+            # larger prior iter can leave stale values past the current
+            # prefix. KV write locations are backend-owned (write_locations);
+            # no location buffer lives here.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
@@ -93,12 +87,6 @@ class InputBuffers:
                 (max_bs,), state_write_padding_pool_index, dtype=torch.int64
             )
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
-            # Initialise to dummy_kv_slot so that padding positions (never
-            # written by compute_out_cache_loc) always point to the reserved
-            # dummy KV slot and never corrupt real KV cache entries.
-            self.out_cache_loc_buf = torch.full(
-                (max_num_tokens,), dummy_kv_slot, dtype=torch.int32
-            )
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
@@ -120,9 +108,6 @@ class InputBuffers:
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
-        tape.filltail(
-            self.out_cache_loc_buf, Reg.TOKENS, self.max_num_tokens, self.dummy_kv_slot
-        )
         tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
         tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
         tape.filltail(
@@ -180,13 +165,7 @@ class InputBuffers:
         forward_op,
         runtime_states: RuntimeStates,
         total_tokens: int,
-        out_loc_table: torch.Tensor,
     ):
-        # out_cache_loc derives from this batch-ordered table (row i == batch
-        # position i): the scheduler's full-history table on the target path,
-        # the staged draft table on the drafter path. Its column grain is the
-        # ctor's page_size; the name stays unit-neutral because the two paths
-        # feed tables of different provenance.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -299,22 +278,19 @@ class InputBuffers:
             ] = force_single_token
             runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
 
-        # Decode-only fast path: one fused Triton kernel writes out_cache_loc,
-        # positions, and seq_lens in a single launch and reads
-        # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
-        # path + compute_position + seq_lens add are all gone.
+        # Decode-only fast path: one fused Triton kernel writes positions and
+        # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
+        # directly, so the indexSelect + compute_position + seq_lens add are
+        # all gone.
         if num_extends == 0 and batch_size > 0:
             fused_decode_input_prep(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
                 positions_ptr=self.positions_buf[:total_tokens],
                 seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                page_table=out_loc_table,
-                page_size=self.page_size,
             )
-            # Decode path's seq_lens / positions / out_cache_loc are done.
+            # Decode path's seq_lens / positions are done.
             valid_cache_lengths = None
         else:
             # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
@@ -322,13 +298,6 @@ class InputBuffers:
             # the seq_lens add use it.
             valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices_device
-            )
-            compute_out_cache_loc(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                input_lengths=input_lengths_device,
-                cache_start=valid_cache_lengths,
-                page_table=out_loc_table,
-                page_size=self.page_size,
             )
 
             # Compute positions. In mixed batches, prefill rows use their extend
@@ -437,15 +406,14 @@ class InputBuffers:
         # Refresh the padding tail of the persistent buffers every iteration.
         # The captured graph replays at a padded batch size and DOES read the
         # padded rows; a previous iter with a *larger* total_tokens / batch_size
-        # leaves stale values in the tail (real cache locations, per-request seq
-        # lengths, positions, token ids, req-pool slots). Reusing those for
-        # padded tokens routes KV writes into real cache slots (corruption),
-        # forces attention to scan oversize ranges, and -- for a stale
-        # out-of-range token id -- trips the embedding gather's device-side
-        # assert that tears the server down. The __init__ safe defaults
-        # (input_ids=1, req_pool=0, positions=0) are not enough on their own
-        # once a larger iter has overwritten the tail, so scrub it back here
-        # (cheap tail-only fills; the active prefix was written above).
+        # leaves stale values in the tail (per-request seq lengths, positions,
+        # token ids, req-pool slots). Reusing those for padded tokens forces
+        # attention to scan oversize ranges and -- for a stale out-of-range
+        # token id -- trips the embedding gather's device-side assert that
+        # tears the server down. The __init__ safe defaults (input_ids=1,
+        # req_pool=0, positions=0) are not enough on their own once a larger
+        # iter has overwritten the tail, so scrub it back here (cheap
+        # tail-only fills; the active prefix was written above).
         if self._pad_tape is not None:
             self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
             if total_tokens < self.max_num_tokens:
@@ -453,7 +421,6 @@ class InputBuffers:
         else:
             if total_tokens < self.max_num_tokens:
                 self.input_ids_buf[total_tokens:].fill_(1)
-                self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
                 self.positions_buf[total_tokens:].fill_(0)
                 self.mrope_positions_buf[:, total_tokens:].zero_()
             if batch_size < self.max_bs:
@@ -469,7 +436,6 @@ class InputBuffers:
         """Prepare padded decode graph inputs for a rank with no real tokens."""
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
-            self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:

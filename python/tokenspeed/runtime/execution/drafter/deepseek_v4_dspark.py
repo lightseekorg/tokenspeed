@@ -86,7 +86,6 @@ class DeepseekV4DSpark(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner | None = None,
-        cache_view=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -99,7 +98,6 @@ class DeepseekV4DSpark(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -278,16 +276,6 @@ class DeepseekV4DSpark(BaseDrafter):
             )
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
-
-    def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
-        num_decodes = base_ctx.bs - base_ctx.num_extends
-        if num_decodes <= 0:
-            return None
-        decode_tokens = num_decodes * self.spec_num_tokens
-        prefill_tokens = base_ctx.input_num_tokens - decode_tokens
-        return self.input_buffers.input_ids_buf[
-            prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
 
     def _seed_prefill_windows(
         self,

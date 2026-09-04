@@ -51,7 +51,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
     DeepseekV4MegaMoEExperts,
-    _deepseek_v4_swa_slot_mapping,
     hc_head,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -207,7 +206,6 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -222,18 +220,11 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         e_out, _ = self.e_proj(input_embeds)
         hidden_states = h_out + e_out.unsqueeze(-2)
 
-        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-            ctx,
-            positions,
-            out_cache_loc,
-        )
         residual, x_def, post_def, comb_def = self.mtp_block(
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             input_ids,
-            swa_slot_mapping,
         )
         return mhc_post(x_def, residual, post_def, comb_def)
 
@@ -291,7 +282,6 @@ class DeepseekV4MultiTokenPredictor(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
@@ -304,7 +294,6 @@ class DeepseekV4MultiTokenPredictor(nn.Module):
             positions,
             previous_hidden_states,
             ctx,
-            out_cache_loc,
             input_embeds,
         )
 
@@ -382,7 +371,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
@@ -404,7 +392,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             positions,
             captured_hidden_states,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             spec_step_idx=spec_step_idx,
         ).flatten(1)

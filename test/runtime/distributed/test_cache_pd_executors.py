@@ -454,6 +454,7 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
             num_attention_layers=2,
             num_key_value_heads=1,
             hf_config=SimpleNamespace(),
+            hf_text_config=SimpleNamespace(),
         ),
     )
 

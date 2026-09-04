@@ -77,7 +77,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         layer_types=layer_types,
     )
 
-    assert pool.num_lcm_blocks == num_lcm_blocks
+    assert pool.arena.plan.num_lcm_blocks == num_lcm_blocks
     assert pool.arena.runtime_contract is not None
     assert pool.arena.runtime_contract.token_capacity == 1024
     assert {
@@ -162,11 +162,9 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         device="cpu",
         dtype=torch.bfloat16,
         context_len=1024,
-        max_graph_bs=1,
         max_bs=1,
         prefix_granularity=plan.prefix_granularity,
         kv_cache_quant_method="none",
-        max_scheduled_tokens=128,
         components=(mla_spec,),
     )
     target_config = AttnConfig(

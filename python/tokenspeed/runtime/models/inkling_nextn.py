@@ -121,7 +121,6 @@ class InklingMultiTokenPredictorLayer(nn.Module):
         token_embeds: torch.Tensor,
         previous_hidden: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Checkpoint order: [hidden, embed] (mtp_model.py reference).
         fused, _ = self.input_proj(
@@ -130,7 +129,7 @@ class InklingMultiTokenPredictorLayer(nn.Module):
                 dim=-1,
             )
         )
-        return self.transformer_block(fused, None, ctx, out_cache_loc)
+        return self.transformer_block(fused, None, ctx)
 
 
 class InklingMultiTokenPredictor(nn.Module):
@@ -182,7 +181,6 @@ class InklingMultiTokenPredictor(nn.Module):
         self,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
@@ -194,9 +192,7 @@ class InklingMultiTokenPredictor(nn.Module):
             if self.base_embed_norm is not None:
                 input_embeds = self.base_embed_norm(input_embeds)
         layer = self.layers[spec_step_idx % self.num_mtp_layers]
-        hidden, residual = layer(
-            input_embeds, captured_hidden_states, ctx, out_cache_loc
-        )
+        hidden, residual = layer(input_embeds, captured_hidden_states, ctx)
         if ctx.forward_mode.is_idle():
             return hidden
         if residual is None:
@@ -279,7 +275,6 @@ class InklingForConditionalGenerationNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
@@ -298,7 +293,6 @@ class InklingForConditionalGenerationNextN(nn.Module):
         hidden_states = self.model(
             input_ids,
             ctx,
-            out_cache_loc,
             captured_hidden_states,
             input_embeds=input_embeds,
             spec_step_idx=spec_step_idx,

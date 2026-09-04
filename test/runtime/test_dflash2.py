@@ -40,7 +40,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
     _walk_greedy_path,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.models.dflash import DFlashAttention
+from tokenspeed.runtime.models.dflash import get_dflash_layer_cache_group_id
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -105,8 +105,11 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
-def test_dflash_attention_uses_the_full_attention_cache_group() -> None:
-    assert DFlashAttention.cache_group_id == FULL_ATTENTION
+def test_dflash_layer_cache_group_follows_the_draft_layer_types() -> None:
+    labeled = SimpleNamespace(layer_types=["sliding_attention", FULL_ATTENTION])
+    assert get_dflash_layer_cache_group_id(labeled, 0) == "sliding_attention"
+    assert get_dflash_layer_cache_group_id(labeled, 1) == FULL_ATTENTION
+    assert get_dflash_layer_cache_group_id(SimpleNamespace(), 0) == FULL_ATTENTION
 
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:

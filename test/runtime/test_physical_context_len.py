@@ -62,20 +62,18 @@ class TestSpecContextPad:
 
 class TestDraftTableWidth:
     @pytest.mark.parametrize(
-        "context_len,spec,draft_kernel_page_size",
+        "context_len,spec,block_granularity",
         [(4096, 4, 64), (4096, 4, 1), (131072, 8, 64), (7, 2, 4)],
     )
-    def test_physical_extent_fits_the_table(
-        self, context_len, spec, draft_kernel_page_size
-    ):
+    def test_physical_extent_fits_the_table(self, context_len, spec, block_granularity):
         # Mirrors the model_executor sizing: table width derives from the
         # physical extent alone, no per-algorithm slack.
         physical = context_len + _SPEC_OVERSHOOT_SPANS * spec
-        width = (physical + draft_kernel_page_size - 1) // draft_kernel_page_size
-        assert width * draft_kernel_page_size >= physical
+        width = (physical + block_granularity - 1) // block_granularity
+        assert width * block_granularity >= physical
         # No regression vs the old formula's non-slack part
         # (context_len + spec_num_tokens).
-        assert width * draft_kernel_page_size >= context_len + spec
+        assert width * block_granularity >= context_len + spec
 
 
 class TestOutputProcessorTripwire:

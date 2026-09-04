@@ -82,12 +82,10 @@ def _attn_config(family: str, pd_enabled: bool):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         context_len=1024,
-        max_graph_bs=1,
         max_bs=1,
         prefix_granularity=_P,
         kernel_page_size=_P,
         kv_cache_quant_method="",
-        max_scheduled_tokens=_P,
         pd_disaggregation_enabled=pd_enabled,
         components=(spec,),
     )

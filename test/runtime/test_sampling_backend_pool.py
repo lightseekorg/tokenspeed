@@ -38,8 +38,8 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 import torch  # noqa: E402
 
 import tokenspeed.runtime.sampling.backends.triton as triton_backend_module  # noqa: E402
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (  # noqa: E402
-    CudaGraphWrapper,
+from tokenspeed.runtime.execution.forward_step import (  # noqa: E402
+    ForwardStepRunner,
 )
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessorOutput,
@@ -373,7 +373,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             valid_cache_lengths=torch.zeros(
                 (POOL + 1,), dtype=torch.int32, device="cuda"
             ),
-            is_all_greedy=False,
             vocab_size=VOCAB,
             device="cuda",
         )
@@ -435,7 +434,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             valid_cache_lengths=torch.zeros(
                 (POOL + 1,), dtype=torch.int32, device="cuda"
             ),
-            is_all_greedy=False,
             vocab_size=VOCAB,
             device="cuda",
         )
@@ -509,7 +507,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             valid_cache_lengths=torch.zeros(
                 (POOL + bs + 1,), dtype=torch.int32, device="cuda"
             ),
-            is_all_greedy=False,
             vocab_size=vocab,
             device="cuda",
         )
@@ -591,7 +588,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             valid_cache_lengths=torch.zeros(
                 (POOL + bs + 1,), dtype=torch.int32, device="cuda"
             ),
-            is_all_greedy=False,
             vocab_size=vocab,
             device="cuda",
         )
@@ -720,7 +716,6 @@ class TestTritonLogprobOutputs(unittest.TestCase):
             valid_cache_lengths=torch.zeros(
                 (POOL + 1,), dtype=torch.int32, device="cuda"
             ),
-            is_all_greedy=False,
             vocab_size=VOCAB,
             device="cuda",
         )
@@ -788,7 +783,7 @@ class TestCudaGraphSamplingVariants(unittest.TestCase):
                 return self.variant
 
         backend = FakeSamplingBackend()
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.sampling_backend = backend
         wrapper.max_tokens_per_req = 4
         wrapper.graphs = {

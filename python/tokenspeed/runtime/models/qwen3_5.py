@@ -103,7 +103,7 @@ from tokenspeed.runtime.multimodal.embedder import (
     pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import (
@@ -546,7 +546,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=None,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -869,10 +868,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        attn_output = self.attn(q, k, v, ctx)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -882,11 +880,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Full attention forward pass."""
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
+        attn_output = self._attn(q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -904,7 +901,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -920,7 +916,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -1022,10 +1017,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         # *input* hidden states are captured. Populated by
         # set_eagle3_layers_to_capture() / set_dflash_layers_to_capture().
         self.layers_to_capture: set = set()
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs = None
-        self._dflash_capture_idx_map = {}
-        self._dflash_incr_active = False
+        # DFLASH: each capture layer's positional tap index.
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -1036,7 +1029,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
@@ -1071,15 +1063,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
                 gathered = layer.comm_manager.gather_residual(aux, ctx)
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if (
-                    self._dflash_incr_active
-                    and self._dflash_incremental_callback is not None
-                    and self._dflash_slot_bufs is not None
-                    and capture_idx is not None
-                ):
-                    num_tokens = gathered.shape[0]
-                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
-                    self._dflash_incremental_callback(capture_idx, num_tokens)
+                if ctx.target_capture_sink is not None and capture_idx is not None:
+                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
@@ -1091,7 +1076,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                 )
 
             # Process deepstack embeddings if provided
@@ -1448,7 +1432,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
-        return EncoderCudaGraphWrapper(
+        return EncoderForwardStepRunner(
             adapter=adapter,
             budget_range=(64, 4096),
             max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
@@ -1483,12 +1467,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         # DFLASH checkpoints name 0-indexed target layer outputs. The capture
         # check runs before layer i, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
@@ -1506,8 +1485,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         self.model._dflash_capture_idx_map = {
             layer_idx: i for i, layer_idx in enumerate(sorted_capture_layers)
         }
-        self.model._dflash_incremental_callback = incremental_callback
-        self.model._dflash_slot_bufs = slot_bufs
 
     @torch.no_grad()
     def forward(
@@ -1515,7 +1492,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1528,7 +1504,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             )
 
@@ -1543,7 +1518,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

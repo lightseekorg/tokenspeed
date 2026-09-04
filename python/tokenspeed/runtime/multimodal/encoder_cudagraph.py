@@ -20,7 +20,7 @@
 
 """Budget-bucketed CUDA graph capture/replay for multimodal encoders.
 
-The :class:`EncoderCudaGraphWrapper` is the generic manager: it owns budget
+The :class:`EncoderForwardStepRunner` is the generic manager: it owns budget
 selection, graph capture, replay buffer updates, greedy packing, and eager
 fallback. Model/modality-specific input layout is supplied by an adapter object.
 """
@@ -53,7 +53,7 @@ class BudgetGraphMetadata:
 
 
 class EncoderCudaGraphBatch(Protocol):
-    """Minimal batch contract consumed by :class:`EncoderCudaGraphWrapper`."""
+    """Minimal batch contract consumed by :class:`EncoderForwardStepRunner`."""
 
     @property
     def input_tensors(self) -> dict[str, torch.Tensor]: ...
@@ -70,7 +70,7 @@ class EncoderCudaGraphBatch(Protocol):
 
 
 class EncoderCudaGraphAdapter(Protocol):
-    """Model/modality-specific contract used by :class:`EncoderCudaGraphWrapper`."""
+    """Model/modality-specific contract used by :class:`EncoderForwardStepRunner`."""
 
     @property
     def modality_name(self) -> str: ...
@@ -285,7 +285,7 @@ class VisionEncoderCudaGraphAdapter:
         return self.post_encode(encoder_outs, batch.grid)
 
 
-class EncoderCudaGraphWrapper:
+class EncoderForwardStepRunner:
     """Generic budget-based CUDA graph manager for encoder callables.
 
     The wrapper does not know about image/video/audio internals. It only expects
@@ -338,7 +338,7 @@ class EncoderCudaGraphWrapper:
             )
         )
         logger.info(
-            "EncoderCudaGraphWrapper initialized: modality=%s, budgets=%s, "
+            "EncoderForwardStepRunner initialized: modality=%s, budgets=%s, "
             "max_batch_size=%d, max_metadata_sequences_per_batch=%s, encoder_tp=%d",
             self.modality_name,
             self.encoder_output_token_budgets,

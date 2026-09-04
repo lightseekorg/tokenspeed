@@ -109,10 +109,9 @@ def test_draft_final_step_follows_the_complete_drafter_run():
 
     class _Drafter:
         supports_pd_layerwise_finalization = True
-        _incremental_proj_enabled = False
 
-        def get_candidates(self, _ctx):
-            return None
+        def prepare_target_forward(self, ctx):
+            events.append("prepare-target")
 
         def run(self, **_kwargs):
             events.extend(("draft-write-0", "draft-write-1", "draft-return"))
@@ -129,7 +128,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
-    executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1)
+    executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
         vocab_size=32,
@@ -148,11 +147,12 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor._draft_final_step_counter = SimpleNamespace(
         record_cache=lambda: events.append("draft-final")
     )
-    ctx = SimpleNamespace(bs=1, num_extends=1)
+    ctx = SimpleNamespace(bs=1, num_extends=1, input_num_tokens=1)
 
     executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
 
     assert events == [
+        "prepare-target",
         "draft-write-0",
         "draft-write-1",
         "draft-return",
@@ -173,8 +173,8 @@ def test_cudagraph_gc_flag_reaches_the_capture_context():
     import dataclasses
     import gc
 
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-        CudaGraphWrapper,
+    from tokenspeed.runtime.execution.forward_step import (
+        ForwardStepRunner,
         freeze_gc,
     )
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
@@ -184,7 +184,7 @@ def test_cudagraph_gc_flag_reaches_the_capture_context():
 
     for flag in (False, True):
         config = SimpleNamespace(enable_cudagraph_gc=flag)
-        wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+        wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
         # Only the flag plumbing is under test; __init__ needs a live model.
         wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
         assert wrapper.enable_cudagraph_gc is flag
@@ -199,3 +199,51 @@ def test_cudagraph_gc_flag_reaches_the_capture_context():
         assert (during > before) is (not flag), (flag, before, during)
         assert after <= before, (before, after)
         assert len(canary) == 64
+
+
+def test_non_spec_decode_routes_through_verify():
+    """The unified sampling rule: decode rows verify even without a drafter.
+
+    Non-speculative decode is verify's N == 1 case — _decode_candidates
+    yields the one-column window (this step's input token per request) and
+    _run_sampling must call verify(), never the sample() fast path.
+    """
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    calls = []
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.drafter = None
+    executor.config = SimpleNamespace(output_length=1)
+    executor.input_buffers = SimpleNamespace(
+        input_ids_buf=torch.arange(8, dtype=torch.int32),
+        force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
+    )
+    executor.sampling_backend = SimpleNamespace(
+        sample=lambda *_a, **_k: calls.append("sample") or (None, None),
+        verify=lambda _lo, _si, cand: calls.append(("verify", tuple(cand.shape)))
+        or (
+            torch.zeros(cand.shape[0], dtype=torch.int32),
+            torch.ones(cand.shape[0], dtype=torch.int32),
+        ),
+    )
+
+    # Pure decode, bs=3, N=1: candidates are the tail 3 ids as [3, 1].
+    ctx = SimpleNamespace(
+        bs=3, num_extends=0, input_num_tokens=3, decode_input_ids=None
+    )
+    candidates = executor._decode_candidates(ctx)
+    assert candidates.shape == (3, 1)
+    assert candidates.view(-1).tolist() == [0, 1, 2]
+
+    executor._run_sampling(object(), object(), ctx, candidates)
+    assert calls == [("verify", (3, 1))]
+
+    # Pure prefill still samples.
+    calls.clear()
+    ctx2 = SimpleNamespace(
+        bs=2, num_extends=2, input_num_tokens=6, decode_input_ids=None
+    )
+    assert executor._decode_candidates(ctx2) is None
+    executor._run_sampling(object(), object(), ctx2, None)
+    assert calls == ["sample"]

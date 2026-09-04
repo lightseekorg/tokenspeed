@@ -256,7 +256,7 @@ class SamplingBackend(ABC):
     def reset_capture_state(self) -> None:
         """Clear any per-pool state that warm-up iterations may have dirtied
         before CUDA graph capture. Warm-up runs sample()/verify() against
-        pool row 0 (see CudaGraphWrapper capture path); stateful backends
+        pool row 0 (see ForwardStepRunner capture path); stateful backends
         override this to zero whatever row 0 accumulates. Default: no-op."""
 
     def get_packed_output_d2h(

@@ -83,14 +83,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             if label in STATE_LAYER_TYPES and self._conv_state[layer_id] is not None
         }
 
-    @property
-    def num_lcm_blocks(self) -> int:
-        return self.arena.plan.num_lcm_blocks
-
-    @property
-    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return list(self._state_buffers_by_layer.values())
-
     @cached_property
     def state_group_by_layer(self) -> dict[int, str]:
         """View-local state layer id -> its state-family cache group id."""

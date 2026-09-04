@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -33,11 +33,11 @@ def _graph_route(
     capture_bs: list[int],
     max_tokens_per_req: int = 1,
 ) -> tuple[bool, int]:
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
     wrapper.disable = disable
     wrapper.dp_size = dp_size
     wrapper.disable_padding = disable_padding
-    wrapper.max_bs = max_bs
+    wrapper.max_capture_bs = max_bs
     wrapper.capture_bs = capture_bs
     wrapper.graphs = set(capture_bs)
     wrapper.max_tokens_per_req = max_tokens_per_req
@@ -115,12 +115,12 @@ def test_logits_processor_dp_layout_threshold_and_modes():
     )
 
 
-def test_cuda_graph_wrapper_uses_existing_route_for_padding():
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+def test_forward_step_runner_uses_existing_route_for_padding():
+    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
     wrapper.disable = False
     wrapper.dp_size = 1
     wrapper.disable_padding = False
-    wrapper.max_bs = 32
+    wrapper.max_capture_bs = 32
     wrapper.capture_bs = [24, 32]
     wrapper.graphs = {24, 32}
     wrapper.max_tokens_per_req = 1
@@ -138,8 +138,8 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
 
 
 def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    wrapper.config = SimpleNamespace(max_req_pool_size=21)
+    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
+    wrapper.config = SimpleNamespace(max_req_pool_size=21, spec_algo="DFLASH")
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
     padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
@@ -148,7 +148,7 @@ def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
 
 
 def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
     wrapper.config = SimpleNamespace(max_req_pool_size=99)
     wrapper.input_buffers = SimpleNamespace(
         state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
