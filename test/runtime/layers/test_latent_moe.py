@@ -802,8 +802,6 @@ def test_kimi3_latent_projection_shard_loader_takes_row_block(
             proj.weight.data, full[rank * rows : (rank + 1) * rows]
         )
         assert proj.shard_slice == (rank * rows, rows)
-        # Storage is already the block, so slicing it again would take a block of one.
-        assert proj.weight_block is proj.weight
         torch.testing.assert_close(proj.project_shard(torch.eye(k)), proj.weight.data.T)
 
 

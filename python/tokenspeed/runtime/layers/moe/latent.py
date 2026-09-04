@@ -483,28 +483,22 @@ class Kimi3LatentProjection(ReplicatedLinear):
             return local
         return all_gather(local.contiguous(), self.column_group, dim=-1)
 
-    @property
-    def weight_block(self) -> torch.Tensor:
-        """This rank's weight rows, which narrowed storage already holds.
-
-        Both sharding routes narrow, and a projection that did not narrow never
-        reaches here: without a mailbox the column path is not taken at all, so
-        there is no full-width tensor left to slice.
-        """
-        return self.weight
-
     def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's ``output_size/tp`` columns, ungathered.
 
         For callers that fold the gather into a collective they already run:
         the column blocks are disjoint, so placing each rank's block into a
         buffer that is about to be summed makes the sum concatenate them.
+
+        ``self.weight`` is already this rank's rows rather than a slice of the
+        full width: both sharding routes narrow storage, and the dispatch only
+        reaches here once ``narrowed`` holds.
         """
         if self.shard_group is None and self.column_group is None:
             raise ValueError("project_shard requires a column-parallel projection")
         return tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
-            self.weight_block,
+            self.weight,
             solution=self.solution,
         )
 

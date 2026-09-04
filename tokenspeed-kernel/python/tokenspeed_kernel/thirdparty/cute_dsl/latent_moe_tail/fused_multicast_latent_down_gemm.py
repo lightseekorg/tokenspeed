@@ -412,13 +412,13 @@ class FusedMulticastLatentDownGemmKernel:
                 raise ValueError(f"{name} must be CUDA bf16 {list(shape)}")
         if not hidden.is_contiguous() or not weight.is_contiguous():
             raise ValueError("hidden and weight must be contiguous")
-        # The kernel writes rows 0..num_rows-1 at a row stride of latent_dim
-        # through the raw pointer, so a short mailbox is an out-of-bounds
-        # multicast store into every peer's symmetric heap.
+        # A short mailbox is an out-of-bounds multicast store into every peer.
         if mailbox.shape[1] < self.num_rows:
             raise ValueError(
                 f"mailbox capacity {mailbox.shape[1]} is smaller than the "
-                f"compiled M {self.num_rows}"
+                f"compiled M {self.num_rows}: the kernel writes rows "
+                f"0..{self.num_rows - 1} at a row stride of the latent dim "
+                f"through the raw pointer"
             )
         if not mailbox.is_contiguous():
             raise ValueError("mailbox must be contiguous")

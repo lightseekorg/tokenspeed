@@ -58,7 +58,7 @@ _DOWN_POOL_DEPTH = 2
 _FUSED_MAX_M = 8
 # Widest k-tile the fused kernel's configs use; a hidden width off it cannot compile.
 _K_TILE = 448 * 8
-# Ties or beats 304 at every measured width, and wins at 1, 2 and 256 upward.
+# Per-kernel sweeps separate 608 from 304; end to end the two are indistinguishable.
 _LAMPORT_CTAS = 608
 _LAMPORT_THREADS = 512
 # Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
@@ -68,12 +68,7 @@ _BF16_BYTES = 2
 logger = logging.getLogger(__name__)
 # Reasons already reported; the decline repeats per MoE block and says nothing new.
 _DECLINED: set[str] = set()
-# The architecture whose fabric semantics are validated here, and so the only
-# one where failing to rendezvous means a broken machine rather than an
-# unsupported one. Deliberately NOT latent_tail's _MULTICAST_MIN_ARCH: that
-# decides whether to attempt the path and admits later architectures, this
-# decides whether to fail a boot over the attempt and must not. They agree
-# today and are separate numbers because they answer different questions.
+# See _rendezvous_failure_is_a_fault for why this is not latent_tail's gate.
 _MULTICAST_VALIDATED_ARCH = 10
 
 
@@ -85,6 +80,12 @@ def _rendezvous_failure_is_a_fault() -> bool:
     failed -- and the message we would print names Blackwell specifics that may
     not even apply there. So above the validated architecture this declines,
     which is the pre-existing behaviour and what the shipped gate asks for.
+
+    ``_MULTICAST_VALIDATED_ARCH`` is deliberately not ``latent_tail``'s
+    ``_MULTICAST_MIN_ARCH``: that one decides whether to attempt the path and
+    admits later architectures, this one decides whether to fail a boot over the
+    attempt and must not. They agree today and stay separate numbers because
+    they answer different questions.
     """
     platform = current_platform()
     return (
@@ -209,13 +210,14 @@ class _MulticastVaGemm:
 
         Returns:
             The mailbox, as the fused producer returns it.
+
+        The store overwrites rather than accumulates, so a word transitions once
+        a round. That is untested and not cheaply testable: the mailbox is armed
+        with negative zero in both BF16 lanes, adding which is the identity
+        bitwise, so an accumulating publish would be byte-identical to this one.
+        A witness would have to catch a peer reading mid-accumulation.
         """
         published = self._block[: hidden_states.shape[0]]
-        # Overwrites rather than accumulates, so a word transitions once a round.
-        # Untested, and not cheaply testable: the mailbox is armed with negative
-        # zero in both BF16 lanes, and adding that is the identity bitwise, so an
-        # accumulating publish is byte-identical to this one. A witness would
-        # have to catch a peer reading these columns mid-accumulation.
         torch.mm(hidden_states, weight_block.t(), out=published)
         return mailbox
 
@@ -624,13 +626,16 @@ class KimiK3LatentDownOp:
 
         Returns:
             The full ``[tokens, latent_size]`` latent, gathered from the mailbox.
+
+        Three invariants the publish depends on: every aligned 32-bit word
+        transitions exactly once a round and never in halves; the publishing
+        GEMM's beta is 0, never accumulating into the mailbox; and it is handed
+        the full mailbox rather than a slice, because the capacity guard bounds
+        a raw-pointer write and cannot see what it protects if given only the
+        batch.
         """
         tokens = hidden_states.shape[0]
         slot = self._slot
-        # Every aligned 32-bit word must transition exactly once a round, not in halves.
-        # The publishing GEMM's beta must be 0, never accumulating into the mailbox.
-        # Full mailbox, not a slice: the capacity guard bounds a raw-pointer
-        # write and cannot see what it protects if handed only the batch.
         slot.gemm_by_m[tokens](
             hidden_states,
             weight,

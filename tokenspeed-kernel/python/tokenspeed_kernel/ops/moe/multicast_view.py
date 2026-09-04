@@ -100,6 +100,12 @@ def bf16_tensor_on_pointer(
     Returns:
         A bfloat16 CUDA tensor aliasing ``pointer``. It allocates nothing and
         frees nothing, so the caller must keep the underlying buffer alive.
+
+    The DLPack deleter is NULL rather than a no-op callback. Freeing is the
+    mailbox owner's job either way, but a ctypes callback is no longer callable
+    once ``Py_FinalizeEx`` has begun clearing module dicts, and a view held to
+    exit is deallocated exactly there. DLPack permits a null deleter; a no-op
+    one segfaults on shutdown.
     """
     from torch.utils.dlpack import from_dlpack
 
@@ -118,10 +124,7 @@ def bf16_tensor_on_pointer(
     managed.dl_tensor.strides = steps
     managed.dl_tensor.byte_offset = 0
     managed.manager_ctx = None
-    # NULL, not a no-op callback: freeing is the mailbox owner's job either way,
-    # but a ctypes callback is no longer callable once Py_FinalizeEx has begun
-    # clearing module dicts, and a view held to exit is deallocated exactly
-    # there. DLPack permits a null deleter; a no-op one segfaults on shutdown.
+    # NULL rather than a no-op callback -- see the note in the docstring.
     managed.deleter = ctypes.cast(None, _DELETER)
     # The consumer keeps the capsule, not the structures it points into.
     _KEEPALIVE.extend((managed, sizes, steps))
