@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import triton
+from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
     _gate_tiling,
     _gate_tiling_dot,
