@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dflash2 import (
     DFlash2,
+    _greedy_path_torch,
     _walk_greedy_path,
 )
 
@@ -260,6 +261,22 @@ def test_greedy_path_follows_the_selected_predecessor() -> None:
     out = torch.empty(1, 4, dtype=torch.int32)
     _walk_greedy_path(candidate_ids, scores, torch.tensor([7]), out)
     assert out.tolist() == [[7, 11, 20, 31]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_the_path_kernel_reproduces_the_torch_walk() -> None:
+    torch.manual_seed(5)
+    candidate_ids = torch.rand(4, 7, 128).topk(16).indices.cuda()
+    scores = torch.randn(4, 7, 16, 16, device="cuda")
+    scores[:, 0] = scores[:, 0, :1].expand(-1, 16, -1)
+    anchors = torch.randint(128, (4,), device="cuda")
+    kernel_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
+    torch_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
+
+    _walk_greedy_path(candidate_ids, scores, anchors, kernel_out)
+    _greedy_path_torch(candidate_ids, scores, anchors, torch_out)
+
+    torch.testing.assert_close(kernel_out, torch_out)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

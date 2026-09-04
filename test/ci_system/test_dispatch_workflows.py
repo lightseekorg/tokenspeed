@@ -368,6 +368,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
     ]
@@ -405,6 +406,21 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
     assert target_path in dspark["server"]["command"]
     assert draft_path in dspark["server"]["command"]
     assert dspark["env"]["TOKENSPEED_DFLASH_AUX_STREAM"] == "attn_res"
+
+
+def test_kimi_k3_dflash2_gb300_uses_a_window_aware_drafter_backend():
+    task = load_yaml(
+        REPO_ROOT / "test/ci/eval/"
+        "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+    )
+    command = task["server"]["command"]
+
+    assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
+    assert "/models/nvidia--Kimi-K3-NVFP4/" in command
+    assert "--speculative-draft-model-path lightseekorg/kimi-k3-dflash2" in command
+    assert "--speculative-algorithm DFLASH" in command
+    # The draft's sliding_attention layers need a backend that masks with them.
+    assert "--drafter-attention-backend mla" in command
 
 
 def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
@@ -476,7 +492,7 @@ def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
     assert checkout["with"]["persist-credentials"] is False
 
 
-def test_gb300_slurm_nightly_matrix_selects_kimi_k3_vision_tasks(monkeypatch):
+def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -498,6 +514,11 @@ def test_gb300_slurm_nightly_matrix_selects_kimi_k3_vision_tasks(monkeypatch):
         (
             "test/ci/eval/"
             "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
+            "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
             "slurm-gb300-4gpu",
         ),
     }
