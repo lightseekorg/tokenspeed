@@ -125,6 +125,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
+    drafter.lm_head = SimpleNamespace()
     drafter.logits_processor = SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None)
 
     with mock.patch("tokenspeed.runtime.execution.drafter.dflash2.DFlash.wire_target"):
@@ -444,3 +445,44 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+def test_distributed_topk_picks_what_a_whole_vocabulary_topk_would(monkeypatch) -> None:
+    """Two shard-local top-16s must agree with one top-16 over the vocabulary."""
+    from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime
+
+    torch.manual_seed(7)
+    rows, hidden, vocab, top_k, tp_size = 3, 6, 40, 4, 2
+    weight = torch.randn(vocab, hidden)
+    hidden_states = torch.randn(rows, hidden)
+    shard = vocab // tp_size
+
+    drafter = DFlash2.__new__(DFlash2)
+    drafter.selector_top_k = top_k
+    drafter.spec_num_tokens = 3
+    drafter.input_buffers = SimpleNamespace(max_bs=2)
+    drafter._candidate_gather_buffers = None
+    drafter._distributed_topk_enabled = True
+    drafter.lm_head = SimpleNamespace(
+        weight=weight[:shard],
+        shard_indices=SimpleNamespace(num_org_elements=shard, org_vocab_start_index=0),
+    )
+    drafter.candidate_logits_processor = SimpleNamespace(
+        tp_size=tp_size, tp_group=None, logit_scale=None, final_logit_softcapping=None
+    )
+
+    # Stand in for rank 1: its own shard-local top-k, ids already global.
+    peer = torch.matmul(hidden_states, weight[shard:].T)
+    peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
+    peer_ids = peer_ids + shard
+
+    def fake_all_gather(out, src, group):
+        out[: src.shape[0]].copy_(src)
+        out[src.shape[0] :].copy_(peer_ids if src.dtype == torch.int64 else peer_values)
+
+    monkeypatch.setattr(dflash2_runtime, "all_gather_into_tensor", fake_all_gather)
+    candidate_ids, unary_logits = drafter._distributed_topk_candidates(hidden_states)
+
+    expected = torch.topk(torch.matmul(hidden_states, weight.T), top_k, dim=-1)
+    assert candidate_ids.tolist() == expected.indices.tolist()
+    torch.testing.assert_close(unary_logits, expected.values.float())

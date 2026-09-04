@@ -25,10 +25,18 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.sampling.triton import dflash2_greedy_path
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    fused_softcap_generic,
+)
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = get_colorful_logger(__name__)
 
 
 def _greedy_path_torch(
@@ -68,6 +76,9 @@ def _walk_greedy_path(
 class DFlash2(DFlash):
     """DFlash block runtime with the DFlash2 top-k transition selector."""
 
+    #: Set from the wired head's shard geometry; see _init_distributed_topk.
+    _distributed_topk_enabled = False
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.candidate_selector = getattr(self.model, "candidate_selector", None)
@@ -86,6 +97,8 @@ class DFlash2(DFlash):
             nested.get("final_logit_softcapping") or 0.0
         )
         self.candidate_logits_processor: LogitsProcessor | None = None
+        self._distributed_topk_enabled = False
+        self._candidate_gather_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def wire_target(self, target_model) -> None:
         super().wire_target(target_model)
@@ -99,12 +112,123 @@ class DFlash2(DFlash):
         self.candidate_logits_processor.final_logit_softcapping = (
             self.final_logit_softcapping if self.final_logit_softcapping > 0 else None
         )
+        self._init_distributed_topk()
+
+    def _init_distributed_topk(self) -> None:
+        """Decide once whether top-k can skip the whole-vocabulary gather.
+
+        Only ``selector_top_k`` candidates per row survive, so all-gathering
+        every rank's whole logits row moves three orders of magnitude more
+        bytes than the answer needs. Taking each shard's local top-k first is
+        exact only when a shard's local index maps to a global token id by a
+        constant offset, which is what these checks establish.
+        """
+        processor = self.candidate_logits_processor
+        head = self.lm_head
+        shard = getattr(head, "shard_indices", None)
+        self._distributed_topk_enabled = False
+        if (
+            int(processor.tp_size) <= 1
+            or shard is None
+            or not hasattr(head, "weight")
+            or processor.skip_all_gather
+            or processor.dp_sampling_enabled
+        ):
+            return
+        num_org = int(shard.num_org_elements)
+        if (
+            int(shard.num_added_elements) != 0
+            or int(shard.num_org_elements_padded) != num_org
+            or num_org * int(processor.tp_size) != int(self.model.config.vocab_size)
+            or int(shard.org_vocab_start_index) != num_org * int(processor.tp_rank)
+        ):
+            logger.info(
+                "DFlash2 distributed top-k disabled: this %d-way vocabulary shard "
+                "is padded or carries added tokens, so a shard-local index is not "
+                "a global token id.",
+                int(processor.tp_size),
+            )
+            return
+        self._distributed_topk_enabled = True
+
+    def _ensure_candidate_gather_buffers(
+        self, values: torch.Tensor, ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resident all-gather landing pads, sized for a full decode block."""
+        rows = int(self.input_buffers.max_bs) * max(self.spec_num_tokens - 1, 1)
+        capacity = int(self.candidate_logits_processor.tp_size) * rows
+        buffers = self._candidate_gather_buffers
+        if (
+            buffers is None
+            or buffers[0].dtype != values.dtype
+            or buffers[1].dtype != ids.dtype
+            or buffers[0].device != values.device
+        ):
+            buffers = (
+                values.new_empty((capacity, self.selector_top_k)),
+                ids.new_empty((capacity, self.selector_top_k)),
+            )
+            self._candidate_gather_buffers = buffers
+        needed = int(values.shape[0]) * int(self.candidate_logits_processor.tp_size)
+        return buffers[0][:needed], buffers[1][:needed]
+
+    def _distributed_topk_candidates(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k over a vocab-parallel head without gathering whole rows."""
+        processor = self.candidate_logits_processor
+        shard = self.lm_head.shard_indices
+        weight = self.lm_head.weight
+        top_k = self.selector_top_k
+
+        logits = torch.matmul(
+            hidden_states.to(weight.dtype),
+            weight[: int(shard.num_org_elements)].T,
+        )
+        if processor.logit_scale is not None:
+            logits.mul_(processor.logit_scale)
+        values, ids = torch.topk(logits, top_k, dim=-1, sorted=False)
+        # Keep the int64 ids the whole-gather path returns: everything
+        # downstream indexes codebooks with them.
+        ids = ids + int(shard.org_vocab_start_index)
+
+        tp_size = int(processor.tp_size)
+        rows = int(values.shape[0])
+        gathered_values, gathered_ids = self._ensure_candidate_gather_buffers(
+            values, ids
+        )
+        all_gather_into_tensor(gathered_values, values.contiguous(), processor.tp_group)
+        all_gather_into_tensor(gathered_ids, ids.contiguous(), processor.tp_group)
+
+        # Rank-major to row-major, so one row's candidates from every rank sit
+        # side by side for the final selection.
+        gathered_values = (
+            gathered_values.view(tp_size, rows, top_k)
+            .transpose(0, 1)
+            .reshape(rows, tp_size * top_k)
+        )
+        gathered_ids = (
+            gathered_ids.view(tp_size, rows, top_k)
+            .transpose(0, 1)
+            .reshape(rows, tp_size * top_k)
+        )
+        # Sorted, so the surviving candidate order does not depend on which
+        # rank happened to contribute a value.
+        unary_logits, lanes = torch.topk(gathered_values, top_k, dim=-1, sorted=True)
+        candidate_ids = torch.gather(gathered_ids, 1, lanes)
+        if processor.final_logit_softcapping:
+            # Monotone in the logit, so it changes the scores the selector sees
+            # but never which candidates got here.
+            fused_softcap_generic(unary_logits, processor.final_logit_softcapping)
+        return candidate_ids, unary_logits.float()
 
     def _compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.candidate_logits_processor is None:
             raise RuntimeError("DFlash2 must be wired to the target before drafting.")
+        if self._distributed_topk_enabled:
+            return self._distributed_topk_candidates(hidden_states)
         metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
         logits = self.candidate_logits_processor._get_logits(
             hidden_states, self.lm_head, metadata
