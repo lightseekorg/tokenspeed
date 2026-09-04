@@ -29,19 +29,14 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
     qwen4_exp_qsa_block_topk,
-    qwen4_exp_qsa_complete_blocks,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_group_cache_locs,
     qwen4_exp_qsa_logical_layout,
     qwen4_exp_qsa_mqa_scores,
-    qwen4_exp_qsa_norm_rope,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_rope,
     qwen4_exp_qsa_selected_slots,
-    qwen4_exp_qsa_sparse_attention,
-    qwen4_exp_qsa_stage_draft,
-    qwen4_exp_qsa_stage_verify,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -67,63 +62,6 @@ def test_qwen4_exp_qsa_mqa_scores_matches_torch(device: str) -> None:
     expected.masked_fill_(columns >= valid_counts.unsqueeze(1), -float("inf"))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_qsa_sparse_attention_matches_torch(device: str) -> None:
-    torch.manual_seed(23)
-    rows, q_heads, kv_heads, head_dim, budget = 4, 8, 2, 64, 37
-    query = torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    key_cache = torch.randn(96, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    value_cache = torch.randn_like(key_cache)
-    selected = torch.randint(1, 96, (rows, budget), device=device, dtype=torch.int32)
-    selected[0, 13:] = -1
-    scale = head_dim**-0.5
-
-    actual = qwen4_exp_qsa_sparse_attention(
-        query,
-        key_cache,
-        value_cache,
-        selected,
-        scale=scale,
-    )
-    expected = torch.zeros_like(actual)
-    group_size = q_heads // kv_heads
-    for row in range(rows):
-        slots = selected[row][selected[row] > 0].long()
-        for head in range(q_heads):
-            kv_head = head // group_size
-            scores = query[row, head].float() @ key_cache[slots, kv_head].float().T
-            probabilities = torch.softmax(scores * scale, dim=-1)
-            expected[row, head] = (
-                probabilities.to(value_cache.dtype) @ value_cache[slots, kv_head]
-            )
-
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
-
-
-def test_qwen4_exp_qsa_sparse_attention_ignores_empty_selection_blocks(
-    device: str,
-) -> None:
-    query = torch.randn(2, 4, 16, device=device, dtype=torch.bfloat16)
-    key_cache = torch.randn(96, 1, 16, device=device, dtype=torch.bfloat16)
-    value_cache = torch.randn(96, 1, 16, device=device, dtype=torch.bfloat16)
-    selected = torch.full((2, 64), -1, device=device, dtype=torch.int32)
-    selected[0, 40:44] = torch.tensor([3, 9, 17, 25], device=device)
-
-    actual = qwen4_exp_qsa_sparse_attention(
-        query,
-        key_cache,
-        value_cache,
-        selected,
-        scale=16**-0.5,
-    )
-    slots = selected[0, 40:44].long()
-    scores = torch.einsum("hd,kd->hk", query[0].float(), key_cache[slots, 0].float())
-    probabilities = torch.softmax(scores * (16**-0.5), dim=-1)
-    expected_first = probabilities @ value_cache[slots, 0].float()
-
-    torch.testing.assert_close(actual[0].float(), expected_first, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]))
 
 
 def test_qwen4_exp_qsa_logical_layout_matches_torch(device: str) -> None:
@@ -266,15 +204,6 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_separate_kernels(
         draft_tags,
         torch.full_like(draft_tags, torch.iinfo(torch.int64).min),
     )
-
-
-def test_qwen4_exp_qsa_complete_blocks_matches_torch(device: str) -> None:
-    positions = torch.tensor([0, 3, 4, 17], device=device, dtype=torch.long)
-
-    actual = qwen4_exp_qsa_complete_blocks(positions, 4)
-    expected = ((positions + 1) // 4).to(torch.int32)
-
-    torch.testing.assert_close(actual, expected)
 
 
 def _ref_compress_pool(
@@ -435,15 +364,19 @@ def test_qwen4_exp_qsa_fused_query_and_verify_staging_matches_separate(
     )
     actual_compressed = torch.zeros_like(expected_compressed)
 
-    expected_query = qwen4_exp_qsa_norm_rope(
-        query,
-        positions,
-        q_weight,
-        1e-6,
-        cos_sin_cache,
-        num_heads=heads,
-        sections=sections,
+    query_heads = query.float().reshape(rows, heads, head_dim)
+    normalized_query = (
+        query_heads
+        * torch.rsqrt(query_heads.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * q_weight
     )
+    expected_query = _ref_rope(
+        normalized_query,
+        positions,
+        cos_sin_cache,
+        rotary_dim,
+        sections,
+    ).to(query.dtype)
     qwen4_exp_qsa_compress_and_store(
         token_k,
         logical,
@@ -558,15 +491,12 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
         draft_position_cache=expected_scratch[1],
         draft_logical_positions=expected_scratch[2],
     )
-    qwen4_exp_qsa_stage_draft(
-        token_k,
-        position_values,
-        logical,
-        requests,
-        recent_locs,
-        *expected_scratch,
-        ratio,
-    )
+    scratch_slots = torch.remainder(logical, ratio).long()
+    request_rows = requests.long()
+    expected_scratch[0][request_rows, scratch_slots] = token_k
+    expected_scratch[2][request_rows, scratch_slots] = logical
+    starts = scratch_slots == 0
+    expected_scratch[1][request_rows[starts]] = position_values[starts]
     qwen4_exp_qsa_compress_and_store(
         token_k,
         logical,
@@ -771,79 +701,6 @@ def test_qwen4_exp_qsa_recent_write_honors_explicit_mask(device: str) -> None:
     torch.testing.assert_close(
         position_cache[1], torch.zeros(3, device=device, dtype=torch.int64)
     )
-
-
-def test_qwen4_exp_qsa_stage_verify_matches_copies(device: str) -> None:
-    torch.manual_seed(41)
-    bs, width, head_dim = 3, 8, 128
-    rows = bs * width
-    # Trailing slices of larger buffers, exactly like the indexer's verify
-    # path; the positions view is the transposed mrope layout with strides
-    # (1, total_rows), so the fused copy must gather, not memcpy.
-    token_k = torch.randn(rows + 5, 1, head_dim, device=device, dtype=torch.bfloat16)[
-        -rows:
-    ]
-    rope_positions = torch.randint(
-        0, 4096, (3, rows + 5), device=device, dtype=torch.int64
-    )
-    position_values = rope_positions.T[-rows:]
-    logical_positions = torch.arange(
-        1000, 1000 + rows + 5, device=device, dtype=torch.int64
-    )[-rows:]
-    recent_locs = torch.randint(1, 4096, (rows + 5,), device=device, dtype=torch.int32)[
-        -rows:
-    ]
-    staged = (
-        token_k.new_empty((bs, width, 1, head_dim)),
-        position_values.new_empty((bs, width, 3)),
-        logical_positions.new_empty((bs, width)),
-        recent_locs.new_empty((bs, width)),
-    )
-    expected = tuple(tensor.clone() for tensor in staged)
-
-    qwen4_exp_qsa_stage_verify(
-        token_k, position_values, logical_positions, recent_locs, *staged
-    )
-
-    expected[0].copy_(token_k.view_as(expected[0]))
-    expected[1].copy_(position_values.view_as(expected[1]))
-    expected[2].copy_(logical_positions.view_as(expected[2]))
-    expected[3].copy_(recent_locs.view_as(expected[3]))
-    for actual, reference in zip(staged, expected):
-        torch.testing.assert_close(actual, reference)
-
-
-def test_qwen4_exp_qsa_stage_verify_handles_expanded_positions(
-    device: str,
-) -> None:
-    torch.manual_seed(43)
-    bs, width, head_dim = 2, 4, 64
-    rows = bs * width
-    # One-dimensional scheduler positions expand to a stride-zero
-    # ``[rows, 3]`` view; all three axes must land in the staged buffer.
-    token_k = torch.randn(rows, 1, head_dim, device=device, dtype=torch.float16)
-    positions = torch.arange(rows, device=device, dtype=torch.int64)
-    position_values = positions.unsqueeze(0).expand(3, -1).reshape(3, -1).T
-    logical_positions = torch.arange(512, 512 + rows, device=device, dtype=torch.int64)
-    recent_locs = torch.randint(1, 1024, (rows,), device=device, dtype=torch.int32)
-    staged = (
-        token_k.new_empty((bs, width, 1, head_dim)),
-        position_values.new_empty((bs, width, 3)),
-        logical_positions.new_empty((bs, width)),
-        recent_locs.new_empty((bs, width)),
-    )
-
-    qwen4_exp_qsa_stage_verify(
-        token_k, position_values, logical_positions, recent_locs, *staged
-    )
-
-    torch.testing.assert_close(staged[0], token_k.reshape(bs, width, 1, head_dim))
-    torch.testing.assert_close(
-        staged[1],
-        positions.unsqueeze(-1).expand(rows, 3).reshape(bs, width, 3),
-    )
-    torch.testing.assert_close(staged[2], logical_positions.reshape(bs, width))
-    torch.testing.assert_close(staged[3], recent_locs.reshape(bs, width))
 
 
 @pytest.mark.parametrize("splits", [1, 3, 13, 16])
@@ -1433,42 +1290,6 @@ def test_qwen4_exp_qsa_mqa_scores_reads_strided_inputs(device: str) -> None:
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_qwen4_exp_qsa_sparse_attention_reads_strided_inputs(device: str) -> None:
-    torch.manual_seed(47)
-    rows, q_heads, kv_heads, head_dim, budget = 4, 8, 2, 64, 29
-    wide = torch.randn(rows, 2 * q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    query = wide[:, :q_heads]
-    key_cache = torch.randn(96, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    value_cache = torch.randn_like(key_cache)
-    slot_grid = torch.randint(
-        1, 96, (rows, 2, budget), device=device, dtype=torch.int64
-    )
-    selected = slot_grid[:, 1]
-    selected[0, 17:] = -1
-    scale = head_dim**-0.5
-
-    actual = qwen4_exp_qsa_sparse_attention(
-        query,
-        key_cache,
-        value_cache,
-        selected,
-        scale=scale,
-    )
-    expected = torch.zeros_like(actual)
-    group_size = q_heads // kv_heads
-    for row in range(rows):
-        slots = selected[row][selected[row] > 0].long()
-        for head in range(q_heads):
-            kv_head = head // group_size
-            scores = query[row, head].float() @ key_cache[slots, kv_head].float().T
-            probabilities = torch.softmax(scores * scale, dim=-1)
-            expected[row, head] = (
-                probabilities.to(value_cache.dtype) @ value_cache[slots, kv_head]
-            )
-
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
-
-
 def test_qwen4_exp_qsa_block_topk_reads_strided_query(device: str) -> None:
     torch.manual_seed(53)
     rows, heads, head_dim, page_size = 3, 4, 16, 64
@@ -1597,84 +1418,6 @@ def test_qwen4_exp_qsa_recent_write_reads_strided_token_k(device: str) -> None:
     raw, positions = run(token_k, True)
     torch.testing.assert_close(raw, expected_raw)
     torch.testing.assert_close(positions, expected_positions)
-
-
-def test_qwen4_exp_qsa_norm_rope_matches_torch(device: str) -> None:
-    torch.manual_seed(19)
-    tokens, heads, head_dim, rotary_dim = 5, 3, 16, 8
-    norm_weight = torch.rand(head_dim, device=device) + 0.5
-    epsilon = 1e-6
-    cos_sin_cache = torch.randn(32, rotary_dim, device=device)
-    positions = torch.randint(0, 32, (tokens,), device=device)
-    wide = torch.randn(
-        tokens, heads * head_dim + 4, device=device, dtype=torch.bfloat16
-    )
-
-    def reference(region):
-        x = region.float().view(tokens, heads, head_dim)
-        normed = (
-            x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + epsilon) * norm_weight
-        )
-        return _ref_rope(normed, positions, cos_sin_cache, rotary_dim)
-
-    contiguous = wide[:, : heads * head_dim].contiguous()
-    actual = qwen4_exp_qsa_norm_rope(
-        contiguous, positions, norm_weight, epsilon, cos_sin_cache, num_heads=heads
-    )
-    torch.testing.assert_close(
-        actual.float(), reference(contiguous), rtol=2e-2, atol=2e-2
-    )
-
-    # The same result must come out of the strided GEMM-view split.
-    strided = wide[:, : heads * head_dim]
-    actual_strided = qwen4_exp_qsa_norm_rope(
-        strided, positions, norm_weight, epsilon, cos_sin_cache, num_heads=heads
-    )
-    torch.testing.assert_close(
-        actual_strided.float(), reference(strided), rtol=2e-2, atol=2e-2
-    )
-
-
-def test_qwen4_exp_qsa_norm_rope_reads_strided_positions(device: str) -> None:
-    torch.manual_seed(67)
-    tokens, heads, head_dim, rotary_dim = 4, 3, 16, 8
-    norm_weight = torch.rand(head_dim, device=device) + 0.5
-    cos_sin_cache = torch.randn(32, rotary_dim, device=device)
-    inputs = torch.randn(tokens, heads * head_dim, device=device, dtype=torch.bfloat16)
-    # Strided int32 positions: every other element of a wider grid.
-    grid = torch.randint(0, 32, (tokens, 2), device=device, dtype=torch.int32)
-    positions = grid[:, 1]
-    assert not positions.is_contiguous()
-
-    actual = qwen4_exp_qsa_norm_rope(
-        inputs, positions, norm_weight, 1e-6, cos_sin_cache, num_heads=heads
-    )
-    packed = qwen4_exp_qsa_norm_rope(
-        inputs,
-        positions.contiguous().long(),
-        norm_weight,
-        1e-6,
-        cos_sin_cache,
-        num_heads=heads,
-    )
-    torch.testing.assert_close(actual, packed, rtol=2e-2, atol=2e-2)
-
-    # Strided ``[3, tokens]`` positions exercise the axis stride path too.
-    mrope = torch.randint(0, 32, (3, 2 * tokens), device=device, dtype=torch.int32)[
-        :, 1::2
-    ]
-    actual_mrope = qwen4_exp_qsa_norm_rope(
-        inputs, mrope, norm_weight, 1e-6, cos_sin_cache, num_heads=heads
-    )
-    packed_mrope = qwen4_exp_qsa_norm_rope(
-        inputs,
-        mrope.contiguous().long(),
-        norm_weight,
-        1e-6,
-        cos_sin_cache,
-        num_heads=heads,
-    )
-    torch.testing.assert_close(actual_mrope, packed_mrope, rtol=2e-2, atol=2e-2)
 
 
 def test_qwen4_exp_qsa_rope_reads_strided_inputs(device: str) -> None:

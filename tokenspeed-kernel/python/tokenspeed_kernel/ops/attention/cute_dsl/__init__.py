@@ -33,7 +33,7 @@ try:
 
     HAS_QSA_SPARSE = True
 except ImportError:
-    # The portable Triton QSA registration remains available without CuTe DSL.
+    # Keep importing the attention package when CuTe DSL is unavailable.
     cute_dsl_blackwell_qsa_sparse_attention = error_fn
     HAS_QSA_SPARSE = False
 

@@ -20,21 +20,13 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import qsa_sparse_attention
-from tokenspeed_kernel.ops.attention.triton.qsa_sparse import (
-    prepare_qsa_sparse_indices,
-)
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
-    get_flashinfer_qsa_sparse_runner,
-)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="QSA sparse attention requires CUDA or ROCm"
@@ -65,59 +57,6 @@ def _reference(
             scores = q[row, head].float() @ keys.T
             output[row, head] = torch.softmax(scores * scale, dim=-1) @ values
     return output.to(q.dtype)
-
-
-def test_prepare_qsa_sparse_indices_packs_little_endian_mask(device: str) -> None:
-    selected = torch.tensor(
-        [
-            [1, -1, 3, 0, 5, 6, -4, 8, 9, 10, 11],
-            [-1, 2, -1, 4, -1, 6, -1, 8, -1, 10, -1],
-        ],
-        dtype=torch.int32,
-        device=device,
-    )
-    indices = torch.empty_like(selected)
-    packed = torch.empty(
-        (selected.shape[0] * math.ceil(selected.shape[1] / 8),),
-        dtype=torch.uint8,
-        device=device,
-    )
-
-    prepare_qsa_sparse_indices(selected, indices, packed)
-
-    torch.testing.assert_close(indices, selected.clamp_min(0))
-    packed_rows = packed.view(selected.shape[0], -1)
-    bit_offsets = torch.arange(8, device=device)
-    unpacked = ((packed_rows[..., None] >> bit_offsets) & 1).reshape(
-        selected.shape[0], -1
-    )[:, : selected.shape[1]]
-    torch.testing.assert_close(unpacked.bool(), selected > 0)
-
-
-def test_qsa_sparse_attention_triton_dispatch_matches_reference(device: str) -> None:
-    torch.manual_seed(31)
-    rows, q_heads, kv_heads, head_dim, width = 2, 4, 1, 32, 37
-    q = torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k_cache = torch.randn(96, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    v_cache = torch.randn_like(k_cache)
-    selected = torch.randint(1, 96, (rows, width), device=device, dtype=torch.int32)
-    selected[0, 17:] = -1
-    scale = head_dim**-0.5
-
-    actual = qsa_sparse_attention(
-        q,
-        k_cache,
-        v_cache,
-        selected,
-        scale=scale,
-    )
-
-    torch.testing.assert_close(
-        actual.float(),
-        _reference(q, k_cache, v_cache, selected, scale).float(),
-        rtol=2e-2,
-        atol=2e-2,
-    )
 
 
 def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> None:
@@ -291,105 +230,3 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
         rtol=3.5e-2,
         atol=3.5e-2,
     )
-
-
-@pytest.mark.parametrize("rows", [1, 4])
-def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
-    device: str,
-    rows: int,
-) -> None:
-    platform = current_platform()
-    specs = KernelRegistry.get().get_for_operator(
-        "attention",
-        "qsa_sparse_attention",
-        platform=platform,
-        solution="flashinfer",
-    )
-    if not platform.is_blackwell or not specs:
-        pytest.skip("FlashInfer QSA FA2 specialization requires NVIDIA Blackwell")
-    pytest.importorskip("flashinfer.sparse")
-
-    torch.manual_seed(37 + rows)
-    cache_slots, q_heads, kv_heads, head_dim, width = 4096, 6, 1, 256, 2051
-    q = torch.randn(rows, q_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k_cache = (
-        torch.randn(
-            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
-        )
-        * 0.25
-    ).to(torch.float8_e4m3fn)
-    v_cache = (
-        torch.randn(
-            cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
-        )
-        * 0.25
-    ).to(torch.float8_e4m3fn)
-    selected = torch.full((rows, width), -1, dtype=torch.int32, device=device)
-    for row in range(rows):
-        suffix = (row % 4) + 1
-        prefix = 1424 if suffix < 4 else 1428
-        selected[row, :prefix] = torch.randint(
-            1, cache_slots, (prefix,), dtype=torch.int32, device=device
-        )
-        if suffix < 4:
-            suffix_start = width - 3
-            selected[row, suffix_start : suffix_start + suffix] = torch.randint(
-                1, cache_slots, (suffix,), dtype=torch.int32, device=device
-            )
-    scale = head_dim**-0.5
-    runner = get_flashinfer_qsa_sparse_runner(q.device)
-
-    first = qsa_sparse_attention(
-        q,
-        k_cache,
-        v_cache,
-        selected,
-        scale=scale,
-        k_scale=1.0,
-        v_scale=1.0,
-        solution="flashinfer",
-    )
-    planned = runner.plan_count
-    selected[:, :256] = torch.randint(
-        1, cache_slots, (rows, 256), dtype=torch.int32, device=device
-    )
-    if rows > 1:
-        selected[-1].fill_(-1)
-    k_scale, v_scale = 0.5, 0.25
-    second = qsa_sparse_attention(
-        q,
-        k_cache,
-        v_cache,
-        selected,
-        scale=scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        solution="flashinfer",
-    )
-
-    assert runner.plan_count == planned
-    assert torch.isfinite(first).all()
-    torch.testing.assert_close(
-        second.float(),
-        _reference(
-            q,
-            k_cache,
-            v_cache,
-            selected,
-            scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        ).float(),
-        rtol=3e-2,
-        atol=3e-2,
-    )
-    matching_plans = [
-        plan
-        for key, plan in runner._plans.items()
-        if key.rows == rows
-        and key.width == width
-        and key.cache_slots == cache_slots
-        and key.num_q_heads == q_heads
-    ]
-    assert len(matching_plans) == 1
-    assert matching_plans[0].wrapper._backend == "fa2"

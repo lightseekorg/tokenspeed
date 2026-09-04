@@ -29,15 +29,12 @@ from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention import qsa_sparse_attention
 from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_block_topk,
-    qwen4_exp_qsa_complete_blocks,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_group_cache_locs,
     qwen4_exp_qsa_logical_layout,
-    qwen4_exp_qsa_norm_rope,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_selected_slots,
-    qwen4_exp_qsa_stage_verify,
 )
 from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.platform import pdl_enabled
@@ -422,28 +419,6 @@ class QSAIndexer(nn.Module):
         k = k.reshape(-1, 1, self.index_head_dim)
         return q, k
 
-    def _project_qk(self, hidden_states, positions):
-        q, k = self._project_qk_raw(hidden_states)
-        rotary = self.rotary_emb
-        if not rotary.is_neox_style:
-            raise ValueError("QSA indexer RoPE requires neox-style embeddings")
-        sections = getattr(rotary, "mrope_section", None)
-        # Fused per-head Gemma RMSNorm + neox RoPE straight off the GEMM
-        # view; raw keys stay unnormalized until all members of a
-        # compression group have been averaged, matching the checkpoint
-        # reference.
-        q = qwen4_exp_qsa_norm_rope(
-            q,
-            positions,
-            self.q_layernorm.gemma_weight,
-            self.q_layernorm.variance_epsilon,
-            rotary.cos_sin_cache,
-            num_heads=self.index_n_heads,
-            sections=(tuple(sections) if positions.ndim == 2 and sections else None),
-            interleaved=bool(getattr(rotary, "mrope_interleaved", False)),
-        )
-        return q, k
-
     @staticmethod
     def _position_values(rope_positions: torch.Tensor) -> torch.Tensor:
         """Reshape positions to ``[tokens, 3]`` as a strided, cast-free view."""
@@ -508,35 +483,6 @@ class QSAIndexer(nn.Module):
         self._active_verify_width = width
         self._last_pool = pool
         return scratch
-
-    def _stage_verified(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        logical_positions: torch.Tensor,
-        recent_locs: torch.Tensor,
-        bs: int,
-        pool,
-    ) -> None:
-        """Stage target-verify candidates until their accepted width is known."""
-
-        scratch = self._verify_scratch_buffers(
-            token_k,
-            position_values,
-            logical_positions,
-            recent_locs,
-            bs,
-            pool,
-        )
-        # Direct callers retain the standalone fused copy; the hot forward
-        # path folds these stores into Q/K preparation below.
-        qwen4_exp_qsa_stage_verify(
-            token_k,
-            position_values,
-            logical_positions,
-            recent_locs,
-            *scratch,
-        )
 
     def _draft_scratch_buffers(
         self,
@@ -740,8 +686,8 @@ class QSAIndexer(nn.Module):
         compressed: torch.Tensor,
         *,
         full_page_size: int,
+        complete_blocks: torch.Tensor,
         qsa_page_expansion: int = 1,
-        complete_blocks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Select logical QSA blocks and emit physical full-cache slots."""
 
@@ -749,10 +695,6 @@ class QSAIndexer(nn.Module):
         if q.shape[0] == 0:
             return torch.empty((0, output_width), dtype=torch.int32, device=q.device)
         page_size = compressed.shape[1]
-        if complete_blocks is None:
-            complete_blocks = qwen4_exp_qsa_complete_blocks(
-                logical_positions, self.compress_ratio
-            )
         cache = compressed.view(-1, 1, self.index_head_dim)
         # Auto normally materializes scores for persistent radix selection;
         # oversized matrices retain the zero-materialization streaming path.

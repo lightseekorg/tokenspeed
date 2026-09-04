@@ -25,7 +25,6 @@ from functools import wraps
 from inspect import signature
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer.qsa_sparse  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,

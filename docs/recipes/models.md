@@ -718,42 +718,6 @@ object:
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
-For the default 512-block QSA selection, the materialized-logits path uses a
-native CUDA persistent radix-select specialization on NVIDIA GPUs. Other top-k
-sizes and platforms retain the portable top-k fallback.
-
-QSA block expansion maps selected logical tokens directly to physical KV-cache
-slots. Sparse attention therefore keeps a backend-neutral direct-slot API and
-does not materialize a second logical layout or a separate logical-token
-selection table. When the full-attention cache uses NVIDIA E4M3 FP8, QSA also
-quantizes and scatters K/V into that cache in one launch.
-
-On NVIDIA B200, the TP4 QSA decode geometry (six query heads, one KV head,
-256-wide heads, and a 2051-token sparse budget) uses an adaptive CuTe DSL
-cluster specialization for BF16 queries with FP8 E4M3 KV cache at every
-positive batch size. Launches with at most eight query rows use eight
-selected-token-split CTAs to expose enough parallelism; larger launches use
-four CTAs. Each CTA uses 16-byte asynchronous KV loads. On both paths, K and V
-share a two-stage ``cp.async`` ring that overlaps loads and FP8 conversion with
-the KQ/PV UMMA pipeline. Both paths combine partial softmax states through
-distributed shared memory in the same launch. The eight-CTA path assigns one
-Q-head reduction to each of six cluster ranks, avoiding a gather to rank zero;
-the four-CTA path retains its compact rank-zero combine. They read physical
-slots directly and allocate neither a packed KV buffer nor global split
-intermediates.
-FlashInfer FA2 remains available through an explicit solution override;
-unsupported shapes or installations without CuTe DSL retain the Triton
-direct-slot path.
-
-The comparison benchmark includes single-row decode and BS1/4/8/16/32/64 with
-MTP3. MTP3 adds three draft rows to the base query, so those cases use 4, 16,
-32, 64, 128, and 256 total query rows respectively:
-
-```bash
-PYTHONPATH=tokenspeed-kernel/python python \
-  tokenspeed-kernel/test/ops/bench_qsa_sparse_attention.py
-```
-
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

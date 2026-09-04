@@ -36,7 +36,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.testing as testing
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
@@ -57,14 +56,12 @@ warpgroup_threads = 128
 
 # Math helpers
 log2_e = math.log2(math.e)  # change exponential base
-use_tensor_ssa_math = False  # experimental
 fadd2 = cute.arch.add_packed_f32x2
 fmul2 = cute.arch.mul_packed_f32x2
 ffma2 = cute.arch.fma_packed_f32x2
 exp2 = partial(cute.math.exp2, fastmath=True)
 warp_fmax = partial(cute.arch.warp_redux_sync, kind="fmax", nan=True)
 smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
-gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
 
 
 @dsl_user_op
@@ -133,7 +130,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         grouped_head_tile,  # GQA packing tile size, can be less than group size
         convert_warpgroups=1,  # Multiple warpgroups striding on convert stages
         kv_splits=4,
-        use_kv_ring=True,
     ):
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
@@ -141,7 +137,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.scaledim = headdim // block_scaledim
         self.convert_warpgroups = convert_warpgroups
         self.kv_splits = kv_splits
-        self.use_kv_ring = use_kv_ring
 
         assert headdim % block_scaledim == 0
         assert grouped_head_tile % 8 == 0 and 0 < grouped_head_tile <= 32
@@ -188,41 +183,6 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.sp_stages = 2
         self.o_stages = 1
         self.kv_ring_stages = 2
-
-    def can_implement(
-        self,
-        problem_shape,
-        kv_splits,
-        q_dtype,
-        kv_dtype,
-        o_dtype,
-        acc_dtype,
-    ):
-        b, h_q, h_k, s_k, d = problem_shape
-
-        if kv_dtype is cutlass.Float8E4M3:
-            raise ValueError("use Float8E4M3FN instead of Float8E4M3")
-
-        if d % 64 != 0:
-            raise testing.CantImplementError(f"headdim({d}) must be multiple of 64")
-
-        if h_q % h_k != 0:
-            raise testing.CantImplementError(
-                f"heads_q({h_q}) must be a multiple of heads_k({h_k})"
-            )
-
-        align_scale_bits = 128  # TMA requirement
-        if self.scaledim * q_dtype.width < align_scale_bits:
-            align_seq = align_scale_bits // (self.scaledim * q_dtype.width)
-            if s_k % align_seq != 0:
-                raise testing.CantImplementError(
-                    f"seqlen({s_k}) must be a multiple of {align_seq}"
-                )
-
-        if kv_dtype.width < 8 and d % 128 != 0:  # TMA requirement
-            raise testing.CantImplementError(
-                f"headdim({d}) must be multiple of 128 for {kv_dtype} KV"
-            )
 
     @cute.jit
     def _issue_sparse_tile(
@@ -368,8 +328,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.kv_stages = (
             min(self.kv_stages, max_kv_stages) if cap_kv_stages else self.kv_stages
         )
-        if self.use_kv_ring:
-            assert self.kv_stages >= self.kv_ring_stages * self.convert_warpgroups
+        assert self.kv_stages >= self.kv_ring_stages * self.convert_warpgroups
 
         ##############################
         # TMA creation
@@ -847,21 +806,20 @@ class MixedInputFusedMultiHeadAttentionDecode:
             tVsV = thr_load_v.partition_S(tAsV)
             tVrV_shape = thr_load_v.partition_D(tAsV).shape[:-1]
 
-            if cutlass.const_expr(self.use_kv_ring):
-                # Prime the unified K-or-V ring with K0. Each conversion
-                # warpgroup owns one 128-D half of every logical ring item.
-                self._issue_sparse_tile(
-                    k_iter,
-                    selected_slots,
-                    coord_hb,
-                    kv_split_idx,
-                    convert_phase * mma_tile_k,
-                    sKV_vector_address,
-                    convert_phase,
-                    warpgroup_tidx,
-                    lane_idx,
-                    kv_smem_dtype,
-                )
+            # Prime the unified K-or-V ring with K0. Each conversion
+            # warpgroup owns one 128-D half of every logical ring item.
+            self._issue_sparse_tile(
+                k_iter,
+                selected_slots,
+                coord_hb,
+                kv_split_idx,
+                convert_phase * mma_tile_k,
+                sKV_vector_address,
+                convert_phase,
+                warpgroup_tidx,
+                lane_idx,
+                kv_smem_dtype,
+            )
 
             #
             # Sequence loop
@@ -869,60 +827,42 @@ class MixedInputFusedMultiHeadAttentionDecode:
             for s in cutlass.range(prefetch_iters + iters_s):
                 if s < iters_s:
                     # Convert and scale K
-                    for dk in cutlass.range(
+                    for _ in cutlass.range(
                         tiles_dk // self.convert_warpgroups, unroll=2
                     ):
-                        if cutlass.const_expr(self.use_kv_ring):
-                            # Issue the next logical K-or-V item before
-                            # consuming K_s. One pending cp.async group
-                            # overlaps its latency with conversion and UMMA.
-                            if s == 0:
-                                self._issue_sparse_tile(
-                                    k_iter,
-                                    selected_slots,
-                                    coord_hb,
-                                    kv_split_idx + kv_splits,
-                                    convert_phase * mma_tile_k,
-                                    sKV_vector_address,
-                                    self.convert_warpgroups + convert_phase,
-                                    warpgroup_tidx,
-                                    lane_idx,
-                                    kv_smem_dtype,
-                                )
-                            else:
-                                self._issue_sparse_tile(
-                                    v_iter,
-                                    selected_slots,
-                                    coord_hb,
-                                    kv_split_idx + (s - 1) * kv_splits,
-                                    convert_phase * mma_tile_m,
-                                    sKV_vector_address,
-                                    convert_phase,
-                                    warpgroup_tidx,
-                                    lane_idx,
-                                    kv_smem_dtype,
-                                )
-                            cute.arch.cp_async_wait_group(1)
-                            k_smem_stage = convert_phase
-                            if s > 0:
-                                k_smem_stage = self.convert_warpgroups + convert_phase
-                        else:
-                            coord_dk = dk * self.convert_warpgroups + convert_phase
-                            selected_tile = kv_split_idx + s * kv_splits
+                        # Issue the next logical K-or-V item before
+                        # consuming K_s. One pending cp.async group overlaps
+                        # its latency with conversion and UMMA.
+                        if s == 0:
                             self._issue_sparse_tile(
                                 k_iter,
                                 selected_slots,
                                 coord_hb,
-                                selected_tile,
-                                coord_dk * mma_tile_k,
+                                kv_split_idx + kv_splits,
+                                convert_phase * mma_tile_k,
+                                sKV_vector_address,
+                                self.convert_warpgroups + convert_phase,
+                                warpgroup_tidx,
+                                lane_idx,
+                                kv_smem_dtype,
+                            )
+                        else:
+                            self._issue_sparse_tile(
+                                v_iter,
+                                selected_slots,
+                                coord_hb,
+                                kv_split_idx + (s - 1) * kv_splits,
+                                convert_phase * mma_tile_m,
                                 sKV_vector_address,
                                 convert_phase,
                                 warpgroup_tidx,
                                 lane_idx,
                                 kv_smem_dtype,
                             )
-                            cute.arch.cp_async_wait_group(0)
-                            k_smem_stage = convert_phase
+                        cute.arch.cp_async_wait_group(1)
+                        k_smem_stage = convert_phase
+                        if s > 0:
+                            k_smem_stage = self.convert_warpgroups + convert_phase
                         cvt_load_nbar.arrive_and_wait()
 
                         tKrK = cute.make_rmem_tensor(tKrK_shape, kv_smem_dtype)
@@ -963,64 +903,44 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 if s >= prefetch_iters:
                     # Convert and scale V
-                    for dmsk in cutlass.range(
+                    for _ in cutlass.range(
                         tiles_dm * tiles_sk // self.convert_warpgroups, unroll=2
                     ):
-                        if cutlass.const_expr(self.use_kv_ring):
-                            # V_(s-1) is resident/in flight. Refill the other
-                            # ring slot with K_(s+1), or the final V item.
-                            if s < iters_s:
-                                if s + 1 < iters_s:
-                                    self._issue_sparse_tile(
-                                        k_iter,
-                                        selected_slots,
-                                        coord_hb,
-                                        kv_split_idx + (s + 1) * kv_splits,
-                                        convert_phase * mma_tile_k,
-                                        sKV_vector_address,
-                                        self.convert_warpgroups + convert_phase,
-                                        warpgroup_tidx,
-                                        lane_idx,
-                                        kv_smem_dtype,
-                                    )
-                                else:
-                                    self._issue_sparse_tile(
-                                        v_iter,
-                                        selected_slots,
-                                        coord_hb,
-                                        kv_split_idx + s * kv_splits,
-                                        convert_phase * mma_tile_m,
-                                        sKV_vector_address,
-                                        self.convert_warpgroups + convert_phase,
-                                        warpgroup_tidx,
-                                        lane_idx,
-                                        kv_smem_dtype,
-                                    )
-                                cute.arch.cp_async_wait_group(1)
+                        # V_(s-1) is resident/in flight. Refill the other
+                        # ring slot with K_(s+1), or the final V item.
+                        if s < iters_s:
+                            if s + 1 < iters_s:
+                                self._issue_sparse_tile(
+                                    k_iter,
+                                    selected_slots,
+                                    coord_hb,
+                                    kv_split_idx + (s + 1) * kv_splits,
+                                    convert_phase * mma_tile_k,
+                                    sKV_vector_address,
+                                    self.convert_warpgroups + convert_phase,
+                                    warpgroup_tidx,
+                                    lane_idx,
+                                    kv_smem_dtype,
+                                )
                             else:
-                                cute.arch.cp_async_wait_group(0)
-                            v_smem_stage = convert_phase
-                            if s == iters_s:
-                                v_smem_stage = self.convert_warpgroups + convert_phase
+                                self._issue_sparse_tile(
+                                    v_iter,
+                                    selected_slots,
+                                    coord_hb,
+                                    kv_split_idx + s * kv_splits,
+                                    convert_phase * mma_tile_m,
+                                    sKV_vector_address,
+                                    self.convert_warpgroups + convert_phase,
+                                    warpgroup_tidx,
+                                    lane_idx,
+                                    kv_smem_dtype,
+                                )
+                            cute.arch.cp_async_wait_group(1)
                         else:
-                            coord_dmsk = dmsk * self.convert_warpgroups + convert_phase
-                            coord_dm = coord_dmsk % tiles_dm
-                            v_iteration = s - prefetch_iters
-                            selected_tile = kv_split_idx + v_iteration * kv_splits
-                            self._issue_sparse_tile(
-                                v_iter,
-                                selected_slots,
-                                coord_hb,
-                                selected_tile,
-                                coord_dm * mma_tile_m,
-                                sKV_vector_address,
-                                convert_phase,
-                                warpgroup_tidx,
-                                lane_idx,
-                                kv_smem_dtype,
-                            )
                             cute.arch.cp_async_wait_group(0)
-                            v_smem_stage = convert_phase
+                        v_smem_stage = convert_phase
+                        if s == iters_s:
+                            v_smem_stage = self.convert_warpgroups + convert_phase
                         cvt_load_nbar.arrive_and_wait()
 
                         tVrV = cute.make_rmem_tensor(tVrV_shape, kv_smem_dtype)
@@ -1290,27 +1210,19 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 # Compute online softmax
                 tSrP = cute.make_rmem_tensor(tSsP.shape[:-1], mma_dtype)
-                if cutlass.const_expr(use_tensor_ssa_math):
-                    tSrP_f32 = exp2(scale_qs_log2_e * (tSrS.load() - tSrM.load()))
-                    tSrP.store(tSrP_f32.to(mma_dtype))  # convert
-                else:
-                    tSrP_f32 = cute.make_rmem_tensor(tSrS.shape, acc_dtype)
-                    for i in cutlass.range_constexpr(0, cute.size(tSrS), 2):
-                        p_f32x2 = fadd2(
-                            (tSrS[i], tSrS[i + 1]), (-tSrM[i], -tSrM[i + 1])
-                        )
-                        p_f32x2 = fmul2(p_f32x2, (scale_qs_log2_e, scale_qs_log2_e))
-                        tSrP_f32[i] = (
-                            exp2(p_f32x2[0])
-                            if tSrValid[i] != 0
-                            else cutlass.Float32(0.0)
-                        )
-                        tSrP_f32[i + 1] = (
-                            exp2(p_f32x2[1])
-                            if tSrValid[i + 1] != 0
-                            else cutlass.Float32(0.0)
-                        )
-                    tSrP.store(tSrP_f32.load().to(mma_dtype))
+                tSrP_f32 = cute.make_rmem_tensor(tSrS.shape, acc_dtype)
+                for i in cutlass.range_constexpr(0, cute.size(tSrS), 2):
+                    p_f32x2 = fadd2((tSrS[i], tSrS[i + 1]), (-tSrM[i], -tSrM[i + 1]))
+                    p_f32x2 = fmul2(p_f32x2, (scale_qs_log2_e, scale_qs_log2_e))
+                    tSrP_f32[i] = (
+                        exp2(p_f32x2[0]) if tSrValid[i] != 0 else cutlass.Float32(0.0)
+                    )
+                    tSrP_f32[i + 1] = (
+                        exp2(p_f32x2[1])
+                        if tSrValid[i + 1] != 0
+                        else cutlass.Float32(0.0)
+                    )
+                tSrP.store(tSrP_f32.load().to(mma_dtype))
 
                 # Store P to smem
                 p_handle = p_producer.acquire_and_advance()
@@ -1319,28 +1231,22 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 p_handle.commit()
 
                 # Compute correction and correct colsum
-                if cutlass.const_expr(use_tensor_ssa_math):
-                    correction = exp2(
-                        scale_qs_log2_e * (tSrM_prev.load() - tSrM.load())
+                correction = cute.make_rmem_tensor_like(tSrM)
+                for i in cutlass.range_constexpr(0, cute.size(tSrM), 2):
+                    c_f32x2 = fadd2(
+                        (tSrM_prev[i], tSrM_prev[i + 1]), (-tSrM[i], -tSrM[i + 1])
                     )
-                    tSrL.store(tSrL.load() * correction + tSrP_f32)
-                else:
-                    correction = cute.make_rmem_tensor_like(tSrM)
-                    for i in cutlass.range_constexpr(0, cute.size(tSrM), 2):
-                        c_f32x2 = fadd2(
-                            (tSrM_prev[i], tSrM_prev[i + 1]), (-tSrM[i], -tSrM[i + 1])
-                        )
-                        c_f32x2 = fmul2(c_f32x2, (scale_qs_log2_e, scale_qs_log2_e))
-                        c_f32x2 = (exp2(c_f32x2[0]), exp2(c_f32x2[1]))
-                        correction[i] = c_f32x2[0]
-                        correction[i + 1] = c_f32x2[1]
-                        l_f32x2 = ffma2(
-                            c_f32x2,
-                            (tSrL[i], tSrL[i + 1]),
-                            (tSrP_f32[i], tSrP_f32[i + 1]),
-                        )
-                        tSrL[i] = l_f32x2[0]
-                        tSrL[i + 1] = l_f32x2[1]
+                    c_f32x2 = fmul2(c_f32x2, (scale_qs_log2_e, scale_qs_log2_e))
+                    c_f32x2 = (exp2(c_f32x2[0]), exp2(c_f32x2[1]))
+                    correction[i] = c_f32x2[0]
+                    correction[i + 1] = c_f32x2[1]
+                    l_f32x2 = ffma2(
+                        c_f32x2,
+                        (tSrL[i], tSrL[i + 1]),
+                        (tSrP_f32[i], tSrP_f32[i + 1]),
+                    )
+                    tSrL[i] = l_f32x2[0]
+                    tSrL[i + 1] = l_f32x2[1]
 
                 # Correct O
                 if s > 0:
@@ -1629,7 +1535,6 @@ def _compile_kernel(
         grouped_head_tile=8,
         convert_warpgroups=2,
         kv_splits=kv_splits,
-        use_kv_ring=True,
     )
     fmha.problem_shape = problem_shape
     return cute.compile(

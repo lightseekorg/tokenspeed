@@ -798,48 +798,6 @@ def _qsa_norm(values: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_cuda
-def test_qsa_project_norms_and_rotates_queries_without_rotating_raw_keys() -> None:
-    device = "cuda"
-
-    class Projection(torch.nn.Module):
-        def forward(self, hidden_states):
-            return hidden_states, None
-
-    indexer = QSAIndexer.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
-    indexer.index_n_heads = 2
-    indexer.index_kv_heads = 1
-    indexer.index_head_dim = 2
-    indexer.index_qk_proj = Projection()
-    indexer.q_layernorm = SimpleNamespace(
-        gemma_weight=torch.ones(2, device=device), variance_epsilon=0.0
-    )
-    torch.manual_seed(3)
-    cos_sin_cache = torch.randn(8, 2, device=device)
-    indexer.rotary_emb = SimpleNamespace(
-        cos_sin_cache=cos_sin_cache,
-        is_neox_style=True,
-        rotary_dim=2,
-        mrope_section=None,
-    )
-    projected = torch.arange(12, dtype=torch.float32, device=device).reshape(2, 6)
-    positions = torch.tensor([1, 5], device=device)
-
-    query, raw_key = indexer._project_qk(projected, positions)
-
-    normed = projected[:, :4].reshape(2, 2, 2)
-    normed = normed * torch.rsqrt((normed * normed).mean(dim=-1, keepdim=True))
-    cos = cos_sin_cache[positions][:, :1].unsqueeze(1)
-    sin = cos_sin_cache[positions][:, 1:].unsqueeze(1)
-    first, second = normed[..., :1], normed[..., 1:]
-    expected = torch.cat(
-        (first * cos - second * sin, second * cos + first * sin), dim=-1
-    )
-    torch.testing.assert_close(query, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(raw_key, projected[:, 4:].reshape(2, 1, 2))
-
-
-@_requires_cuda
 def test_qwen4_exp_qsa_compresses_across_chunks_with_recent_raw_keys() -> None:
     device = "cuda"
     indexer, pool, raw, compressed, rope_cache = _qsa_cache_test_indexer(device)
@@ -1058,40 +1016,6 @@ def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
 
 
 @_requires_cuda
-def test_qwen4_exp_qsa_stage_verified_snapshots_strided_sources() -> None:
-    device = "cuda"
-    indexer = object.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
-    indexer.index_head_dim = 4
-    indexer._verify_scratch = {}
-    indexer._active_verify_width = None
-    indexer._last_pool = None
-
-    bs, width = 2, 3
-    rows = bs * width
-    token_k = torch.randn(rows, 1, indexer.index_head_dim, device=device)
-    # 2-D mrope positions produce the transposed ``[rows, 3]`` view the
-    # fused staging kernel must gather from.
-    positions = torch.arange(3 * rows, device=device, dtype=torch.int64).view(3, rows)
-    position_values = indexer._position_values(positions)
-    assert not position_values.is_contiguous()
-    logical = torch.arange(100, 100 + rows, device=device, dtype=torch.int64)
-    recent_locs = torch.arange(7, 7 + rows, device=device, dtype=torch.int32)
-
-    indexer._stage_verified(token_k, position_values, logical, recent_locs, bs, None)
-
-    staged = indexer._verify_scratch[(bs, width)]
-    torch.testing.assert_close(
-        staged[0], token_k.reshape(bs, width, 1, indexer.index_head_dim)
-    )
-    torch.testing.assert_close(staged[1], positions.T.reshape(bs, width, 3))
-    torch.testing.assert_close(staged[2], logical.reshape(bs, width))
-    torch.testing.assert_close(staged[3], recent_locs.reshape(bs, width))
-    assert indexer._active_verify_width == width
-    assert indexer._last_pool is None
-
-
-@_requires_cuda
 def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
     device = "cuda"
     indexer, pool, _, _, _ = _qsa_cache_test_indexer(device)
@@ -1110,6 +1034,8 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
     full_page_table = torch.tensor(
         [[3, 7, 11], [13, 17, 19]], dtype=torch.int32, device=device
     )
+    ratio = indexer.compress_ratio
+    complete = (logical + 1) // ratio
 
     selected = indexer._select_slots(
         q,
@@ -1119,15 +1045,14 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         full_page_table,
         compressed,
         full_page_size=full_page_size,
+        complete_blocks=complete.to(torch.int32),
     )
 
     # Only blocks before ``complete_blocks`` hold valid compressed keys, so
     # the selection is deterministic; compare selected token sets per row
     # because the streaming top-k does not preserve score order.
-    ratio = indexer.compress_ratio
     assert selected.dtype == torch.int32
     assert selected.shape == (2, indexer.token_topk + ratio - 1)
-    complete = (logical + 1) // ratio
     for row in range(2):
         blocks = torch.arange(int(complete[row]), device=device)
         block_tokens = (
