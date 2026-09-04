@@ -84,6 +84,8 @@ _DSA_ARCHITECTURES = frozenset(
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(
@@ -111,7 +113,6 @@ class _AttentionFamilySpec:
     architectures: frozenset[str]
     configure: Callable[[object], None]
     default_backend: str | None = None
-    supports_target_verify_forward_mode: bool = False
     default_prefix_granularity: int | None = None
 
 
@@ -204,6 +205,7 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_topk = mla_config.index_topk
     model_config.index_head_dim = mla_config.index_head_dim
     model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
 
     model_config.scaling = 1 / math.sqrt(
@@ -250,7 +252,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
-        supports_target_verify_forward_mode=True,
         # V4 kernels need P to be a multiple of their fixed page; default to
         # exactly one page rather than restating the number.
         default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
@@ -260,7 +261,6 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_DSA_ARCHITECTURES,
         configure=configure_glm_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -296,6 +296,21 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def _is_dflash2_mla(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> bool:
+    architectures = _model_architectures(hf_config, hf_text_config)
+    dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
+        hf_config, "dflash_config", None
+    )
+    return (
+        "DFlash2DraftModel" in architectures
+        and isinstance(dflash_config, dict)
+        and dflash_config.get("attention_mode") == "mla"
+    )
 
 
 def _apply_attention_family_defaults(
@@ -555,6 +570,8 @@ class ModelConfig:
         if attention_family is not None:
             _apply_attention_family_defaults(server_args, attention_family)
             attention_family.configure(self)
+        elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
+            configure_mla_attention(self)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -562,13 +579,6 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
-
-        self.use_v4_mtp_paged_metadata = (
-            getattr(server_args, "speculative_algorithm", None) is not None
-            and not is_draft_worker
-            and attention_family is not None
-            and attention_family.supports_target_verify_forward_mode
-        )
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
@@ -840,6 +850,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }

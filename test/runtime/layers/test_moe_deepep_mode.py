@@ -46,7 +46,7 @@ def test_with_dp_attention_the_replicated_flag_decides(
 def test_decode_graph_capture_context_selects_low_latency() -> None:
     """A decode graph must record the low-latency legs, at any DP degree.
 
-    ``CudaGraphWrapper._capture_one`` reports ``all_decode_or_idle=True`` because
+    ``ForwardStepRunner._capture_one`` reports ``all_decode_or_idle=True`` because
     the replay guard only ever replays such a graph for an all-decode forward.
     If capture instead recorded the normal legs, their host-side receive counts
     would deadlock the capture.

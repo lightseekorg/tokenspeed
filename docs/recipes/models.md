@@ -210,6 +210,12 @@ attention. It does not yet expose an equivalent of SGLang's
 `--speculative-dflash-draft-window-size`; add such a flag before relying on
 bounded draft attention for long-context deployments.
 
+Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
+`--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
+candidate selector are enabled automatically from the draft architecture.
+Draft proposals greedily follow the selector's transition-conditioned path,
+independent of the target sampling backend.
+
 ## Kimi K3
 
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA

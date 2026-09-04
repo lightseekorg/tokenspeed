@@ -39,7 +39,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
+    NULL_PAGES,
+    CacheGroupDeclaration,
     CacheGroupSpec,
     compute_cache_group_page_counts,
     group,
@@ -50,9 +51,6 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
-
-# One declared cache group: what the scheduler is told, and the bytes it costs.
-CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]
 
 
 class CacheRecipe(ABC):
@@ -118,8 +116,7 @@ class CacheRecipe(ABC):
             spec=CachePoolSpec(
                 family=self.family,
                 memory_plan=layout.bind(num_lcm_blocks),
-                layer_types=self.layer_types
-                or (FULL_ATTENTION,) * (self.num_target_layers + self.num_draft_layers),
+                layer_types=self.layer_types,
                 # The same declarations the layout was packed from, so plan and
                 # specs cannot name different groups.
                 cache_group_specs=tuple(spec for spec, _ in groups),
@@ -144,7 +141,12 @@ class CacheRecipe(ABC):
     @property
     @abstractmethod
     def layer_types(self) -> tuple[str, ...]:
-        """Per-layer cache-group label, target layers then draft layers."""
+        """Per-layer cache-group label, target layers then draft layers.
+
+        Always one label per merged layer -- consumers size the model from
+        ``len(layer_types)`` -- so a family whose config declares no labels
+        resolves them (full-history) instead of returning fewer.
+        """
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -208,7 +210,7 @@ class CacheRecipe(ABC):
 
     @property
     def pd_disaggregation_enabled(self) -> bool:
-        return bool(getattr(self.attn_config, "pd_disaggregation_enabled", False))
+        return bool(self.attn_config.pd_disaggregation_enabled)
 
     # ------------------------------------------------------------------
     # Seams: groups
@@ -272,9 +274,23 @@ class CacheRecipe(ABC):
         """
         usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
         return self._capped_parents(
-            usable_bytes // layout.lcm_block_bytes - 1,
+            self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
             parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
         )
+
+    def _budgeted_parents(self, usable_bytes: int, parent_bytes: int) -> int:
+        """Parents a byte budget affords beyond the reserved null parent.
+
+        The one place the budget floor is checked, so every family fails the
+        same way when it cannot hold the null parent plus one usable parent.
+        """
+        budgeted = usable_bytes // parent_bytes - 1
+        if budgeted < 1:
+            raise ValueError(
+                f"{self.family} cache budget must hold a null parent and one "
+                "usable LCM parent"
+            )
+        return budgeted
 
     def _capped_parents(self, budgeted: int, *, parent_tokens: int) -> int:
         """Trim a budget-derived parent count to the configured token limit.
@@ -282,11 +298,6 @@ class CacheRecipe(ABC):
         The one place the token limit turns into a parent count, so a family
         that sizes its budget differently still reads the limit the same way.
         """
-        if budgeted < 1:
-            raise ValueError(
-                f"{self.family} cache budget must hold a null parent and one "
-                "usable LCM parent"
-            )
         if self.token_limit is None:
             return budgeted
         requested = self.token_limit // parent_tokens
@@ -335,7 +346,7 @@ class CacheRecipe(ABC):
         )
         parents = 0
         for group_id, packing in layout.group_packing:
-            child_pages = counts[group_id] - 1  # page 0 is the reserved null page
+            child_pages = counts[group_id] - NULL_PAGES
             parents += (child_pages + packing - 1) // packing
         return parents
 

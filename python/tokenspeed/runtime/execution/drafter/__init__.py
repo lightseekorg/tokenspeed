@@ -46,6 +46,7 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
     # Imports are local: drafter modules pull in kernel ops and model code,
     # and this package init must stay importable from lightweight contexts.
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
     from tokenspeed.runtime.models.inkling_nextn import (
@@ -58,6 +59,12 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
         "DFLASH": DFlash,
         "DSPARK": DSpark,
     }
+
+    if spec_algo == "DFLASH":
+        from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel
+
+        if isinstance(model, DFlash2DraftModel):
+            return DFlash2
 
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;

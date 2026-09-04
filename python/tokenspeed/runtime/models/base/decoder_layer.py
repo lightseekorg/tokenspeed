@@ -125,7 +125,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -148,7 +147,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
 
         hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -189,7 +187,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,7 +201,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 aux_hidden_states,
             )
@@ -353,12 +349,11 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._compiled.forward(
-            positions, hidden_states, ctx, out_cache_loc, residual, aux_hidden_states
+            positions, hidden_states, ctx, residual, aux_hidden_states
         )
 
 

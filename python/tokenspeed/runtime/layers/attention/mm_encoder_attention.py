@@ -387,6 +387,8 @@ class MultimodalEncoderAttention(nn.Module):
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
 
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
@@ -405,7 +407,6 @@ class MultimodalEncoderAttention(nn.Module):
             self._backend_fn is vision_attn_fa4
             and self.customized_position_embedding_applier is None
         )
-        self._copy_v_after_packed_qkv_rotary = False
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(
@@ -464,12 +465,17 @@ class MultimodalEncoderAttention(nn.Module):
 
         use_packed_qkv_rotary = (
             self._use_packed_qkv_rotary
+            and isinstance(self.q_norm, nn.Identity)
+            and isinstance(self.k_norm, nn.Identity)
             and position_embeddings is None
             and rotary_pos_emb_cos is not None
             and rotary_pos_emb_sin is not None
         )
         use_packed_qkv_complex_rotary = (
-            self._use_packed_qkv_complex_rotary and position_embeddings is not None
+            self._use_packed_qkv_complex_rotary
+            and isinstance(self.q_norm, nn.Identity)
+            and isinstance(self.k_norm, nn.Identity)
+            and position_embeddings is not None
         )
         cos = rotary_pos_emb_cos if use_packed_qkv_rotary else None
         sin = rotary_pos_emb_sin if use_packed_qkv_rotary else None
@@ -486,7 +492,6 @@ class MultimodalEncoderAttention(nn.Module):
                 self.head_size,
                 cos,
                 sin,
-                copy_v=self._copy_v_after_packed_qkv_rotary,
             )
         elif use_packed_qkv_complex_rotary:
             q, k, v = packed_qkv_complex_rotary(
@@ -496,7 +501,6 @@ class MultimodalEncoderAttention(nn.Module):
                 head,
                 self.head_size,
                 position_embeddings,
-                copy_v=self._copy_v_after_packed_qkv_rotary,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -504,6 +508,8 @@ class MultimodalEncoderAttention(nn.Module):
             q = q.reshape(bsz * s, head, -1)
             k = k.reshape(bsz * s, kv_head, -1)
             v = v.reshape(bsz * s, kv_head, -1)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
             cos = None
             sin = None

@@ -109,6 +109,7 @@ class BaseCausalLM(nn.Module):
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
 
@@ -148,16 +149,13 @@ class BaseCausalLM(nn.Module):
 
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture the target hidden states a DFLASH/DSpark draft consumes.
 
         Checkpoints name layer *outputs*, but a layer captures the residual
-        entering it -- hence the ``+ 1`` shift, same as EAGLE3.
+        entering it -- hence the ``+ 1`` shift, same as EAGLE3. Each forward
+        that wants the taps handed over as they are produced attaches a
+        ``ctx.target_capture_sink``; otherwise they are only collected.
         """
 
         num_layers = len(self.model.layers)
@@ -178,8 +176,6 @@ class BaseCausalLM(nn.Module):
         self.model._dflash_capture_idx_map = {
             layer_idx: i for i, layer_idx in enumerate(capture_layers)
         }
-        self.model._dflash_incremental_callback = incremental_callback
-        self.model._dflash_slot_bufs = slot_bufs
 
     @torch.no_grad()
     def forward(
@@ -187,7 +183,6 @@ class BaseCausalLM(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -197,7 +192,6 @@ class BaseCausalLM(nn.Module):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             **model_kwargs,
         )
         if not self.mapping.is_last_pp_rank:

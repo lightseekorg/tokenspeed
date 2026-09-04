@@ -204,8 +204,10 @@ class TestNextNModelFilters(unittest.TestCase):
             model.checkpoint_weight_name_filter("model.layers.0.eh_proj.weight")
         )
 
-    def test_glm5_nextn(self):
-        from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
+    def test_glm_moe_dsa_nextn(self):
+        from tokenspeed.runtime.models.glm_moe_dsa_nextn import (
+            GlmMoeDsaForCausalLMNextN,
+        )
 
         model = object.__new__(GlmMoeDsaForCausalLMNextN)
         model.config = SimpleNamespace(num_nextn_predict_layers=1, num_hidden_layers=92)

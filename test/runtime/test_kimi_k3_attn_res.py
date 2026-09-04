@@ -365,7 +365,6 @@ class AttnResTests(unittest.TestCase):
                             positions=torch.empty(0),
                             hidden_states=hidden_states,
                             ctx=object(),
-                            out_cache_loc=torch.empty(0),
                             block_residual=block_residual,
                         )
                     )

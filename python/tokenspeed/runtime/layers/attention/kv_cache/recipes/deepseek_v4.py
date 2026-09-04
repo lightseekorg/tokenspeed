@@ -52,7 +52,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -60,6 +59,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
@@ -189,7 +189,7 @@ class DeepseekV4Recipe(CacheRecipe):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         if self.pd_disaggregation_enabled and (
-            getattr(self.server_args, "speculative_algorithm", None) is not None
+            self.server_args.speculative_algorithm is not None
             or self.draft_model_config is not None
             or self.draft_attn_config is not None
             or self.decode_input_tokens != 1
@@ -402,11 +402,9 @@ class DeepseekV4Recipe(CacheRecipe):
         through :meth:`token_capacity`'s upper bound rather than as a cap on
         parents (a V4 parent spans the kernel page, not the prefix grain).
         """
-        budgeted = self.cache_budget_bytes // layout.lcm_block_bytes - 1
-        if budgeted < 1:
-            raise ValueError(
-                "DeepSeek V4 cache budget must hold a null parent and one usable parent"
-            )
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes, layout.lcm_block_bytes
+        )
         return self.parents_needed(layout, self.token_capacity(layout, budgeted))
 
     @override
@@ -430,7 +428,7 @@ class DeepseekV4Recipe(CacheRecipe):
         return DeepseekV4PoolOptions(layout=self._cache_layout)
 
     def _use_fp4_indexer(self, hf_config) -> bool:
-        forced = getattr(self.server_args, "attention_use_fp4_indexer_cache", None)
+        forced = self.server_args.attention_use_fp4_indexer_cache
         attention_config = getattr(hf_config, "attention_config", None)
         if isinstance(attention_config, dict):
             configured = attention_config.get("use_fp4_indexer_cache", None)

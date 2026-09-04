@@ -28,9 +28,11 @@ class TestMlaCacheGroupId(unittest.TestCase):
     not here: constructing it needs distributed init and real weights.
     """
 
-    def test_validation_rejects_an_untagged_layer(self) -> None:
-        """Guard the other half: the check really fires when a tag is missing,
-        so the test above cannot pass vacuously."""
+    def test_validation_rejects_a_mistagged_layer(self) -> None:
+        """Guard the other half: the check really fires when the tag names a
+        group the pool never published, so the test above cannot pass
+        vacuously. (An untagged layer no longer reaches validation — the
+        constructor requires group_id.)"""
         import torch.nn as nn
 
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -45,7 +47,13 @@ class TestMlaCacheGroupId(unittest.TestCase):
             def __init__(self) -> None:
                 super().__init__()
                 self.attn = PagedAttention(
-                    8, 576, 1.0, num_kv_heads=1, layer_id=0, v_head_dim=512
+                    8,
+                    576,
+                    1.0,
+                    num_kv_heads=1,
+                    layer_id=0,
+                    v_head_dim=512,
+                    group_id="unpublished_group",
                 )
 
         specs = (_Spec(FULL_ATTENTION), _Spec("linear_attention"))

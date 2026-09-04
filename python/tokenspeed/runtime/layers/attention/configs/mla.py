@@ -45,11 +45,10 @@ def resolve_mla_kv_cache_dtype(
     for the draft continuation fields. Other MLA drafts continue to honor the
     global cache setting.
     """
-    hf_config = getattr(model_config, "hf_config", None)
     if (
         is_draft
         and server_args.speculative_algorithm == "DSPARK"
-        and getattr(hf_config, "model_type", None) == "k3_dspark"
+        and getattr(model_config.hf_config, "model_type", None) == "k3_dspark"
     ):
         return torch.bfloat16
     return resolve_dtype(server_args.kv_cache_dtype)
@@ -72,7 +71,7 @@ class MLAConfig(SoftmaxAttnConfig):
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
     ) -> dict:
         """MLA component fields, shared with the DSA subclass."""
-        hf_config = getattr(model_config, "hf_config", None)
+        hf_config = model_config.hf_config
         layer_types = tuple(
             getattr(hf_config, "cache_layer_types", None)
             or getattr(hf_config, "layer_types", None)

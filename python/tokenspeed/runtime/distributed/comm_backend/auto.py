@@ -186,6 +186,31 @@ class AutoBackend(CommBackend):
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 
+    def can_acquire_all_reduce_outputs(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> bool:
+        """Whether ``acquire_all_reduce_outputs`` returns producer-direct memory.
+
+        Mirrors the routing in ``acquire_all_reduce_outputs`` below: the cases
+        that fall through to ``super()`` there get ordinary allocations, so they
+        answer False here.
+        """
+        if (
+            self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return False
+        if current_platform().is_amd:
+            return self._triton_ar.can_acquire_outputs(shapes, like, group, op=op)
+        return self._triton_ar.can_acquire_all_reduce_outputs(
+            shapes, like, group, op=op
+        )
+
     def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

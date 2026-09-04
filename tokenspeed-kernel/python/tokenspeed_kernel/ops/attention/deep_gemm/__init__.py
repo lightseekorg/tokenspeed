@@ -18,6 +18,9 @@ from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     combine_topk_weights,
     local_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.triton.kpool_expand import (
+    expand_kpool_to_flat_kv,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -34,6 +37,25 @@ _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
 # ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
 _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1") == "1"
+
+
+def _kpool_cache_views(
+    cache: torch.Tensor, page_size: int, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    groups = head_dim // 128
+    page_stride = cache.stride(0)
+    values = torch.as_strided(
+        cache,
+        (cache.shape[0], page_size, head_dim),
+        (page_stride, head_dim, 1),
+    )
+    scales = torch.as_strided(
+        cache,
+        (cache.shape[0], page_size, groups * 4),
+        (page_stride, groups * 4, 1),
+        cache.storage_offset() + page_size * head_dim,
+    )
+    return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
 
 
 def _use_cute_dsl_decode_topk() -> bool:
@@ -98,6 +120,21 @@ def _check_out(
             f"{tuple(lens_out.shape)} {lens_out.dtype} {lens_out.device}"
         )
     return out, lens_out
+
+
+def _resolve_prefill_tile_max_seqlen_k(
+    candidate_lens: torch.Tensor,
+    candidate_lens_cpu: torch.Tensor | None,
+    *,
+    start: int,
+    end: int,
+    max_seqlen_k: int | None,
+) -> int:
+    if candidate_lens_cpu is not None:
+        return int(candidate_lens_cpu[start:end].max().item())
+    if max_seqlen_k is not None:
+        return int(max_seqlen_k)
+    return int(candidate_lens[start:end].max().item())
 
 
 if platform.is_nvidia:
@@ -422,6 +459,7 @@ if platform.is_nvidia:
         index_k_scale: torch.Tensor | None = None,
         max_logits_bytes: int | None = None,
         candidate_lens_cpu: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -496,12 +534,13 @@ if platform.is_nvidia:
         local_starts_i32 = torch.zeros_like(row_starts)
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
-            chunk_candidate_lens = (
-                candidate_lens_cpu[start:end]
-                if candidate_lens_cpu is not None
-                else candidate_lens[start:end]
+            tile_max_seqlen_k = _resolve_prefill_tile_max_seqlen_k(
+                candidate_lens,
+                candidate_lens_cpu,
+                start=start,
+                end=end,
+                max_seqlen_k=max_seqlen_k,
             )
-            max_seqlen_k = int(chunk_candidate_lens.max().item())
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
             logits = deep_gemm.fp8_mqa_logits(
@@ -511,7 +550,7 @@ if platform.is_nvidia:
                 row_starts[start:end],
                 row_ends[start:end],
                 clean_logits=False,
-                max_seqlen_k=max(max_seqlen_k, 1),
+                max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
@@ -526,3 +565,160 @@ if platform.is_nvidia:
         valid = out >= 0
         out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
         return out, lens_out
+
+    @register_kernel(
+        "attention",
+        "kpool_prefill_topk",
+        name="deep_gemm_kpool_prefill_topk",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16, 64}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "topk_pools": frozenset({512, 1024, 2048}),
+            "prefill_plan": frozenset({True}),
+        },
+        priority=Priority.PERFORMANT,
+        tags={"deep_gemm", "kpool", "ragged-prefill"},
+    )
+    def deep_gemm_kpool_prefill_topk(
+        q: torch.Tensor,
+        pooled_k_cache: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        index_block_table: torch.Tensor,
+        kv_block_table: torch.Tensor,
+        *,
+        pool_size: int,
+        page_size: int,
+        kv_page_size: int,
+        topk_pools: int,
+        softmax_scale: float,
+        apply_relu: bool = True,
+        append_tail: bool = True,
+        chunk_pools: int = 8192,
+        req_ids: torch.Tensor | None = None,
+        causal_lens: torch.Tensor | None = None,
+        pool_workspace_slots: torch.Tensor | None = None,
+        row_starts: torch.Tensor | None = None,
+        row_ends: torch.Tensor | None = None,
+        max_num_pools: int | None = None,
+        max_logits_bytes: int | None = None,
+        out: torch.Tensor | None = None,
+        lens_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run planned KPool prefill with DeepGEMM scoring and TRT-LLM top-k.
+
+        Requires the complete host-built prefill plan and returns expanded
+        global FlatKV slots plus their valid counts.
+        """
+        del positions, query_start_loc, index_block_table, chunk_pools
+        if not apply_relu:
+            raise ValueError("DeepGEMM KPool prefill requires apply_relu=True")
+        planned = (
+            req_ids,
+            causal_lens,
+            pool_workspace_slots,
+            row_starts,
+            row_ends,
+            max_num_pools,
+        )
+        if any(value is None for value in planned):
+            raise RuntimeError(
+                "DeepGEMM KPool prefill requires a complete prefill plan"
+            )
+        if not q.is_cuda:
+            raise RuntimeError("DeepGEMM KPool prefill requires CUDA tensors")
+
+        device = q.device
+        num_tokens = q.shape[0]
+        req_ids = req_ids.to(device=device, dtype=torch.int32).contiguous()
+        causal_lens = causal_lens.to(device=device, dtype=torch.int32).contiguous()
+        pool_workspace_slots = pool_workspace_slots.to(
+            device=device, dtype=torch.int64
+        ).contiguous()
+        row_starts = row_starts.to(device=device, dtype=torch.int32).contiguous()
+        row_ends = row_ends.to(device=device, dtype=torch.int32).contiguous()
+        kv_block_table = kv_block_table.to(
+            device=device, dtype=torch.int32
+        ).contiguous()
+        for name, tensor in (
+            ("req_ids", req_ids),
+            ("causal_lens", causal_lens),
+            ("row_starts", row_starts),
+            ("row_ends", row_ends),
+        ):
+            if tensor.numel() != num_tokens:
+                raise ValueError(
+                    f"{name} must have {num_tokens} entries, got {tensor.numel()}"
+                )
+
+        max_num_pools = int(max_num_pools)
+        if max_num_pools <= int(topk_pools):
+            # Expansion emits natural pool order and ignores this buffer.
+            pool_indices = torch.empty(
+                (num_tokens, int(topk_pools)),
+                dtype=torch.int32,
+                device=device,
+            )
+            return expand_kpool_to_flat_kv(
+                pool_indices,
+                causal_lens,
+                req_ids,
+                kv_block_table,
+                pool_size=int(pool_size),
+                kv_page_size=int(kv_page_size),
+                append_tail=append_tail,
+                out=out,
+                lens_out=lens_out,
+            )
+
+        values, scales = _kpool_cache_views(
+            pooled_k_cache,
+            int(page_size),
+            q.shape[-1],
+        )
+        pages = torch.div(pool_workspace_slots, int(page_size), rounding_mode="floor")
+        rows = torch.remainder(pool_workspace_slots, int(page_size))
+        index_k_fp8 = values[pages, rows]
+        index_k_scale = scales[pages, rows]
+
+        workspace_indices, _ = deep_gemm_dsa_prefill_topk(
+            q,
+            weights,
+            pool_workspace_slots,
+            row_starts,
+            row_ends,
+            topk=int(topk_pools),
+            softmax_scale=softmax_scale,
+            index_k_fp8=index_k_fp8,
+            index_k_scale=index_k_scale,
+            max_logits_bytes=max_logits_bytes,
+            max_seqlen_k=max(max_num_pools, 1),
+        )
+        valid = workspace_indices >= 0
+        pool_indices = torch.where(
+            valid,
+            workspace_indices - row_starts.unsqueeze(1),
+            workspace_indices,
+        ).to(torch.int32)
+        return expand_kpool_to_flat_kv(
+            pool_indices.contiguous(),
+            causal_lens,
+            req_ids,
+            kv_block_table,
+            pool_size=int(pool_size),
+            kv_page_size=int(kv_page_size),
+            append_tail=append_tail,
+            out=out,
+            lens_out=lens_out,
+        )

@@ -63,6 +63,7 @@ from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 def gluon_bf16_moe_stage2_kernel(
     a_ptr,  # inter    (num_tokens*topk, I)   bf16
     b_ptr,  # w2       (E, D, I)              bf16
+    b_scale_ptr,
     c_ptr,  # partials (num_tokens, topk, D)  bf16
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
@@ -78,6 +79,9 @@ def gluon_bf16_moe_stage2_kernel(
     stride_be,
     stride_bn,
     stride_bk,
+    stride_bse,
+    stride_bsn,
+    stride_bsk,
     stride_pt,  # partials token stride  (= topk * D)
     stride_ps,  # partials slot  stride  (= D)
     stride_pn,  # partials n     stride  (= 1)
@@ -85,6 +89,7 @@ def gluon_bf16_moe_stage2_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WEIGHT_FP8: gl.constexpr,
 ):
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -99,11 +104,13 @@ def gluon_bf16_moe_stage2_kernel(
     if off_experts == -1:
         return
 
+    # A 16-row sparse tile owns exactly one MFMA row. Keep all four waves on
+    # N instead of allocating a second, empty MFMA row as the dense tile does.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[2, NUM_WARPS // 2],
+        warps_per_cta=([1, NUM_WARPS] if BLOCK_M == 16 else [2, NUM_WARPS // 2]),
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -124,9 +131,7 @@ def gluon_bf16_moe_stage2_kernel(
     smem_a = gl.allocate_shared_memory(
         a_ptr.dtype.element_ty, [1, BLOCK_M, BLOCK_K], shared_a
     )
-    smem_b = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [1, BLOCK_K, BLOCK_N], shared_b
-    )
+    smem_b = gl.allocate_shared_memory(gl.bfloat16, [1, BLOCK_K, BLOCK_N], shared_b)
 
     # ---- Per-slot A-row gather: inter_row = token * topk + slot --------
     am_layout: gl.constexpr = gl.SliceLayout(1, gload_a)
@@ -162,9 +167,29 @@ def gluon_bf16_moe_stage2_kernel(
         cdna4_async_copy.buffer_load_to_shared(
             smem_a.index(0), a_base, a_offsets + k * A_K_STEP, mask=token_mask[:, None]
         )
-        cdna4_async_copy.buffer_load_to_shared(
-            smem_b.index(0), b_base, b_off + k * B_K_STEP
-        )
+        if WEIGHT_FP8:
+            if BLOCK_N <= 128 and 128 % BLOCK_N == 0 and 128 % BLOCK_K == 0:
+                scale_offset = (
+                    off_experts * stride_bse
+                    + (pid_n * BLOCK_N // 128) * stride_bsn
+                    + (k * BLOCK_K // 128) * stride_bsk
+                )
+                scale = gl.load(b_scale_ptr + scale_offset)
+            else:
+                scale_offsets = (
+                    off_experts * stride_bse
+                    + (offs_bn[None, :] // 128) * stride_bsn
+                    + ((k * BLOCK_K + offs_bk[:, None]) // 128) * stride_bsk
+                )
+                scale = gl.load(b_scale_ptr + scale_offsets)
+            b_fp8 = gl.load(b_base + b_off + k * B_K_STEP).to(
+                gl.float8e4nv, bitcast=True
+            )
+            smem_b.index(0).store((b_fp8.to(gl.float32) * scale).to(gl.bfloat16))
+        else:
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_b.index(0), b_base, b_off + k * B_K_STEP
+            )
         cdna4_async_copy.commit_group()
         cdna4_async_copy.wait_group(0)
         a = smem_a.index(0).load(dot_a_layout)
@@ -254,6 +279,8 @@ def invoke_stage2(
     BLOCK_K: int = 64,
     num_warps: int = 4,
     atomic: bool | None = None,
+    expert_parallel: bool = False,
+    w2_scale: torch.Tensor | None = None,
 ):
     """Launch bf16 MoE stage 2 (down GEMM + routed weight) then reduce over topk.
 
@@ -264,11 +291,16 @@ def invoke_stage2(
     atomic contention on shared output rows makes it slower).
     """
     assert inter_states.dtype == torch.bfloat16
-    assert w2.dtype == torch.bfloat16
+    weight_fp8 = w2_scale is not None
+    if weight_fp8:
+        assert w2.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        assert w2_scale.dtype == torch.float32
+    else:
+        assert w2.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
     assert sorted_weights.dtype == torch.float32
 
-    E, D, I_r = w2.shape
+    _, D, I_r = w2.shape
     num_tokens = out.shape[0]
     assert out.shape == (num_tokens, D)
 
@@ -302,17 +334,21 @@ def invoke_stage2(
     assert I_r % BLOCK_K == 0, f"I ({I_r}) must be a multiple of BLOCK_K ({BLOCK_K})"
     assert D % BLOCK_N == 0, f"D ({D}) must be a multiple of BLOCK_N ({BLOCK_N})"
 
-    # empty() is safe: every (token, slot) pair appears exactly once in the
-    # sorted list, so the GEMM writes all [num_tokens, topk, D] slots before
-    # the reduce reads them (avoids a per-call fill kernel).
-    partials = torch.empty(
+    # Non-EP routing writes every (token, slot) pair exactly once. EP filters
+    # remote routes, so those partial rows must start at zero before reduction.
+    partials_factory = torch.zeros if expert_parallel else torch.empty
+    partials = partials_factory(
         (num_tokens, topk, D), dtype=torch.bfloat16, device=out.device
     )
 
     grid_mn = triton.cdiv(EM, BLOCK_M) * triton.cdiv(D, BLOCK_N)
-    gluon_bf16_moe_stage2_kernel[(grid_mn,)](  # noqa: E501
+    scale = w2 if w2_scale is None else w2_scale
+    scale_strides = (0, 0, 0) if w2_scale is None else w2_scale.stride()
+    weight = w2.view(torch.uint8) if weight_fp8 else w2
+    gluon_bf16_moe_stage2_kernel[(grid_mn,)](
         inter_states,
-        w2,
+        weight,
+        scale,
         partials,
         sorted_token_ids,
         sorted_expert_ids,
@@ -328,6 +364,9 @@ def invoke_stage2(
         w2.stride(0),
         w2.stride(1),
         w2.stride(2),
+        scale_strides[0],
+        scale_strides[1],
+        scale_strides[2],
         partials.stride(0),
         partials.stride(1),
         partials.stride(2),
@@ -335,6 +374,7 @@ def invoke_stage2(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         NUM_WARPS=num_warps,
+        WEIGHT_FP8=weight_fp8,
         num_warps=num_warps,
     )
 

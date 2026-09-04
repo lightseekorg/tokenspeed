@@ -33,9 +33,15 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention import registry as attention_registry
-from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpMambaAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -59,6 +65,15 @@ from tokenspeed.runtime.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.qwen4_exp_ple import (
+    QWEN4_EXP_PLE_CACHE_GROUP,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLELayer,
+    _nth_prime_after,
+    quantize_ple_embedding_rows,
+    qwen4_exp_ple_context_field,
+    qwen4_exp_ple_conv_field,
+)
 from tokenspeed.runtime.models import qwen4_exp_nextn
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
@@ -68,18 +83,9 @@ from tokenspeed.runtime.models.qwen4_exp import (
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
 )
-from tokenspeed.runtime.models.qwen4_exp_ple import (
-    QWEN4_EXP_PLE_CACHE_GROUP,
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
-    _nth_prime_after,
-    quantize_ple_embedding_rows,
-    qwen4_exp_ple_context_field,
-    qwen4_exp_ple_conv_field,
-)
 
 _requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="QSA indexer kernels require CUDA"
+    not torch.cuda.is_available(), reason="requires a CUDA device"
 )
 
 
@@ -226,6 +232,7 @@ def test_qwen4_exp_flat_config_preserves_text_rope_parameters() -> None:
     assert config.text_config.model_type == "qwen4_exp_text"
 
 
+@_requires_cuda
 def test_hyperconnection_mix_and_combine_shapes() -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(
@@ -234,10 +241,10 @@ def test_hyperconnection_mix_and_combine_shapes() -> None:
             hc_lowrank=4,
             params_dtype=torch.float32,
         )
-    )
-    hyper_input = torch.randn(5, 32)
+    ).cuda()
+    hyper_input = torch.randn(5, 32, device="cuda")
     mixed, residuals = mixer.mix(hyper_input)
-    combined = mixer.combine(torch.randn(5, 8), residuals)
+    combined = mixer.combine(torch.randn(5, 8, device="cuda"), residuals)
 
     assert mixed.shape == (5, 8)
     assert combined.shape == hyper_input.shape
@@ -245,6 +252,7 @@ def test_hyperconnection_mix_and_combine_shapes() -> None:
     assert torch.isfinite(combined).all()
 
 
+@_requires_cuda
 def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(
@@ -253,11 +261,11 @@ def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
             hc_lowrank=4,
             params_dtype=torch.float32,
         )
-    )
-    hyper_input = torch.randn(6, 32)
+    ).cuda()
+    hyper_input = torch.randn(6, 32, device="cuda")
     _, residuals = mixer.mix(hyper_input)
     sliced = hyper_input[2:5]
-    unrelated = torch.randn(3, 32)
+    unrelated = torch.randn(3, 32, device="cuda")
     sliced_reference = mixer.hc_norm(sliced)
     unrelated_reference = mixer.hc_norm(unrelated)
 
@@ -285,6 +293,7 @@ def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
     assert recomputes == [unrelated.shape]
 
 
+@_requires_cuda
 def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> None:
     hc_count, hidden_size, lowrank = 4, 8, 6
     mixer = GatedResidualSimple(
@@ -294,20 +303,20 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
             hc_lowrank=lowrank,
             params_dtype=torch.float32,
         )
-    )
-    down_weight = torch.randn(lowrank, hc_count * hidden_size)
-    inject_weight = torch.randn(hc_count, hc_count * hidden_size)
+    ).cuda()
+    down_weight = torch.randn(lowrank, hc_count * hidden_size, device="cuda")
+    inject_weight = torch.randn(hc_count, hc_count * hidden_size, device="cuda")
     param = mixer.mix_inject_proj.weight
     loader = param.weight_loader
     loader(param, down_weight, "mix")
     loader(param, inject_weight, "inject")
 
-    # The shared 1 / hc_count scale is folded into the fused rows.
+    # The shared 1 / hc_count scale is exactly folded for power-of-two HC.
     torch.testing.assert_close(param[:lowrank], down_weight / hc_count)
     torch.testing.assert_close(param[lowrank:], inject_weight / hc_count)
 
-    hyper_input = torch.randn(5, hc_count * hidden_size)
-    block_output = torch.randn(5, hidden_size)
+    hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
+    block_output = torch.randn(5, hidden_size, device="cuda")
     mixed, residuals = mixer.mix(hyper_input)
     combined = mixer.combine(block_output, residuals)
 
@@ -328,68 +337,6 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
         -1, (hc_count, hidden_size)
     ) + block_output.unsqueeze(-2) * inject.unsqueeze(-1)
     torch.testing.assert_close(combined, expected.flatten(-2))
-
-
-@_requires_cuda
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hyperconnection_mix_epilogue_fused_matches_eager(dtype: torch.dtype) -> None:
-    torch.manual_seed(11)
-    hc_count, hidden_size, rows = 4, 320, 129
-    mixer = GatedResidualSimple(
-        HyperConnectionConfig(
-            hc_count=hc_count,
-            hidden_size=hidden_size,
-            hc_lowrank=16,
-            params_dtype=dtype,
-        )
-    ).cuda()
-    gate = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-    normalized = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-
-    fused = mixer._mix_epilogue_cuda(gate, normalized)
-    eager = mixer._mix_epilogue_torch(gate, normalized)
-
-    assert fused.dtype == dtype
-    torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
-    # Strided views (the fused projection's output slices) stay exact.
-    wide = torch.randn(rows, 2, hc_count * hidden_size, device="cuda", dtype=dtype)
-    torch.testing.assert_close(
-        mixer._mix_epilogue_cuda(wide[:, 1], normalized),
-        mixer._mix_epilogue_torch(wide[:, 1], normalized),
-        rtol=2e-2,
-        atol=2e-2,
-    )
-
-
-@_requires_cuda
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hyperconnection_combine_fused_matches_eager(dtype: torch.dtype) -> None:
-    torch.manual_seed(29)
-    hc_count, hidden_size, rows = 4, 320, 129
-    mixer = GatedResidualSimple(
-        HyperConnectionConfig(
-            hc_count=hc_count,
-            hidden_size=hidden_size,
-            hc_lowrank=16,
-            params_dtype=dtype,
-        )
-    ).cuda()
-    hyper_input = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-    block_output = torch.randn(rows, hidden_size, device="cuda", dtype=dtype)
-    inject_logits = torch.randn(rows, hc_count, device="cuda", dtype=dtype)
-
-    fused = mixer._combine_cuda(block_output, hyper_input, inject_logits)
-    eager = mixer._combine_torch(block_output, hyper_input, inject_logits)
-
-    assert fused.dtype == dtype
-    torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
-    # Reduce-scatter hands over row slices of both the residual and the logits.
-    torch.testing.assert_close(
-        mixer._combine_cuda(block_output[4:9], hyper_input[4:9], inject_logits[4:9]),
-        mixer._combine_torch(block_output[4:9], hyper_input[4:9], inject_logits[4:9]),
-        rtol=2e-2,
-        atol=2e-2,
-    )
 
 
 def test_qwen4_exp_loads_fp8_scales_only_into_attention_layers(monkeypatch) -> None:
@@ -419,18 +366,145 @@ def test_qwen4_exp_qsa_page_table_expansion() -> None:
         QSAIndexer._page_table_expansion(96, 256)
 
 
-def test_qwen4_exp_qsa_uses_backend_group_page_size() -> None:
-    backend = SimpleNamespace(
-        _consumer_page_size=lambda group_id: {
-            FULL_ATTENTION: 64,
-            QWEN4_EXP_QSA_CACHE_GROUP: 256,
-        }[group_id]
+# Qwen4-Exp's three history groups as the recipe declares them: the
+# full-attention KV at P, the compressed QSA keys (64 rows x ratio 4) and the
+# recent raw-key window (64 rows x 1).
+_QSA_GROUP_GRANULARITIES = {
+    FULL_ATTENTION: 256,
+    QWEN4_EXP_QSA_CACHE_GROUP: 256,
+    QWEN4_EXP_QSA_RECENT_CACHE_GROUP: 64,
+}
+
+
+def _qsa_router(
+    *, kernel_page_size: int | None, max_bs: int = 4, spec: int = 1
+) -> CacheGroupRouter:
+    """A real ``CacheGroupRouter`` over real MHA leaves for the Qwen4-Exp
+    history groups, bound the way ``set_cache_pool`` binds it (CPU)."""
+    component = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=2,
+        num_kv_heads=1,
+        head_dim=8,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=256,
+        kernel_page_size=kernel_page_size,
+        context_len=1024,
+        max_bs=max_bs,
+        speculative_num_draft_tokens=spec,
+        components=(component,),
     )
 
-    assert QSAIndexer._backend_group_page_size(backend, FULL_ATTENTION) == 64
-    assert (
-        QSAIndexer._backend_group_page_size(backend, QWEN4_EXP_QSA_CACHE_GROUP) == 256
+    def leaf_factory(group_id: str, block_granularity: int) -> MHAAttnBackend:
+        del group_id
+        return MHAAttnBackend(
+            config,
+            component,
+            kernel_page_size=MHAAttnBackend.resolve_kernel_page_size(
+                config, block_granularity
+            ),
+        )
+
+    router = CacheGroupRouter(
+        leaf_factory, is_draft=False, spec_num_tokens=spec, device="cpu"
     )
+    router.bind(
+        CacheGroupGeometry(
+            granularities=dict(_QSA_GROUP_GRANULARITIES),
+            families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
+            full_history_group_id=FULL_ATTENTION,
+        ),
+        {
+            gid: leaf_factory(gid, granularity)
+            for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
+        },
+    )
+    router.init_cuda_graph_state(max_bs)
+    return router
+
+
+def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) -> None:
+    bs = len(seq_lens)
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    ones = torch.ones(bs, dtype=torch.int32)
+    router.init_forward_metadata(
+        bs,
+        bs,
+        torch.arange(1, bs + 1, dtype=torch.int32),
+        seq_lens,
+        ForwardMode.EXTEND,
+        block_tables=block_tables,
+        extend_seq_lens=ones,
+        extend_seq_lens_cpu=ones,
+        extend_prefix_lens=seq_lens - 1,
+        extend_prefix_lens_cpu=seq_lens - 1,
+        extend_with_prefix=True,
+    )
+
+
+def test_qwen4_exp_qsa_reads_group_geometry_from_the_router() -> None:
+    indexer = object.__new__(QSAIndexer)
+    router = _qsa_router(kernel_page_size=64)
+    raw = torch.tensor([[3, 5], [7, -1]], dtype=torch.int32)
+    _qsa_extend_round(
+        router, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[300, 9]
+    )
+
+    # A 64-token kernel page splits the 256-token compressed block four ways
+    # and leaves the 64-token recent block whole; each table is the router's
+    # batch-ordered stack view for exactly the forward's rows.
+    table, expansion = indexer._group_geometry(
+        router, QWEN4_EXP_QSA_CACHE_GROUP, 256, bs=2
+    )
+    assert expansion == 4
+    assert table.shape == (2, router.leaves[QWEN4_EXP_QSA_CACHE_GROUP].max_num_pages)
+    assert table[:, :8].tolist() == [
+        [12, 13, 14, 15, 20, 21, 22, 23],
+        [28, 29, 30, 31, 0, 0, 0, 0],
+    ]
+    table, expansion = indexer._group_geometry(
+        router, QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64, bs=2
+    )
+    assert expansion == 1
+    assert table[:, :2].tolist() == [[3, 5], [7, 0]]
+    assert router.stacks.group_kernel_page_size(FULL_ATTENTION) == 64
+
+    # Without a config override every leaf runs at its group's own grain.
+    native = _qsa_router(kernel_page_size=None)
+    assert indexer._group_geometry(native, QWEN4_EXP_QSA_CACHE_GROUP, 256, bs=1)[1] == 1
+    assert native.stacks.group_kernel_page_size(QWEN4_EXP_QSA_RECENT_CACHE_GROUP) == 64
+
+
+def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
+    indexer = object.__new__(QSAIndexer)
+    router = _qsa_router(kernel_page_size=64, spec=3)
+    raw = torch.tensor([[3, 5]], dtype=torch.int32)
+    tables = {gid: raw for gid in _QSA_GROUP_GRANULARITIES}
+    leaf = router.leaves[FULL_ATTENTION]
+    hybrid = SimpleNamespace(full_attn_backend=router)
+
+    _qsa_extend_round(router, tables, seq_lens=[300])
+    ctx = SimpleNamespace(attn_backend=hybrid, forward_mode=ForwardMode.EXTEND)
+    assert indexer._metadata(ctx) is leaf.forward_extend_metadata
+    assert indexer._seq_lens(indexer._metadata(ctx)).tolist() == [300]
+
+    router.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([301], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+    )
+    ctx = SimpleNamespace(attn_backend=router, forward_mode=ForwardMode.DECODE)
+    assert indexer._metadata(ctx) is leaf.forward_decode_metadata
+    assert indexer._seq_lens(indexer._metadata(ctx)).tolist() == [301]
 
 
 def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
@@ -458,6 +532,38 @@ def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
         indexer._topk_solution(1, small, 1, 64)
 
 
+def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.ReplicatedLinear",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.qsa.indexer.GemmaRMSNorm",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        hidden_size=64,
+        rms_norm_eps=1e-6,
+    )
+    indexer = QSAIndexer(
+        config,
+        mapping=SimpleNamespace(),
+        layer_id=0,
+        quant_config=None,
+        prefix="model.layers.0.attn",
+        rotary_emb=SimpleNamespace(rotary_dim=16),
+    )
+
+    assert indexer._persistent_topk_workspace.dtype == torch.uint8
+    assert indexer._persistent_topk_workspace.numel() == 1024 * 1024
+    assert "_persistent_topk_workspace" not in indexer.state_dict()
+
+
 def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
@@ -468,25 +574,23 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
 
-    metadata = SimpleNamespace(
-        page_tables={
-            QWEN4_EXP_QSA_CACHE_GROUP: torch.zeros((2, 1), dtype=torch.int32),
-            QWEN4_EXP_QSA_RECENT_CACHE_GROUP: torch.zeros((2, 1), dtype=torch.int32),
-        }
+    router = _qsa_router(kernel_page_size=64)
+    raw = torch.tensor([[3], [5]], dtype=torch.int32)
+    _qsa_extend_round(
+        router, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 9]
     )
-    backend = SimpleNamespace()
     logical = torch.tensor([7, 8])
     requests = torch.tensor([0, 1])
     cache_locs = torch.tensor([1, 2], dtype=torch.int32)
     updates = []
     cache_accesses = []
+    group_locs_calls = []
     pool = SimpleNamespace(
         layerwise_load_tracker=SimpleNamespace(
             wait_for_layer=lambda layer_id: cache_accesses.append(("wait", layer_id))
         )
     )
 
-    indexer._metadata = lambda ctx: metadata
     indexer._decode_query_lengths = lambda ctx, total_tokens: None
     indexer._logical_layout = lambda *args, **kwargs: (logical, requests, 1)
     indexer._project_qk = lambda hidden, positions: (
@@ -500,14 +604,12 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         return None, torch.empty(0), None
 
     indexer._fields = fields
-    indexer._full_backend = lambda ctx: backend
-    indexer._backend_group_page_size = lambda *args: 64
-    indexer._page_table_expansion = lambda *args: 1
-    indexer._group_cache_locs = lambda *args: (
-        cache_locs,
-        cache_locs,
-        torch.ones(2, dtype=torch.int32),
-    )
+
+    def group_cache_locs(*args):
+        group_locs_calls.append(args)
+        return cache_locs, cache_locs, torch.ones(2, dtype=torch.int32)
+
+    indexer._group_cache_locs = group_cache_locs
     indexer._write_and_compress = lambda *args, **kwargs: updates.append((args, kwargs))
 
     selections = []
@@ -518,18 +620,34 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         bs=2,
         num_extends=2,
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=backend,
+        draft_narrowing=None,
+        attn_backend=SimpleNamespace(full_attn_backend=router),
         token_to_kv_pool=pool,
-        dsa_decode_topk=None,
     )
 
     actual = indexer(torch.zeros((2, 4)), torch.tensor([7, 8]), ctx)
 
     torch.testing.assert_close(actual, rows)
-    torch.testing.assert_close(ctx.dsa_decode_topk, rows)
+    # The MTP-shared selection is published on the router, not the context.
+    torch.testing.assert_close(router.sparse_topk.decode, rows)
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert len(selections) == 1
+    # The cache-location and top-k kernels address the router's batch-ordered
+    # kernel page tables for the two QSA groups, with the expansion each
+    # leaf's kernel page size implies (256/64 for compressed, 64/64 recent).
+    _, _, qsa_table, qsa_expansion, _, recent_table, recent_expansion, _, _ = (
+        group_locs_calls[0]
+    )
+    stacks = router.stacks
+    assert torch.equal(qsa_table, stacks.table(QWEN4_EXP_QSA_CACHE_GROUP, 2))
+    assert qsa_table[:, :4].tolist() == [[12, 13, 14, 15], [20, 21, 22, 23]]
+    assert qsa_expansion == 4
+    assert torch.equal(recent_table, stacks.table(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 2))
+    assert recent_table[:, :1].tolist() == [[3], [5]]
+    assert recent_expansion == 1
+    assert selections[0][0][3] is qsa_table
+    assert selections[0][1]["qsa_page_expansion"] == 4
 
     def fail_selection(*args, **kwargs):
         raise AssertionError("top-k selection must be skipped")
@@ -659,21 +777,18 @@ def test_qwen4_exp_qsa_rebuilds_layout_after_mtp_prefill_row_gather() -> None:
 
 
 def test_qwen4_exp_qsa_draft_write_mask_keeps_only_accepted_prefix() -> None:
-    ctx = SimpleNamespace(
-        bs=3,
-        num_extends=1,
-        accept_lengths=torch.tensor([0, 2, 1]),
-    )
-    seq_lens = torch.tensor([3, 14, 23])
-    lengths = torch.tensor([3, 4, 4])
+    ctx = SimpleNamespace(bs=3, num_extends=1)
+    # Verify windows start at 10 and 19 (vc); the drafter published the
+    # accepted frontier vc + a with a = [2, 1]. The prompt row's length is
+    # irrelevant: extend rows are always written.
+    accepted_seq_lens = torch.tensor([3, 12, 20])
     logical = torch.tensor([0, 1, 2, 10, 11, 12, 13, 19, 20, 21, 22])
     requests = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
     recent_locs = torch.ones_like(logical, dtype=torch.int32)
 
     actual = QSAIndexer._draft_accepted_write_mask(
         ctx,
-        seq_lens,
-        lengths,
+        accepted_seq_lens,
         logical,
         requests,
         recent_locs,
@@ -715,6 +830,11 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
+    indexer.register_buffer(
+        "_persistent_topk_workspace",
+        torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
+        persistent=False,
+    )
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
 
@@ -1437,7 +1557,6 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         context_len=1024,
-        max_graph_bs=2,
         max_bs=2,
         prefix_granularity=64,
         kernel_page_size=64,
@@ -1785,21 +1904,21 @@ def test_ple_verify_scratch_fill_matches_reference(lengths) -> None:
     torch.testing.assert_close(conv_new, conv_ref)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fused RMSNorm requires a CUDA device"
-)
+@_requires_cuda
 @pytest.mark.parametrize("group_size", [None, 4])
-def test_grouped_gemma_rmsnorm_cuda_matches_native(group_size) -> None:
+def test_grouped_gemma_rmsnorm_cuda_matches_reference(group_size) -> None:
     hidden = 12
     norm = GroupedGemmaRMSNorm(hidden, eps=1e-6, group_size=group_size).cuda()
     with torch.no_grad():
         norm.weight.normal_()
-    norm.gemma_weight = norm.weight.data + 1.0
     x = torch.randn(5, hidden, device="cuda", dtype=torch.float32)
+    effective_group_size = hidden if group_size is None else group_size
+    grouped = x.float().unflatten(-1, (-1, effective_group_size))
+    expected = (
+        grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + 1e-6)
+    ).flatten(-2) * (1.0 + norm.weight.float())
 
-    torch.testing.assert_close(
-        norm.forward_cuda(x), norm.forward_native(x), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(norm(x), expected, atol=1e-2, rtol=1e-2)
 
 
 def _ngram_stub(ngram_size: int, heads_per_ngram: int = 4, eos: int = 7):
@@ -1897,7 +2016,7 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
     not torch.cuda.is_available(), reason="triton n-gram kernel requires CUDA"
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2]])
+@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
 def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     stub = _ngram_stub(ngram_size)
     context_len = ngram_size - 1
@@ -1941,6 +2060,31 @@ def test_ngram_ids_flat_kernel_matches_legacy(ngram_size, lengths) -> None:
     )
     assert torch.equal(ids_only.cpu(), reference)
     assert no_tail is None
+
+    stride = max(lengths, default=0) + 1
+    scratch = torch.full(
+        ((bs + 1) * stride, context_len), -1, dtype=torch.long, device="cuda"
+    )
+    direct_ids, direct_tail = flat(
+        flat_ids.cuda(),
+        initial.cuda(),
+        req,
+        col,
+        starts,
+        need_tail=False,
+        tail_out=scratch,
+        tail_block_rows=stride,
+    )
+    assert torch.equal(direct_ids.cpu(), reference)
+    assert direct_tail is None
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows].cpu(), initial)
+    token_rows = req * stride + 1 + col
+    assert torch.equal(scratch[token_rows].cpu(), contexts[:, 1:])
+    untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
+    untouched[token_rows] = False
+    assert torch.all(scratch[untouched] == -1)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -2064,8 +2208,8 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
-    lengths = [3, 1, 5]
+@pytest.mark.parametrize("lengths", [[3, 1, 5], [0, 4, 2], [0, 0]])
+def test_ple_conv_scatters_windows_into_verify_scratch(lengths) -> None:
     channels = 8
     dtype = torch.bfloat16
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
@@ -2101,14 +2245,17 @@ def test_ple_conv_scatters_windows_into_verify_scratch() -> None:
         windows_block_rows=stride,
     )
 
-    # Same conv results, with the windows landing in their rollback rows and
-    # nothing else in the scratch disturbed.
+    # Same conv results, with carried and token windows landing in their
+    # rollback rows and nothing else in the scratch disturbed.
     assert torch.equal(scattered[0], packed[0])
     assert torch.equal(scattered[1], packed[1])
     assert scattered[2] is scratch
+    initial_rows = torch.arange(bs, device="cuda") * stride
+    assert torch.equal(scratch[initial_rows], initial)
     token_rows = req * stride + 1 + col
     assert torch.equal(scratch[token_rows], packed[2])
     untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
+    untouched[initial_rows] = False
     untouched[token_rows] = False
     assert not scratch[untouched].any()
 

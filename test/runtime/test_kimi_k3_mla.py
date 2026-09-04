@@ -6,12 +6,9 @@ Coverage:
   `get_mla_kv_buffer`) delegating to the generic ``latent_kv`` component view;
 - write-location oracles proving latent writes land at
   ``page_id * P + offset`` (decode, eager/chunked prefill, page boundaries);
-- decode and chunked-prefill numerical parity between the grouped-cache path and the
-  single-table page_table path, plus a naive fp32 reference;
-- proof the grouped-cache path never consumes page_table (poisoned tensors, and hard
-  errors when cache metadata goes missing after binding);
-- debug-gated rejection of null-page writes, out-of-capacity locations, and -1
-  inside a live table range.
+- decode and chunked-prefill numerical parity between the router-expanded
+  (GroupTableStacks) kernel-page table and a hand-built one, plus a naive
+  fp32 reference.
 """
 
 from __future__ import annotations
@@ -35,9 +32,6 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import MLA_KV_LORA_RANK as _KV_LORA_RANK
 from test.runtime.conftest import MLA_LATENT_DIM as _LATENT_DIM
 from test.runtime.conftest import MLA_QK_ROPE_DIM as _QK_ROPE_DIM
-from test.runtime.conftest import (
-    _poison,
-)
 from test.runtime.conftest import full_attention_metadata_for as _metadata_for
 from test.runtime.conftest import kda_layer_id as _kda_layer_id
 from test.runtime.conftest import make_kimi_pool as _make_pool
@@ -52,6 +46,7 @@ register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 _HEADS = 16
 _KERNEL_PAGE = 64
+_FULL = "full_attention"
 
 
 def _fake_layer(layer_id: int, scaling: float = _LATENT_DIM**-0.5):
@@ -71,35 +66,73 @@ def _token_locs(pages: list[int], positions: torch.Tensor, page_size: int):
     return page_tensor[positions // page_size] * page_size + positions % page_size
 
 
-def _kernel_page_table(logical_rows: list[list[int]], prefix_granularity: int, device):
-    """Legacy page_table equivalent: each logical page as 24 kernel pages."""
+def _kernel_page_table(
+    logical_rows: list[list[int]],
+    prefix_granularity: int,
+    device,
+    *,
+    max_num_pages: int,
+):
+    """Hand-built kernel-page table padded to the leaf's ``max_num_pages``:
+    each logical page expands to its ratio consecutive kernel pages; -1 holes
+    collapse to the null page 0 (the router's padding contract)."""
     ratio = prefix_granularity // _KERNEL_PAGE
     rows = []
     for pages in logical_rows:
         row: list[int] = []
         for page in pages:
-            row.extend(max(page, 0) * ratio + k for k in range(ratio))
+            if page > 0:
+                row.extend(page * ratio + k for k in range(ratio))
+            else:
+                row.extend(0 for _ in range(ratio))
+        row.extend(0 for _ in range(max_num_pages - len(row)))
         rows.append(row)
     return torch.tensor(rows, device=device, dtype=torch.int32)
 
 
+def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
+    """Router-side expansion stage: raw scheduler blocks -> the leaf's
+    ``[bs, max_num_pages]`` kernel-page table (GroupTableStacks.fill)."""
+    from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+        GroupTableSpec,
+        GroupTableStacks,
+    )
+
+    bs = len(logical_rows)
+    stacks = GroupTableStacks(
+        [
+            GroupTableSpec(
+                group_id=_FULL,
+                block_granularity=pool.arena.prefix_granularity,
+                kernel_page_size=backend.kernel_page_size,
+                max_num_pages=backend.max_num_pages,
+            )
+        ],
+        max_bs=max(bs, 4),
+        max_tokens_per_req=backend.spec_num_tokens,
+        device=device,
+    )
+    raw = torch.tensor(logical_rows, dtype=torch.int32, device=device)
+    stacks.fill(bs, bs, {_FULL: raw})
+    return stacks.table(_FULL, bs)
+
+
 # ---------------------------------------------------------------------------
-# Bridge: full-attention table accessor
+# Bridge: per-group table views
 # ---------------------------------------------------------------------------
 
 
-def test_bridge_exposes_full_attention_group_and_block_size() -> None:
+def test_bridge_exposes_full_attention_table() -> None:
     pool = _make_pool("cpu", usable_pages=2)
     table = np.array([[1, 2]], dtype=np.int32)
     metadata, forward_op = _metadata_for(pool, table, "cpu")
 
-    assert metadata.full_attention_group_id == "full_attention"
-    assert metadata.block_granularity == pool.arena.prefix_granularity
-    resolved = metadata.require_full_attention_table(active_forward_op=forward_op)
-    assert torch.equal(resolved, torch.tensor(table, dtype=torch.int32))
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tuple(tables) == metadata.group_ids
+    assert torch.equal(tables["full_attention"], torch.tensor(table, dtype=torch.int32))
 
     with pytest.raises(RuntimeError, match="stale"):
-        metadata.require_full_attention_table(active_forward_op=object())
+        metadata.tables(active_forward_op=object())
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +214,7 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Backend: cache metadata + parity (GPU)
+# Backend: kernel-page table expansion parity (GPU)
 # ---------------------------------------------------------------------------
 
 
@@ -213,18 +246,27 @@ def backend_factory(cuda_env, gpu_pool):
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
     def make():
-        if current_platform().is_amd:
-            from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-
-            backend_cls = MLAAttnBackend
-            backend_name = "mla"
-        else:
-            from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
+        # The CuteDSL leaf is SM100 (Blackwell) only; everywhere else the
+        # generic MLA leaf serves the same interface, so the parity claims
+        # under test are identical.
+        is_blackwell = (
+            not current_platform().is_amd
+            and torch.cuda.get_device_capability()[0] >= 10
+        )
+        if is_blackwell:
+            from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
                 CuteDSLMLABackend,
             )
 
             backend_cls = CuteDSLMLABackend
             backend_name = "tokenspeed_mla"
+        else:
+            from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+                MLAAttnBackend,
+            )
+
+            backend_cls = MLAAttnBackend
+            backend_name = "mla"
         spec = MLAConfig(
             backend_name=backend_name,
             num_attention_heads=_HEADS,
@@ -246,12 +288,14 @@ def backend_factory(cuda_env, gpu_pool):
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
-            max_graph_bs=8,
             kv_cache_quant_method="",
             components=(spec,),
         )
-        backend = backend_cls(config, spec)
+        backend = backend_cls(config, spec, kernel_page_size=_KERNEL_PAGE)
         backend.set_cache_pool(gpu_pool)
+        # Production order: set_cache_pool binds the pool, then the router
+        # allocates the persistent decode buffers unconditionally.
+        backend.init_cuda_graph_state(max_bs=8)
         return backend
 
     return make
@@ -272,25 +316,10 @@ def _write_history(pool, layer, logical_rows, lengths, seed=0):
     torch.cuda.synchronize()
 
 
-def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu):
-    bs = len(logical_rows)
-    table_np = np.array(logical_rows, dtype=np.int32)
-    metadata, forward_op = _metadata_for(pool, table_np, "cuda")
+def _refresh_decode(backend, page_table, seq_lens_cpu):
+    bs = page_table.shape[0]
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-    backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
-        # Poisoned: the grouped-cache path must never consume these values.
-        req_pool_indices=_poison((bs,)).to(torch.int64),
-        seq_lens=seq_lens,
-        forward_mode=ForwardMode.DECODE,
-        page_table=_poison((16, 256)),
-        cache_metadata=metadata,
-        forward_batch=forward_op,
-    )
-    return metadata, forward_op, seq_lens
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
 
 
 @requires_cuda
@@ -306,43 +335,35 @@ def test_decode_grouped_matches_single_table_and_reference(
     _write_history(pool, layer, logical_rows, seq_lens_cpu, seed=1)
 
     grouped_backend = backend_factory()
-    _init_cache_decode(grouped_backend, pool, logical_rows, seq_lens_cpu)
+    _refresh_decode(
+        grouped_backend,
+        _expand_via_stacks(grouped_backend, pool, logical_rows),
+        seq_lens_cpu,
+    )
     grouped_md = grouped_backend.forward_decode_metadata
 
-    # Write-location oracle: page_id * P + offset at position seq_len - 1.
-    assert grouped_md.group_out_cache_loc.tolist() == [
-        4 * page_size + 42 - 1,
-        1 * page_size + page_size - 1,
-    ]
-
     bs = len(logical_rows)
-    seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
     torch.manual_seed(2)
     q = torch.randn(bs, _HEADS, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
     out_grouped = grouped_backend.forward_decode(
         q, None, None, layer, None, pool, bs, save_kv_cache=False
     )
 
-    # Single-table arm: byte-equivalent kernel-page page_table.
+    # Single-table arm: byte-equivalent hand-built kernel-page table.
     single_table_backend = backend_factory()
-    page_table = _kernel_page_table(logical_rows, page_size, "cuda")
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-    single_table_backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
-        req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
-        seq_lens=seq_lens,
-        forward_mode=ForwardMode.DECODE,
-        page_table=page_table,
+    page_table = _kernel_page_table(
+        logical_rows,
+        page_size,
+        "cuda",
+        max_num_pages=single_table_backend.max_num_pages,
     )
+    _refresh_decode(single_table_backend, page_table, seq_lens_cpu)
     single_table_md = single_table_backend.forward_decode_metadata
     width = page_table.shape[1]
     assert torch.equal(
-        grouped_md.block_kv_indices[:, :width],
-        single_table_md.block_kv_indices[:, :width],
+        grouped_md.page_table[:, :width],
+        single_table_md.page_table[:, :width],
     )
-    assert single_table_md.group_out_cache_loc is None
     out_single_table = single_table_backend.forward_decode(
         q, None, None, layer, None, pool, bs, save_kv_cache=False
     )
@@ -362,73 +383,25 @@ def test_decode_grouped_matches_single_table_and_reference(
         assert max_err < 0.05 * reference.abs().max().item(), max_err
 
 
-@requires_cuda
-def test_decode_grouped_writes_land_at_group_locations(
-    backend_factory, gpu_pool
-) -> None:
-    """forward_decode(save_kv_cache=True) writes via grouped locationations, not the
-    caller's page_table-derived out_cache_loc."""
-    pool = gpu_pool
-    page_size = pool.arena.prefix_granularity
-    layer = _fake_layer(_mla_layer_id(pool))
-    logical_rows = [[3, 5]]
-    seq_lens_cpu = [page_size + 41]
-
-    backend = backend_factory()
-    _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu)
-
-    torch.manual_seed(3)
-    q = torch.randn(1, _HEADS, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 1, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
-    # Caller loc points at a *different* live location: it must be ignored.
-    decoy = torch.tensor([2 * page_size + 7], device="cuda", dtype=torch.int64)
-    component = pool.get_component(layer.layer_id, "latent_kv")
-    component.zero_()
-    backend.forward_decode(q, k, None, layer, decoy, pool, 1, save_kv_cache=True)
-    torch.cuda.synchronize()
-
-    expected = k.to(torch.float8_e4m3fn).view(torch.uint8)[0, 0]
-    # Position seq_len - 1 = page_size + 40 -> logical page 5, offset 40.
-    got = component[5, 40, 0]
-    assert torch.equal(got, expected)
-    assert torch.count_nonzero(component[2]).item() == 0, "decoy location was written"
-
-
-def _init_prefill(backend, pool, logical_rows, prefix, extend, *, grouped: bool):
+def _init_prefill(backend, page_table, prefix, extend):
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    bs = len(logical_rows)
+    bs = page_table.shape[0]
     seq_lens = torch.tensor(
         [p + e for p, e in zip(prefix, extend)], device="cuda", dtype=torch.int32
     )
-    kwargs = dict(
-        bs=bs,
-        num_extends=bs,
-        seq_lens=seq_lens,
-        forward_mode=ForwardMode.EXTEND,
+    backend.init_forward_metadata(
+        bs,
+        bs,
+        seq_lens,
+        page_table,
+        ForwardMode.EXTEND,
         extend_prefix_lens=torch.tensor(prefix, device="cuda", dtype=torch.int32),
         extend_prefix_lens_cpu=torch.tensor(prefix, dtype=torch.int32),
         extend_seq_lens=torch.tensor(extend, device="cuda", dtype=torch.int32),
         extend_seq_lens_cpu=torch.tensor(extend, dtype=torch.int32),
+        extend_with_prefix=any(p > 0 for p in prefix),
     )
-    if grouped:
-        table_np = np.array(logical_rows, dtype=np.int32)
-        metadata, forward_op = _metadata_for(pool, table_np, "cuda")
-        backend.init_forward_metadata(
-            req_pool_indices=_poison((bs,)).to(torch.int64),
-            page_table=_poison((16, 256)),
-            cache_metadata=metadata,
-            forward_batch=forward_op,
-            **kwargs,
-        )
-    else:
-        backend.init_forward_metadata(
-            req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
-            page_table=_kernel_page_table(
-                logical_rows, pool.arena.prefix_granularity, "cuda"
-            ),
-            **kwargs,
-        )
     return seq_lens
 
 
@@ -450,20 +423,31 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
 
     grouped_backend = backend_factory()
     single_table_backend = backend_factory()
-    _init_prefill(grouped_backend, pool, logical_rows, prefix, extend, grouped=True)
     _init_prefill(
-        single_table_backend, pool, logical_rows, prefix, extend, grouped=False
+        grouped_backend,
+        _expand_via_stacks(grouped_backend, pool, logical_rows),
+        prefix,
+        extend,
+    )
+    _init_prefill(
+        single_table_backend,
+        _kernel_page_table(
+            logical_rows,
+            page_size,
+            "cuda",
+            max_num_pages=single_table_backend.max_num_pages,
+        ),
+        prefix,
+        extend,
+    )
+    assert grouped_backend.chunked_prefill_metadata.extend_prefix_lens_cpu.tolist() == (
+        prefix
+    )
+    assert (
+        grouped_backend.chunked_prefill_metadata.extend_seq_lens_cpu.tolist() == extend
     )
 
-    # Write-location oracle: positions [prefix, seq) at page_id*P+offset.
-    locs = grouped_backend.forward_prefill_metadata.group_out_cache_loc
-    expected = []
-    for pages, prefix_len, extend_len in zip(logical_rows, prefix, extend):
-        for pos in range(prefix_len, prefix_len + extend_len):
-            expected.append(pages[pos // page_size] * page_size + pos % page_size)
-    assert locs.tolist() == expected
-
-    # Chunked-prefill metadata parity with the single-table page_table build.
+    # Chunked-prefill metadata parity with the hand-built page_table build.
     grouped_cm = grouped_backend.chunked_prefill_metadata
     single_table_cm = single_table_backend.chunked_prefill_metadata
     assert grouped_cm.chunked_loop_num == single_table_cm.chunked_loop_num
@@ -563,40 +547,3 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
         max_err = (reference - got).abs().max().item()
         assert max_err < 0.05 * reference.abs().max().item(), (row, max_err)
         offset += extend_len
-
-
-@requires_cuda
-def test_path_never_reads_page_table(backend_factory, gpu_pool) -> None:
-    """Same batch, three page_table flavors (real, poisoned, None): the flat
-    metadata is identical, proving page_table is never consumed."""
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-    pool = gpu_pool
-    page_size = pool.arena.prefix_granularity
-    logical_rows = [[2, 5], [4, -1]]
-    seq_lens_cpu = [page_size + 3, 9]
-    backend = backend_factory()
-
-    results = []
-    for page_table in (
-        _kernel_page_table(logical_rows, page_size, "cuda"),
-        _poison((16, 256)),
-        None,
-    ):
-        table_np = np.array(logical_rows, dtype=np.int32)
-        metadata, forward_op = _metadata_for(pool, table_np, "cuda")
-        backend.init_forward_metadata(
-            bs=2,
-            num_extends=0,
-            req_pool_indices=_poison((2,)).to(torch.int64),
-            seq_lens=torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-            page_table=page_table,
-            cache_metadata=metadata,
-            forward_batch=forward_op,
-        )
-        md = backend.forward_decode_metadata
-        results.append((md.block_kv_indices.clone(), md.group_out_cache_loc.clone()))
-    for block_kv, locs in results[1:]:
-        assert torch.equal(block_kv, results[0][0])
-        assert torch.equal(locs, results[0][1])

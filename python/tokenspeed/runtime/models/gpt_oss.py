@@ -219,11 +219,10 @@ class GptOssAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ):
 
         if hidden_states.shape[0] == 0:
-            return hidden_states, ctx, out_cache_loc, None
+            return hidden_states, ctx, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -234,9 +233,10 @@ class GptOssAttention(nn.Module):
             fused_kv_arg = create_fused_set_kv_buffer_arg(
                 value=v_3d,
                 layer=self.attn,
-                # Cache path: prewrite at this layer's group locations.
-                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
-                    self.attn, out_cache_loc, ctx.forward_mode
+                # Prewrite at this layer's group locations, fetched from the
+                # backend (the one owner of KV write slots).
+                out_cache_loc=ctx.attn_backend.write_locations(
+                    self.attn, ctx.forward_mode
                 ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )
@@ -255,11 +255,11 @@ class GptOssAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k)
             inner_state = q, k, v
-        return None, ctx, out_cache_loc, inner_state
+        return None, ctx, inner_state
 
     def forward_core(self, intermediate_state):
 
-        hidden_states, ctx, out_cache_loc, inner_state = intermediate_state
+        hidden_states, ctx, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
         # Cache was already written by the fused RoPE+KV kernel iff we took that path,
@@ -269,7 +269,6 @@ class GptOssAttention(nn.Module):
             *inner_state,
             save_kv_cache=save_kv_cache,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             sinks=self.sinks,
         )
         output, _ = self.o_proj(attn_output)
@@ -280,14 +279,12 @@ class GptOssAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
 
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         return self.forward_core(s)
 

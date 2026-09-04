@@ -74,6 +74,12 @@ Typical use: adjust one runner instance without disturbing the same task's
 dispatch order on other GPU families. Priority only affects jobs within the
 same workflow stage; later stages cannot contend with earlier ones.
 
+`retries` (eval/perf only) is a non-negative integer: the pipeline restarts the
+managed server and reruns later stages that many extra times after a crash or
+score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
+barrier timeout, GPU memory-access fault) where a clean second attempt is
+cheap relative to a red PR.
+
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
 map that to GitHub Actions `continue-on-error`.

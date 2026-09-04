@@ -1,10 +1,24 @@
 from __future__ import annotations
 
-from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
+import os
+import sys
 
 import pytest
 import torch
+
+# ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``
+# absolute imports) both need to be importable when run_ci_suite executes this
+# file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+
+from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
+
 from cache_pool_test_utils import make_arena
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -14,6 +28,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
+
+
+def test_kimi_k3_draft_mla_cache_retains_full_history() -> None:
+    """DFlash2 SWA changes compute visibility, never draft KV retention."""
+    num_draft_layers = 6
+    recipe = kimi_recipe(draft_layers=num_draft_layers)
+
+    assert recipe.group_ids[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    assert (
+        recipe.layer_types[-num_draft_layers:] == (FULL_ATTENTION,) * num_draft_layers
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -52,7 +77,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         layer_types=layer_types,
     )
 
-    assert pool.num_lcm_blocks == num_lcm_blocks
+    assert pool.arena.plan.num_lcm_blocks == num_lcm_blocks
     assert pool.arena.runtime_contract is not None
     assert pool.arena.runtime_contract.token_capacity == 1024
     assert {
@@ -137,11 +162,9 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         device="cpu",
         dtype=torch.bfloat16,
         context_len=1024,
-        max_graph_bs=1,
         max_bs=1,
         prefix_granularity=plan.prefix_granularity,
         kv_cache_quant_method="none",
-        max_scheduled_tokens=128,
         components=(mla_spec,),
     )
     target_config = AttnConfig(
@@ -203,3 +226,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     # Both views name the one arena, so a clear through either zeros it.
     draft_pool.clear_kv_buffers()
     assert not torch.count_nonzero(draft_pool.kv_buffer[0])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

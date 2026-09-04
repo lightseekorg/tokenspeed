@@ -173,6 +173,83 @@ def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
 
 
 @pytest.mark.parametrize("n_loc", [4, 600])
+@pytest.mark.parametrize(
+    ("nope_dtype", "rope_dtype"),
+    [
+        (torch.bfloat16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+def test_set_casts_mixed_sources_into_fp8_buffer(n_loc, nope_dtype, rope_dtype):
+    """Both dispatch branches accept independently typed cache components."""
+    loc, k_nope, _ = _make_inputs(n_loc, nope_dtype, "rand")
+    _, _, k_rope = _make_inputs(n_loc, rope_dtype, "rand", seed=1)
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv,
+        loc,
+        k_nope.to(torch.float8_e4m3fn),
+        k_rope.to(torch.float8_e4m3fn),
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+
+
+def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
+    import tokenspeed.runtime.layers.attention.kv_cache.mla as mla_pool_module
+
+    pool = object.__new__(MLATokenToKVPool)
+    pool.quant_method = "none"
+    pool.dtype = torch.float8_e4m3fn
+    pool.store_dtype = torch.uint8
+    pool.latent_write_sanitizes = False
+    storage = torch.empty(8, TOTAL_DIM, device="cuda", dtype=torch.uint8)
+    pool.kv_buffer = [storage]
+    k_nope = torch.randn(2, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(2, 1, ROPE_DIM, device="cuda", dtype=torch.bfloat16)
+    loc = torch.tensor([1, 3], device="cuda", dtype=torch.int64)
+    captured = {}
+
+    def capture(kv_buffer, cache_loc, cache_k_nope, cache_k_rope, **kwargs):
+        captured.update(
+            kv_buffer=kv_buffer,
+            cache_loc=cache_loc,
+            cache_k_nope=cache_k_nope,
+            cache_k_rope=cache_k_rope,
+            kwargs=kwargs,
+        )
+
+    monkeypatch.setattr(mla_pool_module, "set_mla_kv_buffer_triton", capture)
+    layer = type("Layer", (), {"layer_id": 0})()
+    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+
+    assert captured["kv_buffer"].dtype == torch.float8_e4m3fn
+    assert captured["kv_buffer"].untyped_storage().data_ptr() == storage.data_ptr()
+    assert captured["cache_loc"] is loc
+    assert captured["cache_k_nope"] is k_nope
+    assert captured["cache_k_rope"] is k_rope
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_supports_zero_width_rope_with_int32_locations(n_loc):
+    loc = torch.arange(n_loc, device="cuda", dtype=torch.int32)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.empty(n_loc, 1, 0, device="cuda", dtype=torch.bfloat16)
+    kv = torch.full((n_loc + 8, NOPE_DIM), 7.5, device="cuda", dtype=torch.bfloat16)
+    ref = kv.clone()
+    ref[loc.long()] = k_nope[:, 0]
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert loc.dtype == torch.int32
+    assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
 def test_set_squashes_nan_and_inf(n_loc):
     """Sanitized mixed-dtype writes stay finite in the fp8 destination."""
     loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "rand")

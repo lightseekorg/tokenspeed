@@ -102,6 +102,18 @@ def _agreed(ok: bool) -> bool:
     return bool(flag.item())
 
 
+def _mapping_stub(world: int = 1):
+    """The slice of ``mapping`` the tail and the producer-direct probe read."""
+    return SimpleNamespace(
+        moe=SimpleNamespace(
+            # tokenspeed groups are tuples of global ranks, not ProcessGroups.
+            tp_ep_group=tuple(range(world)),
+            tp_ep_size=world,
+            has_tp_ep=world > 1,
+        )
+    )
+
+
 def _build_comm(device: torch.device, *, latent_tail=None):
     """A ``K3MoeTailComm`` carrying just what the tail methods touch.
 
@@ -137,14 +149,7 @@ def _build_comm(device: torch.device, *, latent_tail=None):
     # _replicated variants, matching the full-width reference below.
     comm._shard_up_projection = up_proj.shard_group is not None
 
-    comm.mapping = SimpleNamespace(
-        moe=SimpleNamespace(
-            # tokenspeed groups are tuples of global ranks, not ProcessGroups.
-            tp_ep_group=tuple(range(world)),
-            tp_ep_size=world,
-            has_tp_ep=world > 1,
-        )
-    )
+    comm.mapping = _mapping_stub(world)
     comm.execution_plan = SimpleNamespace(
         fused_moe_ar=True,
         join_moe_reduce=True,
@@ -383,6 +388,9 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
     comm.execution_plan = SimpleNamespace(fused_moe_ar=True, join_moe_reduce=True)
     comm.state = SimpleNamespace(multimem_ar_ok=False)
     comm._shard_up_projection = False
+    # __init__ is bypassed here; the probe declines on CPU, so no symmetric
+    # heap is reached.
+    comm.mapping = _mapping_stub()
     comm.routed_hidden, comm.hidden_size = L, H
 
     cap = mod.TAIL_FUSION_MAX_TOKENS
@@ -417,6 +425,9 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
         )
         comm.state = SimpleNamespace(multimem_ar_ok=False)
         comm._shard_up_projection = False
+        # __init__ is bypassed here; the probe declines on CPU, so no
+        # symmetric heap is reached.
+        comm.mapping = _mapping_stub()
         comm.routed_hidden, comm.hidden_size = L, H
         return comm
 
@@ -593,7 +604,48 @@ def test_fused_lane_ar_matches_reference(m):
     comm = _build_comm(dev)
     routed, shared, prefix = _inputs(rank, dev, m, seed=55)
     ref = _reference(comm, routed, shared, prefix)
-    out = comm._tail_fused_lane_ar(routed, shared, prefix, None, m, H)
+    out = comm._tail_fused_lane_ar(routed, shared, prefix, None, None, m, H)
+    torch.cuda.synchronize()
+    assert _rel_err(out, ref) < 0.05
+
+
+@collective
+@pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
+def test_fused_lane_ar_symmetric_matches_reference(m):
+    """The join tier reduces producer-direct partials to the same answer.
+
+    This regime swaps both the operand shape (a pair, not one concatenation)
+    and the kernel that sums it (an in-place symmetric reduce rather than a
+    staged one-shot), so it is the tier variant most able to disagree while
+    every other test still passes. Driving it here is also the only check that
+    the tail consumes the pair in the order it acquired them -- transposing
+    routed and shared would still produce plausibly-shaped output.
+
+    Skipped where the backend declines producer-direct memory; the vote keeps
+    the ranks from splitting over it, since one rank taking the symmetric
+    kernel while another stages would hang rather than fail.
+    """
+    from tokenspeed.runtime.distributed.comm_ops import (
+        acquire_all_reduce_outputs,
+        can_acquire_all_reduce_outputs,
+    )
+
+    rank, dev = _setup()
+    comm = _build_comm(dev)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=55)
+    ref = _reference(comm, routed, shared, prefix)
+
+    group = comm.mapping.moe.tp_ep_group
+    shapes = ((m, L), (m, H))
+    if not _agreed(can_acquire_all_reduce_outputs(shapes, routed, group)):
+        pytest.skip("backend has no producer-direct all-reduce outputs here")
+
+    symm = acquire_all_reduce_outputs(shapes, routed, group)
+    # Stand in for the producers, which write their partials into these
+    # buffers rather than returning fresh ones.
+    symm[0].copy_(routed)
+    symm[1].copy_(shared)
+    out = comm._tail_fused_lane_ar(symm[0], symm[1], prefix, None, symm, m, H)
     torch.cuda.synchronize()
     assert _rel_err(out, ref) < 0.05
 
@@ -658,7 +710,7 @@ def test_tiers_agree_with_each_other():
 
     outs = {"separate_reduce": _run_separate_reduce(comm, *fresh(), m)}
     r, s, p = fresh()
-    outs["fused_lane_ar"] = comm._tail_fused_lane_ar(r, s, p, None, m, H)
+    outs["fused_lane_ar"] = comm._tail_fused_lane_ar(r, s, p, None, None, m, H)
     if _agreed(multimem_available()):
         outs["multimem_ar"] = comm._tail_multimem_ar(*fresh(), m, H)
     if tail is not None:

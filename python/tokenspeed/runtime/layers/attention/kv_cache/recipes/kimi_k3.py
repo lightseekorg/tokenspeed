@@ -40,7 +40,6 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -55,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupDeclaration,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -88,10 +88,9 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- layer vocabulary ----
 
-    @cached_property
+    @property
     def _text_config(self):
-        hf_config = self.model_config.hf_config
-        return getattr(hf_config, "text_config", hf_config)
+        return self.model_config.hf_text_config
 
     @cached_property
     def target_group_ids(self) -> tuple[str, ...]:
@@ -122,8 +121,9 @@ class KimiK3Recipe(CacheRecipe):
             or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
         ):
             raise ValueError(
-                "93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
-                f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+                f"{_KIMI_K3_LAYERS}-layer Kimi-K3 requires "
+                f"{_KIMI_K3_KDA_LAYERS} KDA and {_KIMI_K3_MLA_LAYERS} MLA "
+                f"layers, got {len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
         if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
             raise ValueError(
@@ -306,9 +306,14 @@ class KimiK3Recipe(CacheRecipe):
             kda_replay_commit_supported,
         )
 
+        _, recurrent_shape = self._kda_shapes
+        heads, head_dim, _ = recurrent_shape
         return bool(
             kda_replay_commit_supported(
-                self.attn_config.dtype, recurrent_layout=kda_recurrent_layout()
+                self.attn_config.dtype,
+                recurrent_layout=kda_recurrent_layout(),
+                num_heads=heads,
+                head_dim=head_dim,
             )
         )
 
@@ -318,6 +323,8 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:
+            conv_shape, recurrent_shape = self._kda_shapes
+            heads, head_dim, _ = recurrent_shape
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.
             from tokenspeed_kernel.ops.attention import (
@@ -325,7 +332,9 @@ class KimiK3Recipe(CacheRecipe):
             )
 
             replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
-                self.attn_config.dtype
+                self.attn_config.dtype,
+                num_heads=heads,
+                head_dim=head_dim,
             )
             # Raw-g replay reuses the committed convolution pool as verify scratch.
             conv_bytes = (
@@ -340,8 +349,6 @@ class KimiK3Recipe(CacheRecipe):
                     if field.field_id.endswith(".conv_state")
                 )
             )
-            conv_shape, recurrent_shape = self._kda_shapes
-            heads, head_dim, _ = recurrent_shape
             rows = self.attn_config.max_bs * int(
                 self.server_args.speculative_num_draft_tokens
             )
@@ -373,14 +380,6 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
-
-    @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
-        token_limit = self.token_limit
-        if token_limit is None:
-            return num_lcm_blocks
-        return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

@@ -22,7 +22,7 @@
 
 Root cause: the draft first-step MoE all-gather (``draft_first_step_reduce``)
 sizes its TritonRSAG collective from ``ctx.global_bs``. The CUDA-graph capture
-path (``CudaGraphWrapper._capture_one``) set ``ctx.global_num_tokens`` to a
+path (``ForwardStepRunner._capture_one``) set ``ctx.global_num_tokens`` to a
 uniform dummy but left ``ctx.global_bs`` as ``None``. With ``global_bs is None``
 the draft MoE scattered-token-count helper falls back to a *single-rank* layout
 (only the local rank has tokens), whereas at replay ``ctx.global_bs`` is the live
@@ -125,14 +125,14 @@ def test_capture_matches_replay_all_ranks(rank: int):
 
 
 def test_capture_one_sets_global_bs(monkeypatch):
-    """Guards the fix at its source: CudaGraphWrapper._capture_one must set
+    """Guards the fix at its source: ForwardStepRunner._capture_one must set
     ctx.global_bs (not leave it None) for DP, matching how global_num_tokens is
     set. Verified by inspecting the source so the test needs no GPU/capture."""
     import inspect
 
-    from tokenspeed.runtime.execution import cuda_graph_wrapper
+    from tokenspeed.runtime.execution import forward_step
 
-    src = inspect.getsource(cuda_graph_wrapper.CudaGraphWrapper._capture_one)
+    src = inspect.getsource(forward_step.ForwardStepRunner._capture_one)
     # Both DP token-metadata fields must be assigned in the capture path.
     assert "ctx.global_num_tokens" in src
     assert "ctx.global_bs" in src

@@ -65,6 +65,48 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
+_UNQUANTIZED_LM_HEAD_METHODS = frozenset(
+    {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod"}
+)
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    """Whether ``lm_head``'s quant method should run the logits GEMM.
+
+    Returns ``True`` only when the head is genuinely quantized and its runtime
+    tensor layout matches the method (so a packed weight is never matmul'd, and
+    a mismatched/stale method never runs). Otherwise the caller falls back to a
+    dense ``weight`` matmul.
+    """
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    if method_name == "Nvfp4W4A16LinearMethod":
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "alpha",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+
+    return True
+
+
 def _force_deterministic_rsag() -> bool:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -655,7 +697,10 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
-        if hasattr(lm_head, "weight"):
+        quant_method = getattr(lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(lm_head, quant_method):
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif hasattr(lm_head, "weight"):
             if self._use_fused_lm_head:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
@@ -664,7 +709,7 @@ class LogitsProcessor(nn.Module):
                 )
         else:
             # GGUF models
-            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)

@@ -192,7 +192,7 @@ def _test_dp_chain_matches_legacy(
     n: int,
     vocab: int,
     hidden: int,
-    is_all_greedy: bool,
+    greedy: bool,
     dtype,
 ):
     tp_size = world_size
@@ -250,7 +250,12 @@ def _test_dp_chain_matches_legacy(
             device=device,
         )
     )
-    _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
+    # Greedy is expressed through the pool scalars (top_k=1), matching the
+    # unified sampling route — there is no separate argmax branch.
+    if greedy:
+        _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=1, top_p=1.0)
+    else:
+        _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
 
     hidden_states = _make_hidden_states(
         bs, n, hidden, dtype=dtype, device=device, seed=2024
@@ -266,7 +271,6 @@ def _test_dp_chain_matches_legacy(
     ), f"legacy logits {legacy_logits.shape}, expected {(bs*n, vocab)}"
 
     legacy_info = SamplingBatchInfo(
-        is_all_greedy=is_all_greedy,
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
@@ -296,7 +300,6 @@ def _test_dp_chain_matches_legacy(
     ), f"dp logits {dp_logits.shape}, expected {(reqs_per_rank*n, vocab)}"
 
     dp_info = SamplingBatchInfo(
-        is_all_greedy=is_all_greedy,
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
@@ -346,7 +349,7 @@ class TestDPSamplingLogitsVerify:
             n=n,
             vocab=256,
             hidden=64,
-            is_all_greedy=False,
+            greedy=False,
             dtype=torch.bfloat16,
         )
 
@@ -360,6 +363,6 @@ class TestDPSamplingLogitsVerify:
             n=n,
             vocab=256,
             hidden=64,
-            is_all_greedy=True,
+            greedy=True,
             dtype=torch.bfloat16,
         )

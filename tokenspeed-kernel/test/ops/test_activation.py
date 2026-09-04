@@ -142,6 +142,18 @@ def test_silu_and_mul_writes_provided_output(device: str) -> None:
     assert same.data_ptr() == out.data_ptr()
 
 
+def test_silu_and_mul_applies_glm_clamp(device: str) -> None:
+    x = torch.randn(17, 512, device=device, dtype=torch.bfloat16) * 20
+    gate, up = x.float().chunk(2, dim=-1)
+    gate = gate.clamp(max=10.0)
+    up = up.clamp(-10.0, 10.0)
+    ref = (torch.nn.functional.silu(gate) * up).to(x.dtype)
+
+    out = silu_and_mul(x, limit=10.0)
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 def test_silu_and_mul_empty(device: str) -> None:
     x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
     out = silu_and_mul(x)

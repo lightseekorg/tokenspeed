@@ -22,7 +22,6 @@
 
 Run as ``tune_route.py [shape_set] [route.json]``; the set names a key of
 SHAPE_SETS and defaults to K3's TP16 table.
-
 The shapes are the exact (N, K) that the decode path hands the routed GEMV,
 extracted from a trace of the serving path (rowcta's launch grid is ``(N,)``,
 so gridX identifies each call site). Every measurement cycles
@@ -80,6 +79,9 @@ SHAPE_SETS = {
         # Table keys on exact M; sweep the routed range with no holes.
         list(range(1, 33)),
     ),
+    # Qwen3.8-Flash-Next BF16 shapes observed at UnquantizedLinearMethod across
+    # the FP8/NVFP4 and MTP3/MTP7 serving configurations. Each TP set is tuned
+    # independently because tensor-parallel projections change both N and K.
     "qwen38_next_tp4": (
         [
             (512, 2560, 0, "mlp_gate"),
@@ -92,7 +94,20 @@ SHAPE_SETS = {
             (2560, 2560, 0, "n2560_k2560"),
             (12800, 2560, 0, "n12800_k2560"),
         ],
-        [1, 2, 4, 8],
+        list(range(1, 33)),
+    ),
+    "qwen38_next_tp2": (
+        [
+            (512, 2560, 0, "n512_k2560"),
+            (640, 2560, 0, "n640_k2560"),
+            (2560, 320, 0, "n2560_k320"),
+            (2560, 2560, 0, "n2560_k2560"),
+            (2560, 3072, 0, "n2560_k3072"),
+            (6656, 2560, 0, "n6656_k2560"),
+            (8240, 2560, 0, "n8240_k2560"),
+            (12800, 2560, 0, "n12800_k2560"),
+        ],
+        list(range(1, 33)),
     ),
 }
 SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]
@@ -163,7 +178,11 @@ def candidates(m: int, n: int, k: int):
     )
 
     if skinny.is_available():
-        cfg = skinny.default_config(m, n, k)
+        # Rank the config serving would run, not the bare heuristic, so a
+        # re-sweep cannot demote a shape whose win lives in SKINNY_CONFIG_ROUTE.
+        from tokenspeed_kernel.ops.gemm.routed_gemv import _skinny_config
+
+        cfg = _skinny_config(m, n, k)
         if skinny.supports(cfg, m, n, k):
 
             def sk(i):

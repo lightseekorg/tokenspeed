@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 
 import torch
 
-from tokenspeed.runtime.layers.attention.backends import mla as mla_backend
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.layers.attention.backends.paged import mla as mla_backend
 
 
 def _run_mla_decode(
@@ -15,25 +24,31 @@ def _run_mla_decode(
     q_len_per_req: int = 2,
     data_type: torch.dtype = torch.float32,
     page_size: int = 16,
+    draft_block_decode: bool = False,
+    sliding_window_size: int = -1,
 ) -> dict[str, torch.Tensor]:
     captured = {}
 
     def fake_mla_decode_with_kvcache(**kwargs):
-        captured["q"] = kwargs["q"]
-        captured["cache_seqlens"] = kwargs["cache_seqlens"]
+        captured.update(kwargs)
         return torch.zeros(*kwargs["q"].shape[:-1], 4)
 
     monkeypatch.setattr(
         mla_backend, "mla_decode_with_kvcache", fake_mla_decode_with_kvcache
     )
     backend = object.__new__(mla_backend.MLAAttnBackend)
+    metadata_rows = bs * q_len_per_req if draft_block_decode else bs
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    if draft_block_decode:
+        seq_lens = seq_lens.repeat_interleave(q_len_per_req)
     backend.forward_decode_metadata = SimpleNamespace(
         num_extends=0,
-        page_table=torch.zeros(bs, 1, dtype=torch.int32),
-        seq_lens=torch.tensor([64, 128], dtype=torch.int32)[:bs],
+        page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
+        seq_lens=seq_lens,
     )
     backend.is_draft = is_draft
-    backend.draft_block_decode = False
+    backend.draft_block_decode = draft_block_decode
+    backend.spec_num_tokens = q_len_per_req if draft_block_decode else 1
     backend.max_context_len = 256
     backend.kernel_page_size = page_size
     backend.kv_lora_rank = 2
@@ -51,6 +66,7 @@ def _run_mla_decode(
         logit_cap=0.0,
         k_scale_float=None,
         layer_id=0,
+        sliding_window_size=sliding_window_size,
     )
     token_to_kv_pool = SimpleNamespace(
         get_key_buffer=lambda layer_id: torch.zeros(page_size, 4).to(data_type)
@@ -92,3 +108,19 @@ def test_fp8_decode_dispatches_with_native_fp8_query(monkeypatch):
     )
 
     assert captured["q"].dtype == torch.float8_e4m3fn
+
+
+def test_dflash2_block_decode_passes_exact_sliding_window(monkeypatch):
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        # PagedAttention stores HF's inclusive window as window_left.
+        sliding_window_size=4095,
+    )
+
+    assert captured["window_left"] == 4095
+    assert captured["noncausal_block_size"] == 8
+    assert captured["q"].shape[0] == 16
