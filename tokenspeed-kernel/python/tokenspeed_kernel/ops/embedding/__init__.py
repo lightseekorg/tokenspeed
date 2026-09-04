@@ -242,6 +242,52 @@ def apply_rope(
     )
 
 
+def apply_k_rope(
+    positions: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    *,
+    is_neox: bool = True,
+    k_rope_out: torch.Tensor | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> torch.Tensor:
+    """Rotate keys that have no query to be paired with.
+
+    Context injection rotates a key row on its own. Every registered rope
+    kernel grids over ``num_q_heads + num_k_heads``, so a zero-width query
+    launches no query work at all -- unlike the same-shaped scratch query a
+    caller would otherwise have to allocate and rotate.
+
+    Args:
+        positions: Token positions ``[num_tokens]``.
+        k: Key tensor ``[num_tokens, num_kv_heads * head_size]``.
+        head_size: Per-head hidden dimension.
+        cos_sin_cache: ``[max_position, rotary_dim]`` as concat(cos, sin).
+        is_neox: Half-split rotation. False uses GPT-J interleaved pairs.
+        k_rope_out: Optional output buffer; ``k`` is rotated in place without
+            one.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+
+    Returns:
+        The rotated key, which is ``k_rope_out`` when provided.
+    """
+    _, rotated = apply_rope(
+        positions,
+        k.new_empty((positions.numel(), 0)),
+        k,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        k_rope_out=k_rope_out,
+        solution=solution,
+        override=override,
+    )
+    return rotated
+
+
 def apply_rope_mla(
     # embedding inputs
     positions: torch.Tensor,
@@ -435,6 +481,7 @@ def apply_rope_mla(
 __all__ = [
     "FusedMLASetKVBufferArg",
     "FusedSetKVBufferArg",
+    "apply_k_rope",
     "apply_rope",
     "apply_rope_mla",
     "apply_rope_mla_set_kv",
