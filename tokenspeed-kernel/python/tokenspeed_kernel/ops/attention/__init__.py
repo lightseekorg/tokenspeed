@@ -5518,11 +5518,11 @@ def qsa_sparse_attention(
     selected_slots: torch.Tensor,
     *,
     scale: float,
-    max_seqlen_q: int = 1,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
-    override: str | None = None,
-    solution: str | None = None,
+    max_seqlen_q: int,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    override: str | None,
+    solution: str | None,
 ) -> torch.Tensor:
     """Attend to a per-query list of physical QSA KV-cache slots.
 
@@ -5547,6 +5547,10 @@ def qsa_sparse_attention(
     Returns:
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
+
+    The SM100 CuTe DSL implementation is preferred when its specialization
+    matches. Other supported NVIDIA architectures use FlashInfer FA2 sparse
+    attention as the registered fallback.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:

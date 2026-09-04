@@ -1033,6 +1033,8 @@ class QSAIndexer(nn.Module):
                 if v_cache.dtype in fp8_dtypes
                 else None
             ),
+            override=None,
+            solution=None,
         )
         output = output.reshape(q.shape[0], -1)
         if gate is not None:

@@ -76,9 +76,9 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     selected_slots: torch.Tensor,
     *,
     scale: float,
-    max_seqlen_q: int = 1,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
+    max_seqlen_q: int,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
     """Run the adaptive workspace-free B200 QSA specialization.
 
