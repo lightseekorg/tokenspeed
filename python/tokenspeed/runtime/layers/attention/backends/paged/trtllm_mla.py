@@ -53,6 +53,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
@@ -172,6 +173,12 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
     # ---- Metadata initialization ----
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
 
     def init_forward_metadata(
         self,

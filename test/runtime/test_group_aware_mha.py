@@ -87,6 +87,8 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
                 granularities={gid: 4 for gid in group_ids},
                 families={gid: "history" for gid in group_ids},
                 full_history_group_id=FULL,
+                row_geometry={gid: (4, 1) for gid in group_ids},
+                retentions={gid: ("full_history", None) for gid in group_ids},
             ),
             leaves,
         )

@@ -270,7 +270,7 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         stub_pool = _ContractPool(
             self.P,
-            {0: ("linear_attention", object(), object())},
+            {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
         )
         backend.set_kv_pool(stub_pool)
         self.assertTrue(backend.state_paging_active)

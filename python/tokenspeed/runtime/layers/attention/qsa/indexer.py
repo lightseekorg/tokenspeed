@@ -166,6 +166,12 @@ class QSAIndexer(nn.Module):
             persistent=False,
         )
 
+    def drop_verify_scratch(self) -> None:
+        """Forget the verify views and their pool; a rebind reissues them."""
+        self._verify_scratch.clear()
+        self._active_verify_width = None
+        self._last_pool = None
+
     @staticmethod
     def _full_backend(ctx: ForwardContext) -> CacheGroupRouter:
         """The cache-group router serving the model's paged groups (the

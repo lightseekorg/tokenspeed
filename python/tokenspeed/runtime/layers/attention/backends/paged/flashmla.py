@@ -56,6 +56,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -185,13 +186,7 @@ class FlashMLABackend(PagedAttentionBackend):
             (max_bs + 1,), dtype=torch.int32, device=config.device
         )
 
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
-        )
-        self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
-            self.workspace_buffer,
-            backend="auto",
-        )
+        self._build_prefill_wrappers()
         self.indices_updater_prefill = _PrefillIndicesUpdater(config, spec, self)
 
         # Metadata state. Decode and prefill metadata are split so MIXED batches
@@ -218,6 +213,30 @@ class FlashMLABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Metadata init
     # ------------------------------------------------------------------
+
+    def _build_prefill_wrappers(self) -> None:
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+        self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer,
+            backend="auto",
+        )
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        rebinding = self.cache_pool is not None
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
+        self._decode_tile_metadata = None
+        self._decode_tile_metadata_keepalive = []
+        if rebinding:
+            # The wrappers keep the plan built from the old pool's page table.
+            self._build_prefill_wrappers()
+            self.indices_updater_prefill.prefill_wrapper_ragged = (
+                self.prefill_wrapper_ragged
+            )
 
     def init_forward_metadata(
         self,

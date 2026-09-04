@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -153,6 +154,11 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_extend_metadata = None
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
