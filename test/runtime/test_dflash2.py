@@ -46,7 +46,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
-from tokenspeed.runtime.models.dflash import DFlashAttention
+from tokenspeed.runtime.models.dflash import DFlashAttention, DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -399,3 +399,48 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         torch.testing.assert_close(
             actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
         )
+
+
+def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> None:
+    """Prefill+decode batches must not stop the stream once per request."""
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = 4
+    drafter.device = torch.device("cpu")
+    positions = torch.tensor([10, 11, 12, 13, 14, 20, 21, 22, 23, 30, 31, 32, 33])
+    drafter.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.tensor([5, 1, 1], dtype=torch.int32),
+        req_pool_indices_buf=torch.tensor([0, 1, 2]),
+        positions_buf=positions,
+        out_cache_loc_buf=torch.arange(positions.numel(), dtype=torch.int32),
+    )
+    drafter.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.tensor([100, 200, 300], dtype=torch.int32)
+    )
+    drafter.draft_seq_lens_buf = torch.zeros(3, dtype=torch.int32)
+    written = []
+    drafter._write_native_cache = lambda *args, **kwargs: written.append(kwargs)
+
+    ctx = SimpleNamespace(bs=3, num_extends=1, input_num_tokens=positions.numel())
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),
+        # Row 0 is a prefill chunk; row 1 keeps two tokens, row 2 keeps none.
+        accept_lengths=torch.tensor([0, 2, 0], dtype=torch.int32),
+    )
+
+    assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
+    assert written == [{"decode_only": False}]
+
+
+def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
+    """A resident residual costs one allocation, not one per draft forward."""
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    model._residual_buffer = None
+
+    first = DFlashDraftModel._zeroed_residual(model, torch.ones(4, 8))
+    first.add_(3)
+    second = DFlashDraftModel._zeroed_residual(model, torch.ones(2, 8))
+
+    assert second.data_ptr() == first.data_ptr()
+    assert second.shape == (2, 8)
+    assert not second.any()

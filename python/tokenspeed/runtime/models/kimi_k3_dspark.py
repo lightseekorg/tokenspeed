@@ -39,6 +39,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.embedding import apply_k_rope
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
@@ -162,8 +163,13 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
             .reshape(-1, 1, self.qk_rope_head_dim)
             .clone()
         )
-        dummy_q = k_pe.new_empty(k_pe.shape)
-        _, k_pe_rot = self.rotary_emb(positions, dummy_q, k_pe)
+        k_pe_rot = apply_k_rope(
+            positions,
+            k_pe,
+            self.qk_rope_head_dim,
+            self.rotary_emb.cos_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
         latent[..., self.kv_lora_rank :] = k_pe_rot.reshape(
             latent.size(0), self.qk_rope_head_dim
         )

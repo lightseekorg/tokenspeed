@@ -580,48 +580,30 @@ class DFlash(BaseDrafter):
             self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
             return
 
-        hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
-        pos_chunks = torch.split(positions, lengths.detach().cpu().tolist(), dim=0)
-        loc_chunks = torch.split(cache_locs, lengths.detach().cpu().tolist(), dim=0)
-
-        selected_hidden = []
-        selected_positions = []
-        selected_cache_locs = []
-        new_seq_lens = torch.empty((bs,), dtype=torch.int32, device=self.device)
-
-        for row, (chunk, pos_chunk, loc_chunk) in enumerate(
-            zip(hidden_chunks, pos_chunks, loc_chunks, strict=True)
-        ):
-            if row < base_ctx.num_extends:
-                take = int(chunk.shape[0])
-            else:
-                take = int(accept_lengths[row].item())
-            if take <= 0:
-                pool_idx = req_pool_indices[row]
-                new_seq_lens[row] = self.runtime_states.valid_cache_lengths[pool_idx]
-                continue
-
-            chunk = chunk[:take].contiguous()
-            pos_chunk = pos_chunk[:take].contiguous()
-            loc_chunk = loc_chunk[:take].contiguous()
-            selected_hidden.append(chunk)
-            selected_positions.append(pos_chunk)
-            selected_cache_locs.append(loc_chunk)
-            new_seq_lens[row] = (pos_chunk[-1] + 1).to(torch.int32)
-
-        self.draft_seq_lens_buf[:bs].copy_(new_seq_lens)
-        if not selected_hidden:
+        if base_ctx.input_num_tokens == 0:
             return
 
-        target_hidden = torch.cat(selected_hidden, dim=0)
-        target_positions = torch.cat(selected_positions, dim=0)
-        target_cache_locs = torch.cat(selected_cache_locs, dim=0)
-        self._write_native_cache(
-            target_hidden,
-            target_positions,
-            target_cache_locs,
-            decode_only=decode_only,
+        # Which rows a request kept is a device-side fact, and slicing per
+        # request to drop the rejected ones cost one device-to-host sync per
+        # request. Write every row instead: a rejected row lands past its
+        # request's new valid length, exactly where the CUDA-graph decode path
+        # above already leaves it, and a later round overwrites that slot.
+        starts = torch.cumsum(lengths, 0) - lengths
+        takes = lengths.clone()
+        if bs > base_ctx.num_extends:
+            takes[base_ctx.num_extends :] = (
+                accept_lengths[base_ctx.num_extends : bs]
+                .to(torch.int64)
+                .clamp(min=0, max=self.spec_num_tokens)
+            )
+        last_row = (starts + takes - 1).clamp(min=0, max=base_ctx.input_num_tokens - 1)
+        old_lens = self.runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices
+        ).to(torch.int32)
+        self.draft_seq_lens_buf[:bs].copy_(
+            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
         )
+        self._write_native_cache(hidden, positions, cache_locs, decode_only=decode_only)
 
     def _write_native_cache(
         self,

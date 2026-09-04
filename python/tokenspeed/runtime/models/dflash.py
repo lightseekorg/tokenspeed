@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
@@ -227,9 +228,13 @@ class DFlashAttention(nn.Module):
         return self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        dummy_q = k.new_empty(k.shape)
-        _, k = self.rotary_emb(positions, dummy_q, k)
-        return k
+        return _apply_k_rope(
+            positions,
+            k,
+            self.head_dim,
+            self.rotary_emb.cos_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
 
 
 class DFlashMLP(nn.Module):
@@ -398,6 +403,7 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
         self.block_size = read_checkpoint_block_size(config)
+        self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(self.fc(target_hidden))
@@ -442,6 +448,31 @@ class DFlashDraftModel(nn.Module):
                 attn.attn.v_scale,
             )
 
+    def _zeroed_residual(self, template: torch.Tensor) -> torch.Tensor:
+        """The residual stream the layers accumulate into, cleared in place.
+
+        The layers write through it, so it may not be shared with anything
+        that outlives one forward; nothing does. Growing it during CUDA graph
+        capture would hand a later graph memory owned by an earlier graph's
+        private pool, so capture allocates instead of resizing.
+        """
+        buffer = self._residual_buffer
+        rows = int(template.shape[0])
+        if (
+            buffer is None
+            or buffer.shape[0] < rows
+            or buffer.shape[1:] != template.shape[1:]
+            or buffer.dtype != template.dtype
+            or buffer.device != template.device
+        ):
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                return torch.zeros_like(template)
+            self._residual_buffer = torch.zeros_like(template)
+            return self._residual_buffer
+        residual = buffer[:rows]
+        residual.zero_()
+        return residual
+
     @torch.no_grad()
     def forward(
         self,
@@ -461,7 +492,7 @@ class DFlashDraftModel(nn.Module):
             residual = None
         else:
             hidden_states = input_embeds
-            residual = torch.zeros_like(input_embeds)
+            residual = self._zeroed_residual(input_embeds)
 
         if kv_sync_event is not None:
             torch.cuda.current_stream().wait_event(kv_sync_event)
