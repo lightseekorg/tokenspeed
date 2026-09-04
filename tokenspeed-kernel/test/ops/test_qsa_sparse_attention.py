@@ -69,6 +69,7 @@ def test_qsa_sparse_attention_requires_dispatch_arguments() -> None:
     parameters = inspect.signature(qsa_sparse_attention).parameters
     for name in (
         "max_seqlen_q",
+        "metadata_capacity_rows",
         "k_scale",
         "v_scale",
         "override",
@@ -135,6 +136,7 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
             selected,
             scale=1.0,
             max_seqlen_q=0,
+            metadata_capacity_rows=None,
             k_scale=None,
             v_scale=None,
             override=None,
@@ -148,6 +150,7 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
             selected,
             scale=1.0,
             max_seqlen_q=4,
+            metadata_capacity_rows=None,
             k_scale=None,
             v_scale=None,
             override=None,
@@ -239,6 +242,7 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
         slots,
         scale=scale,
         max_seqlen_q=(4 if rows == 4 else 1),
+        metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
@@ -297,6 +301,7 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
         "k_scale": k_scale,
         "v_scale": v_scale,
         "max_seqlen_q": 1,
+        "metadata_capacity_rows": None,
         "override": "cute_dsl_blackwell_qsa_sparse_attention",
         "solution": None,
     }
@@ -378,6 +383,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_cache,
         width,
         softmax_scale=scale,
+        metadata_capacity_rows=None,
     )
 
     first = qsa_sparse_attention(
@@ -387,6 +393,7 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         selected,
         scale=scale,
         max_seqlen_q=(4 if rows == 4 else 1),
+        metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
@@ -404,13 +411,24 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         selected,
         scale=scale,
         max_seqlen_q=(4 if rows == 4 else 1),
+        metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
         solution="flashinfer",
     )
 
-    assert runner.plan(q, k_cache, v_cache, width, softmax_scale=scale) is plan
+    assert (
+        runner.plan(
+            q,
+            k_cache,
+            v_cache,
+            width,
+            softmax_scale=scale,
+            metadata_capacity_rows=None,
+        )
+        is plan
+    )
     assert torch.isfinite(first).all()
     torch.testing.assert_close(
         second.float(),
@@ -449,15 +467,36 @@ def test_flashinfer_qsa_runner_reuses_one_high_watermark_buffer(device: str) -> 
     )
     fixed_buffer_ptr = one.indices.data_ptr()
     assert one.indices.untyped_storage().nbytes() >= rows * width * 4
-    four = runner.plan(q, cache, cache, width, softmax_scale=0.125)
+    four = runner.plan(
+        q,
+        cache,
+        cache,
+        width,
+        softmax_scale=0.125,
+        metadata_capacity_rows=None,
+    )
     assert four.indices.data_ptr() == fixed_buffer_ptr
 
-    two = runner.plan(q[:2], cache, cache, width, softmax_scale=0.125)
+    two = runner.plan(
+        q[:2],
+        cache,
+        cache,
+        width,
+        softmax_scale=0.125,
+        metadata_capacity_rows=None,
+    )
     assert two.indices.data_ptr() == fixed_buffer_ptr
     assert four.wrapper._int_workspace_buffer.numel() < 8 * 1024 * 1024
     assert four.wrapper._pin_memory_int_workspace_buffer.numel() == 0
 
-    again = runner.plan(q[:1], cache, cache, width, softmax_scale=0.125)
+    again = runner.plan(
+        q[:1],
+        cache,
+        cache,
+        width,
+        softmax_scale=0.125,
+        metadata_capacity_rows=None,
+    )
     assert again is one
     assert again.indices.data_ptr() == fixed_buffer_ptr
 

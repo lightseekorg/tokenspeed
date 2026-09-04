@@ -254,7 +254,7 @@ class _FlashInferQSASparseRunner:
         selected_width: int,
         *,
         softmax_scale: float,
-        metadata_capacity_rows: int | None = None,
+        metadata_capacity_rows: int | None,
     ) -> _FlashInferQSAPlan:
         """Return a cached FA2 plan for the supplied QSA tensor geometry."""
 

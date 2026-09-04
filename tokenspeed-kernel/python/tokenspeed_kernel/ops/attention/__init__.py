@@ -5519,7 +5519,7 @@ def qsa_sparse_attention(
     *,
     scale: float,
     max_seqlen_q: int,
-    metadata_capacity_rows: int | None = None,
+    metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
     override: str | None,
@@ -5539,9 +5539,9 @@ def qsa_sparse_attention(
         max_seqlen_q: Number of uniformly packed query tokens per request. This
             is 1 for normal decode and ``spec_num_tokens`` for compact
             speculative decode.
-        metadata_capacity_rows: Optional row capacity reserved by stateful
-            fallback implementations. The actual query-row count is used when
-            this is smaller or omitted; workspace-free kernels ignore it.
+        metadata_capacity_rows: Row capacity reserved by stateful fallback
+            implementations. Pass ``None`` to use the actual query-row count;
+            workspace-free kernels ignore it.
         k_scale: Optional scalar FP8 key descale.
         v_scale: Optional scalar FP8 value descale.
         override: Optional registered kernel name or solution override.
