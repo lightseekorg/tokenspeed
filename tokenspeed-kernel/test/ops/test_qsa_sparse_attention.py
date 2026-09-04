@@ -70,10 +70,12 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
         qsa_sparse_attention(q, cache, cache, selected, scale=1.0, max_seqlen_q=4)
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4, 9])
 def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
     device: str,
     rows: int,
+    cache_dtype: torch.dtype,
 ) -> None:
     platform = current_platform()
     if platform.arch_version != ArchVersion(10, 0):
@@ -94,13 +96,13 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
             cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
         )
         * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(cache_dtype)
     v_cache = (
         torch.randn(
             cache_slots, kv_heads, head_dim, device=device, dtype=torch.bfloat16
         )
         * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(cache_dtype)
     slot_storage = torch.full((rows, width * 2), -1, dtype=torch.int32, device=device)
     slots = slot_storage[:, ::2]
     slots[:, :2049] = torch.randint(
@@ -142,7 +144,9 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
     assert mtp3_kernel.name == "cute_dsl_blackwell_qsa_sparse_attention"
 
     scale = head_dim**-0.5
-    k_scale, v_scale = 0.5, 0.25
+    k_scale, v_scale = (
+        (0.5, 0.25) if cache_dtype is torch.float8_e4m3fn else (None, None)
+    )
     actual = qsa_sparse_attention(
         q,
         k_cache,
@@ -163,16 +167,18 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
             v_cache,
             slots,
             scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
+            k_scale=1.0 if k_scale is None else k_scale,
+            v_scale=1.0 if v_scale is None else v_scale,
         ).float(),
         rtol=3.5e-2,
         atol=3.5e-2,
     )
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
     device: str,
+    cache_dtype: torch.dtype,
 ) -> None:
     platform = current_platform()
     if platform.arch_version != ArchVersion(10, 0):
@@ -188,15 +194,17 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
     q = torch.randn(1, 6, 256, device=device, dtype=torch.bfloat16)
     k_cache = (
         torch.randn(cache_slots, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(cache_dtype)
     v_cache = (
         torch.randn(cache_slots, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(cache_dtype)
     selected = torch.randint(
         1, cache_slots, (1, width), device=device, dtype=torch.int32
     )
     scale = 256**-0.5
-    k_scale, v_scale = 0.5, 0.25
+    k_scale, v_scale = (
+        (0.5, 0.25) if cache_dtype is torch.float8_e4m3fn else (None, None)
+    )
     kwargs = {
         "scale": scale,
         "k_scale": k_scale,
@@ -224,8 +232,8 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
             v_cache,
             selected,
             scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
+            k_scale=1.0 if k_scale is None else k_scale,
+            v_scale=1.0 if v_scale is None else v_scale,
         ).float(),
         rtol=3.5e-2,
         atol=3.5e-2,

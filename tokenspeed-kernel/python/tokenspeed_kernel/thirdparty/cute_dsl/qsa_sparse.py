@@ -223,6 +223,92 @@ class MixedInputFusedMultiHeadAttentionDecode:
         cute.arch.cp_async_commit_group()
 
     @cute.jit
+    def _issue_sparse_tile_bf16(
+        self,
+        cache_iter: cute.Pointer,
+        selected_slots: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        selected_tile: cutlass.Int32,
+        dim_offset: cutlass.Int32,
+        smem_base: cutlass.Int64,
+        smem_stage: cutlass.Int32,
+        warpgroup_tidx: cutlass.Int32,
+        lane_idx: cutlass.Int32,
+        kv_smem_dtype: Type[cutlass.Numeric],
+    ):
+        """Gather one 128x128 BF16 tile with aligned 16-byte copies."""
+        for iteration in cutlass.range_constexpr(16):
+            vector = warpgroup_tidx + iteration * warpgroup_threads
+            row = vector // 16
+            vector_in_row = vector - row * 16
+            col = vector_in_row * 8
+            selected_idx = selected_tile * 128 + row
+            slot = cutlass.Int32(0)
+            if lane_idx % 16 == 0 and selected_idx < selected_slots.shape[1]:
+                candidate = selected_slots[batch_idx, selected_idx]
+                if candidate > 0:
+                    slot = candidate
+            slot = cute.arch.shuffle_sync(slot, lane_idx - lane_idx % 16)
+            source = cache_iter + slot * 256 + dim_offset + col
+            logical_address = (
+                smem_base
+                + row * 128
+                + (col % 64) * 2
+                + (col // 64) * 16384
+                + smem_stage * 32768
+            )
+            swizzled_address = logical_address ^ ((logical_address >> 3) & 0x70)
+            destination = cute.make_ptr(
+                kv_smem_dtype,
+                swizzled_address,
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            )
+            copy_gmem_to_smem_u128(destination, source)
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _issue_sparse_tile_for_dtype(
+        self,
+        cache_iter: cute.Pointer,
+        selected_slots: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        selected_tile: cutlass.Int32,
+        dim_offset: cutlass.Int32,
+        smem_base: cutlass.Int64,
+        smem_stage: cutlass.Int32,
+        warpgroup_tidx: cutlass.Int32,
+        lane_idx: cutlass.Int32,
+        kv_smem_dtype: Type[cutlass.Numeric],
+    ):
+        if cutlass.const_expr(cache_iter.dtype is cutlass.BFloat16):
+            self._issue_sparse_tile_bf16(
+                cache_iter,
+                selected_slots,
+                batch_idx,
+                selected_tile,
+                dim_offset,
+                smem_base,
+                smem_stage,
+                warpgroup_tidx,
+                lane_idx,
+                kv_smem_dtype,
+            )
+        else:
+            self._issue_sparse_tile(
+                cache_iter,
+                selected_slots,
+                batch_idx,
+                selected_tile,
+                dim_offset,
+                smem_base,
+                smem_stage,
+                warpgroup_tidx,
+                lane_idx,
+                kv_smem_dtype,
+            )
+
+    @cute.jit
     def __call__(
         self,
         q_tensor: cute.Tensor,
@@ -341,7 +427,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             q_iter,
             cute.make_ordered_layout(shape=(h_r, d, (h_k, b)), order=(1, 0, (2, 3))),
         )
-        assert k_iter.dtype is not q_iter.dtype
+        assert k_iter.dtype is not q_iter.dtype or k_iter.dtype is cutlass.BFloat16
         assert v_iter.dtype is k_iter.dtype
 
         # (MMA, MMA_M/N, MMA_K, Stages)
@@ -742,7 +828,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             cvt_type = cutlass.Float32
             if cutlass.const_expr(
                 mma_dtype is cutlass.BFloat16
-                and k_dtype in (cutlass.Int4, cutlass.Int8)
+                and (k_dtype in (cutlass.Int4, cutlass.Int8) or k_dtype is mma_dtype)
             ):
                 cvt_type = mma_dtype
 
@@ -764,13 +850,19 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)),
                 mma_dtype,
             )
-            smem_load_atom_k = cute.make_copy_atom(
-                cute.nvgpu.warp.LdMatrix8x16x8bOp(
+            if cutlass.const_expr(k_dtype is cutlass.BFloat16):
+                # The K partition keeps four BF16 values contiguous per lane.
+                smem_load_atom_k = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    kv_smem_dtype,
+                    num_bits_per_copy=64,
+                )
+            else:
+                smem_load_op_k = cute.nvgpu.warp.LdMatrix8x16x8bOp(
                     num_matrices=4,
                     unpack_bits=(k_dtype.width if k_dtype.width < 8 else None),
-                ),
-                kv_smem_dtype,
-            )
+                )
+                smem_load_atom_k = cute.make_copy_atom(smem_load_op_k, kv_smem_dtype)
 
             tmem_store_k = tcgen05.make_tmem_copy(
                 tmem_store_atom_k, tAtK_cvt[mma_dice + (0,)]
@@ -788,12 +880,20 @@ class MixedInputFusedMultiHeadAttentionDecode:
             tmem_store_atom_v = cute.make_copy_atom(
                 tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)), mma_dtype
             )
-            smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
-                transpose=True,
-                num_matrices=2,
-                unpack_bits=(v_dtype.width if v_dtype.width < 8 else None),
-            )
-            smem_load_atom_v = cute.make_copy_atom(smem_load_op_v, kv_smem_dtype)
+            if cutlass.const_expr(v_dtype is cutlass.BFloat16):
+                # The transposed V partition is scalar-strided in this layout.
+                smem_load_atom_v = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    kv_smem_dtype,
+                    num_bits_per_copy=16,
+                )
+            else:
+                smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
+                    transpose=True,
+                    num_matrices=2,
+                    unpack_bits=(v_dtype.width if v_dtype.width < 8 else None),
+                )
+                smem_load_atom_v = cute.make_copy_atom(smem_load_op_v, kv_smem_dtype)
 
             tmem_store_v = tcgen05.make_tmem_copy(
                 tmem_store_atom_v, tAtV_cvt[mma_dice + (0,)]
@@ -809,7 +909,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
             # Prime the unified K-or-V ring with K0. Each conversion
             # warpgroup owns one 128-D half of every logical ring item.
-            self._issue_sparse_tile(
+            self._issue_sparse_tile_for_dtype(
                 k_iter,
                 selected_slots,
                 coord_hb,
@@ -835,7 +935,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         # consuming K_s. One pending cp.async group overlaps
                         # its latency with conversion and UMMA.
                         if s == 0:
-                            self._issue_sparse_tile(
+                            self._issue_sparse_tile_for_dtype(
                                 k_iter,
                                 selected_slots,
                                 coord_hb,
@@ -848,7 +948,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 kv_smem_dtype,
                             )
                         else:
-                            self._issue_sparse_tile(
+                            self._issue_sparse_tile_for_dtype(
                                 v_iter,
                                 selected_slots,
                                 coord_hb,
@@ -911,7 +1011,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         # ring slot with K_(s+1), or the final V item.
                         if s < iters_s:
                             if s + 1 < iters_s:
-                                self._issue_sparse_tile(
+                                self._issue_sparse_tile_for_dtype(
                                     k_iter,
                                     selected_slots,
                                     coord_hb,
@@ -924,7 +1024,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     kv_smem_dtype,
                                 )
                             else:
-                                self._issue_sparse_tile(
+                                self._issue_sparse_tile_for_dtype(
                                     v_iter,
                                     selected_slots,
                                     coord_hb,
@@ -1575,11 +1675,10 @@ def kernel(
         raise ValueError("candidate requires selected slots shape [tokens, 2051]")
     if query.dtype is not torch.bfloat16:
         raise TypeError("candidate requires BF16 query")
-    if (
-        key_cache.dtype is not torch.float8_e4m3fn
-        or value_cache.dtype is not torch.float8_e4m3fn
-    ):
-        raise TypeError("candidate requires FP8 E4M3FN K/V cache")
+    if key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError("candidate requires BF16 or FP8 E4M3FN K/V cache")
+    if value_cache.dtype is not key_cache.dtype:
+        raise TypeError("candidate requires matching K/V cache dtypes")
     if selected_slots.dtype is not torch.int32:
         raise TypeError("candidate requires int32 selected slots")
     if max_seqlen_q < 1 or query.shape[0] % max_seqlen_q:
@@ -1611,6 +1710,7 @@ def kernel(
         query.device.index,
         problem_shape,
         max_seqlen_q,
+        key_cache.dtype,
         _SMALL_NUM_SPLITS if query.shape[0] <= _SMALL_MAX_ROWS else _LARGE_NUM_SPLITS,
         tuple(selected_slots.stride()),
     )
@@ -1626,8 +1726,16 @@ def kernel(
         _COMPILED_KERNELS[cache_key] = compiled
     compiled(
         query,
-        key_cache.view(torch.uint8),
-        value_cache.view(torch.uint8),
+        (
+            key_cache.view(torch.uint8)
+            if key_cache.dtype is torch.float8_e4m3fn
+            else key_cache
+        ),
+        (
+            value_cache.view(torch.uint8)
+            if value_cache.dtype is torch.float8_e4m3fn
+            else value_cache
+        ),
         selected_slots,
         output,
         scale_qs,

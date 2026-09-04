@@ -51,7 +51,12 @@ _SELECTED_WIDTH = 2051
                 q=dense_tensor_format(torch.bfloat16),
                 k_cache=dense_tensor_format(torch.float8_e4m3fn),
                 v_cache=dense_tensor_format(torch.float8_e4m3fn),
-            )
+            ),
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=dense_tensor_format(torch.bfloat16),
+                v_cache=dense_tensor_format(torch.bfloat16),
+            ),
         }
     ),
     traits={
@@ -79,8 +84,10 @@ def cute_dsl_blackwell_qsa_sparse_attention(
 
     Args:
         q: BF16 query tensor shaped ``[tokens, 6, 256]``.
-        k_cache: FP8 E4M3 key cache shaped ``[cache_slots, 1, 256]``.
-        v_cache: FP8 E4M3 value cache shaped ``[cache_slots, 1, 256]``.
+        k_cache: BF16 or FP8 E4M3 key cache shaped
+            ``[cache_slots, 1, 256]``.
+        v_cache: BF16 or FP8 E4M3 value cache shaped
+            ``[cache_slots, 1, 256]``. Its dtype must match ``k_cache``.
         selected_slots: Physical cache slots shaped ``[tokens, 2051]``;
             non-positive values are ignored.
         scale: Softmax scale applied to query-key scores.
