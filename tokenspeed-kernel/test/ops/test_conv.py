@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
+    dflash2_grouped_conv,
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
@@ -789,3 +790,39 @@ def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
         page_size=P,
     )
     torch.testing.assert_close(y_prefill, y_decode, atol=0, rtol=0)
+
+
+def ref_grouped_conv(x, delta, base, block_size, group_size):
+    """Torch reference: block-local grouped conv with per-row coefficients."""
+    taps, num_groups = base.shape[0], delta.shape[2]
+    blocks = x.float().unflatten(-1, (num_groups, group_size))
+    coefficients = base.float().view(
+        1, taps, num_groups, group_size
+    ) + delta.float().unsqueeze(-1)
+    y = torch.zeros_like(blocks)
+    for row in range(x.shape[0]):
+        for tap in range(min(row % block_size + 1, taps)):
+            y[row] += coefficients[row, tap] * blocks[row - tap]
+    return y.flatten(-2).to(x.dtype)
+
+
+@pytest.mark.parametrize("block_size,taps", [(8, 2), (6, 3), (8, 1)])
+def test_dflash2_grouped_conv_matches_reference(
+    block_size: int, taps: int, device: str
+) -> None:
+    torch.manual_seed(0)
+    rows, num_groups, group_size = 3 * block_size, 5, 16
+    channels = num_groups * group_size
+    x = torch.randn(rows, channels, device=device, dtype=DTYPE)
+    # Two sides of the projection share one buffer, so delta is a strided slice.
+    projection = torch.randn(rows, 2, taps, num_groups, device=device, dtype=DTYPE)
+    base = torch.randn(2, taps, channels, device=device, dtype=DTYPE)
+
+    for side in (0, 1):
+        y = dflash2_grouped_conv(
+            x, projection[:, side], base[side], block_size, group_size
+        )
+        expected = ref_grouped_conv(
+            x, projection[:, side], base[side], block_size, group_size
+        )
+        torch.testing.assert_close(y, expected, atol=ATOL, rtol=RTOL)

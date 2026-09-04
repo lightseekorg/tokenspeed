@@ -57,6 +57,10 @@ from tokenspeed.runtime.models.dflash2 import (
     _score_edges,
 )
 
+_CUDA_ONLY = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required"
+)
+
 
 def test_dflash2_architecture_dispatches_to_its_selector_runtime() -> None:
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
@@ -202,11 +206,17 @@ def test_draft_attention_window_validation_accepts_the_served_combinations() -> 
 
 
 @pytest.mark.parametrize("block_size", (6, 8))
-def test_grouped_conv_matches_a_block_local_reference(block_size: int) -> None:
+@pytest.mark.parametrize(
+    "device",
+    ("cpu", pytest.param("cuda", marks=_CUDA_ONLY)),
+)
+def test_grouped_conv_matches_a_block_local_reference(
+    block_size: int, device: str
+) -> None:
     torch.manual_seed(0)
-    hidden = torch.randn(2 * block_size, 12)
-    delta = torch.randn(2 * block_size, 3, 3)
-    base = torch.randn(3, 12)
+    hidden = torch.randn(2 * block_size, 12, device=device)
+    delta = torch.randn(2 * block_size, 3, 3, device=device)
+    base = torch.randn(3, 12, device=device)
     actual = _grouped_conv(hidden, delta, base, block_size, 3, 4, 3)
 
     expected = torch.zeros_like(hidden)
