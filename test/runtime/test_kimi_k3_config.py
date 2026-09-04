@@ -297,6 +297,34 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
 
     @_NVIDIA_ONLY
+    def test_the_packed_input_projection_declines_a_narrowed_weight(self):
+        """It reads the routed weight directly, so a narrowed one would bypass the gather.
+
+        Shipped once without this: the packed path handed the experts one rank's
+        448 columns where the expert weight takes 3584, and narrow and wide
+        generated different text from the same prompt.
+        """
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_native=False,
+                use_trtllm=True,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+            )
+        )
+        moe = built.layer
+        moe.packed_input_projection_weight = torch.zeros(1)
+        moe.routed_expert_down_proj.narrowed = True
+        self.assertIsNone(moe._latent_input_projections(torch.zeros(2, 8)))
+        moe.routed_expert_down_proj.narrowed = False
+        self.assertIsNotNone(
+            moe.packed_input_projection_weight,
+            "the packed weight must still be set, or the guard proves nothing",
+        )
+
+    @_NVIDIA_ONLY
     def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
         """The gate has an on direction, and the deployment plan is it."""
         from tokenspeed.runtime.models import kimi_k3

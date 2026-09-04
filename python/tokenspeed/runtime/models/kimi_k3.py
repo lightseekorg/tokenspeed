@@ -1735,10 +1735,16 @@ class KimiLinearMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
-        Returns ``None`` before the projection weights are concatenated, which
-        leaves the caller on the separate per-module projections.
+        Returns ``None`` before the projection weights are concatenated, and
+        whenever the routed projection narrowed its storage: this path reads that
+        weight directly, so it would hand the experts one rank's columns instead
+        of the gathered latent. The caller then takes the projection's own
+        forward, which gathers.
         """
-        if self.packed_input_projection_weight is None:
+        if (
+            self.packed_input_projection_weight is None
+            or self.routed_expert_down_proj.narrowed
+        ):
             return None
         router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
