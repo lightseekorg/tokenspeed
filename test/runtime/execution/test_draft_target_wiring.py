@@ -222,3 +222,26 @@ def test_dspark_wire_target_installs_capture_layers():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_incremental_capture_writers_check_the_armed_flag() -> None:
+    """A target may only fill the drafter's slot buffers when it armed them.
+
+    The slots hold one decode block; an extend forward's rows do not fit and
+    nothing would read them. Each target model carries its own copy of the
+    capture loop, so the check has to hold in every copy -- one that drops it
+    runs fine until the first prefill wide enough to overflow a slot.
+    """
+    import pathlib as _pathlib
+
+    models = _pathlib.Path(factory.__file__).parent.parent / "models"
+    writers = [
+        path
+        for path in models.rglob("*.py")
+        if "_dflash_slot_bufs[" in path.read_text()
+    ]
+    assert writers, "no target model writes the drafter's slot buffers"
+    unguarded = [
+        path.name for path in writers if "_dflash_incr_active" not in path.read_text()
+    ]
+    assert not unguarded, unguarded

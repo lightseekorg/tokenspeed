@@ -2608,6 +2608,7 @@ class KimiLinearModel(nn.Module):
         self.dflash_aux_stream: str = "prefix"
         self._dflash_incremental_callback = None
         self._dflash_slot_bufs = None
+        self._dflash_incr_active = False
         self._dflash_capture_idx_map: dict[int, int] = {}
 
     def _refresh_dflash_capture_fallback(self) -> None:
@@ -2733,7 +2734,15 @@ class KimiLinearModel(nn.Module):
                     layer_idx, prefix_sum, block_residual
                 )
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if self._dflash_slot_bufs is not None and capture_idx is not None:
+                # The slots are sized for one decode block, and the drafter
+                # only accumulates into them on the decode-only forwards it
+                # armed. An extend forward's rows would not fit and nothing
+                # would consume them.
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
                     num_tokens = captured.shape[0]
                     self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
                     if self._dflash_incremental_callback is not None:

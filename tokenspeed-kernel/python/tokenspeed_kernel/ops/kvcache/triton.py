@@ -51,6 +51,7 @@ __all__ = [
     "gather_page_table_with_padding",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
+    "mla_latent_norm_rope_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
     "set_mla_kv_buffer_triton",
@@ -718,6 +719,184 @@ def set_mla_kv_buffer_triton(
             MAX_FINITE=max_finite,
             **extra_kwargs,
         )
+
+
+@triton.jit
+def _sanitize(x, MAX_FINITE: tl.constexpr):
+    """Replace NaN with zero and infinities with the widest storable value."""
+    x = tl.where(x != x, 0.0, x)
+    x = tl.where(x == float("inf"), MAX_FINITE, x)
+    return tl.where(x == -float("inf"), -MAX_FINITE, x)
+
+
+@triton.jit
+def _mla_latent_norm_rope_scatter_kernel(
+    latent_ptr,  # [total_ctx, n_layers, kv_lora_rank + rope_dim]
+    norm_weight_ptr,  # [n_layers, kv_lora_rank]
+    eps_ptr,  # [n_layers]
+    cos_sin_cache_ptr,  # [max_pos, rope_dim]
+    positions_ptr,  # [total_ctx]
+    loc_ptr,  # [total_ctx]
+    buf_ptrs_ptr,  # [n_layers] — one latent plane data_ptr per layer
+    latent_stride_ctx,
+    latent_stride_layer,
+    norm_weight_stride_layer,
+    cos_sin_stride_pos,
+    dst_row_stride,
+    kv_lora_rank: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_LORA: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+):
+    """One latent row of one layer per CTA. Grid: (total_ctx, n_layers)."""
+    ctx_id = tl.program_id(0)
+    layer_id = tl.program_id(1)
+
+    src = latent_ptr + ctx_id * latent_stride_ctx + layer_id * latent_stride_layer
+    dst_slot = tl.load(loc_ptr + ctx_id).to(tl.int64)
+    if IS_FP8:
+        dst = tl.load(buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        dst = tl.load(buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
+    dst = dst + dst_slot * dst_row_stride
+
+    offs = tl.arange(0, BLOCK_LORA)
+    mask = offs < kv_lora_rank
+    nope = tl.load(src + offs, mask=mask, other=0.0).to(tl.float32)
+    eps = tl.load(eps_ptr + layer_id).to(tl.float32)
+    weight = tl.load(
+        norm_weight_ptr + layer_id * norm_weight_stride_layer + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    nope = nope * tl.rsqrt(tl.sum(nope * nope) / kv_lora_rank + eps) * weight
+
+    half = tl.arange(0, HALF_ROPE)
+    cos_sin = cos_sin_cache_ptr + tl.load(positions_ptr + ctx_id) * cos_sin_stride_pos
+    cos = tl.load(cos_sin + half).to(tl.float32)
+    sin = tl.load(cos_sin + HALF_ROPE + half).to(tl.float32)
+    if IS_NEOX:
+        first, second = half, HALF_ROPE + half
+    else:
+        first, second = 2 * half, 2 * half + 1
+    rope = src + kv_lora_rank
+    x1 = tl.load(rope + first).to(tl.float32)
+    x2 = tl.load(rope + second).to(tl.float32)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+
+    if SANITIZE:
+        nope = _sanitize(nope, MAX_FINITE)
+        o1 = _sanitize(o1, MAX_FINITE)
+        o2 = _sanitize(o2, MAX_FINITE)
+
+    if IS_FP8:
+        tl.store(dst + offs, nope.to(tl.float8e4nv), mask=mask)
+        tl.store(dst + kv_lora_rank + first, o1.to(tl.float8e4nv))
+        tl.store(dst + kv_lora_rank + second, o2.to(tl.float8e4nv))
+    else:
+        tl.store(dst + offs, nope.to(tl.bfloat16), mask=mask)
+        tl.store(dst + kv_lora_rank + first, o1.to(tl.bfloat16))
+        tl.store(dst + kv_lora_rank + second, o2.to(tl.bfloat16))
+
+
+def mla_latent_norm_rope_scatter(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    loc: torch.Tensor,
+    kv_buffer_ptrs: torch.Tensor,
+    kv_buffer_row_stride: int,
+    kv_buffer_dtype: torch.dtype,
+    *,
+    is_neox: bool,
+    sanitize: bool = False,
+) -> None:
+    """Normalize, rotate and scatter every layer's latent KV in one launch.
+
+    Each ``[kv_lora_rank + rope_dim]`` row is RMSNormed over its latent half
+    with that layer's weight and epsilon, rotated over its RoPE tail, and
+    stored into that layer's latent cache plane at ``loc``. This is the whole
+    context-injection write for an MLA draft: no intermediate K tensor is
+    materialized.
+
+    Args:
+        latent: Stacked projection output ``[total_ctx, n_layers,
+            kv_lora_rank + rope_dim]``, pre-norm and pre-RoPE.
+        norm_weight: Per-layer RMSNorm weight ``[n_layers, kv_lora_rank]``.
+        eps: Per-layer RMSNorm epsilon ``[n_layers]``, float32.
+        cos_sin_cache: ``[max_position, rope_dim]`` packed as concat(cos, sin).
+        positions: Token position per row ``[total_ctx]``.
+        loc: Destination cache slot per row ``[total_ctx]``.
+        kv_buffer_ptrs: ``[n_layers]`` int64 ``data_ptr()`` of each layer's
+            latent plane, in the same layer order as ``latent``.
+        kv_buffer_row_stride: Elements between consecutive cache slots; the
+            same for every layer.
+        kv_buffer_dtype: Element type of the latent planes; ``bfloat16`` or
+            ``float8_e4m3fn``.
+        is_neox: Half-split rotation. False uses GPT-J interleaved pairs.
+        sanitize: Replace NaN and infinity before storing.
+
+    Returns:
+        None. The cache writes are enqueued on the current device stream.
+
+    Raises:
+        ValueError: The operands are not the shape or dtype the kernel
+            indexes with.
+    """
+    if latent.ndim != 3:
+        raise ValueError(
+            f"latent must be [total_ctx, n_layers, width], got {tuple(latent.shape)}"
+        )
+    total_ctx, n_layers, width = latent.shape
+    kv_lora_rank = norm_weight.shape[-1]
+    rope_dim = width - kv_lora_rank
+    if norm_weight.shape[0] != n_layers or eps.shape[0] != n_layers:
+        raise ValueError(
+            f"norm_weight/eps must cover {n_layers} layers, got "
+            f"{tuple(norm_weight.shape)} and {tuple(eps.shape)}"
+        )
+    if rope_dim <= 0 or cos_sin_cache.shape[-1] != rope_dim:
+        raise ValueError(
+            f"cos_sin_cache last dim {cos_sin_cache.shape[-1]} must equal the "
+            f"{rope_dim}-wide RoPE tail"
+        )
+    if rope_dim // 2 != triton.next_power_of_2(rope_dim // 2):
+        raise ValueError(f"rope_dim/2 must be a power of two, got {rope_dim // 2}")
+    if kv_buffer_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(f"unsupported latent cache dtype {kv_buffer_dtype}")
+    if total_ctx == 0:
+        return
+
+    max_finite = min(torch.finfo(latent.dtype).max, torch.finfo(kv_buffer_dtype).max)
+    _mla_latent_norm_rope_scatter_kernel[(total_ctx, n_layers)](
+        latent,
+        norm_weight,
+        eps,
+        cos_sin_cache,
+        positions,
+        loc,
+        kv_buffer_ptrs,
+        latent.stride(0),
+        latent.stride(1),
+        norm_weight.stride(0),
+        cos_sin_cache.stride(0),
+        kv_buffer_row_stride,
+        kv_lora_rank,
+        rope_dim,
+        BLOCK_LORA=triton.next_power_of_2(kv_lora_rank),
+        HALF_ROPE=rope_dim // 2,
+        IS_NEOX=bool(is_neox),
+        IS_FP8=kv_buffer_dtype == torch.float8_e4m3fn,
+        SANITIZE=bool(sanitize),
+        MAX_FINITE=max_finite,
+    )
 
 
 @triton.jit
