@@ -808,3 +808,11 @@ def test_mi450_sim_has_one_hour_internal_timeout():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "3600"
+
+
+def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
+    script = (REPO_ROOT / "test/ci_system/run_mi450_rocjitsu.sh").read_text()
+
+    assert 'libhip_path="${rocm_root}/lib/libamdhip64.so"' in script
+    assert 'test -f "${libhip_path}"' in script
+    assert 'export TRITON_LIBHIP_PATH="${libhip_path}"' in script
