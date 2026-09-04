@@ -68,6 +68,7 @@ def create_sampling_backend(
         flashinfer_full as _ff,
     )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 
@@ -75,7 +76,8 @@ def create_sampling_backend(
     if name not in _BACKEND_REGISTRY:
         raise ValueError(
             f"Unknown sampling backend: {name!r}. "
-            f"Available: {list(_BACKEND_REGISTRY)}"
+            f"Available: {list(_BACKEND_REGISTRY)} (a backend with an optional "
+            "package registers only when that package is installed)"
         )
     cls = _BACKEND_REGISTRY[name]
 

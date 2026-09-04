@@ -347,6 +347,7 @@ class TestCLIConfigCompat(unittest.TestCase):
             "flashinfer_full",
             "triton",
             "triton_full",
+            "sonic",
         ):
             args = self._parse_args(
                 ["--model", "test/model", "--sampling-backend", backend]

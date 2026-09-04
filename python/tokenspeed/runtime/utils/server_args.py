@@ -1627,6 +1627,7 @@ class ServerArgs:
                 "flashinfer_full",
                 "triton",
                 "triton_full",
+                "sonic",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -1640,7 +1641,16 @@ class ServerArgs:
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Finite top_k values must be < 128 or -1.",
+            "Finite top_k values must be < 128 or -1. "
+            "'sonic': one fused Triton pipeline per step (sonic-sampler; two kernels for "
+            "sampling, three for chain verification) covering greedy, "
+            "temperature/top_k/top_p/min_p, penalties, logit_bias and grammar for both "
+            "single-step sampling and chain verification; top_k=-1 is realized as bounded "
+            "top-128 truncation and candidates are ranked at bf16 resolution. Requires bf16 "
+            "logits. Allocates slot-indexed [max_req_pool_size, vocab_size] planes: about "
+            "(10 + 4 * draft tokens) bytes per element on device and 6 bytes per element in "
+            "pinned host memory (substantial memory). Requires the optional sonic-sampler "
+            "package.",
         )
         parser.add_argument(
             "--dp-sampling",
