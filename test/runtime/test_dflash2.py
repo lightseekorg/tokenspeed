@@ -335,3 +335,70 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     expected = torch.empty_like(static_out)
     _walk_greedy_path(static_candidates, eager_scores, static_anchor, expected)
     torch.testing.assert_close(replayed, expected)
+
+
+@_CUDA_ONLY
+def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
+    """One GEMM + one launch must land what norm -> RoPE -> scatter lands."""
+    from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+
+    from tokenspeed.runtime.layers.layernorm import RMSNorm
+    from tokenspeed.runtime.layers.rotary_embedding import get_rope
+
+    torch.manual_seed(3)
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    layers, tokens, hidden, q_lora, kv_lora, rope_dim = 3, 16, 64, 8, 32, 16
+    width = kv_lora + rope_dim
+    rotary = get_rope(
+        rope_dim, rotary_dim=rope_dim, max_position=128, base=10000, is_neox_style=False
+    ).to(device)
+    norms = [
+        RMSNorm(kv_lora, eps=1e-6).to(device=device, dtype=dtype) for _ in range(layers)
+    ]
+    for norm in norms:
+        norm.weight.data.normal_()
+    weights = [
+        torch.randn(q_lora + width, hidden, device=device, dtype=dtype)
+        for _ in range(layers)
+    ]
+    hidden_states = torch.randn(tokens, hidden, device=device, dtype=dtype)
+    positions = torch.randint(128, (tokens,), device=device)
+    loc = torch.randperm(tokens, device=device).to(torch.int32)
+
+    expected = torch.zeros(tokens, width, device=device, dtype=dtype)
+    planes = []
+    for index, weight in enumerate(weights):
+        latent = torch.nn.functional.linear(hidden_states, weight[q_lora:])
+        latent = torch.cat(
+            (norms[index](latent[..., :kv_lora].contiguous()), latent[..., kv_lora:]),
+            dim=-1,
+        )
+        k_pe = latent[..., kv_lora:].reshape(-1, 1, rope_dim).clone()
+        _, rotated = rotary(positions, k_pe.new_empty(k_pe.shape), k_pe)
+        latent[..., kv_lora:] = rotated.reshape(tokens, rope_dim)
+        plane = torch.zeros_like(expected)
+        plane[loc.long()] = latent
+        planes.append(plane)
+
+    stacked = torch.mm(
+        hidden_states,
+        torch.cat([w[q_lora:] for w in weights], dim=0).t().contiguous(),
+    ).view(tokens, layers, width)
+    actual = [torch.zeros_like(expected) for _ in range(layers)]
+    mla_latent_norm_rope_scatter(
+        stacked,
+        torch.stack([norm.weight.data for norm in norms]),
+        torch.full((layers,), 1e-6, device=device),
+        rotary.cos_sin_cache,
+        positions,
+        loc,
+        torch.tensor([p.data_ptr() for p in actual], dtype=torch.int64, device=device),
+        actual[0].stride(0),
+        dtype,
+        is_neox=rotary.is_neox_style,
+    )
+
+    for index in range(layers):
+        torch.testing.assert_close(
+            actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
+        )

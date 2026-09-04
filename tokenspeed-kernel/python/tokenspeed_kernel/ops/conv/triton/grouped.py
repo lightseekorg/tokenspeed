@@ -76,7 +76,9 @@ def _grouped_conv_kernel(
             acc += coefficient * tl.load(
                 x_ptr + (row - tap) * x_stride_row + offs, mask=mask, other=0.0
             ).to(tl.float32)
-    tl.store(y_ptr + row * y_stride_row + offs, acc.to(y_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        y_ptr + row * y_stride_row + offs, acc.to(y_ptr.dtype.element_ty), mask=mask
+    )
 
 
 def dflash2_grouped_conv(
