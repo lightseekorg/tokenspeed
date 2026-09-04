@@ -149,14 +149,14 @@ def _decline(reason: str) -> None:
     return None
 
 
-def _pool_slot(block_index: int, depth: int = _DOWN_POOL_DEPTH) -> int:
+def _pool_slot(block_index: int) -> int:
     """Map an ordinal among the MoE blocks to its rank-identical slot.
 
     The ordinal, not the decoder layer id: with a MoE frequency above one every
     MoE layer has the same parity, which would collapse the pool to one slot and
     leave consecutive rounds sharing a mailbox with nothing in between.
     """
-    return block_index % depth
+    return block_index % _DOWN_POOL_DEPTH
 
 
 def _lamport_geometry(m: int) -> tuple[int, int]:
@@ -294,7 +294,6 @@ class KimiK3LatentDownOp:
         tp_size: int,
         layer_count: int,
         group: dist.ProcessGroup | None = None,
-        pool_depth: int = _DOWN_POOL_DEPTH,
     ) -> bool:
         """Whether this rank can host the multicast down projection.
 
@@ -312,7 +311,7 @@ class KimiK3LatentDownOp:
         """
         return (
             cls._unavailable_reason(
-                hidden_size, latent_size, tp_size, layer_count, group, pool_depth
+                hidden_size, latent_size, tp_size, layer_count, group
             )
             is None
         )
@@ -325,7 +324,6 @@ class KimiK3LatentDownOp:
         tp_size: int,
         layer_count: int,
         group: dist.ProcessGroup | None = None,
-        pool_depth: int = _DOWN_POOL_DEPTH,
     ) -> str | None:
         """The first condition this rank fails, or None when it can host.
 
@@ -345,8 +343,10 @@ class KimiK3LatentDownOp:
             return "not an NVIDIA platform"
         if tp_size <= 1:
             return "a single rank has nothing to gather"
-        if layer_count < pool_depth or layer_count % pool_depth:
-            return f"{layer_count} blocks is not whole {pool_depth}-slot rotations"
+        if layer_count < _DOWN_POOL_DEPTH or layer_count % _DOWN_POOL_DEPTH:
+            return (
+                f"{layer_count} blocks is not whole {_DOWN_POOL_DEPTH}-slot rotations"
+            )
         if hidden_size % _K_TILE:
             return f"hidden {hidden_size} is not a multiple of the {_K_TILE} k-tile"
         if latent_size % tp_size or (latent_size // tp_size) % 8:
@@ -365,7 +365,6 @@ class KimiK3LatentDownOp:
         layer_count: int,
         model_scope: str,
         max_m: int,
-        pool_depth: int = _DOWN_POOL_DEPTH,
     ) -> "KimiK3LatentDownOp | None":
         """Bind this layer to a pooled mailbox, or return None if unsupported.
 
@@ -403,13 +402,12 @@ class KimiK3LatentDownOp:
             latent_size,
             tp_size,
             layer_count,
-            pool_depth,
             max_m,
             device,
         )
         if not verdict:
             key = cls._verdict_key(
-                group, hidden_size, latent_size, tp_size, layer_count, pool_depth, max_m
+                group, hidden_size, latent_size, tp_size, layer_count, max_m
             )
             return _decline(cls._reasons.get(key, "the group declined"))
         cls._agree_on_ceiling(group, max_m, tp_size, device)
@@ -420,8 +418,7 @@ class KimiK3LatentDownOp:
             tp_size,
             device.index,
             model_scope,
-            _pool_slot(block_index, pool_depth),
-            pool_depth,
+            _pool_slot(block_index),
             max_m,
             group.group_name,
         )
@@ -446,7 +443,6 @@ class KimiK3LatentDownOp:
         latent_size: int,
         tp_size: int,
         layer_count: int,
-        pool_depth: int,
         max_m: int,
     ) -> tuple:
         """The identity a verdict and its reason are both cached under.
@@ -461,7 +457,6 @@ class KimiK3LatentDownOp:
             latent_size,
             tp_size,
             layer_count,
-            pool_depth,
             max_m,
         )
 
@@ -473,7 +468,6 @@ class KimiK3LatentDownOp:
         latent_size: int,
         tp_size: int,
         layer_count: int,
-        pool_depth: int,
         max_m: int,
         device: torch.device,
     ) -> bool:
@@ -490,11 +484,11 @@ class KimiK3LatentDownOp:
         bug rather than something to negotiate.
         """
         key = cls._verdict_key(
-            group, hidden_size, latent_size, tp_size, layer_count, pool_depth, max_m
+            group, hidden_size, latent_size, tp_size, layer_count, max_m
         )
         if key not in cls._verdicts:
             reason = cls._unavailable_reason(
-                hidden_size, latent_size, tp_size, layer_count, group, pool_depth
+                hidden_size, latent_size, tp_size, layer_count, group
             )
             # A peer's reason is not knowable here, only that it voted no.
             cls._reasons[key] = reason or "a peer declined"

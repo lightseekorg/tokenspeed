@@ -343,6 +343,9 @@ from tokenspeed_kernel.ops.moe.latent_down import (
     _LAMPORT_THREADS,
     arm_mailbox,
 )
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
+    NEG_ZERO_F32_BITS,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy import (
     LamportCopyKernel,
 )
@@ -356,7 +359,11 @@ down = LamportCopyKernel(
     sentinel=_DOWN_SENTINEL,
 )
 tail = LamportCopyKernel(
-    hidden_dim={latent}, max_m={max_m}, ctas=_LAMPORT_CTAS, threads=_LAMPORT_THREADS
+    hidden_dim={latent},
+    max_m={max_m},
+    ctas=_LAMPORT_CTAS,
+    threads=_LAMPORT_THREADS,
+    sentinel=NEG_ZERO_F32_BITS,
 )
 
 mailbox = torch.empty(1, {max_m}, {latent}, device=device, dtype=torch.bfloat16)

@@ -803,13 +803,20 @@ def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
 def _shard_k3_latent_projection(mapping: Mapping, hidden_size: int) -> bool:
     """Whether to shard K3's routed latent projections across NVIDIA ranks.
 
-    The HIP test is what keeps a shard away from the packed input projection:
-    that path exists only under ``execution_plan.use_native``, which follows
-    ``native_latent_moe_available()`` and so is AMD-only. The two are mutually
-    exclusive by platform, not by any condition visible at the call site.
+    The platform test is what keeps a shard away from the packed input
+    projection: that path exists only under ``execution_plan.use_native``,
+    which follows ``native_latent_moe_available()`` and so is AMD-only. The two
+    are mutually exclusive by platform, not by any condition visible at the
+    call site. It asks the platform rather than ``torch.version.hip``, which
+    answers only about AMD and so admits NPU, where the multicast op's device
+    is not addressable at all.
+
+    True on an NVIDIA generation without the fabric: the multicast op declines
+    at construction and the projection stays replicated, so the width decision
+    is made downstream rather than here.
     """
     return (
-        torch.version.hip is None
+        current_platform().is_nvidia
         and mapping.moe.tp_ep_size > 1
         and hidden_size % mapping.moe.tp_ep_size == 0
     )
@@ -1557,7 +1564,10 @@ class KimiLinearMoE(nn.Module):
                 # The gate itself, so mailbox and gather meet by construction.
                 max_m=DOWN_MAILBOX_MAX_TOKENS,
             )
+            # The mailbox and both producers are bf16; another activation dtype
+            # keeps the replica rather than failing at the first forward.
             if self._shard_latent_projections
+            and torch.get_default_dtype() is torch.bfloat16
             else None
         )
         # Past the mailbox's ceiling the same columns split over the group again.

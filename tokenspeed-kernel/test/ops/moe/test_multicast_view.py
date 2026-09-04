@@ -34,6 +34,7 @@ import sys
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -64,6 +65,9 @@ def _run(program: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="the multicast view is NVIDIA-only"
+)
 def test_a_view_held_to_interpreter_exit_does_not_crash_the_process() -> None:
     """The deleter must be null, not a no-op callback.
 

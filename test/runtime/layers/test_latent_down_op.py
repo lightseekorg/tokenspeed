@@ -446,9 +446,8 @@ def test_availability_needs_a_whole_number_of_rotations(layers: int) -> None:
 
 def test_a_stage_that_wraps_onto_its_own_slot_is_refused() -> None:
     """PP3 and PP4 give 31 and 23 local blocks; both wrap onto themselves."""
-    depth = latent_down._DOWN_POOL_DEPTH
     for local in (23, 31):
-        slots = [latent_down._pool_slot(b, depth) for b in range(local)]
+        slots = [latent_down._pool_slot(b) for b in range(local)]
         assert slots[-1] == slots[0], "this is the case the gate must refuse"
         with _eligible():
             assert not latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, local)
@@ -726,38 +725,6 @@ def test_the_verdict_does_not_answer_for_another_rotation() -> None:
     assert votes == [1, 0]
 
 
-def test_the_pool_is_keyed_by_the_depth_it_rotates_over() -> None:
-    """Two depths over one group are two rotations, not one."""
-    group = mock.Mock(group_name="g")
-    built = []
-    with (
-        _eligible(),
-        mock.patch.object(latent_down.dist, "get_rank", side_effect=lambda group: 0),
-        mock.patch.object(
-            latent_down.dist, "get_world_size", side_effect=lambda group: 8
-        ),
-        mock.patch.object(latent_down.dist, "all_reduce", lambda t, **k: None),
-        mock.patch.object(
-            latent_down.KimiK3LatentDownOp,
-            "_build_slot",
-            side_effect=lambda *a: built.append(a) or _stub_slot(),
-        ),
-    ):
-        for depth in (2, 4):
-            latent_down.KimiK3LatentDownOp.initialize(
-                group=group,
-                hidden_size=7168,
-                latent_size=3584,
-                device=torch.device("cpu"),
-                block_index=0,
-                layer_count=92,
-                model_scope="s",
-                max_m=8,
-                pool_depth=depth,
-            )
-    assert len(built) == 2
-
-
 def test_the_eight_rank_check_program_still_binds() -> None:
     """That program is the only exerciser of the real path; it drifted once."""
     import inspect
@@ -771,7 +738,6 @@ def test_the_eight_rank_check_program_still_binds() -> None:
         layer_count=92,
         model_scope="check",
         max_m=8,
-        pool_depth=2,
     )
 
 

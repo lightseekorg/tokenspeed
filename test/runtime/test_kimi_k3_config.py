@@ -6,6 +6,7 @@ layer) and the architecture-registration touchpoints (``_CONFIG_REGISTRY``,
 ``_MLA_ARCHITECTURES``, ``is_multimodal_model``, ``EntryClass``).
 """
 
+import contextlib
 import os
 import sys
 import unittest
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -149,6 +151,24 @@ def _linear_calls_by_prefix(linear_calls):
     return {c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c}
 
 
+# The shard's own predicate starts at the platform, so there is no wiring to
+# assert off NVIDIA; the predicate itself is covered separately.
+@contextlib.contextmanager
+def _model_dtype(dtype: torch.dtype):
+    """The context weight loading runs under, which the wiring reads."""
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+_NVIDIA_ONLY = unittest.skipIf(
+    not current_platform().is_nvidia, "the latent down shard is NVIDIA-only"
+)
+
+
 class KimiK3RegistrationTests(unittest.TestCase):
     def _build_moe_block(
         self, plan, *, moe_layer_freq=1, layer_index=1, routed_hidden=64
@@ -226,6 +246,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             ),
         )
         with (
+            _model_dtype(torch.bfloat16),
             # Negotiated once per process; another test already claimed it.
             mock.patch.object(K3MoeTailCommState, "_instance", None),
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
@@ -275,6 +296,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             config=config,
         )
 
+    @_NVIDIA_ONLY
     def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
         """The gate has an on direction, and the deployment plan is it."""
         from tokenspeed.runtime.models import kimi_k3
@@ -334,6 +356,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
         self.assertIsNone(down.get("column_group"))
 
+    @_NVIDIA_ONLY
     def test_the_shard_stays_off_the_plan_that_cannot_absorb_it(self):
         """Marlin keeps the latent in bf16, so it keeps the replicated projection."""
         from tokenspeed.runtime.models import kimi_k3
@@ -355,6 +378,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
         self.assertEqual(down["multicast_down"], "mc-op")
 
+    @_NVIDIA_ONLY
     def test_the_rotation_ordinal_counts_moe_blocks_not_layers(self):
         """At a frequency above one the two are different numbers."""
         from tokenspeed.runtime.models import kimi_k3
@@ -822,6 +846,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
 
+    @_NVIDIA_ONLY
     def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
@@ -904,6 +929,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
 
         with (
+            _model_dtype(torch.bfloat16),
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
             mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),

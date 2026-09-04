@@ -145,8 +145,13 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     assert early_exit.count("fragment_is_dirty(remote)") == 2
     assert early_exit.count("fill_(-0x80000000)") == 1
 
+    # Each mailbox names its own: the down projection's producers cannot all
+    # sanitize -0, so it needs the pattern that takes two coincidences to spell.
     tail = (package / "ops/moe/latent_tail.py").read_text()
-    assert "sentinel=" not in tail
+    assert "sentinel=NEG_ZERO_F32_BITS" in tail
+    down = (package / "ops/moe/latent_down.py").read_text()
+    assert "sentinel=_DOWN_SENTINEL" in down
+    assert "_DOWN_SENTINEL = 0x80008000" in down
 
 
 @pytest.mark.parametrize(

@@ -382,6 +382,8 @@ class KimiK3LatentTailOp:
                 max_m=_MAX_NUM_TOKENS,
                 ctas=_LAMPORT_COPY_CTAS,
                 threads=_LAMPORT_COPY_THREADS,
+                # This mailbox is armed with (+0, -0); the down projection's is not.
+                sentinel=NEG_ZERO_F32_BITS,
             )
 
     @property

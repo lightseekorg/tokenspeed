@@ -42,7 +42,8 @@ class LamportCopy:
         ctas: int,
         threads: int,
         has_residual: bool = False,
-        sentinel: int = NEG_ZERO_F32_BITS,
+        *,
+        sentinel: int,
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = pdl_enabled()
@@ -146,7 +147,8 @@ def compile_kernel(
     threads: int,
     device_index: int,
     has_residual: bool = False,
-    sentinel: int = NEG_ZERO_F32_BITS,
+    *,
+    sentinel: int,
 ):
     if hidden_dim <= 0 or hidden_dim % VEC_BF16:
         raise ValueError("hidden_dim must be a positive multiple of 8")
@@ -171,7 +173,7 @@ def compile_kernel(
             assumed_align=16,
         )
         return cute.compile(
-            LamportCopy(hidden_dim, ctas, threads, has_residual, sentinel),
+            LamportCopy(hidden_dim, ctas, threads, has_residual, sentinel=sentinel),
             mailbox,
             output,
             residual,
@@ -190,7 +192,7 @@ def launch(
     ctas: int,
     threads: int,
     residual: torch.Tensor | None = None,
-    sentinel: int = NEG_ZERO_F32_BITS,
+    sentinel: int,
 ) -> None:
     if not 1 <= m <= max_m:
         raise ValueError(f"runtime M={m} must be in [1, {max_m}]")
@@ -263,7 +265,7 @@ class LamportCopyKernel:
         max_m: int,
         ctas: int,
         threads: int,
-        sentinel: int = NEG_ZERO_F32_BITS,
+        sentinel: int,
     ) -> None:
         """Bind a gather to one mailbox.
 
