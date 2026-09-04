@@ -5,8 +5,8 @@ numpy
 # torch version needs to pinned here for CUDA builds
 torch==2.13.0
 apache-tvm-ffi==0.1.13.post3
-tokenspeed-proton>=3.8.10.post20260721
-tokenspeed-triton>=3.8.10.post20260721
+tokenspeed-proton==3.8.10.post20260828
+tokenspeed-triton==3.8.10.post20260828
 nvidia-cutlass-dsl[cu13]==4.7.1
 nvidia-cutlass-dsl-libs-cu13==4.7.1
 flashinfer-python==0.6.18
