@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,6 +150,15 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     # sanitize -0, so it needs the pattern that takes two coincidences to spell.
     tail = (package / "ops/moe/latent_tail.py").read_text()
     assert "sentinel=NEG_ZERO_F32_BITS" in tail
+    # Naming it is not enough: the text check passes while the import is absent,
+    # which is a NameError at the first tail construction and not at import.
+    tail_imports = {
+        alias.asname or alias.name
+        for node in ast.walk(ast.parse(tail))
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "NEG_ZERO_F32_BITS" in tail_imports
     down = (package / "ops/moe/latent_down.py").read_text()
     assert "sentinel=_DOWN_SENTINEL" in down
     assert "_DOWN_SENTINEL = 0x80008000" in down

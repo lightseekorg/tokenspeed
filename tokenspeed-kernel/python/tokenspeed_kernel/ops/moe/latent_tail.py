@@ -303,6 +303,9 @@ class KimiK3LatentTailOp:
             CollectiveKernel,
             LamportCopyKernel,
         )
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
+            NEG_ZERO_F32_BITS,
+        )
 
         self.contract = contract
         self.rank = dist.get_rank(group)
