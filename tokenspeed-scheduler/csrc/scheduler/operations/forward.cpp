@@ -348,6 +348,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = admission_reserve});
     if (source == fsm::PrefillSource::kLocal) {
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens + tokens_this_round);
+        setSnapshotStatePrefillReserve(demands, config_.cache_groups, split_tail_tokens);
     }
 
     if (source == fsm::PrefillSource::kRemote) {
@@ -357,6 +358,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
                 demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
+                // Also reserve one growth block: the endpoint slot is still inside
+                // kMambaStateWindow at the first boundary crossing, so without it every
+                // landed request needs a fresh empty parent per state group and a full
+                // pool deadlocks (residents are retraction-exempt). One granularity is the
+                // minimum that adds a block for every P and matches the local two-block end state.
+                demands[i].reserve_tokens = block_granularity;
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
@@ -366,7 +373,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             }
         }
     }
-    setSnapshotStatePrefillReserve(demands, config_.cache_groups, split_tail_tokens);
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
     std::optional<CacheCoordinator::AdmissionResult> admission = admit(plan, feedback, std::move(match.probe), demands);
     if (!admission) {

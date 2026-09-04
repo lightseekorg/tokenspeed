@@ -852,16 +852,19 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ASSERT_EQ(full.size(), 5u);
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
+    // Endpoint snapshot lands in slot 3; slot 4 is the pre-reserved growth block
+    // so the first boundary crossing never needs a fresh empty parent.
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 4u);
+    ASSERT_EQ(state.size(), 5u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_EQ(state[2], 0);
     EXPECT_GT(state[3], 0);
+    EXPECT_GT(state[4], 0);
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
     EXPECT_EQ(plan.pages_to_zero.at("full"), full);
-    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3]}));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
+    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -872,7 +875,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     const auto& decode_state = decode->block_tables.at("state").at(0);
     ASSERT_EQ(decode_state.size(), 5u);
     EXPECT_EQ(decode_state[3], state[3]);
-    EXPECT_GT(decode_state[4], 0);
+    EXPECT_EQ(decode_state[4], state[4]);  // first decode consumes the owned growth block in place
 
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
@@ -889,9 +892,10 @@ TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsBlockGranular
     ASSERT_NE(destination, nullptr);
 
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 8u);
-    EXPECT_TRUE(std::ranges::all_of(state.begin(), state.end() - 1, [](std::int32_t page_id) { return page_id == 0; }));
-    EXPECT_GT(state.back(), 0);
+    ASSERT_EQ(state.size(), 9u);  // endpoint snapshot slot 7 plus one growth block at the group's own granularity
+    EXPECT_TRUE(std::ranges::all_of(state.begin(), state.end() - 2, [](std::int32_t page_id) { return page_id == 0; }));
+    EXPECT_GT(state[7], 0);
+    EXPECT_GT(state[8], 0);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefixSparse) {
@@ -917,11 +921,12 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefix
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 4u);
+    ASSERT_EQ(state.size(), 5u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_EQ(state[2], 0);
     EXPECT_GT(state[3], 0);
+    EXPECT_GT(state[4], 0);
 }
 
 TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMaterializingRemoteTail) {
