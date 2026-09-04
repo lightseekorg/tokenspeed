@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
+    state_verify_commit_rows,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
@@ -102,7 +103,9 @@ def test_copy_state_rows_accepts_32_and_64_bit_row_ids(
         for _ in range(num_layers)
     ]
     src_rows = torch.tensor([4, -1, 1, 0, 3, 2], device=device, dtype=src_row_dtype)
-    dst_rows = torch.tensor([0, 2, 4, 1, 3, 5], device=device, dtype=dst_row_dtype)
+    # Rows 1 and 4 carry a negative destination: the kernel must skip those
+    # stores entirely, leaving dst rows 2 and 3 at their sentinel.
+    dst_rows = torch.tensor([0, -1, 4, 1, -1, 5], device=device, dtype=dst_row_dtype)
     src_addresses = torch.tensor(
         [slab.data_ptr() for slab in src_slabs], device=device, dtype=torch.uint64
     )
@@ -130,6 +133,8 @@ def test_copy_state_rows_accepts_32_and_64_bit_row_ids(
             work_index = layer * rows_per_layer + row
             dst_row = int(dst_rows[work_index])
             src_row = int(src_rows[work_index])
+            if dst_row < 0:
+                continue
             if src_row < 0:
                 expected[layer][dst_row, :row_i32] = 0
             else:
@@ -137,6 +142,81 @@ def test_copy_state_rows_accepts_32_and_64_bit_row_ids(
 
     for actual, reference in zip(dst_slabs, expected, strict=True):
         assert torch.equal(actual, reference)
+
+
+def test_copy_state_rows_masks_null_destination_pages(device: str) -> None:
+    """A layer whose destination rows are all null must be left untouched.
+
+    This is the contract PLE's batched post-verify commit depends on: cache
+    page id 0 is the null page, the caller maps it to row -1, and the whole
+    layer's slab must survive bit-identically while its peers in the same
+    launch still commit.
+    """
+
+    num_layers = 3
+    rows_per_layer = 4
+    row_i32 = 6
+    row_stride_i32 = 9
+    null_layer = 1
+    src_slabs = [
+        torch.arange(
+            layer * 100,
+            layer * 100 + rows_per_layer * row_stride_i32,
+            device=device,
+            dtype=torch.int32,
+        ).reshape(rows_per_layer, row_stride_i32)
+        for layer in range(num_layers)
+    ]
+    dst_slabs = [
+        torch.full(
+            (rows_per_layer, row_stride_i32), -7, device=device, dtype=torch.int32
+        )
+        for _ in range(num_layers)
+    ]
+    before = [slab.clone() for slab in dst_slabs]
+    # Every request of the null layer resolves page 0, i.e. destination -1.
+    dst_rows = torch.tensor(
+        [
+            -1 if layer == null_layer else (row + 1) % rows_per_layer
+            for layer in range(num_layers)
+            for row in range(rows_per_layer)
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+    src_rows = torch.arange(
+        num_layers * rows_per_layer, device=device, dtype=torch.int64
+    )
+    src_rows = src_rows % rows_per_layer
+    row_strides = torch.full(
+        (num_layers,), row_stride_i32, device=device, dtype=torch.int64
+    )
+
+    copy_state_rows(
+        torch.tensor(
+            [slab.data_ptr() for slab in src_slabs], device=device, dtype=torch.uint64
+        ),
+        torch.tensor(
+            [slab.data_ptr() for slab in dst_slabs], device=device, dtype=torch.uint64
+        ),
+        src_rows,
+        dst_rows,
+        row_bytes=row_i32 * 4,
+        src_row_strides=row_strides,
+        dst_row_strides=row_strides,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(dst_slabs[null_layer], before[null_layer])
+    for layer in range(num_layers):
+        if layer == null_layer:
+            continue
+        expected = before[layer].clone()
+        for row in range(rows_per_layer):
+            expected[(row + 1) % rows_per_layer, :row_i32] = src_slabs[layer][
+                row, :row_i32
+            ]
+        assert torch.equal(dst_slabs[layer], expected)
 
 
 def test_copy_state_rows_commits_verified_state(device: str) -> None:
@@ -261,6 +341,127 @@ def test_copy_state_rows_commits_verified_state(device: str) -> None:
         assert torch.equal(actual, expected)
     for actual, expected in zip(ssm_committed, expected_ssm):
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("row_dtype", [torch.int32, torch.int64])
+def test_state_verify_commit_rows_matches_torch(
+    device: str, row_dtype: torch.dtype
+) -> None:
+    num_layers, batch_size, verify_width = 3, 4, 3
+    # 9 exceeds verify_width and must clamp down; 0 must clamp up to 1.
+    accepted = torch.tensor([1, 0, 3, 9], device=device, dtype=torch.int32)
+    # Page 0 is the null page; -1 stands in for a pad slot a caller did not
+    # clamp, and must map to -1 exactly like the null page does.
+    pages = torch.tensor([5, 0, 7, -1], device=device, dtype=torch.int64)
+    src_rows = torch.empty(num_layers * batch_size, device=device, dtype=row_dtype)
+    dst_rows = torch.empty(num_layers * batch_size, device=device, dtype=row_dtype)
+
+    state_verify_commit_rows(
+        accepted,
+        pages,
+        src_rows,
+        dst_rows,
+        verify_width=verify_width,
+        num_layers=num_layers,
+    )
+    torch.cuda.synchronize()
+
+    clamped = accepted.to(torch.int64).clamp(1, verify_width)
+    expected_src = (
+        torch.arange(batch_size, device=device, dtype=torch.int64) * (verify_width + 1)
+        + clamped
+    ).repeat(num_layers)
+    expected_dst = torch.where(
+        pages > 0, pages.to(torch.int64), torch.full_like(pages, -1)
+    ).repeat(num_layers)
+    assert torch.equal(src_rows.to(torch.int64), expected_src)
+    assert torch.equal(dst_rows.to(torch.int64), expected_dst)
+
+
+def test_state_verify_commit_rows_single_layer_matches_tiled_prefix(
+    device: str,
+) -> None:
+    """The shared-field launch passes num_layers=1 and slices the first block.
+
+    A single-layer result must equal the first ``batch_size`` entries of the
+    tiled one, otherwise the caller's ``rows[:bs]`` view addresses a different
+    layer's tile.
+    """
+
+    num_layers, batch_size, verify_width = 4, 3, 2
+    accepted = torch.tensor([1, 2, 5], device=device, dtype=torch.int32)
+    pages = torch.tensor([2, 0, 9], device=device, dtype=torch.int64)
+    tiled_src = torch.empty(num_layers * batch_size, device=device, dtype=torch.int64)
+    tiled_dst = torch.empty(num_layers * batch_size, device=device, dtype=torch.int64)
+    single_src = torch.empty(batch_size, device=device, dtype=torch.int64)
+    single_dst = torch.empty(batch_size, device=device, dtype=torch.int64)
+
+    state_verify_commit_rows(
+        accepted,
+        pages,
+        tiled_src,
+        tiled_dst,
+        verify_width=verify_width,
+        num_layers=num_layers,
+    )
+    state_verify_commit_rows(
+        accepted,
+        pages,
+        single_src,
+        single_dst,
+        verify_width=verify_width,
+        num_layers=1,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(single_src, tiled_src[:batch_size])
+    assert torch.equal(single_dst, tiled_dst[:batch_size])
+    for layer in range(num_layers):
+        tile = slice(layer * batch_size, (layer + 1) * batch_size)
+        assert torch.equal(tiled_src[tile], single_src)
+        assert torch.equal(tiled_dst[tile], single_dst)
+
+
+def test_state_verify_commit_rows_rejects_bad_args(device: str) -> None:
+    accepted = torch.tensor([1, 2], device=device, dtype=torch.int32)
+    pages = torch.tensor([3, 4], device=device, dtype=torch.int64)
+    src = torch.empty(2, device=device, dtype=torch.int64)
+    dst = torch.empty(2, device=device, dtype=torch.int64)
+    kwargs = {"verify_width": 2, "num_layers": 1}
+
+    with pytest.raises(ValueError, match="one page id per request"):
+        state_verify_commit_rows(accepted, pages[:1], src, dst, **kwargs)
+    with pytest.raises(ValueError, match="num_layers \\* batch_size"):
+        state_verify_commit_rows(accepted, pages, src[:1], dst, **kwargs)
+    with pytest.raises(ValueError, match="num_layers \\* batch_size"):
+        state_verify_commit_rows(accepted, pages, src, dst[:1], **kwargs)
+    with pytest.raises(ValueError, match="verify_width"):
+        state_verify_commit_rows(
+            accepted, pages, src, dst, verify_width=0, num_layers=1
+        )
+    with pytest.raises(ValueError, match="num_layers"):
+        state_verify_commit_rows(
+            accepted, pages, src, dst, verify_width=2, num_layers=0
+        )
+    with pytest.raises(ValueError, match="torch.int32 or torch.int64"):
+        state_verify_commit_rows(
+            accepted,
+            pages,
+            torch.empty(2, device=device, dtype=torch.float32),
+            dst,
+            **kwargs,
+        )
+
+
+def test_state_verify_commit_rows_empty_batch_is_noop(device: str) -> None:
+    accepted = torch.empty(0, device=device, dtype=torch.int32)
+    pages = torch.empty(0, device=device, dtype=torch.int64)
+    src = torch.empty(0, device=device, dtype=torch.int64)
+    dst = torch.empty(0, device=device, dtype=torch.int64)
+
+    state_verify_commit_rows(accepted, pages, src, dst, verify_width=2, num_layers=3)
+    torch.cuda.synchronize()
+    assert src.numel() == 0 and dst.numel() == 0
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

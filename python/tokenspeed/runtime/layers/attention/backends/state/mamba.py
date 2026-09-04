@@ -311,6 +311,17 @@ class _GDNReplayWorkspace:
     state_dtype: torch.dtype
 
 
+def _row_stride_i32(tensor: torch.Tensor) -> int:
+    """Return one state row's stride in int32 words for pointer-table copies."""
+
+    if tensor[0].numel() and not tensor[0].is_contiguous():
+        raise RuntimeError("batched verify state copy requires contiguous row payloads")
+    stride_bytes = tensor.stride(0) * tensor.element_size()
+    if stride_bytes % 4:
+        raise RuntimeError("state row stride must be 4-byte aligned")
+    return stride_bytes // 4
+
+
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
@@ -589,18 +600,6 @@ class MambaAttnBackend(AttentionBackend):
         ssm_element_st = []
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
-
-        def _row_stride_i32(t: torch.Tensor) -> int:
-            # Slab components are page-interleaved as_strided views: row
-            # payload contiguous, row-to-row stride the physical page.
-            if t[0].numel() and not t[0].is_contiguous():
-                raise RuntimeError(
-                    "batched verify state copy requires contiguous row payloads"
-                )
-            stride_bytes = t.stride(0) * t.element_size()
-            if stride_bytes % 4:
-                raise RuntimeError("state row stride must be 4-byte aligned")
-            return stride_bytes // 4
 
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)

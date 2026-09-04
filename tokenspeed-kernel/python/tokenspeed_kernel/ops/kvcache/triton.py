@@ -53,6 +53,7 @@ __all__ = [
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
     "set_mla_kv_buffer_triton",
+    "state_verify_commit_rows",
     "store_kv_cache",
     "store_sf_interleaved",
     "transfer_cache_ranges",
@@ -239,7 +240,8 @@ def _copy_state_rows_kernel(
 
     Row strides are per-layer (int32 units) so page-interleaved ``as_strided``
     slab views and dense scratch tensors mix freely. A negative source row id
-    stores zeros instead (seed-invalid fill).
+    stores zeros instead (seed-invalid fill). A negative destination row id
+    skips the store entirely, which is how callers mask a null cache page.
     """
     work_index = tl.program_id(0)
     chunk_index = tl.program_id(1)
@@ -262,7 +264,11 @@ def _copy_state_rows_kernel(
         mask=mask & (src_row >= 0),
         other=0,
     )
-    tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+    tl.store(
+        dst_ptr + dst_row * dst_stride + offsets.to(tl.int64),
+        values,
+        mask=mask & (dst_row >= 0),
+    )
 
 
 def copy_state_rows(
@@ -290,6 +296,8 @@ def copy_state_rows(
         src_rows: CUDA int32 or int64 ``[num_layers * rows_per_layer]`` source
             row ids, layer-major. A negative id zero-fills its destination row.
         dst_rows: CUDA int32 or int64 tensor, same layout, destination row ids.
+            A negative id suppresses that row's store, so a caller holding a
+            null cache page id can mask it instead of clamping it onto page 0.
         row_bytes: Byte width of the copied row payload (divisible by 4).
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
             source slabs in int32 units (``stride_bytes // 4``).
@@ -335,6 +343,100 @@ def copy_state_rows(
         total // num_layers,
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
+    )
+
+
+@triton.jit
+def _state_verify_commit_rows_kernel(
+    accepted_ptr,
+    pages_ptr,
+    src_rows_ptr,
+    dst_rows_ptr,
+    batch_size,
+    verify_width,
+):
+    """Emit one (source scratch row, destination page row) pair per request.
+
+    ``program_id(0)`` is the request and ``program_id(1)`` the layer, so the
+    outputs land layer-major exactly as :func:`copy_state_rows` expects. A null
+    page id (0) becomes destination row -1, which the copy kernel skips.
+    """
+    request = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1).to(tl.int64)
+    out = layer * batch_size + request
+    accepted = tl.load(accepted_ptr + request).to(tl.int64)
+    accepted = tl.minimum(tl.maximum(accepted, 1), verify_width)
+    src_dtype = src_rows_ptr.dtype.element_ty
+    tl.store(
+        src_rows_ptr + out,
+        (request * (verify_width + 1) + accepted).to(src_dtype),
+    )
+    page = tl.load(pages_ptr + request).to(tl.int64)
+    dst_dtype = dst_rows_ptr.dtype.element_ty
+    tl.store(dst_rows_ptr + out, tl.where(page > 0, page, -1).to(dst_dtype))
+
+
+def state_verify_commit_rows(
+    accepted_lengths: torch.Tensor,
+    destination_pages: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    *,
+    verify_width: int,
+    num_layers: int,
+) -> None:
+    """Build batched verify-commit row ids for :func:`copy_state_rows`.
+
+    Sinks the ``arange``/``clamp``/``where`` chain that a post-verify state
+    commit otherwise runs eagerly into one launch, and tiles it layer-major so
+    a single output pair feeds every layer's copy. Each request owns
+    ``verify_width + 1`` verify-scratch rows whose first is the carried state,
+    so accepting ``k`` tokens reads row ``request * (verify_width + 1) + k``.
+    Cache page id 0 is the null page and is emitted as destination row -1,
+    which :func:`copy_state_rows` skips instead of writing page 0.
+
+    Args:
+        accepted_lengths: CUDA ``[batch_size]`` per-request accepted widths.
+            Values are clamped to ``[1, verify_width]`` because the first
+            verified token is always accepted.
+        destination_pages: CUDA ``[batch_size]`` committed page ids; id 0 is
+            the null page and is emitted as destination row ``-1``.
+        src_rows: CUDA int32 or int64 ``[num_layers * batch_size]`` output,
+            layer-major, holding ``request * (verify_width + 1) + accepted``.
+        dst_rows: Same layout, holding the destination page id or ``-1``.
+        verify_width: Candidate width per request; the scratch row block is
+            ``verify_width + 1`` rows whose first row is the carried state.
+        num_layers: Layer repetitions to tile, matching ``copy_state_rows``.
+
+    Returns:
+        None. Both output tensors are written in place in one launch.
+
+    Raises:
+        ValueError: On a size, dtype or value disagreement.
+    """
+    batch_size = accepted_lengths.numel()
+    if batch_size == 0:
+        return
+    if verify_width < 1:
+        raise ValueError("verify_width must be at least one candidate per request")
+    if num_layers < 1:
+        raise ValueError("num_layers must be at least one")
+    if destination_pages.numel() != batch_size:
+        raise ValueError("destination_pages must hold exactly one page id per request")
+    total = num_layers * batch_size
+    if src_rows.numel() != total or dst_rows.numel() != total:
+        raise ValueError("row id outputs must hold num_layers * batch_size entries")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
+
+    _state_verify_commit_rows_kernel[(batch_size, num_layers)](
+        accepted_lengths,
+        destination_pages,
+        src_rows,
+        dst_rows,
+        batch_size,
+        verify_width,
     )
 
 

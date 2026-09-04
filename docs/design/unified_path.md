@@ -315,14 +315,14 @@ support) and `cache_metadata.py` (the runner's block-table bridge) stay at
 the root; `paged/` holds the block-table route — the `CacheGroupRouter`, its
 geometry / table-stack / write-location helpers, and every kernel-facing
 paged leaf (`base.py` is `PagedAttentionBackend`; MHA, MLA, FlashMLA, TRT-LLM,
-TRT-LLM MLA, TokenSpeed MLA, DSA, MSA); `state/` holds the recurrent and
-side-state consumers (Mamba/GDN, KDA, the QSA verify-commit lifecycle);
+TRT-LLM MLA, TokenSpeed MLA, DSA, MSA); `state/` holds the recurrent consumers
+(Mamba/GDN and KDA);
 `hybrid/` the layer-routing composite (`linear.py` is
 `HybridLinearAttnBackend`); and `specific/` the bespoke single-model backends
-(DeepSeek V4, Qwen4-Exp's GDN extension, Inkling's dense + conv-state
-wrapper). A new leaf goes under `paged/`, a new state family under
-`state/`; a model-shaped backend earns `specific/` only when it cannot be a
-router with one leaf.
+(DeepSeek V4, Qwen4-Exp's GDN extension, QSA's registered router + sparse
+dispatch, and Inkling's dense + conv-state wrapper). A new leaf goes under
+`paged/`, a new recurrent family under `state/`; model-specific composition
+and lifecycle extensions go under `specific/`.
 
 ## One block-table route: router + leaves
 

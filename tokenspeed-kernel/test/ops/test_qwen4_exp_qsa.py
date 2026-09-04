@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
     qwen4_exp_qsa_block_topk,
+    qwen4_exp_qsa_commit_verify_layers,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
@@ -1286,3 +1287,280 @@ def test_qwen4_exp_qsa_recent_write_reads_strided_token_k(device: str) -> None:
     raw, positions = run(token_k, True)
     torch.testing.assert_close(raw, expected_raw)
     torch.testing.assert_close(positions, expected_positions)
+
+
+def test_qwen4_exp_qsa_commit_verify_layers_matches_per_layer_writes(
+    device: str,
+) -> None:
+    ratio, head_dim, recent_page_size = 4, 8, 64
+    num_layers, bs, width = 3, 3, 5
+    rows = bs * width
+    logical = torch.arange(40, 40 + rows, device=device, dtype=torch.int64)
+    requests = torch.arange(bs, device=device).repeat_interleave(width)
+    position_values = torch.randint(1, 64, (rows, 3), device=device, dtype=torch.int64)
+    recent_locs = torch.empty(rows, device=device, dtype=torch.int32)
+    for request in range(bs):
+        recent_locs[request * width : (request + 1) * width] = (
+            request + 1
+        ) * recent_page_size + torch.arange(width, device=device, dtype=torch.int32)
+    accepted = torch.tensor([1, 5, 3], device=device, dtype=torch.int64)
+    accepted_clamped = accepted.clamp(min=0, max=width)
+    steps = torch.arange(width, device=device).expand(bs, width)
+    logical_by_request = logical.view(bs, width)
+    last = logical_by_request.gather(
+        1, (accepted_clamped - 1).clamp_min(0).unsqueeze(1)
+    )
+    write_mask = (steps < accepted_clamped.unsqueeze(1)) & (
+        logical_by_request > last - ratio
+    )
+
+    num_pages = bs + 1
+    token_ks = []
+    raws = []
+    position_caches = []
+    for layer in range(num_layers):
+        torch.manual_seed(61 + layer)
+        token_ks.append(
+            torch.randn(rows, 1, head_dim, device=device, dtype=torch.bfloat16)
+        )
+        raws.append(
+            torch.zeros(
+                num_pages,
+                ratio,
+                1,
+                head_dim,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        )
+        position_caches.append(
+            torch.zeros(num_pages, 3, device=device, dtype=torch.int64)
+        )
+
+    expected_raws = []
+    expected_positions = []
+    for layer in range(num_layers):
+        raw = torch.zeros_like(raws[layer])
+        position_cache = torch.zeros_like(position_caches[layer])
+        qwen4_exp_qsa_recent_write(
+            token_ks[layer],
+            logical,
+            requests,
+            recent_locs,
+            position_values,
+            raw,
+            position_cache,
+            recent_page_size,
+            ratio,
+            write_mask=write_mask.reshape(-1),
+            request_limit=None,
+            enable_pdl=False,
+        )
+        expected_raws.append(raw)
+        expected_positions.append(position_cache)
+
+    staged = torch.full(
+        (num_layers, bs + 1, width, 1, head_dim),
+        512.0,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    for layer in range(num_layers):
+        staged[layer, :bs] = token_ks[layer].reshape(bs, width, 1, head_dim)
+
+    qwen4_exp_qsa_commit_verify_layers(
+        torch.tensor(
+            [raw.data_ptr() for raw in raws], device=device, dtype=torch.uint64
+        ),
+        torch.tensor(
+            [cache.data_ptr() for cache in position_caches],
+            device=device,
+            dtype=torch.uint64,
+        ),
+        staged,
+        logical,
+        recent_locs,
+        position_values,
+        accepted,
+        raws[0],
+        position_caches[0],
+        recent_page_size,
+        ratio,
+        verify_width=width,
+    )
+    torch.cuda.synchronize()
+
+    for layer in range(num_layers):
+        torch.testing.assert_close(raws[layer], expected_raws[layer], atol=0, rtol=0)
+        torch.testing.assert_close(
+            position_caches[layer], expected_positions[layer], atol=0, rtol=0
+        )
+
+
+def test_qwen4_exp_qsa_commit_verify_layers_skips_invalid_pages(device: str) -> None:
+    ratio, head_dim, recent_page_size = 4, 8, 64
+    num_layers, bs, width = 2, 2, 4
+    rows = bs * width
+    logical = torch.arange(8, 8 + rows, device=device, dtype=torch.int64)
+    position_values = torch.randint(1, 64, (rows, 3), device=device, dtype=torch.int64)
+    recent_locs = torch.zeros(rows, device=device, dtype=torch.int32)
+    accepted = torch.tensor([4, 2], device=device, dtype=torch.int64)
+    staged = torch.randn(
+        num_layers,
+        bs,
+        width,
+        1,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    raws = [
+        torch.full(
+            (bs + 1, ratio, 1, head_dim),
+            -3.0,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        for _ in range(num_layers)
+    ]
+    position_caches = [
+        torch.full((bs + 1, 3), -3, device=device, dtype=torch.int64)
+        for _ in range(num_layers)
+    ]
+    before_raws = [raw.clone() for raw in raws]
+    before_positions = [cache.clone() for cache in position_caches]
+
+    qwen4_exp_qsa_commit_verify_layers(
+        torch.tensor(
+            [raw.data_ptr() for raw in raws], device=device, dtype=torch.uint64
+        ),
+        torch.tensor(
+            [cache.data_ptr() for cache in position_caches],
+            device=device,
+            dtype=torch.uint64,
+        ),
+        staged,
+        logical,
+        recent_locs,
+        position_values,
+        accepted,
+        raws[0],
+        position_caches[0],
+        recent_page_size,
+        ratio,
+        verify_width=width,
+    )
+    torch.cuda.synchronize()
+
+    for layer in range(num_layers):
+        assert torch.equal(raws[layer], before_raws[layer])
+        assert torch.equal(position_caches[layer], before_positions[layer])
+
+
+def test_qwen4_exp_qsa_commit_verify_layers_rejects_bad_args(device: str) -> None:
+    ratio, head_dim, recent_page_size = 4, 8, 64
+    num_layers, bs, width = 2, 2, 4
+    rows = bs * width
+    logical = torch.arange(rows, device=device, dtype=torch.int64)
+    recent_locs = torch.arange(1, rows + 1, device=device, dtype=torch.int32)
+    position_values = torch.zeros(rows, 3, device=device, dtype=torch.int64)
+    accepted = torch.tensor([2, 3], device=device, dtype=torch.int64)
+    staged = torch.zeros(
+        num_layers,
+        bs,
+        width,
+        1,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    raw = torch.zeros(bs + 1, ratio, 1, head_dim, device=device, dtype=torch.bfloat16)
+    position_cache = torch.zeros(bs + 1, 3, device=device, dtype=torch.int64)
+    addresses = torch.zeros(num_layers, device=device, dtype=torch.uint64)
+    args = (
+        addresses,
+        addresses,
+        staged,
+        logical,
+        recent_locs,
+        position_values,
+        accepted,
+        raw,
+        position_cache,
+        recent_page_size,
+        ratio,
+    )
+
+    with pytest.raises(ValueError, match="one address per layer"):
+        qwen4_exp_qsa_commit_verify_layers(
+            *args[:1], addresses[:1], *args[2:], verify_width=width
+        )
+    with pytest.raises(ValueError, match="torch.uint64"):
+        qwen4_exp_qsa_commit_verify_layers(
+            addresses.to(torch.int64),
+            addresses,
+            *args[2:],
+            verify_width=width,
+        )
+    with pytest.raises(ValueError, match="one layer block per address"):
+        qwen4_exp_qsa_commit_verify_layers(
+            addresses,
+            addresses,
+            staged[:1],
+            *args[3:],
+            verify_width=width,
+        )
+    with pytest.raises(ValueError, match="positive multiple of verify_width"):
+        qwen4_exp_qsa_commit_verify_layers(*args, verify_width=width - 1)
+    with pytest.raises(ValueError, match="one accepted length per request"):
+        qwen4_exp_qsa_commit_verify_layers(
+            *args[:6], accepted[:1], *args[7:], verify_width=width
+        )
+    with pytest.raises(ValueError, match="must be contiguous"):
+        qwen4_exp_qsa_commit_verify_layers(
+            addresses,
+            addresses,
+            torch.zeros(
+                num_layers,
+                bs + 1,
+                width,
+                1,
+                head_dim,
+                device=device,
+                dtype=torch.bfloat16,
+            )[:, :bs],
+            *args[3:],
+            verify_width=width,
+        )
+    with pytest.raises(ValueError, match="must be bfloat16"):
+        qwen4_exp_qsa_commit_verify_layers(
+            *args[:7],
+            raw.to(torch.float32),
+            position_cache,
+            recent_page_size,
+            ratio,
+            verify_width=width,
+        )
+    with pytest.raises(ValueError, match="must be int64"):
+        qwen4_exp_qsa_commit_verify_layers(
+            *args[:8],
+            position_cache.to(torch.int32),
+            recent_page_size,
+            ratio,
+            verify_width=width,
+        )
+    with pytest.raises(ValueError, match="bucket covers fewer rows"):
+        qwen4_exp_qsa_commit_verify_layers(
+            addresses,
+            addresses,
+            staged,
+            torch.arange(rows + width, device=device, dtype=torch.int64),
+            torch.arange(1, rows + width + 1, device=device, dtype=torch.int32),
+            torch.zeros(rows + width, 3, device=device, dtype=torch.int64),
+            torch.tensor([2, 3, 1], device=device, dtype=torch.int64),
+            raw,
+            position_cache,
+            recent_page_size,
+            ratio,
+            verify_width=width,
+        )

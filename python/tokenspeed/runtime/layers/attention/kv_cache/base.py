@@ -210,6 +210,22 @@ class CachePool(ABC):
             )
         return self._field_layer_offset + layer_id
 
+    @property
+    def field_layer_range(self) -> range:
+        """Global model-layer ids owned by this compute view.
+
+        Cache-plan field ids use global layer numbers, while target and draft
+        pools expose local layer numbers to their models.  Consumers that
+        inspect the shared plan use this range to keep only fields belonging
+        to their own view instead of accidentally including the adjacent
+        target or draft window.
+        """
+
+        return range(
+            self._field_layer_offset,
+            self._field_layer_offset + self.layer_num,
+        )
+
     # Per-layer plane name -> the attribute holding its per-layer list.
     # Subclasses declare only the planes their kernels read; a plane they do
     # not name is not this view's concern.

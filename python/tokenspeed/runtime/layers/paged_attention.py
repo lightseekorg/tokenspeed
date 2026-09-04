@@ -100,6 +100,7 @@ class PagedAttention(nn.Module):
             ctx.forward_mode,
             ctx.bs,
             save_kv_cache,
+            ctx=ctx,
             **kwargs,
         )
 

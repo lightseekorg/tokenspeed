@@ -1149,6 +1149,259 @@ def qwen4_exp_qsa_recent_write(
 
 
 @triton.jit
+def _qwen4_exp_qsa_verify_row_mask(
+    logical_positions,
+    accepted_lengths,
+    row,
+    verify_width,
+    compress_ratio,
+):
+    """Return whether one staged row belongs to the accepted trailing window."""
+
+    request = row // verify_width
+    step = row % verify_width
+    accepted = tl.load(accepted_lengths + request).to(tl.int64)
+    accepted = tl.minimum(tl.maximum(accepted, 0), verify_width)
+    write = step < accepted
+    if write:
+        last_index = request * verify_width + accepted - 1
+        last_position = tl.load(logical_positions + last_index).to(tl.int64)
+        position = tl.load(logical_positions + row).to(tl.int64)
+        write = position > last_position - compress_ratio
+    return write
+
+
+@triton.jit
+def _qwen4_exp_qsa_verify_row_writes(
+    logical_positions,
+    accepted_lengths,
+    recent_locs,
+    row,
+    rows,
+    verify_width,
+    compress_ratio,
+):
+    """Combine acceptance, valid-location, and ring-shadow predicates."""
+
+    write = _qwen4_exp_qsa_verify_row_mask(
+        logical_positions, accepted_lengths, row, verify_width, compress_ratio
+    )
+    write &= tl.load(recent_locs + row).to(tl.int64) > 0
+    if write:
+        future = row + compress_ratio
+        if future < rows:
+            has_future = _qwen4_exp_qsa_verify_row_mask(
+                logical_positions,
+                accepted_lengths,
+                future,
+                verify_width,
+                compress_ratio,
+            )
+            has_future &= tl.load(recent_locs + future).to(tl.int64) > 0
+            if has_future:
+                has_future &= future // verify_width == row // verify_width
+            if has_future:
+                has_future &= (
+                    tl.load(logical_positions + future).to(tl.int64)
+                    == tl.load(logical_positions + row).to(tl.int64) + compress_ratio
+                )
+            write &= not has_future
+    return write
+
+
+@triton.jit
+def _qwen4_exp_qsa_commit_verify_layers_kernel(
+    raw_addresses,
+    position_addresses,
+    staged_k,
+    logical_positions,
+    recent_locs,
+    position_values,
+    accepted_lengths,
+    rows,
+    head_dim,
+    recent_page_size,
+    verify_width,
+    stride_k_l,
+    stride_pv_n,
+    stride_pv_a,
+    stride_raw_p,
+    stride_raw_s,
+    stride_raw_d,
+    stride_pc_p,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    layer = tl.program_id(1)
+    write = _qwen4_exp_qsa_verify_row_writes(
+        logical_positions,
+        accepted_lengths,
+        recent_locs,
+        row,
+        rows,
+        verify_width,
+        COMPRESS_RATIO,
+    )
+    if write:
+        loc = tl.load(recent_locs + row).to(tl.int64)
+        position = tl.load(logical_positions + row).to(tl.int64)
+        slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
+        page = loc // recent_page_size
+        dim_offsets = tl.arange(0, BLOCK_D)
+        dim_mask = dim_offsets < head_dim
+        values = tl.load(
+            staged_k + layer.to(tl.int64) * stride_k_l + row * head_dim + dim_offsets,
+            mask=dim_mask,
+            other=0.0,
+        )
+        raw_ptr = tl.cast(tl.load(raw_addresses + layer), tl.pointer_type(tl.bfloat16))
+        tl.store(
+            raw_ptr
+            + page * stride_raw_p
+            + slot * stride_raw_s
+            + dim_offsets * stride_raw_d,
+            values.to(tl.bfloat16),
+            mask=dim_mask,
+        )
+        if slot == 0:
+            axes = tl.arange(0, 4)
+            axis_mask = axes < 3
+            rope_positions = tl.load(
+                position_values + row * stride_pv_n + axes * stride_pv_a,
+                mask=axis_mask,
+                other=0,
+            )
+            position_ptr = tl.cast(
+                tl.load(position_addresses + layer), tl.pointer_type(tl.int64)
+            )
+            tl.store(
+                position_ptr + page * stride_pc_p + axes,
+                rope_positions,
+                mask=axis_mask,
+            )
+
+
+def qwen4_exp_qsa_commit_verify_layers(
+    raw_addresses: torch.Tensor,
+    position_addresses: torch.Tensor,
+    staged_k: torch.Tensor,
+    logical_positions: torch.Tensor,
+    recent_locs: torch.Tensor,
+    position_values: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    raw_cache: torch.Tensor,
+    position_cache: torch.Tensor,
+    recent_page_size: int,
+    compress_ratio: int,
+    *,
+    verify_width: int,
+) -> None:
+    """Commit accepted target-verify raw keys into every QSA layer at once.
+
+    The layer-dependent keys arrive as one contiguous layer-major staging
+    tensor. Logical positions, recent-cache locations, and RoPE positions are
+    shared by every layer; destination fields are supplied as address tables.
+
+    Args:
+        raw_addresses: CUDA uint64 base address for each raw-key cache field.
+        position_addresses: CUDA uint64 base address for each position field.
+        staged_k: Keys shaped ``[layers, capacity, width, 1, head_dim]``.
+        logical_positions: Request-major logical positions for live rows.
+        recent_locs: Recent-cache locations for live rows.
+        position_values: RoPE positions shaped ``[rows, 3]``.
+        accepted_lengths: Accepted width for each request.
+        raw_cache: One raw-key field used as the stride and dtype donor.
+        position_cache: One position field used as the stride and dtype donor.
+        recent_page_size: Rows covered by one recent-cache page.
+        compress_ratio: Tokens grouped into one compressed entry.
+        verify_width: Candidate width per request.
+
+    Returns:
+        None.
+    """
+
+    num_layers = raw_addresses.numel()
+    rows = logical_positions.shape[0]
+    if num_layers == 0 or not rows:
+        return
+    if position_addresses.numel() != num_layers:
+        raise ValueError(
+            "Qwen4-Exp QSA batched verify commit needs one address per layer "
+            "in both destination tables"
+        )
+    if raw_addresses.dtype != torch.uint64 or position_addresses.dtype != torch.uint64:
+        raise ValueError("QSA cache field address tables must have dtype torch.uint64")
+    if staged_k.shape[0] != num_layers:
+        raise ValueError(
+            "QSA staged keys must hold exactly one layer block per address"
+        )
+    if verify_width < 1 or rows % verify_width:
+        raise ValueError("QSA verify rows must be a positive multiple of verify_width")
+    if accepted_lengths.shape[0] != rows // verify_width:
+        raise ValueError(
+            "QSA batched verify commits need one accepted length per request"
+        )
+    head_dim = staged_k.shape[-1]
+    if staged_k.ndim != 5 or tuple(staged_k.shape[2:]) != (
+        verify_width,
+        1,
+        head_dim,
+    ):
+        raise ValueError(
+            "QSA staged keys must be shaped "
+            "[num_layers, bucket_rows, verify_width, 1, head_dim]"
+        )
+    if not staged_k.is_contiguous():
+        raise ValueError(
+            "QSA staged keys must be contiguous so one layer stride addresses "
+            "every row"
+        )
+    if rows > staged_k.shape[1] * verify_width:
+        raise ValueError(
+            "QSA staged keys bucket covers fewer rows than this verify commit "
+            f"needs: {staged_k.shape[1]} x {verify_width} for {rows} rows"
+        )
+    if raw_cache.dtype != torch.bfloat16:
+        raise ValueError("QSA raw-key cache fields must be bfloat16")
+    if position_cache.dtype != torch.int64:
+        raise ValueError("QSA RoPE position cache fields must be int64")
+    if raw_cache.shape[-1] != head_dim or raw_cache.shape[1] != compress_ratio:
+        raise ValueError(
+            "QSA raw-key cache geometry disagrees with the staged keys or the "
+            "compression ratio"
+        )
+    if position_values.shape[0] != rows or recent_locs.shape[0] != rows:
+        raise ValueError(
+            "QSA batched verify commit needs one shared row per staged row"
+        )
+
+    _qwen4_exp_qsa_commit_verify_layers_kernel[(rows, num_layers)](
+        raw_addresses,
+        position_addresses,
+        staged_k,
+        logical_positions,
+        recent_locs,
+        position_values,
+        accepted_lengths,
+        rows,
+        head_dim,
+        recent_page_size,
+        verify_width,
+        staged_k.stride(0),
+        position_values.stride(0),
+        position_values.stride(1),
+        raw_cache.stride(0),
+        raw_cache.stride(1),
+        raw_cache.stride(-1),
+        position_cache.stride(0),
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _qwen4_exp_qsa_pad_keys_to_topk(
     keys, BLOCK_TOPK: tl.constexpr, BLOCK_N: tl.constexpr
 ):

@@ -44,3 +44,4 @@ from tokenspeed.runtime.layers.attention.backends.paged import dsa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mla  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import msa  # noqa: F401
+from tokenspeed.runtime.layers.attention.backends.specific import qsa  # noqa: F401

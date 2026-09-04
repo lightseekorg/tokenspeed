@@ -846,12 +846,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self._verify_scratch[key] = scratch
         return scratch
 
-    def commit_verified(
-        self,
-        accepted_lengths: torch.Tensor,
-        destination_pages: torch.Tensor,
-    ) -> None:
-        bs = accepted_lengths.shape[0]
+    def verify_scratch_bucket(
+        self, bs: int
+    ) -> tuple[tuple[int, int], torch.Tensor, torch.Tensor] | None:
+        """Return the captured verify-scratch bucket covering a live batch."""
+
         active_width = self._active_verify_key[1] if self._active_verify_key else None
         candidates = [
             key
@@ -859,25 +858,10 @@ class Qwen4ExpPLELayer(nn.Module):
             if key[0] >= bs and (active_width is None or key[1] == active_width)
         ]
         if not candidates:
-            return
-        # Graph capture owns one scratch tensor per padded batch bucket. Model
-        # Python does not run on replay, so `_active_verify_key` still names the
-        # last captured graph; the smallest bucket covering the live batch is
-        # the graph ForwardStepRunner selected for this step.
+            return None
         key = min(candidates, key=lambda value: value[0])
-        _, width = key
         context_scratch, conv_scratch = self._verify_scratch[key]
-        accepted = accepted_lengths.to(torch.long).clamp(1, width)
-        source = torch.arange(bs, device=accepted.device) * (width + 1) + accepted
-        pool = self._last_pool
-        context_field = pool.arena.field(self.context_field_id)
-        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
-        self._write_pages(
-            context_field, destination_pages, context_scratch.index_select(0, source)
-        )
-        self._write_pages(
-            conv_field, destination_pages, conv_scratch.index_select(0, source)
-        )
+        return key, context_scratch, conv_scratch
 
     def _final_context(
         self,
@@ -984,7 +968,6 @@ class Qwen4ExpPLELayer(nn.Module):
         input_pages = in_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
         output_pages = out_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
         pool = ctx.token_to_kv_pool
-        self._last_pool = pool
         load_tracker = getattr(pool, "layerwise_load_tracker", None)
         if load_tracker is not None:
             load_tracker.wait_for_layer(self.layer_id)

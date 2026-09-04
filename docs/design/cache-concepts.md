@@ -204,6 +204,15 @@ already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
 
+A batched post-verification commit is the one side-cache writer that issues no
+fence of its own. It moves every bound layer's fields in a single launch, so it
+cannot fence per layer, and it relies on two invariants instead: it runs after
+the whole model forward, by which point every bound layer has already fenced
+this step in its own forward, and under pipeline parallelism only the layers
+this rank forwards are bound to it. Moving such a commit earlier than the end of
+the forward, or binding layers the rank does not forward, breaks the fence
+guarantee without any call site visibly dropping a wait.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under
@@ -449,6 +458,40 @@ repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
 the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
+
+## Sparse indexers: model-owned weights, backend-owned dispatch
+
+Sparse-attention families split one mechanism across the model and the
+backend. The invariant is the division, not where any helper happens to sit:
+
+* The **model** owns the weights and the top-k selection: the indexer is an
+  `nn.Module` (weight loading addresses it by module path), and its forward
+  ends by handing `topk_indices` to the normal attention call
+  (`PagedAttention.forward` → the backend), never to a side channel.
+* The **backend** owns everything the dispatch needs: the metadata slot, the
+  per-group page tables and consumer page sizes, the derived layout, and any
+  speculative side-state (QSA's verify staging + batched commit). A backend
+  whose attention is sparse is a *registered* backend (`register_backend`),
+  not a lazily bolted-on coordinator — that is what puts its workspace on
+  the `workspace_bytes` ledger and lets the registry size it before
+  CUDA-graph capture.
+
+Two consequences worth remembering when touching this boundary:
+
+* **Whoever produces the metadata owns the group route.** `set_cache_pool`
+  binds the producer's `CacheGroupRouter`, whose `init_forward_metadata*`
+  owns table expansion, per-group write locations, and capture buffers. QSA
+  is a registered router subclass: it creates one MHA leaf per history group
+  and derives the indexer's layout directly from the router stacks. A wrapper
+  inserted above it must forward `set_cache_pool`; there is no parallel group
+  geometry on the model side.
+* **Sparse addressing belongs to the consumer of the group.** DSA's index
+  rows ride the history group's table and write locations, so its dense
+  child stays a pure calculator. QSA's compressed/recent groups are
+  scheduler-owned cache groups with heterogeneous page sizes, so the QSA
+  backend consumes them through its router and MHA leaves — duplicating that
+  machinery in the model or hybrid wrapper would fork the single source of
+  truth the pipeline is built around.
 
 ## Code placement
 
