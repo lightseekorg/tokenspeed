@@ -3,5 +3,5 @@ wheel
 psutil
 numpy
 torch
-tokenspeed-proton==3.8.10.post20260904
-tokenspeed-triton==3.8.10.post20260904
+tokenspeed-proton==3.8.10.post20260828
+tokenspeed-triton==3.8.10.post20260828

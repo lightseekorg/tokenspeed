@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-VENDOR_VERSION = "3.8.10.post20260904"
+VENDOR_VERSION = "3.8.10.post20260828"
 
 
 def read_vendor_pins(path: Path) -> dict[str, str]:
