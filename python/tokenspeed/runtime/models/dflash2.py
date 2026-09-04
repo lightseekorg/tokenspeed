@@ -27,6 +27,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -79,7 +80,7 @@ def _dflash2_mla_rope(config: Any) -> tuple[float, dict[str, Any] | None]:
     return rope_theta, scaling
 
 
-def _grouped_conv(
+def _grouped_conv_torch(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
     base: torch.Tensor,
@@ -88,7 +89,7 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
-    """Apply DFlash2's grouped dynamic depthwise convolution to flat blocks."""
+    """Torch reference for the grouped conv; CUDA rows take the Triton kernel."""
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     output = coefficients[:, 0] * blocks
@@ -103,6 +104,23 @@ def _grouped_conv(
             -1, 1, 1
         )
     return output.flatten(-2)
+
+
+def _grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    """Apply DFlash2's grouped dynamic depthwise convolution to flat blocks."""
+    if hidden_states.is_cuda:
+        return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
+    return _grouped_conv_torch(
+        hidden_states, delta, base, block_size, num_groups, group_size, taps
+    )
 
 
 class DFlashGroupedConv(nn.Module):
