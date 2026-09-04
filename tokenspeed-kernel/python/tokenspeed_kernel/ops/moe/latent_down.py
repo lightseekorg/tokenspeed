@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -66,6 +67,26 @@ _DOWN_SENTINEL = 0x80008000
 _BF16_BYTES = 2
 
 logger = logging.getLogger(__name__)
+
+
+class _Producer(Protocol):
+    """Leaves this rank's column block in every peer's mailbox."""
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight_block: torch.Tensor,
+        mailbox: torch.Tensor,
+        multicast_ptr: int,
+    ) -> torch.Tensor: ...
+
+
+class _Gather(Protocol):
+    """Assembles the full latent from a mailbox the peers have published into."""
+
+    def __call__(self, mailbox: torch.Tensor, m: int) -> tuple[torch.Tensor, ...]: ...
+
+
 # Reasons already reported; the decline repeats per MoE block and says nothing new.
 _DECLINED: set[str] = set()
 # See _rendezvous_failure_is_a_fault for why this is not latent_tail's gate.
@@ -155,8 +176,8 @@ class _MailboxSlot:
 
     mailbox: torch.Tensor
     multicast_ptr: int
-    gemm_by_m: dict[int, object]
-    gather_by_m: dict[int, object]
+    gemm_by_m: dict[int, _Producer]
+    gather_by_m: dict[int, _Gather]
 
 
 class _MulticastVaGemm:
@@ -230,21 +251,14 @@ def _wide_producer(
     latent_size: int,
     max_m: int,
     device: torch.device,
-) -> object:
+) -> _Producer:
     """Choose the producer for widths past the fused kernel's ceiling.
 
-    One producer today, and this is the only place a second one is chosen.
-    Every producer is called as
-    ``(hidden_states, weight_block, mailbox, multicast_ptr)`` and leaves this
-    rank's column block in every peer's mailbox, so a swap is this function
-    plus whatever the new producer needs to be constructed with.
-
-    The alternative this seam exists for is ``AdaptiveUpProjectionKernel`` in
-    ``thirdparty/cute_dsl/latent_moe_tail/fused_add_multicast_gemm.py``: a
-    tcgen05 persistent multicast GEMM that runs the tensor-core path at every
-    width with ``skinny_max_m=0`` and releases the gather early, which a
-    library GEMM gives no way to do. It owns the mailbox it publishes into, so
-    adopting it means the slot borrowing that mailbox rather than this one.
+    One producer today, and this is the only place a second one is chosen, so a
+    swap is this function plus whatever the new producer is constructed with.
+    The candidate is ``AdaptiveUpProjectionKernel`` in
+    ``fused_add_multicast_gemm.py``, not adopted because it owns the mailbox it
+    publishes into and the slot would have to borrow that one instead.
     """
     return _MulticastVaGemm(
         multicast_ptr=multicast_ptr,
@@ -573,7 +587,7 @@ class KimiK3LatentDownOp:
         rank = dist.get_rank(group)
         tp_size = dist.get_world_size(group)
         shard_dim = latent_size // tp_size
-        gemm_by_m: dict[int, object] = {
+        gemm_by_m: dict[int, _Producer] = {
             m: FusedMulticastLatentDownGemmKernel(
                 rank=rank,
                 tp_size=tp_size,
@@ -593,8 +607,8 @@ class KimiK3LatentDownOp:
                 device=device,
             )
             gemm_by_m.update({m: wide for m in range(_FUSED_MAX_M + 1, max_m + 1)})
-        gathers: dict[tuple[int, int], object] = {}
-        gather_by_m: dict[int, object] = {}
+        gathers: dict[tuple[int, int], _Gather] = {}
+        gather_by_m: dict[int, _Gather] = {}
         for m in range(1, max_m + 1):
             geometry = _lamport_geometry(m)
             if geometry not in gathers:
