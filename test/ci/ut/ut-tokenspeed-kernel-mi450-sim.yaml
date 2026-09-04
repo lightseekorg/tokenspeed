@@ -122,30 +122,6 @@ env:
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-explicit-bm128]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[prefill-default]
 
-    # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
-    # https://github.com/ROCm/rocm-systems/issues/10793
-    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_prefill_checkpoint_taps_and_fp8
-
-    # rocJITsu returns the wrong leading-sign-bit count from v_cls_i32, which
-    # corrupts int64-to-float conversion. These tests pack an int64 argmax index
-    # into a float32 buffer, so the index comes back off by up to 3:
-    # https://github.com/ROCm/rocm-systems/issues/10805
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_falls_back_when_cute_unavailable
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[16-151936]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[32-201088]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[4-200064]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[64-163840]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_under_cuda_graph
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_writes_into_caller_buffer
-
-    # rocJITsu truncates the bf16 result of v_fma_mixlo_bf16 instead of rounding
-    # to nearest even, so bf16 kernels land one ulp low on about half their
-    # outputs and no longer match an fp32 reference exactly:
-    # https://github.com/ROCm/rocm-systems/issues/10806
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_cuda_fallback
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_decode_append_defers_unmaterialized_pool
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_prefill_write_matches_reference
-    --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
