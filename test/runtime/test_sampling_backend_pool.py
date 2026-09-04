@@ -13,6 +13,7 @@ leaves a finished request's scalars live for its slot's next tenant.
 
 Tests below cover:
   * greedy backend opts out of pool state (prepare_step is a no-op).
+  * greedy verify outputs share one packed buffer for a single D2H copy.
   * flashinfer backend scatters temperature/top_k/top_p/seed on flip.
   * steady-state: same rid+slot across steps → no redundant _reset_slot.
   * slot recycle: slot reassigned to a new rid → _reset_slot fires.
@@ -130,6 +131,75 @@ class TestGreedyNoPoolState(unittest.TestCase):
             request_ids=["a", "b"],
             request_pool_indices=[999, -1],  # would fail bounds check otherwise
             sampling_params_list=[_sp("a"), _sp("b")],
+        )
+
+
+class TestGreedyPackedOutput(unittest.TestCase):
+    def setUp(self):
+        self.backend = GreedySamplingBackend(_make_config())
+        self.tokens = self.backend._predict_buf[:8]
+        self.lengths = self.backend._accept_length_buf[:2]
+        self.tokens.copy_(torch.arange(8, dtype=torch.int32, device="cuda"))
+        self.lengths.copy_(torch.tensor([2, 4], dtype=torch.int32, device="cuda"))
+
+    def test_verify_outputs_share_packed_storage(self):
+        storage_ptr = self.backend._output_pack_buf.untyped_storage().data_ptr()
+        self.assertEqual(self.tokens.untyped_storage().data_ptr(), storage_ptr)
+        self.assertEqual(self.lengths.untyped_storage().data_ptr(), storage_ptr)
+        self.assertEqual(
+            self.tokens.data_ptr(), self.backend._output_pack_buf.data_ptr()
+        )
+        self.assertEqual(
+            self.lengths.storage_offset(),
+            self.backend._predict_max,
+        )
+
+    def test_packed_output_d2h_returns_expected_cpu_views(self):
+        packed = self.backend.get_packed_output_d2h(self.tokens, self.lengths)
+        self.assertIsNotNone(packed)
+        packed_tokens, packed_lengths = packed
+        torch.cuda.synchronize()
+
+        self.assertTrue(packed_tokens.is_pinned())
+        self.assertTrue(packed_lengths.is_pinned())
+        torch.testing.assert_close(packed_tokens, torch.arange(8, dtype=torch.int32))
+        torch.testing.assert_close(
+            packed_lengths,
+            torch.tensor([2, 4], dtype=torch.int32),
+        )
+
+    def test_packed_output_d2h_rejects_foreign_output(self):
+        self.assertIsNone(
+            self.backend.get_packed_output_d2h(
+                self.backend._sample_token_buf[:2],
+                self.backend._ones_buf[:2],
+            )
+        )
+        self.assertIsNone(
+            self.backend.get_packed_output_d2h(self.tokens, self.lengths.clone())
+        )
+
+    def test_packed_output_matches_two_copy_fallback(self):
+        packed = self.backend.get_packed_output_d2h(self.tokens, self.lengths)
+        self.assertIsNotNone(packed)
+        fallback = (
+            self.tokens.to("cpu", non_blocking=True),
+            self.lengths.to("cpu", non_blocking=True),
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(packed[0], fallback[0])
+        torch.testing.assert_close(packed[1], fallback[1])
+
+    def test_clamp_preserves_packed_output_alias(self):
+        self.tokens[0] = -1
+        self.tokens[-1] = VOCAB
+        data_ptr = self.tokens.data_ptr()
+        self.tokens.clamp_(0, VOCAB - 1)
+
+        self.assertEqual(self.tokens.data_ptr(), data_ptr)
+        self.assertIsNotNone(
+            self.backend.get_packed_output_d2h(self.tokens, self.lengths)
         )
 
 
