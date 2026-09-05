@@ -96,6 +96,23 @@ SHAPE_SETS = {
         ],
         list(range(1, 33)),
     ),
+    # Kimi-K3 DFlash2 block drafter at TP8. The five draft layers run
+    # M = batch * 8 and the selector and head run M = batch * 7, so the
+    # served M reaches well past the 32 the other sets stop at.
+    "k3_dflash2_tp8": (
+        [
+            (1792, 7168, 10, "conv_kernel_proj"),
+            (2112, 7168, 0, "fused_qkv_a"),
+            (1536, 1536, 5, "q_b_proj"),
+            (7168, 1024, 5, "o_proj"),
+            (3584, 7168, 5, "gate_up_proj"),
+            (7168, 1792, 5, "down_proj"),
+            (256, 7168, 1, "selector_hidden_proj"),
+            (7168, 35840, 1, "context_fc"),
+            (20480, 7168, 1, "lm_head"),
+        ],
+        list(range(1, 9)) + [16, 24, 32, 40, 64],
+    ),
     "qwen38_next_tp2": (
         [
             (512, 2560, 0, "n512_k2560"),
