@@ -8,13 +8,14 @@ triggers:
   - debug
 runner:
   labels:
-    - amd-mi450-sim
+    - amd-mi45x-cpu-test
 env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
   MI450_SIM_RUN_TIMEOUT: "3600"
-  MI450_SIM_WORKERS: "6"
+  # A ceiling on concurrent simulators. A simulator takes two CPU threads.
+  MI450_SIM_WORKERS: "16"
   TEST_DESELECTS: |
     # Iris symmetric heaps require physical KFD/ARSMI peer topology. rocJITsu
     # provides compute emulation only, so keep these tests enabled on hardware.
