@@ -374,7 +374,6 @@ def _launch_kernel(
     grid_m_for_swizzle = num_tiles_total // grid_n
     auto_group_m, auto_xcd = _autotune_pid_swizzle(
         num_tiles_total=num_tiles_total,
-        grid_n=grid_n,
         grid_m_padded=grid_m_for_swizzle,
         block_m=block_m,
     )

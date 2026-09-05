@@ -26,8 +26,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 _HIDDEN = gl.constexpr(7168)
-_ROUTER = gl.constexpr(896)
-_LATENT = gl.constexpr(3584)
 _SHARED = gl.constexpr(768)
 _ROUTER_BLOCK_N = gl.constexpr(4)
 _LATENT_BLOCK_N = gl.constexpr(16)
