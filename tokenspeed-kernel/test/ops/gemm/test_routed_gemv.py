@@ -379,8 +379,18 @@ def test_measured_route_source_has_no_duplicate_keys():
         cfg_dupes = [k for k, n in collections.Counter(cfg_keys).items() if n > 1]
         assert not cfg_dupes, f"duplicate {name} keys in source: {cfg_dupes}"
         assert len(table) == len(cfg_keys), name
-    # Exact-M keying: entries may only exist in the gap-free swept range.
-    assert all(m <= 32 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+    # Exact-M keying: entries may only exist in the gap-free swept range. The
+    # bound is the widest M any routed backend serves, which the split-K
+    # tactics carry to 64; nothing above that has been swept.
+    assert all(m <= 64 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+    for name, table in (
+        ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
+        ("SPLITK_TACTIC_ROUTE", routed_gemv.SPLITK_TACTIC_ROUTE),
+    ):
+        start = src.index(f"{name}: MappingProxyType")
+        span = src[start : src.index(")", src.index("}", start))]
+        cfg_keys = re.findall(r"\((\d+), (\d+), (\d+)\): \(", span)
+        assert len(table) == len(cfg_keys), name
 
 
 def test_skinny_config_route_entries_are_valid():
@@ -399,6 +409,145 @@ def test_skinny_config_route_entries_are_valid():
         assert tuned[0] % 32 == 0, (m, n, k)
         config = SkinnyGemmConfig(m, *tuned)
         assert shape_dynamic_skinny_gemm.supports(config, m, n, k), (m, n, k)
+
+
+# What each FlashInfer BF16 backend does here, per PDL setting: None when it
+# runs, else the substring its refusal must carry. The route's candidate set
+# rests on this. A sweep that catches every exception and scores it as "no
+# result" cannot tell "this backend lost" from "this backend was never asked
+# properly" -- which is how three of these were missed: they reject pdl=True
+# outright rather than ignoring it.
+_BF16_BACKEND_SUPPORT = {
+    "cudnn": {True: None, False: None},
+    "tgv": {True: None, False: None},
+    "tinygemm": {True: None, False: None},
+    "cute-dsl": {True: None, False: None},
+    "cutlass": {True: "does not support PDL", False: None},
+    "cublaslt": {True: "does not support PDL", False: None},
+    "cutile": {True: "ignores `pdl`", False: "No valid config found"},
+}
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("backend", sorted(_BF16_BACKEND_SUPPORT))
+def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
+    """Pin the candidate set the measured tables were chosen from.
+
+    A wheel that makes a refused backend work, or breaks one that worked, moves
+    the set the tuner should have searched -- and neither shows up as a wrong
+    answer anywhere, only as a table that is quietly no longer the best pick.
+    """
+    from flashinfer import mm_bf16
+
+    m, n, k = 8, 1792, 7168  # a real draft projection
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ w.float().t()
+    for pdl, refusal in _BF16_BACKEND_SUPPORT[backend].items():
+        try:
+            got = mm_bf16(x, w.t(), pdl=pdl, backend=backend)
+        except Exception as exc:  # noqa: BLE001  (any refusal is the signal)
+            assert refusal is not None, (
+                f"{backend} pdl={pdl} was usable when the tables were tuned and "
+                f"now raises {exc!r}; re-run test/gemm_tuning/tune_route.py"
+            )
+            assert refusal in str(
+                exc
+            ), f"{backend} pdl={pdl} refuses for a new reason: {exc!r}"
+            continue
+        assert refusal is None, (
+            f"{backend} pdl={pdl} now runs but was excluded from the sweep; "
+            f"re-run test/gemm_tuning/tune_route.py -- it may win a shape"
+        )
+        rel = (got.float() - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 0.02, f"{backend} pdl={pdl} rel err {rel:.4f}"
+
+
+def test_splitk_tactic_route_entries_are_valid():
+    """Every measured tactic must target a shape the route sends to splitk and
+    be one the vendor kernel accepts; a typo would silently fall back."""
+    from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
+    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
+
+    if not flashinfer_splitk.is_available():
+        pytest.skip("flashinfer split-K BF16 GEMM is not the measured build")
+    for (m, n, k), tactic in SPLITK_TACTIC_ROUTE.items():
+        assert MEASURED_ROUTE.get((m, n, k)) == "splitk", (m, n, k)
+        assert flashinfer_splitk.supports(m, n, k, tactic), (m, n, k)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("m", [33, 47, 64])
+def test_splitk_serves_m_past_the_vendor_cutover(m):
+    """What the table above M == 32 rests on.
+
+    Public M rides the kernel's MMA-N axis, so the vendor's cutover is a
+    heuristic rather than a contract and M is tiled, not truncated. A kernel
+    that computed only the first tile would leave whole rows zero.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
+
+    if not flashinfer_splitk.is_available():
+        pytest.skip("flashinfer split-K BF16 GEMM is not the measured build")
+    torch.manual_seed(0)
+    n, k, tactic = 1792, 7168, (64, 32, 2, 9)
+    assert flashinfer_splitk.supports(m, n, k, tactic)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+    flashinfer_splitk.splitk_mm(x, w, tactic, out)
+    ref = x.float() @ w.float().t()
+    assert int((out.abs().sum(dim=1) == 0).sum()) == 0
+    assert (out.float() - ref).abs().max() / ref.abs().max() < 0.02
+
+
+def _splitk_cases():
+    from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
+
+    return sorted(SPLITK_TACTIC_ROUTE)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("shape", _splitk_cases())
+def test_splitk_captures_and_replays(shape):
+    """The drafter runs entirely inside a CUDA graph, so a routed backend that
+    cannot be captured would silently fall back there and nowhere else -- and
+    the fallback is correct, so nothing else in the suite would notice."""
+    m, n, k = shape
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    decode_gemv(x, w, out=out)  # warm
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        decode_gemv(x, w, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    from tokenspeed_kernel.ops.gemm import routed_gemv as route
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        decode_gemv(x, w, out=out)
+    # Warming happens eagerly only, so the capture must have found it already
+    # warm rather than marking it warm from inside.
+    assert ("splitk", x.device.index or 0, m, n, k) in route._warmed
+    # Poisoned output and fresh input: only a replay that really runs passes.
+    x.copy_(torch.randn_like(x))
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(out.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 
 def test_skinny_config_prefers_the_measured_table_over_the_heuristic():

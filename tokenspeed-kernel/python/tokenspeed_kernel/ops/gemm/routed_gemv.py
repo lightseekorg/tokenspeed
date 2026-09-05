@@ -188,7 +188,7 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (5, 1536, 1536): "ll_bf16",  # 2.46 vs skinny 3.12 us (1.26x)
         (6, 1536, 1536): "ll_bf16",  # 2.49 vs skinny 3.27 us (1.31x)
         (7, 1536, 1536): "ll_bf16",  # 2.50 vs skinny 3.47 us (1.39x)
-        (8, 1536, 1536): "ll_bf16",  # 2.53 vs tgv 2.87 us (1.13x)
+        (8, 1536, 1536): "splitk",  # 1.98 vs ll_bf16 2.54 us (1.28x)
         (1, 7168, 1024): "tgv",  # 1.24x
         (2, 7168, 1024): "tgv",  # 1.16x
         (3, 7168, 1024): "tgv",  # 1.15x
@@ -574,10 +574,10 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (5, 1792, 7168): "ll_bf16",  # 5.63 vs 7.75 us (1.38x)
         (6, 1792, 7168): "ll_bf16",  # 5.66 vs 7.77 us (1.37x)
         (7, 1792, 7168): "ll_bf16",  # 5.67 vs 7.79 us (1.38x)
-        (8, 1792, 7168): "ll_bf16",  # 5.69 vs 7.79 us (1.37x)
-        (16, 1792, 7168): "ll_bf16",  # 6.96 vs 7.92 us (1.14x)
+        (8, 1792, 7168): "splitk",  # 5.30 vs ll_bf16 5.70 us (1.08x)
+        (16, 1792, 7168): "splitk",  # 5.47 vs ll_bf16 6.97 us (1.27x)
         (24, 1792, 7168): "ll_bf16",  # 6.67 vs 8.62 us (1.29x)
-        (32, 1792, 7168): "ll_bf16",  # 6.78 vs 9.54 us (1.41x)
+        (32, 1792, 7168): "splitk",  # 6.37 vs ll_bf16 6.81 us (1.07x)
         (2, 256, 7168): "ll_bf16",  # 3.14 vs 4.40 us (1.40x)
         (3, 256, 7168): "ll_bf16",  # 3.13 vs 4.49 us (1.44x)
         (4, 256, 7168): "ll_bf16",  # 3.12 vs 4.58 us (1.47x)
@@ -585,6 +585,10 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (6, 256, 7168): "ll_bf16",  # 2.98 vs 4.43 us (1.49x)
         (7, 256, 7168): "ll_bf16",  # 3.15 vs 4.64 us (1.47x)
         (8, 256, 7168): "ll_bf16",  # 3.12 vs 4.60 us (1.47x)
+        # The selector runs M = batch * (block width - 1), so its served M is
+        # 7/14/28/56 -- not the batch * 8 the rest of the draft keys on.
+        (14, 256, 7168): "ll_bf16",  # 3.08 vs 4.70 us (1.53x)
+        (28, 256, 7168): "ll_bf16",  # 3.27 vs 4.76 us (1.46x)
         (16, 256, 7168): "ll_bf16",  # 3.08 vs 4.62 us (1.50x)
         (24, 256, 7168): "ll_bf16",  # 3.25 vs 4.64 us (1.43x)
         (32, 256, 7168): "ll_bf16",  # 3.28 vs 4.73 us (1.44x)
@@ -593,11 +597,22 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (5, 7168, 1792): "tgv",  # 5.28 vs 5.83 us (1.10x)
         (6, 7168, 1792): "tgv",  # 5.34 vs 5.69 us (1.07x)
         (7, 7168, 1792): "tgv",  # 5.34 vs 5.83 us (1.09x)
-        (8, 7168, 1792): "tgv",  # 5.32 vs 5.82 us (1.09x)
+        (8, 7168, 1792): "splitk",  # 4.98 vs tgv 5.33 us (1.07x)
         (16, 3584, 7168): "ll_bf16",  # 9.25 vs 11.60 us (1.25x)
         (24, 3584, 7168): "ll_bf16",  # 9.76 vs 12.53 us (1.28x)
         (32, 3584, 7168): "ll_bf16",  # 9.83 vs 11.82 us (1.20x)
         (24, 1536, 1536): "tgv",  # 2.78 vs 3.01 us (1.08x)
+        # DFlash2 draft at TP8 on the measured split-K tactic; the tactics
+        # themselves are in SPLITK_TACTIC_ROUTE.
+        (56, 256, 7168): "splitk",  # 3.69 vs 5.72 us (1.55x)
+        (64, 1792, 7168): "splitk",  # 7.42 vs 9.22 us (1.24x)
+        (64, 3584, 7168): "splitk",  # 11.94 vs 12.83 us (1.08x)
+        (16, 1536, 1536): "splitk",  # 2.38 vs tgv 2.90 us (1.22x)
+        (32, 1536, 1536): "splitk",  # 2.75 vs 3.02 us (1.10x)
+        (16, 7168, 1024): "splitk",  # 3.78 vs 4.34 us (1.15x)
+        (32, 7168, 1024): "splitk",  # 4.01 vs 4.51 us (1.12x)
+        (16, 7168, 1792): "splitk",  # 5.01 vs 5.76 us (1.15x)
+        (32, 7168, 1792): "splitk",  # 5.52 vs 6.36 us (1.15x)
     }
 )
 
@@ -656,6 +671,38 @@ SKINNY_CONFIG_ROUTE: MappingProxyType[
         (2, 320, 2560): (160, 2, 1, 16),
         (5, 1536, 7168): (224, 2, 1, 16),
         (6, 1536, 7168): (64, 2, 1, 16),
+    }
+)
+
+
+# Measured (m, n, k) -> (mma_m, mma_n, split_k, ab_stages) for the split-K
+# BF16 kernel. FlashInfer picks these from a generic occupancy heuristic and
+# stops at M == 32; a block drafter's projections are cold-weight and
+# grid-starved, and its M is batch times block width. Same rule as
+# MEASURED_ROUTE: an entry exists only where it beat what serving could
+# already reach by 4%. ``test/gemm_tuning/tune_splitk_tactic.py`` reproduces it.
+SPLITK_TACTIC_ROUTE: MappingProxyType[
+    tuple[int, int, int], tuple[int, int, int, int]
+] = MappingProxyType(
+    {
+        # DFlash2 draft at TP8, M = batch * 8. Left out on purpose:
+        # 2112x7168 is also the K3 target's replicated latent projection and
+        # already runs a dedicated fused kernel, and 20480x7168 is the head,
+        # whose call site is a bare matmul the router never sees.
+        (8, 1536, 1536): (64, 8, 4, 12),  # 1.98 vs ll_bf16 2.54 us (1.28x)
+        (16, 1536, 1536): (64, 16, 3, 10),  # 2.38 vs tgv 2.90 us (1.22x)
+        (32, 1536, 1536): (64, 16, 2, 11),  # 2.75 vs 3.02 us (1.10x)
+        (56, 256, 7168): (64, 16, 4, 10),  # 3.69 vs 5.72 us (1.55x)
+        (8, 1792, 7168): (64, 8, 4, 12),  # 5.30 vs 5.70 us (1.08x)
+        (16, 1792, 7168): (64, 16, 4, 10),  # 5.47 vs 6.97 us (1.27x)
+        (32, 1792, 7168): (64, 32, 4, 8),  # 6.37 vs 6.81 us (1.07x)
+        (64, 1792, 7168): (64, 32, 2, 9),  # 7.42 vs 9.22 us (1.24x)
+        (64, 3584, 7168): (64, 32, 1, 9),  # 11.94 vs 12.83 us (1.08x)
+        (16, 7168, 1024): (128, 16, 1, 6),  # 3.78 vs 4.34 us (1.15x)
+        (32, 7168, 1024): (64, 32, 1, 9),  # 4.01 vs 4.51 us (1.12x)
+        (8, 7168, 1792): (64, 16, 1, 11),  # 4.98 vs tgv 5.33 us (1.07x)
+        (16, 7168, 1792): (64, 16, 1, 11),  # 5.01 vs 5.76 us (1.15x)
+        (32, 7168, 1792): (64, 32, 1, 9),  # 5.52 vs 6.36 us (1.15x)
     }
 )
 
@@ -775,6 +822,40 @@ def tgv_gemv(
         out=out,
     )
     _mark_warmed("tgv", dev, m, n, k)
+    return result
+
+
+def splitk_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` via the split-K BF16 GEMM on its measured tactic.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous bf16 weight.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    tactic = SPLITK_TACTIC_ROUTE.get((m, n, k))
+    if (
+        tactic is None
+        or x.dtype != torch.bfloat16
+        or not flashinfer_splitk.is_available()
+        or not _usable_in_capture("splitk", dev, m, n, k)
+        or not flashinfer_splitk.supports(m, n, k, tactic)
+    ):
+        return _torch_decode_gemv(x, weight, out)
+    result = flashinfer_splitk.splitk_mm(
+        x, weight, tactic, out, enable_pdl=pdl_enabled()
+    )
+    _mark_warmed("splitk", dev, m, n, k)
     return result
 
 
@@ -948,13 +1029,18 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv, "ll_bf16": ll_bf16_gemv}
+    impls = {
+        "skinny": skinny_gemv,
+        "tgv": tgv_gemv,
+        "ll_bf16": ll_bf16_gemv,
+        "splitk": splitk_gemv,
+    }
     for (m, n, k), backend in MEASURED_ROUTE.items():
         register_kernel(
             "gemm",
             "decode_gemv",
             name=f"{backend}_gemv_m{m}_n{n}_k{k}",
-            solution="flashinfer" if backend == "tgv" else "cute_dsl",
+            solution="flashinfer" if backend in ("tgv", "splitk") else "cute_dsl",
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
             traits={
