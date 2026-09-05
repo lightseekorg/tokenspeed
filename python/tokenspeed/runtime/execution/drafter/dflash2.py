@@ -136,6 +136,14 @@ class DFlash2(DFlash):
         ):
             return
         num_org = int(shard.num_org_elements)
+        if int(self.model.config.vocab_size) > 2**24:
+            logger.info(
+                "DFlash2 distributed top-k disabled: a token id in a "
+                "%d-token vocabulary is not exact in the fp32 the packed "
+                "all-gather carries it in.",
+                int(self.model.config.vocab_size),
+            )
+            return
         if (
             int(shard.num_added_elements) != 0
             or int(shard.num_org_elements_padded) != num_org
@@ -152,25 +160,27 @@ class DFlash2(DFlash):
         self._distributed_topk_enabled = True
 
     def _ensure_candidate_gather_buffers(
-        self, values: torch.Tensor, ids: torch.Tensor
+        self, rows: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resident all-gather landing pads, sized for a full decode block."""
-        rows = int(self.input_buffers.max_bs) * max(self.spec_num_tokens - 1, 1)
-        capacity = int(self.candidate_logits_processor.tp_size) * rows
+        """Resident staging and landing pad for one packed all-gather.
+
+        Values and ids ride the same fp32 rows, so a step pays one collective
+        rather than two. ``_init_distributed_topk`` checks the vocabulary is
+        small enough for an id to be exact in fp32.
+        """
+        capacity = int(self.input_buffers.max_bs) * max(self.spec_num_tokens - 1, 1)
+        tp_size = int(self.candidate_logits_processor.tp_size)
+        width = 2 * self.selector_top_k
         buffers = self._candidate_gather_buffers
-        if (
-            buffers is None
-            or buffers[0].dtype != values.dtype
-            or buffers[1].dtype != ids.dtype
-            or buffers[0].device != values.device
-        ):
+        if buffers is None or buffers[0].device != device:
             buffers = (
-                values.new_empty((capacity, self.selector_top_k)),
-                ids.new_empty((capacity, self.selector_top_k)),
+                torch.empty((capacity, width), dtype=torch.float32, device=device),
+                torch.empty(
+                    (tp_size * capacity, width), dtype=torch.float32, device=device
+                ),
             )
             self._candidate_gather_buffers = buffers
-        needed = int(values.shape[0]) * int(self.candidate_logits_processor.tp_size)
-        return buffers[0][:needed], buffers[1][:needed]
+        return buffers[0][:rows], buffers[1][: rows * tp_size]
 
     def _distributed_topk_candidates(
         self, hidden_states: torch.Tensor
@@ -188,39 +198,32 @@ class DFlash2(DFlash):
         if processor.logit_scale is not None:
             logits.mul_(processor.logit_scale)
         values, ids = torch.topk(logits, top_k, dim=-1, sorted=False)
-        # Keep the int64 ids the whole-gather path returns: everything
-        # downstream indexes codebooks with them.
-        ids = ids + int(shard.org_vocab_start_index)
 
         tp_size = int(processor.tp_size)
         rows = int(values.shape[0])
-        gathered_values, gathered_ids = self._ensure_candidate_gather_buffers(
-            values, ids
-        )
-        all_gather_into_tensor(gathered_values, values.contiguous(), processor.tp_group)
-        all_gather_into_tensor(gathered_ids, ids.contiguous(), processor.tp_group)
+        staged, gathered = self._ensure_candidate_gather_buffers(rows, values.device)
+        staged[:, :top_k].copy_(values)
+        staged[:, top_k:].copy_(ids)
+        staged[:, top_k:].add_(float(shard.org_vocab_start_index))
+        all_gather_into_tensor(gathered, staged, processor.tp_group)
 
         # Rank-major to row-major, so one row's candidates from every rank sit
-        # side by side for the final selection.
-        gathered_values = (
-            gathered_values.view(tp_size, rows, top_k)
-            .transpose(0, 1)
-            .reshape(rows, tp_size * top_k)
-        )
-        gathered_ids = (
-            gathered_ids.view(tp_size, rows, top_k)
-            .transpose(0, 1)
-            .reshape(rows, tp_size * top_k)
+        # side by side for the final selection, values and ids each on a plane.
+        planes = (
+            gathered.view(tp_size, rows, 2, top_k)
+            .permute(1, 2, 0, 3)
+            .reshape(rows, 2, tp_size * top_k)
         )
         # Sorted, so the surviving candidate order does not depend on which
         # rank happened to contribute a value.
-        unary_logits, lanes = torch.topk(gathered_values, top_k, dim=-1, sorted=True)
-        candidate_ids = torch.gather(gathered_ids, 1, lanes)
+        unary_logits, lanes = torch.topk(planes[:, 0], top_k, dim=-1, sorted=True)
+        # Everything downstream indexes codebooks with these.
+        candidate_ids = torch.gather(planes[:, 1], 1, lanes).to(torch.int64)
         if processor.final_logit_softcapping:
             # Monotone in the logit, so it changes the scores the selector sees
             # but never which candidates got here.
             fused_softcap_generic(unary_logits, processor.final_logit_softcapping)
-        return candidate_ids, unary_logits.float()
+        return candidate_ids, unary_logits
 
     def _compute_candidates(
         self, hidden_states: torch.Tensor

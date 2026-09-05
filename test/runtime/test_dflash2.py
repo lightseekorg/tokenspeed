@@ -496,18 +496,25 @@ def test_distributed_topk_picks_what_a_whole_vocabulary_topk_would(monkeypatch) 
         tp_size=tp_size, tp_group=None, logit_scale=None, final_logit_softcapping=None
     )
 
-    # Stand in for rank 1: its own shard-local top-k, ids already global.
+    # Stand in for rank 1: its own shard-local top-k, packed as this rank
+    # packs its own -- values then global ids, one fp32 row.
     peer = torch.matmul(hidden_states, weight[shard:].T)
     peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
-    peer_ids = peer_ids + shard
+    peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
+
+    calls = []
 
     def fake_all_gather(out, src, group):
+        calls.append(src.shape)
         out[: src.shape[0]].copy_(src)
-        out[src.shape[0] :].copy_(peer_ids if src.dtype == torch.int64 else peer_values)
+        out[src.shape[0] :].copy_(peer_packed)
 
     monkeypatch.setattr(dflash2_runtime, "all_gather_into_tensor", fake_all_gather)
     candidate_ids, unary_logits = drafter._distributed_topk_candidates(hidden_states)
 
     expected = torch.topk(torch.matmul(hidden_states, weight.T), top_k, dim=-1)
+    assert candidate_ids.dtype == torch.int64
     assert candidate_ids.tolist() == expected.indices.tolist()
     torch.testing.assert_close(unary_logits, expected.values.float())
+    # One collective carrying both halves, not one per half.
+    assert calls == [(rows, 2 * top_k)]
