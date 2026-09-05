@@ -185,7 +185,6 @@ def _mla_extend_fwd_kernel(
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    # gl.device_print("cur_batch_query_len", cur_batch_query_len)
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
 
