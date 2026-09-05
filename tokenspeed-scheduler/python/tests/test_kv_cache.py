@@ -353,3 +353,19 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     _finish(scheduler, "a")
     scheduler.next_execution_plan()
     assert scheduler.available_kv_pages() == before
+
+
+def test_l3_storage_prefix_hash_and_register_bindings() -> None:
+    cfg = _make_config()
+    cfg.disable_l2_cache = False
+    cfg.num_host_pages = 32
+    cfg.enable_l3_storage = True
+    cfg.disable_prefix_cache = False
+    scheduler = ts.Scheduler(cfg)
+    assert hasattr(scheduler, "prefix_hashes_for_tokens")
+    hashes = scheduler.prefix_hashes_for_tokens([1, 2, 3, 4, 5])
+    assert hashes
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    assert group_ids
+    assert len(group_ids) == len(expanded) == len(offsets)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)

@@ -178,6 +178,7 @@ jobs:
       matrix: ${{ needs.scan.outputs.model_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+      timeout_minutes: 90
     secrets: inherit
 
   model-test-eager:

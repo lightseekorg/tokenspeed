@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import NamedTuple
 
 import psutil
@@ -39,6 +40,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
+from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
@@ -76,6 +78,7 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
+    backup_pages: list[StoragePage] = []
 
 
 def _num_host_lcm_blocks(
@@ -106,6 +109,9 @@ class L2CacheExecutor:
         host_size_gb: float,
         io_backend: str,
         attn_tp_rank: int = 0,
+        storage_backend=None,
+        storage_key_prefix: str = "",
+        storage_rank: int = 0,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -144,6 +150,13 @@ class L2CacheExecutor:
             self.layout,
             num_host_lcm_blocks=host_lcm_blocks,
         )
+        self.l3_store = None
+        if storage_backend is not None:
+            self.attach_l3_storage(
+                storage_backend,
+                key_prefix=storage_key_prefix,
+                rank=storage_rank,
+            )
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(
@@ -193,6 +206,32 @@ class L2CacheExecutor:
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
         self._ready_load_op_ids: list[int] = []
+        self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
+        self._l3_workers: ThreadPoolExecutor | None = None
+
+    def attach_l3_storage(
+        self,
+        storage_backend,
+        *,
+        key_prefix: str,
+        rank: int,
+    ) -> None:
+        """Bind an L3 backend to the compact Host buffer after allocation.
+
+        Mooncake Store must ``register_buffer`` against the pinned Host L2
+        allocation, so the backend is constructed after ``HostCacheStorage``.
+        """
+
+        if self.l3_store is not None:
+            raise RuntimeError("L3 storage backend is already attached")
+        if storage_backend is None:
+            raise ValueError("storage_backend is required")
+        self.l3_store = L3HostStore(
+            storage_backend,
+            self.host_storage,
+            key_prefix=key_prefix,
+            rank=rank,
+        )
 
     def submit_write_backs(self, plan) -> None:
         """Enqueue the plan's D2H snapshot copies on the current stream.
@@ -203,6 +242,7 @@ class L2CacheExecutor:
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
+        write_pages: list[StoragePage] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_transfers(
@@ -214,12 +254,16 @@ class L2CacheExecutor:
                     transfers=transfers,
                     source_is_device=True,
                 )
-        self._start_writing(op_ids, transfers)
+                write_pages.extend(
+                    self._storage_pages(operation, host_is_destination=True)
+                )
+        self._start_writing(op_ids, transfers, write_pages)
 
     def submit_load_backs(self, plan) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing."""
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
+        prefetch_pages: list[StoragePage] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.LoadBackOp):
                 self._append_transfers(
@@ -231,6 +275,15 @@ class L2CacheExecutor:
                     transfers=transfers,
                     source_is_device=False,
                 )
+                prefetch_pages.extend(
+                    self._storage_pages(
+                        operation,
+                        host_is_destination=False,
+                        prefetch_only=True,
+                    )
+                )
+        if prefetch_pages:
+            self._prefetch_from_storage(prefetch_pages)
         load_index = self._start_loading(op_ids, transfers)
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
@@ -261,6 +314,62 @@ class L2CacheExecutor:
                     (source, destination) if source_is_device else (destination, source)
                 )
                 transfers.append((int(group), int(device_block_id), int(host_block_id)))
+
+    @staticmethod
+    def _storage_pages(
+        operation,
+        *,
+        host_is_destination: bool,
+        prefetch_only: bool = False,
+    ) -> list[StoragePage]:
+        hashes = getattr(operation, "content_hashes", None)
+        offsets = getattr(operation, "page_offsets", None)
+        if not hashes or not offsets:
+            return []
+        host_pages = operation.dst_pages if host_is_destination else operation.src_pages
+        prefetch_flags = getattr(operation, "prefetch_from_storage", None)
+        pages: list[StoragePage] = []
+        for groups, hosts, hash_row, offset_row, flags in zip(
+            operation.group_ids,
+            host_pages,
+            hashes,
+            offsets,
+            prefetch_flags or [None] * len(hashes),
+        ):
+            flag_row = flags if flags is not None else [1] * len(groups)
+            for group, host_page, content_hash, page_offset, flag in zip(
+                groups, hosts, hash_row, offset_row, flag_row
+            ):
+                if prefetch_only and int(flag) == 0:
+                    continue
+                if not content_hash:
+                    continue
+                pages.append(
+                    (int(group), int(host_page), str(content_hash), int(page_offset))
+                )
+        return pages
+
+    def _prefetch_from_storage(self, pages: Sequence[StoragePage]) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is None:
+            raise RuntimeError(
+                "LoadBack requested L3 prefetch but no storage backend is configured"
+            )
+        results = l3_store.prefetch(pages)
+        if not all(results):
+            missed = [page for page, ok in zip(pages, results) if not ok]
+            raise RuntimeError(f"L3 prefetch failed for {len(missed)} Host page(s)")
+
+    def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is None:
+            return None
+        return l3_store.exists(pages)
+
+    def rotate_l3_namespace(self) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is not None:
+            l3_store.rotate_namespace()
 
     def _transfer_ranges(
         self,
@@ -301,11 +410,14 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
+        backup_pages: Sequence[StoragePage] | None = None,
     ) -> None:
         if not op_ids:
             return
         op_ids = _ordered_unique(op_ids)
+        backup_pages = list(backup_pages or ())
         if not transfers:
+            self._backup_to_storage(backup_pages)
             with self._ack_lock:
                 self._ready_write_op_ids.extend(op_ids)
             return
@@ -337,7 +449,7 @@ class L2CacheExecutor:
         finish = device_module.Event()
         finish.record(stream)
         with self._ack_lock:
-            self._write_acks.append(_Ack(finish, op_ids))
+            self._write_acks.append(_Ack(finish, op_ids, backup_pages))
 
     def _start_loading(
         self,
@@ -450,11 +562,76 @@ class L2CacheExecutor:
             self._ready_write_op_ids.clear()
             results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
             self._ready_load_op_ids.clear()
-            self._write_acks[:] = self._drain(
-                self._write_acks, self._write_done, results
-            )
+            ready_writes, self._write_acks[:] = self._split_ready(self._write_acks)
             self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
+        for ack in ready_writes:
+            self._complete_or_queue_write(ack, results)
+        self._collect_finished_backups(results)
         return results
+
+    def _complete_or_queue_write(self, ack: _Ack, results: list) -> None:
+        if not ack.backup_pages or getattr(self, "l3_store", None) is None:
+            results.extend(self._write_done(op_id) for op_id in ack.op_ids)
+            return
+        workers = self._l3_workers
+        if workers is None:
+            workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="l3-backup")
+            self._l3_workers = workers
+        future = workers.submit(self._backup_to_storage, list(ack.backup_pages))
+        with self._ack_lock:
+            self._backup_futures.append(
+                (future, list(ack.op_ids), list(ack.backup_pages))
+            )
+
+    def _collect_finished_backups(self, results: list) -> None:
+        with self._ack_lock:
+            inflight = list(getattr(self, "_backup_futures", ()))
+            self._backup_futures = []
+        still: list[tuple[Future, list[int], list[StoragePage]]] = []
+        error = None
+        for future, op_ids, pages in inflight:
+            if error is not None or not future.done():
+                still.append((future, op_ids, pages))
+                continue
+            failed = future.exception()
+            if failed is not None:
+                workers = getattr(self, "_l3_workers", None)
+                if workers is not None:
+                    still.append(
+                        (workers.submit(self._backup_to_storage, pages), op_ids, pages)
+                    )
+                else:
+                    still.append((future, op_ids, pages))
+                error = failed
+                continue
+            future.result()
+            results.extend(self._write_done(op_id) for op_id in op_ids)
+        with self._ack_lock:
+            self._backup_futures.extend(still)
+        if error is not None:
+            raise error
+
+    def _backup_to_storage(self, pages: Sequence[StoragePage]) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if not pages or l3_store is None:
+            return
+        results = l3_store.backup(pages)
+        if len(results) != len(pages) or not all(results):
+            ok = sum(1 for flag in results if flag)
+            raise RuntimeError(
+                f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
+            )
+
+    @staticmethod
+    def _split_ready(queue):
+        ready = []
+        pending = []
+        for ack in queue:
+            if ack.finish_event.query():
+                ready.append(ack)
+            else:
+                pending.append(ack)
+        return ready, pending
 
     @staticmethod
     def _drain(queue, done, results):
@@ -483,6 +660,24 @@ class L2CacheExecutor:
         # thread's handle reaches them); only loads have their own stream.
         torch.cuda.current_stream().synchronize()
         self.load_stream.synchronize()
+        with self._ack_lock:
+            pending_writes = list(self._write_acks)
+            self._write_acks.clear()
+            inflight = list(getattr(self, "_backup_futures", ()))
+            self._backup_futures = []
+        # Synchronization above makes every D2H snapshot complete. Persist the
+        # final batch before closing L3; otherwise a clean process shutdown can
+        # acknowledge work in memory and silently lose the remote object.
+        for ack in pending_writes:
+            self._backup_to_storage(ack.backup_pages)
+        for future, _op_ids, _pages in inflight:
+            future.result()
+        workers = getattr(self, "_l3_workers", None)
+        if workers is not None:
+            workers.shutdown(wait=True)
+            self._l3_workers = None
+        if getattr(self, "l3_store", None) is not None:
+            self.l3_store.close()
 
     def reset(self) -> None:
         self.shutdown()

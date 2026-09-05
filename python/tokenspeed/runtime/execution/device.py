@@ -432,6 +432,36 @@ class DeviceHandle:
         )
         return l2.poll_results()
 
+    def query_l3_storage(self, pages) -> list[bool] | None:
+        """Probe immutable L3 objects without exposing the Host-cache tier."""
+
+        l2 = self._l2
+        if l2 is None:
+            return None
+        return l2.l3_exists(pages)
+
+    def rotate_l3_namespace(self) -> None:
+        """Invalidate this process's view of objects published before clear."""
+
+        if self._l2 is not None:
+            self._l2.rotate_l3_namespace()
+
+    def shutdown_cache(self) -> None:
+        """Join queued cache submissions, then close L2/L3 on the data plane."""
+
+        if self._l2 is None:
+            return
+        errors = []
+        while self._l2_submissions:
+            future = self._l2_submissions.popleft()
+            try:
+                future.result()
+            except BaseException as exc:  # noqa: BLE001 — surface after close
+                errors.append(exc)
+        self._thread.run(self._l2.shutdown)
+        if errors:
+            raise errors[0]
+
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
 
@@ -741,11 +771,6 @@ def build_device_side(
 
     l2_cache_executor = None
     if server_args.enable_kvstore:
-        if server_args.kvstore_storage_backend is not None:
-            raise NotImplementedError(
-                "the cache-group scheduler has no L3 storage tier; unset "
-                "--kvstore-storage-backend"
-            )
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(
@@ -754,7 +779,47 @@ def build_device_side(
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             io_backend=server_args.kvstore_io_backend,
+            attn_tp_rank=attn_tp_rank,
         )
+        if server_args.kvstore_storage_backend is not None:
+            from tokenspeed.runtime.cache.l3.backend import (
+                cache_layout_signature,
+                storage_key_prefix,
+            )
+            from tokenspeed.runtime.cache.l3.factory import (
+                create_kvstore_storage_backend,
+            )
+
+            storage_backend = create_kvstore_storage_backend(
+                server_args.kvstore_storage_backend,
+                server_args.kvstore_storage_backend_extra_config,
+                host_buffer=l2_cache_executor.host_storage.host_buffer,
+                tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+                pp_size=(
+                    server_args.mapping.pp_size if server_args.mapping.has_pp else 1
+                ),
+            )
+            l2_cache_executor.attach_l3_storage(
+                storage_backend,
+                key_prefix=storage_key_prefix(
+                    server_args.model,
+                    revision=server_args.revision or "",
+                    weight_version=server_args.weight_version,
+                    cache_signature=cache_layout_signature(
+                        l2_cache_executor.layout,
+                        cache_dtype=(
+                            f"{server_args.kv_cache_dtype}:{model_config.dtype}"
+                        ),
+                    ),
+                    pipeline_rank=(
+                        server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
+                    ),
+                    draft_model=server_args.speculative_draft_model_path or "",
+                    draft_revision=server_args.revision or "",
+                    draft_weight_version=server_args.weight_version,
+                ),
+                rank=attn_tp_rank,
+            )
 
     kv_transfer = _build_kv_transfer(
         server_args,

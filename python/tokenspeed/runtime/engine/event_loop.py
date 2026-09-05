@@ -319,6 +319,7 @@ class EventLoop:
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
+            "enable_l3_storage=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
             "cache_groups=%s",
@@ -328,6 +329,7 @@ class EventLoop:
             scheduler_cfg.decode_input_tokens,
             scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
+            scheduler_cfg.enable_l3_storage,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
             self.dp_size,
@@ -433,7 +435,7 @@ class EventLoop:
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
-            clear_cache_fn=self.scheduler.clear_cache,
+            clear_cache_fn=self._clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -513,6 +515,82 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _submit_scheduler_requests(self, specs) -> None:
+        self._register_l3_storage_hits(specs)
+        self.scheduler.submit_requests(specs)
+
+    def _clear_cache(self) -> bool:
+        cleared = self.scheduler.clear_cache()
+        if cleared:
+            self._device.rotate_l3_namespace()
+        return cleared
+
+    def _register_l3_storage_hits(self, specs) -> None:
+        """Tell the scheduler which prefix pages already live in L3.
+
+        Cross-instance reuse cannot see Mooncake objects through the Host
+        index. Probe them with the same content hashes the scheduler will
+        use, then register only keys every TP rank agrees exist.
+        """
+
+        if not specs:
+            return
+        hashes = []
+        seen: set[str] = set()
+        for spec in specs:
+            for content_hash in self.scheduler.prefix_hashes_for_tokens(
+                list(spec.tokens)
+            ):
+                if content_hash in seen:
+                    continue
+                seen.add(content_hash)
+                hashes.append(content_hash)
+        if not hashes:
+            return
+        group_ids, content_hashes, page_offsets = self.scheduler.expand_prefix_keys(
+            hashes
+        )
+        pages = [
+            (int(group_id), 0, content_hash, int(page_offset))
+            for group_id, content_hash, page_offset in zip(
+                group_ids, content_hashes, page_offsets
+            )
+        ]
+        exists = self._device.query_l3_storage(pages)
+        if exists is None:
+            return
+        if len(exists) != len(group_ids):
+            raise RuntimeError("L3 existence result is not aligned with cache keys")
+        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None and exists:
+            flags = torch.tensor(
+                [1 if present else 0 for present in exists], dtype=torch.int32
+            )
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
+            exists = [bool(flag) for flag in flags.tolist()]
+        hit_groups = []
+        hit_hashes = []
+        hit_offsets = []
+        miss_groups = []
+        miss_hashes = []
+        miss_offsets = []
+        for group_id, content_hash, page_offset, present in zip(
+            group_ids, content_hashes, page_offsets, exists
+        ):
+            target = (
+                (hit_groups, hit_hashes, hit_offsets)
+                if present
+                else (miss_groups, miss_hashes, miss_offsets)
+            )
+            target[0].append(int(group_id))
+            target[1].append(content_hash)
+            target[2].append(int(page_offset))
+        if miss_groups:
+            self.scheduler.unregister_storage_keys(
+                miss_groups, miss_hashes, miss_offsets
+            )
+        if hit_groups:
+            self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -715,7 +793,7 @@ class EventLoop:
             return
 
         if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+            self._submit_scheduler_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
     def _pp_broadcast_output_tokens(self, forward_op, results) -> None:
@@ -1141,6 +1219,7 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
+        self._device.shutdown_cache()
 
 
 def run_event_loop(

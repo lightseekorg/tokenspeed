@@ -324,6 +324,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
+    std::vector<std::vector<CacheKey>> group_keys = plan.prefix.group_keys;
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
@@ -367,8 +368,34 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
-            groups_[i].Allocator().AppendHostExtension(
-                pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
+            PrefixMatch& host_match = acquired_prefix.host.per_group[i];
+            const std::int32_t floor_pages = acquired_prefix.device.num_common_tokens / geometry_[i].BlockGranularity();
+            std::vector<std::uint8_t> prefetch_flags(host_match.blocks.size());
+            std::vector<CacheKey> host_keys(host_match.blocks.size());
+            for (std::size_t hit_index = 0; hit_index < host_match.blocks.size(); ++hit_index) {
+                if (!host_match.blocks[hit_index]) {
+                    continue;
+                }
+                const CacheKey& key = group_keys[i][static_cast<std::size_t>(floor_pages) + hit_index];
+                host_keys[hit_index] = key;
+                prefetch_flags[hit_index] =
+                    groups_[i].Index().Contains(*host_pool_, host_match.blocks[hit_index]->Location()) ? 0 : 1;
+            }
+            const std::size_t pair_begin = result.load_pairs.size();
+            groups_[i].Allocator().AppendHostExtension(pool_, *demand.table, std::move(host_match.blocks),
+                                                       result.load_pairs);
+            std::size_t pair_index = pair_begin;
+            for (std::size_t hit_index = 0; hit_index < prefetch_flags.size(); ++hit_index) {
+                if (host_keys[hit_index].content_hash.empty()) {
+                    continue;
+                }
+                if (pair_index >= result.load_pairs.size()) {
+                    break;
+                }
+                BlockTransfer& transfer = result.load_pairs[pair_index++];
+                transfer.key = std::move(host_keys[hit_index]);
+                transfer.prefetch_from_storage = prefetch_flags[hit_index] != 0;
+            }
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
