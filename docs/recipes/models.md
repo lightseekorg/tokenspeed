@@ -755,6 +755,15 @@ and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
 `--block-size N` with `N != 64` to override). Requires
 `tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
 
+`TOKENSPEED_DSV4_TRUST_VALIDATED_HASH_TABLE=1` is an opt-in profiling path for
+the immutable token-to-expert tables used by V4 hash-routed layers. After all
+checkpoint weights load, every table entry is checked once against the model's
+expert count before kernel warmup or CUDA Graph capture. A successful check
+lets decode skip the repeated table gather and expert-ID assertion; dynamic
+token IDs remain range-checked on every call. The default keeps the per-call
+table-value check until matched endpoint and graph measurements establish a
+deployment benefit.
+
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
 
 ```bash
@@ -856,6 +865,38 @@ DSpark weights are incomplete, the replay capability is missing, KVStore is
 enabled, or the draft checkpoint contains only MTP/NextN weights. External
 DSpark checkpoints that do not advertise this capability keep the generic
 scheduler behavior.
+
+Same-checkpoint DSpark materializes a stable FP32 view of the local target
+LM-head shard before cache sizing. Public FP32 Markov logits then reuse this
+buffer instead of converting the complete shard during every CUDA Graph
+replay. In-place target weight updates refresh the existing buffer outside the
+replay, preserving the address captured by CUDA Graph.
+
+The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
+round-trip with a fused `tokenspeed-kernel` operation. It computes the same
+per-group power-of-two scale and returns dequantized values in the input dtype;
+the fusion removes intermediate reduction and elementwise launches but does not
+change the model's quantization contract.
+
+DSpark attention RMSNorm uses the platform kernel on CUDA while retaining its
+explicit FP32-accumulating PyTorch expression as the CPU reference. The fused
+path preserves the existing output dtype and is safe to capture and replay in
+the target CUDA Graph.
+
+For DSpark profiling experiments on an unpadded base-only vocabulary,
+`TOKENSPEED_DSPARK_REPLICATE_VOCAB_HEADS=1` replicates the target embedding,
+target LM head, and Markov embedding/projection on every attention-TP rank. The
+candidate removes the per-step Markov embedding reduction and global-argmax
+gathers at the cost of several GiB of persistent memory per GPU. It fails
+closed for padded or added-vocabulary layouts and remains opt-in until matched
+endpoint and CUDA Graph measurements establish a deployment benefit.
+
+`TOKENSPEED_DSPARK_REPLICATE_MARKOV_EMBEDDING=1` is a narrower profiling
+variant. It replicates only the FP32 low-rank Markov embedding while leaving
+the target embedding, target LM head, and Markov projection vocabulary-sharded.
+This removes the Markov embedding reduction without expanding the
+full-vocabulary projection or argmax workload. The full-head flag implies this
+setting; both variants remain opt-in and require matched endpoint validation.
 
 For a two-node TP8 deployment, run one process per node with four local workers
 and the same command on both nodes. See [Multi-Node](../serving/parallelism.md#multi-node)

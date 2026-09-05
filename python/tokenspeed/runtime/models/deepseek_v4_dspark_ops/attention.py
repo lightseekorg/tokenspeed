@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import fp8_quantize_dequantize
+from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm as kernel_grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm import rmsnorm as kernel_rmsnorm
 
 
 def dspark_fp8_quant_dequant(
@@ -30,6 +33,8 @@ def dspark_fp8_quant_dequant(
             "DSpark FP8 activation width must be divisible by block_size; "
             f"got width={x.shape[-1]}, block_size={block_size}."
         )
+    if x.is_cuda:
+        return fp8_quantize_dequantize(x, group_size=block_size)
     original_dtype = x.dtype
     blocks = x.float().unflatten(-1, (-1, block_size))
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
@@ -178,11 +183,37 @@ def dspark_sparse_attn(
     return output.to(q.dtype)
 
 
-def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Apply DSpark RMSNorm through the platform kernel on accelerators."""
+
+    if x.is_cuda:
+        return kernel_rmsnorm(x, weight, eps)
     original_dtype = x.dtype
     normalized = x.float()
     normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + eps))
     return (weight.float() * normalized).to(original_dtype)
+
+
+# Public name for direct contract tests while preserving the historical private
+# helper imported by the DSpark model implementation.
+dspark_rmsnorm = _rmsnorm
+
+
+def _normalize_query_per_head(
+    query: torch.Tensor,
+    head_dim: int,
+    eps: float,
+) -> torch.Tensor:
+    """Normalize every query head without materializing intermediate tensors."""
+
+    if query.is_cuda:
+        return kernel_grouped_rmsnorm(query, head_dim, eps, out=query)
+    query.mul_(torch.rsqrt(query.square().mean(-1, keepdim=True) + eps))
+    return query
 
 
 def _rope_last_dims_batched(
@@ -239,7 +270,7 @@ def dspark_attention_forward_batched(
     )
     block_freqs = freqs_cis[block_positions]
 
-    main_kv = _rmsnorm(_dspark_fp8_linear(main_x, wkv), kv_norm_w, eps)
+    main_kv = dspark_rmsnorm(_dspark_fp8_linear(main_x, wkv), kv_norm_w, eps)
     main_kv = _rope_last_dims_batched(
         main_kv,
         rope_head_dim,
@@ -247,16 +278,16 @@ def dspark_attention_forward_batched(
     )
     main_kv = _quantize_dspark_non_rope(main_kv, rope_head_dim)
 
-    query = _rmsnorm(_dspark_fp8_linear(x, wq_a), q_norm_w, eps)
+    query = dspark_rmsnorm(_dspark_fp8_linear(x, wq_a), q_norm_w, eps)
     query = _dspark_fp8_linear(query, wq_b).unflatten(-1, (n_heads, head_dim))
-    query.mul_(torch.rsqrt(query.square().mean(-1, keepdim=True) + eps))
+    query = _normalize_query_per_head(query, head_dim, eps)
     query = _rope_last_dims_batched(
         query,
         rope_head_dim,
         block_freqs,
     )
 
-    block_kv = _rmsnorm(_dspark_fp8_linear(x, wkv), kv_norm_w, eps)
+    block_kv = dspark_rmsnorm(_dspark_fp8_linear(x, wkv), kv_norm_w, eps)
     block_kv = _rope_last_dims_batched(
         block_kv,
         rope_head_dim,

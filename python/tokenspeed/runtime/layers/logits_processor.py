@@ -387,6 +387,7 @@ class LogitsProcessor(nn.Module):
         *,
         max_M: int,
         skip_ping_pong: bool,
+        dtype: torch.dtype | None = None,
     ) -> DistArgmaxState | None:
         """Build this TP group's distributed-argmax state, or None to fall back.
 
@@ -401,17 +402,27 @@ class LogitsProcessor(nn.Module):
             max_M: Largest row count the caller will ever pass.
             skip_ping_pong: Pin the slot band instead of alternating; only
                 when the caller synchronizes across ranks between calls.
+            dtype: Value dtype of the logits. Defaults to the LM-head weight
+                dtype; callers with an FP32 correction path may override it.
 
         Returns:
             The state, or None when this group must use the gather path.
         """
-        key = (self.tp_group, lm_head.weight.size(0), max_M, skip_ping_pong)
+        resolved_dtype = dtype or lm_head.weight.dtype
+        device = lm_head.weight.device
+        key = (
+            self.tp_group,
+            lm_head.weight.size(0),
+            max_M,
+            skip_ping_pong,
+            resolved_dtype,
+            device,
+        )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
         if torch.cuda.is_current_stream_capturing():
             return None  # never rendezvous inside capture; warmup probes first
 
-        device = lm_head.weight.device
         group = pg_manager.get_process_group("nccl", self.tp_group)
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
@@ -420,7 +431,7 @@ class LogitsProcessor(nn.Module):
                 group=group,
                 rank_in_group=self.tp_rank,
                 max_M=max_M,
-                dtype=lm_head.weight.dtype,
+                dtype=resolved_dtype,
                 device=device,
                 skip_ping_pong=skip_ping_pong,
             )

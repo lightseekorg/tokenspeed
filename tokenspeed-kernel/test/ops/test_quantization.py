@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import (
+    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
@@ -59,6 +60,69 @@ def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     out[..., 1::2] = _e2m1_values(packed >> 4)
     scale_values = torch.pow(2.0, scale.to(torch.int32) - 127).to(torch.float32)
     return out * scale_values.repeat_interleave(32, dim=-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_fp8_quantize_dequantize_ue8m0(
+    device: str,
+    dtype: torch.dtype,
+    group_size: int,
+    require,
+) -> None:
+    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    torch.manual_seed(41)
+    base = torch.randn(3, 2, group_size * 3 + 17, device=device, dtype=dtype)
+    x = base[..., : group_size * 3]
+    assert not x.is_contiguous()
+    blocks = x.float().unflatten(-1, (-1, group_size))
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+    expected = (
+        torch.clamp(blocks / scales, -448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .mul(scales)
+        .flatten(-2)
+        .to(dtype)
+    )
+
+    actual = fp8_quantize_dequantize(
+        x,
+        group_size=group_size,
+        solution="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert actual.shape == x.shape
+    assert actual.dtype == x.dtype
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fp8_quantize_dequantize_cuda_graph_replay(device: str, require) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    x = torch.randn(8, 384, device=device, dtype=dtype)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp8_quantize_dequantize(x, group_size=128, solution="triton")
+
+    x.copy_(torch.linspace(-9.0, 9.0, x.numel(), device=device).reshape_as(x))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    blocks = x.float().unflatten(-1, (-1, 128))
+    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+    expected = (
+        torch.clamp(blocks / scales, -448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .mul(scales)
+        .flatten(-2)
+        .to(dtype)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("solution", ["triton"])

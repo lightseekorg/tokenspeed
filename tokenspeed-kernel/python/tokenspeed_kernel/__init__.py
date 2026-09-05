@@ -111,8 +111,10 @@ from tokenspeed_kernel.ops.moe import (
     moe_sigmoid_bias_topk,
     moe_softmax_topk,
     native_latent_moe_available,
+    pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.quantization import (
+    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
@@ -147,6 +149,8 @@ __all__ = [
     "prepare_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
+    # quantization
+    "fp8_quantize_dequantize",
     # hyperconnection
     "gated_residual_combine",
     "gated_residual_mix",
@@ -209,6 +213,7 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "pack_topk_router_logits",
     "moe_softmax_topk",
     # mhc
     "mhc_fused_hc",

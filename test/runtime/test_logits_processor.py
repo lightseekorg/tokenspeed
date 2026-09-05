@@ -214,6 +214,67 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
     assert len(calls) == 1
 
 
+def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
+    """An FP32 corrected-logits user must not reuse a BF16 sampler state."""
+    monkeypatch.setattr(logits_processor_module, "dist_argmax_available", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda tensor, **k: None,
+    )
+    created = []
+
+    def fake_create(**kwargs):
+        created.append(kwargs["dtype"])
+        return SimpleNamespace(dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(
+        logits_processor_module, "try_create_dist_argmax_state", fake_create
+    )
+    monkeypatch.setattr(LogitsProcessor, "_LOGITS_DIST_ARGMAX_STATES", {})
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
+
+    bf16_state = processor.acquire_dist_argmax_state(
+        lm_head, max_M=8, skip_ping_pong=False
+    )
+    fp32_state = processor.acquire_dist_argmax_state(
+        lm_head, max_M=8, skip_ping_pong=False, dtype=torch.float32
+    )
+    assert bf16_state.dtype == torch.bfloat16
+    assert fp32_state.dtype == torch.float32
+    assert created == [torch.bfloat16, torch.float32]
+
+    # Both verdicts are independently cached.
+    assert (
+        processor.acquire_dist_argmax_state(
+            lm_head, max_M=8, skip_ping_pong=False, dtype=torch.float32
+        )
+        is fp32_state
+    )
+    assert len(created) == 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0

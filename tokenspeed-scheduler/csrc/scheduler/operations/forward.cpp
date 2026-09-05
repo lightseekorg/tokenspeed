@@ -89,6 +89,19 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
+void scopeAdmissionHeadroom(std::span<GroupDemand> demands, const CacheCoordinator& coordinator,
+                            std::int32_t decode_reserve) {
+    _assert(demands.size() == static_cast<std::size_t>(coordinator.NumGroups()), "demands/cache groups size mismatch");
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        if (!coordinator.GroupIsPrefixClosed(static_cast<std::int32_t>(i))) {
+            // Full-history groups must reserve the unscheduled prompt so a
+            // partially prefetched request cannot be stranded. Sliding/state
+            // groups recycle old pages and only need the decode headroom.
+            demands[i].reserve_tokens = decode_reserve;
+        }
+    }
+}
+
 void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                                     const CacheCoordinator& coordinator, std::int32_t after_tokens) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
@@ -346,6 +359,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
     std::vector<GroupDemand> demands =
         makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = admission_reserve});
+    scopeAdmissionHeadroom(demands, coordinator_, decode_reserve);
     if (source == fsm::PrefillSource::kLocal) {
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens + tokens_this_round);
         setSnapshotStatePrefillReserve(demands, config_.cache_groups, split_tail_tokens);
