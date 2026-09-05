@@ -62,9 +62,12 @@ elif current_platform().is_nvidia:
         pass
     else:
         mla_kv_pack_quantize_fp8 = _with_pdl_default(_mla_kv_pack_quantize_fp8, 8)
-        tokenspeed_mla_decode = _with_pdl_default(_tokenspeed_mla_decode, 13)
+        tokenspeed_mla_decode = _with_pdl_default(_tokenspeed_mla_decode, 14)
         tokenspeed_mla_prefill = _with_pdl_default(_tokenspeed_mla_prefill, 12)
         warmup_compile_prefill = _with_pdl_default(_warmup_compile_prefill, 3)
+
+        # Registration side effect, only where the library actually imported.
+        import tokenspeed_kernel.ops.attention.tokenspeed_mla.decode  # noqa: F401
 
 __all__ = [
     "get_num_sm",
