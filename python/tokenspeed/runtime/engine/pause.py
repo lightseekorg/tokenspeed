@@ -407,10 +407,7 @@ class PauseHooks:
         scheduler and the forward path can never reap it. Handle that here:
 
         - state missing  -> already published and reaped; drop silently.
-        - state finished -> aborted in place. Stream a terminating finish for
-          pause-initiated aborts (the passive client is still waiting) and drop
-          the registered state so the rid does not leak; client-initiated aborts
-          already tore down their own state, so just reap.
+        - state finished -> stream its terminal frame and reap it.
         - otherwise      -> still live; admit it.
         """
         output_processor = self._loop.output_processor
