@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import (
@@ -84,23 +85,94 @@ def _allocator_identity(allocator: _ScratchAllocator | None) -> object:
     return getattr(allocator, "__self__", allocator)
 
 
-def _multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
+def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
     """Whether NVLS multicast can actually map across ``group``'s ranks.
 
     ``symm_mem`` importing is not enough: a cross-host group without fabric or
     IMEX still reports multicast support locally and then hangs inside the
     rendezvous instead of letting the caller fall back. The host-span test is
     at group granularity: a node-local subgroup of a multi-host job never
-    needs fabric.
+    needs fabric, and probing one would decline a group that works over plain
+    NVLink on a machine with no fabric at all.
+
+    Size alone does not establish node-locality, and neither does alignment to
+    the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
+    and starts on a multiple of three while still living on two hosts. What
+    decides it is which host each rank sits on, which the world map records
+    beside the fabric verdict. Nothing is divided out of the visible device
+    count here: a job running fewer workers than a host has GPUs puts two hosts
+    inside one such window, and the group would skip the fabric test entirely.
+
+    Both terms come from the map gathered at distributed initialization, so
+    every rank makes the same local decision, and a map never gathered declines
+    rather than guessing at placement.
     """
     import torch.distributed as dist
-    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+    from tokenspeed_kernel.ops.communication.fabric import (
+        group_has_fabric,
+        group_host_span,
+    )
 
     if not dist.is_initialized():
         return False
-    if dist.get_world_size(group) <= torch.cuda.device_count():
+    # ``None`` is the default group and has to be tested like any other.
+    ranks = dist.get_process_group_ranks(
+        group if group is not None else dist.group.WORLD
+    )
+    span = group_host_span(ranks)
+    if span is None:
+        return False
+    if span <= 1:
         return True
-    return fabric_allocation_supported(torch.cuda.current_device())
+    return group_has_fabric(ranks)
+
+
+# sm100 and up may attempt the multicast path; sm90 lacks the fabric handles.
+_MULTICAST_MIN_ARCH = 10
+
+
+def multicast_backend_unavailable_reason(
+    group: dist.ProcessGroup | None = None,
+) -> str | None:
+    """Which term of the backend's eligibility fails here, or None.
+
+    Callers that only branch want ``multicast_backend_available``. Callers that
+    have to tell a machine which cannot host this from one which should have
+    and did not need the term: capability and the optional imports say the
+    former, an unreachable fabric says the latter, and only that last one is a
+    fault rather than a configuration.
+    """
+    if not torch.cuda.is_available():
+        return "no CUDA device"
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return f"{platform.vendor} does not carry the NVLS multicast path"
+    # Whether to attempt the path. Deliberately not the same number as
+    # latent_down's _MULTICAST_VALIDATED_ARCH, which decides whether a failure
+    # to rendezvous is a broken machine: a later architecture should get to try.
+    if platform.arch_version.major < _MULTICAST_MIN_ARCH:
+        return (
+            f"compute capability {platform.arch_version.major}, "
+            f"below {_MULTICAST_MIN_ARCH}"
+        )
+    try:
+        import cutlass  # noqa: F401
+        import cutlass.cute  # noqa: F401
+        from torch.distributed import _symmetric_memory  # noqa: F401
+    except ImportError:
+        return "cutlass or symmetric memory is not importable"
+    if not multicast_reachable(group):
+        return "fabric unreachable"
+    return None
+
+
+def multicast_backend_available(group: dist.ProcessGroup | None = None) -> bool:
+    """Whether the CuteDSL multicast backend can run here at all.
+
+    Separate from any one op's shapes: capability, the optional imports, and
+    fabric reachability. All three must hold before a collective rendezvous.
+    """
+    return multicast_backend_unavailable_reason(group) is None
 
 
 def latent_tail_supported(
@@ -120,17 +192,7 @@ def latent_tail_supported(
         return False
     if (hidden_size, latent_size) != (7168, 3584) or dtype != torch.bfloat16:
         return False
-    if not torch.cuda.is_available():
-        return False
-    if torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        import cutlass  # noqa: F401
-        import cutlass.cute  # noqa: F401
-        from torch.distributed import _symmetric_memory  # noqa: F401
-    except ImportError:
-        return False
-    return _multicast_reachable(group)
+    return multicast_backend_available(group)
 
 
 @dataclass
@@ -245,6 +307,9 @@ class KimiK3LatentTailOp:
             CollectiveKernel,
             LamportCopyKernel,
         )
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
+            NEG_ZERO_F32_BITS,
+        )
 
         self.contract = contract
         self.rank = dist.get_rank(group)
@@ -324,6 +389,8 @@ class KimiK3LatentTailOp:
                 max_m=_MAX_NUM_TOKENS,
                 ctas=_LAMPORT_COPY_CTAS,
                 threads=_LAMPORT_COPY_THREADS,
+                # This mailbox is armed with (+0, -0); the down projection's is not.
+                sentinel=NEG_ZERO_F32_BITS,
             )
 
     @property
