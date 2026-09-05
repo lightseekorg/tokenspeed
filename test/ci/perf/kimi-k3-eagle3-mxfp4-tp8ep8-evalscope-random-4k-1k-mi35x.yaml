@@ -60,7 +60,7 @@ server:
     interval: 10
 perf:
   install:
-    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.9.1'
   # EvalScope loads remote tokenizer paths through ModelScope even when the
   # dataset source is Hugging Face, so materialize the HF tokenizer locally.
   command: >-
