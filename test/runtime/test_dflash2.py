@@ -75,6 +75,18 @@ def test_draft_projections_reach_the_measured_gemv_route() -> None:
         assert all((m, n, k) in MEASURED_ROUTE for m in (8, 16, 24, 32))
 
 
+def test_the_conv_commutes_with_a_shard_reduction() -> None:
+    """What lets the all-reduce move to the far side of ``conv.finish``."""
+    conv = DFlashGroupedConv(
+        16, taps=2, group_size=4, block_size=8, params_dtype=torch.float64
+    )
+    torch.nn.init.normal_(conv.base_kernel)
+    coefficients = torch.randn(8, 2, 4, dtype=torch.float64)
+    shards = [torch.randn(8, 16, dtype=torch.float64) for _ in range(3)]
+    reduced_after = sum(conv.finish(shard, coefficients) for shard in shards)
+    torch.testing.assert_close(reduced_after, conv.finish(sum(shards), coefficients))
+
+
 def test_dflash2_architecture_dispatches_to_its_selector_runtime() -> None:
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
     assert get_drafter_impl("DFLASH", model) is DFlash2
