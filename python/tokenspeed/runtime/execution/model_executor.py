@@ -110,15 +110,19 @@ def _draft_idle_global_num_tokens_for_step(
     return global_bs
 
 
-PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
+# Covers a whole chunk: a lower cap leaves every chunk's tail running eager.
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 8192
 
 
-def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+def _resolve_prefill_graph_max_tokens(server_args, context_len: int) -> int:
+    """Largest prefill-graph bucket: explicit value, or the smallest of 8192,
+    the chunk, the kv budget, and what the request buffers can hold.
 
     Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
     receive counts come back to the host, and a host sync cannot be captured.
+
+    An explicit value is passed through unclamped, as before.
     """
     if server_args.all2all_backend not in (None, "none"):
         return 0
@@ -129,7 +133,12 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
         cap = min(cap, int(server_args.chunked_prefill_size))
     if server_args.max_total_tokens:
         cap = min(cap, int(server_args.max_total_tokens))
-    return cap
+    # A bucket over context_len * max_bs overflows the request-indexed buffers.
+    per_rank_max_batch = max(
+        1,
+        int(server_args.max_num_seqs) // max(int(server_args.mapping.attn.dp_size), 1),
+    )
+    return min(cap, max(1, int(context_len)) * per_rank_max_batch)
 
 
 def _cache_arena_attr(pool, name: str, default):
@@ -277,7 +286,9 @@ class ModelExecutorConfig:
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
-            prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
+            prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(
+                server_args, model_config.context_len
+            ),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
