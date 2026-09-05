@@ -35,6 +35,7 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
@@ -133,6 +134,7 @@ class DFlashGroupedConv(nn.Module):
         group_size: int,
         block_size: int,
         params_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -150,11 +152,15 @@ class DFlashGroupedConv(nn.Module):
         self.base_kernel = nn.Parameter(
             torch.empty(2, self.taps, hidden_size, dtype=params_dtype)
         )
-        self.kernel_projection = nn.Linear(
+        # The repo's linear layer, not nn.Linear: this projection is the
+        # drafter's most frequent GEMM and only this path consults the
+        # measured decode-GEMV route.
+        self.kernel_projection = ReplicatedLinear(
             hidden_size,
             2 * self.taps * self.num_groups,
             bias=False,
-            dtype=params_dtype,
+            params_dtype=params_dtype,
+            prefix=add_prefix("kernel_projection", prefix),
         )
 
     def _convolve(
@@ -171,7 +177,7 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)[0].reshape(
             hidden_states.shape[0], 2, self.taps, self.num_groups
         )
         return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
@@ -215,6 +221,7 @@ class CandidateSelector(nn.Module):
         rank: int,
         top_k: int,
         params_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if rank < 1:
@@ -230,8 +237,12 @@ class CandidateSelector(nn.Module):
         self.successor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype)
         )
-        self.hidden_projection = nn.Linear(
-            hidden_size, rank, bias=False, dtype=params_dtype
+        self.hidden_projection = ReplicatedLinear(
+            hidden_size,
+            rank,
+            bias=False,
+            params_dtype=params_dtype,
+            prefix=add_prefix("hidden_projection", prefix),
         )
 
     def forward(
@@ -241,7 +252,8 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        hidden = self.hidden_projection(hidden_states)
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        hidden = self.hidden_projection(flat)[0].view(*hidden_states.shape[:-1], -1)
         return _score_edges(
             self.predecessor_codebook,
             self.successor_codebook,
@@ -319,8 +331,12 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             group_size=int(_dflash2_config_value(config, "conv_group_size")),
             block_size=int(_dflash2_config_value(config, "block_size")),
         )
-        self.attention_conv = DFlashGroupedConv(**conv_args)
-        self.mlp_conv = DFlashGroupedConv(**conv_args)
+        self.attention_conv = DFlashGroupedConv(
+            **conv_args, prefix=add_prefix("attention_conv", prefix)
+        )
+        self.mlp_conv = DFlashGroupedConv(
+            **conv_args, prefix=add_prefix("mlp_conv", prefix)
+        )
 
     def forward(
         self,
@@ -399,6 +415,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             rank=int(_dflash2_config_value(config, "selector_rank")),
             top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,
+            prefix=add_prefix("candidate_selector", prefix),
         )
 
     @property
