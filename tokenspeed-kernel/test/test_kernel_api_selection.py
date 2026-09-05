@@ -2576,16 +2576,6 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
     assert plan["apply_kernel_name"] != kernel_name
 
 
-def test_kimi3_mxfp4_situ_ep8_preserves_fused_decode_plan() -> None:
-    registry = KernelRegistry.get()
-    a8_kernel = registry.get_by_name("gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply")
-    a16_kernel = registry.get_by_name("gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply")
-    if a8_kernel is None or a16_kernel is None:
-        pytest.skip("gfx950 SiTU EP8 kernels are unavailable")
-
-    assert a16_kernel.priority > a8_kernel.priority
-
-
 def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -18,11 +18,6 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 `M >= 9`, staged MFMA decode), so the kernel dependency arrow points from
 `fused/` to the staged files, never back.
 
-Kimi K3 TP8/EP8 auto-selects the linear-weight A16W4 plan. Its linear layout is
-required by the joint routed/shared `M <= 4` decode pipeline used for ordinary
-decode and EAGLE3 verification; the preshuffled A8W4 EP plan remains available
-for future use once it can preserve that small-token path.
-
 For the staged package's second GEMM, TP uses direct atomic accumulation through
 64 tokens and scratch-plus-FP32-reduce at larger sizes; EP uses atomic
 accumulation because each rank owns only a sparse subset of the routed experts.
