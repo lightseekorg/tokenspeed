@@ -209,6 +209,8 @@ def test_dflash_wire_target_installs_capture_layers():
 def test_dspark_wire_target_installs_capture_layers():
     drafter = mock.MagicMock(spec=DeepseekV4DSpark)
     drafter.target_layer_ids = [10, 20]
+    draft_head = mock.MagicMock()
+    drafter.draft_model = mock.MagicMock(lm_head=draft_head)
     target_model = mock.MagicMock(
         spec=["lm_head", "logits_processor", "set_dspark_layers_to_capture"]
     )
@@ -216,7 +218,7 @@ def test_dspark_wire_target_installs_capture_layers():
     DeepseekV4DSpark.wire_target(drafter, target_model)
 
     target_model.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
-    assert drafter.lm_head is target_model.lm_head
+    assert drafter.lm_head is draft_head
 
 
 # --------------------------------------------------------------------------

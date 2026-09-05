@@ -24,12 +24,85 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_fp8_with_scale",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
 ]
+
+
+def fp8_quantize_dequantize(
+    x: torch.Tensor,
+    group_size: int,
+    scale_encoding: Literal["ue8m0"] = "ue8m0",
+    *,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Simulate grouped FP8 quantization and return the dequantized tensor.
+
+    Each contiguous group on the last dimension receives an independently
+    computed scale.  The result has the same shape and dtype as ``x``.  This
+    operation is intended for models whose published inference contract
+    requires an explicit FP8 round trip before a higher-precision operation.
+
+    Args:
+        x: Input tensor with a contiguous last dimension.
+        group_size: Number of consecutive values that share a scale.
+        scale_encoding: Scale selection contract.  ``"ue8m0"`` chooses the
+            next power-of-two scale needed for finite E4M3 values.
+        override: Optional exact kernel name override.
+        solution: Optional registered solution to select.
+
+    Returns:
+        The grouped FP8-quantized and dequantized tensor in ``x.dtype``.
+    """
+
+    if group_size <= 0 or x.shape[-1] % group_size != 0:
+        raise ValueError(
+            "FP8 quantize/dequantize requires the last dimension to be "
+            f"divisible by a positive group_size; got shape={tuple(x.shape)}, "
+            f"group_size={group_size}."
+        )
+    traits = {
+        "group_size": group_size,
+        "scale_encoding": scale_encoding,
+    }
+    signature = format_signature(x=dense_tensor_format(x.dtype))
+    kernel = select_kernel(
+        "quantization",
+        "fp8_quantize_dequantize",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "shape": tuple(x.shape),
+        "group_size": group_size,
+        "scale_encoding": scale_encoding,
+    }
+    ShapeCapture.get().record(
+        "quantization",
+        "fp8_quantize_dequantize",
+        kernel.name,
+        x.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "quantization",
+        "fp8_quantize_dequantize",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            x,
+            group_size=group_size,
+            scale_encoding=scale_encoding,
+        )
 
 
 def quantize_fp8(

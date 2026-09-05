@@ -36,6 +36,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -98,6 +100,8 @@ def mhc_pre(
             rms_eps,
             hc_eps,
             sinkhorn_iters,
+            norm_weight,
+            norm_eps,
         )
 
 
@@ -167,6 +171,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compose the registered previous post-mapping and current pre-mapping.
 
@@ -199,6 +205,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight,
+        norm_eps,
     )
     return residual_cur, layer_input, post_cur, comb_cur
 
