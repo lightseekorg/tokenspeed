@@ -13,139 +13,28 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
-  MI450_SIM_RUN_TIMEOUT: "3600"
+  # Keep emulation within the PR lane's five-and-a-half-minute execution budget.
+  MI450_SIM_RUN_TIMEOUT: "330"
   MI450_SIM_WORKERS: "6"
-  TEST_DESELECTS: |
-    # Iris symmetric heaps require physical KFD/ARSMI peer topology. rocJITsu
-    # provides compute emulation only, so keep these tests enabled on hardware.
-    --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[per_row]
-    --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[persistent]
-
-    # These tests exceed the rocJITsu CI budget before producing a result.
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights
-    --deselect=tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_batched_replay_checkpoint_boundary_matches_layer_loop
-    --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_prefill_lse
-    --deselect=tokenspeed-kernel/test/ops/test_attention_gdn.py::test_gdn_chunk_prefill_triton_matches_torch_reference
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_prefill
-    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-2048]
-    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-6144]
-    --deselect=tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[32-32]
-    --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_logits_matches_stream
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-151936]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-163840]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-200064]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-201088]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[199-151936]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_under_cuda_graph[64-201088]
-
-    # rocJITsu returns incorrect values converting FP8 E4M3 to float.
-    # https://github.com/ROCm/rocm-systems/issues/10760
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_batch_mixed_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_1024]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_persistent_q2_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_q3_boundary_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_fp8_glm52_production_shape
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e4m3-decode]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e4m3-prefill]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-decode]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-prefill]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[decode_sparse_long_1024]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[decode_sparse_mixed_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_first_prompt_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_mixed_1024]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_short_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_chunk_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_long_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_mixed_1024]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_persistent_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_matches_weighted_relu_oracle
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_prefill_uses_workspace_rows_not_global_slots
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_accepts_block_split_writer_output
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_logits_cover_empty_and_short_spans
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_feeds_block_scaled_gemm
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[130-300-block_size2]
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[192-256-block_size3]
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[256-256-block_size0]
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[6144-2048-block_size1]
-    --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_scale_is_per_block
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m1-adaptive]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m16-adaptive]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m2-adaptive]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m4-adaptive]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m8-adaptive]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_decode_dense_kvcache[q_fp8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_bf16-triton-decode]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_bf16-triton-prefill]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_fp8-triton-decode]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_fp8-triton-prefill]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_dsv4.py::DeepseekV4AttentionOpsTest::test_sparse_prefill_dequantize_and_gather_matches_reference
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch32]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch64]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[triton-fp8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[fp8-e4m3]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_decode_qlen4_verify_matches_per_token_decode[fp8_e4m3]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[decode]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[extend]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_dense_scores_match_reference
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-portable]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-production]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[1-production-16-rows]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-portable]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-production]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[2-production-16-rows]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-portable]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-production]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_matches_reference[4-production-16-rows]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[False-1024]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[False-2048]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[True-1024]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_parallel_scoring_and_device_sort_match_reference[True-2048]
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_ragged_prefill_workspace_budget_tiles_query_rows
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_select.py::test_decode_cuda_graph_tracks_dynamic_lengths
-    --deselect=tokenspeed-kernel/test/test_numerics.py::TestNumericsVerification::test_gemm_fp8[gemm.bmm:triton_bmm_fp8_blockscale]
-    --deselect=tokenspeed-kernel/test/test_numerics.py::TestNumericsVerification::test_gemm_fp8[gemm.mm:triton_mm_fp8_blockscale]
-
-    # rocJITsu ignores clamp on v_subrev_nc_u32_e64:
-    # https://github.com/ROCm/rocm-systems/issues/10762
-    --deselect=tokenspeed-kernel/test/ops/moe/test_triton_mxfp4_apply.py::test_triton_mxfp4_moe_matches_torch[silu]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_triton_mxfp4_apply.py::test_triton_mxfp4_moe_matches_torch[situ]
-
-    # rocJITsu drops scalar-memory loads targeting vcc_lo:
-    # https://github.com/ROCm/rocm-systems/issues/10768
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-explicit-bm128]
-    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[prefill-default]
-
-    # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
-    # https://github.com/ROCm/rocm-systems/issues/10793
-    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_prefill_checkpoint_taps_and_fp8
-
-    # rocJITsu returns the wrong leading-sign-bit count from v_cls_i32, which
-    # corrupts int64-to-float conversion. These tests pack an int64 argmax index
-    # into a float32 buffer, so the index comes back off by up to 3:
-    # https://github.com/ROCm/rocm-systems/issues/10805
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_falls_back_when_cute_unavailable
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[16-151936]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[32-201088]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[4-200064]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_matches_torch_max[64-163840]
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_under_cuda_graph
-    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_pair_writes_into_caller_buffer
-
-    # rocJITsu truncates the bf16 result of v_fma_mixlo_bf16 instead of rounding
-    # to nearest even, so bf16 kernels land one ulp low on about half their
-    # outputs and no longer match an fp32 reference exactly:
-    # https://github.com/ROCm/rocm-systems/issues/10806
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_cuda_fallback
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_decode_append_defers_unmaterialized_pool
-    --deselect=tokenspeed-kernel/test/ops/test_kpool_cache.py::test_prefill_write_matches_reference
-    --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch
+  # rocJITsu is a functional simulator, so run architecture-specific compile and
+  # launch coverage here. Generic kernel tests remain covered on AMD hardware.
+  MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
+  MI450_SIM_TESTS: |
+    tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-bh16bn64]
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache_projected_value_matches_split_and_captures
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_split_output[12]
+    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
+    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_decode_defaults_to_specialized_kernel_on_amd[2-8-8-False--5.0]
+    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1]
+    tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_trivial_q2_2048]
+    tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_short_512]
+    tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-decode]
+    tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
+    tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
+    tokenspeed-kernel/test/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
+    tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
@@ -163,7 +52,7 @@ ut:
       print(props, flush=True); assert "gfx1250" in props.gcnArchName'
     - >-
       bash test/ci_system/run_mi450_rocjitsu_parallel.sh
-      -v --timeout=600
-      $(printf '%s\n' "${TEST_DESELECTS}" | awk 'NF && $1 !~ /^#/')
+      -v --timeout=300
+      $(printf '%s\n' "${MI450_SIM_TESTS}" | awk 'NF && $1 !~ /^#/')
 report:
   github_step_summary: true
