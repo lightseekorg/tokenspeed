@@ -91,13 +91,33 @@ class CacheArena:
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        plan_groups = {group.group_id: group for group in plan.groups}
+        self._block_segment_geometry_by_group = {
+            group_id: (
+                plan_groups[group_id].page_count,
+                tuple(
+                    (
+                        self.field_block_byte_offset(field.field_id, 0),
+                        field.page_stride_bytes,
+                        field.payload_bytes,
+                    )
+                    for field in plan.fields
+                    if field.group_id == group_id
+                ),
+            )
+            for group_id in plan_groups
+        }
+        logger.info(
+            "Cached cache zero-segment geometry: groups=%d fields=%d",
+            len(self._block_segment_geometry_by_group),
+            len(plan.fields),
+        )
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
         # packing; the contract carries them beside the specs rather than
         # copying them in, and the recipe packs the plan from the same
         # (spec, fields) pairs these specs come from, so both name one group
         # set by construction.
-        plan_groups = {group.group_id: group for group in plan.groups}
         self.runtime_contract = CacheRuntimeContract(
             # The identity axis comes from the plan, never read back out of
             # view state. Per-group CacheBlock spans live in the group specs
@@ -234,15 +254,26 @@ class CacheArena:
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:
-        self.plan.group(group_id)
-        fields = [field for field in self.plan.fields if field.group_id == group_id]
+        try:
+            page_count, fields = self._block_segment_geometry_by_group[group_id]
+        except KeyError:
+            self.plan.group(group_id)
+            raise AssertionError("plan group exists without cached geometry") from None
+        for block_id in block_ids:
+            if (
+                isinstance(block_id, bool)
+                or not isinstance(block_id, int)
+                or block_id < 0
+                or block_id >= page_count
+            ):
+                raise IndexError(
+                    f"page_id {block_id} outside [0, {page_count}) for "
+                    f"group {group_id!r}"
+                )
         return [
-            (
-                self.field_block_byte_offset(field.field_id, block_id),
-                field.payload_bytes,
-            )
+            (base_offset + block_id * page_stride, payload_bytes)
             for block_id in block_ids
-            for field in fields
+            for base_offset, page_stride, payload_bytes in fields
         ]
 
     @property

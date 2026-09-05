@@ -172,6 +172,104 @@ def test_batch_admission_debits_simulated_free_pages():
     assert len(admitted & {"r0", "r1"}) <= 1
 
 
+def test_v4_long_prompt_does_not_reserve_full_headroom_in_sliding_groups():
+    num_lcm_blocks = 12_383
+    cfg = _base_config(num_device_pages=num_lcm_blocks + 1)
+    cfg.prefix_granularity = 256
+    cfg.max_scheduled_tokens = 8192
+    cfg.max_batch_size = 8
+    cfg.decode_input_tokens = 6
+    cfg.overlap_schedule_depth = 1
+    cfg.disable_prefix_cache = False
+    cfg.prefix_replay_tokens = 128
+
+    def group(
+        group_id: str,
+        rows_per_page: int,
+        entry_stride_tokens: int,
+        packing: int,
+        retention: CacheRetention,
+        family: CacheGroupFamily,
+        sliding_window_tokens: int | None = None,
+    ) -> CacheGroupConfig:
+        return CacheGroupConfig(
+            group_id=group_id,
+            rows_per_page=rows_per_page,
+            entry_stride_tokens=entry_stride_tokens,
+            total_pages=1 + num_lcm_blocks * packing,
+            cache_blocks_per_lcm_block=packing,
+            retention=retention,
+            family=family,
+            sliding_window_tokens=sliding_window_tokens,
+        )
+
+    cfg.cache_groups = [
+        group(
+            "v4.swa_kv",
+            64,
+            1,
+            1,
+            CacheRetention.SlidingWindow,
+            CacheGroupFamily.State,
+            128,
+        ),
+        group(
+            "v4.c4a.compressed_kv",
+            64,
+            4,
+            1,
+            CacheRetention.FullHistory,
+            CacheGroupFamily.History,
+        ),
+        group(
+            "v4.c4a.compressor_state",
+            4,
+            1,
+            2,
+            CacheRetention.SlidingWindow,
+            CacheGroupFamily.State,
+            10,
+        ),
+        group(
+            "v4.c4a.indexer_compressor_state",
+            4,
+            1,
+            8,
+            CacheRetention.SlidingWindow,
+            CacheGroupFamily.State,
+            10,
+        ),
+        group(
+            "v4.c128a.compressed_kv",
+            2,
+            128,
+            32,
+            CacheRetention.FullHistory,
+            CacheGroupFamily.History,
+        ),
+        group(
+            "v4.c128a.compressor_state",
+            8,
+            1,
+            2,
+            CacheRetention.SlidingWindow,
+            CacheGroupFamily.State,
+            128,
+        ),
+    ]
+    scheduler = Scheduler(cfg)
+    request = _make_spec("v4-long", list(range(54_645)))
+    request.max_new_tokens = 500
+    scheduler.submit_requests([request])
+
+    plan = scheduler.next_execution_plan()
+
+    operation = next(op for op in plan.forward if "v4-long" in op.request_ids)
+    assert operation.input_lengths == [8192]
+    assert scheduler.waiting_size() == 0
+    assert scheduler.prefilling_size() == 1
+
+
 def test_group_tables_use_each_groups_block_granularity():
     cfg = _base_config(num_device_pages=17)
     cfg.prefix_granularity = 8

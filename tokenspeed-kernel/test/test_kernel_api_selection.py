@@ -380,6 +380,11 @@ def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     return tokenspeed_kernel.quantize_mxfp8(x)
 
 
+def _fp8_quantize_dequantize() -> torch.Tensor:
+    x = torch.empty((4, 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.fp8_quantize_dequantize(x, group_size=128)
+
+
 def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
@@ -1427,6 +1432,55 @@ def _attention_dsv4_swa_cache_insert() -> object:
         64,
         q_out=q_out,
     )
+
+
+def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime may skip only the redundant position check, not the insert."""
+    calls: list[dict[str, object]] = []
+
+    class _SelectedKernel:
+        name = "test_dsv4_swa_cache_insert"
+
+        def __call__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        _attention_pkg,
+        "select_kernel",
+        lambda *args, **kwargs: _SelectedKernel(),
+    )
+    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
+    kv = torch.empty((1, 512), dtype=torch.bfloat16)
+    cache = torch.empty((1, 584), dtype=torch.uint8)
+    slots = torch.zeros((1,), dtype=torch.int64)
+    positions = torch.ones((1,), dtype=torch.int64)
+    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="positions entries must index"):
+        tokenspeed_kernel.dsv4_swa_cache_insert(
+            q,
+            kv,
+            cache,
+            slots,
+            positions,
+            cos_sin_cache,
+            1e-6,
+            1,
+        )
+    tokenspeed_kernel.dsv4_swa_cache_insert(
+        q,
+        kv,
+        cache,
+        slots,
+        positions,
+        cos_sin_cache,
+        1e-6,
+        1,
+        validate_positions=False,
+    )
+    assert len(calls) == 1
 
 
 def _attention_dsa_decode_fp8_dense_rank128_q4(
@@ -4081,6 +4135,14 @@ _CASES = [
         _dsv4_linear_fp32,
     ),
     # Quantization API x architecture golden cases.
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "quantization",
+        "fp8_quantize_dequantize",
+        "triton_fp8_quantize_dequantize",
+        _fp8_quantize_dequantize,
+    ),
     _case(
         _is_hopper,
         "hopper",
