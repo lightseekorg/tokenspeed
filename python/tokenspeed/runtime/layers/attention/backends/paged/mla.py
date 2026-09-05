@@ -86,6 +86,11 @@ class MLADecodeMetadata:
     seq_lens: torch.Tensor
     # Verify window width baked into the graph views (1 outside target verify).
     q_len_per_req: int = 1
+    # Block decode only: the same rows before expansion, one per request.
+    # The query-axis fold reads these instead of re-deriving them once
+    # per layer.
+    block_page_table: torch.Tensor | None = None
+    block_seq_lens: torch.Tensor | None = None
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
@@ -128,6 +133,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: MLAPrefillMetadata | None = None
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
+        self._block_page_table_buf: torch.Tensor | None = None
+        self._block_seq_lens_buf: torch.Tensor | None = None
 
     def _takes_query_blocks(
         self, num_q_heads: int, q_len: int, sliding_window: bool
@@ -298,6 +305,40 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
 
+    def _ensure_block_row_buffers(self, bs: int) -> None:
+        """Resident per-request rows behind the block entries, sized once.
+
+        Allocated against the graph buffers' capacity so a captured graph
+        records a block that outlives it.
+        """
+        if self._block_page_table_buf is not None:
+            return
+        max_bs = self.page_table_buf.shape[0] // max(self.block_decode_expansion, 1)
+        self._block_page_table_buf = torch.zeros(
+            (max_bs, self.max_num_pages),
+            dtype=self.page_table_buf.dtype,
+            device=self.page_table_buf.device,
+        )
+        self._block_seq_lens_buf = torch.zeros(
+            max_bs, dtype=self.seq_lens_buf.dtype, device=self.seq_lens_buf.device
+        )
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Broadcast, keeping the per-request row the query-axis fold reads.
+
+        The drafter calls this inside the captured graph, so the row has to be
+        written there too rather than derived from the expanded view per layer.
+        """
+        self._ensure_block_row_buffers(bs)
+        rows = self._block_seq_lens_buf[:bs]
+        torch.clamp(
+            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
+        )
+        expansion = self.block_decode_expansion
+        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
+            rows.unsqueeze(1)
+        )
+
     def _decode_views(self, bs: int) -> MLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -309,10 +350,17 @@ class MLAAttnBackend(PagedAttentionBackend):
             return metadata
         if self.block_decode_active:
             expanded_bs = bs * self.block_decode_expansion
+            self._ensure_block_row_buffers(bs)
             metadata = MLADecodeMetadata(
                 num_extends=0,
                 page_table=self.page_table_buf[:expanded_bs],
                 seq_lens=self.seq_lens_buf[:expanded_bs],
+                # The rows the block entries were expanded from. A kernel that
+                # reads the block on the query axis wants exactly these, and
+                # re-deriving them from the expanded view costs a strided copy
+                # per layer instead of one write per forward.
+                block_page_table=self._block_page_table_buf[:bs],
+                block_seq_lens=self._block_seq_lens_buf[:bs],
             )
         else:
             metadata = MLADecodeMetadata(
@@ -345,8 +393,11 @@ class MLAAttnBackend(PagedAttentionBackend):
             # seeding needs the same safe baseline the recorded
             # fill_block_decode_seq_lens overwrites on replay.
             spec = self.spec_num_tokens
+            self._ensure_block_row_buffers(bs)
+            rows = self._block_page_table_buf[:bs]
+            rows.copy_(page_table[:bs])
             self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(
-                page_table[:bs, None, :]
+                rows[:, None, :]
             )
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
@@ -399,8 +450,8 @@ class MLAAttnBackend(PagedAttentionBackend):
             ):
                 # A kernel that reads the block on the query axis takes the
                 # request's page table and cache length as one row rather than
-                # q_len copies of one row. Take the first row of each request's
-                # group: the flattened metadata replicates it.
+                # q_len copies of one row. Both are built once per forward,
+                # where the block rows were expanded from them.
                 #
                 # Only when the forward is as wide as the block the metadata
                 # was expanded for. The config layer reconciles the two for
@@ -409,8 +460,8 @@ class MLAAttnBackend(PagedAttentionBackend):
                 # arithmetic rather than any shipping configuration: a stride
                 # that disagreed would read the next request's row.
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
-                page_table = metadata.page_table[rows::q_len_per_req].contiguous()
-                cache_seqlens = metadata.seq_lens[rows::q_len_per_req].contiguous()
+                page_table = metadata.block_page_table
+                cache_seqlens = metadata.block_seq_lens
             else:
                 # Metadata already carries one row per block position, each with
                 # the block-end length, so the block is non-causal. Adding the
