@@ -32,12 +32,15 @@ def create_kvstore_storage_backend(
     extra_config: str | None,
     *,
     host_buffer: Any,
-    tp_size: int = 1,
+    tp_size: int,
+    pp_size: int,
 ) -> KvStoreStorage | None:
     """Return an L3 backend for ``backend_name``, or None when L3 is unset.
 
     ``memory`` is a test-only in-process store. ``mooncake`` is the production
-    Mooncake Store client (SGLang/vLLM HiCache equivalent).
+    Mooncake Store client (SGLang/vLLM HiCache equivalent). ``tp_size`` and
+    ``pp_size`` divide ``global_segment_size`` so every attention-TP rank on
+    every pipeline stage mounts an equal share of the configured total.
     """
 
     if backend_name is None:
@@ -55,5 +58,6 @@ def create_kvstore_storage_backend(
             parse_extra_config(extra_config),
             host_buffer=host_buffer,
             tp_size=tp_size,
+            pp_size=pp_size,
         )
     raise ValueError(f"unsupported KVStore storage backend {backend_name!r}")

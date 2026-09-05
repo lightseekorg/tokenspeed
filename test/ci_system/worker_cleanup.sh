@@ -27,6 +27,41 @@ _listen_pids() {
     lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
   elif command -v fuser >/dev/null 2>&1; then
     fuser -n tcp "$port" 2>/dev/null || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :${port}" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'
+  else
+    python3 - "$port" <<'PY'
+import glob
+import os
+import sys
+
+port = int(sys.argv[1])
+needle = f"{port:04X}"
+inodes = set()
+for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 10 or parts[3] != "0A":
+            continue
+        _host, _, hexport = parts[1].rpartition(":")
+        if hexport.upper() == needle:
+            inodes.add(parts[9])
+if not inodes:
+    sys.exit(0)
+pids = set()
+for fd in glob.glob("/proc/[0-9]*/fd/[0-9]*"):
+    try:
+        target = os.readlink(fd)
+    except OSError:
+        continue
+    if target.startswith("socket:[") and target[8:-1] in inodes:
+        pids.add(fd.split("/")[2])
+print("\n".join(sorted(pids, key=int)))
+PY
   fi
 }
 

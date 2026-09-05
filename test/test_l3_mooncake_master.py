@@ -258,6 +258,8 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             "mooncake",
             json.dumps(self._extra_config()),
             host_buffer=host.host_buffer,
+            tp_size=1,
+            pp_size=1,
         )
         self.assertIsInstance(backend, MooncakeKvStore)
         l3 = L3HostStore(backend, host, key_prefix="live", rank=0)

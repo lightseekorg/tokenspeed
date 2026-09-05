@@ -139,7 +139,8 @@ class MooncakeKvStore:
         extra_config: dict[str, Any] | None = None,
         *,
         host_buffer: Any,
-        tp_size: int = 1,
+        tp_size: int,
+        pp_size: int,
     ):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -153,7 +154,14 @@ class MooncakeKvStore:
         self.config = MooncakeStoreConfig.from_mapping(extra_config)
         self.store = MooncakeDistributedStore()
         tp_size = max(int(tp_size), 1)
-        per_rank_segment = self.config.global_segment_size // tp_size
+        pp_size = max(int(pp_size), 1)
+        per_rank_segment = self.config.global_segment_size // (tp_size * pp_size)
+        if per_rank_segment <= 0:
+            raise ValueError(
+                "Mooncake global_segment_size "
+                f"{self.config.global_segment_size} is too small to split "
+                f"across tp_size={tp_size} pp_size={pp_size}"
+            )
         setup_kwargs: dict[str, Any] = {}
         if self.config.tenant_id != _DEFAULT_TENANT_ID:
             setup_kwargs["tenant_id"] = self.config.tenant_id

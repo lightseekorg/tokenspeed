@@ -82,20 +82,34 @@ def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
 
 
 def storage_key_prefix(
-    model_name: str | None,
+    model_name: str,
     *,
-    weight_version: str = "default",
-    cache_signature: str = "",
-    pipeline_rank: int = 0,
+    revision: str,
+    weight_version: str,
+    cache_signature: str,
+    pipeline_rank: int,
+    draft_model: str,
+    draft_revision: str,
+    draft_weight_version: str,
 ) -> str:
-    """Return a collision-resistant namespace for compatible L3 objects."""
+    """Return a collision-resistant namespace for compatible L3 objects.
+
+    Every component is required so a new caller cannot omit the checkpoint
+    identity, cache layout, pipeline stage, or draft pool and silently
+    collide with an incompatible deployment. Empty strings are valid and
+    mean "unset" (no Hugging Face revision, no speculative draft).
+    """
 
     payload = json.dumps(
         {
-            "model": str(model_name or ""),
+            "model": str(model_name),
+            "revision": str(revision),
             "weight_version": str(weight_version),
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
+            "draft_model": str(draft_model),
+            "draft_revision": str(draft_revision),
+            "draft_weight_version": str(draft_weight_version),
         },
         sort_keys=True,
         separators=(",", ":"),

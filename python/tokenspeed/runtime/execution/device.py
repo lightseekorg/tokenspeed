@@ -447,10 +447,20 @@ class DeviceHandle:
             self._l2.rotate_l3_namespace()
 
     def shutdown_cache(self) -> None:
-        """Drain and close the Host-cache tier, when configured."""
+        """Join queued cache submissions, then close L2/L3 on the data plane."""
 
-        if self._l2 is not None:
-            self._l2.shutdown()
+        if self._l2 is None:
+            return
+        errors = []
+        while self._l2_submissions:
+            future = self._l2_submissions.popleft()
+            try:
+                future.result()
+            except BaseException as exc:  # noqa: BLE001 — surface after close
+                errors.append(exc)
+        self._thread.run(self._l2.shutdown)
+        if errors:
+            raise errors[0]
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
@@ -785,11 +795,15 @@ def build_device_side(
                 server_args.kvstore_storage_backend_extra_config,
                 host_buffer=l2_cache_executor.host_storage.host_buffer,
                 tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+                pp_size=(
+                    server_args.mapping.pp_size if server_args.mapping.has_pp else 1
+                ),
             )
             l2_cache_executor.attach_l3_storage(
                 storage_backend,
                 key_prefix=storage_key_prefix(
                     server_args.model,
+                    revision=server_args.revision or "",
                     weight_version=server_args.weight_version,
                     cache_signature=cache_layout_signature(
                         l2_cache_executor.layout,
@@ -800,6 +814,9 @@ def build_device_side(
                     pipeline_rank=(
                         server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
                     ),
+                    draft_model=server_args.speculative_draft_model_path or "",
+                    draft_revision=server_args.revision or "",
+                    draft_weight_version=server_args.weight_version,
                 ),
                 rank=attn_tp_rank,
             )

@@ -63,37 +63,31 @@ class StorageKeyTest(unittest.TestCase):
         self.assertEqual(storage_object_key("abc", 0, 0), "abc|g0|o0|r0")
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
-        base = storage_key_prefix(
-            "org/model", weight_version="v1", cache_signature="layout", pipeline_rank=0
-        )
-        self.assertEqual(
-            base,
-            storage_key_prefix(
-                "org/model",
-                weight_version="v1",
-                cache_signature="layout",
-                pipeline_rank=0,
-            ),
-        )
-        self.assertNotEqual(base, storage_key_prefix("org_model"))
-        self.assertNotEqual(
-            base,
-            storage_key_prefix(
-                "org/model",
-                weight_version="v2",
-                cache_signature="layout",
-                pipeline_rank=0,
-            ),
-        )
-        self.assertNotEqual(
-            base,
-            storage_key_prefix(
-                "org/model",
-                weight_version="v1",
-                cache_signature="layout",
-                pipeline_rank=1,
-            ),
-        )
+        def prefix(**overrides):
+            values = {
+                "model_name": "org/model",
+                "revision": "abc",
+                "weight_version": "v1",
+                "cache_signature": "layout",
+                "pipeline_rank": 0,
+                "draft_model": "",
+                "draft_revision": "",
+                "draft_weight_version": "",
+            }
+            values.update(overrides)
+            return storage_key_prefix(**values)
+
+        base = prefix()
+        self.assertEqual(base, prefix())
+        self.assertTrue(base.startswith("tsl3v1-"))
+        self.assertNotEqual(base, prefix(model_name="org_model"))
+        self.assertNotEqual(base, prefix(revision="def"))
+        self.assertNotEqual(base, prefix(weight_version="v2"))
+        self.assertNotEqual(base, prefix(cache_signature="other"))
+        self.assertNotEqual(base, prefix(pipeline_rank=1))
+        self.assertNotEqual(base, prefix(draft_model="org/draft"))
+        with self.assertRaises(TypeError):
+            storage_key_prefix("org/model")
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(
@@ -168,7 +162,7 @@ class L3HostStoreTest(unittest.TestCase):
         )
         l3.close()
 
-    def test_namespace_rotation_hides_objects_published_before_clear(self):
+    def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh")
         l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
@@ -176,12 +170,13 @@ class L3HostStoreTest(unittest.TestCase):
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
-        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
+        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
         self.assertEqual(l3.exists(pages), [False])
         restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
+        self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
         self.assertEqual(restarted.exists(pages), [False])
 
-    def test_namespace_rotates_locally_even_when_remote_delete_fails(self):
+    def test_clear_raises_when_remote_delete_fails_and_keeps_the_prefix(self):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1)
@@ -190,18 +185,24 @@ class L3HostStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "delete failed"):
             l3.rotate_namespace()
 
-        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
+        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
 
 
 class FactoryTest(unittest.TestCase):
     def test_memory_and_unknown_backend(self):
-        backend = create_kvstore_storage_backend("memory", None, host_buffer=object())
+        backend = create_kvstore_storage_backend(
+            "memory", None, host_buffer=object(), tp_size=1, pp_size=1
+        )
         self.assertIsInstance(backend, MemoryKvStore)
         self.assertIsNone(
-            create_kvstore_storage_backend(None, None, host_buffer=object())
+            create_kvstore_storage_backend(
+                None, None, host_buffer=object(), tp_size=1, pp_size=1
+            )
         )
         with self.assertRaisesRegex(ValueError, "unsupported"):
-            create_kvstore_storage_backend("nfs", None, host_buffer=object())
+            create_kvstore_storage_backend(
+                "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
+            )
 
 
 class MooncakeConfigTest(unittest.TestCase):
@@ -271,6 +272,8 @@ class MooncakeKvStoreTest(unittest.TestCase):
                         "tenant_id": "tenant-a",
                     },
                     host_buffer=host,
+                    tp_size=1,
+                    pp_size=1,
                 )
 
     def test_concurrent_create_is_treated_as_idempotent_success(self):
@@ -307,6 +310,39 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter.store.remove_by_regex.return_value = -1
         with self.assertRaisesRegex(RuntimeError, "Failed to clear"):
             adapter.remove_by_prefix("model_")
+
+    def test_segment_is_divided_across_tp_and_pp_ranks(self):
+        captured = {}
+
+        class _Store:
+            def setup(self, *_args, **_kwargs):
+                captured["segment"] = _args[2]
+                return 0
+
+            def register_buffer(self, ptr, size):
+                del ptr, size
+                return 0
+
+        store_module = types.ModuleType("mooncake.store")
+        store_module.MooncakeDistributedStore = _Store
+        package = types.ModuleType("mooncake")
+        package.store = store_module
+        host = SimpleNamespace(
+            data_ptr=lambda: 1, numel=lambda: 8, element_size=lambda: 1
+        )
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                {
+                    "master_server_address": "127.0.0.1:50051",
+                    "global_segment_size": 8 * 1024**3,
+                },
+                host_buffer=host,
+                tp_size=2,
+                pp_size=2,
+            )
+        self.assertEqual(captured["segment"], 2 * 1024**3)
 
 
 if __name__ == "__main__":

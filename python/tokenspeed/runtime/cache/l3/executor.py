@@ -43,27 +43,28 @@ class L3HostStore:
         backend: KvStoreStorage,
         host_storage: Any,
         *,
-        key_prefix: str = "",
-        rank: int = 0,
+        key_prefix: str,
+        rank: int,
     ):
         self.backend = backend
         self.host_storage = host_storage
         self._base_key_prefix = key_prefix
-        self._namespace_generation = 0
         self.rank = int(rank)
 
     @property
     def key_prefix(self) -> str:
-        if self._namespace_generation == 0:
-            return self._base_key_prefix
-        return f"{self._base_key_prefix}.e{self._namespace_generation}"
+        return self._base_key_prefix
 
     def rotate_namespace(self) -> None:
-        """Delete this namespace and stop reusing any concurrently stale view."""
+        """Delete objects under this stable namespace.
 
-        previous_prefix = self.key_prefix
-        self._namespace_generation += 1
-        self.backend.remove_by_prefix(f"{previous_prefix}_")
+        Cache flush / weight update is cluster-wide: every instance that
+        shares the store must clear together. The prefix itself does not
+        change, so a restarted peer still probes the same namespace and
+        observes the deletion through ``batch_exists``.
+        """
+
+        self.backend.remove_by_prefix(f"{self.key_prefix}_")
 
     def object_key(self, content_hash: str, group_id: int, page_offset: int) -> str:
         return storage_object_key(

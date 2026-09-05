@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -444,24 +445,55 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         )
         self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
 
-    def test_drain_writes_backs_up_host_pages_after_d2h(self):
+    def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
+        started = threading.Event()
+        release = threading.Event()
+
+        def backup(pages):
+            del pages
+            started.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("L3 backup was not released")
+            return [True]
+
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        executor._backup_futures = []
+        executor._l3_workers = None
         executor.l3_store = Mock()
-        executor.l3_store.backup.return_value = [True]
+        executor.l3_store.backup.side_effect = backup
         finish = Mock()
         finish.query.return_value = True
-        results = []
-        pending = executor._drain_writes(
-            [_Ack(finish, [7], [(0, 1, "h0", 0)])], results
-        )
-        self.assertEqual(pending, [])
+        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+
+        first = executor.poll_results()
+        self.assertEqual(first, [])
+        self.assertTrue(started.wait(timeout=2))
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
-        self.assertEqual(len(results), 1)
+        release.set()
+        deadline = time.monotonic() + 2
+        second = []
+        try:
+            while time.monotonic() < deadline:
+                second = executor.poll_results()
+                if second:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(int(second[0].op_id), 7)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
 
     def test_backup_failure_does_not_ack_writeback(self):
         try:
@@ -470,14 +502,42 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        executor._backup_futures = []
+        executor._l3_workers = None
         executor.l3_store = Mock()
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
         finish.query.return_value = True
-        results = []
-        with self.assertRaisesRegex(RuntimeError, "L3 backup failed"):
-            executor._drain_writes([_Ack(finish, [7], [(0, 1, "h0", 0)])], results)
-        self.assertEqual(results, [])
+        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+
+        raised = None
+        try:
+            try:
+                first = executor.poll_results()
+            except RuntimeError as exc:
+                raised = exc
+                first = None
+            if raised is None:
+                self.assertEqual(first, [])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        executor.poll_results()
+                    except RuntimeError as exc:
+                        raised = exc
+                        break
+                    time.sleep(0.01)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
+        self.assertIsNotNone(raised)
+        self.assertRegex(str(raised), "L3 backup failed")
 
     def test_prefetch_failure_raises(self):
         try:
@@ -501,6 +561,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._write_acks = [_Ack(Mock(), [7], [(0, 1, "h0", 0)])]
+        executor._backup_futures = []
+        executor._l3_workers = None
         executor.load_stream = Mock()
         executor.l3_store = Mock()
         executor.l3_store.backup.return_value = [True]

@@ -49,6 +49,11 @@ for _ in $(seq 1 50); do
   sleep 0.05
 done
 zombie=$(cat {str(zombie_file)!r})
+for _ in $(seq 1 50); do
+  state=$(awk '/^State:/{{print $2; exit}}' "/proc/$zombie/status" 2>/dev/null || true)
+  [[ "$state" == "Z" ]] && break
+  sleep 0.05
+done
 if pid_is_live "$zombie"; then
   echo "zombie $zombie reported live" >&2
   kill "$parent" 2>/dev/null || true

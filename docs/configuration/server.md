@@ -314,8 +314,14 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
-Each packed Host CacheBlock is one Mooncake object. L3 requires Host L2
-(do not pass `--disable-kvstore`). Pass Mooncake client settings as JSON
+Each packed Host CacheBlock is one Mooncake object, keyed as
+`{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}`. The
+hashed prefix includes the loaded checkpoint (`--model`, `--revision`,
+`--weight-version`), the packed layout, the pipeline stage, and any
+speculative draft checkpoint. `global_segment_size` is split across
+attention-TP × pipeline-parallel ranks so the mounted total matches the
+configured size. L3 requires Host L2 (do not pass `--disable-kvstore`).
+Pass Mooncake client settings as JSON
 in `--kvstore-storage-backend-extra-config`, for example:
 
 ```json
