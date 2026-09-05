@@ -47,12 +47,16 @@ def _run_mla_decode(
     spec = block_size or q_len_per_req
     metadata_rows = bs * spec if draft_block_decode else bs
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    block_seq_lens = seq_lens
     if draft_block_decode:
         seq_lens = seq_lens.repeat_interleave(spec)
     backend.forward_decode_metadata = SimpleNamespace(
         num_extends=0,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
         seq_lens=seq_lens,
+        # Built once per forward alongside the expanded rows above.
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=block_seq_lens,
     )
     backend.is_draft = is_draft
     backend.draft_block_decode = draft_block_decode
@@ -139,9 +143,9 @@ def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monke
     """One row per request instead of one per block position, same mask.
 
     The flattened metadata repeats each request's page table and block-end
-    length once per block position, so the first row of every group is the
-    request. Folding is only correct because of that, and only allowed when a
-    kernel says it reads the query-axis form.
+    length once per block position, so the un-expanded rows are the request.
+    Folding is only correct because of that, and only allowed when a kernel
+    says it reads the query-axis form.
     """
     captured = _run_mla_decode(
         monkeypatch,
@@ -220,6 +224,23 @@ def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkey
     )
     assert captured["q"].shape[:2] == (14, 1)
     assert captured["noncausal_block_size"] == 8
+
+
+def test_the_metadata_carries_the_fold_the_layers_used_to_re_derive() -> None:
+    """Hoisted out of the per-layer path; it must still be the same rows."""
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.spec_num_tokens = 4
+    backend.max_context_len = 256
+    expanded_table, expanded_lens, block_table, block_lens = (
+        backend._expand_block_decode_metadata(
+            torch.arange(6, dtype=torch.int32).view(2, 3),
+            torch.tensor([64, 128], dtype=torch.int32),
+            2,
+        )
+    )
+
+    torch.testing.assert_close(block_table, expanded_table[0::4])
+    torch.testing.assert_close(block_lens, expanded_lens[0::4])
 
 
 def test_the_cutedsl_drafter_backend_never_reaches_the_shared_dispatcher() -> None:

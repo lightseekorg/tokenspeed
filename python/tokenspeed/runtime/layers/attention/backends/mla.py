@@ -97,6 +97,10 @@ class MLADecodeMetadata:
     # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
+    # Block decode only: the same rows before expansion, one per request. The
+    # query-axis fold reads these instead of re-deriving them once per layer.
+    block_page_table: torch.Tensor | None = None
+    block_seq_lens: torch.Tensor | None = None
 
     @property
     def block_kv_indices(self) -> torch.Tensor:
@@ -154,6 +158,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata: dict[int, MLADecodeMetadata] = {}
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
+        self.cuda_graph_block_page_table: torch.Tensor | None = None
+        self.cuda_graph_block_seq_lens: torch.Tensor | None = None
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
 
@@ -452,9 +458,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             )
             group_out_cache_loc = None
         if self._block_decode_active:
-            page_table, block_seq_lens = self._expand_block_decode_metadata(
-                page_table, seq_lens[:bs], bs
-            )
+            (
+                page_table,
+                expanded_seq_lens,
+                block_page_table,
+                block_seq_lens,
+            ) = self._expand_block_decode_metadata(page_table, seq_lens[:bs], bs)
             self.forward_decode_metadata = MLADecodeMetadata(
                 # The drafter calls in with num_extends == bs (its rows are
                 # "extend" by its own convention) but every one of them is a
@@ -462,12 +471,14 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 # Carrying its value here would slice the whole block away.
                 num_extends=0,
                 page_table=page_table,
-                seq_lens=block_seq_lens,
+                seq_lens=expanded_seq_lens,
                 # The drafter owns block write locations: it recomputes them
                 # in-graph from the live draft length, which is not knowable
                 # here. Only the read path takes the group page table.
                 group_out_cache_loc=None,
                 group_q_len_per_req=1,
+                block_page_table=block_page_table,
+                block_seq_lens=block_seq_lens,
             )
             return
         self.forward_decode_metadata = MLADecodeMetadata(
@@ -491,7 +502,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         page_table: torch.Tensor,
         seq_lens: torch.Tensor,
         bs: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """One decode row per block position, all sharing the block-end length.
 
         The MLA decode kernel derives its mask from each row's ``cache_seqlens``.
@@ -504,12 +515,14 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # Clamp so a request near the context limit cannot ask the kernel for
         # more page-table columns than exist (mirrors the MHA path, where the
         # unclamped block-end length caused out-of-bounds page reads).
-        expanded_seq_lens = (
-            seq_lens.clamp(spec, self.max_context_len)
-            .repeat_interleave(spec)
-            .contiguous()
+        block_seq_lens = seq_lens.clamp(spec, self.max_context_len)
+        expanded_seq_lens = block_seq_lens.repeat_interleave(spec).contiguous()
+        return (
+            expanded_page_table,
+            expanded_seq_lens,
+            page_table.contiguous(),
+            block_seq_lens,
         )
-        return expanded_page_table, expanded_seq_lens
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Broadcast each request's block-end length to its block rows.
@@ -519,9 +532,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         itself recomputed in-graph from the target's accept lengths).
         """
         spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
-        )
+        rows = self.cuda_graph_block_seq_lens[:bs]
+        torch.clamp(block_seq_lens[:bs], spec, self.max_context_len, out=rows)
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(rows.unsqueeze(1))
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         if (
@@ -568,6 +581,14 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.cuda_graph_seq_lens = torch.zeros(
             graph_rows, dtype=torch.int32, device=self.device
         )
+        if self._block_decode_active:
+            # Per-request rows for the query-axis fold, filled once per forward.
+            self.cuda_graph_block_page_table = torch.zeros(
+                (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_block_seq_lens = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            )
         self.decode_cuda_graph_metadata = {}
         if self._cache_contract_bound:
             # Target verify records spec_num_tokens write locations per request.
@@ -655,9 +676,15 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             page_table=self.cuda_graph_page_table[:expanded_bs, :],
             seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
             group_out_cache_loc=None,
+            block_page_table=self.cuda_graph_block_page_table[
+                :bs, : self.max_num_pages
+            ],
+            block_seq_lens=self.cuda_graph_block_seq_lens[:bs],
         )
         metadata.page_table.zero_()
         metadata.seq_lens.fill_(spec)
+        metadata.block_page_table.zero_()
+        metadata.block_seq_lens.fill_(spec)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -676,29 +703,26 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         spec = self.spec_num_tokens
         width = self.max_num_pages
         rows = self.cuda_graph_page_table[: bs * spec, :width].view(bs, spec, width)
+        # One row per request first: the query-axis fold reads it directly, and
+        # the block rows are broadcast from it.
+        block = self.cuda_graph_block_page_table[:bs, :width]
         if self._cache_groups_bound and cache_metadata is not None:
             table = self._resolve_full_history_table(cache_metadata, forward_batch, 0)
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
-                rows[:real_bs].copy_(table[:real_bs, None, :width])
+                block[:real_bs].copy_(table[:real_bs, :width])
             if real_bs < bs:
-                rows[real_bs:].zero_()
-            return
-        if (
-            self._cache_groups_bound
-            and self._cache_contract_bound
-            and page_table is not None
-        ):
+                block[real_bs:].zero_()
+        elif page_table is not None:
             # Draft replay receives the already-expanded batch table published
             # by ModelExecutor. Padded rows were zeroed at publication time.
-            rows.copy_(page_table[:bs, :width][:, None, :])
-            return
-        if page_table is None:
+            block.copy_(page_table[:bs, :width])
+        else:
             raise RuntimeError(
                 "MLA block-decode replay has neither cache metadata nor a "
                 "draft page table to read page ids from"
             )
-        rows.copy_(page_table[:bs, :width][:, None, :])
+        rows.copy_(block[:, None, :])
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -826,8 +850,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             ):
                 # A kernel that reads the block on the query axis takes the
                 # request's page table and cache length as one row rather than
-                # q_len copies of one row. Take the first row of each request's
-                # group: the flattened metadata replicates it.
+                # q_len copies of one row. Both are built once per forward,
+                # where the block rows were expanded from them.
                 #
                 # Only when the forward is as wide as the block the metadata
                 # was expanded for. The config layer reconciles the two for
@@ -836,8 +860,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 # arithmetic rather than any shipping configuration: a stride
                 # that disagreed would read the next request's row.
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
-                page_table = metadata.page_table[rows::q_len_per_req].contiguous()
-                cache_seqlens = metadata.seq_lens[rows::q_len_per_req].contiguous()
+                page_table = metadata.block_page_table
+                cache_seqlens = metadata.block_seq_lens
             else:
                 # Metadata already carries one row per block position, each with
                 # the block-end length, so the block is non-causal. Adding the
