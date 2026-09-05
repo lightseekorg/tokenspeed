@@ -502,14 +502,23 @@ class DFlashDraftModel(nn.Module):
                 residual=residual,
             )
 
-        if residual is None:
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.final_norm(hidden_states, residual)
 
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=hidden_states
         )
+
+    def final_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Norm the last layer's output.
+
+        A draft whose layers hand back a shard-local partial overrides this to
+        reduce first.
+        """
+        if residual is None:
+            return self.norm(hidden_states)
+        return self.norm(hidden_states, residual)[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

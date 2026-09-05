@@ -32,7 +32,7 @@ from torch import nn
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -265,6 +265,25 @@ class CandidateSelector(nn.Module):
         )
 
 
+def _reduce_norm(
+    norm: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    tp: MappingBase,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a shard-local partial, then norm.
+
+    Deliberately the unfused path, matching
+    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
+    from the target's shapes and the draft's block forward is a different
+    width. This puts the reduction where that fusion can absorb it once it has
+    been verified at this width.
+    """
+    if tp.tp_size <= 1:
+        return norm(hidden_states, residual)
+    return norm(all_reduce(hidden_states, tp.tp_group), residual)
+
+
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     """DFlash layer with dynamic convolutions around attention and the MLP."""
 
@@ -355,13 +374,17 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            # Borrowed vocab-parallel embeddings are shard-local partials. The
-            # grouped conv needs a complete hidden row, while every later layer
-            # already receives the all-reduced output of the preceding MLP
-            # conv. Reduce exactly once, at the first draft layer.
-            if self.layer_id == 0 and self.mapping.dense.tp_size > 1:
-                hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # Every layer is handed a shard-local partial: borrowed
+            # vocab-parallel embeddings at layer 0, the preceding MLP conv
+            # afterwards. The conv is linear in its input and its coefficients
+            # come from an already-reduced hidden, so the reduction commutes
+            # with it and lands here, where the norm can absorb it.
+            hidden_states, residual = _reduce_norm(
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.mapping.dense,
+            )
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         attention_kwargs = dict(
@@ -373,15 +396,16 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         if self.comm_manager is not None:
             attention_kwargs["comm_manager"] = self.comm_manager
         hidden_states = self.self_attn(**attention_kwargs)
-        if self.mapping.attn.tp_size > 1:
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+        hidden_states, residual = _reduce_norm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+            self.mapping.attn,
+        )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self.mapping.dense.tp_size > 1:
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
         return hidden_states, residual
 
@@ -417,6 +441,20 @@ class DFlash2DraftModel(DFlashDraftModel):
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )
+
+    def final_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The last layer hands back its MLP conv's partial; reduce it here."""
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = _reduce_norm(
+            self.norm,
+            hidden_states,
+            residual,
+            self.mapping.dense,
+        )
+        return hidden_states
 
     @property
     def _uses_mla(self) -> bool:
