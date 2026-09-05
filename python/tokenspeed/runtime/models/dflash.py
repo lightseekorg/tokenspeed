@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -391,10 +392,11 @@ class DFlashDraftModel(nn.Module):
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
-        self.fc = nn.Linear(
+        self.fc = ReplicatedLinear(
             self.num_context_features * int(config.hidden_size),
             int(config.hidden_size),
             bias=False,
+            prefix=add_prefix("fc", prefix),
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
@@ -402,7 +404,7 @@ class DFlashDraftModel(nn.Module):
         self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden))
+        return self.hidden_norm(self.fc(target_hidden)[0])
 
     # ------------------------------------------------------------------
     # Context-injection contract
@@ -415,7 +417,7 @@ class DFlashDraftModel(nn.Module):
 
     @property
     def context_in_features(self) -> int:
-        return int(self.fc.in_features)
+        return int(self.fc.input_size)
 
     @property
     def context_dtype(self) -> torch.dtype:

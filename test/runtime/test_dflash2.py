@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm.routed_gemv import MEASURED_ROUTE
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -46,6 +47,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
+from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.models.dflash import (
     DFlashDraftModel,
     get_dflash_layer_cache_group_id,
@@ -63,6 +65,17 @@ from tokenspeed.runtime.models.dflash2 import (
 _CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
 )
+
+
+def test_draft_projections_reach_the_measured_gemv_route() -> None:
+    conv = DFlashGroupedConv(16, taps=2, group_size=4, block_size=8)
+    selector = CandidateSelector(16, vocab_size=32, rank=4, top_k=4)
+    assert isinstance(conv.kernel_projection, ReplicatedLinear)
+    assert isinstance(selector.hidden_projection, ReplicatedLinear)
+    # The TP8 widths at the M a block drafter serves: batch * block width for
+    # the conv, batch * (block width - 1) for the selector.
+    for n, k in ((1792, 7168), (256, 7168)):
+        assert all((m, n, k) in MEASURED_ROUTE for m in (8, 16, 24, 32))
 
 
 def test_dflash2_architecture_dispatches_to_its_selector_runtime() -> None:

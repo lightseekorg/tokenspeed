@@ -38,8 +38,6 @@ for no reason at all.
 from __future__ import annotations
 
 import torch
-from tokenspeed_mla import get_num_sm, tokenspeed_mla_decode
-
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -47,6 +45,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_mla import get_num_sm, tokenspeed_mla_decode
 
 __all__ = ["tokenspeed_mla_decode_with_kvcache"]
 
