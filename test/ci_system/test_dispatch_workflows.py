@@ -794,14 +794,14 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
     assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120
 
 
-def test_mi450_sim_uses_direct_runner_and_extended_timeout():
+def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
     job = workflow["jobs"]["test"]
 
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 75 || inputs.timeout_minutes }}"
+        " && 45 || inputs.timeout_minutes }}"
     )
 
 
@@ -811,7 +811,7 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
     assert task["runner"]["labels"] == ["amd-mi45x-cpu-test"]
 
 
-def test_mi450_sim_has_one_hour_internal_timeout():
+def test_mi450_sim_has_half_hour_internal_timeout():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
-    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "3600"
+    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "1800"

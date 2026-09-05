@@ -13,7 +13,7 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
-  MI450_SIM_RUN_TIMEOUT: "3600"
+  MI450_SIM_RUN_TIMEOUT: "1800"
   # A ceiling on concurrent simulators. A simulator takes two CPU threads.
   MI450_SIM_WORKERS: "16"
   TEST_DESELECTS: |
