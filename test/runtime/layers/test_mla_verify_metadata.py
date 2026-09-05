@@ -47,12 +47,16 @@ def _run_mla_decode(
     spec = block_size or q_len_per_req
     metadata_rows = bs * spec if draft_block_decode else bs
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    block_seq_lens = seq_lens
     if draft_block_decode:
         seq_lens = seq_lens.repeat_interleave(spec)
     backend.forward_decode_metadata = SimpleNamespace(
         num_extends=0,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
         seq_lens=seq_lens,
+        # Built once per forward alongside the expanded rows above.
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=block_seq_lens,
     )
     backend.is_draft = is_draft
     backend.draft_block_decode = draft_block_decode
@@ -139,9 +143,9 @@ def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monke
     """One row per request instead of one per block position, same mask.
 
     The flattened metadata repeats each request's page table and block-end
-    length once per block position, so the first row of every group is the
-    request. Folding is only correct because of that, and only allowed when a
-    kernel says it reads the query-axis form.
+    length once per block position, so the un-expanded rows are the request.
+    Folding is only correct because of that, and only allowed when a kernel
+    says it reads the query-axis form.
     """
     captured = _run_mla_decode(
         monkeypatch,
@@ -220,6 +224,35 @@ def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkey
     )
     assert captured["q"].shape[:2] == (14, 1)
     assert captured["noncausal_block_size"] == 8
+
+
+def test_the_metadata_carries_the_fold_the_layers_used_to_re_derive() -> None:
+    """Hoisted out of the per-layer path; it must still be the same rows.
+
+    The block entries are the per-request rows repeated ``spec`` times, so the
+    rows the fold reads have to equal every ``spec``-th expanded entry -- which
+    is exactly what the per-layer strided copy used to compute.
+    """
+    bs, spec, pages = 2, 4, 3
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.spec_num_tokens = spec
+    backend.max_context_len = 256
+    backend.max_num_pages = pages
+    backend.draft_block_decode = True  # block_decode_active/_expansion derive
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
+
+    page_table = torch.arange(bs * pages, dtype=torch.int32).view(bs, pages)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
+    backend.fill_block_decode_seq_lens(bs, seq_lens)
+    metadata = backend.forward_decode_metadata
+
+    torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
+    torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens[0::spec])
 
 
 def test_the_cutedsl_drafter_backend_never_reaches_the_shared_dispatcher() -> None:
