@@ -349,11 +349,11 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @cached_property
     def tail_extra_slots(self) -> int:
-        if getattr(self.server_args, "speculative_algorithm", None) is None:
+        if self.server_args.speculative_algorithm is None:
             return 0
         return _require_non_negative_int(
             "speculative_num_draft_tokens",
-            int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0),
+            int(self.server_args.speculative_num_draft_tokens or 0),
         )
 
     @override
@@ -425,16 +425,10 @@ class Glm53FlashRecipe(CacheRecipe):
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
         usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
-        num_lcm_blocks = usable_bytes // layout.lcm_block_bytes - 1
-        if num_lcm_blocks < 1:
-            raise ValueError(
-                f"{self.family} cache budget must hold a null parent and one "
-                "usable LCM parent"
-            )
-        token_limit = self.token_limit
-        if token_limit is None:
-            return num_lcm_blocks
-        return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
+        budgeted = self._budgeted_parents(usable_bytes, layout.lcm_block_bytes)
+        if self.token_limit is None:
+            return budgeted
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

@@ -40,9 +40,6 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor | None = None
     min_ps: torch.Tensor | None = None
 
-    # Whether all requests use greedy sampling
-    is_all_greedy: bool = False
-
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int = 0
     grammars: list | None = None
@@ -68,6 +65,12 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
+    # First batch row this info covers, relative to the step's full batch.
+    # Per-step row-indexed backend buffers (the coin buffers a mixed round's
+    # prepare_step filled in prefill-then-decode order) must be read at this
+    # offset — a MIXED round's verify() sees only the decode suffix.
+    batch_row_offset: int = 0
+
     # Device
     device: str = "cuda"
 
@@ -78,10 +81,6 @@ class SamplingBatchInfo:
         different sampler ops to a prefix vs suffix of rows. Only ``slice``
         is supported — int indexing would yield 0-dim tensors and break
         downstream gathers.
-
-        ``is_all_greedy`` is inherited from the parent; when ``top_ks`` is
-        populated the slice refines it from the sliced tensor (one GPU
-        sync, only on the disagg slice path).
         """
         if not isinstance(s, slice):
             raise TypeError(
@@ -97,8 +96,8 @@ class SamplingBatchInfo:
             top_ps=_slice(self.top_ps),
             top_ks=_slice(self.top_ks),
             min_ps=_slice(self.min_ps),
-            is_all_greedy=self.is_all_greedy,
             req_pool_indices=_slice(self.req_pool_indices),
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
+            batch_row_offset=self.batch_row_offset + (s.start or 0),
         )

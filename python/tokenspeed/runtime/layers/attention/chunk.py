@@ -25,16 +25,12 @@ import torch
 import triton
 import triton.language as tl
 
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
-
-logger = get_colorful_logger(__name__)
 
 
 @triton.jit
 def create_chunked_cache_kv_indices_paged(
-    page_table_ptr,  # (max_batch, max_pages)
-    req_pool_indices_ptr,  # (batch_size,)
+    page_table_ptr,  # [bs, max_pages], row i == batch position i
     chunk_start_idx_ptr,  # (batch_size,)
     chunk_seq_lens_ptr,  # (batch_size,)
     chunk_cum_seq_lens_ptr,  # (batch_size + 1,)
@@ -45,7 +41,6 @@ def create_chunked_cache_kv_indices_paged(
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
     chunk_kv_indices_offset = tl.load(chunk_cum_seq_lens_ptr + pid)
 
     chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
@@ -58,7 +53,7 @@ def create_chunked_cache_kv_indices_paged(
         token_pos = chunk_start_pos + offset
         page_idx = token_pos // PAGE_SIZE
         page_id = tl.load(
-            page_table_ptr + req_pool_index * page_table_ptr_stride + page_idx,
+            page_table_ptr + pid * page_table_ptr_stride + page_idx,
             mask=mask,
         )
         kv_slot = page_id * PAGE_SIZE + token_pos % PAGE_SIZE
@@ -126,10 +121,9 @@ def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
     return chunks
 
 
-def get_chunks_paged(
-    prefix_lens, prefix_lens_cpu, page_table, req_pool_indices, page_size
-):
-    """Page-table aware version of get_chunks."""
+def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
+    """Chunk the cached prefixes and resolve each chunk's KV slots through
+    the batch-ordered ``[bs, max_pages]`` kernel page table."""
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
 
@@ -150,7 +144,6 @@ def get_chunks_paged(
         )
         create_chunked_cache_kv_indices_paged[(batch_size,)](
             page_table,
-            req_pool_indices,
             chunks.starts[idx],
             chunks.len_in_chunk[idx],
             chunks.cum_seq_lens[idx],
@@ -167,13 +160,13 @@ def build_chunked_prefill_metadata_arrays(
     extend_prefix_lens,
     extend_prefix_lens_cpu,
     page_table,
-    req_pool_indices,
     page_size,
 ):
     """Build the per-prefix-loop arrays for chunked-prefill MLA.
 
     Run once per chunked-prefill iteration in the backend's
-    ``_init_prefill_metadata``. Returns:
+    ``_init_prefill_metadata``; ``page_table`` is the batch-ordered
+    ``[num_extends, max_pages]`` kernel page table. Returns:
 
     - ``chunked_loop_num``: number of prefix loop iterations
     - ``chunk_kv_indices_list``: List[Tensor], paged KV indices per loop_idx
@@ -193,7 +186,6 @@ def build_chunked_prefill_metadata_arrays(
         extend_prefix_lens,
         extend_prefix_lens_cpu,
         page_table,
-        req_pool_indices,
         page_size,
     )
     chunked_loop_num = chunks.starts.shape[0]

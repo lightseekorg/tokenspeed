@@ -74,6 +74,10 @@ if platform.is_amd:
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+        _supports_a16w4_warp_decode_ep_gfx950,
+        gluon_a16w4_situ_warp_decode_ep_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
         gluon_a16w4_grouped_ep_gfx950,
         gluon_a16w4_situ_grouped_ep_gfx950,
@@ -171,8 +175,7 @@ if platform.is_amd:
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
         output = getattr(w, "_situ_output_buffer", None)
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-            _supports_a16w4_warp_decode_ep_gfx950,
-            gluon_a16w4_warp_decode_ep_gfx950,
+            gluon_a16w4_situ_warp_decode_ep_gfx950 as route_direct_decode,
         )
 
         use_route_direct_decode = _supports_a16w4_warp_decode_ep_gfx950(
@@ -187,7 +190,7 @@ if platform.is_amd:
         if use_route_direct_decode:
             # Both stages localize global expert IDs while consuming the linear
             # checkpoint layout, avoiding four pointwise localization kernels.
-            return gluon_a16w4_warp_decode_ep_gfx950(
+            return route_direct_decode(
                 x,
                 w.w13_weight,
                 w.w13_weight_scale,
@@ -380,6 +383,28 @@ if platform.is_amd:
                 activation="situ",
                 do_finalize=do_finalize,
             )
+        if _supports_a16w4_warp_decode_ep_gfx950(
+            x,
+            w.w13_weight_triton_tensor,
+            w.w13_precision_config.b_mx_scale,
+            w.w2_weight_triton_tensor,
+            w.w2_precision_config.b_mx_scale,
+            linear_weights=False,
+        ):
+            num_local_experts = int(getattr(w, "num_local_experts"))
+            return gluon_a16w4_situ_warp_decode_ep_gfx950(
+                x,
+                w.w13_weight_triton_tensor,
+                w.w13_precision_config.b_mx_scale,
+                w.w2_weight_triton_tensor,
+                w.w2_precision_config.b_mx_scale,
+                topk_weights,
+                topk_ids,
+                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+                situ_linear_beta=float(situ_linear_beta),
+                expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
+                routed_out=getattr(w, "_situ_output_buffer", None),
+            )
         num_local_experts = int(getattr(w, "num_local_experts"))
         global_num_experts = int(getattr(w, "num_experts"))
         out = gluon_mxfp4_fp8_precomputed_situ(
@@ -395,6 +420,7 @@ if platform.is_amd:
             out=getattr(w, "_situ_output_buffer", None),
             expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
             global_num_experts=global_num_experts,
+            prefill_activation_format="e4m3",
         )
         if out is None:
             raise ValueError("gfx950 A8W4 SiTU EP MoE does not support this shape")

@@ -35,34 +35,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
 )
 
 
-def _estimate_pipeline_lds_per_buffer(
-    *,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    x_format: str,
-    w_format: str = "e2m1",
-    has_x_block_scale: bool | None = None,
-    has_w_block_scale: bool = True,
-    scale_load_mode: str = "transpose",
-) -> int:
-    if has_x_block_scale is None:
-        has_x_block_scale = x_format == "e2m1"
-    x_bytes = block_m * block_k
-    if x_format == "e2m1":
-        x_bytes //= 2
-    w_bytes = block_n * block_k
-    if w_format == "e2m1":
-        w_bytes //= 2
-    scale_bytes = 0
-    if scale_load_mode != "bypass":
-        if has_x_block_scale:
-            scale_bytes += block_m * (block_k // 32)
-        if has_w_block_scale:
-            scale_bytes += block_n * (block_k // 32)
-    return x_bytes + w_bytes + scale_bytes
-
-
 def _effective_scale_load_mode(
     mode: str,
     block_m: int,
@@ -264,7 +236,6 @@ def _autotune_block(
 
 def _autotune_pid_swizzle(
     num_tiles_total: int,
-    grid_n: int,
     grid_m_padded: int,
     block_m: int,
 ) -> tuple[int, int]:

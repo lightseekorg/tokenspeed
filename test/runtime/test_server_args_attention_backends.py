@@ -122,7 +122,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
 
     def test_mha_kernel_solution_backends_use_mha_backend(self):
-        from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
 
         for backend in ("mha", "fa3", "fa4", "triton", "flashinfer"):
             self.assertIs(
@@ -131,7 +133,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
 
     def test_mla_backend_registered_for_mla(self):
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
 
         self.assertIs(
             registry._get_backend_cls("mla", AttentionArch.MLA),
@@ -139,7 +143,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
 
     def test_gluon_backend_registered_for_mla(self):
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
 
         self.assertIs(
             registry._get_backend_cls("gluon", AttentionArch.MLA),
@@ -149,7 +155,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_gluon_mla_backend_forces_gluon_kernel_solution(self):
         import torch
 
-        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
@@ -177,34 +185,53 @@ class TestAttentionBackendChoices(unittest.TestCase):
             context_len=65536,
             kernel_page_size=64,
             max_bs=8,
-            max_graph_bs=8,
             components=(spec,),
         )
 
-        self.assertEqual(MLAAttnBackend(config, spec).kernel_solution, "gluon")
+        self.assertEqual(
+            MLAAttnBackend(config, spec, kernel_page_size=64).kernel_solution,
+            "gluon",
+        )
 
-    def test_dsa_routes_dense_attention_through_registry(self):
-        from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+    def test_dsa_routes_dense_attention_by_platform(self):
+        import dataclasses
+
+        from tokenspeed.runtime.layers.attention.backends.paged import (
+            dsa as dsa_backend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
         config = object()
+        # The dense delegate interprets backend_name itself, so _make_dense_leaf
+        # must hand it a spec cleared of the wrapper-selecting 'dsa' name.
+        spec = SoftmaxAttnConfig(
+            backend_name="dsa",
+            num_attention_heads=2,
+            num_kv_heads=1,
+            head_dim=8,
+            attn_tp_size=1,
+        )
         dense_backend = object()
 
-        for platform, name in (
-            (SimpleNamespace(is_nvidia=True, is_amd=False), "trtllm_mla"),
-            (SimpleNamespace(is_nvidia=False, is_amd=True), "mla"),
+        for platform, cls_name in (
+            (SimpleNamespace(is_nvidia=True, is_amd=False), "TRTLLMMLABackend"),
+            (SimpleNamespace(is_nvidia=False, is_amd=True), "MLAAttnBackend"),
         ):
             with (
-                self.subTest(name=name),
+                self.subTest(name=cls_name),
                 mock.patch.object(
-                    registry,
-                    "_create_attn_backend_with_name",
-                    return_value=dense_backend,
+                    dsa_backend, cls_name, return_value=dense_backend
                 ) as create,
             ):
                 self.assertIs(
-                    dsa_backend._make_dense_backend(config, platform), dense_backend
+                    dsa_backend._make_dense_leaf(config, spec, platform, 64),
+                    dense_backend,
                 )
-                create.assert_called_once_with(name, AttentionArch.MLA, config)
+                create.assert_called_once_with(
+                    config,
+                    dataclasses.replace(spec, backend_name=None),
+                    kernel_page_size=64,
+                )
 
     def test_named_backend_routing_does_not_mutate_source_spec(self):
         from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
@@ -259,6 +286,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
             prefix_granularity=64,
             kernel_page_size=None,
             max_cudagraph_capture_size=4,
+            chunked_prefill_size=8192,
+            disaggregation_mode="null",
             kv_cache_quant_method="none",
             speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
@@ -266,6 +295,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
         )
         model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(),
             context_len=4096,
             num_attention_heads=16,
             num_key_value_heads=8,
@@ -278,6 +308,60 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
         self.assertEqual(config.context_len, 4108)
+
+
+class TestPagedRouterNameResolution(unittest.TestCase):
+    """Names reaching create_paged_router select the LEAF; wrapper names
+    must not leak into leaf constructors that interpret backend_name
+    themselves (MHA/MLA kernel-solution maps)."""
+
+    def _config(self):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+
+        spec = MHAConfig(
+            backend_name="hybrid_linear_attn",  # the composite sentinel
+            num_attention_heads=2,
+            num_kv_heads=2,
+            head_dim=8,
+            attn_tp_size=1,
+        )
+        return AttnConfig(
+            device="cpu",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            prefix_granularity=64,
+            kernel_page_size=64,
+            context_len=256,
+            max_bs=2,
+            kv_cache_quant_method="none",
+            components=(spec,),
+        )
+
+    def test_hybrid_sentinel_resolves_the_arch_default_leaf(self):
+        # 'hybrid_linear_attn' names the WRAPPER; the paged leaf under it
+        # auto-resolves from the arch. Startup used to die with
+        # "Unknown attention backend: 'hybrid_linear_attn'".
+        config = self._config()
+        router = registry.create_paged_router(config, AttentionArch.MHA)
+        leaf = router._leaf_factory("full_attention", 64)
+        self.assertEqual(type(leaf).__name__, "MHAAttnBackend")
+        # And the leaf's own spec resolved a kernel solution (backend_name
+        # was cleared, not passed through as the sentinel).
+        self.assertNotEqual(
+            getattr(leaf, "kernel_solution", "unset"), "hybrid_linear_attn"
+        )
+
+    def test_leaf_factory_does_not_mutate_the_shared_spec(self):
+        config = self._config()
+        spec = config.component(registry.SoftmaxAttnConfig)
+        router = registry.create_paged_router(
+            config, AttentionArch.MHA, backend_name="mha"
+        )
+        router._leaf_factory("full_attention", 64)
+        # Lazy leaf construction must not leave a mutated shared component.
+        self.assertEqual(spec.backend_name, "hybrid_linear_attn")
 
 
 class TestDecodeHostL2(unittest.TestCase):

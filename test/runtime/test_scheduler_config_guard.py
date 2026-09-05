@@ -58,7 +58,7 @@ class FakeContract:
 
 
 class FakePool:
-    def __init__(self, contract: FakeContract | None):
+    def __init__(self, contract: FakeContract):
         # The arena publishes the contract; a view only names its arena.
         self.arena = SimpleNamespace(runtime_contract=contract)
 
@@ -72,13 +72,6 @@ class HybridBackend:
 
 
 class ValidateSchedulerConfigTest(unittest.TestCase):
-    def test_contractless_pool_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "CacheRuntimeContract"):
-            _pcs.validate_scheduler_config(
-                attn_backend=HistoryBackend(),
-                kv_pool=FakePool(None),
-            )
-
     def test_covered_families_pass(self):
         _pcs.validate_scheduler_config(
             attn_backend=HistoryBackend(),

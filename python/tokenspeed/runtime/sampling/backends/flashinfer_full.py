@@ -433,8 +433,11 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
-        coins = self._coins_buf[:bs, :num_tokens_per_req]
-        coins_for_final_sampling = self._final_coins_buf[:bs]
+        # Coins were filled in the step's full batch order; a MIXED round's
+        # verify sees only the decode suffix (see FlashInferSamplingBackend).
+        row0 = sampling_info.batch_row_offset
+        coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
+        coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
         chain_speculative_sampling_target_only(
             predicts=predict,

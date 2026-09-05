@@ -111,9 +111,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
-            # top_k = 1 means greedy sampling
             self.temperature = 1.0
             self.top_k = 1
+        if self.top_k == 1:
+            # top_k = 1 means greedy sampling — whether it came from a
+            # near-zero temperature or the caller asked for it directly.
+            # Greedy ignores randomness by definition, so pin the seed: the
+            # unified pool route breaks exact-tie logits with the request's
+            # random stream, and a request-derived seed would make two
+            # identical greedy requests disagree on tied tokens
+            # (dummy-weight tests hit ties routinely; bf16 serving can too).
+            self.seed = 0
         if self.top_k == -1:
             self.top_k = _TOP_K_DISABLED
 

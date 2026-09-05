@@ -36,9 +36,9 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass(kw_only=True)
 class MHAConfig(SoftmaxAttnConfig):
-    # Mixed full+sliding models are ONE component: the per-layer kv-head
-    # vector lives here alongside the inherited layer_types/window.
-    layer_kv_head_counts: tuple[int, ...] | None = None
+    # Mixed full+sliding models are ONE component carrying the inherited
+    # per-layer layer_types/window vectors; the per-layer kv-head counts
+    # live on the cache-pool spec (``CachePoolSpec.layer_kv_head_counts``).
 
     @classmethod
     def generate(
@@ -51,7 +51,7 @@ class MHAConfig(SoftmaxAttnConfig):
         if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
-        hf_config = getattr(model_config, "hf_config", None)
+        hf_config = model_config.hf_config
         # cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
         layer_types = tuple(
             getattr(hf_config, "cache_layer_types", None)

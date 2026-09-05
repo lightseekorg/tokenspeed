@@ -66,8 +66,9 @@ logger = logging.getLogger(__name__)
 class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     """Decoder layer that injects the draft attention and narrows residuals.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates
-    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
+    Restricted to single-layer drafts: the narrowing happens once, at this
+    layer's attention, so a second layer would receive the already-narrowed
+    ``[bs, H]`` rows.
     """
 
     @property
@@ -80,7 +81,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Narrow residual to the draft attention's [bs, H] live rows."""
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
             return residual
         return residual.index_select(0, ctx.gather_ids)
 
@@ -89,7 +90,6 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -104,7 +104,6 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
@@ -171,26 +170,30 @@ class DeepseekModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        if captured_hidden_states is None:
-            raise ValueError("DeepSeek NextN requires captured_hidden_states.")
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if ctx.forward_mode.is_idle():
+            # A DP idle forward carries no rows and exists only so this
+            # rank joins the decoder's MoE collectives; there is no target
+            # hidden state to fuse, so feed eh_proj an empty row block.
+            fused = self.eh_proj.weight.new_zeros((0, self.eh_proj.in_features))
         else:
-            hidden_states = input_embeds
-
-        hidden_states = self.eh_proj(
-            torch.cat(
+            if captured_hidden_states is None:
+                raise ValueError("DeepSeek NextN requires captured_hidden_states.")
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            fused = torch.cat(
                 (
                     self.enorm(hidden_states),
                     self.hnorm(captured_hidden_states),
                 ),
                 dim=-1,
             )
-        )
+
+        hidden_states = self.eh_proj(fused)
 
         residual = None
         if CP_METADATA:
@@ -206,7 +209,6 @@ class DeepseekModelNextN(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
         )
 
@@ -285,7 +287,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
@@ -293,7 +294,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
             )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -471,6 +471,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         cached_a_proj.pop(q_a_proj_name)
                         cached_a_proj.pop(kv_a_proj_name)
                 else:
+                    # Experts this rank owns were consumed by ``moe_loader``
+                    # above; under ep_size > 1 the remaining expert weights
+                    # belong to other ranks.
+                    if ".mlp.experts." in name:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

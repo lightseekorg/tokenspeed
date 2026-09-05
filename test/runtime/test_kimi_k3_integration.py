@@ -39,15 +39,9 @@ def test_metadata_validates_each_groups_own_page_range() -> None:
         "linear_attention_0": np.array([[2]], dtype=np.int32),
     }
     metadata, forward_op = cache_metadata_for(pool.arena.runtime_contract, valid, "cpu")
-    assert metadata.max_page_ids == {
-        "full_attention": 24,
-        "linear_attention_0": 2,
-        "linear_attention_1": 2,
-        "linear_attention_2": 2,
-    }
-    assert (
-        metadata.require_full_attention_table(active_forward_op=forward_op).item() == 24
-    )
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tables["full_attention"].item() == 24
+    assert tables["linear_attention_0"].item() == 2
 
     with pytest.raises(ValueError, match="outside -1..2"):
         cache_metadata_for(

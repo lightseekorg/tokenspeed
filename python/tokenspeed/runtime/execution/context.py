@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -36,9 +36,55 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
+class TargetCaptureSink(Protocol):
+    """A drafter's per-forward consumer of the target's captured taps.
+
+    The target model calls it from inside its layer loop, once per capture
+    layer in ascending layer order, as soon as that tap exists — so the
+    drafter can start work on it under the target's remaining layers.
+    """
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        """Consume capture ``capture_idx`` (the draft's positional tap index)
+        for the forward's ``[num_tokens, hidden]`` rows, gathered across
+        attention TP."""
+
+
+class DraftNarrowing(Protocol):
+    """The drafter's hand in a draft forward that narrows the target's
+    verify-shaped rows to one live row per request (Eagle step 0).
+
+    The forward's input rows are the target's verify window — ``N`` rows per
+    decode request, ragged prompt rows in a MIXED round. The draft writes KV
+    for every row, and from the attention onward each layer keeps only the
+    ``gather_ids`` live rows. The drafter attaches this for exactly those
+    forwards; ``None`` on every other draft step and on every target forward.
+    """
+
+    def publish_accepted_prefix(self) -> None:
+        """Republish the draft's decode lengths as the accepted prefix
+        (``valid_cache_len + accept_len`` per decode request) — the context
+        the live row attends over. The drafter owns the lengths and the
+        backend call; the model names the moment, right before the first
+        kernel that reads the live rows. Idempotent. A layer that first runs
+        verify-shaped kernels over the whole window (the QSA indexer's
+        layout) calls it after them; a draft whose step 0 attends the whole
+        verify window never calls it — the drafter's step loop publishes for
+        the following steps."""
+
+
 @dataclass
 class ForwardContext:
-    """Do not contain Tensor"""
+    """Do not contain Tensor.
+
+    The context describes a forward (mode, counts, DP layout) and points at
+    the two long-lived subsystems it runs against; data travels as forward
+    arguments or through those subsystems (attention metadata, the backend's
+    per-forward scratch, the KV pool). The collaborators a drafter attaches
+    per forward (``draft_narrowing``, ``target_capture_sink``) lend behavior,
+    not buffers. ``gather_ids`` is the one tensor left, pending its move to a
+    forward argument beside ``positions``.
+    """
 
     # --- attention infrastructure ---
     attn_backend: AttentionBackend
@@ -68,19 +114,14 @@ class ForwardContext:
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
 
-    # --- spec-decode draft (drafter-owned buffers plumbed per forward) ---
-    # draft_seq_lens_buf: mutable per-request seq_lens alias the draft backend reads.
-    draft_seq_lens_buf: torch.Tensor | None = None
-    # accept_lengths: per-request accepted verify width for cache_seqlens correction.
-    accept_lengths: torch.Tensor | None = None
-
-    # Sparse-attention top-k shared across layers and draft steps (DSA/QSA).
-    dsa_prefill_topk: Any | None = None
-    dsa_decode_topk: Any | None = None
-
-    # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
-    dsa_swa_slot_mapping: torch.Tensor | None = None
-    dsa_compressor_slot_cache: Any | None = None
+    # --- spec-decode draft (drafter-attached collaborators, per forward) ---
+    # Set on the draft forwards that narrow verify-shaped rows to the
+    # ``gather_ids`` live rows; its presence is the narrowing flag.
+    draft_narrowing: DraftNarrowing | None = None
+    # The drafter's consumer of this target forward's captured taps, attached
+    # by the drafter (prepare_target_forward) for the rounds it overlaps with
+    # the target; None means the taps are only collected in aux_hidden_states.
+    target_capture_sink: TargetCaptureSink | None = None
 
 
 @contextmanager

@@ -175,6 +175,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
     shared_out: torch.Tensor | None = None,
     expert_start: int = 0,
     global_num_experts: int | None = None,
+    prefill_activation_format: str = "e2m1",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Run route-direct SiTU decode or block-ragged SiTU prefill.
 
@@ -244,7 +245,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             expert_start=expert_start,
             global_num_experts=global_num_experts,
             out=out,
-            activation_format="e4m3",
+            activation_format=prefill_activation_format,
         )
         return result
 
@@ -1191,9 +1192,11 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         raise ValueError("local expert range exceeds global expert count")
     if force_reduce is None:
-        # EP ranks own only a fraction of each token's routes. Combining those
-        # sparse local contributions atomically avoids the full top-k scratch.
-        force_reduce = global_num_experts == n_experts and expert_start == 0
+        # EP ranks own only a fraction of each token's routes. For TP, keep the
+        # faster atomic path within the graph-captured EAGLE3 decode window and
+        # preserve deterministic FP32 reduction for larger batches.
+        is_ep_shard = global_num_experts != n_experts or expert_start != 0
+        force_reduce = False if is_ep_shard else n_tokens > 64
     hidden_dim = int(hidden_states.shape[1])
     inter_dim = int(package_w13.shape[1]) // 2
     if (

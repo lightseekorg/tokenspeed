@@ -644,7 +644,6 @@ def get_config(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
     softmax_scale: float,
-    is_fp8: bool,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -742,7 +741,6 @@ def gluon_mla_prefill_gfx1250(
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
-        is_fp8=is_fp8,
     )
     _mla_prefill_gfx1250_kernel[config.grid](
         q,

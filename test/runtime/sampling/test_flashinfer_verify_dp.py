@@ -149,7 +149,7 @@ def _test_verify_dp_matches_today(
     bs: int,
     n: int,
     vocab: int,
-    is_all_greedy: bool,
+    greedy: bool,
     dtype,
     enable_output_logprobs: bool = False,
     forbid_global_logprob_writer: bool = False,
@@ -182,20 +182,23 @@ def _test_verify_dp_matches_today(
             device=device,
         )
     )
-    _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
+    # Greedy is expressed through the pool scalars (top_k=1), matching the
+    # unified sampling route — there is no separate argmax branch.
+    if greedy:
+        _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=1, top_p=1.0)
+    else:
+        _seed_pool_scalars(backend, bs=bs, temperature=1.0, top_k=32, top_p=0.9)
 
     full_logits = _make_logits(bs, n, vocab, dtype=dtype, device=device, seed=2024)
     candidates = _make_candidates(bs, n, vocab, device=device, seed=2024)
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
     sampling_info_full_batch = SamplingBatchInfo(
-        is_all_greedy=is_all_greedy,
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
     )
     sampling_info_dp = SamplingBatchInfo(
-        is_all_greedy=is_all_greedy,
         vocab_size=vocab,
         req_pool_indices=req_pool_indices,
         device=str(device),
@@ -325,7 +328,7 @@ class TestFlashInferVerifyDP:
             bs=bs,
             n=n,
             vocab=256,
-            is_all_greedy=False,
+            greedy=False,
             dtype=dtype,
         )
 
@@ -338,7 +341,7 @@ class TestFlashInferVerifyDP:
             bs=bs,
             n=n,
             vocab=256,
-            is_all_greedy=True,
+            greedy=True,
             dtype=torch.float32,
         )
 
@@ -351,7 +354,7 @@ class TestFlashInferVerifyDP:
             bs=bs,
             n=n,
             vocab=256,
-            is_all_greedy=True,
+            greedy=True,
             dtype=torch.float32,
             enable_output_logprobs=True,
             forbid_global_logprob_writer=True,

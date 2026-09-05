@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The taped padding scrub must leave exactly what six torch fills left.
+"""The taped padding scrub must leave exactly what the torch fills left.
 
-The captured graph reads the padded rows, so a tail this misses routes KV
-writes into real cache slots; the comparison is bitwise on every buffer.
+The captured graph reads the padded rows, so a tail this misses feeds stale
+token ids / positions / seq lens into the recorded kernels; the comparison is
+bitwise on every buffer. (KV write locations are backend-owned now — no
+location buffer lives in InputBuffers.)
 """
 
 from __future__ import annotations
@@ -36,10 +38,9 @@ from tokenspeed_kernel.ops.metadata import Reg  # noqa: E402
 
 from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
 
-MAX_BS, MAX_TOKENS, DUMMY, PAD_POOL = 8, 64, 777, 5
+MAX_BS, MAX_TOKENS, PAD_POOL = 8, 64, 5
 BUFS = (
     "input_ids_buf",
-    "out_cache_loc_buf",
     "positions_buf",
     "req_pool_indices_buf",
     "state_write_req_pool_indices_buf",
@@ -47,21 +48,18 @@ BUFS = (
 )
 
 
-def _make():
+def _make(device="cuda"):
     return InputBuffers(
         max_bs=MAX_BS,
         max_num_tokens=MAX_TOKENS,
-        page_size=1,
-        dummy_kv_slot=DUMMY,
         state_write_padding_pool_index=PAD_POOL,
-        device="cuda",
+        device=device,
     )
 
 
 def _torch_scrub(ib, total_tokens, batch_size):
     if total_tokens < ib.max_num_tokens:
         ib.input_ids_buf[total_tokens:].fill_(1)
-        ib.out_cache_loc_buf[total_tokens:].fill_(ib.dummy_kv_slot)
         ib.positions_buf[total_tokens:].fill_(0)
     if batch_size < ib.max_bs:
         ib.req_pool_indices_buf[batch_size:].fill_(0)
@@ -81,7 +79,7 @@ def _dirty(ib):
     ("total_tokens", "batch_size"),
     [(0, 0), (1, 1), (17, 3), (63, 7), (MAX_TOKENS, MAX_BS), (MAX_TOKENS - 1, 1)],
 )
-def test_tape_matches_the_six_torch_fills(total_tokens, batch_size):
+def test_tape_matches_the_torch_fills(total_tokens, batch_size):
     taped, plain = _make(), _make()
     assert taped._pad_tape is not None
     _dirty(taped)
@@ -94,7 +92,7 @@ def test_tape_matches_the_six_torch_fills(total_tokens, batch_size):
 
 
 def _count_device_work(fn):
-    """Kernels and memcpies this issues, counted apart: the tape trades five
+    """Kernels and memcpies this issues, counted apart: the tape trades the
     kernel launches for one register upload, so both sides have to be seen."""
     fn()
     torch.cuda.synchronize()
@@ -115,14 +113,14 @@ def _count_device_work(fn):
 
 
 def test_the_scrub_costs_one_launch():
-    """Six fills on the step's critical path were six launches; collapsing them
-    is the whole point, so the count is the assertion."""
+    """Five fills on the step's critical path were five launches; collapsing
+    them is the whole point, so the count is the assertion."""
     ib = _make()
     taped_k, taped_c = _count_device_work(
         lambda: ib._pad_tape.run({Reg.TOKENS: 4, Reg.BS: 2})
     )
     plain_k, _ = _count_device_work(lambda: _torch_scrub(_make(), 4, 2))
-    assert plain_k >= 6, plain_k
+    assert plain_k >= 5, plain_k
     assert taped_k == 1, taped_k
     assert taped_c <= 1, taped_c
 
@@ -130,12 +128,5 @@ def test_the_scrub_costs_one_launch():
 def test_a_cpu_input_buffer_keeps_the_torch_path():
     """The runtime builds these on CPU in metadata tests; a tape would need a
     GPU there."""
-    ib = InputBuffers(
-        max_bs=MAX_BS,
-        max_num_tokens=MAX_TOKENS,
-        page_size=1,
-        dummy_kv_slot=DUMMY,
-        state_write_padding_pool_index=PAD_POOL,
-        device="cpu",
-    )
+    ib = _make(device="cpu")
     assert ib._pad_tape is None

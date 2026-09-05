@@ -13,6 +13,7 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
     Glm53FlashPoolOptions,
@@ -81,7 +82,6 @@ def _recipe(
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=16,
-        max_graph_bs=16,
         pd_disaggregation_enabled=pd_disaggregation_enabled,
         speculative_num_steps=2 if draft_layers else 0,
         speculative_num_draft_tokens=3 if draft_layers else 1,
@@ -276,6 +276,7 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     class Recipe:
         family = "GLM-5.3-Flash"
         cache_budget_bytes = (budgeted + 1) * layout.lcm_block_bytes
+        _budgeted_parents = CacheRecipe._budgeted_parents
 
         def workspace_bytes(self) -> int:
             return 0

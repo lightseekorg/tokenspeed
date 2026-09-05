@@ -359,11 +359,18 @@ class _CaptureModel:
         self.layers = [object()] * num_layers
         self.layers_to_capture = []
         self._dflash_capture_idx_map = {}
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs = None
-        self._dflash_incr_active = False
 
     notify = BaseTransformerModel._notify_dflash_capture
+
+
+class _RecordingSink:
+    """A TargetCaptureSink that keeps what the target handed it."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[int, torch.Tensor]] = []
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        self.seen.append((capture_idx, hidden.clone()))
 
 
 class _CaptureCausalLM:
@@ -395,27 +402,32 @@ def test_taps_shift_by_one_and_sort_for_positional_concat() -> None:
     assert causal_lm.capture_aux_hidden_states is True
 
 
-def test_each_capture_reaches_the_drafter_in_concat_order() -> None:
-    slot_bufs = [torch.zeros(4, 3) for _ in range(2)]
-    seen: list[tuple[int, int]] = []
+def test_each_capture_reaches_the_forward_sink_in_concat_order() -> None:
     causal_lm = _CaptureCausalLM(num_layers=8)
-    causal_lm.set_dflash_layers_to_capture(
-        [1, 5],
-        incremental_callback=lambda idx, num_tokens: seen.append((idx, num_tokens)),
-        slot_bufs=slot_bufs,
-    )
+    causal_lm.set_dflash_layers_to_capture([1, 5])
     model = causal_lm.model
-    model._dflash_incr_active = True
+    sink = _RecordingSink()
 
     aux_hidden_states: list[torch.Tensor] = []
     aux_hidden_states.append(torch.ones(2, 3))
-    model.notify(2, aux_hidden_states)
+    model.notify(sink, 2, aux_hidden_states)
     aux_hidden_states.append(torch.full((2, 3), 2.0))
-    model.notify(6, aux_hidden_states)
+    model.notify(sink, 6, aux_hidden_states)
 
-    assert seen == [(0, 2), (1, 2)]
-    assert torch.equal(slot_bufs[0][:2], torch.ones(2, 3))
-    assert torch.equal(slot_bufs[1][:2], torch.full((2, 3), 2.0))
+    assert [idx for idx, _ in sink.seen] == [0, 1]
+    assert torch.equal(sink.seen[0][1], torch.ones(2, 3))
+    assert torch.equal(sink.seen[1][1], torch.full((2, 3), 2.0))
+
+
+def test_an_idle_forward_hands_the_sink_nothing() -> None:
+    """Idle skips the attention block, so no tap was appended."""
+    causal_lm = _CaptureCausalLM(num_layers=8)
+    causal_lm.set_dflash_layers_to_capture([1])
+    sink = _RecordingSink()
+
+    causal_lm.model.notify(sink, 2, [])
+
+    assert sink.seen == []
 
 
 # --------------------------------------------------------------------------

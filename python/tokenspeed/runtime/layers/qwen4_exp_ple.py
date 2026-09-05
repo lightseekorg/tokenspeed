@@ -43,7 +43,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     qwen4_exp_linear_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
@@ -863,7 +863,7 @@ class Qwen4ExpPLELayer(nn.Module):
         # Graph capture owns one scratch tensor per padded batch bucket. Model
         # Python does not run on replay, so `_active_verify_key` still names the
         # last captured graph; the smallest bucket covering the live batch is
-        # the graph CudaGraphWrapper selected for this step.
+        # the graph ForwardStepRunner selected for this step.
         key = min(candidates, key=lambda value: value[0])
         _, width = key
         context_scratch, conv_scratch = self._verify_scratch[key]

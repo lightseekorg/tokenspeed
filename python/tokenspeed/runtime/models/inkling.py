@@ -102,7 +102,7 @@ from tokenspeed.runtime.configs.inkling_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -366,7 +366,13 @@ def _sconv_apply(
     every covered boundary in-kernel.
     """
     backend = ctx.attn_backend
-    md = backend.conv_metadata
+    # Same routing as the dense metadata: prefill-family forwards read the
+    # extend-init slot, decode-family forwards the capture/refresh slot.
+    md = (
+        backend.conv_prefill_metadata
+        if ctx.forward_mode.is_extend_or_mixed()
+        else backend.conv_decode_metadata
+    )
 
     # Channel slice of the layer's [slots, R, conv_dim] ring.
     state = backend.conv_pool.layer_state_wd(layer_id)[
@@ -580,7 +586,6 @@ class InklingAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
@@ -625,7 +630,6 @@ class InklingAttention(nn.Module):
             k,
             v,
             ctx,
-            out_cache_loc,
             rel_logits=rel_logits,
             log_scaling_tau=None if self.is_local else log_scaling_tau,
             # Inkling's readiness boundary is after both hidden-state sconv
@@ -1061,7 +1065,6 @@ class InklingDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if ctx.forward_mode.is_idle():
@@ -1076,7 +1079,6 @@ class InklingDecoderLayer(nn.Module):
         attn_out = self.attn(
             hidden_states,
             ctx,
-            out_cache_loc,
             log_scaling_tau=log_scaling_tau,
         )
         if self.attn_sconv is not None:
@@ -1472,7 +1474,6 @@ class InklingTextModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is None:
@@ -1497,7 +1498,6 @@ class InklingTextModel(nn.Module):
                 hidden_states,
                 residual,
                 ctx,
-                out_cache_loc,
                 log_scaling_tau=log_scaling_tau,
             )
         if residual is None:
@@ -1684,13 +1684,12 @@ class InklingForConditionalGeneration(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         multimodal_context = kwargs.pop("multimodal_context", None)
         input_embeds = self._embed_multimodal(ctx, input_ids, multimodal_context)
         hidden_states, aux_hidden_states = self.model(
-            input_ids, positions, ctx, out_cache_loc, input_embeds=input_embeds
+            input_ids, positions, ctx, input_embeds=input_embeds
         )
         return self._compute_logits(
             input_ids, hidden_states, ctx, aux_hidden_states=aux_hidden_states

@@ -95,6 +95,15 @@ Consequences worth knowing:
   an open optimization (it would lower `MaxSingleRequestTokens`, so it needs
   its own capacity baseline).
 
+- **Remote (D-role) admissions bank one growth block per state group.** A
+  D-role admission has no local tail to split; the peer lands only the endpoint
+  snapshot, so `schedulePrefillFirstChunk` (remote branch) reserves
+  `block_granularity` extra tokens in every `LatestSnapshot` group, i.e. one
+  more block for every prompt length. Without it each landed request needs a
+  fresh **empty** parent per state group at its first boundary, and a full pool
+  deadlocks silently because residents are retraction-exempt. Capacity planning
+  counts 2 state blocks per admitted request, as for a local prefill.
+
 ### 1.3 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over

@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import torch
 import triton
 import triton.language as tl
 
@@ -31,59 +30,27 @@ from tokenspeed.runtime.utils import get_available_gpu_memory
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices_ptr,
+    page_table_ptr,  # [bs, max_context_len] per-token slot table, row i == batch position i
     page_kernel_lens_ptr,
     kv_indptr,
-    kv_start_idx,
     kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
+    page_table_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
-    # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
     kv_indices_offset = tl.load(kv_indptr + pid)
+    kv_len = tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
-    kv_start = 0
-    kv_end = 0
-    if kv_start_idx:
-        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
-        kv_end = kv_start
-    kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    num_loop = tl.cdiv(kv_len, BLOCK_SIZE)
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < kv_end - kv_start
+        mask = offset < kv_len
         data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
+            page_table_ptr + pid * page_table_stride + offset,
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
-
-# --- Page table helpers (shared across attention backends) ---
-
-
-def build_page_table(
-    req_pool_indices: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    max_seq_len_k: int,
-) -> torch.Tensor:
-    """Build page table from a batch-ordered table.
-
-    page_table: [bs, max_pages] page IDs, row i == batch position i (the
-    drafter's page table or the idle/warmup placeholder).
-    Returns: [bs, max_pages_needed] page table slice.
-    """
-    max_pages = (max_seq_len_k + page_size - 1) // page_size
-    return page_table[: req_pool_indices.shape[0], :max_pages]
 
 
 # --- Page-based memory profiling ---

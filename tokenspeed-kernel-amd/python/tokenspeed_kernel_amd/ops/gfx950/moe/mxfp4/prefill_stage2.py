@@ -377,7 +377,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     cta_id = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(EM, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
-    total_tiles = num_pid_m * num_pid_n
     num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
     if PERSISTENT:
         worker_id = gl.program_id(axis=1)
@@ -924,10 +923,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     b_scale1_c3 = gl.convert_layout(b_scale1_c3, b_scale_layout_chunk)
 
                 cdna4_async_copy.wait_group(1)
-                if USE_ASYNC_E4M3:
-                    # The copy distributes M across waves while every MFMA
-                    # wave consumes all rows, so publish the completed LDS
-                    # writes before cross-wave reads.
+                if USE_ASYNC_A:
+                    # The async copy and MFMA layouts distribute rows across
+                    # waves differently. Publish the completed LDS writes
+                    # before every wave reads its dot operand.
                     gl.barrier()
                 a0 = cdna4_async_copy.load_shared_relaxed(smem_a.index(0), dot_a_layout)
                 acc0 = gl.amd.cdna4.mfma_scaled(
@@ -1067,7 +1066,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 m3 = tok_ok
 
                 cdna4_async_copy.wait_group(0)
-                if USE_ASYNC_E4M3:
+                if USE_ASYNC_A:
                     gl.barrier()
                 a1 = cdna4_async_copy.load_shared_relaxed(smem_a.index(1), dot_a_layout)
 
@@ -1117,7 +1116,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     # intermediate (K=3072 for Kimi-K3), while retaining the
                     # same two-buffer schedule used by the short TP shard.
                     for pair_k in range(2, NUM_K_ITERS, 2):
-                        if USE_ASYNC_E4M3:
+                        if USE_ASYNC_A:
                             # Every MFMA wave reads all M rows. Finish those
                             # cross-wave reads before any wave reuses either
                             # shared slot as the next async-copy destination.
@@ -1266,7 +1265,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         )
 
                         cdna4_async_copy.wait_group(1)
-                        if USE_ASYNC_E4M3:
+                        if USE_ASYNC_A:
                             gl.barrier()
                         a_even = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(0), dot_a_layout
@@ -1308,7 +1307,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             acc=acc3,
                         )
                         cdna4_async_copy.wait_group(0)
-                        if USE_ASYNC_E4M3:
+                        if USE_ASYNC_A:
                             gl.barrier()
                         a_odd = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(1), dot_a_layout
@@ -1610,8 +1609,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     stubs (kernel does the down-projection with no activation);
     ``splitk not in {0, 1, None}``; ``sorted_weights=None``.
     """
-    global _USES_FP32_ATOMIC
-
     # Step 1: validate inputs and reject unsupported modes.
     del quant_type, activation  # signature stubs (no activation in stage 2)
     if splitk not in (0, 1, None):

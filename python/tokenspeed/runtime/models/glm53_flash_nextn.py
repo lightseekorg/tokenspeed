@@ -99,7 +99,6 @@ class Glm53FlashModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         hidden_states = self.embed_tokens(input_ids)
@@ -122,7 +121,6 @@ class Glm53FlashModelNextN(nn.Module):
             positions,
             hidden_states,
             ctx,
-            out_cache_loc,
             None,
         )
         if not ctx.forward_mode.is_idle():
@@ -196,26 +194,6 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
-    @staticmethod
-    def _apply_first_step_correction(
-        ctx: ForwardContext,
-        *,
-        spec_step_idx: int,
-    ) -> None:
-        if spec_step_idx != 0:
-            return
-        if ctx.draft_seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        if ctx.num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[ctx.num_extends :]
-        ).to(ctx.draft_seq_lens_buf.dtype)
-        ctx.draft_seq_lens_buf[ctx.num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        ctx.attn_backend.advance_draft_forward_metadata(
-            ctx.draft_seq_lens_buf[: ctx.bs]
-        )
-
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)
 
     @torch.no_grad()
@@ -224,27 +202,23 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        spec_step_idx = int(kwargs.pop("spec_step_idx", 0))
         del kwargs
         # The first NextN pass is the draft-extend/catch-up pass over the full
-        # target verify window.  Keep the target's post-write sequence lengths
-        # while that multi-query pass runs; shrinking them to the accepted
-        # prefix here shifts the attention window whenever not every draft was
-        # accepted.  Publish the accepted-prefix view only after catch-up, for
-        # the subsequent one-token draft steps.
+        # target verify window and keeps the target's post-verify sequence
+        # lengths for it; shrinking them to the accepted prefix would shift the
+        # attention window whenever not every draft was accepted. The accepted
+        # prefix is never published here — the drafter's step loop publishes it
+        # for the subsequent one-token draft steps.
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, _ = self.model(
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
             )
-        self._apply_first_step_correction(ctx, spec_step_idx=spec_step_idx)
         return self.logits_processor(
             input_ids,
             hidden_states,

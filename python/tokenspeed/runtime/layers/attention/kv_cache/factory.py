@@ -122,7 +122,6 @@ def create_cache_pool(
             raise TypeError("DeepSeek V4 cache spec is missing pool options")
         return HybridDeepseekV4TokenToKVPool(
             arena,
-            model_dtype=config.dtype,
             layout=options.layout,
             layer_num=num_layers,
             rank=rank,
@@ -157,14 +156,21 @@ def create_cache_pool(
             head_dim=softmax_attn.head_dim,
             layer_num=num_layers,
             rank=rank,
-            index_head_dim=softmax_attn.index_head_dim,
-            index_dtype=config.dtype,
-            indexed_layer_ids=softmax_attn.sparse_layer_ids,
-            layer_types=spec.layer_types,
             field_layer_offset=field_layer_offset,
         )
     if isinstance(softmax_attn, MHAConfig):
+        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+            HybridMHATokenToKVPool,
+        )
+
         pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
+        # Only the hybrid pools route layers by label; a plain MHA pool has no
+        # state layers to tell apart.
+        hybrid_kwargs = (
+            {"layer_types": spec.layer_types}
+            if issubclass(pool_cls, HybridMHATokenToKVPool)
+            else {}
+        )
         return pool_cls(
             arena=arena,
             dtype=config.kv_cache_dtype,
@@ -172,10 +178,10 @@ def create_cache_pool(
             head_dim=softmax_attn.head_dim,
             layer_num=num_layers,
             rank=rank,
-            layer_types=spec.layer_types,
             layer_kv_head_counts=spec.layer_kv_head_counts,
             kv_alloc_head_count=softmax_attn.num_kv_heads,
             field_layer_offset=field_layer_offset,
+            **hybrid_kwargs,
         )
     if isinstance(softmax_attn, MLAConfig):
         if spec.family == "mla":

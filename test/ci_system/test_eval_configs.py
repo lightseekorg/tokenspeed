@@ -171,14 +171,15 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert task["score_threshold"] == 0.90
 
 
-def test_kimi_k3_amd_gates_use_eagle3_tp8ep8():
+def test_kimi_k3_amd_gates_use_eagle3():
     filenames = (
-        "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+        "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
         "kimi-k3-eagle3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
     )
+    ep_sizes = ("1", "8")
     tasks = []
-    for config_dir, filename in zip(
-        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, strict=True
+    for config_dir, filename, ep_size in zip(
+        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, ep_sizes, strict=True
     ):
         task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
@@ -194,7 +195,7 @@ def test_kimi_k3_amd_gates_use_eagle3_tp8ep8():
         assert flag_value(server_tokens, "--speculative-eagle-topk") == "1"
         assert flag_value(server_tokens, "--eagle3-layers-to-capture") == "2,46,90"
         assert flag_value(server_tokens, "--tp") == "8"
-        assert flag_value(server_tokens, "--ep-size") == "8"
+        assert flag_value(server_tokens, "--ep-size") == ep_size
         tasks.append(task)
 
     eval_tokens = shlex.split(tasks[0]["eval"]["command"])

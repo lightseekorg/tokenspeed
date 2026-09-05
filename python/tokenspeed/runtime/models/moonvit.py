@@ -62,7 +62,7 @@ except ImportError:
 
 
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
@@ -989,8 +989,8 @@ class MoonViTVisionPath(nn.Module):
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
-    ) -> EncoderCudaGraphWrapper:
-        return EncoderCudaGraphWrapper(
+    ) -> EncoderForwardStepRunner:
+        return EncoderForwardStepRunner(
             adapter=VisionEncoderCudaGraphAdapter(
                 tower=self.vision_tower.encoder,
                 pre_encode=self.pre_encode,
