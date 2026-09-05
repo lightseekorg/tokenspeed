@@ -77,6 +77,8 @@ if current_platform().is_amd:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run split-K prenorm with a GFX950 Gluon reduction/Sinkhorn stage."""
         return _mhc_pre_impl(
@@ -89,4 +91,6 @@ if current_platform().is_amd:
             sinkhorn_iters,
             _mhc_prenorm_gemm_triton,
             pre_reduce_apply_impl=_mhc_pre_reduce_apply_impl,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
