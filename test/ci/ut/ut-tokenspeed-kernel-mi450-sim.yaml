@@ -8,14 +8,15 @@ triggers:
   - debug
 runner:
   labels:
-    - amd-mi450-sim
+    - amd-mi45x-cpu-test
 env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
   # Keep emulation within the PR lane's five-and-a-half-minute execution budget.
   MI450_SIM_RUN_TIMEOUT: "330"
-  MI450_SIM_WORKERS: "6"
+  # A ceiling on concurrent simulators. A simulator takes two CPU threads.
+  MI450_SIM_WORKERS: "16"
   # rocJITsu is a functional simulator, so run architecture-specific compile and
   # launch coverage here. Generic tests and the production-sized MXFP4 MoE test
   # remain covered on AMD hardware; MXFP4 MoE alone exceeds this lane's budget.
