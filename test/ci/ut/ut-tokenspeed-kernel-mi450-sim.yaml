@@ -17,7 +17,8 @@ env:
   MI450_SIM_RUN_TIMEOUT: "330"
   MI450_SIM_WORKERS: "6"
   # rocJITsu is a functional simulator, so run architecture-specific compile and
-  # launch coverage here. Generic kernel tests remain covered on AMD hardware.
+  # launch coverage here. Generic tests and the production-sized MXFP4 MoE test
+  # remain covered on AMD hardware; MXFP4 MoE alone exceeds this lane's budget.
   MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
   MI450_SIM_TESTS: |
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
@@ -34,7 +35,6 @@ env:
     tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
     tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
     tokenspeed-kernel/test/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
-    tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
