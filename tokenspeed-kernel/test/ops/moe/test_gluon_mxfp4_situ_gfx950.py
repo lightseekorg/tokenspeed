@@ -34,9 +34,26 @@ if not is_cdna4():
     )
 
 import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.selection import kernel_override  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
     quantize_mxfp8_sorted_routes,
 )
+
+_A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+
+
+def _a8w4_ep_plan(intermediate_size: int) -> dict:
+    with kernel_override("moe", "apply", _A8W4_EP_APPLY):
+        return tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=8,
+            ispp=intermediate_size,
+            internal_activation_dtype="input",
+            solution="gluon",
+        )
 
 
 def _unswizzle_cdna4_route_scales(
@@ -204,17 +221,8 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     router_logits = torch.zeros(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=ep_size,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    plan = _a8w4_ep_plan(intermediate_size)
+    assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
     tokenspeed_kernel.moe_process_weights(plan, module)
     decode_calls = []
     decode = gluon_mxfp4.gluon_a16w4_situ_warp_decode_ep_gfx950
@@ -302,16 +310,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
     router_logits = torch.empty(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=8,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
+    plan = _a8w4_ep_plan(intermediate_size)
     tokenspeed_kernel.moe_process_weights(plan, module)
 
     def reject_a16(*_args, **_kwargs):
@@ -410,16 +409,7 @@ def test_ep_idle_forward_returns_empty_output_gfx950() -> None:
     module = torch.nn.Module()
     module._situ_output_buffer = output
 
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=8,
-        ispp=3072,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
+    plan = _a8w4_ep_plan(3072)
     actual = tokenspeed_kernel.moe_apply(
         plan,
         hidden_states,
@@ -1462,17 +1452,8 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
         dim=-1,
     )
     router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=ep_size,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    plan = _a8w4_ep_plan(intermediate_size)
+    assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
     tokenspeed_kernel.moe_process_weights(plan, module)
     output_storage = torch.empty(
         (num_tokens, latent_size + 7168),
