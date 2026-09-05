@@ -267,9 +267,10 @@ Notes:
   two physical kernel pages before draft attention.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
-  mla`. `tokenspeed_mla`, which K3 auto-selects for the target, does not
-  implement that mask, so pairing it with such a draft is rejected at startup
-  instead of silently serving those layers full-history attention.
+  mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
+  which walks the KV from the window rather than from token zero, and fall back
+  to the portable Triton kernel anywhere its shape gate does not hold. The
+  draft's full-attention layer is unaffected either way.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head;
   it must not be padded with an eighth, unused mask row.
