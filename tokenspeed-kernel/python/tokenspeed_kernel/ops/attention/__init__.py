@@ -1640,6 +1640,80 @@ def mla_extend_with_kvcache(
         )
 
 
+def supports_mla_decode_query_blocks(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    num_q_heads: int,
+    q_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sliding_window: bool,
+    solution: str | None = None,
+) -> bool:
+    """Whether an MLA decode kernel takes a proposal block on the query axis.
+
+    A block drafter can lay its proposal out two ways: one flattened row per
+    block position, each carrying the block-end cache length, or the block on
+    the query axis with one page table row per request. Both spell the same
+    mask, but a kernel serves one or the other, so the caller has to know
+    which before it builds the metadata.
+
+    ``True`` means the selected kernel declared both this ``q_len`` and a
+    proposal block of that width, so it volunteered for the
+    ``[batch, q_len, heads, dim]`` form. A kernel that merely omits a trait
+    matches by omission, which is not proof, so omission answers ``False`` and
+    the caller keeps the flattened form the portable kernel reads.
+
+    Args:
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        page_size: Tokens per KV cache page.
+        num_q_heads: Query heads this rank owns.
+        q_len: Query rows per request, i.e. the proposal block width.
+        kv_lora_rank: MLA latent width.
+        qk_rope_head_dim: RoPE width.
+        sliding_window: Whether the layer bounds its history, since a kernel
+            may serve one of the two masks and not the other.
+        solution: The solution the call will pin, so the answer is about the
+            kernel that call will actually reach.
+
+    Returns:
+        Whether the block may be handed over on the query axis.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            ),
+            traits={
+                "sliding_window": sliding_window,
+                "page_size": page_size,
+                "q_len": q_len,
+                "num_q_heads": num_q_heads,
+                "kv_lora_rank": kv_lora_rank,
+                "qk_rope_head_dim": qk_rope_head_dim,
+                "support_logit_cap": False,
+                "return_lse": False,
+                "block_on_query_axis": True,
+                "noncausal_block_size": q_len,
+            },
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None:
+        return False
+    return q_len in spec.traits.get("q_len", ()) and q_len in spec.traits.get(
+        "noncausal_block_size", ()
+    )
+
+
 def mla_decode_with_kvcache(
     # attention inputs
     q: torch.Tensor,
@@ -1699,8 +1773,15 @@ def mla_decode_with_kvcache(
             in a proposal block, or -1 for full attention. A non-causal row
             also sees the whole proposal block. DFlash2 passes the model's
             ``sliding_window - 1`` value here.
-        noncausal_block_size: Number of flattened proposal rows per request.
-            Use one for ordinary causal decode.
+        noncausal_block_size: Proposal rows per request. Use one for ordinary
+            causal decode. A block reaches a kernel in one of two layouts, and
+            which one this is follows from the shapes: flattened when ``q_len``
+            is 1 and the batch carries ``noncausal_block_size`` rows per
+            request, each with the block-end ``cache_seqlens``; on the query
+            axis when ``q_len`` equals it and the batch, page table and
+            ``cache_seqlens`` carry one entry per request. Ask
+            :func:`supports_mla_decode_query_blocks` before building the
+            second, since not every kernel reads it.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
             kv_lora_rank]. When ``value_weight`` is provided, this is required
@@ -1763,42 +1844,33 @@ def mla_decode_with_kvcache(
         if return_lse:
             raise ValueError("projected MLA decode does not support return_lse")
 
-    # The portable Triton MLA kernel is currently the exact implementation of
-    # DFlash2's non-causal sliding mask. Keep full-attention dispatch unchanged;
-    # optimized projected-value kernels can add this trait independently.
-    if window_left >= 0:
-        if override not in (None, "triton_mla_decode_with_kvcache"):
-            raise ValueError(
-                "sliding MLA decode currently requires "
-                "triton_mla_decode_with_kvcache"
-            )
-        if solution not in (None, "triton"):
-            raise ValueError("sliding MLA decode currently requires solution='triton'")
-        override = "triton_mla_decode_with_kvcache"
-        solution = "triton"
-        if projected_value:
-            attention = mla_decode_with_kvcache(
-                q=q,
-                kv_cache=kv_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                qk_nope_head_dim=qk_nope_head_dim,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                softmax_scale=softmax_scale,
-                logit_cap=logit_cap,
-                window_left=window_left,
-                noncausal_block_size=noncausal_block_size,
-                override=override,
-                solution=solution,
-            )
-            return mla_project_value(
-                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
-                value_weight,
-                gate=gate,
-                out=out,
-            )
+    # No windowed kernel fuses the value projection, so compose the windowed
+    # latent decode with the standalone projection. Kernel choice is left to
+    # the ``sliding_window`` trait below rather than pinned here: more than one
+    # implementation applies the mask now.
+    if window_left >= 0 and projected_value:
+        attention = mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            logit_cap=logit_cap,
+            window_left=window_left,
+            noncausal_block_size=noncausal_block_size,
+            override=override,
+            solution=solution,
+        )
+        return mla_project_value(
+            attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+            value_weight,
+            gate=gate,
+            out=out,
+        )
 
     traits = {
         "batch_size": q.shape[0],
@@ -1812,6 +1884,14 @@ def mla_decode_with_kvcache(
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "sliding_window": window_left >= 0,
+        # A proposal block reaches a kernel one of two ways: flattened to one
+        # row per position on the batch axis, or whole on the query axis. A
+        # kernel reads one or the other, never both.
+        "block_on_query_axis": q.shape[1] == noncausal_block_size,
+        # Greater than one only for a block drafter's non-causal proposal, so
+        # a kernel can declare itself for that case without also volunteering
+        # for ordinary decode or target verify.
+        "noncausal_block_size": noncausal_block_size,
     }
     if projected_value:
         traits.update(
@@ -1936,7 +2016,10 @@ def mla_decode_with_kvcache(
             return_lse=return_lse,
             out=out,
         )
-        if window_left >= 0:
+        # Forward the mask arguments only where they carry information, so a
+        # kernel registered for plain decode is never handed a keyword it does
+        # not take. A block of one with no window is plain decode.
+        if window_left >= 0 or noncausal_block_size != 1:
             kernel_kwargs.update(
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,
@@ -5591,6 +5674,7 @@ import tokenspeed_kernel.ops.attention.flash_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
 # isort: on
@@ -5612,6 +5696,7 @@ __all__ = [
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
+    "supports_mla_decode_query_blocks",
     "dsa_decode",
     "dsa_prefill",
     "dsa_prefill_topk",

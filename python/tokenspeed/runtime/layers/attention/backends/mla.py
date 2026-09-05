@@ -30,6 +30,7 @@ from tokenspeed_kernel import (
     mla_extend_with_kvcache,
     mla_prefill,
     mla_use_absorbed_extend,
+    supports_mla_decode_query_blocks,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -51,10 +52,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+logger = get_colorful_logger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -150,7 +154,45 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata: dict[int, MLADecodeMetadata] = {}
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
+        self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
+
+    def _takes_query_blocks(
+        self, num_q_heads: int, q_len: int, sliding_window: bool
+    ) -> bool:
+        """Whether a decode kernel wants this block on the query axis.
+
+        Only the shapes this backend was built for and the layer's mask decide
+        it, so it is resolved once per combination and reused. False keeps the
+        flattened one-row-per-block-position metadata the portable kernel
+        reads, which is what every other configuration has always sent.
+        """
+        key = (num_q_heads, q_len, sliding_window)
+        answer = self._query_block_decode.get(key)
+        if answer is None:
+            answer = supports_mla_decode_query_blocks(
+                q_dtype=self.data_type,
+                kv_dtype=self.data_type,
+                page_size=self.kernel_page_size,
+                num_q_heads=num_q_heads,
+                q_len=q_len,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                sliding_window=sliding_window,
+                solution=self.kernel_solution,
+            )
+            self._query_block_decode[key] = answer
+            logger.info(
+                "MLA block decode uses the %s layout "
+                "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
+                "query-axis" if answer else "flattened",
+                num_q_heads,
+                q_len,
+                self.kernel_page_size,
+                self.data_type,
+                sliding_window,
+            )
+        return answer
 
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
@@ -774,15 +816,37 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
+        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        noncausal_block_size = self.spec_num_tokens if self._block_decode_active else 1
+
         if self._block_decode_active:
-            # Metadata already carries one row per block position, each with the
-            # block-end length, so the block is non-causal. Adding the causal
-            # offsets below would re-impose exactly the ordering the draft must
-            # not have, and re-expanding the rows would square the batch.
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             rows = num_extends * q_len_per_req
-            page_table = metadata.page_table[rows:]
-            cache_seqlens = metadata.seq_lens[rows:]
+            if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
+                layer.tp_q_head_num, q_len_per_req, window_left >= 0
+            ):
+                # A kernel that reads the block on the query axis takes the
+                # request's page table and cache length as one row rather than
+                # q_len copies of one row. Take the first row of each request's
+                # group: the flattened metadata replicates it.
+                #
+                # Only when the forward is as wide as the block the metadata
+                # was expanded for. The config layer reconciles the two for
+                # every drafter it knows (see resolve_speculative_num_tokens,
+                # which subtracts DSpark's anchor row), so this guards the
+                # arithmetic rather than any shipping configuration: a stride
+                # that disagreed would read the next request's row.
+                query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+                page_table = metadata.page_table[rows::q_len_per_req].contiguous()
+                cache_seqlens = metadata.seq_lens[rows::q_len_per_req].contiguous()
+            else:
+                # Metadata already carries one row per block position, each with
+                # the block-end length, so the block is non-causal. Adding the
+                # causal offsets below would re-impose exactly the ordering the
+                # draft must not have, and re-expanding the rows would square
+                # the batch.
+                query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
+                page_table = metadata.page_table[rows:]
+                cache_seqlens = metadata.seq_lens[rows:]
             max_seqlen_k = self.max_context_len
         elif q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
@@ -826,8 +890,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
-        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
-        noncausal_block_size = self.spec_num_tokens if self._block_decode_active else 1
         if value_weight is not None:
             # Fuse projection and gate into decode to avoid materializing latent output.
             result = mla_decode_with_kvcache(
