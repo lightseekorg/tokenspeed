@@ -801,7 +801,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 45 || inputs.timeout_minutes }}"
+        " && 10 || inputs.timeout_minutes }}"
     )
 
 
@@ -811,7 +811,9 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
     assert task["runner"]["labels"] == ["amd-mi45x-cpu-test"]
 
 
-def test_mi450_sim_has_half_hour_internal_timeout():
+def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
 
-    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "1800"
+    assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
+    assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
+    assert "tokenspeed-kernel/test/ops/attention" in task["env"]["MI450_SIM_TESTS"]
