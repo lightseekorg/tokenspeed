@@ -175,6 +175,8 @@ class _MailboxSlot:
     """One symmetric mailbox plus the kernels bound to it."""
 
     mailbox: torch.Tensor
+    # The rendezvous outlives the slot: producers write the raw multicast_ptr.
+    handle: object
     multicast_ptr: int
     gemm_by_m: dict[int, _Producer]
     gather_by_m: dict[int, _Gather]
@@ -615,7 +617,7 @@ class KimiK3LatentDownOp:
                     sentinel=_DOWN_SENTINEL,
                 )
             gather_by_m[m] = gathers[geometry]
-        return _MailboxSlot(mailbox, multicast_ptr, gemm_by_m, gather_by_m)
+        return _MailboxSlot(mailbox, handle, multicast_ptr, gemm_by_m, gather_by_m)
 
     def handles(self, num_tokens: int) -> bool:
         """Whether this op covers a batch of this width."""

@@ -38,8 +38,13 @@ def _stub_slot():
     allocation, so they have to hand back something slot-shaped.
     """
     return latent_down._MailboxSlot(
-        torch.zeros(1, 8, 64, dtype=torch.bfloat16), 0, {}, {}
+        torch.zeros(1, 8, 64, dtype=torch.bfloat16), _rendezvous_stub(), 0, {}, {}
     )
+
+
+def _rendezvous_stub():
+    """Stand-in for the symmetric-memory handle the slot has to outlive."""
+    return mock.Mock(name="symm_mem_handle")
 
 
 @contextlib.contextmanager
@@ -262,7 +267,10 @@ def test_the_width_gate_is_the_ceiling_it_was_built_with(ceiling: int) -> None:
     op built narrow must not.
     """
     op = latent_down.KimiK3LatentDownOp(
-        latent_down._MailboxSlot(torch.zeros(1), 0, {}, {}), 448, 0, ceiling
+        latent_down._MailboxSlot(torch.zeros(1), _rendezvous_stub(), 0, {}, {}),
+        448,
+        0,
+        ceiling,
     )
     # The lower bound is the shape the multicast split wins by the most, so it
     # needs a witness of its own rather than riding on the upper one.
@@ -291,6 +299,7 @@ def _stub_op(rank: int, shard_dim: int, latent: int, seen: dict, max_m: int = 8)
 
     slot = latent_down._MailboxSlot(
         mailbox=torch.zeros(1, max_m, latent, dtype=torch.bfloat16),
+        handle=_rendezvous_stub(),
         multicast_ptr=1234,
         gemm_by_m={
             # The real kernel is compiled for a static M and checks it, and the
@@ -507,7 +516,7 @@ def test_a_pooled_slot_is_re_armed_before_it_is_handed_out() -> None:
     latent_down.KimiK3LatentDownOp._pools.clear()
     latent_down.KimiK3LatentDownOp._verdicts.clear()
     mailbox = torch.zeros(1, latent_down._FUSED_MAX_M, 64, dtype=torch.bfloat16)
-    slot = latent_down._MailboxSlot(mailbox, 1, {}, {})
+    slot = latent_down._MailboxSlot(mailbox, _rendezvous_stub(), 1, {}, {})
     with (
         _eligible(),
         mock.patch.object(latent_down.dist, "get_rank", side_effect=lambda group: 0),
