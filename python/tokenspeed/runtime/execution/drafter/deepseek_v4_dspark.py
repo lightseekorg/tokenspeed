@@ -398,7 +398,11 @@ class DeepseekV4DSpark(BaseDrafter):
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
 
     def on_target_weights_updated(self) -> None:
-        """Refresh the stable FP32 head after an in-place target reload."""
+        """Refresh target-derived weights after an in-place target reload."""
+        if self.model.replicate_vocab_heads:
+            embed, head = self.target_model.get_embed_and_head()
+            self.draft_model.refresh_replicated_embed_and_head(embed, head)
+            return
         self.model.refresh_local_base_logits_head(
             self.lm_head.weight,
             force=True,

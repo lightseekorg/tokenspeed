@@ -717,6 +717,52 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
 
+    def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
+        captured = {}
+
+        class FakeExperts:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.topk_output_format = object()
+
+        backend = SimpleNamespace(
+            is_mega_moe=lambda: False,
+            is_flashinfer_trtllm=lambda: True,
+        )
+        config = SimpleNamespace(
+            n_shared_experts=None,
+            routed_scaling_factor=2.5,
+            scoring_func="sqrtsoftplus",
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            hidden_size=256,
+            moe_intermediate_size=128,
+            hidden_act="silu",
+            norm_topk_prob=True,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=1),
+            moe=SimpleNamespace(
+                ep_size=1,
+                tp_size=1,
+                tp_ep_size=1,
+                tp_rank=0,
+                ep_rank=0,
+            ),
+        )
+        gate = SimpleNamespace(e_score_correction_bias=None)
+
+        with (
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", return_value=gate),
+            patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK"),
+        ):
+            moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
+
+        self.assertEqual(moe.routed_scaling_factor, 2.5)
+        self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
+
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
             rank=1,
@@ -2106,6 +2152,39 @@ class TestDeepseekV4Config(unittest.TestCase):
                 mapping,
                 label="embedding",
             )
+
+    def test_dspark_replicated_weight_refresh_preserves_graph_buffers(self):
+        old_embed = torch.zeros(8, 3)
+        old_head = torch.zeros(8, 3)
+        new_embed = torch.full((8, 3), 2.0)
+        new_head = torch.full((8, 3), 3.0)
+        model = SimpleNamespace(
+            replicate_vocab_heads=True,
+            embed_tokens=SimpleNamespace(weight=old_embed),
+            refresh_local_base_logits_head=Mock(),
+        )
+        draft = object.__new__(DeepseekV4ForCausalLMDSpark)
+        draft.model = model
+        draft.lm_head = SimpleNamespace(weight=old_head)
+        draft.mapping = SimpleNamespace()
+        embed_ptr = old_embed.data_ptr()
+        head_ptr = old_head.data_ptr()
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark._replicate_dspark_vocab_weight",
+            side_effect=(new_embed, new_head),
+        ) as replicate:
+            draft.refresh_replicated_embed_and_head(object(), object())
+
+        self.assertEqual(replicate.call_count, 2)
+        self.assertEqual(old_embed.data_ptr(), embed_ptr)
+        self.assertEqual(old_head.data_ptr(), head_ptr)
+        self.assertTrue(torch.equal(old_embed, new_embed))
+        self.assertTrue(torch.equal(old_head, new_head))
+        model.refresh_local_base_logits_head.assert_called_once_with(
+            old_head,
+            force=True,
+        )
 
     def test_dspark_wire_target_keeps_reconstructed_draft_head(self):
         draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)

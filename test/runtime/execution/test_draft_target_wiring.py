@@ -230,6 +230,7 @@ def test_dspark_weight_update_forces_cached_head_refresh():
     head = mock.MagicMock()
     drafter.lm_head = mock.MagicMock(weight=head)
     drafter.model = mock.MagicMock()
+    drafter.model.replicate_vocab_heads = False
 
     DeepseekV4DSpark.on_target_weights_updated(drafter)
 
@@ -237,6 +238,24 @@ def test_dspark_weight_update_forces_cached_head_refresh():
         head,
         force=True,
     )
+
+
+def test_dspark_weight_update_refreshes_replicated_vocab_weights():
+    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
+    drafter.model = mock.MagicMock(replicate_vocab_heads=True)
+    drafter.draft_model = mock.MagicMock()
+    drafter.target_model = mock.MagicMock()
+    embed = mock.MagicMock()
+    head = mock.MagicMock()
+    drafter.target_model.get_embed_and_head.return_value = (embed, head)
+
+    DeepseekV4DSpark.on_target_weights_updated(drafter)
+
+    drafter.draft_model.refresh_replicated_embed_and_head.assert_called_once_with(
+        embed,
+        head,
+    )
+    drafter.model.refresh_local_base_logits_head.assert_not_called()
 
 
 def test_device_weight_update_notifies_drafter_before_returning():

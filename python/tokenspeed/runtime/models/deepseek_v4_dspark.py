@@ -803,6 +803,41 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def refresh_replicated_embed_and_head(
+        self,
+        embed: torch.Tensor,
+        head: torch.Tensor,
+    ) -> None:
+        """Refresh graph-stable replicated vocabulary buffers from TP shards."""
+
+        if not self.model.replicate_vocab_heads:
+            raise RuntimeError("DSpark vocabulary heads are not replicated.")
+        replicated_embed = _replicate_dspark_vocab_weight(
+            embed,
+            self.model.embed_tokens,
+            self.mapping,
+            label="embedding",
+        )
+        replicated_head = _replicate_dspark_vocab_weight(
+            head,
+            self.lm_head,
+            self.mapping,
+            label="LM head",
+        )
+        destinations = (
+            ("embedding", self.model.embed_tokens.weight, replicated_embed),
+            ("LM head", self.lm_head.weight, replicated_head),
+        )
+        with torch.no_grad():
+            for label, destination, source in destinations:
+                if destination.shape != source.shape:
+                    raise RuntimeError(
+                        f"DSpark replicated {label} shape changed after initialization: "
+                        f"expected {tuple(destination.shape)}, got {tuple(source.shape)}."
+                    )
+                destination.copy_(source)
+        self.model.refresh_local_base_logits_head(self.lm_head.weight, force=True)
+
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         match = _DSPARK_WEIGHT_RE.match(name)
         return match is not None and int(match.group(1)) < self.model.num_stages
