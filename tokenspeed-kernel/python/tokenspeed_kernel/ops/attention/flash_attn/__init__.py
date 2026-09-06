@@ -158,6 +158,7 @@ if platform.is_nvidia and platform.is_blackwell:
             "support_sinks": frozenset({False}),
             "return_lse": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
+            "support_skip_softmax": frozenset({False}),
         },
     )
     def fa4_mha_prefill(
@@ -1166,6 +1167,7 @@ elif platform.is_nvidia and platform.is_hopper:
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
+            "support_skip_softmax": frozenset({False}),
         },
     )
     def fa3_mha_prefill(
