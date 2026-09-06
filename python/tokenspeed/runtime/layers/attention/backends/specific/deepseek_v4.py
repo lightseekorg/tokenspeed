@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
     dsv4_indexer_decode_metadata_compute,
+    dsv4_validate_active_cache_pages,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -267,6 +268,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._expected_cache_group_ids: tuple[str, ...] | None = None
         self._cache_group_raw_tokens_per_page: dict[str, int] = {}
         self._cache_group_max_page_ids: dict[str, int] = {}
+        self._cuda_graph_active_page_validity: torch.Tensor | None = None
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
@@ -492,6 +494,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> None:
         """Check only each live row's active page on GPU hot paths."""
         if actual_bs == 0:
+            return
+        if seq_lens.is_cuda and self._cuda_graph_active_page_validity is not None:
+            validity = self._cuda_graph_active_page_validity[: len(tables)]
+            for index, (group_id, table) in enumerate(tables.items()):
+                raw_tokens_per_page = self._cache_group_raw_tokens_per_page.get(
+                    group_id
+                )
+                max_page_id = self._cache_group_max_page_ids.get(group_id)
+                if raw_tokens_per_page is None or max_page_id is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 cache group contract is incomplete for "
+                        f"{group_id!r}"
+                    )
+                dsv4_validate_active_cache_pages(
+                    seq_lens=seq_lens,
+                    block_table=table,
+                    actual_bs=actual_bs,
+                    raw_tokens_per_page=raw_tokens_per_page,
+                    max_page_id=max_page_id,
+                    out=validity[index : index + 1],
+                )
+            torch._assert_async(
+                validity.all(),
+                f"DeepSeek V4 {phase} cache groups contain a negative sequence "
+                "length, a missing active page, or a page ID beyond capacity",
+            )
             return
         live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
         seq_lens_valid = live_seq_lens.ge(0).all()
@@ -1729,8 +1757,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         group_ids = self._expected_cache_group_ids
         assert group_ids is not None
+        self._cuda_graph_active_page_validity = None
         if not group_ids:
             return
+        self._cuda_graph_active_page_validity = torch.ones(
+            (len(group_ids),), dtype=torch.bool, device=self.device
+        )
         # The backend owns the contract math (per-group table widths); the
         # buffers object owns the storage those widths size.
         group_widths = {

@@ -66,6 +66,7 @@ from tokenspeed_kernel import (
     pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
 from torch import nn
@@ -1385,6 +1386,32 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
+def _deepseek_v4_group_slot_mapping(
+    positions: torch.Tensor,
+    req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    rows_per_block: int,
+    is_valid_token: torch.Tensor | None,
+) -> torch.Tensor:
+    if positions.is_cuda and block_table.is_cuda:
+        return dsv4_group_slot_mapping(
+            positions=positions,
+            req_indices=req_indices,
+            block_table=block_table,
+            rows_per_block=rows_per_block,
+            entry_stride_tokens=1,
+            base_offsets=None,
+            is_valid_token=is_valid_token,
+        )
+    mapping = _group_slot_mapping_from_raw(
+        positions,
+        req_indices,
+        block_table,
+        rows_per_block,
+    )
+    return _mask_invalid_graph_tokens(mapping, is_valid_token)
+
+
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
     capacity: int,
@@ -1427,6 +1454,9 @@ def _deepseek_v4_swa_slot_mapping(
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    is_valid_token = getattr(metadata, "is_valid_token", None)
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[: positions.numel()]
     if cache_metadata.swa_page_table is None or (
         token_to_req_indices.numel() != positions.numel()
         and (
@@ -1438,15 +1468,13 @@ def _deepseek_v4_swa_slot_mapping(
             (positions.numel(),), -1, dtype=torch.int64, device=positions.device
         )
     else:
-        slot_mapping = _group_slot_mapping_from_raw(
+        slot_mapping = _deepseek_v4_group_slot_mapping(
             positions,
             token_to_req_indices,
             cache_metadata.swa_page_table,
             ctx.token_to_kv_pool.swa_block_size,
+            is_valid_token,
         )
-    is_valid_token = getattr(metadata, "is_valid_token", None)
-    if is_valid_token is not None:
-        is_valid_token = is_valid_token[: positions.numel()]
     # Attribute access is deliberately unguarded: a pool without
     # swa_capacity_slots must fail fast here rather than skip the bounds
     # check that protects the fused cache-insert kernels.
@@ -2290,14 +2318,15 @@ class DeepseekV4Compressor(nn.Module):
                         "DeepSeek V4 missing cache-group block table for compressor "
                         f"state ratio={self.compress_ratio}"
                     )
-                mapping = _group_slot_mapping_from_raw(
+                mapping = _deepseek_v4_group_slot_mapping(
                     positions,
                     metadata.token_to_req_indices[: positions.numel()],
                     resolved_state_block_table,
                     state_block_size,
+                    valid_token,
                 )
                 return (
-                    _mask_invalid_graph_tokens(mapping, valid_token),
+                    mapping,
                     resolved_state_block_table,
                 )
 
@@ -2773,14 +2802,15 @@ class DeepseekV4Indexer(nn.Module):
                     "compressor state"
                 )
             block_size = pool.get_indexer_state_block_size(layer_index)
-            mapping = _group_slot_mapping_from_raw(
+            mapping = _deepseek_v4_group_slot_mapping(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
                 block_table,
                 block_size,
+                valid_token,
             )
             return (
-                _mask_invalid_graph_tokens(mapping, valid_token),
+                mapping,
                 block_table,
                 block_size,
             )

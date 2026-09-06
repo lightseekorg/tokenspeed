@@ -2088,6 +2088,42 @@ def _mhc_pre() -> object:
     )
 
 
+def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
+    selected: dict[str, object] = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        selected.update(kwargs)
+
+        def kernel(*kernel_args):
+            return kernel_args
+
+        kernel.name = "fake_mhc_pre"
+        return kernel
+
+    monkeypatch.setattr(
+        tokenspeed_kernel.ops.mhc,
+        "select_kernel",
+        fake_select_kernel,
+    )
+    residual = torch.empty((1, 4, 8), dtype=torch.bfloat16)
+    fn = torch.empty((24, 32), dtype=torch.float32)
+    hc_scale = torch.empty(3, dtype=torch.float32)
+    hc_base = torch.empty(24, dtype=torch.float32)
+    tokenspeed_kernel.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        2,
+        "legacy_override",
+        "legacy_solution",
+    )
+    assert selected["override"] == "legacy_override"
+    assert selected["solution"] == "legacy_solution"
+
+
 def _mhc_post() -> object:
     hidden_states = torch.empty((1, 16), dtype=torch.bfloat16)
     residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
