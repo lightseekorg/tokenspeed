@@ -20,10 +20,12 @@
 
 """Regression test for the D-role KV-capacity deadlock (Kimi-K3 shaped config).
 
-Root cause: a D-role remote admission gives each snapshot-state group (KDA) exactly one
-materialized block and ``reserve_tokens=0`` (``setSnapshotStatePrefillReserve(...,
-split_tail_tokens=0)`` because ``shouldSplitFinalStateCheckpoint`` is false for
-``Role::kD``).  At its first block boundary every request therefore needs one
+Root cause: a D-role remote admission used to give each snapshot-state group (KDA)
+exactly one materialized block and ``reserve_tokens=0`` (the former
+``setSnapshotStatePrefillReserve`` helper only ever received the split tail, which
+is 0 on ``Role::kD`` because ``shouldSplitFinalStateCheckpoint`` is false there;
+``groupReserveTokens`` replaces it).  At its first block boundary every
+request therefore needed one
 fresh EMPTY parent per state group (packing 1).  When the prefill side is slow the
 pool fills with whole-prompt reservations before any KV lands; once fewer than
 (#state groups) empty parents remain, no landed request can take its first
@@ -34,10 +36,12 @@ request -> permanent, silent deadlock (``#running-req 0``, ``#queue-req 0``,
 
 Small-scale reproduction: K3-shaped 4-group config (1 History + 3 State groups,
 P = 2 tokens per block, 32 usable pages).  Prompts of exactly one block (2
-tokens) with max_new_tokens = 4 reserve ceil((2+4)/2) = 3 History pages + 3
-state blocks = 6 pages each; five of them fill 30 of 32 pages.  Landing all five
-afterwards leaves 2 < 3 empty parents: on the unfixed scheduler no forward op is
-ever produced again.
+tokens) with max_new_tokens = 4.  On the unfixed scheduler each admission
+reserves ceil((2+4)/2) = 3 History pages + 3 state blocks = 6 pages; five of
+them fill 30 of 32 pages, and landing all five afterwards leaves 2 < 3 empty
+parents, so no forward op is ever produced again.  With the growth reserve each
+admission takes 3 + 6 = 9 pages: three requests are admitted, the rest queue,
+and every landed request decodes from its own banked block.
 """
 
 from __future__ import annotations
@@ -192,7 +196,8 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
 
 class TestDRoleStateGroupReserve:
     def test_pool_filled_by_remote_admissions_before_landing_never_wedges(self):
-        """Five one-block prompts are admitted (30/32 pages) before any KV lands.
+        """Unfixed, five one-block prompts are admitted (30/32 pages) before any KV
+        lands; fixed, three fit (27/32) and the rest queue.
         Unfixed: after landing, every request needs 3 empty parents for its first
         decode step, only 2 exist, no forward op is ever produced, nothing finishes
         (available stays 2, active 30) -- the production deadlock.  Fixed: every

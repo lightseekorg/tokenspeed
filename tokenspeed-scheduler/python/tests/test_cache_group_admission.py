@@ -205,3 +205,57 @@ def test_group_tables_use_each_groups_block_granularity():
     # The first round covers eight prompt tokens plus one decode-reserve token.
     assert len(tables["history"][0]) == 2
     assert len(tables["state"][0]) == 5
+
+
+def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
+    """Fused role, P=4, 8-token chunks: one full-history group beside one
+    sliding-window group (window 4), both one page per LCM block."""
+    cfg = _base_config(num_device_pages=num_usable_pages + 1)
+    cfg.prefix_granularity = 4
+    cfg.max_scheduled_tokens = 8
+    cfg.decode_input_tokens = 1
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
+        ),
+        CacheGroupConfig(
+            group_id="swa",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=CacheRetention.SlidingWindow,
+            sliding_window_tokens=4,
+            family=CacheGroupFamily.State,
+        ),
+    ]
+    return Scheduler(cfg)
+
+
+def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
+    # A 32-token prompt with max_new_tokens=8 admits its first 8-token chunk on
+    # a decoding role with 24 unscheduled prompt tokens + 8 tokens of decode
+    # headroom prepaid. The full-history group must hold that: 8 + 32 tokens
+    # -> 10 pages. The sliding-window group recycles slid-out pages, so the
+    # rest of the prompt costs it nothing: it holds only the chunk, 2 pages.
+    # 12 pages fit a 16-page pool; had the headroom been broadcast to both
+    # groups (20 pages) the request would have sat in the waiting queue.
+    scheduler = _hybrid_chunked_scheduler(num_usable_pages=16)
+    request = _make_spec("long", list(range(32)))
+    request.max_new_tokens = 8
+    scheduler.submit_requests([request])
+
+    plan = scheduler.next_execution_plan()
+
+    operation = next(op for op in plan.forward if "long" in op.request_ids)
+    assert operation.input_lengths == [8]
+    tables = dict(operation.block_tables)
+    assert len(tables["history"][0]) == 10
+    assert len(tables["swa"][0]) == 2
+    assert scheduler.cache_group_available_pages("history") == 4
+    assert scheduler.waiting_size() == 0
+    assert scheduler.prefilling_size() == 1
