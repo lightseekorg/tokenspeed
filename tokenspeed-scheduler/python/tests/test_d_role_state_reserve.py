@@ -24,7 +24,7 @@ Root cause: a D-role remote admission used to give each snapshot-state group (KD
 exactly one materialized block and ``reserve_tokens=0`` (the former
 ``setSnapshotStatePrefillReserve`` helper only ever received the split tail, which
 is 0 on ``Role::kD`` because ``shouldSplitFinalStateCheckpoint`` is false there;
-``reserveSnapshotStateGrowth`` replaces it).  At its first block boundary every
+``groupReserveTokens`` replaces it).  At its first block boundary every
 request therefore needed one
 fresh EMPTY parent per state group (packing 1).  When the prefill side is slow the
 pool fills with whole-prompt reservations before any KV lands; once fewer than

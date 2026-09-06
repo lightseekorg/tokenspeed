@@ -156,6 +156,25 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
         << "all pages returned to the pool after a chunked-prefill request finishes";
 }
 
+TEST_F(ChunkedPrefillSuite, FirstChunkPrepaysPromptHeadroomOnlyInFullHistoryGroup) {
+    // 16 tokens in 4-token chunks with a declared budget of 6: the first
+    // chunk prepays the 12 unscheduled prompt tokens plus 6 tokens of decode
+    // headroom. The full-history group holds all of it (4 + 18 tokens -> 11
+    // pages); the sliding-window group recycles slid-out pages and holds only
+    // the chunk itself. An intermediate chunk banks no tail and no decode
+    // slot, so it reserves nothing there.
+    RequestSpec request = MakeRequestSpec("r1", /*num_pages=*/8);
+    request.max_new_tokens = 6;
+    Submit(request);
+
+    ExecutionPlan chunk1 = PlanOnce();
+    const ForwardBatch* op1 = FindForwardBatch(chunk1);
+    ASSERT_NE(op1, nullptr);
+    ASSERT_EQ(op1->input_lengths, (std::vector<std::int32_t>{4}));
+    EXPECT_EQ(op1->block_tables.at("full").at(0).size(), 11u);
+    EXPECT_EQ(op1->block_tables.at("swa").at(0).size(), 2u);
+}
+
 class MambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

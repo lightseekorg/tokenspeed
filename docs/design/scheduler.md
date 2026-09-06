@@ -26,11 +26,25 @@ caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
-**Decode reserve.** The chunk that completes the prompt also reserves
-`decode_input_tokens` (`completes_prefill ? reserve : 0`), so the request's
-first decode step is guaranteed a slot. Intermediate chunks reserve nothing —
-they are not about to decode. Snapshot-state groups additionally bank one
-growth block at the admission that finishes shaping them (§1.2).
+**Reserve.** What an admission holds beyond the chunk it computes is stated
+once per round (`PrefillReserve`: split tail, decode width, prompt headroom,
+whether the round finishes shaping the state groups) and turned into each
+group's page demand by `reservePrefillDemands` — the only writer of
+`GroupDemand::reserve_tokens`. `groupReserveTokens` picks the rule by the
+group's retention, never by call site:
+
+- *Full-history* groups hold the tail and decode slot — the chunk that
+  completes the prompt reserves `decode_input_tokens`, so the first decode step
+  is guaranteed a slot; intermediate chunks reserve nothing, they are not about
+  to decode — raised on a decoding role's first chunk to the rest of the prompt
+  plus the admission headroom (§4), so a partially prefetched request is never
+  stranded.
+- *Sliding-window* groups (either family) recycle slid-out pages, so the rest
+  of the prompt costs them nothing: they hold only the tail and decode slot.
+  Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
+  waiting on a pool that had room for it.
+- *Snapshot-state* groups bank one growth block at the admission that finishes
+  shaping them and nothing on any other round (§1.2).
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -85,12 +99,11 @@ Consequences worth knowing:
 - **A banked tail is exempt from head-of-line.** Its remaining pages are
   already held, so nobody behind it can starve it, and the queue may move on.
 - **In hybrid architectures the tail is banked in every cache group, not just
-  the state group.** The mechanism is indirect: `admission_reserve` is
-  broadcast to all groups, and `reserveSnapshotStateGrowth` then re-derives
-  *only* the state groups to `max(block_granularity, tail, decode)` — never
-  less than the tail, never a headroom-sized token reserve. The history/KV
-  group silently keeps `tail + decode (+ headroom)`. Correct, but implicit —
-  worth reading twice before changing either function.
+  the state group.** `groupReserveTokens` gives the history/KV and
+  sliding-window groups `tail + decode` (a decoding role's first chunk raises
+  the history group's to the prompt headroom) and the state groups
+  `max(block_granularity, tail, decode)` — never less than the tail, never a
+  headroom-sized token reserve.
 - **Bound to state groups.** `shouldSplitFinalStateCheckpoint` requires
   `HasMambaStateGroup()`, so a pure-KV model never banks a tail and is
   head-of-line pinned until its final chunk. Extending the mechanism there is
@@ -99,7 +112,7 @@ Consequences worth knowing:
 
 - **Every state group banks one growth block at the admission that finishes
   shaping it** (completing chunk, split body, or remote landing):
-  `reserveSnapshotStateGrowth` reserves `max(block_granularity, tail,
+  `groupReserveTokens` reserves `max(block_granularity, tail,
   decode_input_tokens)`, one block beyond the endpoint for every prompt length.
   Without it an endpoint that lands alone in its block (aligned prompt, remote
   landing, `disable_prefix_cache`) needs a fresh **empty** parent per state
@@ -338,7 +351,10 @@ over-optimistic, and never makes anyone else wait.
   except the state-checkpoint tail (1.2), which is banked for exactly one round
   and asserted against nesting, the snapshot-state growth block banked by the
   admission that finishes shaping a state group (1.2), and the admission
-  headroom (4).
+  headroom (4) — which only full-history groups hold.
+- A prefill demand's reserve is decided once per group, by retention, in
+  `reservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
+  helper asserts it found none set.
 - An incomplete local prefill is not overtaken (1.1) — unless its tail is
   already banked. Decodes are never hostage to it: they consume no fresh
   capacity within their reserve, so they keep running beside a stalled

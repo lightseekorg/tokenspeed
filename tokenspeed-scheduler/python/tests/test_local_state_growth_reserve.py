@@ -23,7 +23,7 @@
 An aligned prompt has no tail to split, so its completing admission used to
 materialize one state block with zero spare and its first decode step needed a
 fresh EMPTY parent per state group -- the D-role wedge, on the local path.
-``reserveSnapshotStateGrowth`` banks one growth block on every admission that
+``groupReserveTokens`` banks one growth block on every admission that
 finishes shaping a state group, so the first decode step is consumed in place.
 
 Shape: K3-shaped 4-group config (P = 2 tokens per block, 32 usable pages),
