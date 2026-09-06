@@ -36,10 +36,11 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the mHC pre-mapping for one residual stream.
 
@@ -55,6 +56,8 @@ def mhc_pre(
         sinkhorn_iters: Number of Sinkhorn row/column normalization iterations.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        norm_weight: Optional BF16 RMSNorm weight fused into the selected kernel.
+        norm_eps: RMSNorm epsilon, required when ``norm_weight`` is provided.
 
     Returns:
         A tuple of the BF16 layer input ``[..., hidden_size]``, FP32 post mix
@@ -205,8 +208,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
-        norm_weight,
-        norm_eps,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
     return residual_cur, layer_input, post_cur, comb_cur
 
