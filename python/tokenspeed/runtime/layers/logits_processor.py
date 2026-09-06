@@ -387,7 +387,7 @@ class LogitsProcessor(nn.Module):
         *,
         max_M: int,
         skip_ping_pong: bool,
-        dtype: torch.dtype | None = None,
+        dtype: torch.dtype,
     ) -> DistArgmaxState | None:
         """Build this TP group's distributed-argmax state, or None to fall back.
 
@@ -402,20 +402,18 @@ class LogitsProcessor(nn.Module):
             max_M: Largest row count the caller will ever pass.
             skip_ping_pong: Pin the slot band instead of alternating; only
                 when the caller synchronizes across ranks between calls.
-            dtype: Value dtype of the logits. Defaults to the LM-head weight
-                dtype; callers with an FP32 correction path may override it.
+            dtype: Value dtype of the logits selected by the caller.
 
         Returns:
             The state, or None when this group must use the gather path.
         """
-        resolved_dtype = dtype or lm_head.weight.dtype
         device = lm_head.weight.device
         key = (
             self.tp_group,
             lm_head.weight.size(0),
             max_M,
             skip_ping_pong,
-            resolved_dtype,
+            dtype,
             device,
         )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
@@ -431,7 +429,7 @@ class LogitsProcessor(nn.Module):
                 group=group,
                 rank_in_group=self.tp_rank,
                 max_M=max_M,
-                dtype=resolved_dtype,
+                dtype=dtype,
                 device=device,
                 skip_ping_pong=skip_ping_pong,
             )
@@ -462,6 +460,7 @@ class LogitsProcessor(nn.Module):
             lm_head,
             max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
             skip_ping_pong=True,
+            dtype=lm_head.weight.dtype,
         )
 
     def forward(

@@ -256,7 +256,7 @@ def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
     lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
 
     bf16_state = processor.acquire_dist_argmax_state(
-        lm_head, max_M=8, skip_ping_pong=False
+        lm_head, max_M=8, skip_ping_pong=False, dtype=torch.bfloat16
     )
     fp32_state = processor.acquire_dist_argmax_state(
         lm_head, max_M=8, skip_ping_pong=False, dtype=torch.float32
