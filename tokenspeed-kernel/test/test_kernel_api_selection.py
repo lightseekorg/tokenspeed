@@ -2145,6 +2145,45 @@ def test_mhc_normalization_contract_is_explicit() -> None:
         assert parameters[name].default is inspect.Parameter.empty
 
 
+@pytest.mark.parametrize(
+    ("norm_weight", "norm_eps"),
+    [
+        (torch.empty(16, dtype=torch.bfloat16), None),
+        (None, 1e-6),
+    ],
+)
+def test_mhc_normalization_arguments_must_be_paired(
+    monkeypatch, norm_weight: torch.Tensor | None, norm_eps: float | None
+) -> None:
+    def fail_select_kernel(*args, **kwargs):
+        raise AssertionError("invalid normalization arguments reached kernel selection")
+
+    monkeypatch.setattr(
+        tokenspeed_kernel.ops.mhc,
+        "select_kernel",
+        fail_select_kernel,
+    )
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    fn = torch.empty((24, 64), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+
+    with pytest.raises(
+        ValueError, match="norm_weight and norm_eps must be provided together"
+    ):
+        tokenspeed_kernel.mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            1e-6,
+            1e-6,
+            2,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+
 def _mhc_post() -> object:
     hidden_states = torch.empty((1, 16), dtype=torch.bfloat16)
     residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
