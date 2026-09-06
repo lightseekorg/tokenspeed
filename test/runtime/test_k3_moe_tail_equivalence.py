@@ -71,6 +71,8 @@ def _world_size() -> int:
 
 
 def _setup() -> tuple[int, torch.device]:
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager,
     )
@@ -79,6 +81,9 @@ def _setup() -> tuple[int, torch.device]:
         dist.init_process_group("nccl")
     local = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local)
+    # A server gathers this at distributed init; the gates refuse to, because
+    # they are also asked from dispatch, where the world is not all present.
+    gather_fabric_map()
     # The runtime's collectives look groups up by rank tuple; serving registers
     # them during distributed init, which this test does not run. Register the
     # already-built world group rather than calling init_process_group: that

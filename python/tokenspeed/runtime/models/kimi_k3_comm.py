@@ -610,7 +610,7 @@ class K3MoeTailComm:
         self.up_proj = up_proj
         self.execution_plan = execution_plan
         # Derived from the projection itself (built with a shard group iff
-        # _shard_k3_up_projection held), so comm and module cannot disagree.
+        # _shard_k3_latent_projection held), so comm and module cannot disagree.
         self._shard_up_projection = up_proj.shard_group is not None
         self.latent_tail = None
         if self.state.latent_tail_ok:

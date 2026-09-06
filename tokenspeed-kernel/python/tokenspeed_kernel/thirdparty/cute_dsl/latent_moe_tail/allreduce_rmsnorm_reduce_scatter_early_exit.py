@@ -17,6 +17,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from .primitives import (
+    NEG_ZERO_F32_BITS,
     NUM_LAMPORT_BUFFERS,
     PACKED_BYTES,
     VEC_BF16,
@@ -457,7 +458,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                         cute.AddressSpace.gmem,
                         assumed_align=16,
                     )
-                    store_lamport_sentinel_128(clear_ptr)
+                    store_lamport_sentinel_128(clear_ptr, sentinel=NEG_ZERO_F32_BITS)
                     clear_idx = clear_idx + total_threads
 
             rank_words = cute.make_rmem_tensor(
@@ -484,7 +485,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                         remote = load_global_u32x4(remote_ptr, volatile=True)
                         for word in cutlass.range_constexpr(4):
                             rank_words[source_rank, word] = remote[word]
-                        valid = valid & (not fragment_is_dirty(remote))
+                        valid = valid & (
+                            not fragment_is_dirty(remote, sentinel=NEG_ZERO_F32_BITS)
+                        )
 
             accum = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
             for element in cutlass.range_constexpr(VEC_BF16):
@@ -658,7 +661,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                         cute.AddressSpace.gmem,
                         assumed_align=16,
                     )
-                    store_lamport_sentinel_128(clear_ptr)
+                    store_lamport_sentinel_128(clear_ptr, sentinel=NEG_ZERO_F32_BITS)
                     clear_idx = clear_idx + total_threads
 
             if destination == self.rank:
@@ -682,7 +685,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                         remote = load_global_u32x4(remote_ptr, volatile=True)
                         for word in cutlass.range_constexpr(4):
                             rank_words[source_rank, word] = remote[word]
-                        valid = valid & (not fragment_is_dirty(remote))
+                        valid = valid & (
+                            not fragment_is_dirty(remote, sentinel=NEG_ZERO_F32_BITS)
+                        )
 
                 accum = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
                 for element in cutlass.range_constexpr(VEC_BF16):

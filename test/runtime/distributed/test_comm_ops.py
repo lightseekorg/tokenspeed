@@ -37,7 +37,16 @@ class TestAutoBackendTopology:
         backend._triton_ar = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
+        # A host-spread group's rsag routing keys on the fabric probe, so pin
+        # both the probe and the local device count the tests assume.
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
         return backend
+
+    @staticmethod
+    def _set_fabric(monkeypatch, supported: bool) -> None:
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
     def test_group_spans_nodes(self, backend):
         assert not backend._group_spans_nodes((0, 1, 2, 3))
@@ -45,7 +54,10 @@ class TestAutoBackendTopology:
         assert backend._group_spans_nodes((0, 1, 4, 5))
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
-    def test_cross_node_token_ops_fall_back_to_nccl(self, backend, method):
+    def test_host_spread_token_ops_without_fabric_use_nccl(
+        self, backend, monkeypatch, method
+    ):
+        self._set_fabric(monkeypatch, False)
         tensor = Mock()
         scattered = [1] * 8
         getattr(backend._nccl, method).return_value = "nccl-result"
@@ -56,6 +68,49 @@ class TestAutoBackendTopology:
         getattr(backend._nccl, method).assert_called_once_with(
             tensor, tuple(range(8)), scattered
         )
+        getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_host_spread_token_ops_with_fabric_use_rsag(
+        self, backend, monkeypatch, method
+    ):
+        """An NVLink domain can span hosts; the fabric decides, not the count."""
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        scattered = [1] * 8
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, tuple(range(8)), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._nccl, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_a_strided_group_smaller_than_one_host_is_still_probed(
+        self, backend, monkeypatch, method
+    ):
+        """``Mapping`` groups are strided, so rank count does not locate them.
+
+        An attention DP group is ``(0, 8)`` at ``attn_tp_size=8``: two ranks,
+        fewer than one host holds, living on two hosts. Sizing it against the
+        local device count would admit it with no probe, and a group the fabric
+        cannot map hangs inside the rendezvous rather than falling back.
+        """
+        groups: list[tuple[int, ...]] = []
+        self._set_fabric(monkeypatch, False)
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(
+            fabric,
+            "group_has_fabric",
+            lambda ranks: groups.append(tuple(ranks)) or False,
+        )
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(Mock(), (0, 8), [1, 1])
+
+        assert groups == [(0, 8)]
+        assert result == "nccl-result"
         getattr(backend._rsag, method).assert_not_called()
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
@@ -100,7 +155,10 @@ class TestAutoBackendTopology:
         assert result == "trtllm-result"
         backend._nccl.all_reduce.assert_not_called()
 
-    def test_cross_node_last_dim_all_gather_falls_back_to_nccl(self, backend):
+    def test_host_spread_last_dim_all_gather_without_fabric_uses_nccl(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, False)
         tensor = Mock()
         tensor.dim.return_value = 2
         backend._nccl.all_gather.return_value = "nccl-result"
@@ -110,6 +168,140 @@ class TestAutoBackendTopology:
         assert result == "nccl-result"
         backend._nccl.all_gather.assert_called_once_with(tensor, tuple(range(8)), -1)
         backend._rsag.all_gather.assert_not_called()
+
+    def test_host_spread_last_dim_all_gather_with_fabric_uses_rsag(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        tensor.dim.return_value = 2
+        backend._rsag.all_gather.return_value = "rsag-result"
+
+        result = backend.all_gather(tensor, tuple(range(8)), dim=-1)
+
+        assert result == "rsag-result"
+        backend._nccl.all_gather.assert_not_called()
+
+    def test_host_spread_all_reduce_still_keys_on_topology(self, backend, monkeypatch):
+        """Fabric governs the rsag paths only: triton_ar stays node-local."""
+        self._set_fabric(monkeypatch, True)
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
+        tensor = torch.empty(1)
+        backend._nccl.all_reduce.return_value = "nccl-result"
+
+        assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
+        backend._triton_ar.can_run.assert_not_called()
+
+
+def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    original_tensor = torch.tensor
+    original_empty_like = torch.empty_like
+    monkeypatch.setattr(fabric, "_fabric_map", None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(fabric, "fabric_allocation_supported", lambda device: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    calls = []
+
+    def fake_all_gather(outputs, local, group):
+        calls.append(group)
+        for output, value in zip(outputs, (True, False, True, True), strict=True):
+            output.fill_(value)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(torch, "tensor", lambda value, **kwargs: original_tensor(value))
+    monkeypatch.setattr(torch, "empty_like", lambda value: original_empty_like(value))
+
+    assert fabric.gather_fabric_map() == [True, False, True, True]
+    assert fabric.group_has_fabric((0, 2, 3))
+    assert not fabric.group_has_fabric((0, 1))
+    assert calls == [torch.distributed.group.WORLD]
+
+
+@pytest.mark.parametrize("capturing", [True, False])
+def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
+    monkeypatch, capturing
+):
+    """The raise does not depend on capture, and that is the point.
+
+    Outside a capture a missing map used to be gathered lazily, over WORLD.
+    This question is asked at dispatch, where the ranks present are the
+    group's, so that gather would block on world ranks that never arrive.
+    """
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_fabric_map", None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda *args, **kw: pytest.fail("a missing map must not start a collective"),
+    )
+    # Without this the lazy path would die in get_world_size first and the
+    # stub above would never be reached -- a guard that cannot fire.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
+
+    with pytest.raises(RuntimeError, match="never gathered"):
+        fabric.group_has_fabric((0, 1))
+
+
+def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    import tokenspeed.runtime.execution.distributed_initializer as initializer
+
+    events = []
+    mapping = SimpleNamespace(
+        world_group=(0,),
+        attn=SimpleNamespace(tp_group=(0,), dp_group=(0,), tp_rank=0, dp_rank=0),
+        linear_attn=SimpleNamespace(tp_group=(0,)),
+        dense=SimpleNamespace(tp_group=(0,)),
+        moe=SimpleNamespace(tp_ep_group=(0,)),
+        has_pp=False,
+        rank=0,
+    )
+    config = SimpleNamespace(
+        device="cuda",
+        gpu_id=0,
+        dist_init_addr=None,
+        nccl_port=1234,
+        distributed_timeout_seconds=10,
+        mapping=mapping,
+        hidden_size=0,
+        world_size=1,
+    )
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(set_device=lambda gpu: None),
+    )
+    monkeypatch.setattr(
+        initializer, "get_available_gpu_memory", lambda *args, **kwargs: 1.0
+    )
+    monkeypatch.setattr(
+        initializer, "maybe_set_numa_aware_cpu_affinity", lambda gpu: None
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager,
+        "init_distributed",
+        lambda *args, **kwargs: events.append("distributed"),
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager,
+        "init_process_group",
+        lambda group: events.append("group"),
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager, "get_process_group", lambda backend, group: "pg"
+    )
+    monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
+
+    initializer.DistributedInitializer.initialize(config)
+
+    assert events[0] == "distributed"
+    assert events[-1] == "fabric"
+    assert events.count("fabric") == 1
 
 
 def get_open_port() -> int:

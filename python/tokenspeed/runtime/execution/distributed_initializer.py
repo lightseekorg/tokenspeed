@@ -177,6 +177,10 @@ class DistributedInitializer:
             # broadcasts like the sampled first token (gloo).
             pg_manager.init_process_group(config.mapping.pp_group)
 
+        from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+        gather_fabric_map()
+
         # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (

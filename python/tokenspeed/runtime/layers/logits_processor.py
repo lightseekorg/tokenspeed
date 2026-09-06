@@ -340,23 +340,45 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
-    def _tp_group_spans_nodes(self) -> bool:
+    def _tp_group_multicast_reachable(self) -> bool:
+        """Whether the gather's symmetric buffer can map multicast here.
+
+        Topology now only admits: an NVLink domain can span hosts, so a
+        host-spread group is asked of the fabric rather than refused outright,
+        and without fabric the rendezvous hangs rather than failing over. The
+        rank count cannot stand in for the topology test -- a strided group can
+        be smaller than one host's device count while living on two.
+
+        The world fabric map is gathered during distributed initialization, so
+        the group verdict is a local lookup with no dispatch-time collective.
+        """
         if self.tp_group is None:
             return False
+
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+        )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = global_server_args_dict.get("mapping")
         nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        if not nprocs_per_node:
-            return False
-        return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        spans_hosts = bool(nprocs_per_node) and (
+            len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        )
+        if not spans_hosts:
+            return True
+        return group_has_fabric(self.tp_group)
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
+        if (
+            self.tp_size == 1
+            or self.skip_all_gather
+            or not self._tp_group_multicast_reachable()
+        ):
             return None
 
         vocab_padded = lm_head.weight.size(0) * self.tp_size
@@ -715,16 +737,20 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
-            if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
-                self._all_gather_state = self._init_all_gather_state(lm_head)
+            state = self._all_gather_state
+            if state is self._LOGITS_AG_STATE_UNINITIALIZED:
+                # create_state rendezvouses; leave it for an eager call.
+                if torch.cuda.is_current_stream_capturing():
+                    state = None
+                else:
+                    state = self._all_gather_state = self._init_all_gather_state(
+                        lm_head
+                    )
 
-            if (
-                self._all_gather_state is not None
-                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
-            ):
+            if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
                 # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
                 logits = all_gather_inner(
-                    self._all_gather_state,
+                    state,
                     logits,
                     tp_hidden_dim=logits.size(-1) * self.tp_size,
                     skip_entry_sync=True,
