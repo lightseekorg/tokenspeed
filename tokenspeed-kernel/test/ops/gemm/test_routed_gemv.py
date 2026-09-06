@@ -467,8 +467,10 @@ def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
         assert rel < 0.02, f"{backend} pdl={pdl} rel err {rel:.4f}"
 
 
-def test_the_vendor_cutover_is_restored_after_every_call():
-    """Widening M is scoped to this adapter; mm_bf16's own path is untouched."""
+def test_the_shared_vendor_module_is_never_touched():
+    """The adapter owns its instance; mm_bf16's own path never sees the change."""
+    import sys
+
     from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as vendor
     from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
     from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
@@ -478,18 +480,20 @@ def test_the_vendor_cutover_is_restored_after_every_call():
 
     m, n, k = 64, 1792, 7168
     tactic = SPLITK_TACTIC_ROUTE[(m, n, k)]
-    assert vendor._MAX_M == 32
+
+    # A separate namespace, so there is no shared state to race over.
+    private = flashinfer_splitk._module()
+    assert private is not vendor
+    assert sys.modules[flashinfer_splitk._VENDOR_MODULE] is vendor
 
     assert flashinfer_splitk.supports(m, n, k, tactic)
-    assert vendor._MAX_M == 32
-
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
     flashinfer_splitk.splitk_mm(x, w, tactic, None)
-    assert vendor._MAX_M == 32
 
-    # The vendor's own policy still refuses this M, which is what keeps every
-    # other mm_bf16 caller on the behaviour it had.
+    # Unchanged throughout: the vendor's own policy still refuses this M, which
+    # is what keeps every other mm_bf16 caller on the behaviour it had.
+    assert vendor._MAX_M == 32
     with pytest.raises(ValueError, match="low-M policy"):
         vendor.validate_tactic(vendor.SplitKTactic(*tactic), m, n, k)
 

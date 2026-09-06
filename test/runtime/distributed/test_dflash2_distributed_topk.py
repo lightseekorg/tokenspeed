@@ -30,13 +30,22 @@ Usage:
     python -m pytest test/runtime/distributed/test_dflash2_distributed_topk.py -v
 """
 
+import os
 import socket
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, suite="runtime-2gpu")
 
 VOCAB, HIDDEN, ROWS, TOP_K = 64, 16, 5, 4
 SEED = 3
@@ -56,7 +65,41 @@ def _inputs(device):
     return weight.to(device), hidden.to(device)
 
 
-def _drafter(rank, world_size, device, group):
+def _quantized_head(shard, device, logits):
+    """A head the production predicate accepts as genuinely quantized.
+
+    Only ``apply`` is stood in for -- with a real packed weight the collective
+    would still be exercised, but the reference would have to model NVFP4
+    rounding. The point here is that the quantized branch survives the real
+    all-gather, not that NVFP4 multiplies correctly.
+    """
+    from torch import nn
+
+    from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
+
+    head = nn.Module()
+    head.register_parameter(
+        "weight",
+        nn.Parameter(
+            torch.empty((shard, HIDDEN // 2), dtype=torch.uint8, device=device),
+            requires_grad=False,
+        ),
+    )
+    head.register_parameter(
+        "weight_scale",
+        nn.Parameter(
+            torch.ones((1,), dtype=torch.float32, device=device), requires_grad=False
+        ),
+    )
+    head.alpha = torch.ones((1,), dtype=torch.float32, device=device)
+    head.input_size_per_partition = HIDDEN
+    head.output_size_per_partition = shard
+    head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
+    head.quant_method.apply = lambda layer, x, bias: logits
+    return head
+
+
+def _drafter(rank, world_size, device, group, quantized=False):
     from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 
     weight, _ = _inputs(device)
@@ -69,12 +112,16 @@ def _drafter(rank, world_size, device, group):
     drafter._distributed_topk_enabled = True
     drafter._radix_topk = None
     drafter._shard_seq_lens = None
-    drafter.lm_head = SimpleNamespace(
-        weight=weight[rank * shard : (rank + 1) * shard],
-        quant_method=None,
-        shard_indices=SimpleNamespace(
-            num_org_elements=shard, org_vocab_start_index=rank * shard
-        ),
+    if quantized:
+        _, hidden = _inputs(device)
+        rank_logits = torch.matmul(hidden, weight[rank * shard : (rank + 1) * shard].T)
+        drafter.lm_head = _quantized_head(shard, device, rank_logits)
+    else:
+        drafter.lm_head = SimpleNamespace(
+            weight=weight[rank * shard : (rank + 1) * shard], quant_method=None
+        )
+    drafter.lm_head.shard_indices = SimpleNamespace(
+        num_org_elements=shard, org_vocab_start_index=rank * shard
     )
     drafter.candidate_logits_processor = SimpleNamespace(
         tp_size=world_size,
@@ -85,10 +132,10 @@ def _drafter(rank, world_size, device, group):
     return drafter
 
 
-def _check_candidates(rank, world_size, device, group, **_):
+def _check_candidates(rank, world_size, device, group, quantized=False, **_):
     """Every rank must agree with one top-k over the whole vocabulary."""
     weight, hidden = _inputs(device)
-    drafter = _drafter(rank, world_size, device, group)
+    drafter = _drafter(rank, world_size, device, group, quantized=quantized)
 
     candidate_ids, unary_logits = drafter._distributed_topk_candidates(hidden)
 
@@ -162,8 +209,16 @@ def _run(world_size, test_fn):
         raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in error_dict.items()))
 
 
+def _check_quantized_candidates(rank, world_size, device, group, **kwargs):
+    _check_candidates(rank, world_size, device, group, quantized=True, **kwargs)
+
+
 def test_two_ranks_pick_what_a_whole_vocabulary_topk_would():
     _run(2, _check_candidates)
+
+
+def test_a_quantized_head_survives_the_real_collective():
+    _run(2, _check_quantized_candidates)
 
 
 def test_two_ranks_keep_their_candidates_through_a_cuda_graph():

@@ -559,34 +559,107 @@ def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
         torch.testing.assert_close(values.float(), got, atol=1e-2, rtol=0)
 
 
-def test_distributed_topk_runs_a_quantized_head_through_its_quant_method() -> None:
+def _nvfp4_head(shard: int, hidden: int, logits: torch.Tensor):
+    """A head the production predicate accepts as genuinely quantized.
+
+    Same shape as the NextN fixture: a packed uint8 weight plus the runtime
+    attributes ``should_apply_lm_head_quant_method`` requires. Only ``apply``
+    is stood in for, so the dispatch is checked against the real quant method.
+    """
+    from torch import nn
+
+    from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
+
+    head = nn.Module()
+    head.register_parameter(
+        "weight",
+        nn.Parameter(
+            torch.empty((shard, hidden // 2), dtype=torch.uint8), requires_grad=False
+        ),
+    )
+    head.register_parameter(
+        "weight_scale",
+        nn.Parameter(torch.ones((1,), dtype=torch.float32), requires_grad=False),
+    )
+    head.alpha = torch.ones((1,), dtype=torch.float32)
+    head.input_size_per_partition = hidden
+    head.output_size_per_partition = shard
+    head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
+    head.quant_method.apply = mock.Mock(return_value=logits)
+    return head
+
+
+def test_a_quantized_head_reaches_its_quant_method_not_a_matmul() -> None:
     """A packed weight must never be matmul'd, on the fast path either."""
+    from tokenspeed.runtime.layers.logits_processor import (
+        should_apply_lm_head_quant_method,
+    )
+
     torch.manual_seed(11)
     rows, hidden, shard = 3, 6, 20
     hidden_states = torch.randn(rows, hidden)
     dense = torch.randn(rows, shard)
 
-    class FakeQuantMethod:
-        def __init__(self):
-            self.calls = 0
-
-        def apply(self, layer, x, bias):
-            self.calls += 1
-            return dense
-
-    quant_method = FakeQuantMethod()
     drafter = DFlash2.__new__(DFlash2)
-    # uint8 is what a packed head carries: a matmul against it is nonsense,
-    # so reaching the right branch is the whole assertion.
-    drafter.lm_head = SimpleNamespace(
-        weight=torch.zeros(shard, hidden, dtype=torch.uint8),
-        quant_method=quant_method,
+    drafter.lm_head = _nvfp4_head(shard, hidden, dense)
+    # The production predicate, not our own opinion, is what must say "quantized".
+    assert should_apply_lm_head_quant_method(
+        drafter.lm_head, drafter.lm_head.quant_method
     )
 
     logits = drafter._shard_logits(hidden_states)
 
-    assert quant_method.calls == 1
+    drafter.lm_head.quant_method.apply.assert_called_once()
     torch.testing.assert_close(logits, dense)
+
+
+def test_a_quantized_head_picks_candidates_through_the_padding_slice(
+    monkeypatch,
+) -> None:
+    """The whole fast path on a quantized head: apply, slice, gather, select."""
+    from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime
+
+    torch.manual_seed(13)
+    rows, hidden, shard, pad, top_k, tp_size = 3, 6, 20, 4, 4, 2
+    hidden_states = torch.randn(rows, hidden)
+    # apply() answers over the padded partition; only the first `shard`
+    # columns are real token ids, so the slice is what keeps ids meaningful.
+    padded = torch.randn(rows, shard + pad)
+    padded[:, shard:] = 1e4  # would win every slot if the slice were dropped
+
+    drafter = DFlash2.__new__(DFlash2)
+    drafter.selector_top_k = top_k
+    drafter.spec_num_tokens = 3
+    drafter.input_buffers = SimpleNamespace(max_bs=2)
+    drafter._candidate_gather_buffers = None
+    drafter._distributed_topk_enabled = True
+    drafter._radix_topk = None
+    drafter._shard_seq_lens = None
+    drafter.lm_head = _nvfp4_head(shard, hidden, padded)
+    drafter.lm_head.shard_indices = SimpleNamespace(
+        num_org_elements=shard, org_vocab_start_index=0
+    )
+    drafter.candidate_logits_processor = SimpleNamespace(
+        tp_size=tp_size, tp_group=None, logit_scale=None, final_logit_softcapping=None
+    )
+
+    peer = torch.full((rows, shard), -1e4)
+    peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
+    peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
+
+    def fake_all_gather(out, src, group):
+        out[: src.shape[0]].copy_(src)
+        out[src.shape[0] :].copy_(peer_packed)
+
+    monkeypatch.setattr(dflash2_runtime, "all_gather_into_tensor", fake_all_gather)
+    candidate_ids, _ = drafter._distributed_topk_candidates(hidden_states)
+
+    # Every winner is a real token of this shard, never one of the pad columns
+    # and never the peer's deliberately-losing rows.
+    assert candidate_ids.max().item() < shard
+    want = torch.topk(padded[:, :shard], top_k, dim=-1).values
+    got = torch.gather(padded[:, :shard], 1, candidate_ids)
+    assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
 
 
 def test_shard_logits_matmuls_an_unquantized_head() -> None:

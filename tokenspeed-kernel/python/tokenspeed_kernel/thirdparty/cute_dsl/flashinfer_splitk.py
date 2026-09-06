@@ -27,10 +27,12 @@ decisions that a block drafter should not inherit:
 * ``_MAX_M`` refuses M above 32.
 
 Both cost real time here. The drafter's projections are cold-weight and
-grid-starved -- ncu puts them at 0.18-0.74 waves per SM, and DRAM throughput
-tracks that ratio rather than the kernel's arithmetic -- so the tactic that
-wins is the one that fills the machine, not the one the heuristic picks. And
-the drafter's M is its batch times its block width, which reaches 64.
+grid-starved, so DRAM throughput tracks how much of the machine the grid fills
+rather than the kernel's arithmetic, and the tactic that wins is the one that
+fills it -- not the one a generic occupancy heuristic picks. And the drafter's
+M is its batch times its block width, which reaches 64. The measurements behind
+both claims, and the tactic per shape, come from
+``test/gemm_tuning/tune_splitk_tactic.py``.
 
 Public M rides the kernel's MMA-N axis, so M above the cutover is tiled, not
 truncated; ``test_routed_gemv.py`` checks that directly. Raising the cutover is
@@ -38,21 +40,25 @@ therefore a change of policy, not of contract, and this module only does it
 after confirming the vendor's constants are exactly the ones that behaviour was
 measured against.
 
-``run_splitk_dense`` validates through the module-level ``_MAX_M``, so reaching
-M above the vendor's policy means moving it. That happens only for the duration
-of a call from here, so ``mm_bf16``'s own cute-dsl path keeps the vendor's
-cutover and its behaviour is unchanged.
+``run_splitk_dense`` validates through a module-level ``_MAX_M``, so reaching M
+above the vendor's policy means moving it. This module therefore executes the
+vendor source into a namespace of its own and raises the cutover only there:
+the shared module keeps the vendor's constants, ``sys.modules`` is untouched,
+and ``mm_bf16``'s cute-dsl path is unreachable from here -- no shared mutable
+state, so no lock and no window for another thread to observe. The private
+instance carries its own compiled-kernel cache, which costs a second
+compilation only for a (tactic, shape) both paths happen to use.
 """
 
 from __future__ import annotations
 
-import contextlib
 import functools
-import threading
 
 import torch
 
 __all__ = ["MAX_M", "is_available", "splitk_mm", "supports"]
+
+_VENDOR_MODULE = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
 
 #: Largest M this adapter serves. The vendor cutover is 32; the kernel itself
 #: tiles public M and stays exact to here.
@@ -69,17 +75,27 @@ _EXPECTED = {
 }
 _TACTIC_FIELDS = ("mma_m", "mma_n", "split_k", "ab_stages")
 
-_widen_lock = threading.Lock()
-
 
 @functools.lru_cache(maxsize=1)
 def _module():
-    """The vendor kernel module, or None when it is not the one measured."""
-    try:
-        import dataclasses
+    """A private instance of the vendor kernel module, or None.
 
-        from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as mod
-    except ImportError:
+    Executed into its own namespace rather than imported, so raising the M
+    cutover below cannot be observed through the shared module.
+    """
+    import dataclasses
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(_VENDOR_MODULE)
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001  (any import-time failure disables us)
         return None
     for name, value in _EXPECTED.items():
         if getattr(mod, name, None) != value:
@@ -91,24 +107,11 @@ def _module():
         return None
     if not all(callable(getattr(mod, f, None)) for f in ("run_splitk_dense",)):
         return None
+    # Every constant the tactics were measured against is now pinned, so this
+    # relaxes a policy bound and never a correctness one. It lands on this
+    # module's own copy of the vendor namespace.
+    mod._MAX_M = MAX_M
     return mod
-
-
-@contextlib.contextmanager
-def _widened(mod):
-    """Raise the vendor's M cutover for one call, then put it back.
-
-    The guard in :func:`_module` has already pinned every constant the tactics
-    were measured against, so this only relaxes the policy bound, never a
-    correctness one.
-    """
-    with _widen_lock:
-        restore = mod._MAX_M
-        mod._MAX_M = MAX_M
-        try:
-            yield
-        finally:
-            mod._MAX_M = restore
 
 
 def is_available() -> bool:
@@ -122,8 +125,7 @@ def supports(m: int, n: int, k: int, tactic: tuple[int, int, int, int]) -> bool:
     if mod is None or not 1 <= m <= MAX_M:
         return False
     try:
-        with _widened(mod):
-            mod.validate_tactic(mod.SplitKTactic(*tactic), m, n, k)
+        mod.validate_tactic(mod.SplitKTactic(*tactic), m, n, k)
     except (ValueError, AttributeError):
         return False
     return True
@@ -160,13 +162,12 @@ def splitk_mm(
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     # CuTe DSL reads these through DLPack, which rejects autograd views.
-    with _widened(mod):
-        mod.run_splitk_dense(
-            x.detach(),
-            weight.detach().t(),
-            None,
-            out,
-            enable_pdl,
-            mod.SplitKTactic(*tactic),
-        )
+    mod.run_splitk_dense(
+        x.detach(),
+        weight.detach().t(),
+        None,
+        out,
+        enable_pdl,
+        mod.SplitKTactic(*tactic),
+    )
     return out

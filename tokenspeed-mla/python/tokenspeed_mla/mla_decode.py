@@ -421,11 +421,12 @@ def tokenspeed_mla_decode(
         non-negative, query row ``i`` of the ``q_len`` block attends to keys
         ``[max(0, K - q_len - window_left + i), k_bound)`` -- the whole block
         plus ``window_left`` tokens of history, which is the mask a block
-        drafter's ``sliding_attention`` layers declare. Must be ``>= q_len``
-        when non-negative: the block stays fully visible, so a narrower window
-        would no longer bound the distance between the block's own rows, and
-        the mask would be wider than a per-position sliding window means.
-        ``ValueError`` otherwise. The window is part of the kernel cache key
+        drafter's ``sliding_attention`` layers declare. Must be ``>= q_len -
+        1`` when non-negative -- the block's rows are at most that far apart,
+        so the window still admits every pair and the mask matches a
+        per-position ``|query_pos - key_pos| <= window_left``. A narrower
+        window would no longer bound the distance between the block's own
+        rows, and raises ``ValueError``. The window is part of the kernel cache key
         and folds away at compile time, so ``-1`` compiles and runs exactly the
         kernel it did before this argument existed.
     enable_pdl : bool
@@ -498,18 +499,20 @@ def tokenspeed_mla_decode(
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
     if window_left < -1:
         raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
-    if 0 <= window_left < q_len:
-        # Below this the block's own rows are further apart than the window,
-        # and "whole block plus window_left history" stops agreeing with the
-        # per-position mask |query_pos - key_pos| <= window_left that a
-        # sliding-window layer means: row 0 would still see the block's last
-        # row, q_len - 1 positions away. Refuse rather than serve a wider mask
-        # than the caller asked for.
+    if 0 <= window_left < q_len - 1:
+        # The block's rows are at most q_len - 1 apart, so a window that wide
+        # still admits every pair and "whole block plus window_left history"
+        # agrees with the per-position mask |query_pos - key_pos| <=
+        # window_left. Below it row 0 would keep seeing the block's last row
+        # anyway; refuse rather than serve a wider mask than the caller asked
+        # for.
         raise ValueError(
-            f"window_left={window_left} is narrower than the {q_len}-wide "
-            "query block; this kernel keeps the whole block visible, so the "
-            "window would no longer bound the distance between block rows. "
-            f"Use window_left >= {q_len} or a per-position masked kernel."
+            f"window_left={window_left} leaves the {q_len}-wide query block's "
+            "own rows further apart than the window; this kernel keeps the "
+            "whole block visible, so the window would no longer bound the "
+            f"distance between block rows. Use window_left >= {q_len - 1} "
+            "(HF sliding_window >= the block width) or a per-position masked "
+            "kernel."
         )
     if window_left >= 0:
         # No request can read past its own window, so the split heuristic sizes

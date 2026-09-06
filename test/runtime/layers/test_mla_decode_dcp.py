@@ -38,8 +38,18 @@ per-row slice rather than against a second kernel configuration.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 _HAS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 pytestmark = pytest.mark.skipif(
@@ -264,19 +274,21 @@ def _windowed_reference(query, keys, n, window_left, causal_mask):
     return out.unsqueeze(0)
 
 
-@pytest.mark.parametrize("window_left", [0, 1, Q - 1])
+@pytest.mark.parametrize("window_left", [0, 1, Q - 2])
 def test_a_window_narrower_than_the_block_is_refused(window_left):
     """The kernel keeps the whole block visible, so it cannot serve these.
 
     Row 0 would still see the block's last row, Q-1 positions away, which a
-    per-position sliding window of this width does not permit.
+    per-position window this narrow does not permit. Q - 1 is the narrowest
+    that does (HF sliding_window == Q, since window_left is one less), and it
+    is covered by the reference test below.
     """
     ws = _workspace()
     query = (torch.randn(1, Q, H, D, device="cuda") / 8).to(torch.bfloat16)
     keys = (torch.randn(64, D, device="cuda") / 8).to(torch.bfloat16)
     cache, bt = _paged(keys, torch.bfloat16)
 
-    with pytest.raises(ValueError, match="narrower than the"):
+    with pytest.raises(ValueError, match="own rows further apart"):
         _decode(
             query,
             cache,
@@ -291,10 +303,11 @@ def test_a_window_narrower_than_the_block_is_refused(window_left):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("causal_mask", [False, True])
-# Q is the narrowest window the kernel accepts (below it the block's own rows
-# outrun the window); 32 leaves only the last KV tiles alive, 320 keeps most of
-# the cache with the low edge inside it, and 4096 opens it past the cache.
-@pytest.mark.parametrize("window_left", [-1, Q, 32, 320, 4096])
+# Q - 1 is the narrowest window the kernel accepts -- the block's rows are that
+# far apart, so it is exactly HF sliding_window == Q; 32 leaves only the last KV
+# tiles alive, 320 keeps most of the cache with the low edge inside it, and 4096
+# opens it past the cache.
+@pytest.mark.parametrize("window_left", [-1, Q - 1, Q, 32, 320, 4096])
 def test_sliding_window_matches_a_per_row_masked_reference(
     dtype, causal_mask, window_left
 ):
