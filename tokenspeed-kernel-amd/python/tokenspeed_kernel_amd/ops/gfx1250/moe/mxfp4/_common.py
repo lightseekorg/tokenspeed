@@ -84,6 +84,20 @@ def _swizzle2d(pid, grid_m, grid_n, GROUP_M: gl.constexpr):
 
 
 @gluon.jit
+def _enforce_wave_uniform_i32(value):
+    # Force emitting v_readfirstlane to indicate input value is wave-uniform for
+    # potential compiler optimizations.
+    return gl.inline_asm_elementwise(
+        "v_readfirstlane_b32 $0, $1",
+        "=s,v",
+        [value],
+        dtype=gl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
 def compute_pids(
     block_id,
     grid_m,

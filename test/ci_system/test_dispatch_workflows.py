@@ -817,3 +817,11 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/ops/attention" in task["env"]["MI450_SIM_TESTS"]
+
+
+def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
+    script = (REPO_ROOT / "test/ci_system/run_mi450_rocjitsu.sh").read_text()
+
+    assert 'libhip_path="${rocm_root}/lib/libamdhip64.so"' in script
+    assert 'test -f "${libhip_path}"' in script
+    assert 'export TRITON_LIBHIP_PATH="${libhip_path}"' in script

@@ -108,6 +108,11 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
+unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
+TokenSpeed use separate Triton distributions in the same process, and this
+path is accepted by both while still resolving to the same TheRock runtime.
+
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact
