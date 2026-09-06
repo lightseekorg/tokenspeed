@@ -362,13 +362,10 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if ctx.forward_mode.is_idle():
-            return super().forward(
-                positions, hidden_states, ctx, out_cache_loc, residual
-            )
+            return super().forward(positions, hidden_states, ctx, residual)
 
         if residual is None:
             residual = hidden_states
@@ -391,7 +388,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         if self.comm_manager is not None:
             attention_kwargs["comm_manager"] = self.comm_manager
