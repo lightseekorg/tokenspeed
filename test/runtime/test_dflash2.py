@@ -489,6 +489,35 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert not second.any()
 
 
+@_CUDA_ONLY
+def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
+    """The selector's shard top-k, on the vendored single-pass radix kernel.
+
+    ``sorted=False`` either way, so only the candidate set has to match -- but
+    it has to match exactly, since these are the tokens the drafter proposes.
+    """
+    drafter = DFlash2.__new__(DFlash2)
+    drafter.selector_top_k = 16
+    drafter.spec_num_tokens = 8
+    drafter.input_buffers = SimpleNamespace(max_bs=8)
+    drafter._shard_seq_lens = None
+    drafter.lm_head = SimpleNamespace(
+        weight=torch.zeros(1, device="cuda", dtype=torch.bfloat16)
+    )
+    drafter._radix_topk = drafter._probe_radix_topk(20480)
+    if drafter._radix_topk is None:
+        pytest.skip("vendored radix top-k is not built here")
+
+    torch.manual_seed(0)
+    for rows in (7, 56):
+        logits = torch.randn(rows, 20480, device="cuda", dtype=torch.bfloat16)
+        values, ids = drafter._shard_topk(logits, 16)
+        want = torch.topk(logits.float(), 16, dim=-1).values
+        got = torch.gather(logits.float(), 1, ids.long())
+        assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
+        torch.testing.assert_close(values.float(), got, atol=1e-2, rtol=0)
+
+
 def test_distributed_topk_picks_what_a_whole_vocabulary_topk_would(monkeypatch) -> None:
     """Two shard-local top-16s must agree with one top-16 over the vocabulary."""
     from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime

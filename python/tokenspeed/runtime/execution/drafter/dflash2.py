@@ -78,6 +78,8 @@ class DFlash2(DFlash):
 
     #: Set from the wired head's shard geometry; see _init_distributed_topk.
     _distributed_topk_enabled = False
+    _radix_topk = None
+    _shard_seq_lens = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -158,6 +160,79 @@ class DFlash2(DFlash):
             )
             return
         self._distributed_topk_enabled = True
+        self._shard_seq_lens = None
+        self._radix_topk = self._probe_radix_topk(num_org)
+
+    def _probe_radix_topk(self, num_cols: int):
+        """The vendored single-pass radix top-k, if it serves this shard.
+
+        torch's multi-block radix select spends eight launches on a
+        ``[rows, vocab/tp]`` top-16; the vendored TensorRT-LLM kernel does it in
+        one and measured 3.1-4.2x faster at this shape. Probed here, at the
+        widest row count, so its scratch arena is allocated before the drafter
+        is ever captured.
+
+        Returns:
+            The runner class, or None to keep ``torch.topk``.
+        """
+        from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
+            has_cute_dsl_decode_topk,
+        )
+
+        if not has_cute_dsl_decode_topk():
+            return None
+        from tokenspeed_kernel.thirdparty.cute_dsl.topk import (
+            CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner as runner,
+        )
+
+        rows = int(self.input_buffers.max_bs) * max(self.spec_num_tokens - 1, 1)
+        device = self.lm_head.weight.device
+        probe = torch.zeros(rows, num_cols, dtype=torch.bfloat16, device=device)
+        lens = torch.full((rows,), num_cols, dtype=torch.int32, device=device)
+        try:
+            runner._row_states_initialized = False
+            indices, values = runner.forward(
+                probe, lens, self.selector_top_k, 1, return_val=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("DFlash2 radix top-k unavailable (%s); using torch.topk", exc)
+            return None
+        if indices is None or values is None:
+            # Cluster capacity refused the shape; the base runner is only ~1.4x
+            # over torch here, so it is not worth a second code path.
+            logger.info(
+                "DFlash2 radix top-k declined rows=%d cols=%d; using torch.topk",
+                rows,
+                num_cols,
+            )
+            return None
+        return runner
+
+    def _shard_topk(self, logits: torch.Tensor, top_k: int):
+        """Per-row top-k over this rank's vocabulary shard.
+
+        Returns unsorted ``(values, ids)``; the caller re-selects across ranks
+        afterwards, so within-shard order does not matter.
+        """
+        if self._radix_topk is None:
+            return torch.topk(logits, top_k, dim=-1, sorted=False)
+        rows, cols = logits.shape
+        lens = self._shard_seq_lens
+        if lens is None or lens.shape[0] < rows:
+            lens = torch.full(
+                (int(self.input_buffers.max_bs) * max(self.spec_num_tokens - 1, 1),),
+                cols,
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            self._shard_seq_lens = lens
+        self._radix_topk._row_states_initialized = False
+        ids, values = self._radix_topk.forward(
+            logits, lens[:rows], top_k, 1, return_val=True
+        )
+        if ids is None:
+            return torch.topk(logits, top_k, dim=-1, sorted=False)
+        return values, ids
 
     def _ensure_candidate_gather_buffers(
         self, rows: int, device: torch.device
@@ -197,7 +272,7 @@ class DFlash2(DFlash):
         )
         if processor.logit_scale is not None:
             logits.mul_(processor.logit_scale)
-        values, ids = torch.topk(logits, top_k, dim=-1, sorted=False)
+        values, ids = self._shard_topk(logits, top_k)
 
         tp_size = int(processor.tp_size)
         rows = int(values.shape[0])
