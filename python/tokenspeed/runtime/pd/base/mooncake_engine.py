@@ -46,6 +46,12 @@ class MooncakeTransferEngine:
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
 
     def register(self, ptr, length):
+        """Register ``ptr`` with Mooncake.
+
+        Returns:
+            0 on success, nonzero on failure. KV-arena registration may ignore
+            the result; pack scratch must check it before swapping buffers.
+        """
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception:
@@ -54,6 +60,7 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake memory registration %s failed.", ptr)
+        return ret_value
 
     def deregister(self, ptr):
         try:

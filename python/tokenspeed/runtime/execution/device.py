@@ -978,7 +978,7 @@ def _build_kv_transfer(
         ),
         kv_args=get_kv_args(
             global_rank,
-            global_rank,
+            gpu_id,  # local CUDA index; new threads do not inherit current_device
             server_args.disaggregation_ib_device,
             executor.token_to_kv_pool,
             model_config=model_config,
