@@ -49,6 +49,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
     MoEProgramBase,
+    _enforce_wave_uniform_i32,
     _situ_gfx1250,
     _swiglu_gfx1250,
     composition,
@@ -1131,7 +1132,7 @@ def _matmul(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
+        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(cfg.index_type)
         y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
