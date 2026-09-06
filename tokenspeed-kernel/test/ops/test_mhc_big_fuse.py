@@ -18,12 +18,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import inspect
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.mhc.triton import (
     _pre_reduce_apply_fuses_norm,
     _pre_reduce_apply_is_supported,
 )
+
+
+def test_mhc_big_fuse_launch_contract_is_explicit() -> None:
+    from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
+
+    parameters = inspect.signature(mhc_big_fuse).parameters
+    for name in ("norm_weight", "norm_eps", "block_size", "enable_pdl"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty
 
 
 def reference(
@@ -92,6 +103,8 @@ def test_mhc_big_fuse_matches_reference(
         20,
         n_splits,
         num_tokens,
+        norm_weight=None,
+        norm_eps=0.0,
         block_size=block_size,
         enable_pdl=False,
     )
@@ -198,6 +211,8 @@ def test_mhc_big_fuse_rejects_unsupported_splits() -> None:
             20,
             n_splits,
             1,
+            norm_weight=None,
+            norm_eps=0.0,
             block_size=512,
             enable_pdl=False,
         )

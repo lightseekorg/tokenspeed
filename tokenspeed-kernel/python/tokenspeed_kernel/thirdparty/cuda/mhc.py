@@ -25,7 +25,6 @@ import functools
 from pathlib import Path
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -57,10 +56,10 @@ def mhc_big_fuse(
     n_splits: int,
     num_tokens: int,
     *,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float = 0.0,
-    block_size: int = 512,
-    enable_pdl: bool | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    block_size: int,
+    enable_pdl: bool,
 ) -> None:
     """Reduce split-K mHC projections and emit all pre-mapping outputs.
 
@@ -68,7 +67,6 @@ def mhc_big_fuse(
     function replaces the separate pre-mix and residual-apply kernels with one
     CUDA launch. ``block_size`` supports 128, 256, or 512 threads.
     """
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     norm_weight_arg = (
         norm_weight
         if norm_weight is not None
