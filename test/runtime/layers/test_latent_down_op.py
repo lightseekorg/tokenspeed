@@ -128,7 +128,10 @@ def test_availability_needs_a_divisible_multi_rank_group(
     """Every term of the eligibility test has to be visible on its own."""
     with _eligible():
         assert (
-            latent_down.KimiK3LatentDownOp.available(hidden, latent, tp, 92) is expected
+            latent_down.KimiK3LatentDownOp.available(
+                hidden, latent, tp, 92, _voting_group()
+            )
+            is expected
         )
 
 
@@ -152,19 +155,28 @@ def test_the_fabric_is_probed_for_the_group_that_will_rendezvous() -> None:
 def test_availability_requires_a_reachable_fabric() -> None:
     """An unreachable fabric must be refused before any rendezvous."""
     with _eligible(reachable=False):
-        assert latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92) is False
+        assert (
+            latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92, _voting_group())
+            is False
+        )
 
 
 def test_availability_requires_an_nvidia_platform() -> None:
     """A term the fabric probe would also refuse still has to stand alone."""
     with _eligible(nvidia=False):
-        assert latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92) is False
+        assert (
+            latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92, _voting_group())
+            is False
+        )
 
 
 def test_availability_requires_an_initialized_process_group() -> None:
     """Without distributed there is no group to rendezvous over."""
     with _eligible(initialized=False):
-        assert latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92) is False
+        assert (
+            latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, 92, _voting_group())
+            is False
+        )
 
 
 def test_initialize_remembers_that_a_slot_could_not_be_built() -> None:
@@ -439,7 +451,9 @@ def test_the_group_is_polled_once_not_once_per_layer() -> None:
 def test_availability_needs_a_whole_number_of_rotations(layers: int) -> None:
     """A stage's blocks must wrap onto a different slot, not the same one."""
     with _eligible():
-        available = latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, layers)
+        available = latent_down.KimiK3LatentDownOp.available(
+            7168, 3584, 8, layers, _voting_group()
+        )
     depth = latent_down._DOWN_POOL_DEPTH
     assert available is (layers >= depth and layers % depth == 0)
 
@@ -450,7 +464,9 @@ def test_a_stage_that_wraps_onto_its_own_slot_is_refused() -> None:
         slots = [latent_down._pool_slot(b) for b in range(local)]
         assert slots[-1] == slots[0], "this is the case the gate must refuse"
         with _eligible():
-            assert not latent_down.KimiK3LatentDownOp.available(7168, 3584, 8, local)
+            assert not latent_down.KimiK3LatentDownOp.available(
+                7168, 3584, 8, local, _voting_group()
+            )
 
 
 def test_the_vote_takes_the_minimum_so_one_refusal_is_decisive() -> None:
@@ -1201,7 +1217,13 @@ def test_an_agreed_ceiling_is_polled_once_not_once_per_layer() -> None:
 )
 def test_the_decline_reason_names_the_condition_that_failed(kwargs, expected) -> None:
     """A silent fallback is the failure mode; the reason is the whole point."""
-    args = dict(hidden_size=7168, latent_size=3584, tp_size=8, layer_count=92)
+    args = dict(
+        hidden_size=7168,
+        latent_size=3584,
+        tp_size=8,
+        layer_count=92,
+        group=_voting_group(),
+    )
     args.update(kwargs)
     with _eligible():
         reason = latent_down.KimiK3LatentDownOp._unavailable_reason(**args)
@@ -1210,7 +1232,13 @@ def test_the_decline_reason_names_the_condition_that_failed(kwargs, expected) ->
 
 def test_the_reason_predicate_still_backs_availability() -> None:
     """available() must stay exactly the negation, or the two can drift apart."""
-    args = dict(hidden_size=7168, latent_size=3584, tp_size=8, layer_count=92)
+    args = dict(
+        hidden_size=7168,
+        latent_size=3584,
+        tp_size=8,
+        layer_count=92,
+        group=_voting_group(),
+    )
     with _eligible():
         assert latent_down.KimiK3LatentDownOp.available(**args)
         assert latent_down.KimiK3LatentDownOp._unavailable_reason(**args) is None

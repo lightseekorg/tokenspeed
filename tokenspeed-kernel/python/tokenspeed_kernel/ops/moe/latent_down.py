@@ -293,7 +293,7 @@ class KimiK3LatentDownOp:
         latent_size: int,
         tp_size: int,
         layer_count: int,
-        group: dist.ProcessGroup | None = None,
+        group: dist.ProcessGroup,
     ) -> bool:
         """Whether this rank can host the multicast down projection.
 
@@ -323,7 +323,7 @@ class KimiK3LatentDownOp:
         latent_size: int,
         tp_size: int,
         layer_count: int,
-        group: dist.ProcessGroup | None = None,
+        group: dist.ProcessGroup,
     ) -> str | None:
         """The first condition this rank fails, or None when it can host.
 
