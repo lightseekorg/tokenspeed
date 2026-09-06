@@ -98,4 +98,6 @@ def mhc_big_fuse(
 # Decode uses 64 splits on GB200. Prefill graph buckets can produce arbitrary
 # split counts, so callers must retain the established Triton fallback there.
 mhc_big_fuse.supported_n_splits = frozenset({1, 2, 4, 8, 16, 32, 64})
+mhc_big_fuse.supported_hc_mults = frozenset({4})
+mhc_big_fuse.hidden_size_multiple = 8
 mhc_big_fuse.supports_fused_norm = True

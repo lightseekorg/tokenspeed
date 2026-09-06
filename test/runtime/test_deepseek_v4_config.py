@@ -2929,6 +2929,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=4096,
             )
         )
+        backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=2)
         first_q = torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4)
         first_padded = backend._pad_decode_query(first_q, padded_heads=64)
 
@@ -2944,8 +2945,17 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.count_nonzero(second_padded[:, 16:]) == 0)
 
         different_shape = backend._pad_decode_query(first_q[:1], padded_heads=64)
-        self.assertNotEqual(different_shape.data_ptr(), first_padded.data_ptr())
-        self.assertEqual(len(backend._decode_q_padding_workspaces), 2)
+        self.assertEqual(different_shape.data_ptr(), first_padded.data_ptr())
+        self.assertEqual(
+            tuple(backend._decode_q_padding_workspace.shape),
+            (8, 64, 4),
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds.*workspace"):
+            backend._pad_decode_query(
+                torch.empty(9, 16, 4, dtype=torch.bfloat16),
+                padded_heads=64,
+            )
 
     def test_deepseek_v4_decode_query_padding_validates_shape_and_head_width(self):
         backend = _v4_backend(
@@ -2991,7 +3001,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(padded.data_ptr(), q.data_ptr())
         self.assertTrue(padded.is_contiguous())
-        self.assertFalse(backend._decode_q_padding_workspaces)
+        self.assertIsNone(backend._decode_q_padding_workspace)
 
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
         backend = _v4_backend(

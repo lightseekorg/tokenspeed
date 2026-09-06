@@ -276,9 +276,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # FlashMLA SM100 decode requires a padded query-head width. Calls using
         # one backend are stream ordered, so only the valid prefix needs to be
         # refreshed after the zero-tailed workspace is initialized.
-        self._decode_q_padding_workspaces: dict[
-            tuple[torch.device, torch.dtype, int, int, int, int], torch.Tensor
-        ] = {}
+        self._decode_q_padding_workspace: torch.Tensor | None = None
+        self._decode_q_padding_workspace_layout: (
+            tuple[torch.device, torch.dtype, int, int, int] | None
+        ) = None
         self._swa_window_size = 0
         self._swa_block_size = 0
         self.speculative_num_steps = int(config.speculative_num_steps)
@@ -1067,24 +1068,41 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if num_heads == padded_heads:
             return q.contiguous()
 
-        key = (
+        if self.graph is None:
+            raise RuntimeError(
+                "DeepSeek V4 decode query padding requires initialized decode state"
+            )
+        max_query_tokens = self.graph.max_bs * self.graph.max_tokens_per_req
+        if q.shape[0] > max_query_tokens:
+            raise ValueError(
+                "DeepSeek V4 decode query exceeds the persistent padding workspace: "
+                f"tokens={q.shape[0]}, capacity={max_query_tokens}"
+            )
+
+        layout = (
             q.device,
             q.dtype,
-            q.shape[0],
             num_heads,
             padded_heads,
             q.shape[2],
         )
-        workspace = self._decode_q_padding_workspaces.get(key)
+        workspace = self._decode_q_padding_workspace
         if workspace is None:
             workspace = torch.zeros(
-                (q.shape[0], padded_heads, q.shape[2]),
+                (max_query_tokens, padded_heads, q.shape[2]),
                 dtype=q.dtype,
                 device=q.device,
             )
-            self._decode_q_padding_workspaces[key] = workspace
-        workspace[:, :num_heads].copy_(q)
-        return workspace
+            self._decode_q_padding_workspace = workspace
+            self._decode_q_padding_workspace_layout = layout
+        elif layout != self._decode_q_padding_workspace_layout:
+            raise ValueError(
+                "DeepSeek V4 decode query padding layout changed after allocation: "
+                f"expected={self._decode_q_padding_workspace_layout}, actual={layout}"
+            )
+        workspace_view = workspace[: q.shape[0]]
+        workspace_view[:, :num_heads].copy_(q)
+        return workspace_view
 
     def _dense_prefill_local_compressed_indices(
         self,
@@ -1753,6 +1771,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             device=self.device,
         )
+        self._decode_q_padding_workspace = None
+        self._decode_q_padding_workspace_layout = None
         self.draft_rounds = DeepseekV4DraftRounds(self.graph) if self.is_draft else None
         specs = self._configure_cache_group_contract(
             cache_group_specs,
