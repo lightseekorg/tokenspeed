@@ -657,7 +657,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             setattr(moe, name, MethodType(getattr(DeepseekV4MoE, name), moe))
         return moe
 
-    def _make_fake_deepseek_v4_moe(self, hidden_states, input_ids, stream_fork, calls):
+    def _make_fake_deepseek_v4_moe(
+        self,
+        hidden_states,
+        input_ids,
+        stream_fork,
+        calls,
+        *,
+        bypassed_topk_output,
+        norm_topk_prob,
+    ):
         def select_experts(states, ids):
             calls.append("select")
             self.assertIs(states, hidden_states)
@@ -672,7 +681,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         def make_topk_output(states, weights, ids, scores):
             del weights, ids, scores
             calls.append("topk")
-            return states
+            return SimpleNamespace(
+                hidden_states=states,
+                format=SimpleNamespace(
+                    is_bypassed=lambda: bypassed_topk_output,
+                ),
+            )
 
         def routed_experts(**kwargs):
             calls.append("routed")
@@ -690,6 +704,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             shared_experts=shared_experts,
             stream_fork=stream_fork,
             routed_scaling_factor=2.0,
+            config=SimpleNamespace(norm_topk_prob=norm_topk_prob),
             experts=routed_experts,
             _select_experts=select_experts,
             _make_topk_output=make_topk_output,
@@ -701,7 +716,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(None), calls
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         actual = DeepseekV4MoE.forward(
@@ -716,6 +736,41 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
+
+    def test_deepseek_v4_moe_preserves_unnormalized_kernel_route_weights(self):
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+
+        for bypassed_topk_output, norm_topk_prob, routed_multiplier in (
+            (True, False, 4),
+            (True, True, 2),
+            (False, False, 2),
+        ):
+            with self.subTest(
+                bypassed_topk_output=bypassed_topk_output,
+                norm_topk_prob=norm_topk_prob,
+            ):
+                calls = []
+                moe = self._make_fake_deepseek_v4_moe(
+                    hidden_states,
+                    input_ids,
+                    StreamFork(None),
+                    calls,
+                    bypassed_topk_output=bypassed_topk_output,
+                    norm_topk_prob=norm_topk_prob,
+                )
+
+                actual = DeepseekV4MoE.forward(
+                    moe,
+                    hidden_states,
+                    input_ids,
+                    num_global_tokens=2,
+                    max_num_tokens_per_gpu=2,
+                )
+
+                expected = (hidden_states + 1) * routed_multiplier + hidden_states + 3
+                self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+                self.assertTrue(torch.equal(actual, expected))
 
     def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
         captured = {}
@@ -927,7 +982,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3, device="cuda")
         input_ids = torch.arange(2, device="cuda")
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(torch.cuda.Stream()), calls
+            hidden_states,
+            input_ids,
+            StreamFork(torch.cuda.Stream()),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         with patch.object(deepseek_v4_model, "get_is_capture_mode", return_value=True):
