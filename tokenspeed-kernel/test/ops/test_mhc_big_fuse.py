@@ -219,22 +219,50 @@ def test_mhc_big_fuse_rejects_unsupported_splits() -> None:
 
 
 @pytest.mark.parametrize(
-    ("supported", "n_splits", "expected"),
+    (
+        "supported_splits",
+        "supported_hc_mults",
+        "hidden_size_multiple",
+        "n_splits",
+        "hc_mult",
+        "hidden_size",
+        "expected",
+    ),
     [
-        (None, 5, True),
-        (frozenset({4, 64}), 64, True),
-        (frozenset({4, 64}), 5, False),
+        (None, None, None, 5, 6, 4097, True),
+        (frozenset({4, 64}), frozenset({4}), 8, 64, 4, 4096, True),
+        (frozenset({4, 64}), frozenset({4}), 8, 5, 4, 4096, False),
+        (frozenset({4, 64}), frozenset({4}), 8, 64, 6, 4096, False),
+        (frozenset({4, 64}), frozenset({4}), 8, 64, 4, 4097, False),
     ],
 )
 def test_pre_reduce_apply_capability_gate(
-    supported: frozenset[int] | None, n_splits: int, expected: bool
+    supported_splits: frozenset[int] | None,
+    supported_hc_mults: frozenset[int] | None,
+    hidden_size_multiple: int | None,
+    n_splits: int,
+    hc_mult: int,
+    hidden_size: int,
+    expected: bool,
 ) -> None:
     def implementation() -> None:
         pass
 
-    if supported is not None:
-        implementation.supported_n_splits = supported
-    assert _pre_reduce_apply_is_supported(implementation, n_splits) is expected
+    if supported_splits is not None:
+        implementation.supported_n_splits = supported_splits
+    if supported_hc_mults is not None:
+        implementation.supported_hc_mults = supported_hc_mults
+    if hidden_size_multiple is not None:
+        implementation.hidden_size_multiple = hidden_size_multiple
+    assert (
+        _pre_reduce_apply_is_supported(
+            implementation,
+            n_splits,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

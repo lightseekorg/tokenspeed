@@ -46,11 +46,23 @@ def _compute_num_split(
     return max(split_k, 1)
 
 
-def _pre_reduce_apply_is_supported(pre_reduce_apply_impl, n_splits: int) -> bool:
+def _pre_reduce_apply_is_supported(
+    pre_reduce_apply_impl,
+    n_splits: int,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+) -> bool:
     if pre_reduce_apply_impl is None:
         return False
     supported = getattr(pre_reduce_apply_impl, "supported_n_splits", None)
-    return supported is None or n_splits in supported
+    if supported is not None and n_splits not in supported:
+        return False
+    supported_hc_mults = getattr(pre_reduce_apply_impl, "supported_hc_mults", None)
+    if supported_hc_mults is not None and hc_mult not in supported_hc_mults:
+        return False
+    hidden_size_multiple = getattr(pre_reduce_apply_impl, "hidden_size_multiple", None)
+    return hidden_size_multiple is None or hidden_size % hidden_size_multiple == 0
 
 
 def _pre_reduce_apply_fuses_norm(
@@ -480,7 +492,10 @@ def _mhc_pre_impl(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
     use_pre_reduce_apply = _pre_reduce_apply_is_supported(
-        pre_reduce_apply_impl, n_splits
+        pre_reduce_apply_impl,
+        n_splits,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
     )
     pre_mix = (
         None
