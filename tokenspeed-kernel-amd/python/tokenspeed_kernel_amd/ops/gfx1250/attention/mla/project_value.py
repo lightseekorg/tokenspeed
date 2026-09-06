@@ -56,11 +56,11 @@ def _mla_project_value_kernel(
     k_layout: gl.constexpr = gl.SliceLayout(0, layout)
     offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
     offs_k = gl.arange(0, LATENT, layout=k_layout)
-    attention = gl.amd.gfx1250.buffer_load(
+    attention = gl.amd.cdna5.buffer_load(
         attention_ptr,
         (head * LATENT + offs_k).to(gl.int32),
     ).to(gl.float32)
-    weight = gl.amd.gfx1250.buffer_load(
+    weight = gl.amd.cdna5.buffer_load(
         weight_ptr,
         (
             head * LATENT * VALUE

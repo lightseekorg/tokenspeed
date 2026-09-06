@@ -41,7 +41,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
     maximum,
 )
 
-gfx1250 = gl.amd.gfx1250
+cdna5 = gl.amd.cdna5
 
 _GFX1250_NUM_CUS = 256
 
@@ -182,9 +182,9 @@ class AttentionProgram:
     q_start: gl.tensor
     q_head: gl.tensor
     kv_head: gl.tensor
-    k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    k_desc: gl.amd.cdna5.tdm.tensor_descriptor
     k_buffer: gl.shared_memory_descriptor
-    v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    v_desc: gl.amd.cdna5.tdm.tensor_descriptor
     v_buffer: gl.shared_memory_descriptor
 
     @gluon.constexpr_function
@@ -234,7 +234,7 @@ class AttentionProgram:
         seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         seq_len = seq_end - seq_base
         q_start = q_block * cfg.BLOCK_M
-        k_desc = gfx1250.tdm.make_tensor_descriptor(
+        k_desc = cdna5.tdm.make_tensor_descriptor(
             base=k_ptr + cfg.k_strides.offsets(seq_base, kv_head, 0),
             shape=(seq_len, cfg.HEAD_DIM),
             strides=(cfg.k_strides.stride_t, cfg.k_strides.stride_d),
@@ -246,7 +246,7 @@ class AttentionProgram:
             shape=[cfg.NUM_BUFFERS] + k_desc.block_shape,
             layout=k_desc.layout,
         )
-        v_desc = gfx1250.tdm.make_tensor_descriptor(
+        v_desc = cdna5.tdm.make_tensor_descriptor(
             base=v_ptr + cfg.v_strides.offsets(seq_base, kv_head, 0),
             shape=(seq_len, cfg.HEAD_DIM),
             strides=(cfg.v_strides.stride_t, cfg.v_strides.stride_d),
@@ -288,7 +288,7 @@ class AttentionProgram:
             self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
         )
         mask = offs_m[:, None] < self.seq_len
-        return gfx1250.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
+        return cdna5.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
     def load_k(self, kv_start):
@@ -301,7 +301,7 @@ class AttentionProgram:
             self.seq_base + offs_n[None, :], self.kv_head, offs_d[:, None]
         )
         mask = offs_n[None, :] < self.seq_len
-        return gfx1250.buffer_load(self.k_ptr, offsets, mask=mask, other=0.0)
+        return cdna5.buffer_load(self.k_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
     def load_v(self, kv_start):
@@ -314,23 +314,23 @@ class AttentionProgram:
             self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
         )
         mask = offs_n[:, None] < self.seq_len
-        return gfx1250.buffer_load(self.v_ptr, offsets, mask=mask, other=0.0)
+        return cdna5.buffer_load(self.v_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
     def tdm_load_global_to_shared_k(self, kv_start, buffer_index):
-        gfx1250.tdm.async_load(
+        cdna5.tdm.async_load(
             self.k_desc, [kv_start, 0], self.k_buffer.index(buffer_index)
         )
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, kv_start, buffer_index):
-        gfx1250.tdm.async_load(
+        cdna5.tdm.async_load(
             self.v_desc, [kv_start, 0], self.v_buffer.index(buffer_index)
         )
 
     @gluon.jit
     def tdm_shared_load_k(self, buffer_index, wait_count):
-        gfx1250.tdm.async_wait(wait_count)
+        cdna5.tdm.async_wait(wait_count)
         return (
             self.k_buffer.index(buffer_index)
             .permute([1, 0])
@@ -339,7 +339,7 @@ class AttentionProgram:
 
     @gluon.jit
     def tdm_shared_load_v(self, buffer_index, wait_count):
-        gfx1250.tdm.async_wait(wait_count)
+        cdna5.tdm.async_wait(wait_count)
         return self.v_buffer.index(buffer_index).load(layout=self.cfg.v_layout)
 
     @gluon.jit
@@ -348,11 +348,11 @@ class AttentionProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
-        return gfx1250.wmma(q, k, qk)
+        return cdna5.wmma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        return gfx1250.wmma(p, v, acc)
+        return cdna5.wmma(p, v, acc)
 
     @gluon.jit
     def init_attention_state(self):
@@ -466,7 +466,7 @@ class AttentionProgram:
             mask = offs_m < self.seq_len
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
             lse = (m_i * cfg.SM_SCALE + gl.log2(safe_l)) * _LN2
-            gfx1250.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
+            cdna5.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
     @gluon.jit
     def store_output(self, output):
@@ -482,7 +482,7 @@ class AttentionProgram:
         ).to(gl.int32)
         mask = offs_m[:, None] < self.seq_len
         output = output.to(self.output_ptr.dtype.element_ty)
-        gfx1250.buffer_store(output, self.output_ptr, offsets, mask=mask)
+        cdna5.buffer_store(output, self.output_ptr, offsets, mask=mask)
 
 
 @gluon.jit

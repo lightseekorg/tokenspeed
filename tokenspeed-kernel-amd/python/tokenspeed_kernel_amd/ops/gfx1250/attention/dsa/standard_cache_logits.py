@@ -67,14 +67,14 @@ def _candidate_slots(
     IS_PREFILL: gl.constexpr,
 ):
     if IS_PREFILL:
-        return gl.amd.gfx1250.buffer_load(
+        return gl.amd.cdna5.buffer_load(
             kv_workspace_slots,
             positions.to(gl.int32),
             mask=valid,
             other=0,
         ).to(gl.int64)
     page_indices = positions // PAGE_SIZE
-    pages = gl.amd.gfx1250.buffer_load(
+    pages = gl.amd.cdna5.buffer_load(
         block_table,
         (request_id * block_table_stride + page_indices).to(gl.int32),
         mask=valid,
@@ -105,7 +105,7 @@ def _load_query(
 ):
     heads = gl.arange(0, 32, layout=gl.SliceLayout(1, q_load_layout))[:, None]
     dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))[None, :]
-    query = gl.amd.gfx1250.buffer_load(
+    query = gl.amd.cdna5.buffer_load(
         q,
         (
             row_id * stride_q_row
@@ -114,14 +114,14 @@ def _load_query(
         ).to(gl.int32),
     )
     weight_heads = gl.arange(0, 32, layout=gl.SliceLayout(1, wmma_layout))
-    head_weights = gl.amd.gfx1250.buffer_load(
+    head_weights = gl.amd.cdna5.buffer_load(
         weights,
         (row_id * stride_w_row + (head_offset + weight_heads) * stride_w_head).to(
             gl.int32
         ),
     ).to(gl.float32)
     if Q_IS_FP8:
-        query_scales = gl.amd.gfx1250.buffer_load(
+        query_scales = gl.amd.cdna5.buffer_load(
             q_scales,
             (row_id * stride_qs_row + (head_offset + weight_heads) * stride_qs_head).to(
                 gl.int32
@@ -140,7 +140,7 @@ def _score_head_tile(
     BLOCK_N: gl.constexpr,
 ):
     accumulator = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
-    head_scores = gl.amd.gfx1250.wmma(query, key, accumulator)
+    head_scores = gl.amd.cdna5.wmma(query, key, accumulator)
     head_scores = gl.maximum(
         head_scores,
         0.0,
@@ -193,7 +193,7 @@ def _score_key_tile(
     page_rows = slots - pages * PAGE_SIZE
     key_offsets = pages * PAGE_STRIDE_BYTES + page_rows * HEAD_DIM + dims
     if USE_BUFFER_LOAD:
-        raw_key = gl.amd.gfx1250.buffer_load(
+        raw_key = gl.amd.cdna5.buffer_load(
             index_k_fp8,
             key_offsets.to(gl.int32),
             mask=valid,
@@ -243,7 +243,7 @@ def _score_key_tile(
         + scale_rows
     )
     if USE_BUFFER_LOAD:
-        key_scales = gl.amd.gfx1250.buffer_load(
+        key_scales = gl.amd.cdna5.buffer_load(
             index_k_scale,
             scale_offsets.to(gl.int32),
             mask=scale_valid,
@@ -403,7 +403,7 @@ def _standard_cache_logits_body(
             USE_BUFFER_LOAD,
         )
         if USE_BUFFER_STORE:
-            gl.amd.gfx1250.buffer_store(
+            gl.amd.cdna5.buffer_store(
                 scores,
                 logits,
                 (row_id * logits_stride + positions).to(gl.int32),
