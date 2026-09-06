@@ -29,7 +29,9 @@ DECODE1_WS=${DECODE1_WS:-1}
 ENCODE_PORT=${ENCODE_PORT:-50104}
 PREFILL_PORT=${PREFILL_PORT:-50101}
 DECODE0_PORT=${DECODE0_PORT:-50111}
-DECODE1_PORT=${DECODE1_PORT:-50112}
+# Keep decode1 well away from decode0: a leftover listener (or TIME_WAIT) on
+# the adjacent 50112 has already failed this job with Address already in use.
+DECODE1_PORT=${DECODE1_PORT:-50121}
 ENCODE_BOOTSTRAP_PORT=${ENCODE_BOOTSTRAP_PORT:-18995}
 PREFILL_BOOTSTRAP_PORT=${PREFILL_BOOTSTRAP_PORT:-19311}
 ENCODE_DIST_PORT=${ENCODE_DIST_PORT:-25000}
@@ -93,6 +95,11 @@ echo "[epd-1e1p2d] model=$MODEL served=$SERVED_MODEL_NAME model_path=$MODEL_PATH
 echo "[epd-1e1p2d] encode=gpu${ENCODE_GPUS}/${ENCODE_PORT} prefill=gpu${PREFILL_GPUS}/${PREFILL_PORT} decode0=gpu${DECODE0_GPUS}/${DECODE0_PORT} decode1=gpu${DECODE1_GPUS}/${DECODE1_PORT} lb=${LB_HOST}:${LB_PORT}"
 echo "[epd-1e1p2d] encode_routing=$ENCODE_ROUTING_POLICY enable_mtp=$ENABLE_MTP moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
 
+free_listen_ports "epd-1e1p2d" \
+  "$ENCODE_PORT" "$PREFILL_PORT" "$DECODE0_PORT" "$DECODE1_PORT" \
+  "$ENCODE_BOOTSTRAP_PORT" "$PREFILL_BOOTSTRAP_PORT" \
+  "$LB_PORT" "$PROMETHEUS_PORT"
+
 pids=()
 cleanup() {
   local code=$?
@@ -129,7 +136,8 @@ wait_serving() {
   local start
   start=$(date +%s)
   until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! pid_is_live "$pid"; then
+      wait "$pid" 2>/dev/null || true
       echo "[epd-1e1p2d] $label exited before reaching SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1

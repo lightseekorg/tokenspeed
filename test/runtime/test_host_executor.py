@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -418,6 +419,164 @@ class GroupAwareWireTest(unittest.TestCase):
         finishes[1].record.assert_called_once_with(executor.load_stream)
         self.assertIs(load_events.layer_done_events[0], finishes[0])
         self.assertIs(load_events.layer_done_events[1], finishes[1])
+
+
+class L3FlatKvExecutorTest(unittest.TestCase):
+    def test_storage_pages_skip_non_prefetch_sources(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        operation = SimpleNamespace(
+            content_hashes=[["h0", "h1"]],
+            page_offsets=[[0, 1]],
+            group_ids=[[0, 1]],
+            src_pages=[[3, 4]],
+            dst_pages=[[7, 8]],
+            prefetch_from_storage=[[1, 0]],
+        )
+        pages = L2CacheExecutor._storage_pages(
+            operation, host_is_destination=False, prefetch_only=True
+        )
+        self.assertEqual(pages, [(0, 3, "h0", 0)])
+        write_pages = L2CacheExecutor._storage_pages(
+            operation, host_is_destination=True
+        )
+        self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
+
+    def test_poll_results_backs_up_host_pages_asynchronously(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def backup(pages):
+            del pages
+            started.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("L3 backup was not released")
+            return [True]
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor.l3_store.backup.side_effect = backup
+        finish = Mock()
+        finish.query.return_value = True
+        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+
+        first = executor.poll_results()
+        self.assertEqual(first, [])
+        self.assertTrue(started.wait(timeout=2))
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        release.set()
+        deadline = time.monotonic() + 2
+        second = []
+        try:
+            while time.monotonic() < deadline:
+                second = executor.poll_results()
+                if second:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(int(second[0].op_id), 7)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
+
+    def test_backup_failure_does_not_ack_writeback(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._ready_write_op_ids = []
+        executor._ready_load_op_ids = []
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [False]
+        finish = Mock()
+        finish.query.return_value = True
+        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+
+        raised = None
+        try:
+            try:
+                first = executor.poll_results()
+            except RuntimeError as exc:
+                raised = exc
+                first = None
+            if raised is None:
+                self.assertEqual(first, [])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        executor.poll_results()
+                    except RuntimeError as exc:
+                        raised = exc
+                        break
+                    time.sleep(0.01)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
+        self.assertIsNotNone(raised)
+        self.assertRegex(str(raised), "L3 backup failed")
+
+    def test_prefetch_failure_raises(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.l3_store = Mock()
+        executor.l3_store.prefetch.return_value = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "L3 prefetch failed"):
+            executor._prefetch_from_storage([(0, 1, "h0", 0), (0, 2, "h1", 0)])
+
+    def test_shutdown_persists_completed_d2h_before_closing_l3(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._write_acks = [_Ack(Mock(), [7], [(0, 1, "h0", 0)])]
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor.load_stream = Mock()
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [True]
+        default_stream = Mock()
+        with patch.object(
+            executor_module.torch.cuda, "current_stream", return_value=default_stream
+        ):
+            executor.shutdown()
+
+        default_stream.synchronize.assert_called_once_with()
+        executor.load_stream.synchronize.assert_called_once_with()
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        executor.l3_store.close.assert_called_once_with()
+        self.assertEqual(executor._write_acks, [])
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):

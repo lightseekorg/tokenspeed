@@ -381,5 +381,63 @@ class TestDecodeHostL2(unittest.TestCase):
         self.assertTrue(args.enable_kvstore)
 
 
+class TestL3StorageBackend(unittest.TestCase):
+    def test_cli_accepts_mooncake_and_memory(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = None
+        for candidate in parser._actions:
+            if candidate.dest == "kvstore_storage_backend":
+                action = candidate
+                break
+        self.assertIsNotNone(action)
+        self.assertEqual(set(action.choices), {"mooncake", "memory"})
+
+    def test_memory_backend_keeps_host_layout_and_io(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "memory"
+        args.kvstore_mem_layout = "layer_first"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_mem_layout, "layer_first")
+        self.assertEqual(args.kvstore_io_backend, "direct")
+
+    def test_l3_requires_host_l2(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = True
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_mem_layout = "layer_first"
+        args.kvstore_io_backend = "direct"
+
+        with self.assertRaisesRegex(ValueError, "requires Host L2"):
+            args._handle_kvstore()
+
+    def test_mooncake_backend_switches_layout(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        args.kvstore_mem_layout = "layer_first"
+        args.kvstore_io_backend = "direct"
+
+        args._handle_kvstore()
+
+        self.assertTrue(args.enable_kvstore)
+        self.assertEqual(args.kvstore_mem_layout, "page_first")
+        self.assertEqual(args.kvstore_io_backend, "kernel")
+
+
 if __name__ == "__main__":
     unittest.main()

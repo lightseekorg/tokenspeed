@@ -2,6 +2,10 @@ api_version: ci.tokenspeed.io/v1
 name: eval-deepseek-v4-flash-gsm8k
 type: eval
 workflow_stage: model-test
+# DeepGEMM NVLink barrier timeouts / CUDA launch failures have shown up with
+# --disable-kvstore on this task. One extra server+eval attempt recovers the
+# infrastructure flake without masking a real score miss on the retry.
+retries: 1
 triggers:
   - per-commit
   - manual

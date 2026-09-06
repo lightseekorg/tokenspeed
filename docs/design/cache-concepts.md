@@ -354,6 +354,27 @@ Its responsibilities:
   and only the newest Device-resident checkpoint per state group are queued
   before request ownership is released. Ordinary sliding-window entries
   always stream when published.
+* **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
+  CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
+  beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
+  Host CacheBlock; a later Host miss that is known to exist in L3 allocates
+  a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
+  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}`.
+  The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
+  (`model` + `--revision` + `--weight-version`), the packed CacheBlock
+  layout (dtype and field geometry), the pipeline stage, and the speculative
+  draft checkpoint when a separate draft pool is present. Host eviction does
+  **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
+  that stable prefix rather than minting a process-local generation.
+  Cross-instance reuse probes `batch_exists` before `submit_requests`, then
+  `register_storage_keys` / `unregister_storage_keys`. CI covers this path
+  with the in-process `memory` backend (scheduler tests register keys /
+  evict Host then assert `prefetch_from_storage`, and the CUDA runtime suite
+  round-trips packed Host bytes through `batch_put_from` / Host wipe /
+  `batch_get_into`) plus a live `mooncake_master` job that drives
+  `MooncakeKvStore` over TCP / `P2PHANDSHAKE`, matching SGLang HiCache /
+  vLLM `MooncakeStoreConnector` on packed CacheBlocks rather than split
+  K/V pages.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.

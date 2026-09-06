@@ -83,6 +83,16 @@ public:
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
+    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
+    // backend for existing objects, then registers the matching CacheKeys so
+    // ProbePrefix can treat them as Host hits that require prefetch.
+    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
+        return coordinator_.ExpandPrefixKeys(content_hashes);
+    }
+    void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
+    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
+
 private:
     bool clearCache(bool include_host);
     struct AdmissionMatch {

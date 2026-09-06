@@ -70,6 +70,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .content_hash = keys[i].content_hash,
+            .page_offset = keys[i].page_offset,
         });
         tickets.push_back(StoreTicket{
             std::move(keys[i]),
@@ -92,7 +94,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
     _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
     for (const BlockTransfer& pair : block_transfers) {
-        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(pair.prefetch_from_storage || coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned Host block lost its cache entry before load emission");
     }
     return startLoadBack(std::move(block_transfers));
@@ -124,7 +126,16 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
-    load_backs_.erase(op_id);
+    auto it = load_backs_.find(op_id);
+    if (it == load_backs_.end()) {
+        return;
+    }
+    for (BlockTransfer& transfer : it->second) {
+        if (transfer.prefetch_from_storage && transfer.source) {
+            coordinator_.CacheHostBlock(transfer.source, transfer.key);
+        }
+    }
+    load_backs_.erase(it);
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
@@ -138,6 +149,9 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
             .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
+            .content_hash = block_transfer.key.content_hash,
+            .page_offset = block_transfer.key.page_offset,
+            .prefetch_from_storage = block_transfer.prefetch_from_storage,
         });
     }
     return transfers;

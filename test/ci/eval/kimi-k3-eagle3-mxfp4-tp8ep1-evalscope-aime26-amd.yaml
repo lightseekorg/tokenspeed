@@ -5,6 +5,9 @@ api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k3-eagle3-mxfp4-tp8ep1-aime26-amd
 type: eval
 workflow_stage: model-test
+# AIME26 is 30 problems at temperature 1.0. One extra server+eval attempt
+# covers a remaining one-problem swing around the 0.90 floor.
+retries: 1
 triggers:
   - per-commit
   - manual

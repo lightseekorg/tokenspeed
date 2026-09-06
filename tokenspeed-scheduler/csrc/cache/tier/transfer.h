@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -36,6 +37,9 @@ struct CacheTransfer {
     std::uint32_t group_id{0};
     std::int32_t source_page{-1};
     std::int32_t destination_page{-1};
+    std::string content_hash{};
+    std::int32_t page_offset{0};
+    bool prefetch_from_storage{false};
 
     bool operator==(const CacheTransfer&) const = default;
 };
@@ -63,6 +67,8 @@ struct WriteBackBatch {
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::string>> content_hashes;
+    std::vector<std::vector<std::int32_t>> page_offsets;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
@@ -70,11 +76,15 @@ struct WriteBackBatch {
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
+            std::vector<std::string> operation_hashes;
+            std::vector<std::int32_t> operation_offsets;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
                     operation_groups.push_back(transfer.group_id);
                     operation_sources.push_back(transfer.source_page);
                     operation_destinations.push_back(transfer.destination_page);
+                    operation_hashes.push_back(transfer.content_hash);
+                    operation_offsets.push_back(transfer.page_offset);
                 }
             }
 
@@ -82,6 +92,8 @@ struct WriteBackBatch {
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            content_hashes.push_back(std::move(operation_hashes));
+            page_offsets.push_back(std::move(operation_offsets));
         }
     }
 };
@@ -96,6 +108,9 @@ struct LoadBackBatch {
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    std::vector<std::vector<std::string>> content_hashes;
+    std::vector<std::vector<std::int32_t>> page_offsets;
+    std::vector<std::vector<std::uint8_t>> prefetch_from_storage;
 
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
@@ -103,11 +118,17 @@ struct LoadBackBatch {
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
+            std::vector<std::string> operation_hashes;
+            std::vector<std::int32_t> operation_offsets;
+            std::vector<std::uint8_t> operation_prefetch;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
                     operation_groups.push_back(transfer.group_id);
                     operation_sources.push_back(transfer.source_page);
                     operation_destinations.push_back(transfer.destination_page);
+                    operation_hashes.push_back(transfer.content_hash);
+                    operation_offsets.push_back(transfer.page_offset);
+                    operation_prefetch.push_back(transfer.prefetch_from_storage ? std::uint8_t{1} : std::uint8_t{0});
                 }
             }
 
@@ -115,6 +136,9 @@ struct LoadBackBatch {
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            content_hashes.push_back(std::move(operation_hashes));
+            page_offsets.push_back(std::move(operation_offsets));
+            prefetch_from_storage.push_back(std::move(operation_prefetch));
         }
     }
 };

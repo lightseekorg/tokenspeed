@@ -304,6 +304,26 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     assert isinstance(info.value.__cause__, ValueError)
 
 
+def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
+    from concurrent.futures import Future
+
+    trace: list = []
+    handle = _handle(
+        trace,
+        l2_cache_executor=SimpleNamespace(
+            shutdown=lambda: trace.append("l2_shutdown"),
+        ),
+    )
+    pending = Future()
+    pending.set_result(None)
+    handle._l2_submissions.append(pending)
+
+    handle.shutdown_cache()
+
+    assert list(handle._l2_submissions) == []
+    assert trace == ["run", "l2_shutdown"]
+
+
 def test_cache_polling_without_kvstore_refuses_loudly():
     with pytest.raises(RuntimeError, match="enable-kvstore"):
         _handle([]).poll_cache_results()

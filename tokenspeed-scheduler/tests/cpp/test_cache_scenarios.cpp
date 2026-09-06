@@ -4377,4 +4377,58 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+// ---------------------------------------------------------------------------
+// Mooncake L3 under flat KV: Host writeback inserts storage_keys_; Host
+// eviction must not drop them. A later Device+Host miss that is still in L3
+// allocates a Host page and emits LoadBack with prefetch_from_storage.
+// ---------------------------------------------------------------------------
+class L3StorageHitSuite : public HostHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = HostHitSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        // 6 usable Host pages: r1 fills the pool; the churn request replaces r1.
+        cfg.host_allocator.total_pages = 7;
+        return cfg;
+    }
+};
+
+TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
+    auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
+    ASSERT_FALSE(wb1.empty());
+    SendWriteBackDone(wb1.front().op_ids.at(0));
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+
+    auto wb2 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
+    ASSERT_FALSE(wb2.empty()) << "committed Host entries must be replaceable so r1 leaves L2";
+    SendWriteBackDone(wb2.front().op_ids.at(0));
+    EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0);
+
+    // Same tokens as r1 plus one extra page: Device miss, Host miss, L3 hit.
+    Submit(MakeRequestSpec("r3", /*num_pages=*/5));
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindLoadBack(plan);
+    ASSERT_TRUE(lb.has_value()) << "L3-only prefix must emit a Host prefetch load-back";
+    ASSERT_EQ(lb->op_ids.size(), 1u);
+    ASSERT_EQ(lb->src_pages.at(0).size(), 6u);
+    ASSERT_EQ(lb->prefetch_from_storage.size(), 1u);
+    const auto& flags = lb->prefetch_from_storage.at(0);
+    ASSERT_EQ(flags.size(), lb->src_pages.at(0).size());
+    EXPECT_TRUE(std::all_of(flags.begin(), flags.end(), [](std::uint8_t flag) { return flag != 0; }))
+        << "Host-evicted L3 hits must prefetch, not treat leftover Host pages as warm";
+    EXPECT_FALSE(lb->content_hashes.at(0).empty());
+
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+    SendForwardDone("r3", {9001});
+    ExecutionPlan finalize = PlanOnce();
+    if (auto wb3 = FindWriteBack(finalize)) {
+        SendWriteBackDone(wb3->op_ids.at(0));
+    }
+    SendForwardDone("r3", {9002});
+    SendFinish("r3");
+    PlanOnce();
+}
+
 }  // namespace tokenspeed::test
