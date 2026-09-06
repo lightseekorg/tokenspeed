@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -86,32 +85,6 @@ class _OptFlags:
 @dataclass(frozen=True)
 class _NamedScaleLayout:
     name: str
-
-
-def _parse_amdgcn_metric(amdgcn: str, key: str) -> int | None:
-    m = re.search(rf"\.{key}:\s+(\d+)", amdgcn)
-    if m is not None:
-        return int(m.group(1))
-    m = re.search(rf";\s+{key}\s*[:=]?\s+(\d+)", amdgcn)
-    return int(m.group(1)) if m is not None else None
-
-
-def static_profile(kernel: Any, *, label: str = "") -> dict:
-    """Return basic AMDGCN resource metrics from a compiled kernel object."""
-
-    amdgcn = kernel.asm.get("amdgcn", "")
-    profile = {
-        "sgpr_count": _parse_amdgcn_metric(amdgcn, "sgpr_count"),
-        "sgpr_spill_count": _parse_amdgcn_metric(amdgcn, "sgpr_spill_count"),
-        "vgpr_count": _parse_amdgcn_metric(amdgcn, "vgpr_count"),
-        "vgpr_spill_count": _parse_amdgcn_metric(amdgcn, "vgpr_spill_count"),
-        "scratch_size": _parse_amdgcn_metric(amdgcn, "ScratchSize"),
-        "code_len_in_byte": _parse_amdgcn_metric(amdgcn, "codeLenInByte"),
-        "occupancy": _parse_amdgcn_metric(amdgcn, "Occupancy"),
-    }
-    if label:
-        profile["label"] = label
-    return profile
 
 
 @composition

@@ -377,7 +377,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     cta_id = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(EM, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
-    total_tiles = num_pid_m * num_pid_n
     num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
     if PERSISTENT:
         worker_id = gl.program_id(axis=1)
@@ -1610,8 +1609,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     stubs (kernel does the down-projection with no activation);
     ``splitk not in {0, 1, None}``; ``sorted_weights=None``.
     """
-    global _USES_FP32_ATOMIC
-
     # Step 1: validate inputs and reject unsupported modes.
     del quant_type, activation  # signature stubs (no activation in stage 2)
     if splitk not in (0, 1, None):

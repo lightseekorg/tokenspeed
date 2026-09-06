@@ -542,17 +542,6 @@ def gluon_mxfp_combine(
     return y
 
 
-_TUNING_KW = frozenset(
-    {"block_m", "block_n", "block_k", "num_warps", "num_buffers", "dtype"}
-)
-
-
-# Gluon-only kwargs; explicitly stripped before forwarding upstream.
-_GLUON_PRIVATE_KW = frozenset(
-    {"out", "out_quant_format", "out_quant_scale", "x_scale_ragged_padded"}
-)
-
-
 def gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,

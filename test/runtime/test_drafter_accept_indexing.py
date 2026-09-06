@@ -40,11 +40,13 @@ def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
     drafter.attn_backend = SimpleNamespace(sparse_topk=SparseTopKShare())
     share = drafter.attn_backend.sparse_topk
     first_step_topk = (object(), object())
+    share.qsa_metadata = object()
 
     drafter._attach_dsa_topk(first_step_topk)
 
     assert share.prefill is first_step_topk[0]
     assert share.decode is first_step_topk[1]
+    assert share.qsa_metadata is None
     assert drafter._extract_dsa_topk((None, None)) == first_step_topk
 
     # The target's last indexer layer leaves its selection on the target
@@ -61,8 +63,10 @@ def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
     # drafter passes its own state through untouched.
     model.index_share_for_mtp_iteration = False
     fallback = (object(), object())
+    share.qsa_metadata = object()
     drafter._attach_dsa_topk(fallback)
     assert share.prefill is None and share.decode is None
+    assert share.qsa_metadata is None
     assert drafter._extract_dsa_topk(fallback) == fallback
     assert drafter._target_dsa_topk(base_ctx) == (None, None)
 

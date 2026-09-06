@@ -22,28 +22,23 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention import qsa_sparse_attention
 from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_block_topk,
-    qwen4_exp_qsa_complete_blocks,
     qwen4_exp_qsa_compress_and_store,
-    qwen4_exp_qsa_group_cache_locs,
-    qwen4_exp_qsa_logical_layout,
-    qwen4_exp_qsa_norm_rope,
+    qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
-    qwen4_exp_qsa_selected_tokens,
-    qwen4_exp_qsa_sparse_attention,
-    qwen4_exp_qsa_sparse_slots,
-    qwen4_exp_qsa_stage_draft,
-    qwen4_exp_qsa_stage_verify,
+    qwen4_exp_qsa_selected_slots,
 )
+from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
-from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_valid_rows,
@@ -75,13 +70,26 @@ _DRAFT_INVALID_POSITION = torch.iinfo(torch.int64).min
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
+@dataclass(frozen=True)
+class _QSAForwardMetadata:
+    """Layer-invariant QSA row metadata owned by one model forward."""
+
+    total_tokens: int
+    batch_size: int
+    logical_positions: torch.Tensor
+    request_indices: torch.Tensor
+    qsa_locs: torch.Tensor
+    recent_locs: torch.Tensor
+    complete_blocks: torch.Tensor
+    reset_draft_tags: torch.Tensor | None
+
+
 class QSAIndexer(nn.Module):
     """Config-driven QSA indexer backed by TokenSpeed cache groups."""
 
     def __init__(
         self,
         config,
-        mapping: Mapping,
         layer_id: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -111,9 +119,8 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
-        self.compressed_page_size = QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE
         self.compressed_token_page_size = (
-            self.compressed_page_size * self.compress_ratio
+            QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE * self.compress_ratio
         )
         self.recent_page_size = QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE
         self.block_topk = self.token_topk // self.compress_ratio
@@ -138,8 +145,7 @@ class QSAIndexer(nn.Module):
         )
         self.q_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
-        self.mapping = mapping
-        # Draft QSA indexers can publish step-0 top-k through ForwardContext
+        # Draft QSA indexers can publish step-0 top-k through backend scratch
         # and reuse the target-aligned rows on later MTP steps.
         self.share_topk_for_mtp_iteration = False
         self._verify_scratch: dict[
@@ -215,25 +221,6 @@ class QSAIndexer(nn.Module):
             return total_tokens // bs
         raise RuntimeError("QSA could not infer query lengths")
 
-    def _logical_layout(
-        self,
-        metadata,
-        total_tokens: int,
-        bs: int,
-        query_lengths: torch.Tensor | int | None = None,
-    ):
-        seq_lens = self._seq_lens(metadata)[:bs]
-        if query_lengths is None:
-            lengths = self._query_lengths(metadata, total_tokens, bs)
-        elif isinstance(query_lengths, int):
-            lengths = query_lengths
-        else:
-            lengths = query_lengths[:bs]
-        positions, requests = qwen4_exp_qsa_logical_layout(
-            seq_lens, lengths, total_tokens
-        )
-        return positions, requests, lengths
-
     @staticmethod
     def _decode_query_lengths(
         ctx: ForwardContext,
@@ -254,31 +241,72 @@ class QSAIndexer(nn.Module):
             )
         return total_tokens // ctx.bs
 
-    @staticmethod
-    def _group_cache_locs(
-        logical_positions: torch.Tensor,
-        request_indices: torch.Tensor,
+    def _prepare_forward_metadata(
+        self,
+        ctx: ForwardContext,
+        metadata,
+        total_tokens: int,
+        query_lengths: torch.Tensor | int | None,
         qsa_page_table: torch.Tensor,
         qsa_expansion: int,
-        qsa_page_size: int,
         recent_page_table: torch.Tensor,
         recent_expansion: int,
-        recent_page_size: int,
-        compress_ratio: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map flattened token positions into both QSA cache fields at once."""
+        *,
+        reset_draft_tags: torch.Tensor | None = None,
+    ) -> _QSAForwardMetadata:
+        """Build or reuse cache geometry shared by every QSA layer."""
 
-        return qwen4_exp_qsa_group_cache_locs(
-            logical_positions,
-            request_indices,
-            qsa_page_table,
-            qsa_expansion,
-            qsa_page_size,
-            recent_page_table,
-            recent_expansion,
-            recent_page_size,
-            compress_ratio,
+        share = self._full_backend(ctx).sparse_topk
+        cached = share.qsa_metadata
+        if cached is not None:
+            if not isinstance(cached, _QSAForwardMetadata):
+                raise RuntimeError("invalid QSA per-forward metadata memo")
+            if cached.total_tokens != total_tokens or cached.batch_size != ctx.bs:
+                raise RuntimeError("stale QSA per-forward metadata memo")
+            # Every draft indexer owns its own tag ring even though row geometry
+            # is shared. Reset a later layer's distinct ring before returning.
+            if (
+                reset_draft_tags is not None
+                and cached.reset_draft_tags is not reset_draft_tags
+            ):
+                reset_draft_tags.fill_(_DRAFT_INVALID_POSITION)
+            return cached
+
+        lengths = (
+            self._query_lengths(metadata, total_tokens, ctx.bs)
+            if query_lengths is None
+            else query_lengths
         )
+        seq_lens = self._seq_lens(metadata)[: ctx.bs]
+        # One request CTA expands the row layout, maps both cache groups and
+        # derives complete-block counts for uniform and ragged batches alike.
+        logical, requests, qsa_locs, recent_locs, complete_blocks = (
+            qwen4_exp_qsa_prepare_metadata(
+                seq_lens,
+                lengths,
+                total_tokens,
+                qsa_page_table,
+                qsa_expansion,
+                self.compressed_token_page_size,
+                recent_page_table,
+                recent_expansion,
+                self.recent_page_size,
+                self.compress_ratio,
+                draft_logical_positions=reset_draft_tags,
+            )
+        )
+        result = _QSAForwardMetadata(
+            total_tokens=total_tokens,
+            batch_size=ctx.bs,
+            logical_positions=logical,
+            request_indices=requests,
+            qsa_locs=qsa_locs,
+            recent_locs=recent_locs,
+            complete_blocks=complete_blocks,
+            reset_draft_tags=reset_draft_tags,
+        )
+        share.qsa_metadata = result
+        return result
 
     def _fields(self, pool):
         layer_id = pool._field_layer_id(self.layer_id)
@@ -314,7 +342,9 @@ class QSAIndexer(nn.Module):
         )
         return stacks.table(group_id, bs), expansion
 
-    def _project_qk(self, hidden_states, positions):
+    def _project_qk_raw(self, hidden_states):
+        """Project packed raw index queries and keys without materializing copies."""
+
         qk, _ = self.index_qk_proj(hidden_states)
         q, k = qk.split(
             [
@@ -324,24 +354,6 @@ class QSAIndexer(nn.Module):
             dim=-1,
         )
         k = k.reshape(-1, 1, self.index_head_dim)
-        rotary = self.rotary_emb
-        if not rotary.is_neox_style:
-            raise ValueError("QSA indexer RoPE requires neox-style embeddings")
-        sections = getattr(rotary, "mrope_section", None)
-        # Fused per-head Gemma RMSNorm + neox RoPE straight off the GEMM
-        # view; raw keys stay unnormalized until all members of a
-        # compression group have been averaged, matching the checkpoint
-        # reference.
-        q = qwen4_exp_qsa_norm_rope(
-            q,
-            positions,
-            self.q_layernorm.gemma_weight,
-            self.q_layernorm.variance_epsilon,
-            rotary.cos_sin_cache,
-            num_heads=self.index_n_heads,
-            sections=(tuple(sections) if positions.ndim == 2 and sections else None),
-            interleaved=bool(getattr(rotary, "mrope_interleaved", False)),
-        )
         return q, k
 
     @staticmethod
@@ -355,33 +367,7 @@ class QSAIndexer(nn.Module):
         )
         return values.reshape(3, -1).T
 
-    def _write_recent_cache(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        logical_positions: torch.Tensor,
-        request_indices: torch.Tensor,
-        recent_locs: torch.Tensor,
-        write_mask: torch.Tensor,
-        raw: torch.Tensor,
-        position_cache: torch.Tensor,
-    ) -> None:
-        """Write one request's latest compression window into its cache page."""
-
-        qwen4_exp_qsa_recent_write(
-            token_k,
-            logical_positions,
-            request_indices,
-            recent_locs,
-            position_values,
-            raw,
-            position_cache,
-            self.recent_page_size,
-            self.compress_ratio,
-            write_mask=write_mask,
-        )
-
-    def _stage_verified(
+    def _verify_scratch_buffers(
         self,
         token_k: torch.Tensor,
         position_values: torch.Tensor,
@@ -389,8 +375,8 @@ class QSAIndexer(nn.Module):
         recent_locs: torch.Tensor,
         bs: int,
         pool,
-    ) -> None:
-        """Stage target-verify candidates until their accepted width is known."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate target-verify destinations and record their active shape."""
 
         if bs <= 0 or token_k.shape[0] % bs:
             raise RuntimeError("QSA target-verify rows must be divisible by batch size")
@@ -405,26 +391,16 @@ class QSAIndexer(nn.Module):
                 recent_locs.new_empty((bs, width)),
             )
             self._verify_scratch[key] = scratch
-        # One fused kernel snapshots all four tensors; separate ``copy_``
-        # launches would add four small kernels to every layer's verify step.
-        qwen4_exp_qsa_stage_verify(
-            token_k,
-            position_values,
-            logical_positions,
-            recent_locs,
-            *scratch,
-        )
         self._active_verify_width = width
         self._last_pool = pool
+        return scratch
 
     def _draft_scratch_buffers(
         self,
         token_k: torch.Tensor,
         position_values: torch.Tensor,
-        logical_positions: torch.Tensor,
+        logical_positions: torch.Tensor | None,
         bs: int,
-        *,
-        reset: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the request-local raw-key ring for one draft MTP round."""
 
@@ -434,13 +410,14 @@ class QSAIndexer(nn.Module):
             scratch = (
                 token_k.new_empty((bs, self.compress_ratio, 1, self.index_head_dim)),
                 position_values.new_empty((bs, 3)),
-                logical_positions.new_full(
-                    (bs, self.compress_ratio), _DRAFT_INVALID_POSITION
+                torch.full(
+                    (bs, self.compress_ratio),
+                    _DRAFT_INVALID_POSITION,
+                    dtype=torch.int64,
+                    device=token_k.device,
                 ),
             )
             self._draft_scratch[key] = scratch
-        elif reset:
-            scratch[2].fill_(_DRAFT_INVALID_POSITION)
         return scratch
 
     @staticmethod
@@ -497,15 +474,17 @@ class QSAIndexer(nn.Module):
         request_indices = torch.arange(bs, device=accepted.device).repeat_interleave(
             width
         )
-        self._write_recent_cache(
+        qwen4_exp_qsa_recent_write(
             token_k.reshape(-1, 1, self.index_head_dim),
-            position_values.reshape(-1, 3),
             logical_positions.reshape(-1),
             request_indices,
             recent_locs.reshape(-1),
-            write_mask.reshape(-1),
+            position_values.reshape(-1, 3),
             raw,
             position_cache,
+            self.recent_page_size,
+            self.compress_ratio,
+            write_mask=write_mask.reshape(-1),
         )
 
     def _write_and_compress(
@@ -522,17 +501,21 @@ class QSAIndexer(nn.Module):
         write_mask: torch.Tensor | None = None,
         draft_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         stage_draft: bool = False,
-    ) -> None:
+        query: torch.Tensor | None = None,
+        stage_verify_buffers: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+    ) -> torch.Tensor | None:
         raw, compressed, position_cache = self._fields(pool)
-        if not logical_positions.shape[0]:
-            return
         position_values = self._position_values(rope_positions)
         rotary = self.rotary_emb
+        if query is not None and not rotary.is_neox_style:
+            raise ValueError("QSA indexer RoPE requires neox-style embeddings")
         sections = getattr(rotary, "mrope_section", None)
         # PDL lets the raw-key write launch while the compression kernel's
         # tail drains; the writer still waits before touching raw pages.
         pdl = pdl_enabled()
-        qwen4_exp_qsa_compress_and_store(
+        prepared_query = qwen4_exp_qsa_compress_and_store(
             token_k,
             logical_positions,
             request_indices,
@@ -557,23 +540,25 @@ class QSAIndexer(nn.Module):
                 None if draft_scratch is None else draft_scratch[2]
             ),
             enable_pdl=pdl,
+            query=query,
+            query_norm_weight=(
+                self.q_layernorm.gemma_weight if query is not None else None
+            ),
+            query_norm_epsilon=(
+                self.q_layernorm.variance_epsilon if query is not None else None
+            ),
+            num_query_heads=self.index_n_heads if query is not None else None,
+            stage_verify_buffers=stage_verify_buffers,
+            stage_draft=stage_draft,
         )
         if stage_draft:
             if draft_scratch is None:
                 raise RuntimeError("QSA draft staging requires scratch buffers")
-            qwen4_exp_qsa_stage_draft(
-                token_k,
-                position_values,
-                logical_positions,
-                request_indices,
-                recent_locs,
-                draft_scratch[0],
-                draft_scratch[1],
-                draft_scratch[2],
-                self.compress_ratio,
-                enable_pdl=pdl,
-            )
-            return
+            return prepared_query
+        if recent_request_limit == 0:
+            # Pure target verification must not commit speculative raw keys;
+            # acceptance commits them later through ``commit_verified``.
+            return prepared_query
         qwen4_exp_qsa_recent_write(
             token_k,
             logical_positions,
@@ -588,6 +573,7 @@ class QSAIndexer(nn.Module):
             request_limit=recent_request_limit,
             enable_pdl=pdl,
         )
+        return prepared_query
 
     def _topk_solution(
         self,
@@ -621,25 +607,25 @@ class QSAIndexer(nn.Module):
         # the budget routing falls back to zero-materialization streaming.
         return "logits" if rows * num_blocks * 4 <= budget_mb << 20 else "stream"
 
-    def _select_tokens(
+    def _select_slots(
         self,
         q: torch.Tensor,
         logical_positions: torch.Tensor,
         request_indices: torch.Tensor,
         qsa_page_table: torch.Tensor,
+        full_page_table: torch.Tensor,
         compressed: torch.Tensor,
         *,
+        full_page_size: int,
+        complete_blocks: torch.Tensor,
         qsa_page_expansion: int = 1,
-        complete_blocks: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Select logical QSA blocks and emit physical full-cache slots."""
+
         output_width = self.token_topk + self.compress_ratio - 1
         if q.shape[0] == 0:
             return torch.empty((0, output_width), dtype=torch.int32, device=q.device)
         page_size = compressed.shape[1]
-        if complete_blocks is None:
-            complete_blocks = qwen4_exp_qsa_complete_blocks(
-                logical_positions, self.compress_ratio
-            )
         cache = compressed.view(-1, 1, self.index_head_dim)
         # Auto normally materializes scores for persistent radix selection;
         # oversized matrices retain the zero-materialization streaming path.
@@ -658,10 +644,13 @@ class QSAIndexer(nn.Module):
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=pdl_enabled(),
         )
-        return qwen4_exp_qsa_selected_tokens(
+        return qwen4_exp_qsa_selected_slots(
             selected_blocks,
             complete_blocks,
             logical_positions,
+            request_indices,
+            full_page_table,
+            full_page_size,
             self.compress_ratio,
             self.token_topk,
         )
@@ -673,7 +662,7 @@ class QSAIndexer(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Top-k token indices for this layer, one eager breakable-graph break.
+        """Top-k physical cache slots for this layer, one eager graph break.
 
         Everything here is per-request: the logical layout comes from the live
         query lengths, the compressed / recent writes address this forward's
@@ -694,13 +683,7 @@ class QSAIndexer(nn.Module):
             )
         metadata = self._metadata(ctx)
         query_lengths = self._decode_query_lengths(ctx, hidden_states.shape[0])
-        logical, requests, lengths = self._logical_layout(
-            metadata,
-            hidden_states.shape[0],
-            ctx.bs,
-            query_lengths=query_lengths,
-        )
-        q, token_k = self._project_qk(hidden_states, positions)
+        raw_q, token_k = self._project_qk_raw(hidden_states)
         pool = ctx.token_to_kv_pool
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
@@ -726,31 +709,39 @@ class QSAIndexer(nn.Module):
         recent_page_table, recent_expansion = self._group_geometry(
             router, QWEN4_EXP_QSA_RECENT_CACHE_GROUP, self.recent_page_size, ctx.bs
         )
-        qsa_locs, recent_locs, complete_blocks = self._group_cache_locs(
-            logical,
-            requests,
-            qsa_page_table,
-            qsa_expansion,
-            self.compressed_token_page_size,
-            recent_page_table,
-            recent_expansion,
-            self.recent_page_size,
-            self.compress_ratio,
-        )
+        position_values = self._position_values(positions)
         draft_scratch = None
-        write_mask = None
-        if is_draft_first_step:
+        if is_draft_decode_step and token_k.shape[0] != ctx.bs:
+            raise RuntimeError("QSA draft decode requires one row per request")
+        if is_draft_first_step or is_draft_decode_step:
             draft_scratch = self._draft_scratch_buffers(
                 token_k,
-                self._position_values(positions),
-                logical,
+                position_values,
+                None,
                 ctx.bs,
-                reset=True,
             )
-            # The layout above described the target's verify window; from
-            # here on the draft reads the accepted prefix — the write mask
-            # keeps the rows under it, and the sparse attention's live rows
-            # attend over it.
+        prepared = self._prepare_forward_metadata(
+            ctx,
+            metadata,
+            hidden_states.shape[0],
+            query_lengths,
+            qsa_page_table,
+            qsa_expansion,
+            recent_page_table,
+            recent_expansion,
+            reset_draft_tags=(
+                draft_scratch[2] if is_draft_first_step and draft_scratch else None
+            ),
+        )
+        logical = prepared.logical_positions
+        requests = prepared.request_indices
+        qsa_locs = prepared.qsa_locs
+        recent_locs = prepared.recent_locs
+        complete_blocks = prepared.complete_blocks
+        write_mask = None
+        if is_draft_first_step:
+            # Layout uses the target's verify window. The draft then publishes
+            # its accepted frontier for the write mask and the live attention.
             ctx.draft_narrowing.publish_accepted_prefix()
             write_mask = self._draft_accepted_write_mask(
                 ctx,
@@ -759,16 +750,30 @@ class QSAIndexer(nn.Module):
                 requests,
                 recent_locs,
             )
-        elif is_draft_decode_step:
-            if token_k.shape[0] != ctx.bs:
-                raise RuntimeError("QSA draft decode requires one row per request")
-            draft_scratch = self._draft_scratch_buffers(
-                token_k,
-                self._position_values(positions),
-                logical,
-                ctx.bs,
+        shared_topk = None
+        if self.share_topk_for_mtp_iteration:
+            shared_topk = router.sparse_topk.decode
+            if (
+                shared_topk is not None
+                and shared_topk.shape[0] < hidden_states.shape[0]
+            ):
+                raise RuntimeError(
+                    "QSA MTP top-k reuse requires target-aligned step-0 indices"
+                )
+        verify_scratch = None
+        if is_target_verify:
+            verify_tokens = verify_bs * router.spec_num_tokens
+            if verify_tokens > token_k.shape[0]:
+                raise RuntimeError("QSA verify rows exceed the current input")
+            verify_scratch = self._verify_scratch_buffers(
+                token_k[-verify_tokens:],
+                position_values[-verify_tokens:],
+                logical[-verify_tokens:],
+                recent_locs[-verify_tokens:],
+                verify_bs,
+                pool,
             )
-        self._write_and_compress(
+        q = self._write_and_compress(
             token_k,
             positions,
             logical,
@@ -780,40 +785,29 @@ class QSAIndexer(nn.Module):
             write_mask=write_mask,
             draft_scratch=draft_scratch if is_draft_decode_step else None,
             stage_draft=is_draft_decode_step,
+            # Later MTP iterations reuse step-0 top-k, so their projected Q
+            # region is dead; K compression and draft staging still proceed.
+            query=None if shared_topk is not None else raw_q,
+            stage_verify_buffers=verify_scratch,
         )
-        if is_target_verify:
-            verify_tokens = verify_bs * router.spec_num_tokens
-            if verify_tokens > token_k.shape[0]:
-                raise RuntimeError("QSA verify rows exceed the current input")
-            self._stage_verified(
-                token_k[-verify_tokens:],
-                self._position_values(positions)[-verify_tokens:],
-                logical[-verify_tokens:],
-                recent_locs[-verify_tokens:],
-                verify_bs,
-                pool,
-            )
-        if self.share_topk_for_mtp_iteration:
-            shared_topk = router.sparse_topk.decode
-            num_rows = hidden_states.shape[0]
-            if shared_topk is not None and shared_topk.shape[0] < num_rows:
-                raise RuntimeError(
-                    "QSA MTP top-k reuse requires target-aligned step-0 indices"
-                )
-            if shared_topk is not None:
-                return shared_topk[:num_rows]
-        selected = self._select_tokens(
+        if shared_topk is not None:
+            return shared_topk[: hidden_states.shape[0]]
+        if q is None:
+            raise RuntimeError("QSA fused query preparation did not return queries")
+        selected_slots = self._select_slots(
             q,
             logical,
             requests,
             qsa_page_table,
+            router.stacks.table(FULL_ATTENTION, ctx.bs),
             compressed,
+            full_page_size=router.stacks.group_kernel_page_size(FULL_ATTENTION),
             qsa_page_expansion=qsa_expansion,
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:
-            router.sparse_topk.decode = selected
-        return selected
+            router.sparse_topk.decode = selected_slots
+        return selected_slots
 
     @break_point
     def sparse_attention(
@@ -826,7 +820,7 @@ class QSAIndexer(nn.Module):
         attention_layer,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        topk_indices: torch.Tensor,
+        selected_slots: torch.Tensor,
     ) -> torch.Tensor:
         """Run QSA while preserving the backend's layerwise PD step contract.
 
@@ -838,8 +832,8 @@ class QSAIndexer(nn.Module):
         """
         num_real = current_valid_rows()
         if num_real is not None:
-            q, k, v, gate, out_cache_loc, topk_indices = slice_to_real_tokens(
-                num_real, q, k, v, gate, out_cache_loc, topk_indices
+            q, k, v, gate, out_cache_loc, selected_slots = slice_to_real_tokens(
+                num_real, q, k, v, gate, out_cache_loc, selected_slots
             )
         with ctx.attn_backend.record_pd_cache_step(
             ctx.forward_mode,
@@ -854,7 +848,7 @@ class QSAIndexer(nn.Module):
                 attention_layer=attention_layer,
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
-                topk_indices=topk_indices,
+                selected_slots=selected_slots,
             )
 
     def _sparse_attention_impl(
@@ -867,10 +861,8 @@ class QSAIndexer(nn.Module):
         attention_layer,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        topk_indices: torch.Tensor,
+        selected_slots: torch.Tensor,
     ) -> torch.Tensor:
-        metadata = self._metadata(ctx)
-        stacks = self._full_backend(ctx).stacks
         # The caller fetched the full-attention group's window from the
         # backend (write_locations) — the one write-location source on both
         # the target and draft paths.
@@ -878,56 +870,66 @@ class QSAIndexer(nn.Module):
         q = q.view(-1, attention_layer.tp_q_head_num, attention_layer.head_dim)
         k = k.view(-1, attention_layer.tp_k_head_num, attention_layer.head_dim)
         v = v.view(-1, attention_layer.tp_v_head_num, attention_layer.v_head_dim)
-        ctx.token_to_kv_pool.set_kv_buffer(
-            attention_layer,
-            full_locs,
-            k,
-            v,
-            attention_layer.k_scale,
-            attention_layer.v_scale,
-        )
+        pool = ctx.token_to_kv_pool
+        k_cache, v_cache = pool.get_kv_buffer(attention_layer.layer_id)
+        if (
+            k_cache.dtype == torch.float8_e4m3fn
+            and v_cache.dtype == torch.float8_e4m3fn
+            and k.dtype != k_cache.dtype
+            and v.dtype != v_cache.dtype
+        ):
+            # QSA bypasses the full-attention backend's FP8 save path. Quantize
+            # and scatter K/V together without materialized FP8 temporaries.
+            fused_fp8_set_kv_buffer(
+                k=k,
+                v=v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_loc=full_locs,
+                k_scale=attention_layer.k_scale,
+                v_scale=attention_layer.v_scale,
+                page_size=self._full_backend(ctx).stacks.group_kernel_page_size(
+                    FULL_ATTENTION
+                ),
+            )
+        else:
+            pool.set_kv_buffer(
+                attention_layer,
+                full_locs,
+                k,
+                v,
+                attention_layer.k_scale,
+                attention_layer.v_scale,
+            )
         query_lengths = self._decode_query_lengths(
             ctx,
             q.shape[0],
             force_uniform=ctx.draft_narrowing is not None,
         )
-        logical, requests, _ = self._logical_layout(
-            metadata,
-            q.shape[0],
-            ctx.bs,
-            query_lengths=query_lengths,
-        )
-        k_cache = ctx.token_to_kv_pool.get_key_buffer(attention_layer.layer_id)
-        v_cache = ctx.token_to_kv_pool.get_value_buffer(attention_layer.layer_id)
-        slots = qwen4_exp_qsa_sparse_slots(
-            topk_indices,
-            logical,
-            requests,
-            stacks.table(FULL_ATTENTION, ctx.bs),
-            stacks.group_kernel_page_size(FULL_ATTENTION),
-        )
-        fp8_dtypes = (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-            torch.float8_e4m3fnuz,
-            torch.float8_e5m2fnuz,
-        )
-        output = qwen4_exp_qsa_sparse_attention(
+        is_fp8_cache = k_cache.dtype == torch.float8_e4m3fn
+        router = self._full_backend(ctx)
+        output = qsa_sparse_attention(
             q,
             k_cache,
             v_cache,
-            slots,
+            selected_slots,
             scale=attention_layer.scaling,
+            max_seqlen_q=(query_lengths if isinstance(query_lengths, int) else 1),
+            metadata_capacity_rows=max(
+                q.shape[0], router.stacks.max_bs * router.stacks.max_tokens_per_req
+            ),
             k_scale=(
                 (1.0 if attention_layer.k_scale is None else attention_layer.k_scale)
-                if k_cache.dtype in fp8_dtypes
+                if is_fp8_cache
                 else None
             ),
             v_scale=(
                 (1.0 if attention_layer.v_scale is None else attention_layer.v_scale)
-                if v_cache.dtype in fp8_dtypes
+                if is_fp8_cache
                 else None
             ),
+            override=None,
+            solution=None,
         )
         output = output.reshape(q.shape[0], -1)
         if gate is not None:

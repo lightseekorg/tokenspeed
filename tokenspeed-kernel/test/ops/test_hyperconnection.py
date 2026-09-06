@@ -76,18 +76,24 @@ def _mix_reference(
     normalized: torch.Tensor,
     projection: torch.Tensor,
     up: torch.Tensor,
-    projection_scale: float = 1.0,
+    projection_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x = normalized.double()
-    projected = x @ projection.double().T
+    # The reference runs on the host. Otherwise the two float64 GEMMs trigger
+    # high execution time on simulator-based flows.
+    device = normalized.device
+    x = normalized.cpu().double()
+    projected = x @ projection.cpu().double().T
     down = torch.nn.functional.silu(projected[:, :LOWRANK] * projection_scale)
-    gate = down @ up.double().T
+    gate = down @ up.cpu().double().T
     mixed = (
         torch.sigmoid(gate).unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
         * x.unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
     ).mean(dim=-2)
     inject = projected[:, LOWRANK:] * projection_scale
-    return mixed.to(normalized.dtype), inject.to(normalized.dtype)
+    return (
+        mixed.to(device=device, dtype=normalized.dtype),
+        inject.to(device=device, dtype=normalized.dtype),
+    )
 
 
 @pytest.mark.parametrize("rows", [0, 1, 4, 8, 16, 24, 32, 128])
@@ -106,7 +112,7 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     assert actual_inject.shape == (rows, HC_COUNT)
     if rows == 0:
         return
-    expected, expected_inject = _mix_reference(normalized, projection, up)
+    expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
 
@@ -126,7 +132,7 @@ def test_persistent_mix_matches_fp64_reference(rows: int, dtype: torch.dtype) ->
         LOWRANK,
         override="triton_persistent_hyperconnection_mix",
     )
-    expected, expected_inject = _mix_reference(normalized, projection, up)
+    expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(
@@ -151,7 +157,7 @@ def test_cute_dsl_mix_matches_fp64_reference(rows: int) -> None:
         LOWRANK,
         override="cute_dsl_hyperconnection_mix",
     )
-    expected, expected_inject = _mix_reference(normalized, projection, up)
+    expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
 
@@ -195,7 +201,7 @@ def test_cute_dsl_graph_replay_observes_reloaded_up_weight() -> None:
     graph.replay()
     torch.cuda.synchronize()
 
-    expected, expected_inject = _mix_reference(normalized, projection, up)
+    expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(actual_inject, expected_inject, rtol=3e-2, atol=3e-2)
     assert not torch.allclose(actual, before, rtol=3e-2, atol=3e-2)
@@ -338,7 +344,7 @@ def test_persistent_mix_full_chain_cuda_graph_replays(enable_pdl: bool) -> None:
         ).flatten(-2) * (1.0 + norm_weight.float())
         expected_normalized = expected_normalized.to(residual.dtype)
         expected_mixed, expected_inject = _mix_reference(
-            expected_normalized, projection, up
+            expected_normalized, projection, up, 1.0
         )
         expected_combined = (
             residual.unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
@@ -390,7 +396,7 @@ def test_persistent_mix_uses_stream_private_barriers() -> None:
     for stream in streams:
         stream.synchronize()
     for values, (mixed, inject) in zip((inputs_a, inputs_b), outputs, strict=True):
-        expected, expected_inject = _mix_reference(*values)
+        expected, expected_inject = _mix_reference(*values, 1.0)
         torch.testing.assert_close(mixed, expected, rtol=4e-2, atol=4e-2)
         torch.testing.assert_close(inject, expected_inject, rtol=4e-2, atol=4e-2)
 

@@ -293,11 +293,13 @@ share: V4's write-slot mappings (`DeepseekV4AttentionBackend.slot_mappings`:
 SWA, compressor state / compressed per ratio, indexer state) and the sparse
 indexer's selection (`AttentionBackend.sparse_topk`, a `SparseTopKShare`:
 GLM DSA's `"shared"` layers and the DSA / QSA MTP heads reuse the last
-indexer layer's top-k). Every runner-facing node clears both when it builds
-a forward's metadata (the router's extend init / decode refresh / capture
-seeding, V4's three slot publishers), so the first layer computes, the rest
-reuse, and nothing outlives its forward; the drafter's in-loop seq_lens
-edits are not a new forward and leave the share alone — the drafter itself
+indexer layer's top-k; QSA also keeps its layer-invariant row geometry in
+that share so the fused preparation runs once per forward). Every
+runner-facing node clears both when it builds a forward's metadata (the router's
+extend init / decode refresh / capture seeding, V4's three slot publishers), so
+the first layer computes, the rest reuse, and nothing outlives its forward; the
+drafter's in-loop seq_lens edits are not a new forward and leave the share
+alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
 backend, and starts from the target backend's. `ForwardContext` carries
 none of this. What unification still can NOT test: mempool reuse and
