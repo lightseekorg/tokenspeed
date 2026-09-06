@@ -755,6 +755,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         with (
             patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
             patch.object(deepseek_v4_model, "DeepseekV4MoEGate", return_value=gate),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_routed_expert_quant_config",
+                return_value=(None, False),
+            ),
             patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
             patch.object(deepseek_v4_model, "TopK"),
         ):
