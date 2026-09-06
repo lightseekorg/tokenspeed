@@ -2203,7 +2203,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertEqual(refresh_head.call_count, 11)
-        refresh_head.assert_called_with(drafter.lm_head.weight)
+        refresh_head.assert_called_with(drafter.lm_head.weight, force=False)
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
         values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
