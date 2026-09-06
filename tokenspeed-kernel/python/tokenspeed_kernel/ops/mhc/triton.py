@@ -53,6 +53,16 @@ def _pre_reduce_apply_is_supported(pre_reduce_apply_impl, n_splits: int) -> bool
     return supported is None or n_splits in supported
 
 
+def _pre_reduce_apply_fuses_norm(
+    pre_reduce_apply_impl, use_pre_reduce_apply: bool, has_norm_weight: bool
+) -> bool:
+    return bool(
+        use_pre_reduce_apply
+        and has_norm_weight
+        and getattr(pre_reduce_apply_impl, "supports_fused_norm", False)
+    )
+
+
 @triton.jit
 def _mhc_prenorm_gemm_triton_kernel(
     x,
@@ -499,11 +509,18 @@ def _mhc_pre_impl(
         n_splits,
     )
     block_h = 1024
-    fused_norm = bool(
-        norm_weight is not None
-        and getattr(pre_reduce_apply_impl, "supports_fused_norm", False)
+    fused_norm = _pre_reduce_apply_fuses_norm(
+        pre_reduce_apply_impl,
+        use_pre_reduce_apply,
+        norm_weight is not None,
     )
     if use_pre_reduce_apply:
+        fused_norm_kwargs = {}
+        if fused_norm:
+            fused_norm_kwargs = {
+                "norm_weight": norm_weight,
+                "norm_eps": 0.0 if norm_eps is None else norm_eps,
+            }
         pre_reduce_apply_impl(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -519,8 +536,7 @@ def _mhc_pre_impl(
             sinkhorn_iters,
             n_splits,
             num_tokens,
-            norm_weight=norm_weight if fused_norm else None,
-            norm_eps=0.0 if norm_eps is None else norm_eps,
+            **fused_norm_kwargs,
         )
     else:
         if pre_mix_impl is None:

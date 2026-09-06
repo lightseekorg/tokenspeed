@@ -20,7 +20,10 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.mhc.triton import _pre_reduce_apply_is_supported
+from tokenspeed_kernel.ops.mhc.triton import (
+    _pre_reduce_apply_fuses_norm,
+    _pre_reduce_apply_is_supported,
+)
 
 
 def reference(
@@ -53,8 +56,8 @@ def reference(
 def test_mhc_big_fuse_matches_reference(
     num_tokens: int, n_splits: int, block_size: int
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVIDIA CUDA required")
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
 
     torch.manual_seed(7)
@@ -108,8 +111,8 @@ def test_mhc_big_fuse_matches_reference(
 def test_mhc_big_fuse_norm_matches_reference(
     num_tokens: int, n_splits: int, block_size: int
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVIDIA CUDA required")
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
 
     torch.manual_seed(17)
@@ -164,8 +167,8 @@ def test_mhc_big_fuse_norm_matches_reference(
 
 
 def test_mhc_big_fuse_rejects_unsupported_splits() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVIDIA CUDA required")
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
 
     device = torch.device("cuda")
@@ -217,3 +220,32 @@ def test_pre_reduce_apply_capability_gate(
     if supported is not None:
         implementation.supported_n_splits = supported
     assert _pre_reduce_apply_is_supported(implementation, n_splits) is expected
+
+
+@pytest.mark.parametrize(
+    ("use_pre_reduce_apply", "has_norm_weight", "supports_fused_norm", "expected"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_pre_reduce_apply_fused_norm_gate(
+    use_pre_reduce_apply: bool,
+    has_norm_weight: bool,
+    supports_fused_norm: bool,
+    expected: bool,
+) -> None:
+    def implementation() -> None:
+        pass
+
+    implementation.supports_fused_norm = supports_fused_norm
+    assert (
+        _pre_reduce_apply_fuses_norm(
+            implementation,
+            use_pre_reduce_apply,
+            has_norm_weight,
+        )
+        is expected
+    )
