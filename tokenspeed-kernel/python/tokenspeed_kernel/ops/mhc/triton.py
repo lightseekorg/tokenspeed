@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.mhc.triton_prefill import (
     mhc_pre_mix_hc4,
     mhc_prefill_project_hc4,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -516,10 +516,12 @@ def _mhc_pre_impl(
     )
     if use_pre_reduce_apply:
         fused_norm_kwargs = {}
-        if fused_norm:
+        if getattr(pre_reduce_apply_impl, "supports_fused_norm", False):
             fused_norm_kwargs = {
-                "norm_weight": norm_weight,
+                "norm_weight": norm_weight if fused_norm else None,
                 "norm_eps": 0.0 if norm_eps is None else norm_eps,
+                "block_size": 512,
+                "enable_pdl": pdl_enabled(),
             }
         pre_reduce_apply_impl(
             gemm_out_mul,
