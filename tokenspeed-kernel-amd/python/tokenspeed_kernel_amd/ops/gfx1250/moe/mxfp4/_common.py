@@ -417,13 +417,13 @@ class MoEConfig:
         )
         if self.USE_WMMA_SCALED:
             self.layout_x_scale = gl.constexpr(
-                gl.amd.gfx1250.get_wmma_scale_layout(
+                gl.amd.cdna5.get_wmma_scale_layout(
                     self.dot_layout_x,
                     [BLOCK_M // NUM_SUBTILES_M, BLOCK_K_SCALE // NUM_SUBTILES_K],
                 )
             )
             self.layout_w_scale = gl.constexpr(
-                gl.amd.gfx1250.get_wmma_scale_layout(
+                gl.amd.cdna5.get_wmma_scale_layout(
                     self.dot_layout_w,
                     [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_SCALE // NUM_SUBTILES_K],
                 )
@@ -530,7 +530,7 @@ def create_descriptor(
             other=0,
         ).to(gl.int32)
 
-        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=x_ptr,
             shape=(M, K // cfg.DIV_FACTOR_X),
             strides=(stride_xm, stride_xk),
@@ -540,7 +540,7 @@ def create_descriptor(
 
         if cfg.WITH_X_MX_SCALE:
             BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // SCALE_BLOCK
-            x_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
                 base=x_scale_ptr,
                 shape=(M, K // SCALE_BLOCK),
                 strides=(stride_x_scale_m, stride_x_scale_k),
@@ -552,7 +552,7 @@ def create_descriptor(
     else:
         gathered_m = gl.constexpr(0)
         x_offs = off_m * stride_xm
-        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=x_ptr + x_offs,
             shape=(M, K // cfg.DIV_FACTOR_X),
             strides=(stride_xm, stride_xk),
@@ -562,7 +562,7 @@ def create_descriptor(
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_offs = off_m * stride_x_scale_m // PRESHUFFLE_FACTOR
-            x_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
                 base=x_scale_ptr + x_scale_offs,
                 shape=(
                     (M + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR,
@@ -576,7 +576,7 @@ def create_descriptor(
             x_scale_desc = gl.constexpr(0)
 
     if cfg.W_TRANSPOSE:
-        w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=w_ptr + w_offs,
             shape=(N, K // cfg.DIV_FACTOR_W),
             strides=(stride_wn, stride_wk),
@@ -584,7 +584,7 @@ def create_descriptor(
             layout=cfg.shared_layout_w,
         )
     else:
-        w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=w_ptr + w_offs,
             shape=(K // cfg.DIV_FACTOR_W, N),
             strides=(stride_wk, stride_wn),
@@ -597,7 +597,7 @@ def create_descriptor(
         N_PADDED = (N + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR * PRESHUFFLE_FACTOR
         K_SCALE = (K + SCALE_BLOCK - 1) // SCALE_BLOCK
         K_SCALE_PADDED = (K_SCALE + SCALE_KWIDTH - 1) // SCALE_KWIDTH * SCALE_KWIDTH
-        w_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        w_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=w_scale_ptr + w_scale_offs,
             shape=(N_PADDED // PRESHUFFLE_FACTOR, K_SCALE_PADDED * PRESHUFFLE_FACTOR),
             strides=(stride_w_scale_n, stride_w_scale_k),
@@ -620,11 +620,11 @@ class MoEProgramBase:
     def wmma(self, x, scale_x, w, scale_w, accumulator):
         cfg = self.cfg
         if cfg.USE_WMMA_SCALED:
-            return gl.amd.gfx1250.wmma_scaled(
+            return gl.amd.cdna5.wmma_scaled(
                 x, scale_x, cfg.DTYPE_X, w, scale_w, cfg.DTYPE_W, accumulator
             )
         else:
-            return gl.amd.gfx1250.wmma(x, w, accumulator)
+            return gl.amd.cdna5.wmma(x, w, accumulator)
 
     @gluon.jit
     def issue_global_loads(self, load_idx, pred=1):
@@ -635,16 +635,16 @@ class MoEProgramBase:
 
         if cfg.USE_GATHER:
             col_offset_x = self.off_k_x + load_idx * BLOCK_K_PACKED_X
-            x_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
                 self.x_desc, add_offsets=[0, col_offset_x], pred=pred, clamp_bounds=True
             )
-            gl.amd.gfx1250.tdm.async_gather(
+            gl.amd.cdna5.tdm.async_gather(
                 x_desc_k,
                 self.gathered_m,
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.x_desc,
                 [0, load_idx * BLOCK_K_PACKED_X],
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -652,14 +652,14 @@ class MoEProgramBase:
             )
 
         if cfg.W_TRANSPOSE:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_desc,
                 [0, load_idx * BLOCK_K_PACKED_W],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_desc,
                 [load_idx * BLOCK_K_PACKED_W, 0],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -672,19 +672,19 @@ class MoEProgramBase:
                     self.off_k_x * cfg.DIV_FACTOR_X // cfg.SCALE_BLOCK
                     + load_idx * BLOCK_K_SCALE
                 )
-                x_scale_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                x_scale_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
                     self.x_scale_desc,
                     add_offsets=[0, col_offset_x_scale],
                     pred=pred,
                     clamp_bounds=True,
                 )
-                gl.amd.gfx1250.tdm.async_gather(
+                gl.amd.cdna5.tdm.async_gather(
                     x_scale_desc_k,
                     self.gathered_m,
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 )
             else:
-                gl.amd.gfx1250.tdm.async_load(
+                gl.amd.cdna5.tdm.async_load(
                     self.x_scale_desc,
                     [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -692,7 +692,7 @@ class MoEProgramBase:
                 )
 
         if cfg.WITH_W_MX_SCALE:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_scale_desc,
                 [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -703,7 +703,7 @@ class MoEProgramBase:
 
     @gluon.jit
     def async_wait(self, waitcnt):
-        gl.amd.gfx1250.tdm.async_wait(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
+        gl.amd.cdna5.tdm.async_wait(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
 
 
 @composition
@@ -717,10 +717,10 @@ class MoEPipelinedProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    w_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor

@@ -407,9 +407,9 @@ def _mla_extend_fwd_kernel(
 
         KV_lora = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
+        S = gl.amd.cdna5.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
         K_rope = k_rope_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
+        S = gl.amd.cdna5.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
 
         seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
 
@@ -450,7 +450,7 @@ def _mla_extend_fwd_kernel(
         else:
             P = P.to(KV_lora_trans.dtype, fp_downcast_rounding="rtz")
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
-        acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
+        acc = gl.amd.cdna5.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
     # epilogue

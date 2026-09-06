@@ -359,7 +359,7 @@ def _matmul_decode(
         )
         out_smem.store(out)
 
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
@@ -368,11 +368,11 @@ def _matmul_decode(
         )
 
         col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(cfg.index_type)
-        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        y_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
-        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.cdna5.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
+        gl.amd.cdna5.tdm.async_wait(0)
     else:
         offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
@@ -388,4 +388,4 @@ def _matmul_decode(
             + offs_y_n.to(cfg.index_type)[None, :] * stride_y_n
         )
         y_mask = mask_m[:, None] & mask_n[None, :]
-        gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
+        gl.amd.cdna5.buffer_store(out, Y_ptr, y_offs, mask=y_mask)

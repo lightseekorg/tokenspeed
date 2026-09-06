@@ -98,7 +98,7 @@ def _accumulate_histogram_tile(
     offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
     offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
     valid = offsets < candidate_len
-    values = gl.amd.gfx1250.buffer_load(
+    values = gl.amd.cdna5.buffer_load(
         candidate_logits,
         offsets,
         mask=valid,
@@ -143,7 +143,7 @@ def _emit_topk_tile(
     offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
     offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
     valid = offsets < candidate_len
-    values = gl.amd.gfx1250.buffer_load(
+    values = gl.amd.cdna5.buffer_load(
         candidate_logits,
         offsets,
         mask=valid,

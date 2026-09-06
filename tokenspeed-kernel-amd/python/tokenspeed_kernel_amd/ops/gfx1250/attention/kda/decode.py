@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-gfx1250 = gl.amd.gfx1250
+cdna5 = gl.amd.cdna5
 
 _GFX1250_NUM_CUS = 256
 
@@ -241,7 +241,7 @@ def _kda_recurrent_decode_kernel(
     decay = gl.exp(log_decay)
     state_mask = value_mask[:, None] & key_mask[None, :]
     read_offsets = value_offsets[:, None] * K + key_offsets[None, :]
-    running = gfx1250.buffer_load(
+    running = cdna5.buffer_load(
         state_pool + read_base,
         read_offsets.to(gl.int32),
         mask=state_mask,
@@ -263,7 +263,7 @@ def _kda_recurrent_decode_kernel(
         mask=value_mask,
     )
     write_offsets = value_offsets[:, None] * K + key_offsets[None, :]
-    gfx1250.buffer_store(
+    cdna5.buffer_store(
         running,
         state_pool + write_base,
         write_offsets.to(gl.int32),
