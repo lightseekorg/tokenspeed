@@ -54,6 +54,7 @@ __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",
     "dsv4_combine_dense_swa_indices",
     "dsv4_combine_topk_swa_indices",
+    "dsv4_compact_compressed_slot_mapping",
     "dsv4_compressed_slot_mapping",
     "dsv4_group_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
@@ -3189,6 +3190,97 @@ def dsv4_compressed_slot_mapping(
     do_not_specialize=[
         "num_tokens",
         "num_reqs",
+        "max_blocks_per_seq",
+    ]
+)
+def _dsv4_compact_compressed_slot_mapping_kernel(
+    slot_mapping_ptr,
+    token_to_req_indices_ptr,
+    token_to_req_indices_stride,
+    query_start_loc_ptr,
+    query_start_loc_stride,
+    seq_lens_ptr,
+    seq_lens_stride,
+    is_valid_token_ptr,
+    is_valid_token_stride,
+    block_table_ptr,
+    block_table_stride,
+    block_table_base_offsets_ptr,
+    block_table_base_offsets_stride,
+    num_tokens,
+    num_reqs,
+    max_blocks_per_seq,
+    has_valid_token: tl.constexpr,
+    has_block_table_base_offsets: tl.constexpr,
+    block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_is_valid = token_idx < num_tokens
+    if has_valid_token:
+        token_is_valid &= tl.load(
+            is_valid_token_ptr + token_idx * is_valid_token_stride,
+            mask=token_is_valid,
+            other=False,
+        )
+
+    req_idx = tl.load(
+        token_to_req_indices_ptr + token_idx * token_to_req_indices_stride,
+        mask=token_is_valid,
+        other=-1,
+    ).to(tl.int32)
+    req_is_valid = token_is_valid & (req_idx >= 0) & (req_idx < num_reqs)
+    query_start = tl.load(
+        query_start_loc_ptr + req_idx * query_start_loc_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    query_end = tl.load(
+        query_start_loc_ptr + (req_idx + 1) * query_start_loc_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    seq_len = tl.load(
+        seq_lens_ptr + req_idx * seq_lens_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    position = seq_len - (query_end - query_start) + token_idx - query_start
+    compressed_position = position // compress_ratio
+    logical_page = compressed_position // block_size
+    offset = compressed_position % block_size
+
+    base_page = tl.zeros((), dtype=tl.int64)
+    if has_block_table_base_offsets:
+        base_page = tl.load(
+            block_table_base_offsets_ptr + req_idx * block_table_base_offsets_stride,
+            mask=req_is_valid,
+            other=0,
+        ).to(tl.int64)
+    table_page = logical_page - base_page
+    page_is_valid = (
+        req_is_valid
+        & (position >= 0)
+        & ((position + 1) % compress_ratio == 0)
+        & (table_page >= 0)
+        & (table_page < max_blocks_per_seq)
+    )
+    page_id = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_page,
+        mask=page_is_valid,
+        other=-1,
+    ).to(tl.int64)
+    slot = page_id * block_size + offset
+    tl.store(
+        slot_mapping_ptr + token_idx,
+        tl.where(page_is_valid & (page_id >= 0), slot, -1),
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "num_reqs",
         "max_blocks_per_req",
     ]
 )
@@ -3266,6 +3358,150 @@ def _dsv4_group_slot_mapping_kernel(
         tl.where(table_entry_is_valid & (block_id >= 0), slot, -1),
         mask=token_in_range,
     )
+
+
+def dsv4_compact_compressed_slot_mapping(
+    *,
+    num_tokens: int,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    compress_ratio: int,
+    block_table_base_offsets: torch.Tensor | None = None,
+    is_valid_token: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build slots for a grouped DeepSeek V4 compressed-cache page table.
+
+    The table may contain full logical rows or compact rows accompanied by a
+    per-request base logical-page offset. Invalid and non-boundary tokens map
+    to ``-1``.
+    """
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if token_to_req_indices.numel() < num_tokens:
+        raise ValueError(
+            "token_to_req_indices must cover every token: "
+            f"tokens={num_tokens}, request_indices={token_to_req_indices.numel()}"
+        )
+    if query_start_loc.dim() != 1 or seq_lens.dim() != 1:
+        raise ValueError("query_start_loc and seq_lens must be 1-D")
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
+    if block_table_base_offsets is not None and block_table_base_offsets.dim() != 1:
+        raise ValueError("block_table_base_offsets must be 1-D")
+    if is_valid_token is not None:
+        if is_valid_token.numel() != num_tokens:
+            if is_valid_token.numel() <= 0 or num_tokens % is_valid_token.numel() != 0:
+                raise ValueError(
+                    "is_valid_token must cover or evenly expand across every token: "
+                    f"tokens={num_tokens}, validity={is_valid_token.numel()}"
+                )
+            is_valid_token = is_valid_token.repeat_interleave(
+                num_tokens // is_valid_token.numel()
+            )
+        is_valid_token = is_valid_token.to(device=seq_lens.device, dtype=torch.bool)
+    if out is None:
+        out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
+    if out.dim() != 1 or out.dtype != torch.int64 or out.numel() < num_tokens:
+        raise ValueError(
+            "out must be a 1-D int64 tensor with at least num_tokens entries, got "
+            f"shape={tuple(out.shape)} dtype={out.dtype} tokens={num_tokens}"
+        )
+    if out.stride(0) != 1:
+        raise ValueError("out must be contiguous")
+
+    slot_mapping = out[:num_tokens]
+    if out.numel() == 0:
+        return slot_mapping
+
+    num_reqs = min(
+        seq_lens.numel(),
+        max(0, query_start_loc.numel() - 1),
+        block_table.shape[0],
+        (
+            block_table_base_offsets.numel()
+            if block_table_base_offsets is not None
+            else seq_lens.numel()
+        ),
+    )
+    if seq_lens.is_cuda:
+        req_indices_i32 = token_to_req_indices.to(torch.int32)
+        query_start_i32 = query_start_loc.to(torch.int32)
+        seq_lens_i32 = seq_lens.to(torch.int32)
+        block_table_i32 = _as_int32_block_table(block_table)
+        validity_arg = seq_lens_i32 if is_valid_token is None else is_valid_token
+        base_offsets_arg = (
+            seq_lens_i32
+            if block_table_base_offsets is None
+            else block_table_base_offsets.to(torch.int32)
+        )
+        _dsv4_compact_compressed_slot_mapping_kernel[(out.numel(),)](
+            out,
+            req_indices_i32,
+            req_indices_i32.stride(0),
+            query_start_i32,
+            query_start_i32.stride(0),
+            seq_lens_i32,
+            seq_lens_i32.stride(0),
+            validity_arg,
+            validity_arg.stride(0),
+            block_table_i32,
+            block_table_i32.stride(0),
+            base_offsets_arg,
+            base_offsets_arg.stride(0),
+            num_tokens,
+            num_reqs,
+            block_table_i32.shape[1],
+            has_valid_token=is_valid_token is not None,
+            has_block_table_base_offsets=block_table_base_offsets is not None,
+            block_size=block_size,
+            compress_ratio=compress_ratio,
+        )
+        return slot_mapping
+
+    out.fill_(-1)
+    if num_tokens == 0 or num_reqs == 0:
+        return slot_mapping
+    req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+    valid_req = (req_idx >= 0) & (req_idx < num_reqs)
+    safe_req = req_idx.clamp(0, num_reqs - 1)
+    query_starts = query_start_loc[safe_req].to(torch.int64)
+    query_lens = query_start_loc[safe_req + 1].to(torch.int64) - query_starts
+    positions = (
+        seq_lens[safe_req].to(torch.int64)
+        - query_lens
+        + torch.arange(num_tokens, dtype=torch.int64, device=seq_lens.device)
+        - query_starts
+    )
+    compressed_positions = torch.div(positions, compress_ratio, rounding_mode="floor")
+    table_pages = torch.div(compressed_positions, block_size, rounding_mode="floor")
+    if block_table_base_offsets is not None:
+        table_pages -= block_table_base_offsets[safe_req].to(torch.int64)
+    valid_page = (
+        valid_req
+        & (positions >= 0)
+        & (((positions + 1) % compress_ratio) == 0)
+        & (table_pages >= 0)
+        & (table_pages < block_table.shape[1])
+    )
+    safe_page = table_pages.clamp(0, max(0, block_table.shape[1] - 1))
+    if block_table.shape[1] == 0:
+        page_ids = torch.full_like(table_pages, -1)
+    else:
+        page_ids = block_table.to(torch.int64)[safe_req, safe_page]
+    valid_page &= page_ids >= 0
+    if is_valid_token is not None:
+        valid_page &= is_valid_token[:num_tokens]
+    slots = page_ids * block_size + compressed_positions % block_size
+    slot_mapping.copy_(torch.where(valid_page, slots, torch.full_like(slots, -1)))
+    return slot_mapping
 
 
 def dsv4_group_slot_mapping(

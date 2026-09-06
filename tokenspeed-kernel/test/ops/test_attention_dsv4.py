@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     _dsv4_use_serial_four_block_indexer_q,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
+    dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_dense_compressed_indices_and_lens,
@@ -2401,6 +2402,87 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         )
         self.assertTrue(torch.equal(out[5:].cpu(), torch.full((3,), -1)))
+
+    def test_grouped_compressed_slot_mapping_matches_full_table_reference(self):
+        device = torch.device("cuda")
+        token_to_req_indices = torch.tensor(
+            [0, 0, 0, 1, 1, -1], device=device, dtype=torch.int32
+        )
+        query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([264, 520], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[10, 20, 21], [30, 40, -1]], device=device, dtype=torch.int32
+        )
+        is_valid_token = torch.tensor(
+            [True, True, True, True, False, True], device=device, dtype=torch.bool
+        )
+        out = torch.full((8,), 1234, device=device, dtype=torch.int64)
+
+        actual = dsv4_compact_compressed_slot_mapping(
+            num_tokens=6,
+            token_to_req_indices=token_to_req_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            block_size=64,
+            compress_ratio=4,
+            is_valid_token=is_valid_token,
+            out=out,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(actual.data_ptr(), out.data_ptr())
+        self.assertTrue(
+            torch.equal(
+                actual.cpu(),
+                torch.tensor([-1, -1, 20 * 64 + 1, -1, -1, -1]),
+            )
+        )
+        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
+
+    def test_grouped_compressed_slot_mapping_compact_table_graph_replay(self):
+        device = torch.device("cuda")
+        token_to_req_indices = torch.tensor(
+            [0, 0, 0, 1, 1, -1], device=device, dtype=torch.int32
+        )
+        query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([264, 520], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[20, 21], [30, -1]], device=device, dtype=torch.int32
+        )
+        base_offsets = torch.tensor([1, 2], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor(
+            [True, True, True, True, False, True], device=device, dtype=torch.bool
+        )
+        out = torch.full((8,), 1234, device=device, dtype=torch.int64)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dsv4_compact_compressed_slot_mapping(
+                num_tokens=6,
+                token_to_req_indices=token_to_req_indices,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                block_table=block_table,
+                block_size=64,
+                compress_ratio=4,
+                block_table_base_offsets=base_offsets,
+                is_valid_token=is_valid_token,
+                out=out,
+            )
+        seq_lens.copy_(torch.tensor([268, 524], device=device, dtype=torch.int32))
+        block_table[0, 0] = 22
+        is_valid_token[4] = True
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(
+                out[:6].cpu(),
+                torch.tensor([-1, -1, 22 * 64 + 2, -1, 30 * 64 + 2, -1]),
+            )
+        )
+        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
 
     def test_group_slot_mapping_matches_reference_and_replay(self):
         device = torch.device("cuda")
