@@ -85,7 +85,7 @@ def _allocator_identity(allocator: _ScratchAllocator | None) -> object:
     return getattr(allocator, "__self__", allocator)
 
 
-def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
+def multicast_reachable(group: dist.ProcessGroup) -> bool:
     """Whether NVLS multicast can actually map across ``group``'s ranks.
 
     ``symm_mem`` importing is not enough: a cross-host group without fabric or
@@ -115,10 +115,7 @@ def multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
 
     if not dist.is_initialized():
         return False
-    # ``None`` is the default group and has to be tested like any other.
-    ranks = dist.get_process_group_ranks(
-        group if group is not None else dist.group.WORLD
-    )
+    ranks = dist.get_process_group_ranks(group)
     span = group_host_span(ranks)
     if span is None:
         return False
@@ -132,7 +129,7 @@ _MULTICAST_MIN_ARCH = 10
 
 
 def multicast_backend_unavailable_reason(
-    group: dist.ProcessGroup | None = None,
+    group: dist.ProcessGroup,
 ) -> str | None:
     """Which term of the backend's eligibility fails here, or None.
 
@@ -166,7 +163,7 @@ def multicast_backend_unavailable_reason(
     return None
 
 
-def multicast_backend_available(group: dist.ProcessGroup | None = None) -> bool:
+def multicast_backend_available(group: dist.ProcessGroup) -> bool:
     """Whether the CuteDSL multicast backend can run here at all.
 
     Separate from any one op's shapes: capability, the optional imports, and
@@ -181,7 +178,7 @@ def latent_tail_supported(
     hidden_size: int,
     latent_size: int,
     dtype: torch.dtype,
-    group: dist.ProcessGroup | None = None,
+    group: dist.ProcessGroup,
 ) -> bool:
     """Cheap, non-collective eligibility probe (no rendezvous).
 

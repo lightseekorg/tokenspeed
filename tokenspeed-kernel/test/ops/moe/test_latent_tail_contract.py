@@ -265,8 +265,8 @@ def test_the_probe_is_skipped_only_within_one_host_window(
 
 
 @pytest.mark.parametrize("per_host,probed", [(4, True), (8, False)])
-def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
-    """``None`` means the world group, not "assume reachable".
+def test_the_world_group_is_tested_like_any_other(per_host, probed) -> None:
+    """The world group earns no exemption from the probe.
 
     Short-circuiting it drops the only size term the test has, so a world that
     spans hosts is admitted with no probe -- and the reachability vote its
@@ -300,9 +300,7 @@ def test_the_default_group_is_tested_like_any_other(per_host, probed) -> None:
                 side_effect=lambda ranks: seen.append(list(ranks)) or False,
             ),
         ):
-            assert tail.multicast_reachable() is not probed
-            # Passing ``None`` straight through reads the same here and
-            # raises in real torch, so the argument is the assertion.
+            assert tail.multicast_reachable(world) is not probed
             ranks_of.assert_called_once_with(world)
     finally:
         fabric._host_map = saved
