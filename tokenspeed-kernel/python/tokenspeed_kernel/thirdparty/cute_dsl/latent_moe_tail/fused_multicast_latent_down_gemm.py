@@ -39,30 +39,46 @@ from .primitives import (
 
 @dataclass(frozen=True)
 class DownConfig:
-    block_size: int = 224
-    outputs_per_block: int = 2
-    k_unroll: int = 2
-    vector_width: int = 8
-    prefetch_b_before_pdl: bool = True
+    block_size: int
+    outputs_per_block: int
+    k_unroll: int
+    vector_width: int
+    prefetch_b_before_pdl: bool
 
 
-def config_for_m(num_rows: int, shard_dim: int = 224) -> DownConfig:
+def config_for_m(num_rows: int, shard_dim: int) -> DownConfig:
     if shard_dim == 448:
         if num_rows >= 6:
             return DownConfig(
                 block_size=224,
                 outputs_per_block=2,
                 k_unroll=1,
+                vector_width=8,
+                prefetch_b_before_pdl=True,
             )
         outputs_per_block = 2 if num_rows <= 3 else 4
         return DownConfig(
             block_size=448,
             outputs_per_block=outputs_per_block,
             k_unroll=1,
+            vector_width=8,
+            prefetch_b_before_pdl=True,
         )
     if num_rows == 1:
-        return DownConfig(outputs_per_block=8, k_unroll=1)
-    return DownConfig(outputs_per_block=4)
+        return DownConfig(
+            block_size=224,
+            outputs_per_block=8,
+            k_unroll=1,
+            vector_width=8,
+            prefetch_b_before_pdl=True,
+        )
+    return DownConfig(
+        block_size=224,
+        outputs_per_block=4,
+        k_unroll=2,
+        vector_width=8,
+        prefetch_b_before_pdl=True,
+    )
 
 
 def _as_cute(tensor: torch.Tensor):
