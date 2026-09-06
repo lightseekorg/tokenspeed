@@ -436,6 +436,8 @@ def _mhc_pre_impl(
     pre_mix_impl=None,
     pre_reduce_apply_impl=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
     if not residual.is_cuda:
@@ -519,7 +521,7 @@ def _mhc_pre_impl(
         if getattr(pre_reduce_apply_impl, "supports_fused_norm", False):
             fused_norm_kwargs = {
                 "norm_weight": norm_weight if fused_norm else None,
-                "norm_eps": 0.0 if norm_eps is None else norm_eps,
+                "norm_eps": norm_eps if fused_norm else 0.0,
                 "block_size": 512,
                 "enable_pdl": pdl_enabled(),
             }

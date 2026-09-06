@@ -57,13 +57,17 @@ def mhc_pre(
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
         norm_weight: Optional BF16 RMSNorm weight fused into the selected kernel.
-        norm_eps: RMSNorm epsilon, required when ``norm_weight`` is provided.
+        norm_eps: Optional RMSNorm epsilon. This must be provided together with
+            ``norm_weight``.
 
     Returns:
         A tuple of the BF16 layer input ``[..., hidden_size]``, FP32 post mix
         ``[..., hc_mult, 1]``, and FP32 combine mix
         ``[..., hc_mult, hc_mult]``.
     """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+
     hc_mult = int(residual.shape[-2])
     hidden_size = int(residual.shape[-1])
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
