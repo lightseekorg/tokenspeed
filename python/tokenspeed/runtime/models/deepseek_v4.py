@@ -2174,6 +2174,8 @@ class DeepseekV4MoE(nn.Module):
                     num_global_tokens=num_global_tokens,
                     max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 )
+                if topk_output.format.is_bypassed() and not self.config.norm_topk_prob:
+                    routed *= topk_weights.sum(dim=-1, keepdim=True).to(routed.dtype)
                 if self.routed_scaling_factor != 1.0:
                     routed *= self.routed_scaling_factor
             with fork.branch():
