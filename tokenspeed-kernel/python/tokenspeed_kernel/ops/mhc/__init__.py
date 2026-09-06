@@ -39,8 +39,8 @@ def mhc_pre(
     override: str | None = None,
     solution: str | None = None,
     *,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute the mHC pre-mapping for one residual stream.
 
@@ -174,8 +174,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compose the registered previous post-mapping and current pre-mapping.
 

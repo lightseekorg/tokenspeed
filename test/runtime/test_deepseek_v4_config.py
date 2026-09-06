@@ -1964,6 +1964,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values,
                 gathered_ids,
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
             )
 
         self.assertEqual(gather.call_count, 2)
@@ -1976,6 +1982,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values[:, :1],
                 gathered_ids[:, :1],
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
             )
 
     def test_dspark_replicated_argmax_bypasses_collective_workspaces(self):
@@ -2000,6 +2012,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 torch.empty(0),
                 torch.empty(0, dtype=torch.int64),
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
             )
 
         gather.assert_not_called()
@@ -2337,29 +2355,42 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.bfloat16,
         )
 
-        self.assertTrue(model.refresh_local_base_logits_head(head))
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
         cached_ptr = model._local_base_head_fp32.data_ptr()
-        self.assertFalse(model.refresh_local_base_logits_head(head))
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
         self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
         self.assertTrue(
             torch.equal(
-                model.local_base_logits(hidden),
+                model.local_base_logits(hidden, None),
                 hidden.float() @ head.float().T,
             )
         )
 
         head.add_(1)
-        self.assertTrue(model.refresh_local_base_logits_head(head))
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
         self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
         self.assertTrue(
             torch.equal(
-                model.local_base_logits(hidden),
+                model.local_base_logits(hidden, None),
                 hidden.float() @ head.float().T,
             )
         )
 
         with self.assertRaisesRegex(RuntimeError, "shape or device changed"):
-            model.refresh_local_base_logits_head(torch.ones(3, 2))
+            model.refresh_local_base_logits_head(torch.ones(3, 2), force=False)
+
+        original_version = int(head._version)
+        replacement = torch.full_like(head, 3)
+        head.data.copy_(replacement)
+        self.assertEqual(int(head._version), original_version)
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=True))
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ replacement.float().T,
+            )
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_dspark_cached_base_logits_survive_cuda_graph_refresh(self):
@@ -2378,18 +2409,18 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.bfloat16,
             device="cuda",
         )
-        model.refresh_local_base_logits_head(head)
+        model.refresh_local_base_logits_head(head, force=False)
         cached_ptr = model._local_base_head_fp32.data_ptr()
 
         warmup_stream = torch.cuda.Stream()
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                model.local_base_logits(hidden)
+                model.local_base_logits(hidden, None)
         torch.cuda.current_stream().wait_stream(warmup_stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            logits = model.local_base_logits(hidden)
+            logits = model.local_base_logits(hidden, None)
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(
@@ -2397,7 +2428,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         head.add_(1)
-        model.refresh_local_base_logits_head(head)
+        model.refresh_local_base_logits_head(head, force=False)
         self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
         graph.replay()
         torch.cuda.synchronize()
@@ -6442,6 +6473,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rms_eps=1e-6,
                 hc_eps=1e-6,
                 sinkhorn_iters=2,
+                norm_weight=None,
+                norm_eps=None,
             )
         with self.assertRaises(RuntimeError):
             mhc_post(hidden_states, residual, post, comb)
@@ -6472,6 +6505,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6508,6 +6542,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            hash_table_values_validated=False,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6561,6 +6596,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 renormalize=True,
                 hash_indices_table=table,
                 input_ids=input_ids,
+                hash_table_values_validated=False,
             )
             trusted = dsv4_select_experts(
                 logits,
@@ -6658,6 +6694,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()

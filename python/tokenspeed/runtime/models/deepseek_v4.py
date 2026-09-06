@@ -254,8 +254,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_pre(
         residual,
@@ -290,8 +290,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -1590,7 +1590,8 @@ def dsv4_select_experts(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
-    hash_table_values_validated: bool = False,
+    *,
+    hash_table_values_validated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
     try:

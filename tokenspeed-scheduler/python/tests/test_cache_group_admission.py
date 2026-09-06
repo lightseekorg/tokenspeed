@@ -186,7 +186,7 @@ def test_v4_long_prompt_does_not_reserve_full_headroom_in_sliding_groups():
         packing: int,
         retention: CacheRetention,
         family: CacheGroupFamily,
-        sliding_window_tokens: int | None = None,
+        sliding_window_tokens: int | None,
     ) -> CacheGroupConfig:
         return CacheGroupConfig(
             group_id=group_id,
@@ -216,6 +216,7 @@ def test_v4_long_prompt_does_not_reserve_full_headroom_in_sliding_groups():
             1,
             CacheRetention.FullHistory,
             CacheGroupFamily.History,
+            None,
         ),
         group(
             "v4.c4a.compressor_state",
@@ -242,6 +243,7 @@ def test_v4_long_prompt_does_not_reserve_full_headroom_in_sliding_groups():
             32,
             CacheRetention.FullHistory,
             CacheGroupFamily.History,
+            None,
         ),
         group(
             "v4.c128a.compressor_state",

@@ -837,6 +837,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 cos_sin_cache=cos_sin,
                 rms_norm_eps=eps,
                 block_size=block_size,
+                validate_positions=True,
             )
 
         stream = torch.cuda.Stream()
@@ -928,6 +929,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 cos_sin_cache=cos_sin,
                 rms_norm_eps=eps,
                 block_size=block_size,
+                validate_positions=True,
             )
         except RuntimeError as exc:
             if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
@@ -2173,6 +2175,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             block_size=4,
             compress_ratio=2,
             width=8,
+            block_table_base_offsets=None,
+            is_valid_token=None,
             out_indices=out_indices,
             out_lens=out_lens,
         )
@@ -2218,6 +2222,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 [1, 1], device=device, dtype=torch.int32
             ),
             is_valid_token=is_valid_token,
+            out_indices=None,
+            out_lens=None,
         )
         torch.cuda.synchronize()
 
@@ -2426,6 +2432,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             block_table=block_table,
             block_size=64,
             compress_ratio=4,
+            block_table_base_offsets=None,
             is_valid_token=is_valid_token,
             out=out,
         )
@@ -2546,6 +2553,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     [[10], [20]], device="cuda", dtype=torch.int32
                 ),
                 rows_per_block=64,
+                entry_stride_tokens=1,
+                base_offsets=None,
+                is_valid_token=None,
             )
 
     def test_group_slot_mapping_accepts_empty_decode_batch(self):
@@ -2554,6 +2564,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             req_indices=torch.empty(0, device="cuda", dtype=torch.int32),
             block_table=torch.empty((0, 0), device="cuda", dtype=torch.int32),
             rows_per_block=64,
+            entry_stride_tokens=1,
+            base_offsets=None,
+            is_valid_token=None,
         )
 
         self.assertEqual(tuple(actual.shape), (0,))

@@ -360,7 +360,8 @@ def dsv4_select_experts(
     need_scores: bool = True,
     override: str | None = None,
     solution: str | None = None,
-    hash_table_values_validated: bool = False,
+    *,
+    hash_table_values_validated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 experts from sqrt-softplus router scores.
 

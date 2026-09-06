@@ -90,6 +90,8 @@ def test_fp8_quantize_dequantize_ue8m0(
     actual = fp8_quantize_dequantize(
         x,
         group_size=group_size,
+        scale_encoding="ue8m0",
+        override=None,
         solution="triton",
     )
     torch.cuda.synchronize()
@@ -105,7 +107,13 @@ def test_fp8_quantize_dequantize_cuda_graph_replay(device: str, require) -> None
     x = torch.randn(8, 384, device=device, dtype=dtype)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = fp8_quantize_dequantize(x, group_size=128, solution="triton")
+        actual = fp8_quantize_dequantize(
+            x,
+            group_size=128,
+            scale_encoding="ue8m0",
+            override=None,
+            solution="triton",
+        )
 
     x.copy_(torch.linspace(-9.0, 9.0, x.numel(), device=device).reshape_as(x))
     graph.replay()

@@ -25,7 +25,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 import tokenspeed.runtime.execution.factory as factory  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    UpdateWeightsFromDistributedReqInput,
+)
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
+from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter import get_drafter_impl  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
@@ -219,6 +223,45 @@ def test_dspark_wire_target_installs_capture_layers():
 
     target_model.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
     assert drafter.lm_head is draft_head
+
+
+def test_dspark_weight_update_forces_cached_head_refresh():
+    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
+    head = mock.MagicMock()
+    drafter.lm_head = mock.MagicMock(weight=head)
+    drafter.model = mock.MagicMock()
+
+    DeepseekV4DSpark.on_target_weights_updated(drafter)
+
+    drafter.model.refresh_local_base_logits_head.assert_called_once_with(
+        head,
+        force=True,
+    )
+
+
+def test_device_weight_update_notifies_drafter_before_returning():
+    runner = mock.MagicMock()
+    runner.update_weights_from_distributed.return_value = (True, "updated")
+    drafter = mock.MagicMock(spec=BaseDrafter)
+    forward_thread = mock.MagicMock()
+    forward_thread.run.side_effect = lambda callback: callback()
+    executor = SimpleNamespace(
+        model_runner=runner,
+        drafter=drafter,
+        forward_thread=forward_thread,
+    )
+    handle = DeviceHandle(executor)
+    request = UpdateWeightsFromDistributedReqInput(
+        names=[],
+        dtype_names=[],
+        shapes=[],
+        group_name="weight_update_group",
+        flush_cache=True,
+        weight_version=None,
+    )
+
+    assert handle.update_weights(request) == (True, "updated")
+    drafter.on_target_weights_updated.assert_called_once_with()
 
 
 # --------------------------------------------------------------------------

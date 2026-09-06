@@ -73,8 +73,8 @@ if tf32_hc_prenorm_gemm is not None:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float | None = None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run mHC pre-mapping with DeepGEMM prenorm and Triton mixing."""
         if get_pdl() != pdl_enabled():

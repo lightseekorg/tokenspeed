@@ -391,6 +391,9 @@ def test_v4_markov_walk_routes_every_step_through_distributed_argmax(
         dist_argmax_state=object(),
         dist_argmax_max=max_scratch,
         dist_argmax_ids=id_scratch,
+        local_cute_argmax=False,
+        local_argmax_max=None,
+        local_argmax_ids=None,
     )
 
     previous = bonus
@@ -447,6 +450,9 @@ def test_v4_markov_walk_routes_every_step_through_local_cute_argmax(
         gathered_values=torch.empty((1, rows)),
         gathered_ids=torch.empty((1, rows), dtype=torch.int64),
         output=output,
+        dist_argmax_state=None,
+        dist_argmax_max=None,
+        dist_argmax_ids=None,
         local_cute_argmax=True,
         local_argmax_max=max_scratch,
         local_argmax_ids=id_scratch,
