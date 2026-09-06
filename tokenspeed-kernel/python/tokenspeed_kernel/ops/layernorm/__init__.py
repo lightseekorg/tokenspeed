@@ -137,7 +137,8 @@ def grouped_rmsnorm(
     x: torch.Tensor,
     group_size: int,
     eps: float,
-    out: torch.Tensor | None = None,
+    *,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply weight-free RMSNorm to contiguous groups of the last dimension.
 

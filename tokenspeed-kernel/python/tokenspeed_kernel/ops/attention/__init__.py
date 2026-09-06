@@ -3453,7 +3453,8 @@ def dsv4_swa_cache_insert(
     q_out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
-    validate_positions: bool = True,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
 

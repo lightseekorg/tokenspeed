@@ -349,7 +349,10 @@ class DeepseekV4DSpark(BaseDrafter):
         """Refresh request-to-window slots outside CUDA Graph replay."""
 
         if hasattr(self, "lm_head"):
-            self.model.refresh_local_base_logits_head(self.lm_head.weight)
+            self.model.refresh_local_base_logits_head(
+                self.lm_head.weight,
+                force=False,
+            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -393,6 +396,13 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
+
+    def on_target_weights_updated(self) -> None:
+        """Refresh the stable FP32 head after an in-place target reload."""
+        self.model.refresh_local_base_logits_head(
+            self.lm_head.weight,
+            force=True,
+        )
 
     @staticmethod
     def _bonus_tokens_from_output(
@@ -549,7 +559,7 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden)
+        local_logits = self.model.local_base_logits(draft_hidden, None)
         dist_argmax_state = self._ensure_dist_argmax_state()
         local_cute_argmax = self._ensure_local_argmax_ready(local_logits[:, 0])
         sample_dspark_block_greedy(

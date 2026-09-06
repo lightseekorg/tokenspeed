@@ -145,6 +145,7 @@ class DeepseekV4CacheMetadata:
                 block_table=page_table,
                 block_size=kv_cache_block_size,
                 compress_ratio=compress_ratio,
+                block_table_base_offsets=None,
                 is_valid_token=is_valid_token,
                 out=out,
             )

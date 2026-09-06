@@ -32,6 +32,7 @@ import-guarded on missing optional backend packages are skipped.
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -382,7 +383,13 @@ def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
 
 def _fp8_quantize_dequantize() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.fp8_quantize_dequantize(x, group_size=128)
+    return tokenspeed_kernel.fp8_quantize_dequantize(
+        x,
+        group_size=128,
+        scale_encoding="ue8m0",
+        override=None,
+        solution=None,
+    )
 
 
 def _mm_dense() -> torch.Tensor:
@@ -1431,6 +1438,7 @@ def _attention_dsv4_swa_cache_insert() -> object:
         1e-6,
         64,
         q_out=q_out,
+        validate_positions=True,
     )
 
 
@@ -1468,6 +1476,7 @@ def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
             cos_sin_cache,
             1e-6,
             1,
+            validate_positions=True,
         )
     tokenspeed_kernel.dsv4_swa_cache_insert(
         q,
@@ -2085,6 +2094,8 @@ def _mhc_pre() -> object:
         1e-6,
         1e-6,
         2,
+        norm_weight=None,
+        norm_eps=None,
     )
 
 
@@ -2119,9 +2130,19 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
         2,
         "legacy_override",
         "legacy_solution",
+        norm_weight=None,
+        norm_eps=None,
     )
     assert selected["override"] == "legacy_override"
     assert selected["solution"] == "legacy_solution"
+
+
+def test_mhc_normalization_contract_is_explicit() -> None:
+    parameters = inspect.signature(tokenspeed_kernel.mhc_pre).parameters
+
+    for name in ("norm_weight", "norm_eps"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty
 
 
 def _mhc_post() -> object:
@@ -2982,6 +3003,7 @@ def _dsv4_select_experts_bias() -> object:
         True,
         correction_bias=correction_bias,
         need_scores=False,
+        hash_table_values_validated=False,
     )
 
 
@@ -2995,6 +3017,7 @@ def _dsv4_select_experts_hash() -> object:
         True,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
+        hash_table_values_validated=False,
     )
 
 

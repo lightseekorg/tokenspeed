@@ -41,7 +41,7 @@ _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"
 _HOST_CACHE_BLOCK_SIZE = 4096
 
 
-def _parse_boolean_env(name: str, default: bool = False) -> bool:
+def _parse_boolean_env(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default

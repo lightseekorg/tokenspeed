@@ -34,7 +34,13 @@ def dspark_fp8_quant_dequant(
             f"got width={x.shape[-1]}, block_size={block_size}."
         )
     if x.is_cuda:
-        return fp8_quantize_dequantize(x, group_size=block_size)
+        return fp8_quantize_dequantize(
+            x,
+            group_size=block_size,
+            scale_encoding="ue8m0",
+            override=None,
+            solution=None,
+        )
     original_dtype = x.dtype
     blocks = x.float().unflatten(-1, (-1, block_size))
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)

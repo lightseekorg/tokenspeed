@@ -593,7 +593,18 @@ class DeviceHandle:
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
-        return self._thread.run(lambda: handler(req))
+
+        def _apply_update():
+            result = handler(req)
+            if (
+                type(req) is UpdateWeightsFromDistributedReqInput
+                and result[0]
+                and self._executor.drafter is not None
+            ):
+                self._executor.drafter.on_target_weights_updated()
+            return result
+
+        return self._thread.run(_apply_update)
 
 
 def build_device_side(

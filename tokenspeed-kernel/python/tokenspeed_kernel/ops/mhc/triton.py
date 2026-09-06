@@ -431,10 +431,10 @@ def _mhc_pre_impl(
     hc_eps: float,
     sinkhorn_iters: int,
     prenorm_gemm,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
     pre_mix_impl=None,
     pre_reduce_apply_impl=None,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
@@ -708,8 +708,8 @@ def triton_mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the portable Triton mHC pre-mapping."""
     num_tokens = residual.numel() // (residual.shape[-2] * residual.shape[-1])
@@ -739,8 +739,8 @@ def triton_mhc_pre(
         hc_eps,
         sinkhorn_iters,
         _mhc_prenorm_gemm_triton,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
+        norm_weight,
+        norm_eps,
     )
 
 

@@ -1028,7 +1028,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_size=block_size,
             compress_ratio=compress_ratio,
             width=width,
+            block_table_base_offsets=None,
             is_valid_token=is_valid_token,
+            out_indices=None,
+            out_lens=None,
         )
         indices = indices_2d.unsqueeze(1)
         dense_indices_cache[cache_key] = (indices, lens)

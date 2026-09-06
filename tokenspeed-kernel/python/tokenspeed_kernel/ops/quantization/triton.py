@@ -307,7 +307,7 @@ def _fp8_quantize_dequantize_kernel(
 def triton_fp8_quantize_dequantize(
     x: torch.Tensor,
     group_size: int,
-    scale_encoding: str = "ue8m0",
+    scale_encoding: str,
 ) -> torch.Tensor:
     if group_size not in {64, 128}:
         raise ValueError(f"unsupported FP8 round-trip group_size: {group_size}")

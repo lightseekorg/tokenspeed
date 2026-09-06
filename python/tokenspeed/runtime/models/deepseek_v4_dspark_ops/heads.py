@@ -25,12 +25,12 @@ def _local_vocab_argmax(
     tp_group,
     gathered_values: torch.Tensor,
     gathered_ids: torch.Tensor,
-    dist_argmax_state: DistArgmaxState | None = None,
-    dist_argmax_max: torch.Tensor | None = None,
-    dist_argmax_ids: torch.Tensor | None = None,
-    local_cute_argmax: bool = False,
-    local_argmax_max: torch.Tensor | None = None,
-    local_argmax_ids: torch.Tensor | None = None,
+    dist_argmax_state: DistArgmaxState | None,
+    dist_argmax_max: torch.Tensor | None,
+    dist_argmax_ids: torch.Tensor | None,
+    local_cute_argmax: bool,
+    local_argmax_max: torch.Tensor | None,
+    local_argmax_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     """Return global argmax IDs for vocab-sharded logits."""
     shard = lm_head.shard_indices
@@ -217,12 +217,12 @@ def sample_dspark_block_greedy(
     gathered_values: torch.Tensor,
     gathered_ids: torch.Tensor,
     output: torch.Tensor,
-    dist_argmax_state: DistArgmaxState | None = None,
-    dist_argmax_max: torch.Tensor | None = None,
-    dist_argmax_ids: torch.Tensor | None = None,
-    local_cute_argmax: bool = False,
-    local_argmax_max: torch.Tensor | None = None,
-    local_argmax_ids: torch.Tensor | None = None,
+    dist_argmax_state: DistArgmaxState | None,
+    dist_argmax_max: torch.Tensor | None,
+    dist_argmax_ids: torch.Tensor | None,
+    local_cute_argmax: bool,
+    local_argmax_max: torch.Tensor | None,
+    local_argmax_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the trained Markov correction and greedily sample a fixed block."""
 

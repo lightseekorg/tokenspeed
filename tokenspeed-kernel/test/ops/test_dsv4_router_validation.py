@@ -38,6 +38,7 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            hash_table_values_validated=False,
         )
 
 

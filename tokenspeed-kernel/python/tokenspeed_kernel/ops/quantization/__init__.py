@@ -36,10 +36,10 @@ __all__ = [
 def fp8_quantize_dequantize(
     x: torch.Tensor,
     group_size: int,
-    scale_encoding: Literal["ue8m0"] = "ue8m0",
+    scale_encoding: Literal["ue8m0"],
     *,
-    override: str | None = None,
-    solution: str | None = None,
+    override: str | None,
+    solution: str | None,
 ) -> torch.Tensor:
     """Simulate grouped FP8 quantization and return the dequantized tensor.
 

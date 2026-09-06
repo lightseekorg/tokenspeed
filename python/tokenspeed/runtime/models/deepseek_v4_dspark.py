@@ -499,6 +499,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.attn_norm(layer_input)
         attention_output = dspark_attention_forward_batched(
@@ -522,6 +524,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.ffn_norm(layer_input)
         flat_input = layer_input.reshape(batch * block_size, hidden_size)
@@ -610,13 +614,13 @@ class DeepseekV4DSparkModel(nn.Module):
     def local_base_logits(
         self,
         hidden_states: torch.Tensor,
-        lm_head: nn.Module | None = None,
+        lm_head: nn.Module | None,
     ) -> torch.Tensor:
         """Compute public FP32 base logits from the local vocabulary shard.
 
         Production DSpark replay uses a stable FP32 head buffer initialized by
-        ``set_embed_and_head``. The optional head keeps the uncached reference
-        path available for callers that do not wire a target model.
+        ``set_embed_and_head``. Passing a head keeps the uncached reference
+        path available; production callers pass ``None`` for the replay buffer.
         """
 
         if lm_head is not None:
@@ -629,7 +633,12 @@ class DeepseekV4DSparkModel(nn.Module):
                 )
         return torch.matmul(hidden_states.float(), head_fp32.T)
 
-    def refresh_local_base_logits_head(self, head: torch.Tensor) -> bool:
+    def refresh_local_base_logits_head(
+        self,
+        head: torch.Tensor,
+        *,
+        force: bool,
+    ) -> bool:
         """Refresh the stable FP32 local-head buffer after a weight update.
 
         Returns ``True`` when the buffer was initialized or updated. Once the
@@ -654,7 +663,7 @@ class DeepseekV4DSparkModel(nn.Module):
             with torch.no_grad():
                 cached.copy_(head)
             self._local_base_head_fp32 = cached
-        elif (
+        elif not force and (
             source_ptr == self._local_base_head_source_ptr
             and source_version == self._local_base_head_source_version
         ):
@@ -790,7 +799,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        self.model.refresh_local_base_logits_head(head)
+        self.model.refresh_local_base_logits_head(head, force=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

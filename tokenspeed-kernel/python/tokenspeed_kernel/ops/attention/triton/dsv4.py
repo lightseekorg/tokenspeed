@@ -1042,7 +1042,7 @@ def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
     weights: torch.Tensor,
     softmax_scale: float,
     head_scale: float,
-    prefer_serial_four_block: bool = False,
+    prefer_serial_four_block: bool,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     num_tokens, num_heads, head_dim = index_q.shape
     q_packed = torch.empty(
@@ -2480,10 +2480,10 @@ def dsv4_decode_dense_compressed_indices_and_lens(
     block_size: int,
     compress_ratio: int,
     width: int,
-    block_table_base_offsets: torch.Tensor | None = None,
-    is_valid_token: torch.Tensor | None = None,
-    out_indices: torch.Tensor | None = None,
-    out_lens: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
+    out_indices: torch.Tensor | None,
+    out_lens: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build dense compressed decode KV slots and per-token lengths.
 
@@ -3369,9 +3369,9 @@ def dsv4_compact_compressed_slot_mapping(
     block_table: torch.Tensor,
     block_size: int,
     compress_ratio: int,
-    block_table_base_offsets: torch.Tensor | None = None,
-    is_valid_token: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Build slots for a grouped DeepSeek V4 compressed-cache page table.
 
@@ -3510,9 +3510,9 @@ def dsv4_group_slot_mapping(
     req_indices: torch.Tensor,
     block_table: torch.Tensor,
     rows_per_block: int,
-    entry_stride_tokens: int = 1,
-    base_offsets: torch.Tensor | None = None,
-    is_valid_token: torch.Tensor | None = None,
+    entry_stride_tokens: int,
+    base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
 ) -> torch.Tensor:
     """Map logical token positions to physical rows of a cache block table.
 
