@@ -32,6 +32,7 @@ from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     fused_softcap_generic,
+    should_apply_lm_head_quant_method,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -257,19 +258,28 @@ class DFlash2(DFlash):
             self._candidate_gather_buffers = buffers
         return buffers[0][:rows], buffers[1][: rows * tp_size]
 
+    def _shard_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's slice of the logits row, however the head computes it.
+
+        Same dispatch as ``LogitsProcessor._get_logits``: a genuinely quantized
+        head runs its own GEMM, because its ``weight`` is a packed tensor that
+        must never be matmul'd.
+        """
+        head = self.lm_head
+        quant_method = getattr(head, "quant_method", None)
+        if should_apply_lm_head_quant_method(head, quant_method):
+            return quant_method.apply(head, hidden_states, None)
+        return torch.matmul(hidden_states.to(head.weight.dtype), head.weight.T)
+
     def _distributed_topk_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Top-k over a vocab-parallel head without gathering whole rows."""
         processor = self.candidate_logits_processor
         shard = self.lm_head.shard_indices
-        weight = self.lm_head.weight
         top_k = self.selector_top_k
 
-        logits = torch.matmul(
-            hidden_states.to(weight.dtype),
-            weight[: int(shard.num_org_elements)].T,
-        )
+        logits = self._shard_logits(hidden_states)[:, : int(shard.num_org_elements)]
         if processor.logit_scale is not None:
             logits.mul_(processor.logit_scale)
         values, ids = self._shard_topk(logits, top_k)

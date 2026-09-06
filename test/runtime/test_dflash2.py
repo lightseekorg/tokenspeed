@@ -559,6 +559,51 @@ def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
         torch.testing.assert_close(values.float(), got, atol=1e-2, rtol=0)
 
 
+def test_distributed_topk_runs_a_quantized_head_through_its_quant_method() -> None:
+    """A packed weight must never be matmul'd, on the fast path either."""
+    torch.manual_seed(11)
+    rows, hidden, shard = 3, 6, 20
+    hidden_states = torch.randn(rows, hidden)
+    dense = torch.randn(rows, shard)
+
+    class FakeQuantMethod:
+        def __init__(self):
+            self.calls = 0
+
+        def apply(self, layer, x, bias):
+            self.calls += 1
+            return dense
+
+    quant_method = FakeQuantMethod()
+    drafter = DFlash2.__new__(DFlash2)
+    # uint8 is what a packed head carries: a matmul against it is nonsense,
+    # so reaching the right branch is the whole assertion.
+    drafter.lm_head = SimpleNamespace(
+        weight=torch.zeros(shard, hidden, dtype=torch.uint8),
+        quant_method=quant_method,
+    )
+
+    logits = drafter._shard_logits(hidden_states)
+
+    assert quant_method.calls == 1
+    torch.testing.assert_close(logits, dense)
+
+
+def test_shard_logits_matmuls_an_unquantized_head() -> None:
+    """The dense head keeps the plain matmul, unchanged."""
+    torch.manual_seed(12)
+    rows, hidden, shard = 3, 6, 20
+    weight = torch.randn(shard, hidden)
+    hidden_states = torch.randn(rows, hidden)
+
+    drafter = DFlash2.__new__(DFlash2)
+    drafter.lm_head = SimpleNamespace(weight=weight, quant_method=None)
+
+    torch.testing.assert_close(
+        drafter._shard_logits(hidden_states), hidden_states @ weight.T
+    )
+
+
 def test_distributed_topk_picks_what_a_whole_vocabulary_topk_would(monkeypatch) -> None:
     """Two shard-local top-16s must agree with one top-16 over the vocabulary."""
     from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime

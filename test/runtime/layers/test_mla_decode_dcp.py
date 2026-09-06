@@ -264,11 +264,37 @@ def _windowed_reference(query, keys, n, window_left, causal_mask):
     return out.unsqueeze(0)
 
 
+@pytest.mark.parametrize("window_left", [0, 1, Q - 1])
+def test_a_window_narrower_than_the_block_is_refused(window_left):
+    """The kernel keeps the whole block visible, so it cannot serve these.
+
+    Row 0 would still see the block's last row, Q-1 positions away, which a
+    per-position sliding window of this width does not permit.
+    """
+    ws = _workspace()
+    query = (torch.randn(1, Q, H, D, device="cuda") / 8).to(torch.bfloat16)
+    keys = (torch.randn(64, D, device="cuda") / 8).to(torch.bfloat16)
+    cache, bt = _paged(keys, torch.bfloat16)
+
+    with pytest.raises(ValueError, match="narrower than the"):
+        _decode(
+            query,
+            cache,
+            bt,
+            64,
+            ws,
+            torch.bfloat16,
+            causal_mask=False,
+            window_left=window_left,
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("causal_mask", [False, True])
-# 32 leaves only the last KV tiles alive, 320 keeps most of the cache with the
-# low edge inside it, and 4096 opens the window past the cache entirely.
-@pytest.mark.parametrize("window_left", [-1, 32, 320, 4096])
+# Q is the narrowest window the kernel accepts (below it the block's own rows
+# outrun the window); 32 leaves only the last KV tiles alive, 320 keeps most of
+# the cache with the low edge inside it, and 4096 opens it past the cache.
+@pytest.mark.parametrize("window_left", [-1, Q, 32, 320, 4096])
 def test_sliding_window_matches_a_per_row_masked_reference(
     dtype, causal_mask, window_left
 ):

@@ -379,7 +379,9 @@ def test_incremental_capture_writers_check_the_sink_is_armed() -> None:
 
     models = _pathlib.Path(factory.__file__).parent.parent / "models"
     writers = [
-        path for path in models.rglob("*.py") if "on_target_capture(" in path.read_text()
+        path
+        for path in models.rglob("*.py")
+        if "on_target_capture(" in path.read_text()
     ]
     assert writers, "no target model hands taps to the drafter's capture sink"
     unguarded = [

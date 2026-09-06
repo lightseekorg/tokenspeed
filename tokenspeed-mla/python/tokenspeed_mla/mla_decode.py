@@ -421,9 +421,13 @@ def tokenspeed_mla_decode(
         non-negative, query row ``i`` of the ``q_len`` block attends to keys
         ``[max(0, K - q_len - window_left + i), k_bound)`` -- the whole block
         plus ``window_left`` tokens of history, which is the mask a block
-        drafter's ``sliding_attention`` layers declare. The window is part of
-        the kernel cache key and folds away at compile time, so ``-1`` compiles
-        and runs exactly the kernel it did before this argument existed.
+        drafter's ``sliding_attention`` layers declare. Must be ``>= q_len``
+        when non-negative: the block stays fully visible, so a narrower window
+        would no longer bound the distance between the block's own rows, and
+        the mask would be wider than a per-position sliding window means.
+        ``ValueError`` otherwise. The window is part of the kernel cache key
+        and folds away at compile time, so ``-1`` compiles and runs exactly the
+        kernel it did before this argument existed.
     enable_pdl : bool
         When True, enables Programmatic Dependent Launch (PDL) on the
         underlying CuTe DSL decode kernel. Tokenspeed callers wire this from
@@ -494,6 +498,19 @@ def tokenspeed_mla_decode(
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
     if window_left < -1:
         raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if 0 <= window_left < q_len:
+        # Below this the block's own rows are further apart than the window,
+        # and "whole block plus window_left history" stops agreeing with the
+        # per-position mask |query_pos - key_pos| <= window_left that a
+        # sliding-window layer means: row 0 would still see the block's last
+        # row, q_len - 1 positions away. Refuse rather than serve a wider mask
+        # than the caller asked for.
+        raise ValueError(
+            f"window_left={window_left} is narrower than the {q_len}-wide "
+            "query block; this kernel keeps the whole block visible, so the "
+            "window would no longer bound the distance between block rows. "
+            f"Use window_left >= {q_len} or a per-position masked kernel."
+        )
     if window_left >= 0:
         # No request can read past its own window, so the split heuristic sizes
         # itself from the window rather than from the longest cached sequence.

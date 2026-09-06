@@ -33,14 +33,20 @@ wins is the one that fills the machine, not the one the heuristic picks. And
 the drafter's M is its batch times its block width, which reaches 64.
 
 Public M rides the kernel's MMA-N axis, so M above the cutover is tiled, not
-truncated; ``test_flashinfer_splitk.py`` checks that directly. Raising the
-cutover is therefore a change of policy, not of contract, and this module only
-does it after confirming the vendor's constants are exactly the ones that
-behaviour was measured against.
+truncated; ``test_routed_gemv.py`` checks that directly. Raising the cutover is
+therefore a change of policy, not of contract, and this module only does it
+after confirming the vendor's constants are exactly the ones that behaviour was
+measured against.
+
+``run_splitk_dense`` validates through the module-level ``_MAX_M``, so reaching
+M above the vendor's policy means moving it. That happens only for the duration
+of a call from here, so ``mm_bf16``'s own cute-dsl path keeps the vendor's
+cutover and its behaviour is unchanged.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import threading
 
@@ -85,14 +91,24 @@ def _module():
         return None
     if not all(callable(getattr(mod, f, None)) for f in ("run_splitk_dense",)):
         return None
-    with _widen_lock:
-        # One permanent widening, after the guard above pinned every constant
-        # the measurement was taken against. Scoped to this process; the only
-        # other reader is mm_bf16's own cute-dsl path, which this makes serve
-        # M <= 64 with its default tactic -- measured faster than the cuBLAS
-        # it would otherwise fall back to.
-        mod._MAX_M = MAX_M
     return mod
+
+
+@contextlib.contextmanager
+def _widened(mod):
+    """Raise the vendor's M cutover for one call, then put it back.
+
+    The guard in :func:`_module` has already pinned every constant the tactics
+    were measured against, so this only relaxes the policy bound, never a
+    correctness one.
+    """
+    with _widen_lock:
+        restore = mod._MAX_M
+        mod._MAX_M = MAX_M
+        try:
+            yield
+        finally:
+            mod._MAX_M = restore
 
 
 def is_available() -> bool:
@@ -106,7 +122,8 @@ def supports(m: int, n: int, k: int, tactic: tuple[int, int, int, int]) -> bool:
     if mod is None or not 1 <= m <= MAX_M:
         return False
     try:
-        mod.validate_tactic(mod.SplitKTactic(*tactic), m, n, k)
+        with _widened(mod):
+            mod.validate_tactic(mod.SplitKTactic(*tactic), m, n, k)
     except (ValueError, AttributeError):
         return False
     return True
@@ -143,12 +160,13 @@ def splitk_mm(
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     # CuTe DSL reads these through DLPack, which rejects autograd views.
-    mod.run_splitk_dense(
-        x.detach(),
-        weight.detach().t(),
-        None,
-        out,
-        enable_pdl,
-        mod.SplitKTactic(*tactic),
-    )
+    with _widened(mod):
+        mod.run_splitk_dense(
+            x.detach(),
+            weight.detach().t(),
+            None,
+            out,
+            enable_pdl,
+            mod.SplitKTactic(*tactic),
+        )
     return out

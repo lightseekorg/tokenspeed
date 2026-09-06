@@ -148,12 +148,16 @@ Notes:
 - The draft checkpoint stores fp32 master weights. It is loaded in the target's
   dtype rather than the standalone fp32-to-fp16 default, because the two
   exchange hidden states and share the target's embedding and LM head.
-- Measured on 4x GB200 at an 8-wide verify window (`--speculative-num-steps 7
-  --speculative-num-draft-tokens 8`, one row narrower than this checkpoint
-  calls for): gsm8k `mean_acc` 0.9727 versus 0.9773 without speculative
-  decoding (paired disagreement 3 vs 9, McNemar p ~ 0.15 -- within run-to-run
-  noise), at a mean accepted length of 4.99 of 8 and about 1.7x decode
-  throughput at 16 concurrent requests.
+- **Not reproducible on this build.** The numbers below were taken on 4x GB200
+  at an 8-wide verify window (`--speculative-num-steps 7
+  --speculative-num-draft-tokens 8`), one row narrower than this checkpoint
+  calls for, before the startup width check existed; that launch is now
+  rejected. They are kept as a record of the drafter's behaviour, not as a
+  figure for the supported configuration, whose accepted length and throughput
+  will differ at the wider block: gsm8k `mean_acc` 0.9727 versus 0.9773 without
+  speculative decoding (paired disagreement 3 vs 9, McNemar p ~ 0.15 -- within
+  run-to-run noise), at a mean accepted length of 4.99 of 8 and about 1.7x
+  decode throughput at 16 concurrent requests.
 
 ## Kimi K2.5 / K2.6
 
