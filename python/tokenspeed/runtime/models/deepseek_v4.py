@@ -2021,7 +2021,10 @@ class DeepseekV4MoE(nn.Module):
                     else "precomputed_topk"
                 ),
                 routing_config={
-                    "routed_scaling_factor": self.routed_scaling_factor,
+                    # Keep scaling at the common post-expert boundary below.
+                    # Kernel-routing backends otherwise apply the same factor
+                    # internally and the routed contribution is scaled twice.
+                    "routed_scaling_factor": 1.0,
                     "normalize_topk_weights": config.norm_topk_prob,
                     "correction_bias": self.gate.e_score_correction_bias,
                     "routing_method_type": RoutingMethodType.Renormalize,
