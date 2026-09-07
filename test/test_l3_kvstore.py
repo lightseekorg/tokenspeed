@@ -128,27 +128,52 @@ class StorageKeyTest(unittest.TestCase):
             signature.parameters["model_overrides"].default, inspect.Parameter.empty
         )
 
+    def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
+        return l3_checkpoint_id(
+            model_path,
+            hf_config=hf_config,
+            revision=revision,
+            load_format=load_format,
+        )
+
     def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
         commit = "a" * 40
         other = "b" * 40
         self.assertEqual(
-            l3_checkpoint_id(
+            self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
+                load_format="auto",
             ),
-            commit,
+            f"{commit}:auto",
         )
         self.assertNotEqual(
-            l3_checkpoint_id(
+            self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
+                load_format="auto",
             ),
-            l3_checkpoint_id(
+            self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=other),
                 revision="main",
+                load_format="auto",
+            ),
+        )
+        self.assertNotEqual(
+            self._checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+                load_format="auto",
+            ),
+            self._checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+                load_format="pt",
             ),
         )
 
@@ -160,10 +185,13 @@ class StorageKeyTest(unittest.TestCase):
             with open(os.path.join(snapshot, "config.json"), "w") as handle:
                 handle.write("{}")
             self.assertEqual(
-                l3_checkpoint_id(
-                    snapshot, hf_config=SimpleNamespace(), revision="main"
+                self._checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="safetensors",
                 ),
-                commit,
+                f"{commit}:safetensors",
             )
 
     def test_checkpoint_id_fingerprints_local_weight_bytes(self):
@@ -180,12 +208,25 @@ class StorageKeyTest(unittest.TestCase):
                 os.path.getsize(os.path.join(second, "model.safetensors")), 3
             )
             self.assertNotEqual(
-                l3_checkpoint_id(first, hf_config=SimpleNamespace(), revision=""),
-                l3_checkpoint_id(second, hf_config=SimpleNamespace(), revision=""),
+                self._checkpoint_id(
+                    first,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
             )
             self.assertTrue(
-                l3_checkpoint_id(
-                    first, hf_config=SimpleNamespace(), revision=""
+                self._checkpoint_id(
+                    first,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
                 ).startswith("local-")
             )
 
@@ -197,18 +238,20 @@ class StorageKeyTest(unittest.TestCase):
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
-            first_id = l3_checkpoint_id(
+            first_id = self._checkpoint_id(
                 first,
                 hf_config=SimpleNamespace(_commit_hash=inherited),
                 revision="",
+                load_format="auto",
             )
-            second_id = l3_checkpoint_id(
+            second_id = self._checkpoint_id(
                 second,
                 hf_config=SimpleNamespace(_commit_hash=inherited),
                 revision="",
+                load_format="auto",
             )
             self.assertNotEqual(first_id, second_id)
-            self.assertNotEqual(first_id, inherited)
+            self.assertFalse(first_id.startswith(inherited))
             self.assertTrue(first_id.startswith("local-"))
 
     def test_checkpoint_id_fingerprints_local_hf_quant_config(self):
@@ -226,8 +269,116 @@ class StorageKeyTest(unittest.TestCase):
                         f'"kv_cache_quant_algo":"{kv_algo}"}}'
                     )
             self.assertNotEqual(
-                l3_checkpoint_id(first, hf_config=SimpleNamespace(), revision=""),
-                l3_checkpoint_id(second, hf_config=SimpleNamespace(), revision=""),
+                self._checkpoint_id(
+                    first,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
+    def test_checkpoint_id_uses_selected_load_format_weight_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                handle.write(b"safe-weights")
+            with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
+                handle.write(b"bin-weights")
+            with open(os.path.join(directory, "model.pt"), "wb") as handle:
+                handle.write(b"pt-weights")
+            safetensors_id = self._checkpoint_id(
+                directory,
+                load_format="safetensors",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            bin_id = self._checkpoint_id(
+                directory,
+                load_format="npcache",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            pt_id = self._checkpoint_id(
+                directory,
+                load_format="pt",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            auto_id = self._checkpoint_id(
+                directory,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertNotEqual(safetensors_id, bin_id)
+            self.assertNotEqual(safetensors_id, pt_id)
+            self.assertNotEqual(bin_id, pt_id)
+            self.assertNotEqual(auto_id, safetensors_id)
+            self.assertTrue(safetensors_id.endswith(":safetensors"))
+            self.assertTrue(auto_id.endswith(":auto"))
+
+    def test_checkpoint_id_ignores_unselected_weight_files(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, leftover in ((first, b"aaa"), (second, b"bbb")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write("{}")
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(b"same-safe")
+                with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
+                    handle.write(leftover)
+            self.assertEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="safetensors",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="safetensors",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+            self.assertNotEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="npcache",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="npcache",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
+    def test_checkpoint_id_requires_load_format(self):
+        signature = inspect.signature(l3_checkpoint_id)
+        self.assertIs(
+            signature.parameters["load_format"].default, inspect.Parameter.empty
+        )
+        with self.assertRaises(TypeError):
+            l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash="a" * 40),
+                revision="main",
+            )
+        with self.assertRaises(ValueError):
+            self._checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash="a" * 40),
+                revision="main",
+                load_format="  ",
             )
 
     def test_local_fingerprint_is_cached_per_directory(self):
@@ -244,11 +395,17 @@ class StorageKeyTest(unittest.TestCase):
                 "_update_file_digest",
                 wraps=l3_backend._update_file_digest,
             ) as digest:
-                first = l3_checkpoint_id(
-                    directory, hf_config=SimpleNamespace(), revision=""
+                first = self._checkpoint_id(
+                    directory,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
                 )
-                second = l3_checkpoint_id(
-                    directory, hf_config=SimpleNamespace(), revision=""
+                second = self._checkpoint_id(
+                    directory,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
                 )
             self.assertEqual(first, second)
             self.assertEqual(digest.call_count, 2)
@@ -298,6 +455,7 @@ class StorageKeyTest(unittest.TestCase):
                 "org/unpinned-model",
                 hf_config=SimpleNamespace(),
                 revision="main",
+                load_format="auto",
             )
 
     def test_cache_quantization_id_hashes_scale_file_contents(self):

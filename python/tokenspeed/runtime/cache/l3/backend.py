@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import hashlib
 import json
@@ -31,13 +32,21 @@ from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
-_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt")
 _CHECKPOINT_METADATA_FILES = (
     "config.json",
     "hf_quant_config.json",
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
 )
+# First matching group wins, matching DefaultModelLoader._prepare_weights.
+_LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "auto": (("*.safetensors",), ("*.bin",), ("*.pt",)),
+    "safetensors": (("*.safetensors",),),
+    "instanttensor": (("*.safetensors",),),
+    "mistral": (("consolidated*.safetensors",),),
+    "pt": (("*.pt",),),
+    "npcache": (("*.bin",),),
+}
 
 
 def resolve_l3_weight_version(
@@ -169,38 +178,49 @@ def l3_checkpoint_id(
     *,
     hf_config: Any,
     revision: str,
+    load_format: str,
 ) -> str:
     """Return an immutable identity for the loaded checkpoint bytes.
 
     ``--revision`` may be a moving branch or omitted. Two instances that
     resolve different commits (or local trees) must not share Mooncake
     keys. A local directory is identified from the snapshot folder name
-    or a fingerprint of weight-file contents — never from
-    ``hf_config._commit_hash``, which a copied or fine-tuned tree can
-    inherit from its source. Local fingerprints also hash
-    ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
+    or a fingerprint of the weight files ``--load-format`` actually
+    selects — never from ``hf_config._commit_hash``, which a copied or
+    fine-tuned tree can inherit from its source. Local fingerprints also
+    hash ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
     quantization cannot collide under identical weight bytes. Hugging Face
     hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
-    pinned ``--revision``.
+    pinned ``--revision``. The returned id always includes the normalized
+    load format so two deployments that share a directory (or commit)
+    but select different ``.safetensors`` / ``.bin`` / ``.pt`` sets
+    cannot restore each other's KV.
     """
 
+    fmt = _normalize_load_format(load_format)
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:
-            return snapshot
-        return "local-" + _local_checkpoint_fingerprint(model_path)
+            return _checkpoint_id_with_load_format(snapshot, load_format=fmt)
+        return _checkpoint_id_with_load_format(
+            "local-" + _local_checkpoint_fingerprint(model_path, fmt),
+            load_format=fmt,
+        )
     commit = getattr(hf_config, "_commit_hash", None)
     if isinstance(commit, str) and _HF_COMMIT_HASH_RE.fullmatch(commit):
-        return commit
+        return _checkpoint_id_with_load_format(commit, load_format=fmt)
     model_dir = _resolved_model_dir(model_path, revision=revision)
     if model_dir is not None:
         snapshot = _snapshot_commit_hash(model_dir)
         if snapshot is not None:
-            return snapshot
-        return "local-" + _local_checkpoint_fingerprint(model_dir)
+            return _checkpoint_id_with_load_format(snapshot, load_format=fmt)
+        return _checkpoint_id_with_load_format(
+            "local-" + _local_checkpoint_fingerprint(model_dir, fmt),
+            load_format=fmt,
+        )
     if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
-        return revision
+        return _checkpoint_id_with_load_format(revision, load_format=fmt)
     raise ValueError(
         "L3 namespace needs an immutable checkpoint id; pin --revision to a "
         "commit or load from a local snapshot"
@@ -249,21 +269,58 @@ def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
         return None
 
 
-@functools.cache
-def _local_checkpoint_fingerprint(model_dir: str) -> str:
-    """Hash config/index/quant-config bytes and every local weight file's contents.
+def _normalize_load_format(load_format: str) -> str:
+    if not isinstance(load_format, str):
+        raise TypeError("load_format must be a str")
+    normalized = load_format.strip().lower()
+    if not normalized:
+        raise ValueError("load_format must be a non-empty str")
+    return normalized
 
-    Cached by directory path so a process that resolves the same local
-    checkpoint more than once (target plus draft, or a repeated prefix
-    rebuild) does not re-read every shard. ``hf_quant_config.json`` is
-    hashed with ``config.json``: ModelOpt mixed-precision maps, group
-    sizes, and KV quantization live there, not in the weight tensors.
+
+def _checkpoint_id_with_load_format(identity: str, *, load_format: str) -> str:
+    return f"{identity}:{load_format}"
+
+
+def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozenset[str]:
+    """Return the weight files ``--load-format`` would load from ``names``.
+
+    Pattern groups match ``DefaultModelLoader._prepare_weights``: the first
+    group that matches any file wins, so ``auto`` hashes ``*.safetensors``
+    when those exist and does not mix in leftover ``*.bin`` / ``*.pt``.
+    """
+
+    groups = _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS.get(load_format, ())
+    for patterns in groups:
+        matched = frozenset(
+            name
+            for name in names
+            if any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+        )
+        if matched:
+            return matched
+    return frozenset()
+
+
+@functools.cache
+def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
+    """Hash config/index/quant-config bytes and the selected weight files.
+
+    Cached by directory path and load format so a process that resolves
+    the same local checkpoint more than once (target plus draft, or a
+    repeated prefix rebuild) does not re-read every shard.
+    ``hf_quant_config.json`` is hashed with ``config.json``: ModelOpt
+    mixed-precision maps, group sizes, and KV quantization live there,
+    not in the weight tensors. Weight bytes are limited to the files
+    ``--load-format`` selects so a directory that contains more than one
+    checkpoint encoding cannot share a namespace across loaders.
     """
     hasher = hashlib.sha256()
     try:
-        names = sorted(os.listdir(model_dir))
+        names = tuple(sorted(os.listdir(model_dir)))
     except OSError:
         return hasher.hexdigest()
+    selected_weights = _selected_weight_names(names, load_format=load_format)
     for name in names:
         path = os.path.join(model_dir, name)
         if not os.path.isfile(path):
@@ -272,8 +329,7 @@ def _local_checkpoint_fingerprint(model_dir: str) -> str:
             hasher.update(name.encode())
             _update_file_digest(hasher, path)
             continue
-        lowered = name.lower()
-        if lowered.endswith(_WEIGHT_FILE_SUFFIXES):
+        if name in selected_weights:
             hasher.update(name.encode())
             _update_file_digest(hasher, path)
     return hasher.hexdigest()

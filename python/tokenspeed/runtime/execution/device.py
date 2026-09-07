@@ -868,12 +868,14 @@ def build_device_side(
                     model_config.model_path,
                     hf_config=model_config.hf_config,
                     revision=str(model_config.revision or ""),
+                    load_format=str(server_args.load_format),
                 )
                 if draft_model_config is not None:
                     draft_revision = l3_checkpoint_id(
                         draft_model_config.model_path,
                         hf_config=draft_model_config.hf_config,
                         revision=str(draft_model_config.revision or ""),
+                        load_format=str(server_args.load_format),
                     )
                 else:
                     draft_revision = ""

@@ -401,8 +401,11 @@ Its responsibilities:
   loaded — a copied config's inherited `_commit_hash` is not trusted —
   and local fingerprints include `hf_quant_config.json` (ModelOpt
   mixed-precision maps and KV quantization live there, not in the
-  weight tensors) — so two instances cannot share a Mooncake
-  key while serving incompatible KV. Zigzag CP assigns
+  weight tensors) plus only the weight files `--load-format` selects
+  (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`). The
+  returned checkpoint id also records that load format, so two
+  deployments that share a directory or commit cannot restore KV
+  produced by a different encoding. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
   object key. A live weight
