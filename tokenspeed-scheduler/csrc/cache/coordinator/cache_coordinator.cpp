@@ -35,7 +35,7 @@
 namespace tokenspeed {
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                                   BlockPool* host_pool, bool stream_device_cache_to_host, bool enable_l3_storage)
+                                   bool enable_l3_storage, BlockPool* host_pool, bool stream_device_cache_to_host)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
@@ -899,8 +899,8 @@ std::vector<CacheKey> CacheCoordinator::ExpandPrefixKeys(std::span<const std::st
 }
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host,
-                                 bool enable_l3_storage) {
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 bool stream_device_cache_to_host) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
@@ -933,8 +933,8 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         }
         groups.emplace_back(spec, std::move(allocator), std::move(matcher));
     }
-    return CacheCoordinator{std::move(groups), prefix_granularity,          pool,
-                            host_pool,         stream_device_cache_to_host, enable_l3_storage};
+    return CacheCoordinator{std::move(groups), prefix_granularity, pool,
+                            enable_l3_storage, host_pool,          stream_device_cache_to_host};
 }
 
 }  // namespace tokenspeed

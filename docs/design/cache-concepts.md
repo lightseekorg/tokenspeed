@@ -365,11 +365,15 @@ Its responsibilities:
   layout (dtype and field geometry), the pipeline stage, and the speculative
   draft checkpoint when a separate draft pool is present. A live weight
   load rebuilds that prefix after the GPU update so new KV is not published
-  under the previous checkpoint; `ENABLE_CP` workers share `attn_tp_rank==0`
+  under the previous checkpoint; a requested cache flush must succeed
+  first, because `ClearCache` rejects in-flight Host writebacks (pause
+  drain does not wait for those). `ENABLE_CP` workers share `attn_tp_rank==0`
   and are distinguished by `c{cp_rank}`. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
+  MIN-reduces existence across every cache-owning rank in the DP replica
+  (attention TP, then CP, then PP; not across DP) and
   `register_storage_keys` / `unregister_storage_keys`. That probe is skipped
   when L3 is unset: Host-only and `--disable-kvstore` admission must not
   hash prefixes or copy `group_keys` for a storage index that does not
@@ -391,6 +395,8 @@ Its responsibilities:
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
 while each manager may use a smaller cache-page token count.
+`enable_l3_storage` is a required argument so Host-hit tagging of L3 keys
+cannot be skipped by a silent default.
 
 ### `AdmissionPlanner` (`cache_admission.cpp`, anonymous namespace)
 

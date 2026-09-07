@@ -79,8 +79,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       block_pool_{config_.device_allocator.NumUsableBlocks()},
       host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
-                                   hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
-                                   config_.StreamsDeviceCacheToHost(), config_.enable_l3_storage)},
+                                   config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
+                                   config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());

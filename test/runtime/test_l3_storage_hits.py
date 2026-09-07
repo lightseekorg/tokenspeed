@@ -89,6 +89,7 @@ class _Loop:
 
     _submit_scheduler_requests = EventLoop._submit_scheduler_requests
     _register_l3_storage_hits = EventLoop._register_l3_storage_hits
+    _converge_l3_exists = EventLoop._converge_l3_exists
     _clear_cache = EventLoop._clear_cache
 
     def __init__(self, exists_flags=None) -> None:
@@ -96,6 +97,10 @@ class _Loop:
         self.scheduler = _Scheduler()
         self.attn_tp_size = 1
         self.attn_tp_cpu_group = None
+        self.attn_cp_size = 1
+        self.attn_cp_cpu_group = None
+        self.pp_size = 1
+        self.pp_cpu_group = None
         self._enable_l3_storage = exists_flags is not None
 
 
@@ -146,6 +151,77 @@ def test_successful_clear_rotates_l3_namespace() -> None:
     loop.scheduler.clear_result = False
     assert not loop._clear_cache()
     assert loop._device.rotations == 1
+
+
+def test_replica_min_reduces_tp_then_cp_then_pp(monkeypatch) -> None:
+    groups_seen = []
+
+    def fake_all_reduce(flags, op=None, group=None):
+        groups_seen.append(group)
+        flags.fill_(0)
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.dist.all_reduce",
+        fake_all_reduce,
+    )
+
+    loop = _Loop(exists_flags=[True])
+    loop.attn_tp_size = 2
+    loop.attn_tp_cpu_group = "tp"
+    loop.attn_cp_size = 2
+    loop.attn_cp_cpu_group = "cp"
+    loop.pp_size = 2
+    loop.pp_cpu_group = "pp"
+
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+
+    assert groups_seen == ["tp", "cp", "pp"]
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
+def test_enable_cp_min_uses_cp_group_when_tp_is_one(monkeypatch) -> None:
+    groups_seen = []
+
+    def fake_all_reduce(flags, op=None, group=None):
+        groups_seen.append(group)
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.dist.all_reduce",
+        fake_all_reduce,
+    )
+
+    loop = _Loop(exists_flags=[True])
+    loop.attn_tp_size = 1
+    loop.attn_tp_cpu_group = "tp"
+    loop.attn_cp_size = 4
+    loop.attn_cp_cpu_group = "cp"
+
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+
+    assert groups_seen == ["cp"]
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
+
+
+def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
+    groups_seen = []
+
+    def fake_all_reduce(flags, op=None, group=None):
+        groups_seen.append(group)
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.dist.all_reduce",
+        fake_all_reduce,
+    )
+
+    loop = _Loop(exists_flags=[True])
+    loop.pp_size = 2
+    loop.pp_cpu_group = "pp"
+
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+
+    assert groups_seen == ["pp"]
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
 
 
 if __name__ == "__main__":

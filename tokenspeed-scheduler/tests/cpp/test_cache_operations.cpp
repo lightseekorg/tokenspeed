@@ -153,8 +153,9 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     std::vector<BlockTable> tables(1);
@@ -184,8 +185,9 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
     const auto cache_device = [&](const CacheKey& key) {
         CacheBlockRef block = device_pool.AcquireBlock(key.group_id, /*packing=*/1);
@@ -226,8 +228,9 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
@@ -260,8 +263,9 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
             .block_granularity = 2,
         },
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     const auto cache_block = [&](BlockPool& pool, const CacheKey& key) {
@@ -312,7 +316,8 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*host_pool=*/nullptr,
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
 
     std::vector<BlockTable> tables(1);
@@ -430,8 +435,9 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
     ASSERT_TRUE(coordinator.EnablesL3Storage());
 
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
@@ -458,9 +464,9 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*enable_l3_storage=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/false, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
     ASSERT_FALSE(coordinator.EnablesL3Storage());
 
     CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
@@ -489,9 +495,9 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true,
-                                                   /*enable_l3_storage=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/true, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
     ASSERT_TRUE(coordinator.ContainsStorageKey(key));
@@ -517,9 +523,9 @@ TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
             .block_granularity = 2,
         },
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true,
-                                                   /*enable_l3_storage=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/true, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true);
     const std::array keys{
         CacheKey{.group_id = 0, .content_hash = "h0"},
         CacheKey{.group_id = 1, .content_hash = "h0"},
@@ -543,8 +549,9 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
     const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
     ASSERT_EQ(keys.size(), 2u);
     EXPECT_EQ(keys[0].content_hash, "h0");
@@ -577,8 +584,9 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
 
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};

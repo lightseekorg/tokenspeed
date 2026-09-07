@@ -94,6 +94,50 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.clear_cache_fn.assert_not_called()
         handler._device.set_l3_weight_version.assert_called_once_with("v2")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
+
+    def test_rejected_flush_does_not_switch_l3_prefix(self):
+        handler = self._handler()
+        handler.clear_cache_fn = mock.Mock(return_value=False)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        handler.process_requests([req])
+
+        handler.clear_cache_fn.assert_called_once_with()
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertIsInstance(output, UpdateWeightsFromDistributedReqOutput)
+        self.assertFalse(output.success)
+        self.assertIn("cache flush failed", output.message)
+
+    def test_missing_flush_handler_does_not_switch_l3_prefix(self):
+        handler = self._handler()
+        handler.clear_cache_fn = None
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        handler.process_requests([req])
+
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+        self.assertIn("cache flush failed", output.message)
 
 
 if __name__ == "__main__":

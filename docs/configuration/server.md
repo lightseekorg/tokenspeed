@@ -319,7 +319,10 @@ Each packed Host CacheBlock is one Mooncake object, keyed as
 The hashed prefix includes the loaded checkpoint (`--model`, `--revision`,
 `--weight-version`), the packed layout, the pipeline stage, and any
 speculative draft checkpoint. Live weight updates rebuild that prefix
-after the GPU load. Context-parallel workers (`ENABLE_CP`) share
+after the GPU load. A requested `flush_cache` must succeed before the
+prefix switches: in-flight Host writebacks cause `ClearCache` to reject,
+and the update RPC then fails so the caller retries instead of publishing
+new KV under a mixed namespace. Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}`.
 `global_segment_size` is split across
 attention-TP × pipeline-parallel ranks so the mounted total matches the

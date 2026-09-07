@@ -271,7 +271,7 @@ class RequestHandler:
                 # RL weight sync: receive broadcast weights + load into the model.
                 ok, msg = self._device.update_weights(recv_req)
                 if ok:
-                    self._commit_l3_weight_version(recv_req)
+                    ok, msg = self._commit_l3_weight_version(recv_req, msg)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
@@ -285,22 +285,30 @@ class RequestHandler:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
 
-    def _commit_l3_weight_version(self, recv_req) -> None:
+    def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
         """Flush the old L3 namespace, then publish under the new checkpoint.
 
         ``flush_cache`` deletes objects under the *current* prefix. The
         prefix is rebuilt afterwards so newly computed KV cannot land in a
-        peer still serving the previous ``weight_version``.
+        peer still serving the previous ``weight_version``. A requested
+        flush that fails must not switch the prefix: GPU weights may
+        already be loaded, so the RPC reports failure and the caller
+        retries after in-flight Host writebacks drain.
         """
 
-        flush_cache = bool(getattr(recv_req, "flush_cache", False))
-        if flush_cache and self.clear_cache_fn is not None:
-            self.clear_cache_fn()
-        version = getattr(recv_req, "weight_version", None)
+        flush_cache = recv_req.flush_cache
+        if flush_cache:
+            if self.clear_cache_fn is None or not self.clear_cache_fn():
+                return (
+                    False,
+                    "cache flush failed after weights were loaded; retry the update",
+                )
+        version = recv_req.weight_version
         if version is None:
-            return
+            return True, msg
         self.server_args.weight_version = str(version)
         self._device.set_l3_weight_version(str(version))
+        return True, msg
 
     def handle_generate_request(
         self,

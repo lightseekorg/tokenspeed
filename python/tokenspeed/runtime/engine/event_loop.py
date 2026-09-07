@@ -230,6 +230,18 @@ class EventLoop:
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
         )
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -531,12 +543,39 @@ class EventLoop:
             self._device.rotate_l3_namespace()
         return cleared
 
+    def _converge_l3_exists(self, exists: list[bool]) -> list[bool]:
+        """MIN-reduce L3 exists across every cache-owning rank in this replica.
+
+        Cache-owning ranks share a DP replica (attention TP × CP × PP). They
+        must admit the same prefix pages or later PP/CP collectives hang.
+        DP ranks hold different sequences and are not reduced. Order is
+        TP, then CP, then PP so every rank enters the same sequence of
+        groups.
+        """
+
+        groups = []
+        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
+            groups.append(self.attn_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if not groups:
+            return exists
+        flags = torch.tensor(
+            [1 if present else 0 for present in exists], dtype=torch.int32
+        )
+        for group in groups:
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
+        return [bool(flag) for flag in flags.tolist()]
+
     def _register_l3_storage_hits(self, specs) -> None:
         """Tell the scheduler which prefix pages already live in L3.
 
         Cross-instance reuse cannot see Mooncake objects through the Host
         index. Probe them with the same content hashes the scheduler will
-        use, then register only keys every TP rank agrees exist.
+        use, then register only keys every cache-owning rank in the replica
+        agrees exist.
 
         Skipped when L3 is unset: hashing the full token list is not free,
         and --disable-kvstore admit still goes through this helper.
@@ -571,12 +610,7 @@ class EventLoop:
             return
         if len(exists) != len(group_ids):
             raise RuntimeError("L3 existence result is not aligned with cache keys")
-        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None and exists:
-            flags = torch.tensor(
-                [1 if present else 0 for present in exists], dtype=torch.int32
-            )
-            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
-            exists = [bool(flag) for flag in flags.tolist()]
+        exists = self._converge_l3_exists(exists)
         hit_groups = []
         hit_hashes = []
         hit_offsets = []

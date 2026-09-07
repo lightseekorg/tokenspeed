@@ -292,4 +292,6 @@ For orientation, one iteration of `event_loop`:
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must
   not pay: a round is microseconds, and agentic history is tens of thousands
-  of tokens.
+  of tokens. When L3 is on, existence is MIN-reduced across every
+  cache-owning rank in the replica (attention TP, then CP, then PP) so
+  those ranks admit the same prefix pages.

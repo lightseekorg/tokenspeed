@@ -112,7 +112,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64);
         {
-            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false);
 
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -186,7 +186,7 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64);
-    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the
