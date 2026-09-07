@@ -20,7 +20,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.pack_topk import pack_topk_router_logits
+from tokenspeed_kernel.ops.moe import pack_topk_router_logits
 
 
 def _inputs(device: str):

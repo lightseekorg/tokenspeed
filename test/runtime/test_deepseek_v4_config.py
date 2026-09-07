@@ -2957,7 +2957,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 prefix_granularity=64,
                 kernel_page_size=64,
                 device="cpu",
-                num_attention_heads=64,
+                num_attention_heads=32,
                 num_kv_heads=1,
                 attn_tp_size=4,
                 dtype=torch.bfloat16,
@@ -2973,7 +2973,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             tuple(backend._decode_q_padding_workspace.shape),
             (8, 64, 4),
         )
-        first_q = torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4)
+        first_q = torch.arange(2 * 8 * 4, dtype=torch.bfloat16).view(2, 8, 4)
         with patch.object(
             torch,
             "zeros",
@@ -2982,15 +2982,15 @@ class TestDeepseekV4Config(unittest.TestCase):
             first_padded = backend._pad_decode_query(first_q, padded_heads=64)
 
         self.assertEqual(first_padded.shape, (2, 64, 4))
-        self.assertTrue(torch.equal(first_padded[:, :16], first_q))
-        self.assertTrue(torch.count_nonzero(first_padded[:, 16:]) == 0)
+        self.assertTrue(torch.equal(first_padded[:, :8], first_q))
+        self.assertTrue(torch.count_nonzero(first_padded[:, 8:]) == 0)
 
         second_q = torch.full_like(first_q, 7)
         second_padded = backend._pad_decode_query(second_q, padded_heads=64)
 
         self.assertEqual(second_padded.data_ptr(), first_padded.data_ptr())
-        self.assertTrue(torch.equal(second_padded[:, :16], second_q))
-        self.assertTrue(torch.count_nonzero(second_padded[:, 16:]) == 0)
+        self.assertTrue(torch.equal(second_padded[:, :8], second_q))
+        self.assertTrue(torch.count_nonzero(second_padded[:, 8:]) == 0)
 
         different_shape = backend._pad_decode_query(first_q[:1], padded_heads=64)
         self.assertEqual(different_shape.data_ptr(), first_padded.data_ptr())
@@ -3001,7 +3001,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "exceeds.*workspace"):
             backend._pad_decode_query(
-                torch.empty(9, 16, 4, dtype=torch.bfloat16),
+                torch.empty(9, 8, 4, dtype=torch.bfloat16),
                 padded_heads=64,
             )
 
