@@ -482,6 +482,7 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         actual[0].stride(0),
         dtype,
         is_neox=rotary.is_neox_style,
+        sanitize=False,
     )
 
     for index in range(layers):

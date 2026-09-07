@@ -25,14 +25,11 @@ Registered for a block drafter's proposal and nothing else:
 proposes a whole non-causal block (``configs/mla.py`` sets
 ``draft_block_decode`` from exactly that), so ordinary decode and target
 verify cannot reach this registration however their other traits line up.
+Both masks are served within that scope, since a draft mixes
+``sliding_attention`` layers with full-attention ones.
 
-This is the path for callers that select through the dispatcher. The
-``tokenspeed_mla`` backend reaches the same kernel by calling
-``tokenspeed_mla_decode`` itself, for a target's decode and a draft's block
-alike, so a trait added here does not change what that backend runs.
-
-Within that scope both masks are served: a draft mixes ``sliding_attention``
-layers with full-attention ones, and the block is non-causal under either.
+The ``tokenspeed_mla`` backend calls ``tokenspeed_mla_decode`` itself instead
+of selecting here, so a trait added here does not change what it runs.
 """
 
 from __future__ import annotations

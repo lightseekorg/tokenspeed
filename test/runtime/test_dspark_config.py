@@ -152,23 +152,29 @@ def test_validate_holds_each_family_to_its_own_convention() -> None:
 
 def test_geometry_applies_the_family_convention() -> None:
     """spec_num_tokens is the verify width; drafts are one fewer."""
-    assert _resolve_block_geometry(SimpleNamespace(), spec_num_tokens=8) == (8, 7)
+    assert _resolve_block_geometry(
+        SimpleNamespace(), spec_num_tokens=8, spec_algorithm="DFLASH"
+    ) == (8, 7)
     assert _resolve_block_geometry(
         SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DSPARK"
     ) == (8, 7)
-    assert _resolve_block_geometry(SimpleNamespace(block_size=8), 8) == (8, 7)
+    assert _resolve_block_geometry(SimpleNamespace(block_size=8), 8, "DFLASH") == (8, 7)
     assert _resolve_block_geometry(
-        SimpleNamespace(dflash_config={"block_size": 8}), 8
+        SimpleNamespace(dflash_config={"block_size": 8}), 8, "DFLASH"
     ) == (8, 7)
 
     with pytest.raises(ValueError, match=r"--speculative-num-steps 6"):
-        _resolve_block_geometry(SimpleNamespace(block_size=7), spec_num_tokens=8)
+        _resolve_block_geometry(
+            SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DFLASH"
+        )
 
 
 def test_geometry_rejects_degenerate_verify_width() -> None:
     """A verify window with no room for a draft is not block decoding."""
     with pytest.raises(ValueError, match=r">= 2"):
-        _resolve_block_geometry(SimpleNamespace(), spec_num_tokens=1)
+        _resolve_block_geometry(
+            SimpleNamespace(), spec_num_tokens=1, spec_algorithm="DFLASH"
+        )
 
 
 def test_drafters_declare_their_checkpoint_convention() -> None:

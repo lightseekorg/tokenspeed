@@ -447,29 +447,19 @@ class MLAAttnBackend(PagedAttentionBackend):
             if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
                 layer.tp_q_head_num, q_len_per_req, window_left >= 0
             ):
-                # A kernel that reads the block on the query axis takes the
-                # request's page table and cache length as one row rather than
-                # q_len copies of one row. Both are built once per forward,
-                # where the block rows were expanded from them.
-                #
-                # Only when the forward is as wide as the block the metadata
-                # was expanded for. The config layer reconciles the two for
-                # every drafter it knows (see resolve_speculative_num_tokens,
-                # which subtracts DSpark's anchor row), so this guards the
-                # arithmetic rather than any shipping configuration: a stride
-                # that disagreed would read the next request's row.
+                # One page table row and one cache length per request, both
+                # built once per forward. Valid only at the stride the
+                # metadata was expanded with, which the width test above
+                # pins: a narrower forward would read the next request's row.
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
             else:
-                # Metadata already carries one row per block position, each with
-                # the block-end length, so the block is non-causal. Adding the
-                # causal offsets below would re-impose exactly the ordering the
-                # draft must not have, and re-expanding the rows would square
-                # the batch. No extend offset either: refresh_decode_metadata
-                # expanded rows [0, bs), which is exactly what this query
-                # covers, so skipping metadata rows while keeping every query
-                # row indexes past the end of both.
+                # One metadata row per block position already, each at the
+                # block-end length, so the causal offsets below would re-impose
+                # the ordering the draft must not have. No extend offset
+                # either: refresh_decode_metadata expanded rows [0, bs), which
+                # is exactly what this query covers.
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
                 page_table = metadata.page_table
                 cache_seqlens = metadata.seq_lens

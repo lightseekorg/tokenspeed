@@ -20,34 +20,18 @@
 
 """FlashInfer's low-M split-K BF16 GEMM, driven by a caller-chosen tactic.
 
-``mm_bf16(backend="cute-dsl")`` reaches this kernel through two policy
-decisions that a block drafter should not inherit:
+``mm_bf16(backend="cute-dsl")`` reaches the same kernel under two policies a
+block drafter should not inherit: the tactic comes from ``default_tactic``, a
+generic occupancy heuristic, and ``_MAX_M`` refuses M above 32. These
+projections are cold-weight and grid-starved, so the tactic that wins is the
+one that fills the machine, and a block drafter's M is its batch times its
+block width, which reaches 64. Public M rides the kernel's MMA-N axis, so M
+past the cutover is tiled and not truncated: a policy bound, not a correctness
+one.
 
-* the tactic comes from ``default_tactic``, a generic occupancy heuristic;
-* ``_MAX_M`` refuses M above 32.
-
-Both cost real time here. The drafter's projections are cold-weight and
-grid-starved, so DRAM throughput tracks how much of the machine the grid fills
-rather than the kernel's arithmetic, and the tactic that wins is the one that
-fills it -- not the one a generic occupancy heuristic picks. And the drafter's
-M is its batch times its block width, which reaches 64. The measurements behind
-both claims, and the tactic per shape, come from
-``test/gemm_tuning/tune_splitk_tactic.py``.
-
-Public M rides the kernel's MMA-N axis, so M above the cutover is tiled, not
-truncated; ``test_routed_gemv.py`` checks that directly. Raising the cutover is
-therefore a change of policy, not of contract, and this module only does it
-after confirming the vendor's constants are exactly the ones that behaviour was
-measured against.
-
-``run_splitk_dense`` validates through a module-level ``_MAX_M``, so reaching M
-above the vendor's policy means moving it. This module therefore executes the
-vendor source into a namespace of its own and raises the cutover only there:
-the shared module keeps the vendor's constants, ``sys.modules`` is untouched,
-and ``mm_bf16``'s cute-dsl path is unreachable from here -- no shared mutable
-state, so no lock and no window for another thread to observe. The private
-instance carries its own compiled-kernel cache, which costs a second
-compilation only for a (tactic, shape) both paths happen to use.
+``test/gemm_tuning/tune_splitk_tactic.py`` measures the tactics.
+``tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py`` checks both the
+exactness past the cutover and that the shared vendor module stays untouched.
 """
 
 from __future__ import annotations

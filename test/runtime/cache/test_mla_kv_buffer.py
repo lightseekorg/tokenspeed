@@ -804,8 +804,13 @@ def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("is_neox", [True, False])
-def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox):
-    """The DFlash MLA context write folds three steps into one launch."""
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, sanitize):
+    """The DFlash MLA context write folds three steps into one launch.
+
+    The inputs are finite and within range, so sanitizing must leave every
+    stored byte where the unsanitized write puts it.
+    """
     torch.manual_seed(0)
     n_layers, n_loc, n_slots, eps_value = 3, 12, 64, 1e-6
     latent = torch.randn(
@@ -832,6 +837,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox):
         buffers[0].stride(0),
         dtype,
         is_neox=is_neox,
+        sanitize=sanitize,
     )
 
     tolerance = 0.08 if dtype == torch.float8_e4m3fn else 0.02

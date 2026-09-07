@@ -141,13 +141,15 @@ def test_dflash2_block_decode_passes_exact_sliding_window(monkeypatch):
     assert captured["q"].shape[0] == 16
 
 
-def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monkeypatch):
+@pytest.mark.parametrize("window", [4095, -1])
+def test_a_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monkeypatch, window):
     """One row per request instead of one per block position, same mask.
 
     The flattened metadata repeats each request's page table and block-end
     length once per block position, so the un-expanded rows are the request.
-    Folding is only correct because of that, and only allowed when a kernel
-    says it reads the query-axis form.
+    The layout follows the kernel and not the mask: a draft mixes windowed and
+    full-attention layers over one metadata buffer, so both fold whenever a
+    kernel says it reads the query-axis form.
     """
     captured = _run_mla_decode(
         monkeypatch,
@@ -155,7 +157,7 @@ def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monke
         bs=2,
         q_len_per_req=8,
         draft_block_decode=True,
-        sliding_window_size=4095,
+        sliding_window_size=window,
         query_blocks=True,
     )
 
@@ -163,29 +165,7 @@ def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monke
     assert captured["page_table"].shape[0] == 2
     assert captured["cache_seqlens"].tolist() == [64, 128]
     assert captured["noncausal_block_size"] == 8
-    assert captured["window_left"] == 4095
-
-
-def test_a_full_attention_block_layer_folds_on_the_same_terms(monkeypatch):
-    """The layout follows the kernel, not the mask.
-
-    A draft mixes windowed and full-attention layers over one metadata buffer,
-    so both ask the same question and a windowless layer folds whenever a
-    kernel reads that form.
-    """
-    captured = _run_mla_decode(
-        monkeypatch,
-        is_draft=True,
-        bs=2,
-        q_len_per_req=8,
-        draft_block_decode=True,
-        sliding_window_size=-1,
-        query_blocks=True,
-    )
-
-    assert captured["q"].shape[:2] == (2, 8)
-    assert captured["page_table"].shape[0] == 2
-    assert captured["window_left"] == -1
+    assert captured["window_left"] == window
 
 
 def test_a_block_layer_keeps_the_flattened_rows_when_no_kernel_reads_the_fold(
@@ -212,8 +192,8 @@ def test_a_flattened_block_never_skips_metadata_rows_for_extends(monkeypatch):
     ``refresh_decode_metadata`` expands rows ``[0, bs)`` into
     ``[0, bs * block)`` and the drafter's query covers those same requests, so
     skipping metadata rows while keeping every query row runs the kernel off
-    the end of both. A drafter that is not ``kimi_mla`` reports
-    ``num_extends == bs``, which is what used to empty the slice.
+    the end of both, and a drafter that is not ``kimi_mla`` reports
+    ``num_extends == bs`` -- enough to empty the slice outright.
     """
     captured = _run_mla_decode(
         monkeypatch,
@@ -252,12 +232,11 @@ def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkey
     assert captured["noncausal_block_size"] == 8
 
 
-def test_the_metadata_carries_the_fold_the_layers_used_to_re_derive() -> None:
-    """Hoisted out of the per-layer path; it must still be the same rows.
+def test_the_metadata_fold_rows_are_every_spec_th_expanded_row() -> None:
+    """The fold reads the rows the block was expanded from.
 
     The block entries are the per-request rows repeated ``spec`` times, so the
-    rows the fold reads have to equal every ``spec``-th expanded entry -- which
-    is exactly what the per-layer strided copy used to compute.
+    rows the fold reads have to equal every ``spec``-th expanded entry.
     """
     bs, spec, pages = 2, 4, 3
     backend = object.__new__(mla_backend.MLAAttnBackend)
@@ -279,22 +258,6 @@ def test_the_metadata_carries_the_fold_the_layers_used_to_re_derive() -> None:
 
     torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
     torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens[0::spec])
-
-
-def test_the_cutedsl_drafter_backend_never_reaches_the_shared_dispatcher() -> None:
-    """The K3 DSpark gate runs ``--drafter-attention-backend tokenspeed_mla``.
-
-    That backend calls the CuteDSL decode kernel directly and never imports
-    ``mla_decode_with_kvcache``, so which kernel the shared dispatcher selects
-    is not a variable for that configuration -- registering a new candidate
-    there cannot reach it.
-    """
-    from tokenspeed.runtime.layers.attention.backends import (
-        tokenspeed_mla as cutedsl_backend,
-    )
-
-    assert not hasattr(cutedsl_backend, "mla_decode_with_kvcache")
-    assert hasattr(cutedsl_backend, "tokenspeed_mla_decode")
 
 
 def _run_cutedsl_decode(
@@ -367,22 +330,17 @@ def _run_cutedsl_decode(
     return captured
 
 
-def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(monkeypatch):
-    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=4095)
+@pytest.mark.parametrize("window", [4095, -1])
+def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(
+    monkeypatch, window
+):
+    """The same fold on the CuteDSL leaf, under either mask."""
+    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=window)
 
     assert captured["query"].shape[:2] == (2, 8)
     assert captured["block_tables"].shape[0] == 2
     assert captured["seq_lens"].tolist() == [64, 128]
-    assert captured["window_left"] == 4095
-    assert captured["causal_mask"] is False
-
-
-def test_a_full_attention_cutedsl_block_folds_on_the_same_terms(monkeypatch):
-    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=-1)
-
-    assert captured["query"].shape[:2] == (2, 8)
-    assert captured["block_tables"].shape[0] == 2
-    assert captured["window_left"] == -1
+    assert captured["window_left"] == window
     assert captured["causal_mask"] is False
 
 

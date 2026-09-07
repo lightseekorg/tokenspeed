@@ -1024,7 +1024,7 @@ def mla_latent_norm_rope_scatter(
     kv_buffer_dtype: torch.dtype,
     *,
     is_neox: bool,
-    sanitize: bool = False,
+    sanitize: bool,
 ) -> None:
     """Normalize, rotate and scatter every layer's latent KV in one launch.
 

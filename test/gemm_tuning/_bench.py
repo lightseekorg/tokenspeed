@@ -29,16 +29,11 @@ from __future__ import annotations
 
 import torch
 
-# (N, K, calls/step, M per batch row, label). The (N, K) are OBSERVED -- logged
-# at the decode_gemv dispatch entry during a real run, not derived.
-#
-# calls/step is NOT measured for every set: the shape probe dedups, so it
-# reports which shapes exist and not how often each fires. It is left at 0 where
-# the counts were never traced, so the per-step projection stays zero rather
-# than quoting a number carried over from a different parallelism.
-#
-# M per batch row is what the call site multiplies the batch by: 1 for ordinary
-# decode, and a block drafter's block width for a shape it runs once per block.
+# (N, K, calls/step, M per batch row, label). The (N, K) are OBSERVED at the
+# decode_gemv dispatch entry, not derived. calls/step is 0 where the counts were
+# never traced, which zeroes the per-step projection instead of quoting one from
+# a different parallelism. M per batch row is what the call site multiplies the
+# batch by: 1 for ordinary decode, the block width for a per-block shape.
 SHAPE_SETS = {
     "k3_tp16": (
         [

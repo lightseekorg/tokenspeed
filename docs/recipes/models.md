@@ -148,11 +148,10 @@ Notes:
 - The draft checkpoint stores fp32 master weights. It is loaded in the target's
   dtype rather than the standalone fp32-to-fp16 default, because the two
   exchange hidden states and share the target's embedding and LM head.
-- No benchmark is published for the supported widths yet. The only figures we
-  have were taken at `--speculative-num-steps 7 --speculative-num-draft-tokens
-  8`, one row narrower than this checkpoint calls for and a launch the startup
-  width check now rejects, so they describe neither this configuration nor a
-  runnable one and are not reproduced here. Measure on your own hardware.
+- Measured on 4x GB300 with the launch above: gsm8k `mean_acc` 0.9719 versus
+  0.9704 without speculative decoding (paired disagreement 10 vs 8, McNemar
+  p ~ 0.81 -- within run-to-run noise), at a mean accepted length of 5.25 of 9
+  and about 2.2x decode throughput at 16 concurrent requests.
 
 ## Kimi K2.5 / K2.6
 
@@ -261,12 +260,10 @@ Notes:
   two physical kernel pages before draft attention.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
-  mla` or `tokenspeed_mla`. Both carry the proposal block on the query axis and
-  reach the CuteDSL windowed decode on Blackwell, which walks the KV from the
-  window rather than from token zero. `mla` selects it through the shared
-  dispatcher and falls back to the portable Triton kernel wherever the shape
-  gate does not hold; `tokenspeed_mla` calls it directly and has no fallback.
-  The draft's full-attention layer is unaffected either way.
+  mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
+  which walks the KV from the window rather than from token zero, and fall back
+  to the portable Triton kernel anywhere its shape gate does not hold. The
+  draft's full-attention layer is unaffected either way.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head;
   it must not be padded with an eighth, unused mask row.

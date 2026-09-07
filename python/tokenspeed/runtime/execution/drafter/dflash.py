@@ -73,7 +73,7 @@ def _resolve_aux_hidden_stream(cfg) -> str:
 
 
 def _resolve_block_geometry(
-    cfg, spec_num_tokens: int, spec_algorithm: str = "DFLASH"
+    cfg, spec_num_tokens: int, spec_algorithm: str
 ) -> tuple[int, int]:
     """Resolve (verify_width, draft_block_size) for a block drafter.
 

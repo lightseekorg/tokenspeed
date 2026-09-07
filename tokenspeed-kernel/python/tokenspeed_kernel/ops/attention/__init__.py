@@ -1661,10 +1661,8 @@ def supports_mla_decode_query_blocks(
     which before it builds the metadata.
 
     ``True`` means the selected kernel declared both this ``q_len`` and a
-    proposal block of that width, so it volunteered for the
-    ``[batch, q_len, heads, dim]`` form. A kernel that merely omits a trait
-    matches by omission, which is not proof, so omission answers ``False`` and
-    the caller keeps the flattened form the portable kernel reads.
+    proposal block of that width. A kernel that merely omits a trait matches by
+    omission, which is not proof, so omission answers ``False``.
 
     Args:
         q_dtype: Query dtype.
