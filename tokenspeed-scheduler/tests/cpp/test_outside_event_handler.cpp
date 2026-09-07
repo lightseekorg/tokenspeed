@@ -825,7 +825,7 @@ protected:
         sliding.total_pages = cfg.device_allocator.total_pages;
         sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
         sliding.sliding_window_tokens = 4;
-        sliding.family = CacheGroupFamily::State;
+        sliding.family = CacheGroupFamily::History;
         sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {sliding};
         return cfg;

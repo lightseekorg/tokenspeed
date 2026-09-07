@@ -74,8 +74,6 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             });
             continue;
         }
-        // family=State also covers linear-attention groups with a trailing
-        // window; those translate like any other sliding group.
         const bool is_swa = group.retention == CacheGroupConfig::Retention::SlidingWindow;
         specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,

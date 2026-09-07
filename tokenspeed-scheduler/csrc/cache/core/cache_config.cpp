@@ -44,6 +44,11 @@ void CacheGroupConfig::Validate() const {
     if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
         throw std::invalid_argument(where + "sliding_window_tokens must be > 0 for sliding groups");
     }
+    if (family == CacheGroupFamily::State && retention == Retention::SlidingWindow) {
+        throw std::invalid_argument(where +
+                                    "a State group keeps recurrent-state checkpoints and rides FullHistory "
+                                    "retention; a sliding token window is a History group");
+    }
 }
 
 }  // namespace tokenspeed

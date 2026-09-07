@@ -102,14 +102,14 @@ def aligned_max_scheduled_tokens(
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
-    Recurrent-state groups (family=State, retention=FullHistory — the C++
-    ``final_state_manager`` criterion) register their state snapshot only when
-    a prefill chunk ends exactly on a CacheBlock boundary
-    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
-    state write. A chunk size that is not a multiple of every such group's
-    CacheBlock token span therefore never registers a state block. Since the
-    admission probe takes the minimum hit across groups, prefix-cache reuse
-    silently degrades to zero for the whole model.
+    Recurrent-state groups (family=State, the C++ ``IsSnapshotStateGroup``
+    criterion) register their state snapshot only when a prefill chunk ends
+    exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
+    interior boundaries never received a state write. A chunk size that is
+    not a multiple of every such group's CacheBlock token span therefore
+    never registers a state block. Since the admission probe takes the
+    minimum hit across groups, prefix-cache reuse silently degrades to zero
+    for the whole model.
 
     Args:
         max_scheduled_tokens: Requested per-step token budget
@@ -130,8 +130,6 @@ def aligned_max_scheduled_tokens(
     grain = 1
     for group in cache_groups or ():
         if group.family != CacheGroupFamily.State:
-            continue
-        if group.retention == CacheRetention.SlidingWindow:
             continue
         grain = math.lcm(grain, int(group.block_granularity))
     if grain == 1:

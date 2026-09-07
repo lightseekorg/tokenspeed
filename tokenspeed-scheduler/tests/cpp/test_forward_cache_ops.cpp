@@ -546,6 +546,21 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
+    // A State group holds checkpoints, never a token window that could slide
+    // out; the same window declared as History is an ordinary SWA group.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "sliding_state";
+    group.retention = CacheGroupConfig::Retention::SlidingWindow;
+    group.sliding_window_tokens = 256;
+    group.family = CacheGroupFamily::State;
+    ExpectRejectedNamingGroup(config, "sliding_state");
+
+    group.family = CacheGroupFamily::History;
+    EXPECT_NO_THROW(config.Validate());
+}
+
 TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
     SchedulerConfig config = MakeValidConfig();
     config.cache_groups[0].family = CacheGroupFamily::State;

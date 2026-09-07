@@ -26,21 +26,27 @@ Two quantities anchor the vocabulary:
   addresses the cache.
 
 `block_granularity` is the generic quantity; a group *declares* it through
-one of two family-specific shapes (Python
-`CacheGroupSpec`):
+one of two shapes (Python `CacheGroupSpec`), and the group's **family** is
+the name of that shape:
 
 * **Row geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
-  **`page_size`**) — for paged KV-cache consumers, whose blocks physically
-  hold rows of entries (per-token KV, sliding windows, compressed entries).
-  "Page" vocabulary is *only* legal here.
-* **`checkpoint_granularity`** — for snapshot-style state groups
-  (recurrent/conv state), whose blocks each hold one state snapshot taken
+  **`page_size`**) — the `history` family: paged KV-cache consumers whose
+  blocks physically hold rows of entries (per-token KV, sliding windows,
+  compressed entries, compressor input tails). "Page" vocabulary is *only*
+  legal here. Retention is `full_history` or `sliding_window`.
+* **`checkpoint_granularity`** — the `state` family: snapshot-style groups
+  (recurrent/conv state) whose blocks each hold one state snapshot taken
   every this-many tokens. Such a group has no rows and no pages; declaring
-  fictional row geometry for it is a bug, not a convention.
+  fictional row geometry for it is a bug, not a convention. A checkpoint
+  summarizes everything before it, so nothing in it ever slides out:
+  retention is always `full_history`.
 
-The two shapes are mutually exclusive, and the split is by *shape*, not by
-family: V4's sliding-window tail and compressor buffers are state-family yet
-have real row geometry, so they declare rows.
+The two shapes are mutually exclusive and `CacheGroupSpec.__post_init__`
+holds each family to its shape, so exactly three `(family, retention)`
+combinations exist — the C++ `AttnKind { kFull, kSlidingWindow,
+kMambaState }`. A trailing window of token rows (DeepSeek V4's SWA kv and
+compressor tails) is a sliding `history` group whatever a kernel calls its
+buffer; `state` is not a routing label for "some backend owns this table".
 
 None of these say anything about storage. A slot of `block_granularity = 64`
 tokens may be backed by only 16 units of physical storage under compression —
@@ -651,14 +657,19 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   — asking such a group for `page_size` is a `TypeError`, since it has no
   rows.
 * Spec geometry is shape-checked at construction: row geometry and
-  `checkpoint_granularity` are mutually exclusive, both positive, and
-  family-gated (`CacheGroupSpec.__post_init__`).
+  `checkpoint_granularity` are mutually exclusive, both positive, and each
+  family is held to its shape and retention — `state` declares
+  `checkpoint_granularity` and `full_history`, `history` declares rows
+  (`CacheGroupSpec.__post_init__`; the C++ `CacheGroupConfig::Validate`
+  refuses a sliding `State` group at the bridge).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
   groups it serves — the router builds one leaf per paged (history-family)
   group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
-  group ids. `cache_consumer_families` remains the boot-time coverage
+  state consumers (Mamba/KDA, Inkling conv) index the dict by their own
+  group ids, as does the V4 backend for the several history groups one V4
+  layer reads at once (its pool view reports no `PagedAttention` binding
+  and no router leaf). `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.

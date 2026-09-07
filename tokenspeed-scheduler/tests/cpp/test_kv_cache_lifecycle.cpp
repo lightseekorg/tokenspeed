@@ -57,7 +57,7 @@ protected:
         swa_grp.total_pages = cfg.device_allocator.total_pages;
         swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
         swa_grp.sliding_window_tokens = 4;
-        swa_grp.family = CacheGroupFamily::State;
+        swa_grp.family = CacheGroupFamily::History;
 
         cfg.cache_groups = {full_grp, swa_grp};
         return cfg;

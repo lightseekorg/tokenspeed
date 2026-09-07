@@ -53,15 +53,13 @@ struct CacheGroupConfig {
     CacheGroupFamily family{CacheGroupFamily::History};
     CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
 
-    // A State group WITHOUT SlidingWindow retention keeps one recurrent-state
-    // checkpoint per block instead of a token history: the mamba-style group
-    // (GDN linear attention, conv columns) whose PD destination layout is a
-    // LatestSnapshot. family=State alone is not enough -- it also covers
-    // sliding-window tail buffers (DeepSeek V4 SWA kv / compressor state),
-    // whose blocks hold real window rows rather than snapshots.
-    bool IsSnapshotStateGroup() const {
-        return family == CacheGroupFamily::State && retention != Retention::SlidingWindow;
-    }
+    // A State group keeps one recurrent-state checkpoint per block instead of
+    // a token history: the mamba-style group (GDN linear attention, conv
+    // columns) whose PD destination layout is a LatestSnapshot. A checkpoint
+    // summarizes everything before it, so nothing in such a group ever slides
+    // out: Validate() rejects State with SlidingWindow retention, and a
+    // trailing token window (SWA kv, compressor tails) is a History group.
+    bool IsSnapshotStateGroup() const { return family == CacheGroupFamily::State; }
 
     void Validate() const;
 };
