@@ -548,9 +548,12 @@ class EventLoop:
 
         ``_register_l3_storage_hits`` runs at submit. A queued request can
         sit past a later ``batch_exists`` miss (delete, eviction, lost
-        object). Re-probe waiting hashes immediately before
+        object). Re-probe admission candidates immediately before
         ``next_execution_plan`` so Admit cannot treat a stale scheduler key
         as a Host hit and then ``batch_get_into`` a missing object.
+        ``waiting_prefix_hashes`` is only the Submitted/Retracted work that
+        can take a batch slot this round, so a long waiter is not hashed
+        and remotely probed on every decode step.
         """
 
         if not self._enable_l3_storage:

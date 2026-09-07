@@ -61,6 +61,14 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             match_order_.push_back(i);
         }
     }
+    if (enable_l3_storage_ && host_pool_ != nullptr) {
+        std::size_t capacity = 0;
+        for (const CacheGroup& group : groups_) {
+            capacity += static_cast<std::size_t>(host_pool_->NumLcmBlocks()) *
+                        static_cast<std::size_t>(group.Spec().cache_blocks_per_lcm_block);
+        }
+        storage_key_limit_ = std::max(capacity, std::size_t{1});
+    }
 }
 
 bool CacheCoordinator::HasMambaStateGroup() const {
@@ -116,6 +124,7 @@ bool CacheCoordinator::ClearDeviceCache() {
 
     pending_stores_.clear();
     storage_keys_.clear();
+    storage_key_order_.clear();
     for (const auto& [group_id, location] : cached_locations) {
         _assert(evictCachedBlock(group_id, location), "clearable Device cache entry disappeared");
     }
@@ -906,24 +915,43 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
     groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
-    if (enable_l3_storage_) {
-        storage_keys_.insert(key);
-    }
+    rememberStorageKey(key);
 }
 
 void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
-    if (!enable_l3_storage_) {
-        return;
-    }
     for (const CacheKey& key : keys) {
         _assert(key.group_id < groups_.size(), "storage key group id out of range");
-        storage_keys_.insert(key);
+        rememberStorageKey(key);
     }
 }
 
 void CacheCoordinator::UnregisterStorageKeys(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
         storage_keys_.erase(key);
+    }
+}
+
+void CacheCoordinator::rememberStorageKey(const CacheKey& key) {
+    if (!enable_l3_storage_ || storage_key_limit_ == 0) {
+        return;
+    }
+    if (!storage_keys_.insert(key).second) {
+        return;
+    }
+    storage_key_order_.push_back(key);
+    evictStorageKeysToLimit();
+}
+
+void CacheCoordinator::evictStorageKeysToLimit() {
+    while (storage_keys_.size() > storage_key_limit_) {
+        while (!storage_key_order_.empty() && !storage_keys_.contains(storage_key_order_.front())) {
+            storage_key_order_.pop_front();
+        }
+        if (storage_key_order_.empty()) {
+            break;
+        }
+        storage_keys_.erase(storage_key_order_.front());
+        storage_key_order_.pop_front();
     }
 }
 

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <span>
@@ -215,8 +216,11 @@ public:
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
 
-    // L3 storage sits below Host: keys known to exist in the remote store, with
-    // no local Host block. Probe treats them as Host hits that require prefetch.
+    // L3 storage sits below Host: a bounded shadow of keys known to exist in
+    // the remote store, with no local Host block. Probe treats them as Host
+    // hits that require prefetch. Capacity tracks Host pages so the set
+    // cannot grow with every historical writeback; admit-time revalidation
+    // re-inserts keys that were LRU-evicted.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
     void UnregisterStorageKeys(std::span<const CacheKey> keys);
@@ -237,6 +241,8 @@ private:
     };
 
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
+    void rememberStorageKey(const CacheKey& key);
+    void evictStorageKeysToLimit();
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();
@@ -280,6 +286,8 @@ private:
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
     std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
+    std::deque<CacheKey> storage_key_order_;
+    std::size_t storage_key_limit_{0};
     CacheMutationSink cache_mutation_sink_;
 };
 

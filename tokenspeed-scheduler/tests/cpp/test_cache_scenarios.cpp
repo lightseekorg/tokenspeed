@@ -4458,8 +4458,10 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
 
 // ---------------------------------------------------------------------------
 // Mooncake L3 under flat KV: Host writeback inserts storage_keys_; Host
-// eviction must not drop them. A later Device+Host miss that is still in L3
-// allocates a Host page and emits LoadBack with prefetch_from_storage.
+// eviction must not drop Mooncake objects. The scheduler shadow is bounded
+// to Host page capacity, so admit-time RegisterStorageKeys restores keys
+// the LRU dropped. A later Device+Host miss that is still in L3 allocates
+// a Host page and emits LoadBack with prefetch_from_storage.
 // ---------------------------------------------------------------------------
 class L3StorageHitSuite : public HostHitSuite {
 protected:
@@ -4484,7 +4486,11 @@ TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
     EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0);
 
     // Same tokens as r1 plus one extra page: Device miss, Host miss, L3 hit.
-    Submit(MakeRequestSpec("r3", /*num_pages=*/5));
+    // Re-register like the event loop's admit-time probe: Host eviction does
+    // not delete Mooncake objects, but the LRU shadow may have dropped r1.
+    RequestSpec r3 = MakeRequestSpec("r3", /*num_pages=*/5);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(r3.tokens)));
+    Submit(r3);
     ExecutionPlan plan = PlanOnce();
     auto lb = FindLoadBack(plan);
     ASSERT_TRUE(lb.has_value()) << "L3-only prefix must emit a Host prefetch load-back";
@@ -4580,6 +4586,18 @@ TEST_F(SchedulerTestSuite, WaitingPrefixHashesMatchSubmittedPrompt) {
     EXPECT_EQ(scheduler_->WaitingPrefixHashes(), expected);
     PlanOnce();
     EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty());
+}
+
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenBatchCannotAdmit) {
+    config_.max_batch_size = 1;
+    config_.enable_l3_storage = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/100));
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty())
+        << "a full batch must not rehash a waiter that cannot be admitted";
 }
 
 TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {

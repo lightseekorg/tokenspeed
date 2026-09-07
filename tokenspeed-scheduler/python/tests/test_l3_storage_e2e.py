@@ -239,6 +239,18 @@ def test_waiting_prefix_hashes_match_submitted_prompt() -> None:
     assert scheduler.waiting_prefix_hashes() == []
 
 
+def test_waiting_prefix_hashes_skip_when_batch_cannot_admit() -> None:
+    """A full decode/prefill batch must not rehash a waiter that cannot join."""
+
+    cfg = _l3_config()
+    cfg.max_batch_size = 1
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests([_spec("r1", list(range(1, 5)))])
+    scheduler.next_execution_plan()
+    scheduler.submit_requests([_spec("r2", list(range(100, 108)))])
+    assert scheduler.waiting_prefix_hashes() == []
+
+
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     scheduler = ts.Scheduler(_l3_config())
     tokens = list(range(1, 9))
@@ -271,7 +283,7 @@ def test_l3_writeback_carries_object_keys() -> None:
 
 
 def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
-    """Same-instance reuse after Host is full: L3 keys outlive L2 eviction."""
+    """Host eviction keeps Mooncake objects; admit-time register restores the shadow."""
 
     cfg = _l3_config(num_device_pages=13, num_host_pages=7, with_swa=True)
     scheduler = ts.Scheduler(cfg)
@@ -290,7 +302,11 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
     _ack_write_back(scheduler, wb2.op_ids[0])
     scheduler.next_execution_plan()
 
-    scheduler.submit_requests([_spec("r3", list(range(1, 11)))])
+    r3_tokens = list(range(1, 11))
+    hashes = scheduler.prefix_hashes_for_tokens(r3_tokens)
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)
+    scheduler.submit_requests([_spec("r3", r3_tokens)])
     plan = scheduler.next_execution_plan()
     load = _find_load_back(plan)
     assert load is not None, "Host-evicted L3 prefix must still emit LoadBackOp"

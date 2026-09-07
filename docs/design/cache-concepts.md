@@ -430,9 +430,13 @@ Its responsibilities:
   MIN-reduces existence across every cache-owning rank in the DP replica
   (attention TP, then CP, then PP; not across DP) and
   `register_storage_keys` / `unregister_storage_keys`. Immediately before
-  `next_execution_plan`, the event loop re-probes `waiting_prefix_hashes`
-  (Submitted and Retracted) so a queued hit cannot survive deletion,
-  eviction, or a lost object. That probe is not a lease: after Admit
+  `next_execution_plan`, the event loop re-probes prefix hashes of waiting
+  requests that can take a batch slot this round so a queued hit cannot
+  survive deletion, eviction, or a lost object. Waiting work that cannot
+  be admitted (full decode batch, head-of-line incomplete prefill) is not
+  rehashed or remotely probed. The scheduler's L3 key shadow is bounded
+  to Host page capacity (LRU); admit-time registration restores keys that
+  were evicted from the shadow. That probe is not a lease: after Admit
   allocates Host pages, `batch_get_into` can still miss. Prefetch runs
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced
   across the replica, and a miss unregisters the keys, skips H2D /

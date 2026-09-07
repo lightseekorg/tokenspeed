@@ -441,20 +441,66 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
 }
 
 std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
+    std::vector<Request*> candidates;
+    candidates.reserve(requests_.size());
+    for (const auto& request : requests_) {
+        candidates.push_back(request.get());
+    }
+    Request* readmission = nextReadmission(candidates);
+
+    bool hol_blocks_new_prompts = false;
+    for (const auto& request : requests_) {
+        const auto* prefilling = request->GetIf<fsm::Prefilling>();
+        if (prefilling != nullptr && !prefilling->TailCheckpointReserved()) {
+            hol_blocks_new_prompts = true;
+            break;
+        }
+    }
+    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
+    const std::int32_t free_slots = config_.max_batch_size - occupied;
+    if (free_slots <= 0 && readmission == nullptr) {
+        return {};
+    }
+
     std::vector<std::string> hashes;
     std::unordered_set<std::string> seen;
-    for (const auto& request : requests_) {
-        if (!request->Is<fsm::Submitted>() && !request->Is<fsm::Retracted>()) {
-            continue;
-        }
-        std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(/*except_last=*/false);
+    const auto append_hashes = [&](const Request& request) {
+        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
         const std::int32_t candidate_prefix_pages =
-            std::max((request->PrefillSize() - 1) / config_.prefix_granularity, 0);
+            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
         prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
         for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
             if (seen.insert(content_hash).second) {
                 hashes.push_back(std::move(content_hash));
             }
+        }
+    };
+    if (readmission != nullptr) {
+        append_hashes(*readmission);
+    }
+    if (free_slots <= 0 || hol_blocks_new_prompts) {
+        return hashes;
+    }
+    std::int32_t remaining = free_slots;
+    if (readmission != nullptr) {
+        remaining = std::max(remaining - 1, 0);
+    }
+    for (Request* request : candidates) {
+        if (remaining <= 0) {
+            break;
+        }
+        if (request == readmission) {
+            continue;
+        }
+        if (request->Is<fsm::Submitted>()) {
+            append_hashes(*request);
+            --remaining;
+            continue;
+        }
+        const auto* retracted = request->GetIf<fsm::Retracted>();
+        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
+            append_hashes(*request);
+            --remaining;
         }
     }
     return hashes;

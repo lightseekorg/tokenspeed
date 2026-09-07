@@ -305,6 +305,15 @@ def test_revalidate_skipped_without_l3() -> None:
     assert loop.scheduler.unregistered is None
 
 
+def test_revalidate_skips_device_when_waiting_hashes_empty() -> None:
+    loop = _Loop(exists_flags=[True])
+    loop.scheduler.waiting_hashes = []
+    loop._revalidate_queued_l3_hits()
+    assert loop._device.pages is None
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered is None
+
+
 def test_vanished_l3_prefetch_unregisters_and_retracts(monkeypatch) -> None:
     retracts: list[str] = []
 

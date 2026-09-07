@@ -661,7 +661,8 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     ASSERT_TRUE(replacement);
     replacement.reset();
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key_h0)) << "Host eviction must drop the L2 index entry";
-    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0)) << "Mooncake L3 keys survive Host eviction";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0))
+        << "Host eviction must not drop Mooncake keys still inside the Host-capacity shadow";
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
     EXPECT_EQ(probe.host.num_common_tokens, 2);
@@ -677,6 +678,34 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     admission.reset();
     coordinator.Free(tables);
     EXPECT_TRUE(coordinator.ClearCache());
+}
+
+TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey key_h2{.group_id = 0, .content_hash = "h2"};
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1, key_h2});
+
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h0))
+        << "the shadow must drop the oldest key once it exceeds Host page capacity";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2));
+    EXPECT_EQ(coordinator.NumStorageKeys(), 2);
+
+    coordinator.RegisterStorageKeys(std::array{key_h0});
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0)) << "admit-time registration restores a shadow-evicted key";
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h1));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2));
 }
 
 TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
