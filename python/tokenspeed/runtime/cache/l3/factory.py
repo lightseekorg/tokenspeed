@@ -55,7 +55,7 @@ def create_kvstore_storage_backend(
         )
 
         return MooncakeKvStore(
-            parse_extra_config(extra_config),
+            extra_config=parse_extra_config(extra_config),
             host_buffer=host_buffer,
             tp_size=tp_size,
             pp_size=pp_size,

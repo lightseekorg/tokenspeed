@@ -253,10 +253,10 @@ For orientation, one iteration of `event_loop`:
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
-   record metrics, DP-sync, and gather per-batch state (draining the
-   in-flight queue first if the dispatch depends on a pending commit,
-   Principle 4).
+   step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
+   derive the forward op, record metrics, DP-sync, and gather per-batch state
+   (draining the in-flight queue first if the dispatch depends on a pending
+   commit, Principle 4).
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache write-backs first (a retraction's snapshot copy must read the
@@ -294,4 +294,6 @@ For orientation, one iteration of `event_loop`:
   not pay: a round is microseconds, and agentic history is tens of thousands
   of tokens. When L3 is on, existence is MIN-reduced across every
   cache-owning rank in the replica (attention TP, then CP, then PP) so
-  those ranks admit the same prefix pages.
+  those ranks admit the same prefix pages. Queued Submitted/Retracted
+  hashes are re-probed immediately before `next_execution_plan` so a hit
+  registered at submit cannot be admitted after the object is gone.

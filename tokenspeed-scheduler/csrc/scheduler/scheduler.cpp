@@ -418,6 +418,26 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     return ComputePrefixHashes(prefix_pages, "");
 }
 
+std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
+    std::vector<std::string> hashes;
+    std::unordered_set<std::string> seen;
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::Submitted>() && !request->Is<fsm::Retracted>()) {
+            continue;
+        }
+        std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(/*except_last=*/false);
+        const std::int32_t candidate_prefix_pages =
+            std::max((request->PrefillSize() - 1) / config_.prefix_granularity, 0);
+        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
+            if (seen.insert(content_hash).second) {
+                hashes.push_back(std::move(content_hash));
+            }
+        }
+    }
+    return hashes;
+}
+
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();

@@ -132,11 +132,15 @@ class MooncakeStoreConfig:
 
 
 class MooncakeKvStore:
-    """Zero-copy Mooncake Store adapter for one compact Host buffer."""
+    """Zero-copy Mooncake Store adapter for one compact Host buffer.
+
+    ``extra_config`` is required. Pass ``None`` to fall back to
+    ``MOONCAKE_MASTER`` / ``MOONCAKE_CLIENT`` and the other env defaults.
+    """
 
     def __init__(
         self,
-        extra_config: dict[str, Any] | None = None,
+        extra_config: dict[str, Any] | None,
         *,
         host_buffer: Any,
         tp_size: int,

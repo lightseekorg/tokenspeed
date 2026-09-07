@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import types
@@ -298,6 +299,20 @@ class MooncakeConfigTest(unittest.TestCase):
         finally:
             os.environ.update(saved)
 
+    def test_from_mapping_none_uses_mooncake_master_env(self):
+        saved = {
+            key: os.environ.pop(key)
+            for key in ("MOONCAKE_MASTER", "MOONCAKE_CLIENT")
+            if key in os.environ
+        }
+        os.environ["MOONCAKE_MASTER"] = "env-master:50051"
+        try:
+            config = MooncakeStoreConfig.from_mapping(None)
+            self.assertEqual(config.master_server_address, "env-master:50051")
+        finally:
+            os.environ.pop("MOONCAKE_MASTER", None)
+            os.environ.update(saved)
+
     def test_default_global_segment_matches_runtime_flag_default(self):
         saved = os.environ.pop("MOONCAKE_GLOBAL_SEGMENT_SIZE", None)
         try:
@@ -311,6 +326,12 @@ class MooncakeConfigTest(unittest.TestCase):
 
 
 class MooncakeKvStoreTest(unittest.TestCase):
+    def test_extra_config_has_no_default(self):
+        param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
+        self.assertIs(param.default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
+
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
             def setup(self, *args, **kwargs):

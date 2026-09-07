@@ -537,37 +537,19 @@ class EventLoop:
             self._register_l3_storage_hits(specs)
         self.scheduler.submit_requests(specs)
 
-    def _clear_cache(self) -> bool:
-        cleared = self.scheduler.clear_cache()
-        if cleared:
-            self._device.rotate_l3_namespace()
-        return cleared
+    def _revalidate_queued_l3_hits(self) -> None:
+        """Drop L3 keys that vanished while a request waited for capacity.
 
-    def _converge_l3_exists(self, exists: list[bool]) -> list[bool]:
-        """MIN-reduce L3 exists across every cache-owning rank in this replica.
-
-        Cache-owning ranks share a DP replica (attention TP × CP × PP). They
-        must admit the same prefix pages or later PP/CP collectives hang.
-        DP ranks hold different sequences and are not reduced. Order is
-        TP, then CP, then PP so every rank enters the same sequence of
-        groups.
+        ``_register_l3_storage_hits`` runs at submit. A queued request can
+        sit past a later ``batch_exists`` miss (delete, eviction, lost
+        object). Re-probe waiting hashes immediately before
+        ``next_execution_plan`` so Admit cannot treat a stale scheduler key
+        as a Host hit and then ``batch_get_into`` a missing object.
         """
 
-        groups = []
-        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
-            groups.append(self.attn_tp_cpu_group)
-        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
-            groups.append(self.attn_cp_cpu_group)
-        if self.pp_size > 1 and self.pp_cpu_group is not None:
-            groups.append(self.pp_cpu_group)
-        if not groups:
-            return exists
-        flags = torch.tensor(
-            [1 if present else 0 for present in exists], dtype=torch.int32
-        )
-        for group in groups:
-            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
-        return [bool(flag) for flag in flags.tolist()]
+        if not self._enable_l3_storage:
+            return
+        self._sync_l3_storage_keys(self.scheduler.waiting_prefix_hashes())
 
     def _register_l3_storage_hits(self, specs) -> None:
         """Tell the scheduler which prefix pages already live in L3.
@@ -594,6 +576,9 @@ class EventLoop:
                     continue
                 seen.add(content_hash)
                 hashes.append(content_hash)
+        self._sync_l3_storage_keys(hashes)
+
+    def _sync_l3_storage_keys(self, hashes: list[str]) -> None:
         if not hashes:
             return
         group_ids, content_hashes, page_offsets = self.scheduler.expand_prefix_keys(
@@ -634,6 +619,38 @@ class EventLoop:
             )
         if hit_groups:
             self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
+
+    def _clear_cache(self) -> bool:
+        cleared = self.scheduler.clear_cache()
+        if cleared:
+            self._device.rotate_l3_namespace()
+        return cleared
+
+    def _converge_l3_exists(self, exists: list[bool]) -> list[bool]:
+        """MIN-reduce L3 exists across every cache-owning rank in this replica.
+
+        Cache-owning ranks share a DP replica (attention TP × CP × PP). They
+        must admit the same prefix pages or later PP/CP collectives hang.
+        DP ranks hold different sequences and are not reduced. Order is
+        TP, then CP, then PP so every rank enters the same sequence of
+        groups.
+        """
+
+        groups = []
+        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
+            groups.append(self.attn_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if not groups:
+            return exists
+        flags = torch.tensor(
+            [1 if present else 0 for present in exists], dtype=torch.int32
+        )
+        for group in groups:
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
+        return [bool(flag) for flag in flags.tolist()]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1094,6 +1111,7 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     idle_round = True
                 else:
+                    self._revalidate_queued_l3_hits()
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
 

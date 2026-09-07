@@ -217,6 +217,19 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
     assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
 
 
+def test_waiting_prefix_hashes_match_submitted_prompt() -> None:
+    """Queued requests expose the same hashes the event loop revalidates."""
+
+    scheduler = ts.Scheduler(_l3_config())
+    tokens = list(range(1, 9))
+    expected = scheduler.prefix_hashes_for_tokens(tokens)
+    assert expected
+    scheduler.submit_requests([_spec("r1", tokens)])
+    assert scheduler.waiting_prefix_hashes() == expected
+    scheduler.next_execution_plan()
+    assert scheduler.waiting_prefix_hashes() == []
+
+
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     scheduler = ts.Scheduler(_l3_config())
     tokens = list(range(1, 9))

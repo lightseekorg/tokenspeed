@@ -20,9 +20,10 @@
 
 """CPU-only tests for EventLoop L3 admit-path registration.
 
-These bind ``_submit_scheduler_requests`` / ``_register_l3_storage_hits`` onto
-a fake loop so the merge-time wiring (pause flush, EPD drain, and the normal
-admit path all go through the helper) can be checked without a model or GPU.
+These bind ``_submit_scheduler_requests`` / ``_register_l3_storage_hits`` /
+``_revalidate_queued_l3_hits`` onto a fake loop so the merge-time wiring
+(pause flush, EPD drain, the normal admit path, and pre-plan revalidation
+of queued hits) can be checked without a model or GPU.
 """
 
 from __future__ import annotations
@@ -49,9 +50,13 @@ class _Scheduler:
         self.unregistered = None
         self.clear_result = True
         self.hash_calls: list[list[int]] = []
+        self.waiting_hashes: list[str] = []
 
     def submit_requests(self, specs) -> None:
         self.submitted.append(list(specs))
+
+    def waiting_prefix_hashes(self):
+        return list(self.waiting_hashes)
 
     def prefix_hashes_for_tokens(self, tokens):
         self.hash_calls.append(list(tokens))
@@ -89,6 +94,8 @@ class _Loop:
 
     _submit_scheduler_requests = EventLoop._submit_scheduler_requests
     _register_l3_storage_hits = EventLoop._register_l3_storage_hits
+    _revalidate_queued_l3_hits = EventLoop._revalidate_queued_l3_hits
+    _sync_l3_storage_keys = EventLoop._sync_l3_storage_keys
     _converge_l3_exists = EventLoop._converge_l3_exists
     _clear_cache = EventLoop._clear_cache
 
@@ -222,6 +229,32 @@ def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
 
     assert groups_seen == ["pp"]
     assert loop.scheduler.registered == ([0], ["h4"], [0])
+
+
+def test_revalidate_unregisters_stale_queued_l3_hits() -> None:
+    """A queued hit that later misses must drop the scheduler key before admit."""
+
+    loop = _Loop(exists_flags=[True])
+    spec = _spec("r0", [1, 2, 3, 4])
+    loop._submit_scheduler_requests([spec])
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
+    assert loop.scheduler.unregistered is None
+
+    loop._device.exists_flags = [False]
+    loop.scheduler.waiting_hashes = ["h4"]
+    loop._revalidate_queued_l3_hits()
+
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+    assert loop.scheduler.hash_calls == [[1, 2, 3, 4]]
+
+
+def test_revalidate_skipped_without_l3() -> None:
+    loop = _Loop(exists_flags=None)
+    loop.scheduler.waiting_hashes = ["h4"]
+    loop._revalidate_queued_l3_hits()
+    assert loop._device.pages is None
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered is None
 
 
 if __name__ == "__main__":

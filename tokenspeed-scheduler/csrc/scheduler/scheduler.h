@@ -87,6 +87,10 @@ public:
     // backend for existing objects, then registers the matching CacheKeys so
     // ProbePrefix can treat them as Host hits that require prefetch.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    // Prefix hashes of Submitted and Retracted requests. The event loop
+    // revalidates these against L3 immediately before NextExecutionPlan so a
+    // queued hit cannot survive deletion, eviction, or a lost object.
+    std::vector<std::string> WaitingPrefixHashes() const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
         return coordinator_.ExpandPrefixKeys(content_hashes);
     }

@@ -390,7 +390,10 @@ Its responsibilities:
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
   MIN-reduces existence across every cache-owning rank in the DP replica
   (attention TP, then CP, then PP; not across DP) and
-  `register_storage_keys` / `unregister_storage_keys`. That probe is skipped
+  `register_storage_keys` / `unregister_storage_keys`. Immediately before
+  `next_execution_plan`, the event loop re-probes `waiting_prefix_hashes`
+  (Submitted and Retracted) so a queued hit cannot survive deletion,
+  eviction, or a lost object. That probe is skipped
   when L3 is unset: Host-only and `--disable-kvstore` admission must not
   hash prefixes or copy `group_keys` for a storage index that does not
   exist. CI covers this path

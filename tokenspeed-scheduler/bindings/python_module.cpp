@@ -352,6 +352,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
         .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
         .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))
+        .def("waiting_prefix_hashes", &tokenspeed::Scheduler::WaitingPrefixHashes)
         .def(
             "expand_prefix_keys",
             [](const tokenspeed::Scheduler& scheduler, const std::vector<std::string>& content_hashes) {

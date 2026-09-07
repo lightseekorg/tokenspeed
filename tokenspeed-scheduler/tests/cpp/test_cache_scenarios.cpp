@@ -4493,6 +4493,17 @@ protected:
     }
 };
 
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesMatchSubmittedPrompt) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> expected = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_FALSE(expected.empty());
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty());
+    Submit(spec);
+    EXPECT_EQ(scheduler_->WaitingPrefixHashes(), expected);
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty());
+}
+
 TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {
     RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/1);
     std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
