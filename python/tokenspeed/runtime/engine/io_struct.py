@@ -913,9 +913,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     shapes: list[list[int]]
     group_name: str = "weight_update_group"
     flush_cache: bool = True
-    # Required: the L3 / meta_info checkpoint identity after a successful
-    # push. Pass ``None`` to keep the current namespace, or to derive
-    # ``{current}-uN`` when L3 is on and ``flush_cache`` is true.
+    # Required. Pass ``None`` to keep the current namespace. Flushed L3
+    # updates must supply a shared checkpoint identity.
     weight_version: str | None
 
 

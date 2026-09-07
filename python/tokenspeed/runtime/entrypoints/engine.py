@@ -57,7 +57,10 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
-from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -372,9 +375,16 @@ class Engine(EngineBase):
         """Update weights from distributed source.
 
         ``weight_version`` is required. Pass ``None`` to keep the current
-        namespace, or to derive ``{current}-uN`` when L3 is on and this
-        update flushes.
+        namespace on an intermediate update. Flushed L3 updates must pass
+        a caller-supplied identity so independent checkpoints cannot share
+        a minted successor.
         """
+        if (
+            flush_cache
+            and weight_version is None
+            and self.server_args.kvstore_storage_backend is not None
+        ):
+            return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
         weight_version = resolve_l3_weight_version(
             self.server_args.weight_version,
             weight_version,

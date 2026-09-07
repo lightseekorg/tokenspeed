@@ -28,22 +28,6 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 
-def next_l3_weight_version(current: str) -> str:
-    """Return a unique L3 namespace successor for a flushed weight update.
-
-    Every rank that shares ``current`` produces the same successor, so L3
-    object keys stay aligned without an extra collective. A numeric ``-uN``
-    suffix is incremented when present; otherwise ``-u1`` is appended.
-    """
-
-    current = str(current)
-    marker = "-u"
-    base, separator, suffix = current.rpartition(marker)
-    if separator and suffix.isdigit():
-        return f"{base}{marker}{int(suffix) + 1}"
-    return f"{current}{marker}1"
-
-
 def resolve_l3_weight_version(
     current: str,
     requested: str | None,
@@ -53,18 +37,22 @@ def resolve_l3_weight_version(
 ) -> str | None:
     """Choose the namespace to publish after a successful weight load.
 
-    An explicit ``requested`` version always wins. When L3 is enabled and
-    the caller asked to flush, ``requested is None`` derives a successor so
-    new KV cannot reuse the previous checkpoint's objects. Callers must
-    pass ``None`` deliberately; a later commit still requires
-    ``flush_cache`` before applying a version that differs from ``current``.
+    An explicit ``requested`` version always wins. ``None`` keeps the
+    current namespace. Flushed L3 updates must pass a caller-supplied
+    identity; minting ``{current}-uN`` would let independent checkpoints
+    collide under the same successor.
     """
 
+    del current, flush_cache, storage_backend
     if requested is not None:
         return str(requested)
-    if flush_cache and storage_backend is not None:
-        return next_l3_weight_version(current)
     return None
+
+
+L3_FLUSH_REQUIRES_WEIGHT_VERSION = (
+    "L3 flushed updates require weight_version so independent replicas "
+    "cannot restore another checkpoint's objects"
+)
 
 
 def storage_object_key(
@@ -132,6 +120,7 @@ def storage_key_prefix(
     weight_version: str,
     cache_signature: str,
     pipeline_rank: int,
+    cp_size: int,
     draft_model: str,
     draft_revision: str,
     draft_weight_version: str,
@@ -139,9 +128,12 @@ def storage_key_prefix(
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, or draft pool and silently
-    collide with an incompatible deployment. Empty strings are valid and
-    mean "unset" (no Hugging Face revision, no speculative draft).
+    identity, cache layout, pipeline stage, context-parallel width, or
+    draft pool and silently collide with an incompatible deployment. Empty
+    strings are valid and mean "unset" (no Hugging Face revision, no
+    speculative draft). ``cp_size`` belongs here rather than only in the
+    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
+    blocks to the same rank under different widths.
     """
 
     payload = json.dumps(
@@ -151,6 +143,7 @@ def storage_key_prefix(
             "weight_version": str(weight_version),
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
+            "cp_size": int(cp_size),
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
             "draft_weight_version": str(draft_weight_version),

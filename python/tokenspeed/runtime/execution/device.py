@@ -814,6 +814,7 @@ def build_device_side(
                 server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
             )
             draft_model = server_args.speculative_draft_model_path or ""
+            cp_size = int(server_args.mapping.attn.cp_size)
 
             def prefix_for_weight_version(weight_version: str) -> str:
                 return storage_key_prefix(
@@ -822,6 +823,7 @@ def build_device_side(
                     weight_version=weight_version,
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
+                    cp_size=cp_size,
                     draft_model=draft_model,
                     draft_revision=revision,
                     draft_weight_version=weight_version,

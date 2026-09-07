@@ -36,7 +36,10 @@ from tokenspeed_kernel.profiling import (
 )
 from viztracer import VizTracer
 
-from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -270,7 +273,9 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self._require_flush_for_l3_version_switch(recv_req)
+                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                if ok:
+                    ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if ok:
                     ok, msg = self._flush_cache_before_weight_load(recv_req)
                 if ok:
@@ -289,6 +294,25 @@ class RequestHandler:
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
+        """Reject a flushed L3 update that has no checkpoint identity.
+
+        Minting ``{current}-uN`` from the old label is not checkpoint
+        specific: two servers that start at ``default`` and load different
+        weights would both publish under ``default-u1``. The second flush
+        only deletes the old ``default`` prefix, so the first server's
+        objects remain and can be restored for incompatible weights.
+        """
+
+        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        if (
+            storage_backend is None
+            or not recv_req.flush_cache
+            or recv_req.weight_version is not None
+        ):
+            return True, ""
+        return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
 
     def _require_flush_for_l3_version_switch(self, recv_req) -> tuple[bool, str]:
         """Reject an L3 namespace change that would skip cache invalidation.
@@ -342,13 +366,15 @@ class RequestHandler:
 
         Device/Host have already been flushed when ``flush_cache`` was
         requested. The prefix is rebuilt here so newly computed KV cannot
-        land in a peer still serving the previous ``weight_version``. When
-        L3 is enabled and the caller passes ``weight_version=None``, a unique
-        successor is derived so the Engine path cannot republish under the
-        startup namespace. An explicit new version with ``flush_cache=False``
-        is rejected before the GPU load.
+        land in a peer still serving the previous ``weight_version``.
+        Flushed L3 updates require an explicit ``weight_version``. An
+        explicit new version with ``flush_cache=False`` is rejected
+        before the GPU load.
         """
 
+        ok, err = self._require_weight_version_for_l3_flush(recv_req)
+        if not ok:
+            return False, err
         ok, err = self._require_flush_for_l3_version_switch(recv_req)
         if not ok:
             return False, err

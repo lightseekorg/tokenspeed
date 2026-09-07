@@ -55,9 +55,9 @@ The SGLang-compatible `update_weights_from_distributed`,
 `update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
 optional `weight_version`. The version changes only after the update succeeds.
 `Engine.update_weights_from_distributed` requires `weight_version`; pass
-`None` to keep the current value, except when L3 is enabled and the
-update flushes the cache: then a unique successor (`{current}-uN`) is derived
-so new KV cannot reuse the previous checkpoint's objects. When L3 is on, a
+`None` to keep the current value on an intermediate update. Flushed L3
+updates must pass a caller-supplied identity so independent checkpoints
+cannot share a minted successor. When L3 is on, a
 new `weight_version` requires `flush_cache=True`; intermediate updates may
 pass `None` until the last call flushes.
 
@@ -322,7 +322,8 @@ Mooncake Store (L3)
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, `--revision`,
-`--weight-version`), the packed layout, the pipeline stage, and any
+`--weight-version`), the packed layout, the pipeline stage, the context-parallel
+width (`cp_size`), and any
 speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
@@ -330,13 +331,13 @@ reject, and the update RPC then fails so the caller retries instead of
 serving new weights against the previous checkpoint. Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the
-new checkpoint. If the update passes `weight_version=None`
-while L3 is enabled, a unique successor (`{current}-uN`) is derived so
-`Engine.update_weights_from_distributed` cannot republish under the
-startup namespace. A successful Engine update stamps that successor into
-frontend `server_args` so a later `weight_version=None` call cannot reuse it.
+new checkpoint. Flushed L3 updates require an explicit `weight_version`;
+minting `{current}-uN` would let independent checkpoints collide.
+A successful Engine update stamps that version into
+frontend `server_args`.
 Context-parallel workers (`ENABLE_CP`) share
-`attn_tp_rank == 0` and are distinguished by `c{cp_rank}`.
+`attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
+in the hashed namespace.
 `global_segment_size` is split across
 attention-TP × pipeline-parallel ranks so the mounted total matches the
 configured size. L3 requires Host L2 (do not pass `--disable-kvstore`).

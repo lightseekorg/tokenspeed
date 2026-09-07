@@ -372,8 +372,12 @@ Its responsibilities:
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
   (`model` + `--revision` + `--weight-version`), the packed CacheBlock
-  layout (dtype and field geometry), the pipeline stage, and the speculative
-  draft checkpoint when a separate draft pool is present. A live weight
+  layout (dtype and field geometry), the pipeline stage, the context-parallel
+  width (`cp_size`), and the speculative
+  draft checkpoint when a separate draft pool is present. Zigzag CP assigns
+  different token blocks to the same `cp_rank` under different widths, so
+  `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
+  object key. A live weight
   load flushes Device/Host first so new parameters cannot reuse the
   previous checkpoint. `ClearCache` rejects in-flight Host writebacks
   (pause drain does not wait for those); the RPC then fails before the
@@ -383,14 +387,14 @@ Its responsibilities:
   `flush_cache=False` is rejected before the GPU load when L3 is on:
   Device/Host still hold the previous checkpoint, and D2H copies not yet
   in `_backup_futures` would later be stored under the new namespace.
-  When L3 is on and the update passes
-  `weight_version=None`, a unique successor (`{current}-uN`) is derived so the
-  Engine `update_weights_from_distributed` path cannot republish under the
-  startup namespace. After a successful RPC the Engine facade stamps that
-  successor into `server_args.weight_version` so a later `weight_version=None`
-  call derives `{current}-u2` instead of repeating `-u1`.
+  Flushed L3 updates require an explicit `weight_version`. Minting
+  `{current}-uN` from the old label is not checkpoint-specific: two
+  servers that start at `default` and load different weights would both
+  publish under `default-u1`, and the second flush would leave the first
+  server's objects in place. After a successful RPC the Engine facade
+  stamps the supplied version into `server_args.weight_version`.
   `ENABLE_CP` workers share `attn_tp_rank==0`
-  and are distinguished by `c{cp_rank}`. Host eviction does
+  and are distinguished by `c{cp_rank}` and `cp_size`. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then

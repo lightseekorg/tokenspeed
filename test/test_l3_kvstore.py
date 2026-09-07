@@ -29,9 +29,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     MemoryKvStore,
     cache_layout_signature,
-    next_l3_weight_version,
     resolve_l3_weight_version,
     storage_key_prefix,
     storage_object_key,
@@ -80,6 +80,7 @@ class StorageKeyTest(unittest.TestCase):
                 "weight_version": "v1",
                 "cache_signature": "layout",
                 "pipeline_rank": 0,
+                "cp_size": 1,
                 "draft_model": "",
                 "draft_revision": "",
                 "draft_weight_version": "",
@@ -95,21 +96,20 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(base, prefix(weight_version="v2"))
         self.assertNotEqual(base, prefix(cache_signature="other"))
         self.assertNotEqual(base, prefix(pipeline_rank=1))
+        self.assertNotEqual(base, prefix(cp_size=2))
+        self.assertNotEqual(prefix(cp_size=2), prefix(cp_size=4))
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
 
-    def test_next_l3_weight_version_is_deterministic(self):
-        self.assertEqual(next_l3_weight_version("v1"), "v1-u1")
-        self.assertEqual(next_l3_weight_version("v1-u1"), "v1-u2")
-        self.assertEqual(
+    def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
+        self.assertIsNone(
             resolve_l3_weight_version(
                 "v1",
                 None,
                 flush_cache=True,
                 storage_backend="memory",
-            ),
-            "v1-u1",
+            )
         )
         self.assertIsNone(
             resolve_l3_weight_version(
@@ -136,6 +136,7 @@ class StorageKeyTest(unittest.TestCase):
             ),
             "explicit",
         )
+        self.assertIn("require weight_version", L3_FLUSH_REQUIRES_WEIGHT_VERSION)
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(
