@@ -288,3 +288,8 @@ For orientation, one iteration of `event_loop`:
 * Never call `scheduler.advance`, `advance_scheduler`, or the KV event
   publisher from a helper or hooks class.
 * Never issue CUDA work, or hold something that can, from the control plane.
+* L3 `batch_exists` registration is on the admit path, but only when
+  `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
+  default (`--disable-kvstore`) path is a control-plane cost the loop must
+  not pay: a round is microseconds, and agentic history is tens of thousands
+  of tokens.

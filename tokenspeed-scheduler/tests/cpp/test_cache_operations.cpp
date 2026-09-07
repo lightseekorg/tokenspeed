@@ -450,6 +450,37 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
     EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
 }
 
+TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false,
+                                                   /*enable_l3_storage=*/false);
+    ASSERT_FALSE(coordinator.EnablesL3Storage());
+
+    CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(host_block);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.CacheHostBlock(host_block, key);
+    host_block.reset();
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 2);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_FALSE(admission->load_pairs[0].prefetch_from_storage);
+    EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
+}
+
 TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     BlockPool device_pool{4};
     BlockPool host_pool{4};

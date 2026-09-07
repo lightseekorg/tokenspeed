@@ -338,6 +338,10 @@ class EventLoop:
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        # L3 prefix hashing / batch_exists is paid only when a storage
+        # backend is configured. --disable-kvstore perf jobs still admit
+        # through _submit_scheduler_requests; they must not hash tokens.
+        self._enable_l3_storage = scheduler_cfg.enable_l3_storage
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
@@ -517,7 +521,8 @@ class EventLoop:
         )
 
     def _submit_scheduler_requests(self, specs) -> None:
-        self._register_l3_storage_hits(specs)
+        if self._enable_l3_storage:
+            self._register_l3_storage_hits(specs)
         self.scheduler.submit_requests(specs)
 
     def _clear_cache(self) -> bool:
@@ -532,16 +537,20 @@ class EventLoop:
         Cross-instance reuse cannot see Mooncake objects through the Host
         index. Probe them with the same content hashes the scheduler will
         use, then register only keys every TP rank agrees exist.
+
+        Skipped when L3 is unset: hashing the full token list is not free,
+        and --disable-kvstore admit still goes through this helper.
         """
 
-        if not specs:
+        if not specs or not self._enable_l3_storage:
             return
         hashes = []
         seen: set[str] = set()
         for spec in specs:
-            for content_hash in self.scheduler.prefix_hashes_for_tokens(
-                list(spec.tokens)
-            ):
+            tokens = spec.tokens
+            if not isinstance(tokens, list):
+                tokens = list(tokens)
+            for content_hash in self.scheduler.prefix_hashes_for_tokens(tokens):
                 if content_hash in seen:
                     continue
                 seen.add(content_hash)

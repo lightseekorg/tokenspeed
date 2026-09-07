@@ -367,7 +367,10 @@ Its responsibilities:
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
-  `register_storage_keys` / `unregister_storage_keys`. CI covers this path
+  `register_storage_keys` / `unregister_storage_keys`. That probe is skipped
+  when L3 is unset: Host-only and `--disable-kvstore` admission must not
+  hash prefixes or copy `group_keys` for a storage index that does not
+  exist. CI covers this path
   with the in-process `memory` backend (scheduler tests register keys /
   evict Host then assert `prefetch_from_storage`, and the CUDA runtime suite
   round-trips packed Host bytes through `batch_put_from` / Host wipe /

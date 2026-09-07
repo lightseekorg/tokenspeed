@@ -48,11 +48,13 @@ class _Scheduler:
         self.registered = None
         self.unregistered = None
         self.clear_result = True
+        self.hash_calls: list[list[int]] = []
 
     def submit_requests(self, specs) -> None:
         self.submitted.append(list(specs))
 
     def prefix_hashes_for_tokens(self, tokens):
+        self.hash_calls.append(list(tokens))
         return [f"h{len(tokens)}"]
 
     def expand_prefix_keys(self, hashes):
@@ -94,6 +96,7 @@ class _Loop:
         self.scheduler = _Scheduler()
         self.attn_tp_size = 1
         self.attn_tp_cpu_group = None
+        self._enable_l3_storage = exists_flags is not None
 
 
 def _spec(rid: str, tokens: list[int]):
@@ -108,6 +111,8 @@ def test_submit_without_l3_still_admits() -> None:
 
     assert loop.scheduler.submitted == [[spec]]
     assert loop.scheduler.registered is None
+    assert loop.scheduler.hash_calls == []
+    assert loop._device.pages is None
 
 
 def test_submit_registers_only_keys_l3_reports_present() -> None:
@@ -117,6 +122,7 @@ def test_submit_registers_only_keys_l3_reports_present() -> None:
     loop._submit_scheduler_requests([spec])
 
     assert loop.scheduler.submitted == [[spec]]
+    assert loop.scheduler.hash_calls == [[1, 2, 3, 4]]
     assert loop._device.pages == [(0, 0, "h4", 0)]
     assert loop.scheduler.registered == ([0], ["h4"], [0])
 

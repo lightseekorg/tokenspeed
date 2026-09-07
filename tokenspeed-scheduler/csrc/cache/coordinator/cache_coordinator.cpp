@@ -388,8 +388,13 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
-        out.host =
-            acquireHostWithKeys(probe.group_keys, out.device.num_common_tokens, std::move(probe.host), access_epoch);
+        if (enable_l3_storage_) {
+            out.host = acquireHostWithKeys(probe.group_keys, out.device.num_common_tokens, std::move(probe.host),
+                                           access_epoch);
+        } else {
+            out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
+                                                             std::move(probe.host), access_epoch);
+        }
     }
     return out;
 }
