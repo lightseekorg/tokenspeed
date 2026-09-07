@@ -345,12 +345,16 @@ victim policy and it **cannot be retracted again**. This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
 over-optimistic, and never makes anyone else wait.
 
-The exemption is latched only when a successful admission actually prepays
-the request's whole then-remaining generation budget. It must not be
-recomputed from the current remaining budget: decode consumes the prepaid
-headroom while reducing that budget, and treating spent headroom as if it
-were still reserved can leave every capacity-blocked request exempt from
-retraction, with no request able to free the next page.
+The exemption compares the windows the admission secured against the budget
+that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`
+— recoverable from the prefill window, because every retraction rebases and
+nothing else moves it), never against the current remaining budget. Decode
+spends the prepaid headroom exactly as fast as it shrinks that budget, so
+judging the window against today's remainder would count spent headroom as
+still held: a request that outgrew a partial reserve would look covered the
+moment its remainder dipped under the window — exactly when it needs a new
+page — and once every resident request looked covered, retraction would have
+no victim and nothing could free that page.
 
 ## 5. Invariants a change must preserve
 
@@ -379,6 +383,9 @@ retraction, with no request able to free the next page.
   window of an incomplete prefill rather than its whole token count.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
-- A request whose last successful admission prepaid its remaining generation
-  is never a victim (2); consuming a partial reserve cannot make that
-  admission retroactively qualify for the exemption.
+- A request whose admission prepaid the generation budget open at that
+  admission is never a victim (2); with the fresh-admission prepay this bounds
+  retraction to requests whose `max_new_tokens` exceeds one safe-step window
+  (or is undeclared). Spending a partial reserve never makes it qualify: the
+  exemption is judged against the budget open at admission, not the current
+  remainder (4).

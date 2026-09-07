@@ -436,7 +436,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
-    request->RecordAdmittedGenerationHeadroom(headroom);
 
     if (!match.extension_hashes.empty()) {
         coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
@@ -650,7 +649,7 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
     Request* victim = nullptr;
     for (Request* request : candidates) {
-        if (request->Is<fsm::Prefilling>() && !request->ReserveCoversGeneration() &&
+        if (request->Is<fsm::Prefilling>() && !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
             (victim == nullptr || request->TokenSize() > victim->TokenSize())) {
             victim = request;
         }
@@ -661,7 +660,8 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
 
     std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
     for (Request* request : candidates) {
-        if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) || request->ReserveCoversGeneration()) {
+        if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) ||
+            request->ReserveCoversGeneration(kRetractionSafeSteps)) {
             continue;
         }
         auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),

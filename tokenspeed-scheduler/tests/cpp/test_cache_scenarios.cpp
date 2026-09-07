@@ -2148,18 +2148,56 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
 
     constexpr std::int32_t kSafeSteps = 4096;
     EXPECT_EQ(request.RemainingNewTokens(), 5000);
+    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 6000) << "the budget the admission saw, before any decode";
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 4096) << "one window, not yet the remaining budget";
+    EXPECT_FALSE(request.ReserveCoversGeneration(kSafeSteps)) << "one window did not cover the 6000 open then";
     request.NoteRetracted();
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 5000)
         << "capped by the REMAINING budget: the generated 1000 are part of the rebased prompt now";
-    EXPECT_FALSE(request.ReserveCoversGeneration()) << "retraction invalidates the previous admission's reserve";
-    request.RecordAdmittedGenerationHeadroom(/*admitted_headroom=*/5000);
-    EXPECT_TRUE(request.ReserveCoversGeneration());
 
     request.Apply(
         fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});
     EXPECT_EQ(request.PrefillSize(), 1004) << "rebase folded prompt + generated into the prefill window";
     EXPECT_EQ(request.RemainingNewTokens(), 5000) << "rebasing does not change the remaining budget";
+    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 5000) << "and is what the readmission will see as open";
+    EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps)) << "two windows cover it: the readmission is exempt";
+}
+
+TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
+    // A 6000-token budget admitted behind one 4096 window is not covered, and
+    // must stay uncovered while decode spends that window: the remainder
+    // shrinks in step with the headroom, so holding the window against the
+    // CURRENT remainder would call the request covered the moment the
+    // remainder dipped under 4096 -- exactly when the spent window forces it
+    // to ask for a new page. With every resident request misjudged that way
+    // retraction has no victim and the pool never frees.
+    BlockPool pool(/*num_lcm_blocks=*/16);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    spec.max_new_tokens = 6000;
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*load_pairs=*/{}});
+    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
+    ASSERT_EQ(request.GeneratedTokens(), 4097);
+
+    constexpr std::int32_t kSafeSteps = 4096;
+    EXPECT_EQ(request.RemainingNewTokens(), 1903) << "the remainder has dipped under one window";
+    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 6000) << "but the admission's budget has not moved";
+    EXPECT_FALSE(request.ReserveCoversGeneration(kSafeSteps)) << "the window it holds is spent, not covering";
 }
 
 TEST(RetractionHeadroom, AnUndeclaredGenerationBudgetDemandsNone) {
@@ -2175,8 +2213,7 @@ TEST(RetractionHeadroom, AnUndeclaredGenerationBudgetDemandsNone) {
 
     constexpr std::int32_t kSafeSteps = 4096;
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 0);
-    request.RecordAdmittedGenerationHeadroom(/*admitted_headroom=*/0);
-    EXPECT_FALSE(request.ReserveCoversGeneration()) << "an undeclared budget never qualifies for exemption";
+    EXPECT_FALSE(request.ReserveCoversGeneration(kSafeSteps)) << "an undeclared budget never qualifies for exemption";
     request.NoteRetracted();
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 0) << "even after a retraction";
 }

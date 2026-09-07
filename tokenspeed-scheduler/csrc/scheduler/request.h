@@ -63,20 +63,25 @@ public:
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
-    void RecordAdmittedGenerationHeadroom(std::int32_t admitted_headroom) {
-        reserve_covers_generation_ = max_new_tokens_ > 0 && admitted_headroom >= RemainingNewTokens();
-    }
-    void NoteRetracted() {
-        ++retraction_count_;
-        reserve_covers_generation_ = false;
-    }
+    void NoteRetracted() { ++retraction_count_; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
     // freed -- so the victim policy skips it. (An undeclared budget is
     // never covered: nothing was reserved for it.)
-    bool ReserveCoversGeneration() const { return reserve_covers_generation_; }
+    //
+    // Judged against the budget that was open AT ADMISSION, never the
+    // current one. The windows were sized then, and decode spends them
+    // exactly as fast as it shrinks RemainingNewTokens(), so holding them
+    // against today's remainder would count spent headroom as still held:
+    // a request that outgrew a partial reserve would look covered the
+    // moment its remainder dipped under the window, and once every
+    // resident request looked covered nothing could be retracted to free
+    // the next page.
+    bool ReserveCoversGeneration(std::int32_t safe_steps) const {
+        return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
+    }
 
     // Tokens generated so far / still permitted. Both survive retraction's
     // RebasePrefill (which folds generated tokens into the prefill window):
@@ -85,6 +90,14 @@ public:
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+    // The budget that was still open when the current admission was granted.
+    // Rebasing is the only thing that moves the prefill window and every
+    // retraction rebases, so PrefillSize() minus the submitted prompt is
+    // exactly what had been generated at that admission -- frozen for its
+    // whole life, where RemainingNewTokens() shrinks with every decode.
+    std::int32_t RemainingNewTokensAtAdmission() const {
+        return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
+    }
 
     template <typename Event>
     void Apply(Event&& event) {
@@ -201,7 +214,6 @@ private:
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t retraction_count_{0};
-    bool reserve_covers_generation_{false};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;
