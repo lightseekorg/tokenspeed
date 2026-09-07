@@ -262,6 +262,10 @@ class EventLoop:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_size=self.attn_cp_size,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            pp_size=self.pp_size,
+            pp_cpu_group=self.pp_cpu_group,
             global_rank=global_rank,
         )
 

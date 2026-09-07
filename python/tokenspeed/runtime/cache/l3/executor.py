@@ -110,14 +110,14 @@ class L3HostStore:
         group_ids: Sequence[int],
         content_hashes: Sequence[str],
         page_offsets: Sequence[int],
-        *,
-        exists: Sequence[bool] | None = None,
+        exists: Sequence[bool] | None,
     ) -> tuple[list[int], list[str], list[int]]:
         """Return the subset of keys that exist in the store.
 
-        ``exists`` is an optional aligned mask (used after a TP all-reduce so
-        every rank registers the same L3 hits). When omitted, the backend is
-        queried locally.
+        ``exists`` is the replica-converged mask from ``batch_exists`` (or
+        ``None`` to probe this rank's backend locally). Callers must pass
+        it explicitly so a forgotten mask cannot silently diverge across
+        cache-owning ranks.
         """
 
         if not (len(group_ids) == len(content_hashes) == len(page_offsets)):

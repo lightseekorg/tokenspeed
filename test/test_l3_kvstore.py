@@ -202,13 +202,25 @@ class L3HostStoreTest(unittest.TestCase):
         host.host_buffer[:8] = b"\x00" * 8
         self.assertEqual(l3.prefetch(pages), [True])
         self.assertEqual(host.host_buffer[:8], b"abcdefgh")
-        groups, hashes, offsets = l3.present_keys([0, 0], ["h0", "miss"], [0, 0])
+        groups, hashes, offsets = l3.present_keys(
+            [0, 0], ["h0", "miss"], [0, 0], exists=None
+        )
         self.assertEqual(groups, [0])
         self.assertEqual(hashes, ["h0"])
         self.assertEqual(offsets, [0])
         self.assertEqual(
             l3.present_keys([0], ["h0"], [0], exists=[False]), ([], [], [])
         )
+        l3.close()
+
+    def test_present_keys_requires_exists_mask(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh")
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        signature = inspect.signature(l3.present_keys)
+        self.assertIs(signature.parameters["exists"].default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            l3.present_keys([0], ["h0"], [0])
         l3.close()
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):

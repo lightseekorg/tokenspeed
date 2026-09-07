@@ -367,7 +367,12 @@ Its responsibilities:
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
-  Host CacheBlock; a later Host miss that is known to exist in L3 allocates
+  Host CacheBlock. That L3 backup is asynchronous, so `WriteBackDone` /
+  `LoadBackDone` are intersected across every cache-owning rank
+  (attention TP, then CP, then PP; not DP) before `CompleteWriteBack`: a
+  finished local backup must not `CacheHostBlock` on one mirrored
+  scheduler while a CP/PP peer still has the op pending. A later Host
+  miss that is known to exist in L3 allocates
   a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint

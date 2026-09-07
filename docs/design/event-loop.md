@@ -296,7 +296,11 @@ For orientation, one iteration of `event_loop`:
   not pay: a round is microseconds, and agentic history is tens of thousands
   of tokens. When L3 is on, existence is MIN-reduced across every
   cache-owning rank in the replica (attention TP, then CP, then PP) so
-  those ranks admit the same prefix pages. Weight-update `flush_cache`
+  those ranks admit the same prefix pages. L2 ``WriteBackDone`` /
+  ``LoadBackDone`` completions are intersected the same way before
+  ``CompleteWriteBack``: L3 Host backups finish asynchronously, so a
+  rank-local ACK would publish a Host block on one mirrored scheduler
+  while a CP/PP peer still has the op pending. Weight-update `flush_cache`
   and standalone `/flush_cache` MIN-reduce a non-mutating
   `can_clear_cache` probe across the replica, then MIN-reduce an
   error-returning L3 `remove_by_prefix`, before any rank mutates
