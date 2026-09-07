@@ -115,10 +115,7 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
-        attn_tp_rank: int = 0,
-        storage_backend=None,
-        storage_key_prefix: str = "",
-        storage_rank: int = 0,
+        attn_tp_rank: int,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -159,14 +156,10 @@ class L2CacheExecutor:
         )
         self.l3_store = None
         self._l3_prefix_for_weight_version = None
-        if storage_backend is not None:
-            self.attach_l3_storage(
-                storage_backend,
-                key_prefix=storage_key_prefix,
-                rank=storage_rank,
-                cp_rank=0,
-                prefix_for_weight_version=lambda _version: storage_key_prefix,
-            )
+        # L3 is attached after Host allocation via ``attach_l3_storage`` with
+        # the complete namespace and shard identity. The constructor does
+        # not take a storage backend: a partial attach would share an empty
+        # prefix across ranks.
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(

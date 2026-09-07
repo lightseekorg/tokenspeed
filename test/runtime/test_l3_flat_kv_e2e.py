@@ -106,6 +106,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 host_ratio=1.0,
                 host_size_gb=0,
                 io_backend="direct",
+                attn_tp_rank=0,
             )
         store = self.MemoryKvStore()
         executor.attach_l3_storage(

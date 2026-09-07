@@ -385,7 +385,8 @@ Its responsibilities:
   context-parallel width (`cp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
   Hugging Face branch or local path is fingerprinted from the commit or
-  local tree actually loaded, so two instances cannot share a Mooncake
+  the contents of the local checkpoint actually loaded, so two instances
+  cannot share a Mooncake
   key while serving incompatible KV. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the

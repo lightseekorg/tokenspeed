@@ -152,11 +152,17 @@ class StorageKeyTest(unittest.TestCase):
 
     def test_checkpoint_id_fingerprints_local_weight_bytes(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
-            for directory, payload in ((first, b"aaa"), (second, b"bbbb")):
+            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
+            self.assertEqual(
+                os.path.getsize(os.path.join(first, "model.safetensors")), 3
+            )
+            self.assertEqual(
+                os.path.getsize(os.path.join(second, "model.safetensors")), 3
+            )
             self.assertNotEqual(
                 l3_checkpoint_id(first, hf_config=SimpleNamespace(), revision=""),
                 l3_checkpoint_id(second, hf_config=SimpleNamespace(), revision=""),

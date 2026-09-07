@@ -164,7 +164,7 @@ def l3_checkpoint_id(
     resolve different commits (or local trees) must not share Mooncake
     keys. Prefer the Hugging Face commit on the loaded config, then a
     snapshot directory name, then a local fingerprint of config/index
-    bytes and weight-file sizes.
+    bytes and weight-file contents.
     """
 
     commit = getattr(hf_config, "_commit_hash", None)
@@ -206,6 +206,7 @@ def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
 
 
 def _local_checkpoint_fingerprint(model_dir: str) -> str:
+    """Hash config/index bytes and every local weight file's contents."""
     hasher = hashlib.sha256()
     try:
         names = sorted(os.listdir(model_dir))
@@ -217,23 +218,27 @@ def _local_checkpoint_fingerprint(model_dir: str) -> str:
             continue
         if name in _CHECKPOINT_METADATA_FILES:
             hasher.update(name.encode())
-            with open(path, "rb") as handle:
-                hasher.update(handle.read())
+            _update_file_digest(hasher, path)
             continue
         lowered = name.lower()
         if lowered.endswith(_WEIGHT_FILE_SUFFIXES):
-            hasher.update(f"{name}:{os.path.getsize(path)}".encode())
+            hasher.update(name.encode())
+            _update_file_digest(hasher, path)
     return hasher.hexdigest()
 
 
-def _file_digest(path: str) -> str:
-    hasher = hashlib.sha256()
+def _update_file_digest(hasher, path: str) -> None:
     with open(path, "rb") as handle:
         while True:
             chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
             hasher.update(chunk)
+
+
+def _file_digest(path: str) -> str:
+    hasher = hashlib.sha256()
+    _update_file_digest(hasher, path)
     return hasher.hexdigest()
 
 

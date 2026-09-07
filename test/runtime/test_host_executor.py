@@ -472,6 +472,20 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             _Ack(object(), [1], [])
 
+    def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        signature = inspect.signature(L2CacheExecutor.__init__)
+        self.assertNotIn("storage_backend", signature.parameters)
+        self.assertNotIn("storage_key_prefix", signature.parameters)
+        self.assertNotIn("storage_rank", signature.parameters)
+        self.assertIs(
+            signature.parameters["attn_tp_rank"].default, inspect.Parameter.empty
+        )
+
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
@@ -684,6 +698,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 host_ratio=1.0,
                 host_size_gb=0,
                 io_backend=io_backend,
+                attn_tp_rank=0,
             )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool
