@@ -208,11 +208,6 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
   --port 8000
 ```
 
-Known limitation: native TokenSpeed DFlash bounds draft attention only where the
-draft checkpoint's `layer_types` declare `sliding_attention`; every other layer
-reads the full history. It does not yet expose an equivalent of SGLang's
-`--speculative-dflash-draft-window-size`, so a checkpoint that declares no
-window cannot be bounded at launch for long-context deployments.
 
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
 `--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
