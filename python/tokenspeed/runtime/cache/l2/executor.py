@@ -466,12 +466,23 @@ class L2CacheExecutor:
             return None
         return l3_store.exists(pages)
 
-    def rotate_l3_namespace(self) -> None:
+    def delete_l3_namespace(self) -> bool:
+        """Delete L3 objects under the current prefix. Device/Host stay intact.
+
+        Returns True when there is no L3 store, or the store reports the
+        prefix is gone. A failed wait or delete returns False so the
+        replica can skip ``ClearCache``.
+        """
+
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
-            return
-        self._wait_l3_backups()
-        l3_store.rotate_namespace()
+            return True
+        try:
+            self._wait_l3_backups()
+        except Exception:
+            logger.exception("L3 backup wait failed before namespace delete")
+            return False
+        return l3_store.rotate_namespace()
 
     def _transfer_ranges(
         self,

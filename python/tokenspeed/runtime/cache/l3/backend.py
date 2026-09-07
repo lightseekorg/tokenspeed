@@ -213,8 +213,12 @@ class KvStoreStorage(Protocol):
     ) -> list[bool]:
         """Write Host buffer slices into the store. True means the put succeeded."""
 
-    def remove_by_prefix(self, prefix: str) -> None:
-        """Remove every object whose key starts with ``prefix``."""
+    def remove_by_prefix(self, prefix: str) -> bool:
+        """Remove every object whose key starts with ``prefix``.
+
+        Returns True when matching objects are gone. False must not be
+        followed by an irreversible Device/Host ``ClearCache``.
+        """
 
     def close(self) -> None:
         """Release backend resources. Idempotent."""
@@ -266,12 +270,13 @@ class MemoryKvStore:
             results.append(True)
         return results
 
-    def remove_by_prefix(self, prefix: str) -> None:
+    def remove_by_prefix(self, prefix: str) -> bool:
         self._objects = {
             key: payload
             for key, payload in self._objects.items()
             if not key.startswith(prefix)
         }
+        return True
 
     def close(self) -> None:
         self._objects.clear()

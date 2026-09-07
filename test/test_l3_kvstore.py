@@ -225,7 +225,19 @@ class L3HostStoreTest(unittest.TestCase):
         self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
         self.assertEqual(restarted.exists(pages), [False])
 
-    def test_clear_raises_when_remote_delete_fails_and_keeps_the_prefix(self):
+    def test_clear_returns_false_when_remote_delete_fails_and_keeps_the_prefix(self):
+        backend = mock.Mock()
+        backend.remove_by_prefix.return_value = False
+        l3 = L3HostStore(
+            backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1, cp_rank=0
+        )
+        old_key = l3.object_key("h0", 0, 0)
+
+        self.assertFalse(l3.rotate_namespace())
+
+        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
+
+    def test_clear_returns_false_when_remote_delete_raises(self):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
@@ -233,8 +245,7 @@ class L3HostStoreTest(unittest.TestCase):
         )
         old_key = l3.object_key("h0", 0, 0)
 
-        with self.assertRaisesRegex(RuntimeError, "delete failed"):
-            l3.rotate_namespace()
+        self.assertFalse(l3.rotate_namespace())
 
         self.assertEqual(old_key, l3.object_key("h0", 0, 0))
 
@@ -399,16 +410,20 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter.store = store
         store.remove_by_regex.return_value = 0
 
-        adapter.remove_by_prefix("model.v1_")
+        self.assertTrue(adapter.remove_by_prefix("model.v1_"))
 
         store.remove_by_regex.assert_called_once_with(r"^model\.v1_.*", True)
+
+    def test_namespace_clear_without_remove_by_regex_is_failure(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = object()
+        self.assertFalse(adapter.remove_by_prefix("model_"))
 
     def test_namespace_clear_failure_is_not_reported_as_success(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = mock.Mock()
         adapter.store.remove_by_regex.return_value = -1
-        with self.assertRaisesRegex(RuntimeError, "Failed to clear"):
-            adapter.remove_by_prefix("model_")
+        self.assertFalse(adapter.remove_by_prefix("model_"))
 
     def test_segment_is_divided_across_tp_cp_and_pp_ranks(self):
         captured = {}

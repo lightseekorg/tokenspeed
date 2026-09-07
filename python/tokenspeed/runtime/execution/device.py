@@ -476,11 +476,17 @@ class DeviceHandle:
             return [], [], []
         return l2.l3_prefetch_storage_keys(execution_plan)
 
-    def rotate_l3_namespace(self) -> None:
-        """Invalidate this process's view of objects published before clear."""
+    def delete_l3_namespace(self) -> bool:
+        """Delete L3 objects under the current prefix. Device/Host stay intact.
 
-        if self._l2 is not None:
-            self._l2.rotate_l3_namespace()
+        Returns True when L2/L3 is unset or the store reports the prefix
+        is gone. Call this before ``ClearCache``; a False must leave
+        every rank's Device/Host indexes untouched.
+        """
+
+        if self._l2 is None:
+            return True
+        return self._l2.delete_l3_namespace()
 
     def set_l3_weight_version(self, weight_version: str) -> None:
         """Publish subsequent Host pages under the new checkpoint identity."""

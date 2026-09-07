@@ -661,11 +661,11 @@ class EventLoop:
     def _can_clear_cache(self) -> bool:
         return self.scheduler.can_clear_cache()
 
+    def _delete_l3_namespace(self) -> bool:
+        return self._device.delete_l3_namespace()
+
     def _clear_cache(self) -> bool:
-        cleared = self.scheduler.clear_cache()
-        if cleared:
-            self._device.rotate_l3_namespace()
-        return cleared
+        return self.scheduler.clear_cache()
 
     def _converge_l3_exists(self, exists: list[bool]) -> list[bool]:
         """MIN-reduce L3 exists across every cache-owning rank in this replica.

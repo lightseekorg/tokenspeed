@@ -384,13 +384,16 @@ Its responsibilities:
   standalone `/flush_cache` first MIN-reduce a non-mutating
   `CanClearCache` / `CacheIsClearable` probe across the same cache-owning
   ranks as L3 exists (attention TP, then CP, then PP; not DP) so no rank
-  mutates Device/Host or rotates L3 until every replica agrees the
-  indexes are clearable. Only then does each rank call `ClearCache`. A
-  failed probe or a failed clear keeps Device/Host (and the previous
-  checkpoint, on a weight update) intact and the caller retries; a split
-  flush would leave mirrored schedulers selecting different prefix
-  boundaries. Successful weight-update ranks must not enter the NCCL
-  broadcasts while a peer is still flushing. After a
+  mutates Device/Host until every replica agrees the indexes are
+  clearable. Remote L3 deletion is then an error-returning phase (no
+  raise into the event loop): each rank waits in-flight Host-to-store
+  backups, `remove_by_prefix`, and MIN-reduces that result. Only then
+  does each rank call `ClearCache`. A failed probe, a failed delete, or
+  a failed clear keeps Device/Host (and the previous checkpoint, on a
+  weight update) intact and the caller retries; a split flush would
+  leave mirrored schedulers selecting different prefix boundaries.
+  Successful weight-update ranks must not enter the NCCL broadcasts
+  while a peer is still flushing or has died on a Mooncake error. After a
   successful flush and GPU
   load, the hashed prefix is rebuilt so new KV is not published under
   the previous checkpoint. An explicit new `weight_version` with

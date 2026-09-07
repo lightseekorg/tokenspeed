@@ -70,16 +70,23 @@ class L3HostStore:
             raise ValueError("key_prefix must be non-empty")
         self._base_key_prefix = key_prefix
 
-    def rotate_namespace(self) -> None:
+    def rotate_namespace(self) -> bool:
         """Delete objects under this stable namespace.
 
         Cache flush / weight update is cluster-wide: every instance that
         shares the store must clear together. The prefix itself does not
         change, so a restarted peer still probes the same namespace and
         observes the deletion through ``batch_exists``.
+
+        Returns True when the store reports the prefix is gone. A False
+        must not be followed by Device/Host ``ClearCache``.
         """
 
-        self.backend.remove_by_prefix(f"{self.key_prefix}_")
+        try:
+            return bool(self.backend.remove_by_prefix(f"{self.key_prefix}_"))
+        except Exception:
+            logger.exception("L3 namespace delete failed")
+            return False
 
     def object_key(self, content_hash: str, group_id: int, page_offset: int) -> str:
         return storage_object_key(

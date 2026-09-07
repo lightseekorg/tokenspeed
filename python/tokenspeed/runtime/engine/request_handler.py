@@ -376,12 +376,13 @@ class RequestHandler:
         checkpoint intact so the caller can retry.
 
         Rank-local ``ClearCache`` is all-or-nothing, but a replica can still
-        split: one rank with no in-flight writebacks would clear and rotate
-        L3 while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces
-        first. An L3 writeback can still be in flight on one TP/CP/PP rank
-        after it has completed on the others; those successful ranks must
-        not enter ``update_weights_from_distributed`` (ordered NCCL
-        broadcasts) while a peer skips it.
+        split: one rank with no in-flight writebacks would clear Device/Host
+        while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces the
+        probe, then MIN-reduces L3 deletion, then clears. An L3 writeback
+        can still be in flight on one TP/CP/PP rank after it has completed
+        on the others; those successful ranks must not enter
+        ``update_weights_from_distributed`` (ordered NCCL broadcasts)
+        while a peer skips it.
         """
 
         if not recv_req.flush_cache:
@@ -395,17 +396,28 @@ class RequestHandler:
         return True, ""
 
     def _try_clear_replica_cache(self) -> bool:
-        """MIN-reduce clearability, then mutate Device/Host (and rotate L3).
+        """MIN-reduce clearability, delete L3, then mutate Device/Host.
 
         Mirrored schedulers must keep the same prefix indexes. A rank whose
-        Host writebacks have drained must not ``ClearCache`` / rotate L3
-        while a TP, CP, or PP peer still rejects. Same groups as L3 exists
-        (attention TP, then CP, then PP; not DP).
+        Host writebacks have drained must not ``ClearCache`` while a TP, CP,
+        or PP peer still rejects. Remote L3 deletion is its own
+        error-returning phase: it runs after the probe agrees and before
+        the irreversible local clear, then MIN-reduces so a Mooncake
+        failure cannot leave one rank cleared and another in NCCL.
+        Same groups as L3 exists (attention TP, then CP, then PP; not DP).
         """
 
         if not self._converge_replica_decision(self.can_clear_cache_fn()):
             return False
+        if not self._converge_replica_decision(self._delete_l3_namespace()):
+            return False
         return self.clear_cache_fn is not None and self.clear_cache_fn()
+
+    def _delete_l3_namespace(self) -> bool:
+        device = self._device
+        if device is None:
+            return True
+        return bool(device.delete_l3_namespace())
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every cache-owning rank in this replica.

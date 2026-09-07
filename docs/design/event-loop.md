@@ -298,8 +298,9 @@ For orientation, one iteration of `event_loop`:
   cache-owning rank in the replica (attention TP, then CP, then PP) so
   those ranks admit the same prefix pages. Weight-update `flush_cache`
   and standalone `/flush_cache` MIN-reduce a non-mutating
-  `can_clear_cache` probe across the replica before any rank mutates
-  Device/Host or rotates L3, then clears. Queued Submitted/Retracted
+  `can_clear_cache` probe across the replica, then MIN-reduce an
+  error-returning L3 `remove_by_prefix`, before any rank mutates
+  Device/Host. Queued Submitted/Retracted
   hashes are re-probed immediately before `next_execution_plan` so a hit
   registered at submit cannot be admitted after the object is gone.
   After Admit, vanished L3 objects are recovered on the same path:

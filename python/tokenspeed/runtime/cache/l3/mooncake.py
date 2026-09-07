@@ -294,20 +294,27 @@ class MooncakeKvStore:
                         results[missing_index[position]] = True
         return results
 
-    def remove_by_prefix(self, prefix: str) -> None:
+    def remove_by_prefix(self, prefix: str) -> bool:
         remover = getattr(self.store, "remove_by_regex", None)
         if not callable(remover):
-            raise RuntimeError(
+            logger.error(
                 "Installed Mooncake does not support remove_by_regex; refusing "
                 "to report a successful L3 cache clear"
             )
-        ret = remover(f"^{re.escape(prefix)}.*", True)
+            return False
+        try:
+            ret = remover(f"^{re.escape(prefix)}.*", True)
+        except Exception:
+            logger.exception(
+                "Mooncake remove_by_regex raised while clearing %s", prefix
+            )
+            return False
         # Mooncake returns the number of removed objects; negative values are
         # error codes.
         if ret < 0:
-            raise RuntimeError(
-                f"Failed to clear Mooncake L3 namespace, error code: {ret}"
-            )
+            logger.error("Failed to clear Mooncake L3 namespace, error code: %s", ret)
+            return False
+        return True
 
     def close(self) -> None:
         store = self.store

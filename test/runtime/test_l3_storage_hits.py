@@ -92,8 +92,9 @@ class _Device:
         self.pages = list(pages)
         return None if self.exists_flags is None else list(self.exists_flags)
 
-    def rotate_l3_namespace(self) -> None:
+    def delete_l3_namespace(self) -> bool:
         self.rotations += 1
+        return True
 
     def plan_has_l3_prefetch(self, plan) -> bool:
         del plan
@@ -122,6 +123,7 @@ class _Loop:
     _converge_l3_exists = EventLoop._converge_l3_exists
     _clear_cache = EventLoop._clear_cache
     _can_clear_cache = EventLoop._can_clear_cache
+    _delete_l3_namespace = EventLoop._delete_l3_namespace
     _recover_if_l3_prefetch_failed = EventLoop._recover_if_l3_prefetch_failed
 
     def __init__(self, exists_flags=None) -> None:
@@ -178,13 +180,22 @@ def test_submit_skips_register_when_l3_misses() -> None:
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
 
 
-def test_successful_clear_rotates_l3_namespace() -> None:
+def test_successful_clear_does_not_delete_l3() -> None:
     loop = _Loop(exists_flags=[True])
     assert loop._clear_cache()
-    assert loop._device.rotations == 1
+    assert loop._device.rotations == 0
 
     loop.scheduler.clear_result = False
     assert not loop._clear_cache()
+    assert loop._device.rotations == 0
+
+
+def test_delete_l3_namespace_does_not_clear_device() -> None:
+    loop = _Loop(exists_flags=[True])
+    assert loop._delete_l3_namespace()
+    assert loop._device.rotations == 1
+    loop.scheduler.clear_result = False
+    assert not loop._can_clear_cache()
     assert loop._device.rotations == 1
 
 
