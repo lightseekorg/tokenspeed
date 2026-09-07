@@ -514,6 +514,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         // Host-warm H2D destinations are already filled on Host. L3 prefetch
         // destinations are empty until LoadBackDone.success, so publishing
         // them here would leave Device prefix hits after a vanished object.
+        // A mixed hash (one group Host-warm, another L3) skips this call;
+        // CompleteLoadBack publishes every filled destination per group.
         const std::int32_t first_extension_slot = admission->device_prefix_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
             if (prefixHashPrefetchesFromStorage(admission->load_pairs, match.extension_hashes[i])) {

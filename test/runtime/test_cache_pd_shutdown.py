@@ -115,6 +115,12 @@ class _EventLoopHarness:
     ) -> None:
         self.trace.append("metrics")
 
+    def _revalidate_queued_l3_hits(self) -> None:
+        return
+
+    def _recover_if_l3_prefetch_failed(self, _execution_plan, _forward_op) -> list:
+        return []
+
 
 def test_event_loop_returns_without_work_when_shutdown_is_pre_set() -> None:
     loop = _EventLoopHarness(pre_set=True)

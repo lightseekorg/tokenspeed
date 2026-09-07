@@ -131,12 +131,15 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
         return;
     }
     // A missed batch_get_into must not publish empty Host or Device pages.
-    // Host-warm H2D destinations were already CacheFullBlocks'd at admit.
+    // Host-warm destinations of a mixed hash were not CacheFullBlocks'd at
+    // admit (the hash had an L3 prefetch sibling). Publish every filled
+    // destination; CacheHostBlock remains prefetch-only because Host-warm
+    // sources are already in the Host index.
     for (BlockTransfer& transfer : it->second) {
-        if (!success || !transfer.prefetch_from_storage) {
+        if (!success) {
             continue;
         }
-        if (transfer.source) {
+        if (transfer.prefetch_from_storage && transfer.source) {
             coordinator_.CacheHostBlock(transfer.source, transfer.key);
         }
         if (transfer.destination) {

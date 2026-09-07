@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <stdexcept>
@@ -515,6 +516,57 @@ TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
     EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(key))
         << "successful L3 prefetch must publish filled Device destinations";
+}
+
+TEST(CacheOperationTest, MixedHostAndL3LoadBackPublishesEveryDeviceDestination) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{4};
+    const std::array specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(host_block);
+    const CacheKey host_key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey l3_key{.group_id = 1, .content_hash = "h0"};
+    coordinator.CacheHostBlock(host_block, host_key);
+    host_block.reset();
+    coordinator.RegisterStorageKeys(std::array{l3_key});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 2);
+    std::vector<BlockTable> tables(2);
+    std::vector<GroupDemand> demands{
+        {.table = &tables[0], .num_tokens = 2},
+        {.table = &tables[1], .num_tokens = 2},
+    };
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 2u);
+    EXPECT_EQ(std::count_if(admission->load_pairs.begin(), admission->load_pairs.end(),
+                            [](const BlockTransfer& transfer) { return transfer.prefetch_from_storage; }),
+              1);
+
+    TierTransferManager transfers(coordinator);
+    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    transfers.CompleteLoadBack(op.op_id, true);
+    coordinator.Free(tables);
+    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(host_key))
+        << "Host-warm sibling of an L3 prefetch must still enter the Device index";
+    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(l3_key));
+    auto retry = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(retry.device.num_common_tokens, 2);
 }
 
 TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
