@@ -40,7 +40,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
-from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
+from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet, l3_unread_key_capacity
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
@@ -163,7 +163,15 @@ class L2CacheExecutor:
         # prefix across ranks.
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
-        self._l3_unread = L3UnreadKeySet(capacity=self.num_host_pages)
+        self._l3_unread = L3UnreadKeySet(
+            capacity=l3_unread_key_capacity(
+                num_host_pages=self.num_host_pages,
+                cache_blocks_per_lcm_block=tuple(
+                    int(group.cache_blocks_per_lcm_block)
+                    for group in self.layout.groups
+                ),
+            )
+        )
         logger.info(
             "Allocated %.2f GB compact Host L2 (%s LCM blocks, %s bytes/block)",
             requested_host_bytes / 1e9,

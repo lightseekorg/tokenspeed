@@ -444,12 +444,34 @@ def copy_host_bytes(host_buffer: Any, offset: int, size: int) -> bytes:
     return bytes(view)
 
 
+def l3_unread_key_capacity(
+    *, num_host_pages: int, cache_blocks_per_lcm_block: Sequence[int]
+) -> int:
+    """Return the unread-set bound in per-group CacheBlocks, not LCM parents.
+
+    Each Host LCM parent packs ``cache_blocks_per_lcm_block`` CacheBlocks
+    per group. Unread keys are those CacheBlocks, so a single multi-group
+    prefetch can insert more entries than ``num_host_pages``. Matching the
+    scheduler L3 shadow, capacity is ``num_host_pages`` times the sum of
+    each group's packing.
+    """
+
+    packed = 0
+    for count in cache_blocks_per_lcm_block:
+        if int(count) <= 0:
+            raise ValueError("cache_blocks_per_lcm_block must be positive")
+        packed += int(count)
+    if packed <= 0:
+        return max(int(num_host_pages), 1)
+    return max(int(num_host_pages) * packed, 1)
+
+
 class L3UnreadKeySet:
     """Failed L3 gets that must not be re-admitted from ``batch_exists``.
 
     A vanished or unreadable object can stay visible to ``batch_exists``.
     Those keys stay unread until the same page is successfully published
-    again, a namespace delete succeeds, or the set exceeds Host page
+    again, a namespace delete succeeds, or the set exceeds Host CacheBlock
     capacity (oldest first) so a long-lived process cannot accumulate
     every historical failure.
     """

@@ -321,7 +321,8 @@ For orientation, one iteration of `event_loop`:
   cannot re-register them; only the replica-converged misses are
   blacklisted, so a restored prefix page stays readable. A later
   successful Host backup forgets that unread entry so L3 reuse can
-  resume; the unread set is bounded to Host page capacity. A backend
+  resume; the unread set is bounded to Host CacheBlock capacity
+  (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN; raising would
   hang healthy peers. Clients are not failed.

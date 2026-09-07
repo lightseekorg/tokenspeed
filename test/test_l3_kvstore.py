@@ -36,6 +36,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
+    l3_unread_key_capacity,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
     storage_key_prefix,
@@ -718,6 +719,24 @@ class L3UnreadKeySetTest(unittest.TestCase):
         unread.forget_pages([(1, 99, "h5", 2)])
         self.assertFalse(unread.contains(1, "h5", 2))
 
+    def test_capacity_counts_packed_cache_blocks_not_lcm_parents(self):
+        self.assertEqual(
+            l3_unread_key_capacity(num_host_pages=2, cache_blocks_per_lcm_block=(4, 1)),
+            10,
+        )
+        unread = L3UnreadKeySet(
+            capacity=l3_unread_key_capacity(
+                num_host_pages=1, cache_blocks_per_lcm_block=(4, 1)
+            )
+        )
+        unread.mark(
+            [0, 0, 0, 0, 1],
+            ["h0", "h1", "h2", "h3", "h4"],
+            [0, 1, 2, 3, 0],
+        )
+        self.assertTrue(unread.contains(0, "h0", 0))
+        self.assertTrue(unread.contains(1, "h4", 0))
+
     def test_capacity_evicts_oldest_failure(self):
         unread = L3UnreadKeySet(capacity=2)
         unread.mark([0, 0, 0], ["h1", "h2", "h3"], [0, 0, 0])
@@ -734,6 +753,10 @@ class L3UnreadKeySetTest(unittest.TestCase):
     def test_capacity_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "capacity must be positive"):
             L3UnreadKeySet(capacity=0)
+
+    def test_unread_capacity_rejects_non_positive_packing(self):
+        with self.assertRaisesRegex(ValueError, "cache_blocks_per_lcm_block"):
+            l3_unread_key_capacity(num_host_pages=2, cache_blocks_per_lcm_block=(4, 0))
 
 
 class MemoryKvStoreTest(unittest.TestCase):

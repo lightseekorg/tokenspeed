@@ -355,7 +355,8 @@ so the next admit recomputes those tokens. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
 retry the same prefetch; only replica-converged misses are blacklisted.
 A later successful Host backup forgets that unread entry so L3 reuse can
-resume; the unread set is bounded to Host page capacity.
+resume; the unread set is bounded to Host CacheBlock capacity (LCM
+parents times each group's `cache_blocks_per_lcm_block`).
 A backend exception or malformed result is a
 local miss so every replica rank still enters the MIN-reduce. Clients
 are not failed.

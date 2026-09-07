@@ -486,7 +486,8 @@ Its responsibilities:
   the same prefetch. Successfully restored pages in a mixed prefetch
   stay readable. A later successful Host backup of a failed page
   forgets that unread entry so L3 reuse can resume; the unread set is
-  also bounded to Host page capacity. Clients are not failed; mixed
+  also bounded to Host CacheBlock capacity (LCM parents times each
+  group's `cache_blocks_per_lcm_block`). Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks
   stay aligned. Existence and prefetch are skipped when L3 is unset:
   Host-only and
