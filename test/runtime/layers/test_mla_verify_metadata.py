@@ -4,6 +4,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 sys.path.insert(
@@ -269,3 +270,132 @@ def test_the_cutedsl_drafter_backend_never_reaches_the_shared_dispatcher() -> No
 
     assert not hasattr(cutedsl_backend, "mla_decode_with_kvcache")
     assert hasattr(cutedsl_backend, "tokenspeed_mla_decode")
+
+
+def _run_cutedsl_decode(
+    monkeypatch,
+    *,
+    bs: int = 2,
+    q_len_per_req: int = 8,
+    draft_block_decode: bool = True,
+    block_size: int = 8,
+    sliding_window_size: int = -1,
+) -> dict:
+    """The CuteDSL leaf's decode call, with the kernel replaced by a probe."""
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    captured = {}
+
+    def fake_tokenspeed_mla_decode(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(*kwargs["query"].shape[:-1], 4)
+
+    monkeypatch.setattr(
+        cutedsl_backend, "tokenspeed_mla_decode", fake_tokenspeed_mla_decode
+    )
+    backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    spec = block_size if draft_block_decode else 1
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(
+        num_extends=0,
+        page_table=torch.zeros(bs * spec, 1, dtype=torch.int32),
+        max_seq_len_k=256,
+        seq_lens_k=seq_lens.repeat_interleave(spec),
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=seq_lens,
+    )
+    backend.draft_block_decode = draft_block_decode
+    backend.spec_num_tokens = spec
+    backend.is_draft = draft_block_decode
+    backend.data_type = torch.float32
+    backend.kv_lora_rank = 2
+    backend.qk_rope_head_dim = 2
+    backend.kv_cache_dim = 4
+    backend.kernel_page_size = 32
+    backend._cutedsl_workspace = lambda q_len: torch.empty(0, dtype=torch.int8)
+
+    layer = SimpleNamespace(
+        tp_q_head_num=1,
+        head_dim=4,
+        v_head_dim=4,
+        scaling=1.0,
+        k_scale_float=None,
+        layer_id=0,
+        sliding_window_size=sliding_window_size,
+    )
+    backend.forward_decode(
+        q=torch.zeros(bs * q_len_per_req, 4),
+        k=None,
+        v=None,
+        layer=layer,
+        out_cache_loc=torch.empty(0, dtype=torch.int32),
+        token_to_kv_pool=SimpleNamespace(
+            get_key_buffer=lambda layer_id: torch.zeros(32, 4)
+        ),
+        bs=bs,
+        save_kv_cache=False,
+    )
+    return captured
+
+
+def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(monkeypatch):
+    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=4095)
+
+    assert captured["query"].shape[:2] == (2, 8)
+    assert captured["block_tables"].shape[0] == 2
+    assert captured["seq_lens"].tolist() == [64, 128]
+    assert captured["window_left"] == 4095
+    assert captured["causal_mask"] is False
+
+
+def test_a_full_attention_cutedsl_block_folds_on_the_same_terms(monkeypatch):
+    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=-1)
+
+    assert captured["query"].shape[:2] == (2, 8)
+    assert captured["block_tables"].shape[0] == 2
+    assert captured["window_left"] == -1
+    assert captured["causal_mask"] is False
+
+
+def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeypatch):
+    captured = _run_cutedsl_decode(
+        monkeypatch, q_len_per_req=2, draft_block_decode=False
+    )
+
+    assert captured["query"].shape[:2] == (2, 2)
+    assert captured["seq_lens"].tolist() == [64, 128]
+    assert captured["window_left"] == -1
+    assert captured["causal_mask"] is True
+
+
+def test_a_narrower_cutedsl_draft_forward_refuses_to_drop_the_window(monkeypatch):
+    with pytest.raises(ValueError, match="query axis"):
+        _run_cutedsl_decode(monkeypatch, q_len_per_req=7, sliding_window_size=4095)
+
+
+def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None:
+    """Same invariant as the shared leaf: the fold rows are every spec-th entry."""
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    bs, spec, pages = 2, 4, 3
+    backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend.spec_num_tokens = spec
+    backend.max_context_len = 256
+    backend.draft_block_decode = True
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
+
+    page_table = torch.arange(bs * pages, dtype=torch.int32).view(bs, pages)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
+    metadata = backend.forward_decode_metadata
+
+    torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
+    torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens_k[0::spec])

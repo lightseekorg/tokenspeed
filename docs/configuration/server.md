@@ -218,7 +218,7 @@ target's page table: `--block-size` is a target-side choice and the draft
 follows it. Any sliding window the draft checkpoint declares is an attention
 mask applied by the draft's own layers, never a cache-retention policy of its
 own. Only the backends that forward that mask to their kernels can serve such a
-draft: `mla` (`gluon` on AMD) for MLA drafts, and
+draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
 `mha`/`fa3`/`fa4`/`triton`/`flashinfer`/`trtllm_mha` for GQA drafts. Any other
 `--drafter-attention-backend` is rejected at startup rather than quietly
 widening the draft's attention to the full history.

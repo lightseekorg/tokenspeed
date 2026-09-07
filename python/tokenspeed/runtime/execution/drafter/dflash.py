@@ -221,8 +221,9 @@ class DFlash(BaseDrafter):
             f"(window_left={sorted(windows)}), but the {backend_name!r} drafter "
             "attention backend ignores per-layer sliding windows and would "
             "silently give those layers full-history attention. Launch with "
-            "--drafter-attention-backend mla ('gluon' on AMD) for MLA drafts, "
-            "or one of mha/fa3/fa4/triton/flashinfer/trtllm_mha for GQA drafts."
+            "--drafter-attention-backend mla or tokenspeed_mla ('gluon' on "
+            "AMD) for MLA drafts, or one of "
+            "mha/fa3/fa4/triton/flashinfer/trtllm_mha for GQA drafts."
         )
 
     def _init_native_buffers(self) -> None:

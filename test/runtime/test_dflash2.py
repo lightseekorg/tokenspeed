@@ -232,7 +232,17 @@ def test_candidate_unary_logits_are_promoted_to_fp32() -> None:
 # Backend names, spelled as --drafter-attention-backend takes them, whose
 # kernel call sites forward layer.sliding_window_size.
 _WINDOW_AWARE_BACKENDS = frozenset(
-    ("mha", "fa3", "fa4", "triton", "flashinfer", "trtllm", "mla", "gluon")
+    (
+        "mha",
+        "fa3",
+        "fa4",
+        "triton",
+        "flashinfer",
+        "trtllm",
+        "mla",
+        "gluon",
+        "tokenspeed_mla",
+    )
 )
 
 
@@ -264,9 +274,9 @@ def test_only_the_documented_backends_apply_per_layer_sliding_windows() -> None:
 
 
 def test_a_sliding_window_draft_rejects_a_backend_that_drops_the_window() -> None:
-    drafter = _window_validator(4095, -1, supported=False, backend="tokenspeed_mla")
+    drafter = _window_validator(4095, -1, supported=False, backend="trtllm_mla")
 
-    with pytest.raises(ValueError, match="tokenspeed_mla.*ignores per-layer"):
+    with pytest.raises(ValueError, match="trtllm_mla.*ignores per-layer"):
         drafter._validate_draft_attention_window()
 
 
