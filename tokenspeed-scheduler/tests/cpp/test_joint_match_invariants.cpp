@@ -85,8 +85,9 @@ std::int32_t GroupPrefixBlocks(const CacheCoordinator& coordinator, const BlockP
     for (const std::string& hash : hashes) {
         keys.push_back(KeyFor(hash, group_id));
     }
-    const GroupPrefixProbe probe = coordinator.GroupMatcher(group_index)
-                                       .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks);
+    const GroupPrefixProbe probe =
+        coordinator.GroupMatcher(group_index)
+            .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks, /*extra_hits=*/nullptr);
     return static_cast<std::int32_t>(probe.hits.size());
 }
 

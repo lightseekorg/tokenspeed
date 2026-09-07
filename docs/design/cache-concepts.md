@@ -280,7 +280,9 @@ Perception rules per directory:
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
   right-to-left for a run backing a resumable boundary (non-closed). Mamba
   needs no matcher of its own: it is `SwaMatcher` at window 2 — "keep the
-  live state page plus its snapshot". A matcher only *reads* the group's
+  live state page plus its snapshot". `Probe` takes the L3 hit set as a
+  required argument (`nullptr` when storage is unset) so Host-only matching
+  cannot be selected by omitting it. A matcher only *reads* the group's
   index; it never touches allocation or physical placement.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).

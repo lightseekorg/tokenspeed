@@ -50,10 +50,11 @@ public:
     virtual std::int32_t BoundaryLookbackPages() const = 0;
     // Probes keys[begin_blocks, begin_blocks + max_blocks) against the index.
     // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
-    // extra_hits is an optional L3 storage index: keys known to exist below Host.
+    // extra_hits is the L3 storage index (keys known to exist below Host).
+    // Pass nullptr when L3 is unset; omitting it would silently skip L3 hits.
     virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
                                    std::int32_t begin_blocks, std::int32_t max_blocks,
-                                   const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const = 0;
+                                   const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const = 0;
 };
 
 // Full attention: a hit is a contiguous run with no holes, so both the device
@@ -65,7 +66,7 @@ public:
 
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
                            std::int32_t begin_blocks, std::int32_t max_blocks,
-                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const override {
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
@@ -96,7 +97,7 @@ public:
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
                            std::int32_t begin_blocks, std::int32_t max_blocks,
-                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const override {
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;

@@ -20,8 +20,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -77,6 +79,22 @@ TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
 
     const GroupPrefixProbe probe = mgr.Probe(pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1);
     EXPECT_TRUE(probe.hits.empty());
+}
+
+TEST(FullAttnMatcherTest, ProbeRequiresExplicitL3HitSet) {
+    BlockPool pool(8);
+    PrefixCacheIndex index(/*group_id=*/0);
+    const CacheKey key{.group_id = 0, .content_hash = "l3"};
+    const std::array keys{key};
+    std::unordered_set<CacheKey, CacheKeyHash> l3_hits{key};
+
+    EXPECT_TRUE(FullAttnMatcher{}
+                    .Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, /*extra_hits=*/nullptr)
+                    .hits.empty());
+    const GroupPrefixProbe probe =
+        FullAttnMatcher{}.Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, &l3_hits);
+    ASSERT_EQ(probe.hits.size(), 1u);
+    EXPECT_EQ(probe.hits.front(), 1);
 }
 
 TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {

@@ -1494,7 +1494,7 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
     PrefixMatch extra_owner = coordinator.GroupPrefixIndex(0).AcquireMatched(
         pool, first_key, /*begin_blocks=*/0,
         coordinator.GroupMatcher(0).Probe(coordinator.GroupPrefixIndex(0), pool, first_key, /*begin_blocks=*/0,
-                                          /*max_blocks=*/1),
+                                          /*max_blocks=*/1, /*extra_hits=*/nullptr),
         NextTestAccessEpoch());
     ASSERT_EQ(extra_owner.NumHitBlocks(), 1);
 
