@@ -7,6 +7,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.entrypoints.engine import Engine
 
 
 class TestRequestHandlerFlushCache(unittest.TestCase):
@@ -177,6 +178,75 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
+
+
+class TestEngineStampsDerivedL3Version(unittest.TestCase):
+    def _engine(self, *, storage_backend):
+        engine = Engine.__new__(Engine)
+        engine.server_args = mock.Mock(
+            weight_version="v1", kvstore_storage_backend=storage_backend
+        )
+        engine.tokenizer_manager = mock.Mock()
+        engine.llm = mock.Mock()
+        return engine
+
+    def test_successful_update_persists_derived_namespace(self):
+        engine = self._engine(storage_backend="memory")
+        engine.llm.run.return_value = (True, "ok")
+
+        engine.update_weights_from_distributed(
+            names=["w"],
+            dtypes=["float16"],
+            shapes=[[1]],
+            group_name="weight_update_group",
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        self.assertEqual(engine.server_args.weight_version, "v1-u1")
+
+        engine.update_weights_from_distributed(
+            names=["w"],
+            dtypes=["float16"],
+            shapes=[[1]],
+            group_name="weight_update_group",
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        self.assertEqual(engine.server_args.weight_version, "v1-u2")
+        req = engine.tokenizer_manager.update_weights_from_distributed.call_args.args[0]
+        self.assertEqual(req.weight_version, "v1-u2")
+
+    def test_failed_update_does_not_persist_derived_namespace(self):
+        engine = self._engine(storage_backend="memory")
+        engine.llm.run.return_value = (False, "nccl failed")
+
+        engine.update_weights_from_distributed(
+            names=["w"],
+            dtypes=["float16"],
+            shapes=[[1]],
+            group_name="weight_update_group",
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        self.assertEqual(engine.server_args.weight_version, "v1")
+
+    def test_without_l3_omitted_version_does_not_stamp(self):
+        engine = self._engine(storage_backend=None)
+        engine.llm.run.return_value = (True, "ok")
+
+        engine.update_weights_from_distributed(
+            names=["w"],
+            dtypes=["float16"],
+            shapes=[[1]],
+            group_name="weight_update_group",
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        self.assertEqual(engine.server_args.weight_version, "v1")
 
 
 if __name__ == "__main__":

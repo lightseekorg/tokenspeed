@@ -378,7 +378,10 @@ Its responsibilities:
   drain does not wait for those). When L3 is on and the update omits
   `weight_version`, a unique successor (`{current}-uN`) is derived so the
   Engine `update_weights_from_distributed` path cannot republish under the
-  startup namespace. `ENABLE_CP` workers share `attn_tp_rank==0`
+  startup namespace. After a successful RPC the Engine facade stamps that
+  successor into `server_args.weight_version` so a later omitted-version
+  call derives `{current}-u2` instead of repeating `-u1`.
+  `ENABLE_CP` workers share `attn_tp_rank==0`
   and are distinguished by `c{cp_rank}`. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.

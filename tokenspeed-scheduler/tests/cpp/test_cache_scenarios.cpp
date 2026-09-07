@@ -4465,7 +4465,8 @@ TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
     ASSERT_EQ(op->input_lengths.size(), 1u);
-    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "first-chunk window must restart from the Host-allocatable L3 prefix";
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "retry must release the discarded admission's load_pairs or the Host "
+                                                  "pages stay pinned and the window collapses to a full miss";
     EXPECT_EQ(op->input_lengths.at(0), 4);
     EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
 }

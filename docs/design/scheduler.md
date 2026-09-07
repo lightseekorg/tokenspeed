@@ -21,7 +21,9 @@ request stays put.
 When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
 `host_prefix_tokens` and rounds that length down to `prefix_granularity`
 (the identity boundary every group's `block_granularity` divides).
-`schedulePrefillFirstChunk` then frees that attempt and retries from the
+`schedulePrefillFirstChunk` then frees that attempt — including the
+discarded `AdmissionResult`, whose `load_pairs` pin Host sources and
+Device destinations independently of the tables — and retries from the
 shortened probe so `hit_tokens` / `tokens_this_round` match the tables.
 Re-probing is not enough: the same L3 keys would look like a full hit again.
 

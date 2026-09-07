@@ -327,7 +327,9 @@ and the update RPC then fails so the caller retries instead of publishing
 new KV under a mixed namespace. If the update omits `weight_version`
 while L3 is enabled, a unique successor (`{current}-uN`) is derived so
 `Engine.update_weights_from_distributed` cannot republish under the
-startup namespace. Context-parallel workers (`ENABLE_CP`) share
+startup namespace. A successful Engine update stamps that successor into
+frontend `server_args` so the next omitted-version call cannot reuse it.
+Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}`.
 `global_segment_size` is split across
 attention-TP × pipeline-parallel ranks so the mounted total matches the

@@ -417,8 +417,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         if (admitted_hit_tokens >= hit_tokens) {
             break;
         }
+        // load_pairs own Host sources and extra Device dest refs; Free(tables)
+        // does not drop those pins. Save the shortened boundary and release
+        // the discarded admission before the next Admit.
+        const std::int32_t shortened_host_prefix = admission->host_prefix_tokens;
+        admission.reset();
         coordinator_.Free(tables);
-        host_prefix_cap = admission->host_prefix_tokens;
+        host_prefix_cap = shortened_host_prefix;
         host_prefix_cap -= host_prefix_cap % prefix_granularity;
     }
 

@@ -657,6 +657,36 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     coordinator.Free(tables);
 }
 
+TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_FALSE(admission->load_pairs.empty());
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+
+    coordinator.Free(tables);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 0)
+        << "Host sources in load_pairs stay pinned after Free(tables); retry must reset admission";
+    admission.reset();
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 2);
+}
+
 TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
     BlockPool device_pool{8};
     BlockPool host_pool{2};

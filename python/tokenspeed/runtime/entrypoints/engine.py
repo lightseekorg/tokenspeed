@@ -383,7 +383,13 @@ class Engine(EngineBase):
             flush_cache=flush_cache,
             weight_version=weight_version,
         )
-        return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
+        result = self.llm.run(
+            self.tokenizer_manager.update_weights_from_distributed(obj)
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
 
     def update_weights_from_tensor(
         self,
