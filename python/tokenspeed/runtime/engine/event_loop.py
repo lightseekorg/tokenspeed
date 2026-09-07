@@ -599,12 +599,9 @@ class EventLoop:
                 group_ids, content_hashes, page_offsets
             )
         ]
-        exists = self._device.query_l3_storage(pages)
-        if exists is None:
-            return
-        if len(exists) != len(group_ids):
-            raise RuntimeError("L3 existence result is not aligned with cache keys")
-        exists = self._converge_l3_exists(exists)
+        exists = self._converge_l3_exists(
+            self._l3_exists_or_miss(pages, expected_len=len(group_ids))
+        )
         hit_groups = []
         hit_hashes = []
         hit_offsets = []
@@ -641,6 +638,8 @@ class EventLoop:
         still miss. Prefetch on this control-plane turn, MIN-reduce across
         the replica, then skip H2D / skip publishing empty Host pages and
         retract (snapshot-less) so the next admit recomputes those tokens.
+        A backend exception or malformed result is a local miss so every
+        rank still enters the MIN-reduce; raising would hang healthy peers.
         Failed keys stay unread: a later ``batch_exists`` hit must not
         re-register them and retry the same prefetch. The whole forward is
         skipped so ranks stay aligned; mixed prefill/decode partners retract
@@ -651,7 +650,7 @@ class EventLoop:
             return []
         if not self._device.plan_has_l3_prefetch(execution_plan):
             return []
-        local_ok = self._device.prefetch_l3_load_backs(execution_plan)
+        local_ok = self._l3_prefetch_ok_or_miss(execution_plan)
         if not self.request_handler.converge_replica_decision(local_ok):
             self._device.invalidate_l3_prefetch()
             groups, hashes, offsets = self._device.l3_prefetch_storage_keys(
@@ -674,6 +673,50 @@ class EventLoop:
             )
             return retracted
         return []
+
+    def _l3_exists_or_miss(self, pages, *, expected_len: int) -> list[bool]:
+        """Probe L3 without skipping the replica MIN-reduce on a local fault.
+
+        A backend exception or a malformed result becomes an all-miss vector
+        of ``expected_len`` so every cache-owning rank still enters
+        ``_converge_l3_exists``. Raising here would leave peers blocked in
+        that collective.
+        """
+
+        try:
+            exists = self._device.query_l3_storage(pages)
+        except Exception:
+            logger.exception(
+                "L3 existence probe failed; treating keys as misses so replica "
+                "ranks can converge"
+            )
+            return [False] * expected_len
+        if exists is None or len(exists) != expected_len:
+            if exists is not None:
+                logger.error(
+                    "L3 existence result is not aligned with cache keys: "
+                    "ok_flags=%s keys=%s",
+                    len(exists),
+                    expected_len,
+                )
+            return [False] * expected_len
+        return exists
+
+    def _l3_prefetch_ok_or_miss(self, execution_plan) -> bool:
+        """Prefetch Host pages from L3, or return False if the RPC faults.
+
+        Peers must still enter ``converge_replica_decision``. A raised
+        ``batch_get_into`` on one rank would otherwise hang the replica.
+        """
+
+        try:
+            return bool(self._device.prefetch_l3_load_backs(execution_plan))
+        except Exception:
+            logger.exception(
+                "L3 prefetch RPC failed; treating as a miss so replica ranks "
+                "can converge"
+            )
+            return False
 
     def _can_clear_cache(self) -> bool:
         return self.scheduler.can_clear_cache()

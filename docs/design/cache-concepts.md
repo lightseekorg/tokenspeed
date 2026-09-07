@@ -465,7 +465,10 @@ Its responsibilities:
   skips publishing empty Host pages (`LoadBackDone.success=false`),
   skips Device prefix publication for those prefetch destinations,
   skips the model forward, and retracts the batch snapshot-less so the
-  next admit recomputes those tokens. Failed `batch_get_into` keys stay
+  next admit recomputes those tokens. A backend exception or malformed
+  result is converted to a local miss before that MIN-reduce so a
+  faulted rank cannot skip the collective and hang healthy peers. Failed
+  `batch_get_into` keys stay
   unread: a later `batch_exists` hit must not re-register them and retry
   the same prefetch. Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks

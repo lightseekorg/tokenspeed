@@ -135,6 +135,8 @@ class _Loop:
     _register_l3_storage_hits = EventLoop._register_l3_storage_hits
     _revalidate_queued_l3_hits = EventLoop._revalidate_queued_l3_hits
     _sync_l3_storage_keys = EventLoop._sync_l3_storage_keys
+    _l3_exists_or_miss = EventLoop._l3_exists_or_miss
+    _l3_prefetch_ok_or_miss = EventLoop._l3_prefetch_ok_or_miss
     _converge_l3_exists = EventLoop._converge_l3_exists
     _clear_cache = EventLoop._clear_cache
     _can_clear_cache = EventLoop._can_clear_cache
@@ -398,6 +400,77 @@ def test_namespace_delete_forgets_unread_l3_keys(monkeypatch) -> None:
     loop.scheduler.waiting_hashes = ["h4"]
     loop._revalidate_queued_l3_hits()
     assert loop.scheduler.registered == ([0], ["h4"], [0])
+
+
+def test_prefetch_rpc_error_converges_then_retracts(monkeypatch) -> None:
+    """A local batch_get_into exception must still enter the replica MIN."""
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    converged: list[bool] = []
+
+    def boom(plan) -> bool:
+        del plan
+        loop._device.prefetch_calls += 1
+        raise RuntimeError("batch_get_into failed")
+
+    def converge(local_ok):
+        converged.append(local_ok)
+        return local_ok
+
+    loop._device.prefetch_l3_load_backs = boom
+    loop.request_handler = SimpleNamespace(converge_replica_decision=converge)
+    events = loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert converged == [False]
+    assert events == ["retract:r0"]
+    assert loop._device.invalidations == 1
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
+def test_exists_rpc_error_converges_as_misses() -> None:
+    """A local batch_exists exception must still enter the replica MIN."""
+
+    loop = _Loop(exists_flags=[True])
+    probed: list[list[bool]] = []
+    bound = loop._converge_l3_exists
+
+    def wrapped(exists):
+        probed.append(list(exists))
+        return bound(exists)
+
+    loop._converge_l3_exists = wrapped
+
+    def boom(pages):
+        loop._device.pages = list(pages)
+        raise RuntimeError("batch_is_exist failed")
+
+    loop._device.query_l3_storage = boom
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+    assert probed == [[False]]
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
+def test_exists_length_mismatch_converges_as_misses() -> None:
+    loop = _Loop(exists_flags=[True, True])
+    probed: list[list[bool]] = []
+    bound = loop._converge_l3_exists
+
+    def wrapped(exists):
+        probed.append(list(exists))
+        return bound(exists)
+
+    loop._converge_l3_exists = wrapped
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+    assert probed == [[False]]
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
 
 
 def test_l3_prefetch_success_does_not_retract() -> None:
