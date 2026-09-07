@@ -18,6 +18,7 @@ from collections.abc import Mapping
 import torch
 from tokenspeed_kernel import (
     dsv4_decode,
+    dsv4_padded_heads,
     dsv4_plan,
     dsv4_prefill,
     dsv4_reset_attention_state,
@@ -1086,14 +1087,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         workspace = self._decode_q_padding_workspace
         if workspace is None:
-            workspace = torch.zeros(
-                (max_query_tokens, padded_heads, q.shape[2]),
-                dtype=q.dtype,
-                device=q.device,
+            raise RuntimeError(
+                "DeepSeek V4 decode query padding workspace must be allocated "
+                "during decode-state initialization"
             )
-            self._decode_q_padding_workspace = workspace
-            self._decode_q_padding_workspace_layout = layout
-        elif layout != self._decode_q_padding_workspace_layout:
+        if layout != self._decode_q_padding_workspace_layout:
             raise ValueError(
                 "DeepSeek V4 decode query padding layout changed after allocation: "
                 f"expected={self._decode_q_padding_workspace_layout}, actual={layout}"
@@ -1771,6 +1769,24 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         self._decode_q_padding_workspace = None
         self._decode_q_padding_workspace_layout = None
+        padded_heads = dsv4_padded_heads(self.num_qo_heads)
+        if padded_heads != self.num_qo_heads:
+            self._decode_q_padding_workspace = torch.zeros(
+                (
+                    self.graph.max_bs * self.graph.max_tokens_per_req,
+                    padded_heads,
+                    self.head_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._decode_q_padding_workspace_layout = (
+                self._decode_q_padding_workspace.device,
+                self._decode_q_padding_workspace.dtype,
+                self.num_qo_heads,
+                padded_heads,
+                self.head_dim,
+            )
         self.draft_rounds = DeepseekV4DraftRounds(self.graph) if self.is_draft else None
         specs = self._configure_cache_group_contract(
             cache_group_specs,

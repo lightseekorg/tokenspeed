@@ -2963,13 +2963,23 @@ class TestDeepseekV4Config(unittest.TestCase):
                 dtype=torch.bfloat16,
                 is_draft=False,
                 speculative_num_draft_tokens=1,
-                head_dim=512,
+                head_dim=4,
                 context_len=4096,
             )
         )
         backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=2)
+        self.assertIsNotNone(backend._decode_q_padding_workspace)
+        self.assertEqual(
+            tuple(backend._decode_q_padding_workspace.shape),
+            (8, 64, 4),
+        )
         first_q = torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4)
-        first_padded = backend._pad_decode_query(first_q, padded_heads=64)
+        with patch.object(
+            torch,
+            "zeros",
+            side_effect=AssertionError("decode query padding allocated after init"),
+        ):
+            first_padded = backend._pad_decode_query(first_q, padded_heads=64)
 
         self.assertEqual(first_padded.shape, (2, 64, 4))
         self.assertTrue(torch.equal(first_padded[:, :16], first_q))
