@@ -374,10 +374,12 @@ Its responsibilities:
   (`model` + `--revision` + `--weight-version`), the packed CacheBlock
   layout (dtype and field geometry), the pipeline stage, and the speculative
   draft checkpoint when a separate draft pool is present. A live weight
-  load rebuilds that prefix after the GPU update so new KV is not published
-  under the previous checkpoint; a requested cache flush must succeed
-  first, because `ClearCache` rejects in-flight Host writebacks (pause
-  drain does not wait for those). An explicit new `weight_version` with
+  load flushes Device/Host first so new parameters cannot reuse the
+  previous checkpoint. `ClearCache` rejects in-flight Host writebacks
+  (pause drain does not wait for those); the RPC then fails before the
+  GPU load and the caller retries. After a successful flush and GPU
+  load, the hashed prefix is rebuilt so new KV is not published under
+  the previous checkpoint. An explicit new `weight_version` with
   `flush_cache=False` is rejected before the GPU load when L3 is on:
   Device/Host still hold the previous checkpoint, and D2H copies not yet
   in `_backup_futures` would later be stored under the new namespace.

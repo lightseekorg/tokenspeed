@@ -43,7 +43,13 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.clear_cache_fn = mock.Mock(
             side_effect=lambda: order.append("flush") or True
         )
-        handler._device.update_weights.return_value = (True, "ok")
+
+        def _update_weights(req):
+            del req
+            order.append("gpu")
+            return True, "ok"
+
+        handler._device.update_weights.side_effect = _update_weights
         handler._device.set_l3_weight_version.side_effect = (
             lambda version: order.append(("prefix", version))
         )
@@ -57,7 +63,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
-        self.assertEqual(order, ["flush", ("prefix", "v2")])
+        self.assertEqual(order, ["flush", "gpu", ("prefix", "v2")])
         self.assertEqual(handler.server_args.weight_version, "v2")
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertIsInstance(output, UpdateWeightsFromDistributedReqOutput)
@@ -77,7 +83,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
-        handler.clear_cache_fn.assert_not_called()
+        handler.clear_cache_fn.assert_called_once_with()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
 
@@ -160,6 +166,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.process_requests([req])
 
         handler.clear_cache_fn.assert_called_once_with()
+        handler._device.update_weights.assert_not_called()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
         output = handler.send_func.send_pyobj.call_args.args[0]
@@ -181,6 +188,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
+        handler._device.update_weights.assert_not_called()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
         output = handler.send_func.send_pyobj.call_args.args[0]

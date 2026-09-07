@@ -60,9 +60,10 @@ class L3HostStore:
     def set_key_prefix(self, key_prefix: str) -> None:
         """Publish and restore under a new namespace without deleting it.
 
-        Live weight updates change ``weight_version`` after the GPU load.
-        Flush / ``rotate_namespace`` still deletes the *current* prefix
-        first so stale KV is gone before this switches the writers.
+        Live weight updates change ``weight_version`` after Device/Host
+        have been flushed and the GPU load succeeds. Flush /
+        ``rotate_namespace`` still deletes the *current* prefix first so
+        stale KV is gone before this switches the writers.
         """
 
         if not key_prefix:

@@ -322,14 +322,14 @@ Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, `--revision`,
 `--weight-version`), the packed layout, the pipeline stage, and any
-speculative draft checkpoint. Live weight updates rebuild that prefix
-after the GPU load. A requested `flush_cache` must succeed before the
-prefix switches: in-flight Host writebacks cause `ClearCache` to reject,
-and the update RPC then fails so the caller retries instead of publishing
-new KV under a mixed namespace. Supplying a new `weight_version` with
-`flush_cache=False` is rejected when L3 is on so stale Device/Host KV
-and in-flight D2H copies cannot be treated as the new checkpoint.
-If the update omits `weight_version`
+speculative draft checkpoint. Live weight updates flush Device/Host
+before the GPU load, then rebuild that prefix. A requested `flush_cache`
+must succeed first: in-flight Host writebacks cause `ClearCache` to
+reject, and the update RPC then fails so the caller retries instead of
+serving new weights against the previous checkpoint. Supplying a new
+`weight_version` with `flush_cache=False` is rejected when L3 is on so
+stale Device/Host KV and in-flight D2H copies cannot be treated as the
+new checkpoint. If the update omits `weight_version`
 while L3 is enabled, a unique successor (`{current}-uN`) is derived so
 `Engine.update_weights_from_distributed` cannot republish under the
 startup namespace. A successful Engine update stamps that successor into

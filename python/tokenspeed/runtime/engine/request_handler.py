@@ -272,6 +272,8 @@ class RequestHandler:
                 # RL weight sync: receive broadcast weights + load into the model.
                 ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if ok:
+                    ok, msg = self._flush_cache_before_weight_load(recv_req)
+                if ok:
                     ok, msg = self._device.update_weights(recv_req)
                     if ok:
                         ok, msg = self._commit_l3_weight_version(recv_req, msg)
@@ -316,35 +318,44 @@ class RequestHandler:
             "and in-flight writebacks cannot land in the new namespace",
         )
 
-    def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
-        """Flush the old L3 namespace, then publish under the new checkpoint.
+    def _flush_cache_before_weight_load(self, recv_req) -> tuple[bool, str]:
+        """Invalidate Device/Host (and L3 objects) before replacing GPU weights.
 
-        ``flush_cache`` deletes objects under the *current* prefix. The
-        prefix is rebuilt afterwards so newly computed KV cannot land in a
-        peer still serving the previous ``weight_version``. A requested
-        flush that fails must not switch the prefix: GPU weights may
-        already be loaded, so the RPC reports failure and the caller
-        retries after in-flight Host writebacks drain. When L3 is enabled
-        and the caller omits ``weight_version``, a unique successor is
-        derived so the Engine path cannot republish under the startup
-        namespace. An explicit new version with ``flush_cache=False`` is
-        rejected before the GPU load.
+        ``ClearCache`` rejects in-flight Host writebacks. Doing this after
+        ``update_weights`` would leave new parameters on the old prefix
+        indexes with no rollback. A failed flush keeps the previous
+        checkpoint intact so the caller can retry.
+        """
+
+        if not recv_req.flush_cache:
+            return True, ""
+        if self.clear_cache_fn is None or not self.clear_cache_fn():
+            return (
+                False,
+                "cache flush failed; retry the update after in-flight "
+                "Host writebacks drain",
+            )
+        return True, ""
+
+    def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
+        """Publish under the new checkpoint after a successful GPU load.
+
+        Device/Host have already been flushed when ``flush_cache`` was
+        requested. The prefix is rebuilt here so newly computed KV cannot
+        land in a peer still serving the previous ``weight_version``. When
+        L3 is enabled and the caller omits ``weight_version``, a unique
+        successor is derived so the Engine path cannot republish under the
+        startup namespace. An explicit new version with ``flush_cache=False``
+        is rejected before the GPU load.
         """
 
         ok, err = self._require_flush_for_l3_version_switch(recv_req)
         if not ok:
             return False, err
-        flush_cache = recv_req.flush_cache
-        if flush_cache:
-            if self.clear_cache_fn is None or not self.clear_cache_fn():
-                return (
-                    False,
-                    "cache flush failed after weights were loaded; retry the update",
-                )
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
             recv_req.weight_version,
-            flush_cache=flush_cache,
+            flush_cache=recv_req.flush_cache,
             storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
         )
         if version is None:
