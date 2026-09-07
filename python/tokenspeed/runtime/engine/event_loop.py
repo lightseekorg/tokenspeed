@@ -641,38 +641,54 @@ class EventLoop:
         A backend exception or malformed result is a local miss so every
         rank still enters the MIN-reduce; raising would hang healthy peers.
         Failed keys stay unread: a later ``batch_exists`` hit must not
-        re-register them and retry the same prefetch. The whole forward is
-        skipped so ranks stay aligned; mixed prefill/decode partners retract
-        rather than finish with an error.
+        re-register them and retry the same prefetch. Only pages whose
+        replica-converged ``batch_get_into`` missed are blacklisted;
+        successfully restored leading pages stay readable. The whole
+        forward is skipped so ranks stay aligned; mixed prefill/decode
+        partners retract rather than finish with an error.
         """
 
         if not self._enable_l3_storage:
             return []
         if not self._device.plan_has_l3_prefetch(execution_plan):
             return []
-        local_ok = self._l3_prefetch_ok_or_miss(execution_plan)
-        if not self.request_handler.converge_replica_decision(local_ok):
-            self._device.invalidate_l3_prefetch()
-            groups, hashes, offsets = self._device.l3_prefetch_storage_keys(
-                execution_plan
-            )
+        groups, hashes, offsets = self._device.l3_prefetch_storage_keys(execution_plan)
+        local_ok = self._l3_prefetch_ok_or_miss(
+            execution_plan, expected_len=len(groups)
+        )
+        ok = self._converge_l3_exists(local_ok)
+        if all(ok):
+            return []
+        self._device.invalidate_l3_prefetch()
+        failed_groups = []
+        failed_hashes = []
+        failed_offsets = []
+        for group_id, content_hash, page_offset, present in zip(
+            groups, hashes, offsets, ok
+        ):
+            if present:
+                continue
+            failed_groups.append(int(group_id))
+            failed_hashes.append(str(content_hash))
+            failed_offsets.append(int(page_offset))
+        if failed_groups:
             self._device.mark_l3_keys_unread(
-                groups=groups, hashes=hashes, offsets=offsets
+                groups=failed_groups, hashes=failed_hashes, offsets=failed_offsets
             )
-            if groups:
-                self.scheduler.unregister_storage_keys(groups, hashes, offsets)
-            retracted = []
-            if forward_op is not None:
-                for rid in forward_op.request_ids:
-                    retracted.append(make_retract_event(rid))
-            logger.warning(
-                "L3 prefetch missed after admit; unregistered %s key(s) and "
-                "retracted %s request(s) for recompute",
-                len(groups),
-                len(retracted),
+            self.scheduler.unregister_storage_keys(
+                failed_groups, failed_hashes, failed_offsets
             )
-            return retracted
-        return []
+        retracted = []
+        if forward_op is not None:
+            for rid in forward_op.request_ids:
+                retracted.append(make_retract_event(rid))
+        logger.warning(
+            "L3 prefetch missed after admit; unregistered %s key(s) and "
+            "retracted %s request(s) for recompute",
+            len(failed_groups),
+            len(retracted),
+        )
+        return retracted
 
     def _l3_exists_or_miss(self, pages, *, expected_len: int) -> list[bool]:
         """Probe L3 without skipping the replica MIN-reduce on a local fault.
@@ -702,21 +718,34 @@ class EventLoop:
             return [False] * expected_len
         return exists
 
-    def _l3_prefetch_ok_or_miss(self, execution_plan) -> bool:
-        """Prefetch Host pages from L3, or return False if the RPC faults.
+    def _l3_prefetch_ok_or_miss(
+        self, execution_plan, *, expected_len: int
+    ) -> list[bool]:
+        """Prefetch Host pages from L3, or miss every key if the RPC faults.
 
-        Peers must still enter ``converge_replica_decision``. A raised
+        Peers must still enter ``_converge_l3_exists``. A raised
         ``batch_get_into`` on one rank would otherwise hang the replica.
+        A malformed per-page vector becomes an all-miss of ``expected_len``.
         """
 
         try:
-            return bool(self._device.prefetch_l3_load_backs(execution_plan))
+            flags = self._device.prefetch_l3_load_backs(execution_plan)
         except Exception:
             logger.exception(
                 "L3 prefetch RPC failed; treating as a miss so replica ranks "
                 "can converge"
             )
-            return False
+            return [False] * expected_len
+        if flags is None or len(flags) != expected_len:
+            if flags is not None:
+                logger.error(
+                    "L3 prefetch result is not aligned with cache keys: "
+                    "ok_flags=%s keys=%s",
+                    len(flags),
+                    expected_len,
+                )
+            return [False] * expected_len
+        return [bool(flag) for flag in flags]
 
     def _can_clear_cache(self) -> bool:
         return self.scheduler.can_clear_cache()

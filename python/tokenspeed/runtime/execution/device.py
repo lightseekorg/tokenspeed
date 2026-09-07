@@ -451,16 +451,17 @@ class DeviceHandle:
             return False
         return l2.plan_has_l3_prefetch(execution_plan)
 
-    def prefetch_l3_load_backs(self, execution_plan) -> bool:
+    def prefetch_l3_load_backs(self, execution_plan) -> list[bool]:
         """Fill Host pages from L3 on the control plane. CPU-only.
 
-        Returns False if any ``batch_get_into`` missed. Existence is not a
-        lease; the event loop MIN-reduces this across the replica before H2D.
+        Returns per-page ``batch_get_into`` success, aligned with
+        ``l3_prefetch_storage_keys``. Existence is not a lease; the event
+        loop MIN-reduces this vector across the replica before H2D.
         """
 
         l2 = self._l2
         if l2 is None:
-            return True
+            return []
         return l2.prefetch_l3_load_backs(execution_plan)
 
     def invalidate_l3_prefetch(self) -> None:

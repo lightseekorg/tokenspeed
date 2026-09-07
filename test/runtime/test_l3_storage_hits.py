@@ -115,10 +115,13 @@ class _Device:
         del plan
         return self.prefetch_pages
 
-    def prefetch_l3_load_backs(self, plan) -> bool:
-        del plan
+    def prefetch_l3_load_backs(self, plan) -> list[bool]:
         self.prefetch_calls += 1
-        return self.prefetch_ok
+        groups, _hashes, _offsets = self.l3_prefetch_storage_keys(plan)
+        flags = self.prefetch_ok
+        if isinstance(flags, bool):
+            return [bool(flags)] * len(groups)
+        return [bool(flag) for flag in flags]
 
     def invalidate_l3_prefetch(self) -> None:
         self.invalidations += 1
@@ -411,23 +414,24 @@ def test_prefetch_rpc_error_converges_then_retracts(monkeypatch) -> None:
     )
     loop = _Loop(exists_flags=[True])
     loop._device.prefetch_pages = True
-    converged: list[bool] = []
+    probed: list[list[bool]] = []
+    bound = loop._converge_l3_exists
 
-    def boom(plan) -> bool:
+    def boom(plan) -> list[bool]:
         del plan
         loop._device.prefetch_calls += 1
         raise RuntimeError("batch_get_into failed")
 
-    def converge(local_ok):
-        converged.append(local_ok)
-        return local_ok
+    def wrapped(exists):
+        probed.append(list(exists))
+        return bound(exists)
 
     loop._device.prefetch_l3_load_backs = boom
-    loop.request_handler = SimpleNamespace(converge_replica_decision=converge)
+    loop._converge_l3_exists = wrapped
     events = loop._recover_if_l3_prefetch_failed(
         SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
     )
-    assert converged == [False]
+    assert probed == [[False]]
     assert events == ["retract:r0"]
     assert loop._device.invalidations == 1
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
@@ -473,6 +477,30 @@ def test_exists_length_mismatch_converges_as_misses() -> None:
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
 
 
+def test_prefetch_length_mismatch_converges_as_misses(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = [True, True]
+    probed: list[list[bool]] = []
+    bound = loop._converge_l3_exists
+
+    def wrapped(exists):
+        probed.append(list(exists))
+        return bound(exists)
+
+    loop._converge_l3_exists = wrapped
+    events = loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert probed == [[False]]
+    assert events == ["retract:r0"]
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
 def test_l3_prefetch_success_does_not_retract() -> None:
     loop = _Loop(exists_flags=[True])
     loop._device.prefetch_pages = True
@@ -485,6 +513,38 @@ def test_l3_prefetch_success_does_not_retract() -> None:
     assert loop._device.invalidations == 0
     assert loop.scheduler.unregistered is None
     assert loop._device.prefetch_calls == 1
+
+
+def test_mixed_l3_prefetch_blacklists_only_failed_pages(monkeypatch) -> None:
+    """A vanished tail must not unread pages whose replica get succeeded."""
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True, True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = [True, False]
+
+    def keys(plan):
+        del plan
+        return [0, 0], ["h4", "h5"], [0, 0]
+
+    loop._device.l3_prefetch_storage_keys = keys
+    events = loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert events == ["retract:r0"]
+    assert loop.scheduler.unregistered == ([0], ["h5"], [0])
+    assert loop._device.l3_key_is_unread(0, "h4", 0) is False
+    assert loop._device.l3_key_is_unread(0, "h5", 0) is True
+
+    loop.scheduler.registered = None
+    loop.scheduler.unregistered = None
+    loop.scheduler.waiting_hashes = ["h4", "h5"]
+    loop._revalidate_queued_l3_hits()
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
+    assert loop.scheduler.unregistered == ([0], ["h5"], [0])
 
 
 if __name__ == "__main__":

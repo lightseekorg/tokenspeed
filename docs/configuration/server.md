@@ -351,15 +351,17 @@ previous checkpoint or entering NCCL weight broadcasts alone. A
 `batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
 skips publishing empty Host pages, and retracts the batch snapshot-less
-so the next admit recomputes those tokens. Failed `batch_get_into` keys
+so the next admit recomputes those tokens. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
-retry the same prefetch. A backend exception or malformed result is a
+retry the same prefetch; only replica-converged misses are blacklisted.
+A backend exception or malformed result is a
 local miss so every replica rank still enters the MIN-reduce. Clients
 are not failed.
 L2 write-back ACKs use the same replica groups: `WriteBackDone` is
 emitted only after every cache-owning rank holds the completion, so an
 ENABLE_CP worker cannot publish Host while a CP peer's Mooncake put is
-still in flight.
+still in flight. A truncated `batch_is_exist` reply is a failed put, not
+an implicit success.
 Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the

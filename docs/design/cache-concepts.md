@@ -379,7 +379,9 @@ Its responsibilities:
   `LoadBackDone` are intersected across every cache-owning rank
   (attention TP, then CP, then PP; not DP) before `CompleteWriteBack`: a
   finished local backup must not `CacheHostBlock` on one mirrored
-  scheduler while a CP/PP peer still has the op pending. Every rank
+  scheduler while a CP/PP peer still has the op pending. A truncated
+  `batch_is_exist` reply is a failed put, not an implicit success:
+  `WriteBackDone` follows only a completed backup. Every rank
   stays in every replica-group gather even when an earlier intersection
   is empty, so a peer that is ready on CP/PP is not left unmatched. A later Host
   miss that is known to exist in L3 allocates
@@ -473,10 +475,11 @@ Its responsibilities:
   skips the model forward, and retracts the batch snapshot-less so the
   next admit recomputes those tokens. A backend exception or malformed
   result is converted to a local miss before that MIN-reduce so a
-  faulted rank cannot skip the collective and hang healthy peers. Failed
-  `batch_get_into` keys stay
+  faulted rank cannot skip the collective and hang healthy peers. Only
+  pages whose replica-converged `batch_get_into` missed stay
   unread: a later `batch_exists` hit must not re-register them and retry
-  the same prefetch. Clients are not failed; mixed
+  the same prefetch. Successfully restored pages in a mixed prefetch
+  stay readable. Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks
   stay aligned. Existence and prefetch are skipped when L3 is unset:
   Host-only and

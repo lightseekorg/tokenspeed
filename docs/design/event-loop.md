@@ -317,8 +317,9 @@ For orientation, one iteration of `event_loop`:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,
   snapshot-less retract of the batch so the next admit recomputes.
-  Failed `batch_get_into` keys stay unread so a later `batch_exists` hit
-  cannot re-register them. A backend exception or malformed existence /
-  prefetch result is a local miss so every cache-owning rank still
-  enters the replica MIN; raising would hang healthy peers. Clients are
-  not failed.
+  Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
+  cannot re-register them; only the replica-converged misses are
+  blacklisted, so a restored prefix page stays readable. A backend
+  exception or malformed existence / prefetch result is a local miss so
+  every cache-owning rank still enters the replica MIN; raising would
+  hang healthy peers. Clients are not failed.

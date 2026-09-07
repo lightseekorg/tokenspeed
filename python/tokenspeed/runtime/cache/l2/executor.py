@@ -402,18 +402,20 @@ class L2CacheExecutor:
                 )
         return pages
 
-    def prefetch_l3_load_backs(self, plan) -> bool:
-        """Fill Host pages from L3 on the control plane. Returns False on miss.
+    def prefetch_l3_load_backs(self, plan) -> list[bool]:
+        """Fill Host pages from L3 on the control plane.
 
-        ``batch_get_into`` is CPU work against the already-allocated Host
-        pages. Existence is not a lease: an object can vanish after
-        ``batch_exists`` and before this get. Callers MIN-reduce the result
-        across the replica before H2D or forward.
+        Returns per-page ``batch_get_into`` success, aligned with
+        ``l3_prefetch_storage_keys``. ``batch_get_into`` is CPU work against
+        the already-allocated Host pages. Existence is not a lease: an
+        object can vanish after ``batch_exists`` and before this get.
+        Callers MIN-reduce the vector across the replica before H2D or
+        forward.
         """
         pages = self._plan_prefetch_pages(plan)
         if not pages:
             self._l3_prefetch_ok = {}
-            return True
+            return []
         results = self._prefetch_from_storage(pages)
         if len(results) != len(pages):
             raise RuntimeError(
@@ -421,7 +423,7 @@ class L2CacheExecutor:
                 f"ok_flags={len(results)} pages={len(pages)}"
             )
         self._l3_prefetch_ok = dict(zip(pages, results))
-        return all(results)
+        return [bool(flag) for flag in results]
 
     def invalidate_l3_prefetch(self) -> None:
         """Force later H2D to skip every L3 source in this plan."""

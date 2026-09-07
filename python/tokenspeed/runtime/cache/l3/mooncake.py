@@ -44,6 +44,15 @@ _DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024
 _DEFAULT_TENANT_ID = "default"
 
 
+def _require_result_len(results: Sequence[Any], expected: int, *, op: str) -> None:
+    """Reject a truncated Mooncake reply before zip can drop unmatched keys."""
+
+    if len(results) != expected:
+        raise ValueError(
+            f"Mooncake {op} returned {len(results)} results for {expected} keys"
+        )
+
+
 def _parse_global_segment_size(value: Any) -> int:
     if isinstance(value, bool):
         raise ValueError("global_segment_size must be an int or size string")
@@ -231,6 +240,7 @@ class MooncakeKvStore:
         if not keys:
             return []
         results = self.store.batch_is_exist(list(keys))
+        _require_result_len(results, len(keys), op="batch_is_exist")
         return [int(flag) == 1 for flag in results]
 
     def batch_get_into(
@@ -242,11 +252,14 @@ class MooncakeKvStore:
     ) -> list[bool]:
         if not keys:
             return []
+        if not (len(keys) == len(offsets) == len(sizes)):
+            raise ValueError("ragged L3 get")
         base = host_buffer_ptr(host_buffer)
         ptrs = [base + int(offset) for offset in offsets]
         results = self.store.batch_get_into(
             list(keys), ptrs, [int(size) for size in sizes]
         )
+        _require_result_len(results, len(keys), op="batch_get_into")
         return [int(result) > 0 for result in results]
 
     def batch_put_from(
@@ -258,7 +271,16 @@ class MooncakeKvStore:
     ) -> list[bool]:
         if not keys:
             return []
-        exist = self.batch_exists(keys)
+        if not (len(keys) == len(offsets) == len(sizes)):
+            raise ValueError("ragged L3 put")
+        try:
+            exist = self.batch_exists(keys)
+        except ValueError:
+            logger.error(
+                "Mooncake batch_is_exist returned a truncated existence reply; "
+                "refusing to ACK Host pages that were not uploaded"
+            )
+            return [False] * len(keys)
         missing_keys = []
         missing_ptrs = []
         missing_sizes = []
@@ -279,6 +301,14 @@ class MooncakeKvStore:
             put_results = self.store.batch_put_from(
                 missing_keys, missing_ptrs, missing_sizes
             )
+            if len(put_results) != len(missing_keys):
+                logger.error(
+                    "Mooncake batch_put_from returned %s results for %s keys; "
+                    "refusing to ACK Host pages that were not uploaded",
+                    len(put_results),
+                    len(missing_keys),
+                )
+                return [False] * len(keys)
             for index, ret in zip(missing_index, put_results):
                 results[index] = int(ret) == 0
             failed_positions = [
@@ -289,7 +319,14 @@ class MooncakeKvStore:
                 # after our existence probe, which is still a successful,
                 # idempotent publication of the immutable cache object.
                 raced_keys = [missing_keys[position] for position in failed_positions]
-                raced_exists = self.batch_exists(raced_keys)
+                try:
+                    raced_exists = self.batch_exists(raced_keys)
+                except ValueError:
+                    logger.error(
+                        "Mooncake batch_is_exist returned a truncated race "
+                        "recheck; leaving failed puts unacknowledged"
+                    )
+                    raced_exists = [False] * len(raced_keys)
                 for position, present in zip(failed_positions, raced_exists):
                     if present:
                         results[missing_index[position]] = True

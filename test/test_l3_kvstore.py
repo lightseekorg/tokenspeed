@@ -958,6 +958,54 @@ class MooncakeKvStoreTest(unittest.TestCase):
         host = SimpleNamespace(data_ptr=lambda: 100)
         self.assertEqual(adapter.batch_put_from(["k"], host, [0], [8]), [True])
 
+    def test_truncated_exists_does_not_ack_unuploaded_keys(self):
+        class _Store:
+            def batch_is_exist(self, keys):
+                del keys
+                return [0]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                del keys, ptrs, sizes
+                raise AssertionError("truncated exists must not issue puts")
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = _Store()
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        self.assertEqual(
+            adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8]),
+            [False, False],
+        )
+
+    def test_truncated_exists_probe_is_rejected(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(batch_is_exist=lambda keys: [1])
+        with self.assertRaisesRegex(ValueError, "batch_is_exist returned 1"):
+            adapter.batch_exists(["k0", "k1"])
+
+    def test_truncated_put_results_do_not_ack_unuploaded_keys(self):
+        class _Store:
+            def batch_is_exist(self, keys):
+                return [0] * len(keys)
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                del ptrs, sizes
+                return [0]
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = _Store()
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        self.assertEqual(
+            adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8]),
+            [False, False],
+        )
+
+    def test_truncated_get_into_is_rejected(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(batch_get_into=lambda keys, ptrs, sizes: [1])
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        with self.assertRaisesRegex(ValueError, "batch_get_into returned 1"):
+            adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])
+
     def test_namespace_clear_uses_anchored_escaped_regex(self):
         adapter = object.__new__(MooncakeKvStore)
         store = mock.Mock()
