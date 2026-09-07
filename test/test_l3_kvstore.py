@@ -23,6 +23,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
@@ -32,6 +33,8 @@ from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     MemoryKvStore,
     cache_layout_signature,
+    l3_cache_quantization_id,
+    l3_checkpoint_id,
     resolve_l3_weight_version,
     storage_key_prefix,
     storage_object_key,
@@ -84,6 +87,7 @@ class StorageKeyTest(unittest.TestCase):
                 "draft_model": "",
                 "draft_revision": "",
                 "draft_weight_version": "",
+                "cache_quantization": "",
             }
             values.update(overrides)
             return storage_key_prefix(**values)
@@ -99,8 +103,113 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(base, prefix(cp_size=2))
         self.assertNotEqual(prefix(cp_size=2), prefix(cp_size=4))
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
+        self.assertNotEqual(base, prefix(cache_quantization='{"quantization":"fp8"}'))
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
+        signature = inspect.signature(storage_key_prefix)
+        self.assertIs(
+            signature.parameters["cache_quantization"].default, inspect.Parameter.empty
+        )
+        self.assertIs(signature.parameters["revision"].default, inspect.Parameter.empty)
+
+    def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
+        commit = "a" * 40
+        other = "b" * 40
+        self.assertEqual(
+            l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+            ),
+            commit,
+        )
+        self.assertNotEqual(
+            l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+            ),
+            l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=other),
+                revision="main",
+            ),
+        )
+
+    def test_checkpoint_id_uses_snapshot_directory_commit(self):
+        commit = "c" * 40
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = os.path.join(root, "snapshots", commit)
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            self.assertEqual(
+                l3_checkpoint_id(
+                    snapshot, hf_config=SimpleNamespace(), revision="main"
+                ),
+                commit,
+            )
+
+    def test_checkpoint_id_fingerprints_local_weight_bytes(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, payload in ((first, b"aaa"), (second, b"bbbb")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(payload)
+            self.assertNotEqual(
+                l3_checkpoint_id(first, hf_config=SimpleNamespace(), revision=""),
+                l3_checkpoint_id(second, hf_config=SimpleNamespace(), revision=""),
+            )
+            self.assertTrue(
+                l3_checkpoint_id(
+                    first, hf_config=SimpleNamespace(), revision=""
+                ).startswith("local-")
+            )
+
+    def test_checkpoint_id_rejects_unpinned_remote_without_commit(self):
+        with self.assertRaises(ValueError):
+            l3_checkpoint_id(
+                "org/unpinned-model",
+                hf_config=SimpleNamespace(),
+                revision="main",
+            )
+
+    def test_cache_quantization_id_hashes_scale_file_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "a.json")
+            second = os.path.join(directory, "b.json")
+            with open(first, "w") as handle:
+                handle.write('{"scale":1}')
+            with open(second, "w") as handle:
+                handle.write('{"scale":2}')
+            same_copy = os.path.join(directory, "a-copy.json")
+            with open(same_copy, "w") as handle:
+                handle.write('{"scale":1}')
+            first_id = l3_cache_quantization_id(
+                quantization="fp8", quantization_param_path=first
+            )
+            self.assertNotEqual(
+                first_id,
+                l3_cache_quantization_id(
+                    quantization="fp8", quantization_param_path=second
+                ),
+            )
+            self.assertEqual(
+                first_id,
+                l3_cache_quantization_id(
+                    quantization="fp8", quantization_param_path=same_copy
+                ),
+            )
+            self.assertNotEqual(
+                first_id,
+                l3_cache_quantization_id(quantization="", quantization_param_path=""),
+            )
+            signature = inspect.signature(l3_cache_quantization_id)
+            self.assertIs(
+                signature.parameters["quantization_param_path"].default,
+                inspect.Parameter.empty,
+            )
 
     def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
         self.assertIsNone(

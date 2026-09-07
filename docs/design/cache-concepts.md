@@ -378,10 +378,15 @@ Its responsibilities:
   a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
-  (`model` + `--revision` + `--weight-version`), the packed CacheBlock
-  layout (dtype and field geometry), the pipeline stage, the context-parallel
-  width (`cp_size`), and the speculative
-  draft checkpoint when a separate draft pool is present. Zigzag CP assigns
+  (`model` + resolved immutable revision + `--weight-version`), the packed
+  CacheBlock layout (dtype and field geometry), the effective
+  cache-quantization config (`quantization` plus the
+  `quantization_param_path` scale-file digest), the pipeline stage, the
+  context-parallel width (`cp_size`), and the speculative
+  draft checkpoint when a separate draft pool is present. An unpinned
+  Hugging Face branch or local path is fingerprinted from the commit or
+  local tree actually loaded, so two instances cannot share a Mooncake
+  key while serving incompatible KV. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
   object key. A live weight

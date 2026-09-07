@@ -23,6 +23,8 @@
 from tokenspeed.runtime.cache.l3.backend import (
     KvStoreStorage,
     MemoryKvStore,
+    l3_cache_quantization_id,
+    l3_checkpoint_id,
     storage_key_prefix,
     storage_object_key,
 )
@@ -32,6 +34,8 @@ __all__ = [
     "KvStoreStorage",
     "MemoryKvStore",
     "create_kvstore_storage_backend",
+    "l3_cache_quantization_id",
+    "l3_checkpoint_id",
     "storage_key_prefix",
     "storage_object_key",
 ]

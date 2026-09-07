@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import threading
@@ -445,9 +446,31 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         )
         self.assertEqual(pages, [(0, 3, "h0", 0)])
         write_pages = L2CacheExecutor._storage_pages(
-            operation, host_is_destination=True
+            operation, host_is_destination=True, prefetch_only=False
         )
         self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
+        with self.assertRaises(TypeError):
+            L2CacheExecutor._storage_pages(operation, host_is_destination=True)
+        signature = inspect.signature(L2CacheExecutor._storage_pages)
+        self.assertIs(
+            signature.parameters["prefetch_only"].default, inspect.Parameter.empty
+        )
+
+    def test_ack_requires_backup_pages_and_success(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        signature = inspect.signature(_Ack)
+        self.assertIs(
+            signature.parameters["backup_pages"].default, inspect.Parameter.empty
+        )
+        self.assertIs(signature.parameters["success"].default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            _Ack(object(), [1])
+        with self.assertRaises(TypeError):
+            _Ack(object(), [1], [])
 
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
@@ -477,7 +500,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor.l3_store.backup.side_effect = backup
         finish = Mock()
         finish.query.return_value = True
-        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+        executor._write_acks = [
+            _Ack(
+                finish_event=finish,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+                success=True,
+            )
+        ]
 
         first = executor.poll_results()
         self.assertEqual(first, [])
@@ -517,7 +547,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
         finish.query.return_value = True
-        executor._write_acks = [_Ack(finish, [7], [(0, 1, "h0", 0)])]
+        executor._write_acks = [
+            _Ack(
+                finish_event=finish,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+                success=True,
+            )
+        ]
 
         raised = None
         try:
@@ -586,7 +623,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
-        executor._write_acks = [_Ack(Mock(), [7], [(0, 1, "h0", 0)])]
+        executor._write_acks = [
+            _Ack(
+                finish_event=Mock(),
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+                success=True,
+            )
+        ]
         executor._backup_futures = []
         executor._l3_workers = None
         executor.load_stream = Mock()

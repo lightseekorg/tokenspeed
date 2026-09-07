@@ -24,8 +24,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from collections.abc import Sequence
 from typing import Any, Protocol
+
+_HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt")
+_CHECKPOINT_METADATA_FILES = (
+    "config.json",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+)
 
 
 def resolve_l3_weight_version(
@@ -113,6 +123,120 @@ def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def l3_cache_quantization_id(
+    *,
+    quantization: str,
+    quantization_param_path: str,
+) -> str:
+    """Return the cache-quantization identity that shapes packed KV bytes.
+
+    FP8 deployments that share ``kv_cache_dtype`` can still load different
+    ``quantization_param_path`` scale files. Mooncake puts are create-only,
+    so those deployments must not share a namespace. Callers pass empty
+    strings when quantization or the scale file is unset.
+    """
+
+    scale_id = ""
+    if quantization_param_path:
+        if os.path.isfile(quantization_param_path):
+            scale_id = _file_digest(quantization_param_path)
+        else:
+            scale_id = str(quantization_param_path)
+    return json.dumps(
+        {
+            "quantization": str(quantization),
+            "scale_id": scale_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def l3_checkpoint_id(
+    model_path: str,
+    *,
+    hf_config: Any,
+    revision: str,
+) -> str:
+    """Return an immutable identity for the loaded checkpoint bytes.
+
+    ``--revision`` may be a moving branch or omitted. Two instances that
+    resolve different commits (or local trees) must not share Mooncake
+    keys. Prefer the Hugging Face commit on the loaded config, then a
+    snapshot directory name, then a local fingerprint of config/index
+    bytes and weight-file sizes.
+    """
+
+    commit = getattr(hf_config, "_commit_hash", None)
+    if isinstance(commit, str) and _HF_COMMIT_HASH_RE.fullmatch(commit):
+        return commit
+    model_dir = _resolved_model_dir(model_path, revision=revision)
+    if model_dir is not None:
+        snapshot = _snapshot_commit_hash(model_dir)
+        if snapshot is not None:
+            return snapshot
+        return "local-" + _local_checkpoint_fingerprint(model_dir)
+    if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
+        return revision
+    raise ValueError(
+        "L3 namespace needs an immutable checkpoint id; pin --revision to a "
+        "commit or load from a local snapshot"
+    )
+
+
+def _snapshot_commit_hash(snapshot_path: str) -> str | None:
+    candidate = os.path.basename(os.path.normpath(snapshot_path))
+    return candidate if _HF_COMMIT_HASH_RE.fullmatch(candidate) else None
+
+
+def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
+    if os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            model_path,
+            revision=revision or None,
+            local_files_only=True,
+            ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+        )
+    except Exception:
+        return None
+
+
+def _local_checkpoint_fingerprint(model_dir: str) -> str:
+    hasher = hashlib.sha256()
+    try:
+        names = sorted(os.listdir(model_dir))
+    except OSError:
+        return hasher.hexdigest()
+    for name in names:
+        path = os.path.join(model_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if name in _CHECKPOINT_METADATA_FILES:
+            hasher.update(name.encode())
+            with open(path, "rb") as handle:
+                hasher.update(handle.read())
+            continue
+        lowered = name.lower()
+        if lowered.endswith(_WEIGHT_FILE_SUFFIXES):
+            hasher.update(f"{name}:{os.path.getsize(path)}".encode())
+    return hasher.hexdigest()
+
+
+def _file_digest(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def storage_key_prefix(
     model_name: str,
     *,
@@ -124,16 +248,19 @@ def storage_key_prefix(
     draft_model: str,
     draft_revision: str,
     draft_weight_version: str,
+    cache_quantization: str,
 ) -> str:
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, context-parallel width, or
-    draft pool and silently collide with an incompatible deployment. Empty
-    strings are valid and mean "unset" (no Hugging Face revision, no
-    speculative draft). ``cp_size`` belongs here rather than only in the
-    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
-    blocks to the same rank under different widths.
+    identity, cache layout, pipeline stage, context-parallel width, draft
+    pool, or cache-quantization config and silently collide with an
+    incompatible deployment. ``revision`` is the resolved immutable
+    checkpoint (Hugging Face commit or local fingerprint), not a moving
+    branch name. Empty strings are valid and mean "unset" (no draft pool,
+    no extra cache scales). ``cp_size`` belongs here rather than only in
+    the per-object ``c{cp_rank}`` shard id: zigzag CP assigns different
+    token blocks to the same rank under different widths.
     """
 
     payload = json.dumps(
@@ -147,6 +274,7 @@ def storage_key_prefix(
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
             "draft_weight_version": str(draft_weight_version),
+            "cache_quantization": str(cache_quantization),
         },
         sort_keys=True,
         separators=(",", ":"),

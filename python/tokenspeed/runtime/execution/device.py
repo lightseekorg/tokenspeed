@@ -832,6 +832,8 @@ def build_device_side(
         if server_args.kvstore_storage_backend is not None:
             from tokenspeed.runtime.cache.l3.backend import (
                 cache_layout_signature,
+                l3_cache_quantization_id,
+                l3_checkpoint_id,
                 storage_key_prefix,
             )
             from tokenspeed.runtime.cache.l3.factory import (
@@ -852,24 +854,42 @@ def build_device_side(
                 l2_cache_executor.layout,
                 cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
             )
-            revision = server_args.revision or ""
+            checkpoint_id = l3_checkpoint_id(
+                model_config.model_path,
+                hf_config=model_config.hf_config,
+                revision=str(model_config.revision or ""),
+            )
+            cache_quantization = l3_cache_quantization_id(
+                quantization=str(model_config.quantization or ""),
+                quantization_param_path=str(server_args.quantization_param_path or ""),
+            )
             pipeline_rank = (
                 server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
             )
-            draft_model = server_args.speculative_draft_model_path or ""
+            if draft_model_config is not None:
+                draft_model = str(draft_model_config.model_path)
+                draft_revision = l3_checkpoint_id(
+                    draft_model_config.model_path,
+                    hf_config=draft_model_config.hf_config,
+                    revision=str(draft_model_config.revision or ""),
+                )
+            else:
+                draft_model = ""
+                draft_revision = ""
             cp_size = int(server_args.mapping.attn.cp_size)
 
             def prefix_for_weight_version(weight_version: str) -> str:
                 return storage_key_prefix(
                     server_args.model,
-                    revision=revision,
+                    revision=checkpoint_id,
                     weight_version=weight_version,
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
                     cp_size=cp_size,
                     draft_model=draft_model,
-                    draft_revision=revision,
-                    draft_weight_version=weight_version,
+                    draft_revision=draft_revision,
+                    draft_weight_version=weight_version if draft_model else "",
+                    cache_quantization=cache_quantization,
                 )
 
             l2_cache_executor.attach_l3_storage(

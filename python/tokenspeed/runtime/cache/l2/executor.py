@@ -76,10 +76,16 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 
 
 class _Ack(NamedTuple):
+    """One in-flight Host copy whose CUDA event has not yet been polled.
+
+    ``backup_pages`` and ``success`` are required so a write cannot omit
+    success and a load cannot omit the L3 page list.
+    """
+
     finish_event: object
     op_ids: list[int]
-    backup_pages: list[StoragePage] = []
-    success: bool = True
+    backup_pages: list[StoragePage]
+    success: bool
 
 
 def _num_host_lcm_blocks(
@@ -290,7 +296,11 @@ class L2CacheExecutor:
                     source_is_device=True,
                 )
                 write_pages.extend(
-                    self._storage_pages(operation, host_is_destination=True)
+                    self._storage_pages(
+                        operation,
+                        host_is_destination=True,
+                        prefetch_only=False,
+                    )
                 )
         self._start_writing(op_ids, transfers, write_pages)
 
@@ -365,8 +375,13 @@ class L2CacheExecutor:
         operation,
         *,
         host_is_destination: bool,
-        prefetch_only: bool = False,
+        prefetch_only: bool,
     ) -> list[StoragePage]:
+        """Collect hashed Host pages from one cache op.
+
+        ``prefetch_only`` must be chosen at the call site: ``True`` keeps
+        only L3-prefetch sources, ``False`` keeps every storage-tagged page.
+        """
         hashes = getattr(operation, "content_hashes", None)
         offsets = getattr(operation, "page_offsets", None)
         if not hashes or not offsets:
@@ -562,7 +577,14 @@ class L2CacheExecutor:
         finish = device_module.Event()
         finish.record(stream)
         with self._ack_lock:
-            self._write_acks.append(_Ack(finish, op_ids, backup_pages))
+            self._write_acks.append(
+                _Ack(
+                    finish_event=finish,
+                    op_ids=op_ids,
+                    backup_pages=backup_pages,
+                    success=True,
+                )
+            )
 
     def _start_loading(
         self,
@@ -667,7 +689,14 @@ class L2CacheExecutor:
         if finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
         with self._ack_lock:
-            self._load_acks.append(_Ack(finish, op_ids, success=success))
+            self._load_acks.append(
+                _Ack(
+                    finish_event=finish,
+                    op_ids=op_ids,
+                    backup_pages=[],
+                    success=success,
+                )
+            )
         return load_index
 
     def poll_results(self) -> list:

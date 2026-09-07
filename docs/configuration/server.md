@@ -321,8 +321,10 @@ Mooncake Store (L3)
 
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
-The hashed prefix includes the loaded checkpoint (`--model`, `--revision`,
-`--weight-version`), the packed layout, the pipeline stage, the context-parallel
+The hashed prefix includes the loaded checkpoint (`--model`, the resolved
+immutable revision, `--weight-version`), the packed layout, the
+cache-quantization config (including `quantization_param_path` scale-file
+bytes), the pipeline stage, the context-parallel
 width (`cp_size`), and any
 speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
