@@ -271,6 +271,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.input_processor.validate_request(obj)
 
         obj.normalize_batch_and_arguments()
+        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -279,16 +280,21 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
             )
 
-        async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(obj, created_time):
-                    yield response
+        try:
+            async with self.model_update_lock.reader_lock:
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    self._send_one_request(obj, tokenized_obj, created_time)
+                    async for response in self._wait_one_response(obj):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(
+                        obj, created_time, request_rids
+                    ):
+                        yield response
+        except BaseException:
+            self._release_req_states_on_failure(request_rids)
+            raise
 
     async def _tokenize_one_request(
         self,
@@ -319,9 +325,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         )
         self.rid_to_state[obj.rid] = state
         mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
-        if mm_inputs is not None:
-            mm_inputs.publish_shm_features()
-        self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
+        try:
+            if mm_inputs is not None:
+                mm_inputs.publish_shm_features()
+            self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
+            state.dispatched = True
+        except BaseException:
+            self.rid_to_state.pop(obj.rid, None)
+            if mm_inputs is not None:
+                mm_inputs.release_shm_features()
+            raise
 
     def submit_encode(self, encode_request) -> None:
         """Send an EPD encode request to the encode-worker scheduler subprocess.
@@ -342,13 +355,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     ):
         """Wait for the response of one request.
 
-        Cancellation contract: callers (FastAPI route handlers, the sync
-        ``LLM`` bridge, RL-trainer drivers, etc.) signal client disconnect
-        via ``asyncio.CancelledError`` — not via a polled
-        ``request.is_disconnected()`` check. If the task driving this
-        generator is cancelled mid-wait, the ``finally`` below drops the
-        rid from ``rid_to_state`` and fires an ``AbortReq`` at the
-        scheduler so no per-request state leaks.
+        Cancellation sends an abort but retains dispatched state until the
+        scheduler returns a terminal frame.
         """
         state = self.rid_to_state[obj.rid]
 
@@ -386,7 +394,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                                     obj.text = ""
                             msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                         logger.info(msg)
-                    del self.rid_to_state[obj.rid]
+                    self.rid_to_state.pop(obj.rid, None)
 
                     # Check if this was an abort/error created by scheduler
                     if isinstance(out["meta_info"].get("finish_reason"), dict):
@@ -411,30 +419,19 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 # final chunk; external cancellation wakes us via
                 # ``asyncio.CancelledError`` from ``state.event.wait()``.
         finally:
-            # Idempotent cleanup split on ``state.finished``:
-            #
-            # * Normal-finish path: the yield loop above already did
-            #   ``del self.rid_to_state[obj.rid]`` at ``state.finished``.
-            #   We defensively ``pop`` with a default so a second exit
-            #   through ``finally`` (e.g. when the yield itself raised
-            #   after the del) is a no-op.
-            #
-            # * Abandoned path (CancelledError / unexpected exception):
-            #   the rid is still in ``rid_to_state``. Call
-            #   ``abort_request`` which **both** removes it from the
-            #   state map **and** sends ``AbortReq`` to the scheduler.
-            #   Ordering matters: ``abort_request`` early-returns if
-            #   the rid is already gone, so we must not pop first.
             if state.finished:
                 self.rid_to_state.pop(obj.rid, None)
             else:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, abandoned=True)
 
     async def _handle_batch_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
         created_time: float | None = None,
+        request_rids: set[str] | None = None,
     ):
+        if request_rids is None:
+            request_rids = set(obj.rid)
         batch_size = obj.batch_size
 
         generators = []
@@ -465,6 +462,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 warmup_obj = prepare_prefix_warmup(tmp_obj, tokenized_objs[i])
+                request_rids.add(tmp_obj.rid)
                 self._send_one_request(tmp_obj, warmup_obj, created_time)
                 await self._wait_one_response(tmp_obj).__anext__()
 
@@ -475,43 +473,85 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     replica_obj = prepare_parallel_sampling_replica(
                         tmp_obj, tokenized_objs[i]
                     )
+                    request_rids.add(tmp_obj.rid)
                     self._send_one_request(tmp_obj, replica_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj))
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
-        if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
-        else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
+        wait_tasks: set[asyncio.Task] = set()
+        try:
+            if not is_stream:
+                ordered_tasks = [
+                    asyncio.create_task(gen.__anext__()) for gen in generators
+                ]
+                wait_tasks = set(ordered_tasks)
+                outputs = await asyncio.gather(*ordered_tasks)
+                yield outputs
+            else:
+                rid_to_index = {rid: i for i, rid in enumerate(rids)}
+                task_map = {
+                    asyncio.create_task(gen.__anext__()): gen for gen in generators
+                }
+                wait_tasks = set(task_map)
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+                    for task in done:
+                        gen = task_map.pop(task)
+                        wait_tasks.discard(task)
+                        try:
+                            result = task.result()
+                            result["index"] = rid_to_index[result["meta_info"]["id"]]
+                            yield result
+                            new_task = asyncio.create_task(gen.__anext__())
+                            task_map[new_task] = gen
+                            wait_tasks.add(new_task)
+                        except StopAsyncIteration:
+                            pass
+        finally:
+            for task in wait_tasks:
+                task.cancel()
+            if wait_tasks:
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
+            if generators:
+                await asyncio.gather(
+                    *(gen.aclose() for gen in generators), return_exceptions=True
+                )
 
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
-    def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
+    def abort_request(self, rid: str, *, abandoned: bool = False):
+        state = self.rid_to_state.get(rid)
+        if state is None:
             return
-        del self.rid_to_state[rid]
+        state.abandoned |= abandoned
+        if state.abort_sent:
+            return
+        state.abort_sent = True
         req = AbortReq(rid=rid)
-        self.engine_core_client.send_to_scheduler.send_pyobj(req)
+        try:
+            self.engine_core_client.send_to_scheduler.send_pyobj(req)
+        except BaseException:
+            state.abort_sent = False
+            raise
+
+    def _release_req_states_on_failure(self, rids: set[str]) -> None:
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            if not state.dispatched:
+                self.rid_to_state.pop(rid, None)
+                continue
+            try:
+                self.abort_request(rid, abandoned=True)
+            except Exception:
+                logger.exception("Failed to abort request %s during cleanup", rid)
 
     def block_generation_admission(self) -> None:
         """Stop requests before they acquire the model-update reader lock."""
