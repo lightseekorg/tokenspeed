@@ -30,6 +30,8 @@ from unittest import mock
 from tokenspeed.runtime.cache.l3.backend import (
     MemoryKvStore,
     cache_layout_signature,
+    next_l3_weight_version,
+    resolve_l3_weight_version,
     storage_key_prefix,
     storage_object_key,
 )
@@ -95,6 +97,44 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
+
+    def test_next_l3_weight_version_is_deterministic(self):
+        self.assertEqual(next_l3_weight_version("v1"), "v1-u1")
+        self.assertEqual(next_l3_weight_version("v1-u1"), "v1-u2")
+        self.assertEqual(
+            resolve_l3_weight_version(
+                "v1",
+                None,
+                flush_cache=True,
+                storage_backend="memory",
+            ),
+            "v1-u1",
+        )
+        self.assertIsNone(
+            resolve_l3_weight_version(
+                "v1",
+                None,
+                flush_cache=True,
+                storage_backend=None,
+            )
+        )
+        self.assertIsNone(
+            resolve_l3_weight_version(
+                "v1",
+                None,
+                flush_cache=False,
+                storage_backend="memory",
+            )
+        )
+        self.assertEqual(
+            resolve_l3_weight_version(
+                "v1",
+                "explicit",
+                flush_cache=True,
+                storage_backend="memory",
+            ),
+            "explicit",
+        )
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(

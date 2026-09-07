@@ -35,6 +35,7 @@
 #include <spdlog/spdlog.h>
 
 #include "scheduler/operations/cache.h"
+#include "cache/core/cache_types.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 
@@ -4429,6 +4430,44 @@ TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
     SendForwardDone("r3", {9002});
     SendFinish("r3");
     PlanOnce();
+}
+
+class L3ShortHostPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        cfg.host_allocator.total_pages = 3;
+        cfg.max_scheduled_tokens = 64;
+        for (auto& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_EQ(hashes.size(), 4u);
+    std::vector<CacheKey> keys;
+    keys.reserve(hashes.size());
+    for (const std::string& content_hash : hashes) {
+        keys.push_back(CacheKey{.group_id = 0, .content_hash = content_hash, .page_offset = 0});
+    }
+    scheduler_->RegisterStorageKeys(keys);
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    ASSERT_EQ(op->input_lengths.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "first-chunk window must restart from the Host-allocatable L3 prefix";
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
 }
 
 }  // namespace tokenspeed::test

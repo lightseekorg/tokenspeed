@@ -36,6 +36,7 @@ from tokenspeed_kernel.profiling import (
 )
 from viztracer import VizTracer
 
+from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -293,7 +294,10 @@ class RequestHandler:
         peer still serving the previous ``weight_version``. A requested
         flush that fails must not switch the prefix: GPU weights may
         already be loaded, so the RPC reports failure and the caller
-        retries after in-flight Host writebacks drain.
+        retries after in-flight Host writebacks drain. When L3 is enabled
+        and the caller omits ``weight_version``, a unique successor is
+        derived so the Engine path cannot republish under the startup
+        namespace.
         """
 
         flush_cache = recv_req.flush_cache
@@ -303,7 +307,12 @@ class RequestHandler:
                     False,
                     "cache flush failed after weights were loaded; retry the update",
                 )
-        version = recv_req.weight_version
+        version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            recv_req.weight_version,
+            flush_cache=flush_cache,
+            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+        )
         if version is None:
             return True, msg
         self.server_args.weight_version = str(version)

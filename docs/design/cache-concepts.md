@@ -334,6 +334,10 @@ Its responsibilities:
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
+  An L3 Host-prefetch shortage is different: `Admit` may return a shorter
+  `host_prefix_tokens` than the probe, and `schedulePrefillFirstChunk`
+  retries from that clamped boundary rather than forwarding a window that
+  skips the discarded prefix.
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
@@ -367,7 +371,10 @@ Its responsibilities:
   load rebuilds that prefix after the GPU update so new KV is not published
   under the previous checkpoint; a requested cache flush must succeed
   first, because `ClearCache` rejects in-flight Host writebacks (pause
-  drain does not wait for those). `ENABLE_CP` workers share `attn_tp_rank==0`
+  drain does not wait for those). When L3 is on and the update omits
+  `weight_version`, a unique successor (`{current}-uN`) is derived so the
+  Engine `update_weights_from_distributed` path cannot republish under the
+  startup namespace. `ENABLE_CP` workers share `attn_tp_rank==0`
   and are distinguished by `c{cp_rank}`. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.

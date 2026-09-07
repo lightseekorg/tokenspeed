@@ -623,4 +623,38 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     EXPECT_TRUE(coordinator.ClearCache());
 }
 
+TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(pinned);
+
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
+    EXPECT_EQ(probe.host.num_common_tokens, 4);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->host_prefix_tokens, 2)
+        << "a pinned Host pool must shorten the L3 prefix instead of admitting stale KV";
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
+
+    admission.reset();
+    coordinator.Free(tables);
+}
+
 }  // namespace tokenspeed::test

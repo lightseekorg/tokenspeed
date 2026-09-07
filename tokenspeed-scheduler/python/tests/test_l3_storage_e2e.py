@@ -154,6 +154,24 @@ def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
     _ack_load_back(scheduler, load.op_ids[0])
 
 
+def test_l3_short_host_pool_retries_first_chunk_from_admitted_prefix() -> None:
+    """A Host-starved L3 hit must not skip the unallocated prefix tokens."""
+
+    scheduler = ts.Scheduler(_l3_config(num_host_pages=3))
+    tokens = list(range(1, 9))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)
+
+    scheduler.submit_requests([_spec("r1", tokens)])
+    plan = scheduler.next_execution_plan()
+    assert plan.forward
+    op = plan.forward[0]
+    assert list(op.extend_prefix_lens) == [4]
+    assert list(op.input_lengths) == [4]
+    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
+
+
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     scheduler = ts.Scheduler(_l3_config())
     tokens = list(range(1, 9))

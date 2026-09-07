@@ -30,7 +30,9 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def _handler(self):
         handler = RequestHandler.__new__(RequestHandler)
         handler.send_func = mock.Mock()
-        handler.server_args = mock.Mock(weight_version="v1")
+        handler.server_args = mock.Mock(
+            weight_version="v1", kvstore_storage_backend=None
+        )
         handler._device = mock.Mock()
         return handler
 
@@ -138,6 +140,43 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
+
+    def test_l3_flush_without_version_derives_a_new_namespace(self):
+        handler = self._handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        handler.process_requests([req])
+
+        handler._device.set_l3_weight_version.assert_called_once_with("v1-u1")
+        self.assertEqual(handler.server_args.weight_version, "v1-u1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
+
+    def test_without_l3_omitted_version_keeps_the_startup_namespace(self):
+        handler = self._handler()
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version=None,
+        )
+
+        handler.process_requests([req])
+
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
 
 
 if __name__ == "__main__":

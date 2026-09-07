@@ -28,6 +28,43 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 
+def next_l3_weight_version(current: str) -> str:
+    """Return a unique L3 namespace successor for a flushed weight update.
+
+    Every rank that shares ``current`` produces the same successor, so L3
+    object keys stay aligned without an extra collective. A numeric ``-uN``
+    suffix is incremented when present; otherwise ``-u1`` is appended.
+    """
+
+    current = str(current)
+    marker = "-u"
+    base, separator, suffix = current.rpartition(marker)
+    if separator and suffix.isdigit():
+        return f"{base}{marker}{int(suffix) + 1}"
+    return f"{current}{marker}1"
+
+
+def resolve_l3_weight_version(
+    current: str,
+    requested: str | None,
+    *,
+    flush_cache: bool,
+    storage_backend: str | None,
+) -> str | None:
+    """Choose the namespace to publish after a successful weight load.
+
+    An explicit ``requested`` version always wins. When L3 is enabled and
+    the caller asked to flush, a missing version is derived so new KV cannot
+    reuse the previous checkpoint's objects.
+    """
+
+    if requested is not None:
+        return str(requested)
+    if flush_cache and storage_backend is not None:
+        return next_l3_weight_version(current)
+    return None
+
+
 def storage_object_key(
     content_hash: str,
     group_id: int,

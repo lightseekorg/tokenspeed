@@ -57,6 +57,7 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
+from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -365,14 +366,22 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        weight_version: str | None = None,
     ):
         """Update weights from distributed source."""
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            weight_version,
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            weight_version=weight_version,
         )
         return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
 

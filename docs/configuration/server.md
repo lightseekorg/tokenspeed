@@ -53,8 +53,10 @@ policy version that produced a sample.
 
 The SGLang-compatible `update_weights_from_distributed`,
 `update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
-optional `weight_version`. The version changes only after the update succeeds;
-omitting it preserves the current value.
+optional `weight_version`. The version changes only after the update succeeds.
+Omitting it preserves the current value, except when L3 is enabled and the
+update flushes the cache: then a unique successor (`{current}-uN`) is derived
+so new KV cannot reuse the previous checkpoint's objects.
 
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
@@ -322,7 +324,10 @@ speculative draft checkpoint. Live weight updates rebuild that prefix
 after the GPU load. A requested `flush_cache` must succeed before the
 prefix switches: in-flight Host writebacks cause `ClearCache` to reject,
 and the update RPC then fails so the caller retries instead of publishing
-new KV under a mixed namespace. Context-parallel workers (`ENABLE_CP`) share
+new KV under a mixed namespace. If the update omits `weight_version`
+while L3 is enabled, a unique successor (`{current}-uN`) is derived so
+`Engine.update_weights_from_distributed` cannot republish under the
+startup namespace. Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}`.
 `global_segment_size` is split across
 attention-TP × pipeline-parallel ranks so the mounted total matches the
