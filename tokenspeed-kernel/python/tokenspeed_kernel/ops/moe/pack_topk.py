@@ -58,6 +58,17 @@ def pack_topk_router_logits(
 ) -> torch.Tensor:
     """Encode selected routes as dense FP32 log-probabilities.
 
+    Args:
+        topk_weights: FP32 route weights with shape ``[num_tokens, top_k]``.
+        topk_ids: Expert indices with shape ``[num_tokens, top_k]`` matching
+            ``topk_weights``.
+        num_experts: Total number of experts represented by the dense output.
+
+    Returns:
+        An FP32 tensor with shape ``[num_tokens, num_experts]`` containing the
+        log weight for each selected expert and a large negative value for
+        every unselected expert.
+
     CUDA inputs use one Triton launch, replacing the fill, clamp, cast, log and
     scatter chain emitted by the PyTorch expression. CPU remains a reference
     fallback for configuration tests.
