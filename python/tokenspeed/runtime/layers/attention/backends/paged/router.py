@@ -23,7 +23,7 @@
 ``CacheGroupRouter`` is the runner-facing attention backend for every model
 whose attention is paged KV. It holds one ``PagedAttentionBackend`` leaf per
 attention (history-family) cache group and is the only object between the
-scheduler bridge and the kernels that knows about groups at all:
+scheduler bridge and the kernels that expands raw group tables:
 
 * it learns each group's block granularity from the pool's published specs
   (``CacheGroupGeometry``) and each leaf's kernel page size, and expands the
@@ -35,9 +35,10 @@ scheduler bridge and the kernels that knows about groups at all:
 * it dispatches a layer's forward to the leaf of ``layer.group_id`` with
   that group's write locations.
 
-Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc`` and nothing
-else. A single-group model is a router with one leaf; there is no
-single-table special case anywhere.
+Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. An optional
+backend runtime receives resolved ``group_view`` results for cross-group
+indexing and owns its transient verify state. A single-group model is a
+router with one leaf; there is no single-table special case anywhere.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
+    PagedAttentionRuntime,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
@@ -99,6 +101,19 @@ class RouterDecodeWriteLocations:
     by_group: dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class PagedGroupView:
+    """Resolved pages for a backend runtime consuming one cache group.
+
+    The table aliases the router's persistent stack. ``pages_per_block`` is
+    the router-owned expansion factor; consumers never expand raw tables.
+    """
+
+    page_table: torch.Tensor
+    kernel_page_size: int
+    pages_per_block: int
+
+
 class CacheGroupRouter(AttentionBackend):
     """One paged leaf per attention cache group; see the module docstring."""
 
@@ -128,6 +143,7 @@ class CacheGroupRouter(AttentionBackend):
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
         self.cache_pool: CachePool | None = None
+        self.runtime: PagedAttentionRuntime | None = None
         self._speculative_state_backends = []
         self._stacks: GroupTableStacks | None = None
         # Published write locations: the decode slot (graph-recorded views,
@@ -192,6 +208,12 @@ class CacheGroupRouter(AttentionBackend):
     def configure_runtime(self, **kwargs) -> None:
         for leaf in self.leaves.values():
             leaf.configure_runtime(**kwargs)
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Allocate the family's shared verify workspace and return its bytes."""
+        if self.runtime is None:
+            return 0
+        return self.runtime.preallocate_verify_workspace(max_bs, draft_token_num)
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
@@ -270,6 +292,24 @@ class CacheGroupRouter(AttentionBackend):
                 "metadata call"
             )
         return self._stacks
+
+    def group_view(self, group_id: str, bs: int) -> PagedGroupView:
+        """Return a group's resolved kernel pages for the current batch.
+
+        Args:
+            group_id: A paged group published by the bound cache pool.
+            bs: Number of batch rows, including graph padding.
+
+        Returns:
+            A view over the router's table with its kernel page size and
+            block expansion. The router remains the only geometry owner.
+        """
+        page_size = self.stacks.group_kernel_page_size(group_id)
+        return PagedGroupView(
+            page_table=self.stacks.table(group_id, bs),
+            kernel_page_size=page_size,
+            pages_per_block=self.stacks.group_page_expansion(group_id),
+        )
 
     # ------------------------------------------------------------------
     # Write locations

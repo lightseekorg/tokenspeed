@@ -25,8 +25,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import tokenspeed.runtime.layers.attention.backends.specific.qsa as qsa_backend_module
+import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
+import tokenspeed.runtime.layers.attention.qsa.runtime as qsa_runtime_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -41,12 +42,8 @@ from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
-from tokenspeed.runtime.layers.attention.backends.specific.qsa import (
-    QSAAttnBackend,
-    QSALayout,
-)
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpMambaAttnBackend,
 )
@@ -69,11 +66,16 @@ from tokenspeed.runtime.layers.attention.qsa import (
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
+from tokenspeed.runtime.layers.attention.qsa.runtime import (
+    QSALayout,
+    decode_query_lengths,
+)
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
@@ -388,11 +390,9 @@ def test_qwen4_exp_loads_fp8_scales_only_into_attention_layers(monkeypatch) -> N
     assert paged_attention.v_scale_float == 0.25
 
 
-def test_qwen4_exp_qsa_page_table_expansion() -> None:
-    assert QSAAttnBackend._page_table_expansion(64, 256) == 4
-    assert QSAAttnBackend._page_table_expansion(256, 256) == 1
-    with pytest.raises(ValueError, match="divisible"):
-        QSAAttnBackend._page_table_expansion(96, 256)
+def test_qwen4_exp_qsa_rejects_invalid_kernel_page_size() -> None:
+    with pytest.raises(ValueError, match="positive multiple"):
+        _qsa_router(kernel_page_size=96, max_bs=4, spec=1)
 
 
 def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
@@ -434,8 +434,8 @@ _QSA_GROUP_GRANULARITIES = {
 
 
 def _qsa_router(
-    *, kernel_page_size: int | None, max_bs: int = 4, spec: int = 1
-) -> QSAAttnBackend:
+    *, kernel_page_size: int | None, max_bs: int, spec: int
+) -> CacheGroupRouter:
     """A real ``CacheGroupRouter`` over real MHA leaves for the Qwen4-Exp
     history groups, bound the way ``set_cache_pool`` binds it (CPU)."""
     component = MHAConfig(
@@ -463,17 +463,9 @@ def _qsa_router(
         components=(component,),
     )
 
-    def leaf_factory(group_id: str, block_granularity: int) -> MHAAttnBackend:
-        del group_id
-        return MHAAttnBackend(
-            config,
-            component,
-            kernel_page_size=MHAAttnBackend.resolve_kernel_page_size(
-                config, block_granularity
-            ),
-        )
-
-    router = QSAAttnBackend(config, component)
+    router = attention_registry.create_paged_router(
+        config, AttentionArch.MHA, backend_name="qsa"
+    )
     router.bind(
         CacheGroupGeometry(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
@@ -481,7 +473,7 @@ def _qsa_router(
             full_history_group_id=FULL_ATTENTION,
         ),
         {
-            gid: leaf_factory(gid, granularity)
+            gid: router._leaf_factory(gid, granularity)
             for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
         },
     )
@@ -509,7 +501,7 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
 
 
 def test_qwen4_exp_qsa_reads_group_geometry_from_the_router() -> None:
-    router = _qsa_router(kernel_page_size=64)
+    router = _qsa_router(kernel_page_size=64, max_bs=4, spec=1)
     raw = torch.tensor([[3, 5], [7, -1]], dtype=torch.int32)
     _qsa_extend_round(
         router, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[300, 9]
@@ -518,28 +510,28 @@ def test_qwen4_exp_qsa_reads_group_geometry_from_the_router() -> None:
     # A 64-token kernel page splits the 256-token compressed block four ways
     # and leaves the 64-token recent block whole; each table is the router's
     # batch-ordered stack view for exactly the forward's rows.
-    table, expansion = router._group_geometry(QWEN4_EXP_QSA_CACHE_GROUP, 256, bs=2)
+    view = router.group_view(QWEN4_EXP_QSA_CACHE_GROUP, bs=2)
+    table, expansion = view.page_table, view.pages_per_block
     assert expansion == 4
     assert table.shape == (2, router.leaves[QWEN4_EXP_QSA_CACHE_GROUP].max_num_pages)
     assert table[:, :8].tolist() == [
         [12, 13, 14, 15, 20, 21, 22, 23],
         [28, 29, 30, 31, 0, 0, 0, 0],
     ]
-    table, expansion = router._group_geometry(
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64, bs=2
-    )
+    view = router.group_view(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, bs=2)
+    table, expansion = view.page_table, view.pages_per_block
     assert expansion == 1
     assert table[:, :2].tolist() == [[3, 5], [7, 0]]
     assert router.stacks.group_kernel_page_size(FULL_ATTENTION) == 64
 
     # Without a config override every leaf runs at its group's own grain.
-    native = _qsa_router(kernel_page_size=None)
-    assert native._group_geometry(QWEN4_EXP_QSA_CACHE_GROUP, 256, bs=1)[1] == 1
+    native = _qsa_router(kernel_page_size=None, max_bs=4, spec=1)
+    assert native.group_view(QWEN4_EXP_QSA_CACHE_GROUP, bs=1).pages_per_block == 1
     assert native.stacks.group_kernel_page_size(QWEN4_EXP_QSA_RECENT_CACHE_GROUP) == 64
 
 
 def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
-    router = _qsa_router(kernel_page_size=64, spec=3)
+    router = _qsa_router(kernel_page_size=64, spec=3, max_bs=4)
     raw = torch.tensor([[3, 5]], dtype=torch.int32)
     tables = {gid: raw for gid in _QSA_GROUP_GRANULARITIES}
     leaf = router.leaves[FULL_ATTENTION]
@@ -547,8 +539,8 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
 
     _qsa_extend_round(router, tables, seq_lens=[300])
     ctx = SimpleNamespace(attn_backend=hybrid, forward_mode=ForwardMode.EXTEND)
-    assert router._metadata(ctx) is leaf.forward_extend_metadata
-    assert router._seq_lens(router._metadata(ctx)).tolist() == [300]
+    assert router.runtime._metadata(ctx) is leaf.forward_extend_metadata
+    assert router.runtime._seq_lens(router.runtime._metadata(ctx)).tolist() == [300]
 
     router.refresh_decode_metadata(
         1,
@@ -559,8 +551,100 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
         block_tables=tables,
     )
     ctx = SimpleNamespace(attn_backend=router, forward_mode=ForwardMode.DECODE)
-    assert router._metadata(ctx) is leaf.forward_decode_metadata
-    assert router._seq_lens(router._metadata(ctx)).tolist() == [301]
+    assert router.runtime._metadata(ctx) is leaf.forward_decode_metadata
+    assert router.runtime._seq_lens(router.runtime._metadata(ctx)).tolist() == [301]
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    ("mode", "query_width"),
+    [(ForwardMode.EXTEND, 1), (ForwardMode.DECODE, 4), (ForwardMode.DECODE, 1)],
+)
+def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
+    monkeypatch: pytest.MonkeyPatch,
+    hybrid: bool,
+    mode: ForwardMode,
+    query_width: int,
+) -> None:
+    router = _qsa_router(kernel_page_size=64, max_bs=4, spec=4)
+    raw = torch.tensor([[3], [5]], dtype=torch.int32)
+    tables = {gid: raw for gid in _QSA_GROUP_GRANULARITIES}
+    lengths = [5, 9]
+    if mode.is_decode():
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.tensor(lengths, dtype=torch.int32),
+            forward_mode=mode,
+            block_tables=tables,
+            num_extends=0,
+            for_graph_replay=False,
+        )
+        kv_width = 4
+    else:
+        _qsa_extend_round(router, tables, seq_lens=lengths)
+        kv_width = 1
+    backend = (
+        HybridLinearAttnBackend(router, SimpleNamespace(), [3]) if hybrid else router
+    )
+    events = []
+    backend.register_step_counter(
+        SimpleNamespace(record_cache=lambda: events.append("cache_step"))
+    )
+    layer = PagedAttention(
+        num_heads=2,
+        head_dim=8,
+        scaling=0.5,
+        num_kv_heads=1,
+        layer_id=3,
+        logit_cap=0.0,
+        v_head_dim=8,
+        sliding_window_size=-1,
+        group_id=FULL_ATTENTION,
+    )
+    pool = SimpleNamespace()
+    ctx = SimpleNamespace(
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        bs=2,
+        forward_mode=mode,
+        draft_narrowing=object() if query_width < kv_width else None,
+    )
+    queries = torch.zeros((2 * query_width, 16))
+    keys = torch.ones((2 * kv_width, 8))
+    topk = torch.zeros((2 * query_width, 4), dtype=torch.int32)
+
+    def sparse(q, k, v, actual_layer, locs, actual_pool, indices, actual_ctx):
+        events.append("attention")
+        assert actual_layer is layer
+        assert actual_pool is pool
+        assert actual_ctx is ctx
+        assert indices is topk
+        assert q.shape[0] == 2 * query_width
+        assert k.shape[0] == v.shape[0] == 2 * kv_width
+        expected = [
+            block * 256 + position
+            for block, length in zip((3, 5), lengths, strict=True)
+            for position in range(length - kv_width, length)
+        ]
+        assert locs.tolist() == expected
+        return q.clone()
+
+    monkeypatch.setattr(router.leaves[FULL_ATTENTION], "_sparse_attention", sparse)
+    output = layer(
+        queries,
+        keys,
+        keys,
+        ctx,
+        save_kv_cache=True,
+        record_kv_cache=None,
+        topk_indices=topk,
+    )
+    assert output.shape == queries.shape
+    assert events == (
+        ["attention", "cache_step"] if mode.is_extend() else ["attention"]
+    )
 
 
 def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
@@ -629,7 +713,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
 
-    router = _qsa_router(kernel_page_size=64)
+    router = _qsa_router(kernel_page_size=64, max_bs=4, spec=1)
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
     _qsa_extend_round(
         router, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 9]
@@ -672,6 +756,8 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
         qsa_page_expansion=4,
         recent_page_table=recent_table,
         recent_page_expansion=1,
+        full_page_table=stacks.table(FULL_ATTENTION, 2),
+        full_kernel_page_size=64,
         reset_draft_tags=None,
     )
 
@@ -679,7 +765,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
         prepare_calls.append((args, kwargs))
         return prepared
 
-    router.qsa_forward_layout = prepare
+    router.runtime.qsa_forward_layout = prepare
 
     def write_and_compress(*args, **kwargs):
         updates.append((args, kwargs))
@@ -744,7 +830,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
 
 
 def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) -> None:
-    router = _qsa_router(kernel_page_size=64)
+    router = _qsa_router(kernel_page_size=64, max_bs=4, spec=1)
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
     _qsa_extend_round(
         router, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 12]
@@ -768,11 +854,11 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         kwargs["draft_logical_positions"].fill_(torch.iinfo(torch.int64).min)
         return outputs
 
-    monkeypatch.setattr(qsa_backend_module, "qwen4_exp_qsa_prepare_metadata", prepare)
+    monkeypatch.setattr(qsa_runtime_module, "qwen4_exp_qsa_prepare_metadata", prepare)
     first_tags = torch.zeros((2, 4), dtype=torch.int64)
     second_tags = torch.zeros_like(first_tags)
 
-    first = router.qsa_forward_layout(
+    first = router.runtime.qsa_forward_layout(
         ctx,
         8,
         compressed_token_page_size=256,
@@ -780,7 +866,7 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         compress_ratio=4,
         reset_draft_tags=first_tags,
     )
-    second = router.qsa_forward_layout(
+    second = router.runtime.qsa_forward_layout(
         ctx,
         8,
         compressed_token_page_size=256,
@@ -871,7 +957,7 @@ def test_qwen4_exp_qsa_uses_compacted_decode_width(
     ctx = SimpleNamespace(bs=1, forward_mode=mode)
 
     assert (
-        QSAAttnBackend._decode_query_lengths(
+        decode_query_lengths(
             ctx,
             total_tokens=1,
             force_uniform=force_uniform,
@@ -1152,7 +1238,7 @@ def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
     device = "cuda"
     indexer, pool, _, _, _ = _qsa_cache_test_indexer(device)
     indexer.layer_id = 0
-    indexer.qsa_coordinator = None
+    indexer.qsa_runtime = None
     raw = torch.zeros((3, 4, 1, 2), dtype=torch.bfloat16, device=device)
     rope_cache = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda actual_pool: (raw, None, rope_cache)
@@ -1170,9 +1256,9 @@ def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
     )
     positions = logical.unsqueeze(-1).expand(-1, 3).clone()
     recent_locs = (64 + logical).to(torch.int32)
-    backend = _qsa_router(kernel_page_size=64, max_bs=1)
-    backend.bind_indexers([indexer])
-    staging = backend.verify_staging_buffers(
+    backend = _qsa_router(kernel_page_size=64, max_bs=1, spec=1)
+    backend.runtime.bind_indexers([indexer])
+    staging = backend.runtime.verify_staging_buffers(
         indexer,
         token_k,
         positions,
@@ -1186,7 +1272,7 @@ def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
     staging[2].copy_(logical.view(1, 4))
     staging[3].copy_(recent_locs.view(1, 4))
 
-    backend.commit_after_mtp_verify(
+    backend.commit_speculative_state_after_verify(
         torch.tensor([1], dtype=torch.int32, device=device), num_extends=0
     )
 
@@ -1196,7 +1282,7 @@ def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
     )
     torch.testing.assert_close(rope_cache[1].cpu(), torch.full((3,), 20))
 
-    backend.commit_after_mtp_verify(
+    backend.commit_speculative_state_after_verify(
         torch.tensor([3], dtype=torch.int32, device=device), num_extends=0
     )
 
@@ -1617,10 +1703,10 @@ def test_qwen4_exp_ple_forward_is_an_eager_break() -> None:
 
 def test_qwen4_exp_qsa_entry_points_are_eager_breaks() -> None:
     # Hybrid targets break at the composite dispatch; bare draft models break
-    # at QSA.forward. Direct child entry points stay plain to avoid nesting.
+    # at CacheGroupRouter.forward. Direct child entry points stay plain to avoid nesting.
     assert hasattr(QSAIndexer.forward, "__wrapped__")
     assert hasattr(HybridLinearAttnBackend.forward, "__wrapped__")
-    assert hasattr(QSAAttnBackend.forward, "__wrapped__")
+    assert hasattr(CacheGroupRouter.forward, "__wrapped__")
     assert not hasattr(QSAAttnBackend.forward_extend, "__wrapped__")
     assert not hasattr(QSAAttnBackend.forward_decode, "__wrapped__")
     assert not hasattr(QSAIndexer, "sparse_attention")
@@ -1640,11 +1726,8 @@ def test_qwen4_exp_qsa_fuses_fp8_kv_store(
 ) -> None:
     backend = object.__new__(QSAAttnBackend)
     page_size = 16
-    backend._stacks = SimpleNamespace(
-        group_kernel_page_size=lambda group_id: page_size,
-        max_bs=8,
-        max_tokens_per_req=4,
-    )
+    backend.kernel_page_size = page_size
+    backend._metadata_capacity_rows = 32
 
     k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
     v_cache = torch.empty_like(k_cache)

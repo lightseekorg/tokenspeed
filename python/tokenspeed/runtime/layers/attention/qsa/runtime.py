@@ -18,36 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registered Qwen4-Exp QSA attention backend.
+"""Backend-owned QSA layout and speculative verification lifecycle.
 
-The model-owned :class:`QSAIndexer` keeps the projection weights and produces
-physical top-k slots. This backend owns the cache-group router, sparse dispatch,
-graph-stable target-verify staging, and the batched post-verification commit.
+The ordinary cache-group router owns the page tables. This runtime consumes
+its resolved views and owns shared verify staging; the paged QSA leaf only
+executes attention, and the model indexer owns weights and top-k selection.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import qsa_sparse_attention
 from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_prepare_metadata,
 )
-from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 
-from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    break_point,
-    current_forward_ctx,
-    current_valid_rows,
-    slice_to_real_tokens,
-)
-from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
@@ -56,18 +44,39 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     cache_field_layer_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.configs.base import (
-        AttnConfig,
-        SoftmaxAttnConfig,
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
-    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+
+def decode_query_lengths(
+    ctx: ForwardContext, total_tokens: int, *, force_uniform: bool
+) -> int | None:
+    """Return the uniform decode query width, or None for a ragged extend.
+
+    Args:
+        ctx: The live model forward context.
+        total_tokens: Query rows, after any draft step-0 narrowing.
+        force_uniform: Whether a narrowed draft requires uniform rows even
+            when its original context still names an extend forward.
+
+    Returns:
+        Query rows per request for uniform forwards, otherwise None.
+    """
+    if not ctx.bs or (
+        not force_uniform
+        and (ctx.forward_mode is None or not ctx.forward_mode.is_decode())
+    ):
+        return None
+    if total_tokens % ctx.bs:
+        raise RuntimeError("Qwen4-Exp QSA decode rows must be divisible by batch size")
+    return total_tokens // ctx.bs
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,8 @@ class QSALayout:
     qsa_page_expansion: int
     recent_page_table: torch.Tensor
     recent_page_expansion: int
+    full_page_table: torch.Tensor
+    full_kernel_page_size: int
     reset_draft_tags: torch.Tensor | None
 
 
@@ -117,30 +128,13 @@ class _QSAVerifyStaging:
         self.capacity = capacity
 
 
-class QSAAttnBackend(CacheGroupRouter):
-    """QSA sparse dispatch over MHA leaves and the shared group router."""
+class QSARuntime:
+    """Shared QSA indexing layout and target-verify staging for one router."""
 
-    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
-        def leaf_factory(group_id: str, block_granularity: int):
-            del group_id
-            kernel_page_size = MHAAttnBackend.resolve_kernel_page_size(
-                config, block_granularity
-            )
-            leaf_spec = dataclasses.replace(spec, backend_name="mha")
-            return MHAAttnBackend(
-                config,
-                leaf_spec,
-                kernel_page_size=kernel_page_size,
-            )
-
-        super().__init__(
-            leaf_factory,
-            is_draft=bool(config.is_draft),
-            spec_num_tokens=config.speculative_num_draft_tokens or 1,
-            device=config.device,
-        )
+    def __init__(self, config: AttnConfig, router: CacheGroupRouter) -> None:
+        self.router = router
         self.dtype = config.dtype
-        self._data_type = config.kv_cache_dtype
+        self.device = config.device
         self._indexers: tuple[QSAIndexer, ...] = ()
         self._slots: dict[int, int] = {}
         self._staging: dict[int, _QSAVerifyStaging] = {}
@@ -150,28 +144,33 @@ class QSAAttnBackend(CacheGroupRouter):
         self._commit_tables_key: tuple | None = None
 
     @property
-    def data_type(self):
-        return self._data_type
+    def is_draft(self) -> bool:
+        return self.router.is_draft
 
-    # ------------------------------------------------------------------
-    # QSA forward geometry
-    # ------------------------------------------------------------------
+    @property
+    def spec_num_tokens(self) -> int:
+        return self.router.spec_num_tokens
+
+    @property
+    def sparse_topk(self):
+        return self.router.sparse_topk
+
+    @property
+    def cache_pool(self):
+        return self.router.cache_pool
 
     def _metadata(self, ctx: ForwardContext):
-        leaf = self.leaves[FULL_ATTENTION]
-        candidates = []
-        if ctx.forward_mode.is_extend_or_mixed():
-            candidates.extend(("forward_extend_metadata", "forward_prefill_metadata"))
-        elif self.spec_num_tokens > 1 and not self.is_draft:
-            candidates.append("forward_prefill_metadata")
-        candidates.append("forward_decode_metadata")
-        for name in candidates:
-            metadata = getattr(leaf, name, None)
-            if metadata is not None:
-                return metadata
-        raise RuntimeError(
-            f"QSA found no {ctx.forward_mode} metadata on the full-attention leaf"
+        leaf = self.router.leaves[FULL_ATTENTION]
+        metadata = (
+            leaf.forward_extend_metadata
+            if ctx.forward_mode.is_extend_or_mixed()
+            else leaf.forward_decode_metadata
         )
+        if metadata is None:
+            raise RuntimeError(
+                f"QSA found no {ctx.forward_mode} metadata on the full-attention leaf"
+            )
+        return metadata
 
     @staticmethod
     def _seq_lens(metadata) -> torch.Tensor:
@@ -195,48 +194,6 @@ class QSAAttnBackend(CacheGroupRouter):
         if bs and total_tokens % bs == 0:
             return total_tokens // bs
         raise RuntimeError("QSA could not infer query lengths")
-
-    @staticmethod
-    def _decode_query_lengths(
-        ctx: ForwardContext,
-        total_tokens: int,
-        *,
-        force_uniform: bool,
-    ) -> int | None:
-        if not ctx.bs or (
-            not force_uniform
-            and (ctx.forward_mode is None or not ctx.forward_mode.is_decode())
-        ):
-            return None
-        if total_tokens % ctx.bs:
-            raise RuntimeError(
-                "Qwen4-Exp QSA decode rows must be divisible by batch size"
-            )
-        return total_tokens // ctx.bs
-
-    @staticmethod
-    def _page_table_expansion(kernel_page_size: int, block_granularity: int) -> int:
-        kernel_page_size = int(kernel_page_size)
-        if block_granularity == kernel_page_size:
-            return 1
-        if block_granularity % kernel_page_size:
-            raise ValueError(
-                "Qwen4-Exp QSA block granularity must be divisible by the "
-                f"group's kernel page size ({block_granularity} vs "
-                f"{kernel_page_size})"
-            )
-        return block_granularity // kernel_page_size
-
-    def _group_geometry(
-        self,
-        group_id: str,
-        block_granularity: int,
-        bs: int,
-    ) -> tuple[torch.Tensor, int]:
-        expansion = self._page_table_expansion(
-            self.stacks.group_kernel_page_size(group_id), block_granularity
-        )
-        return self.stacks.table(group_id, bs), expansion
 
     def qsa_forward_layout(
         self,
@@ -267,23 +224,18 @@ class QSAAttnBackend(CacheGroupRouter):
             return cached
 
         metadata = self._metadata(ctx)
-        query_lengths = self._decode_query_lengths(
+        query_lengths = decode_query_lengths(
             ctx,
             total_tokens,
             force_uniform=False,
         )
         if query_lengths is None:
             query_lengths = self._query_lengths(metadata, total_tokens, ctx.bs)
-        qsa_page_table, qsa_expansion = self._group_geometry(
-            QWEN4_EXP_QSA_CACHE_GROUP,
-            compressed_token_page_size,
-            ctx.bs,
-        )
-        recent_page_table, recent_expansion = self._group_geometry(
-            QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
-            recent_page_size,
-            ctx.bs,
-        )
+        qsa = self.router.group_view(QWEN4_EXP_QSA_CACHE_GROUP, ctx.bs)
+        recent = self.router.group_view(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, ctx.bs)
+        full = self.router.group_view(FULL_ATTENTION, ctx.bs)
+        qsa_page_table, qsa_expansion = qsa.page_table, qsa.pages_per_block
+        recent_page_table, recent_expansion = recent.page_table, recent.pages_per_block
         seq_lens = self._seq_lens(metadata)[: ctx.bs]
         logical, requests, qsa_locs, recent_locs, complete_blocks = (
             qwen4_exp_qsa_prepare_metadata(
@@ -312,6 +264,8 @@ class QSAAttnBackend(CacheGroupRouter):
             qsa_page_expansion=qsa_expansion,
             recent_page_table=recent_page_table,
             recent_page_expansion=recent_expansion,
+            full_page_table=full.page_table,
+            full_kernel_page_size=full.kernel_page_size,
             reset_draft_tags=reset_draft_tags,
         )
         self.sparse_topk.qsa_metadata = layout
@@ -338,7 +292,7 @@ class QSAAttnBackend(CacheGroupRouter):
         self._indexers = bound
         self._slots = {indexer.layer_id: slot for slot, indexer in enumerate(bound)}
         for indexer in bound:
-            indexer.qsa_coordinator = self
+            indexer.qsa_runtime = self
 
     @staticmethod
     def _check_uniform_geometry(indexers: tuple[QSAIndexer, ...]) -> None:
@@ -580,229 +534,43 @@ class QSAAttnBackend(CacheGroupRouter):
             verify_width=width,
         )
 
-    # ------------------------------------------------------------------
-    # Sparse dispatch
-    # ------------------------------------------------------------------
 
-    def _sparse_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool: CachePool,
-        topk_indices: torch.Tensor,
-        ctx: ForwardContext | None,
-    ) -> torch.Tensor:
-        num_real = current_valid_rows()
-        if num_real is not None:
-            q, k, v, out_cache_loc, topk_indices = slice_to_real_tokens(
-                num_real, q, k, v, out_cache_loc, topk_indices
-            )
-        ctx = ctx or current_forward_ctx()
-        if ctx is None:
-            raise RuntimeError("QSA sparse attention requires a forward context")
-        full_locs = out_cache_loc[: k.shape[0]]
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        if (
-            k_cache.dtype == torch.float8_e4m3fn
-            and v_cache.dtype == torch.float8_e4m3fn
-            and k.dtype != k_cache.dtype
-            and v.dtype != v_cache.dtype
-        ):
-            fused_fp8_set_kv_buffer(
-                k=k,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=full_locs,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.stacks.group_kernel_page_size(FULL_ATTENTION),
-            )
-        else:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                full_locs,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
-        max_seqlen_q = self._decode_query_lengths(
-            ctx,
-            q.shape[0],
-            force_uniform=ctx.draft_narrowing is not None,
-        )
-        output = qsa_sparse_attention(
-            q,
-            k_cache,
-            v_cache,
-            topk_indices,
-            scale=layer.scaling,
-            max_seqlen_q=max_seqlen_q if max_seqlen_q is not None else 1,
-            metadata_capacity_rows=max(
-                q.shape[0], self.stacks.max_bs * self.stacks.max_tokens_per_req
-            ),
-            k_scale=(
-                (1.0 if layer.k_scale is None else layer.k_scale)
-                if k_cache.dtype == torch.float8_e4m3fn
-                else None
-            ),
-            v_scale=(
-                (1.0 if layer.v_scale is None else layer.v_scale)
-                if v_cache.dtype == torch.float8_e4m3fn
-                else None
-            ),
-            override=None,
-            solution=None,
-        )
-        return output.reshape(q.shape[0], -1)
+def require_qsa_runtime(attn_backend: AttentionBackend) -> QSARuntime:
+    """Return the registered router runtime used by a target or draft model.
 
-    @break_point
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: PagedAttention,
-        token_to_kv_pool: CachePool,
-        forward_mode: ForwardMode,
-        bs: int,
-        save_kv_cache: bool = True,
-        record_kv_cache: bool | None = None,
-        *,
-        topk_indices: torch.Tensor | None,
-        ctx: ForwardContext | None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if topk_indices is None:
-            return super().forward(
-                q,
-                k,
-                v,
-                layer,
-                token_to_kv_pool,
-                forward_mode,
-                bs,
-                save_kv_cache,
-                record_kv_cache,
-                **kwargs,
-            )
-        out_cache_loc = self.write_locations(layer, forward_mode)
-        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
-            return self._sparse_attention(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                topk_indices,
-                ctx,
-            )
+    Args:
+        attn_backend: The model's router or outer hybrid backend.
 
-    def forward_decode(
-        self,
-        q,
-        k,
-        v,
-        layer,
-        token_to_kv_pool,
-        bs,
-        save_kv_cache=True,
-        *,
-        topk_indices,
-        ctx,
-        **kwargs,
-    ):
-        if topk_indices is None:
-            return super().forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-        return self._sparse_attention(
-            q,
-            k,
-            v,
-            layer,
-            self.write_locations(layer, ForwardMode.DECODE),
-            token_to_kv_pool,
-            topk_indices,
-            ctx,
-        )
-
-    def forward_extend(
-        self,
-        q,
-        k,
-        v,
-        layer,
-        token_to_kv_pool,
-        bs,
-        save_kv_cache=True,
-        *,
-        topk_indices,
-        ctx,
-        forward_mode,
-        **kwargs,
-    ):
-        if topk_indices is None:
-            return super().forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                forward_mode=forward_mode,
-                **kwargs,
-            )
-        return self._sparse_attention(
-            q,
-            k,
-            v,
-            layer,
-            self.write_locations(layer, forward_mode),
-            token_to_kv_pool,
-            topk_indices,
-            ctx,
-        )
-
-
-register_backend("qsa", {AttentionArch.MHA}, QSAAttnBackend)
+    Returns:
+        The QSA runtime created by the backend registry at construction.
+    """
+    router = getattr(attn_backend, "full_attn_backend", attn_backend)
+    runtime = getattr(router, "runtime", None)
+    if not isinstance(runtime, QSARuntime):
+        raise RuntimeError("Qwen4-Exp QSA indexers require a registered QSA runtime")
+    return runtime
 
 
 def bind_qsa_indexers(
-    attn_backend,
+    attn_backend: AttentionBackend,
     indexers: Iterable[QSAIndexer],
-) -> QSAAttnBackend | None:
-    """Bind local QSA indexers to the registered full-attention backend."""
+) -> QSARuntime | None:
+    """Bind local target indexers to their pre-existing backend runtime.
 
-    full_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
-    if getattr(full_backend, "is_draft", False):
+    Args:
+        attn_backend: The model's router or outer hybrid backend.
+        indexers: Model-owned local indexers in ascending layer order.
+
+    Returns:
+        The owning runtime, or None for drafts, which do not commit target
+        acceptance. Construction, budgeting and hook registration precede
+        model binding and never depend on a model forward running.
+    """
+    runtime = require_qsa_runtime(attn_backend)
+    if runtime.is_draft:
         return None
-    if not isinstance(full_backend, QSAAttnBackend):
-        raise RuntimeError(
-            "Qwen4-Exp QSA indexers require the qsa attention backend, got "
-            f"{type(full_backend).__name__}"
-        )
-    full_backend.bind_indexers(indexers)
-    attn_backend.register_speculative_state_backend(full_backend)
-    return full_backend
+    runtime.bind_indexers(indexers)
+    return runtime
 
 
-__all__ = ["QSAAttnBackend", "QSALayout", "bind_qsa_indexers"]
+__all__ = ["QSARuntime", "QSALayout", "bind_qsa_indexers", "require_qsa_runtime"]

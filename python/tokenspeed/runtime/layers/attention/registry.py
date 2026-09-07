@@ -461,12 +461,16 @@ def create_paged_router(
         leaf_spec = dataclasses.replace(spec, backend_name=name)
         return leaf_cls(config, leaf_spec, kernel_page_size=kernel_page_size)
 
-    return CacheGroupRouter(
+    router = CacheGroupRouter(
         leaf_factory,
         is_draft=bool(config.is_draft),
         spec_num_tokens=config.speculative_num_draft_tokens or 1,
         device=config.device,
     )
+    router.runtime = leaf_cls.create_runtime(config, router)
+    if router.runtime is not None:
+        router.register_speculative_state_backend(router.runtime)
+    return router
 
 
 def _validate_lcm_page_size(

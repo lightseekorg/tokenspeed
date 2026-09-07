@@ -334,14 +334,31 @@ support) and `cache_metadata.py` (the runner's block-table bridge) stay at
 the root; `paged/` holds the block-table route — the `CacheGroupRouter`, its
 geometry / table-stack / write-location helpers, and every kernel-facing
 paged leaf (`base.py` is `PagedAttentionBackend`; MHA, MLA, FlashMLA, TRT-LLM,
-TRT-LLM MLA, TokenSpeed MLA, DSA, MSA); `state/` holds the recurrent consumers
+TRT-LLM MLA, TokenSpeed MLA, DSA, MSA, QSA); `state/` holds the recurrent consumers
 (Mamba/GDN and KDA);
 `hybrid/` the layer-routing composite (`linear.py` is
 `HybridLinearAttnBackend`); and `specific/` the bespoke single-model backends
-(DeepSeek V4, Qwen4-Exp's GDN extension, QSA's registered router + sparse
-dispatch, and Inkling's dense + conv-state wrapper). A new leaf goes under
-`paged/`, a new recurrent family under `state/`; model-specific composition
-and lifecycle extensions go under `specific/`.
+(DeepSeek V4, Qwen4-Exp's GDN extension, and Inkling's dense + conv-state
+wrapper). A new leaf goes under `paged/`, a new recurrent family under
+`state/`. A model-shaped backend earns `specific/` only when the ordinary
+router, paged leaves and shared runtime hooks cannot express it; use by one
+model alone is not a reason to introduce a bespoke backend.
+
+QSA follows the ordinary router + leaf path. Its registered paged leaf
+inherits MHA's metadata refresh and capture; `attention/qsa/runtime.py`
+owns its cross-group layout and verify staging. The registry calls the leaf
+class's `create_runtime(config, router)` once per router, before verify
+workspace allocation and model binding. The runtime consumes
+`router.group_view(gid, bs)`, whose table and expansion come from the same
+stacks the leaf metadata uses. It never builds another block-table route.
+QSA compute leaf instances hold no shared runtime or router reference.
+
+Verify workspace allocation delegates from the router to its runtime. The
+runtime registers its post-verify commit on that router at construction;
+`AttentionBackend.commit_speculative_state_after_verify` visits local
+registrations and runner-facing children, so bare draft/target routers and
+hybrid wrappers use the same lifecycle. Model binding supplies the local
+indexers only; it neither creates a runtime nor registers another commit.
 
 ## One block-table route: router + leaves
 
@@ -353,6 +370,7 @@ vocabulary is fixed, with exactly one conversion point:
 | C++ scheduler | per-group `BlockTable`s: rows in `block_granularity` logical index, entries are `CacheBlock` ids | kernel pages, backends |
 | bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
 | **`CacheGroupRouter`** | group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, ALL write-location slot math | kernel calls |
+| backend-owned paged runtime (QSA) | resolved views of its groups, leaf metadata and transient verification workspace | raw scheduler block tables, allocation of persistent request caches |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 

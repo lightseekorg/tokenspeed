@@ -413,9 +413,18 @@ class AttentionBackend(ABC):
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Publish MTP accept/reject results to registered model side-state."""
+        """Publish acceptance to local runtimes and runner-facing children.
+
+        Each runtime registers with its owning node once at construction.
+        Paged compute leaves carry no post-verify lifecycle.
+        """
         for backend in getattr(self, "_speculative_state_backends", ()):
             backend.commit_after_mtp_verify(accepted_lengths, num_extends=num_extends)
+        for child in self.child_backends():
+            if isinstance(child, AttentionBackend):
+                child.commit_speculative_state_after_verify(
+                    accepted_lengths, num_extends=num_extends
+                )
 
     @contextmanager
     def record_pd_cache_step(
