@@ -102,11 +102,12 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     Returns:
         BF16 attention output shaped ``[tokens, 6, 256]``.
 
-    The kernel uses eight sequence-split CTAs for at most eight query rows and
-    four sequence-split CTAs for larger launches. Both paths pipeline K and V
-    through the same two-stage asynchronous ring. The eight-way path assigns
-    the final DSM softmax combine across six head-owning CTA ranks; the
-    four-way path retains its rank-zero combine.
+    Small launches use sixteen sequence-split CTAs when the device occupancy
+    probe allows all rows to fit in one wave, otherwise eight CTAs for up to
+    eight query rows and four for larger launches. All split counts use the
+    same asynchronous K/V ring and head-owning DSM softmax combine. The final
+    three selected entries are computed in that combine, avoiding a mostly
+    empty tensor-core tile. BF16 V staging uses transposed matrix loads.
     """
 
     del metadata_capacity_rows  # The workspace-free specialization has no metadata.

@@ -335,6 +335,84 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("rows", [1, 4, 8, 9])
+def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
+    device: str,
+    cache_dtype: torch.dtype,
+    rows: int,
+) -> None:
+    """Exercise every compression phase, empty splits and tail-only attention."""
+    if current_platform().arch_version != ArchVersion(10, 0):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    from ops.bench_qsa_sparse_attention import make_inputs
+
+    q, k_cache, v_cache, slots = make_inputs(rows, 65539, 262144, cache_dtype, 83)
+    k_scale, v_scale = 1.75, 0.25
+    kwargs = {
+        "scale": 256**-0.5,
+        "max_seqlen_q": 4 if rows == 4 else 1,
+        "metadata_capacity_rows": None,
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+        "override": "cute_dsl_blackwell_qsa_sparse_attention",
+        "solution": None,
+    }
+    # Make the tail dominate one head, forcing rescaling of the full-tile
+    # partial rather than merely adding a negligible tail contribution.
+    tail_slots = slots[:, -3:].clone()
+    k_cache[tail_slots[0, 0].long(), 0] = (q[0, 0] * 8).to(cache_dtype)
+    v_cache[0].fill_(1.0e3 if cache_dtype is torch.bfloat16 else 256.0)
+    slots[:, 13] = 0
+    slots[:, 24] = -1
+    slots[:, 33] = slots[:, 34]  # Duplicate slots retain their softmax weight.
+    qsa_sparse_attention(q, k_cache, v_cache, slots, **kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = qsa_sparse_attention(q, k_cache, v_cache, slots, **kwargs)
+
+    for valid_tail in (0, 1, 2, 3):
+        slots[:, -3:].fill_(-1)
+        slots[:, 2048 : 2048 + valid_tail] = tail_slots[:, :valid_tail]
+        q.mul_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _reference(q, k_cache, v_cache, slots, 256**-0.5, k_scale, v_scale)
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, rtol=3.5e-2, atol=3.5e-2)
+
+    # All full-tile splits are empty; only the SIMD remainder contributes.
+    slots[:, :2048].fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output,
+        _reference(q, k_cache, v_cache, slots, 256**-0.5, k_scale, v_scale),
+        rtol=3.5e-2,
+        atol=3.5e-2,
+    )
+    slots.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+
+
+@pytest.mark.parametrize(
+    ("rows", "capacity", "splits"),
+    [(1, 7, 16), (7, 7, 16), (8, 7, 8), (1, 0, 8), (9, 7, 4)],
+)
+def test_qsa_sparse_attention_blackwell_cluster_capacity(
+    rows: int,
+    capacity: int,
+    splits: int,
+) -> None:
+    if current_platform().arch_version != ArchVersion(10, 0):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _num_splits
+
+    assert _num_splits(rows, capacity) == splits
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4])
 def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
     device: str,
