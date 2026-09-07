@@ -24,15 +24,15 @@ Registered for a block drafter's proposal and nothing else:
 ``noncausal_block_size`` exceeds one only when a DFLASH or DSPARK draft
 proposes a whole non-causal block (``configs/mla.py`` sets
 ``draft_block_decode`` from exactly that), so ordinary decode and target
-verify cannot reach this registration however their other traits line up. A
-target already reaches this same kernel through its own backend, which calls
-``tokenspeed_mla_decode`` directly.
+verify cannot reach this registration however their other traits line up.
 
-Within that scope both masks are served. The windowed one is what the
-portable Triton kernel was the only implementation of, and is why a draft
-whose layers declare ``sliding_attention`` was paying an order of magnitude
-for its attention; the full-attention layers of the same draft were paying it
-for no reason at all.
+This is the path for callers that select through the dispatcher. The
+``tokenspeed_mla`` backend reaches the same kernel by calling
+``tokenspeed_mla_decode`` itself, for a target's decode and a draft's block
+alike, so a trait added here does not change what that backend runs.
+
+Within that scope both masks are served: a draft mixes ``sliding_attention``
+layers with full-attention ones, and the block is non-causal under either.
 """
 
 from __future__ import annotations

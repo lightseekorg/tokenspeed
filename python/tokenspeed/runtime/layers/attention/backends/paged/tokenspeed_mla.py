@@ -100,6 +100,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
+
+    A block drafter's proposal rides the query axis with one page table row and
+    one cache length per request, non-causal and bounded by the layer's window.
+    There is no dispatcher here, so a shape the kernel does not serve is an
+    error rather than a fallback.
     """
 
     default_kernel_page_size = TOKENSPEED_MLA_DEFAULT_PAGE_SIZE
@@ -175,6 +180,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
+        self._logged_block_layouts: set[tuple[int, int, bool]] = set()
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""
@@ -346,6 +352,29 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             rows.unsqueeze(1)
         )
 
+    def _log_block_layout(
+        self, num_q_heads: int, q_len: int, sliding_window: bool
+    ) -> None:
+        """Say which block layout this leaf sends, once per combination.
+
+        The shared leaf logs the same line from ``_takes_query_blocks``; this
+        one has no probe to log from, so it reports what the shapes decided.
+        """
+        key = (num_q_heads, q_len, sliding_window)
+        if key in self._logged_block_layouts:
+            return
+        self._logged_block_layouts.add(key)
+        logger.info(
+            "CuteDSL MLA block decode uses the %s layout "
+            "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
+            "query-axis" if q_len == self.spec_num_tokens else "flattened",
+            num_q_heads,
+            q_len,
+            self.kernel_page_size,
+            self.data_type,
+            sliding_window,
+        )
+
     def _decode_views(self, bs: int) -> CuteDSLMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -460,6 +489,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             # with one page table row and one cache length per request. The
             # metadata was expanded from rows [0, bs), which is what this query
             # covers, so no extend offset applies on either layout.
+            self._log_block_layout(layer.tp_q_head_num, q_len_per_req, window_left >= 0)
             if q_len_per_req == self.spec_num_tokens:
                 causal_mask = False
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)

@@ -266,10 +266,12 @@ Notes:
   two physical kernel pages before draft attention.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
-  mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
-  which walks the KV from the window rather than from token zero, and fall back
-  to the portable Triton kernel anywhere its shape gate does not hold. The
-  draft's full-attention layer is unaffected either way.
+  mla` or `tokenspeed_mla`. Both carry the proposal block on the query axis and
+  reach the CuteDSL windowed decode on Blackwell, which walks the KV from the
+  window rather than from token zero. `mla` selects it through the shared
+  dispatcher and falls back to the portable Triton kernel wherever the shape
+  gate does not hold; `tokenspeed_mla` calls it directly and has no fallback.
+  The draft's full-attention layer is unaffected either way.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head;
   it must not be padded with an eighth, unused mask row.

@@ -341,6 +341,7 @@ def _run_cutedsl_decode(
     backend.kv_cache_dim = 4
     backend.kernel_page_size = 32
     backend._cutedsl_workspace = lambda q_len: torch.empty(0, dtype=torch.int8)
+    backend._logged_block_layouts = set()
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
