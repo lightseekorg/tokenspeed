@@ -571,14 +571,16 @@ class ForwardStepRunner:
     def warmup_decode_path(
         self,
         batch_sizes: tuple[int, ...],
+        *,
+        graph_phase: bool,
     ) -> None:
-        """Run capture-style eager full-model decode for each batch size."""
+        """Run dummy decode with the requested graph/eager phase."""
         if self._forward_func is None:
             return
 
         global _is_cuda_graph_phase
         old_cuda_graph_phase = _is_cuda_graph_phase
-        _is_cuda_graph_phase = True
+        _is_cuda_graph_phase = graph_phase
         try:
             for bs in batch_sizes:
                 ctx = ForwardContext(

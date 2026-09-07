@@ -60,8 +60,9 @@ def test_decode_tuning_without_chunked_prefill(
     calls = []
     metadata = []
 
-    def warmup_decode_path(batch_sizes):
+    def warmup_decode_path(batch_sizes, graph_phase):
         assert not torch.is_grad_enabled()
+        assert graph_phase is (not disable_graph)
         calls.append("decode")
         metadata.append(torch.zeros(1))
 
