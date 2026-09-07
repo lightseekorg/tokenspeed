@@ -34,6 +34,7 @@ _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt")
 _CHECKPOINT_METADATA_FILES = (
     "config.json",
+    "hf_quant_config.json",
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
 )
@@ -176,7 +177,10 @@ def l3_checkpoint_id(
     keys. A local directory is identified from the snapshot folder name
     or a fingerprint of weight-file contents — never from
     ``hf_config._commit_hash``, which a copied or fine-tuned tree can
-    inherit from its source. Hugging Face hub ids still prefer the
+    inherit from its source. Local fingerprints also hash
+    ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
+    quantization cannot collide under identical weight bytes. Hugging Face
+    hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
     pinned ``--revision``.
     """
@@ -247,11 +251,13 @@ def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
 
 @functools.cache
 def _local_checkpoint_fingerprint(model_dir: str) -> str:
-    """Hash config/index bytes and every local weight file's contents.
+    """Hash config/index/quant-config bytes and every local weight file's contents.
 
     Cached by directory path so a process that resolves the same local
     checkpoint more than once (target plus draft, or a repeated prefix
-    rebuild) does not re-read every shard.
+    rebuild) does not re-read every shard. ``hf_quant_config.json`` is
+    hashed with ``config.json``: ModelOpt mixed-precision maps, group
+    sizes, and KV quantization live there, not in the weight tensors.
     """
     hasher = hashlib.sha256()
     try:

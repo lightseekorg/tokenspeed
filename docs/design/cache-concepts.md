@@ -394,7 +394,9 @@ Its responsibilities:
   Hugging Face branch or local path is fingerprinted from a snapshot
   directory commit or the contents of the local checkpoint actually
   loaded — a copied config's inherited `_commit_hash` is not trusted —
-  so two instances cannot share a Mooncake
+  and local fingerprints include `hf_quant_config.json` (ModelOpt
+  mixed-precision maps and KV quantization live there, not in the
+  weight tensors) — so two instances cannot share a Mooncake
   key while serving incompatible KV. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the

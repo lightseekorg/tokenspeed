@@ -211,6 +211,25 @@ class StorageKeyTest(unittest.TestCase):
             self.assertNotEqual(first_id, inherited)
             self.assertTrue(first_id.startswith("local-"))
 
+    def test_checkpoint_id_fingerprints_local_hf_quant_config(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, kv_algo in ((first, "FP8"), (second, "INT8")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(b"weights")
+                with open(
+                    os.path.join(directory, "hf_quant_config.json"), "w"
+                ) as handle:
+                    handle.write(
+                        '{"quantization":{"quant_algo":"NVFP4",'
+                        f'"kv_cache_quant_algo":"{kv_algo}"}}'
+                    )
+            self.assertNotEqual(
+                l3_checkpoint_id(first, hf_config=SimpleNamespace(), revision=""),
+                l3_checkpoint_id(second, hf_config=SimpleNamespace(), revision=""),
+            )
+
     def test_local_fingerprint_is_cached_per_directory(self):
         from tokenspeed.runtime.cache.l3 import backend as l3_backend
 

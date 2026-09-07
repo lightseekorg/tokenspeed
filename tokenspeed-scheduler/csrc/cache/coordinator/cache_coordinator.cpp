@@ -922,7 +922,7 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
 }
 
 void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key) {
-    _assert(block_ref, "CacheDeviceBlock requires a destination block");
+    _assert(static_cast<bool>(block_ref), "CacheDeviceBlock requires a destination block");
     _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, /*logical_block_index=*/-1,

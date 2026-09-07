@@ -1256,6 +1256,9 @@ class EventLoop:
 
                 # Vanished-L3 retract events must reach the scheduler even when
                 # DP idled the model forward: the load-backs still ran.
+                # Skipping this round's forward already set effective_depth to
+                # 0, so overlap partners in ``in_flight`` committed above
+                # before these retracts.
                 request_changes.extend(l3_prefetch_retracts)
 
                 # The forward-result feedback point: everything this round
