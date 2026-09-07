@@ -14,20 +14,98 @@ from tokenspeed.runtime.entrypoints.engine import Engine
 
 
 class TestRequestHandlerFlushCache(unittest.TestCase):
+    def _handler(self, can_clear, clear_result):
+        handler = RequestHandler.__new__(RequestHandler)
+        handler.send_func = mock.Mock()
+        handler.can_clear_cache_fn = mock.Mock(return_value=can_clear)
+        handler.clear_cache_fn = mock.Mock(return_value=clear_result)
+        handler.clear_l1_cache_fn = mock.Mock(return_value=not clear_result)
+        handler._replica_tp_size = 1
+        handler._replica_tp_cpu_group = None
+        handler.attn_cp_size = 1
+        handler.attn_cp_cpu_group = None
+        handler.pp_size = 1
+        handler.pp_cpu_group = None
+        handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
+        return handler
+
     def test_returns_scheduler_clear_result(self):
         for success in (True, False):
             with self.subTest(success=success):
-                handler = RequestHandler.__new__(RequestHandler)
-                handler.send_func = mock.Mock()
-                handler.clear_cache_fn = mock.Mock(return_value=success)
-                handler.clear_l1_cache_fn = mock.Mock(return_value=not success)
+                handler = self._handler(can_clear=True, clear_result=success)
 
                 handler.process_requests([FlushCacheReqInput()])
 
+                handler.can_clear_cache_fn.assert_called_once_with()
                 handler.clear_cache_fn.assert_called_once_with()
                 handler.clear_l1_cache_fn.assert_not_called()
                 output = handler.send_func.send_pyobj.call_args.args[0]
                 self.assertEqual(output.success, success)
+
+    def test_failed_preflight_does_not_clear(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del buf, op
+            groups_seen.append(group)
+
+        handler = self._handler(can_clear=False, clear_result=True)
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["tp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler.clear_cache_fn.assert_not_called()
+        handler.clear_l1_cache_fn.assert_not_called()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+
+    def test_min_reduces_tp_then_cp_then_pp_before_clear(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del op
+            groups_seen.append(group)
+            buf.fill_(0)
+
+        handler = self._handler(can_clear=True, clear_result=True)
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+        handler.attn_cp_size = 2
+        handler.attn_cp_cpu_group = "cp"
+        handler.pp_size = 2
+        handler.pp_cpu_group = "pp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["tp", "cp", "pp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler.clear_cache_fn.assert_not_called()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+
+    def test_agreed_preflight_clears(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del buf, op
+            groups_seen.append(group)
+
+        handler = self._handler(can_clear=True, clear_result=True)
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["tp"])
+        handler.clear_cache_fn.assert_called_once_with()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
 
 
 class TestRequestHandlerL3WeightVersion(unittest.TestCase):

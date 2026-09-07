@@ -380,15 +380,17 @@ Its responsibilities:
   object key. A live weight
   load flushes Device/Host first so new parameters cannot reuse the
   previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
-  (pause drain does not wait for those). Weight-update `flush_cache`
-  first MIN-reduces a non-mutating `CanClearCache` / `CacheIsClearable`
-  probe across the same cache-owning ranks as L3 exists (attention TP,
-  then CP, then PP; not DP) so no rank mutates Device/Host or rotates L3
-  until every replica agrees the indexes are clearable. Only then does
-  each rank call `ClearCache`. A failed probe or a failed clear keeps
-  the previous checkpoint intact and the caller retries; successful
-  ranks must not enter the NCCL weight broadcasts while a peer is still
-  flushing. After a
+  (pause drain does not wait for those). Weight-update `flush_cache` and
+  standalone `/flush_cache` first MIN-reduce a non-mutating
+  `CanClearCache` / `CacheIsClearable` probe across the same cache-owning
+  ranks as L3 exists (attention TP, then CP, then PP; not DP) so no rank
+  mutates Device/Host or rotates L3 until every replica agrees the
+  indexes are clearable. Only then does each rank call `ClearCache`. A
+  failed probe or a failed clear keeps Device/Host (and the previous
+  checkpoint, on a weight update) intact and the caller retries; a split
+  flush would leave mirrored schedulers selecting different prefix
+  boundaries. Successful weight-update ranks must not enter the NCCL
+  broadcasts while a peer is still flushing. After a
   successful flush and GPU
   load, the hashed prefix is rebuilt so new KV is not published under
   the previous checkpoint. An explicit new `weight_version` with

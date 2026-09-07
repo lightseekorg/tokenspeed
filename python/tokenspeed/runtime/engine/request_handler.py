@@ -267,7 +267,7 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                success = self.clear_cache_fn is not None and self.clear_cache_fn()
+                success = self._try_clear_replica_cache()
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
@@ -377,30 +377,35 @@ class RequestHandler:
 
         Rank-local ``ClearCache`` is all-or-nothing, but a replica can still
         split: one rank with no in-flight writebacks would clear and rotate
-        L3 while a peer rejects. Agree that every cache-owning rank can
-        clear (MIN-reduce) before any rank mutates. An L3 writeback can
-        still be in flight on one TP/CP/PP rank after it has completed on
-        the others; those successful ranks must not enter
-        ``update_weights_from_distributed`` (ordered NCCL broadcasts)
-        while a peer skips it.
+        L3 while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces
+        first. An L3 writeback can still be in flight on one TP/CP/PP rank
+        after it has completed on the others; those successful ranks must
+        not enter ``update_weights_from_distributed`` (ordered NCCL
+        broadcasts) while a peer skips it.
         """
 
         if not recv_req.flush_cache:
             return True, ""
-        local_ok = self.can_clear_cache_fn()
-        if not self._converge_replica_decision(local_ok):
-            return (
-                False,
-                "cache flush failed; retry the update after in-flight "
-                "Host writebacks drain",
-            )
-        if self.clear_cache_fn is None or not self.clear_cache_fn():
+        if not self._try_clear_replica_cache():
             return (
                 False,
                 "cache flush failed; retry the update after in-flight "
                 "Host writebacks drain",
             )
         return True, ""
+
+    def _try_clear_replica_cache(self) -> bool:
+        """MIN-reduce clearability, then mutate Device/Host (and rotate L3).
+
+        Mirrored schedulers must keep the same prefix indexes. A rank whose
+        Host writebacks have drained must not ``ClearCache`` / rotate L3
+        while a TP, CP, or PP peer still rejects. Same groups as L3 exists
+        (attention TP, then CP, then PP; not DP).
+        """
+
+        if not self._converge_replica_decision(self.can_clear_cache_fn()):
+            return False
+        return self.clear_cache_fn is not None and self.clear_cache_fn()
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every cache-owning rank in this replica.

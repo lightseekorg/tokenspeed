@@ -327,13 +327,15 @@ width (`cp_size`), and any
 speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
-reject. Weight-update `flush_cache` MIN-reduces a non-mutating
-`can_clear_cache` probe across cache-owning ranks in the replica
-(attention TP, then CP, then PP; not DP) before any rank clears, so a
-rank whose writebacks have drained cannot rotate L3 while a peer still
-rejects. The update RPC then fails so the caller retries instead of
-serving new weights against the previous checkpoint or entering NCCL
-weight broadcasts alone. A `batch_exists` hit is not a lease: if
+reject. Weight-update `flush_cache` and standalone `/flush_cache`
+MIN-reduce a non-mutating `can_clear_cache` probe across cache-owning
+ranks in the replica (attention TP, then CP, then PP; not DP) before any
+rank clears, so a rank whose writebacks have drained cannot rotate L3
+while a peer still rejects. A split flush would leave mirrored
+schedulers with different prefix indexes. The weight-update RPC then
+fails so the caller retries instead of serving new weights against the
+previous checkpoint or entering NCCL weight broadcasts alone. A
+`batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
 skips publishing empty Host pages, and retracts the batch snapshot-less
 so the next admit recomputes those tokens. Clients are not failed.
