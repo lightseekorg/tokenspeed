@@ -621,9 +621,8 @@ class ModelExecutor:
 
         decode_cases = tuple(sorted(self.forward_step.capture_bs))
         logger.info(
-            "FlashInfer startup tuning: prefill=%d tokens, decode cases=%s",
-            num_tokens,
-            decode_cases,
+            f"FlashInfer startup tuning: prefill={num_tokens} tokens, "
+            f"decode cases={decode_cases}"
         )
 
         ib = self.input_buffers
@@ -662,7 +661,7 @@ class ModelExecutor:
         torch.get_device_module(self.device).synchronize()
         save_flashinfer_autotune_cache(cache_path, cpu_group, owner_rank)
 
-        logger.info("FlashInfer startup tuning finished in %.1fs", time.time() - tic)
+        logger.info(f"FlashInfer startup tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):
