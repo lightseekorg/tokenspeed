@@ -366,9 +366,15 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
-        weight_version: str | None = None,
+        *,
+        weight_version: str | None,
     ):
-        """Update weights from distributed source."""
+        """Update weights from distributed source.
+
+        ``weight_version`` is required. Pass ``None`` to keep the current
+        namespace, or to derive ``{current}-uN`` when L3 is on and this
+        update flushes.
+        """
         weight_version = resolve_l3_weight_version(
             self.server_args.weight_version,
             weight_version,

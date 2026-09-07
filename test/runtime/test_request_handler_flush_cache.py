@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest import mock
 
@@ -300,6 +301,27 @@ class TestEngineStampsDerivedL3Version(unittest.TestCase):
         )
 
         self.assertEqual(engine.server_args.weight_version, "v1")
+
+    def test_weight_version_has_no_default(self):
+        param = inspect.signature(Engine.update_weights_from_distributed).parameters[
+            "weight_version"
+        ]
+        self.assertIs(param.default, inspect.Parameter.empty)
+        engine = self._engine(storage_backend="memory")
+        with self.assertRaises(TypeError):
+            engine.update_weights_from_distributed(
+                names=["w"],
+                dtypes=["float16"],
+                shapes=[[1]],
+                group_name="weight_update_group",
+                flush_cache=True,
+            )
+        with self.assertRaises(TypeError):
+            UpdateWeightsFromDistributedReqInput(
+                names=["w"],
+                dtype_names=["float16"],
+                shapes=[[1]],
+            )
 
 
 if __name__ == "__main__":

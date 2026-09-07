@@ -383,11 +383,11 @@ Its responsibilities:
   `flush_cache=False` is rejected before the GPU load when L3 is on:
   Device/Host still hold the previous checkpoint, and D2H copies not yet
   in `_backup_futures` would later be stored under the new namespace.
-  When L3 is on and the update omits
-  `weight_version`, a unique successor (`{current}-uN`) is derived so the
+  When L3 is on and the update passes
+  `weight_version=None`, a unique successor (`{current}-uN`) is derived so the
   Engine `update_weights_from_distributed` path cannot republish under the
   startup namespace. After a successful RPC the Engine facade stamps that
-  successor into `server_args.weight_version` so a later omitted-version
+  successor into `server_args.weight_version` so a later `weight_version=None`
   call derives `{current}-u2` instead of repeating `-u1`.
   `ENABLE_CP` workers share `attn_tp_rank==0`
   and are distinguished by `c{cp_rank}`. Host eviction does

@@ -343,7 +343,7 @@ class RequestHandler:
         Device/Host have already been flushed when ``flush_cache`` was
         requested. The prefix is rebuilt here so newly computed KV cannot
         land in a peer still serving the previous ``weight_version``. When
-        L3 is enabled and the caller omits ``weight_version``, a unique
+        L3 is enabled and the caller passes ``weight_version=None``, a unique
         successor is derived so the Engine path cannot republish under the
         startup namespace. An explicit new version with ``flush_cache=False``
         is rejected before the GPU load.

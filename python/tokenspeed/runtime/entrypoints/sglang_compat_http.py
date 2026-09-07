@@ -166,9 +166,12 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
             raise ValueError("names, dtypes, shapes must have equal length")
         flush_cache = bool(body.get("flush_cache", False))
         llm = _llm(request)
+        requested_version = body.get("weight_version")
+        if requested_version is not None:
+            requested_version = str(requested_version)
         weight_version = resolve_l3_weight_version(
             llm.server_args.weight_version,
-            body.get("weight_version"),
+            requested_version,
             flush_cache=flush_cache,
             storage_backend=getattr(llm.server_args, "kvstore_storage_backend", None),
         )

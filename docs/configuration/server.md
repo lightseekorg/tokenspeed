@@ -54,11 +54,12 @@ policy version that produced a sample.
 The SGLang-compatible `update_weights_from_distributed`,
 `update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
 optional `weight_version`. The version changes only after the update succeeds.
-Omitting it preserves the current value, except when L3 is enabled and the
+`Engine.update_weights_from_distributed` requires `weight_version`; pass
+`None` to keep the current value, except when L3 is enabled and the
 update flushes the cache: then a unique successor (`{current}-uN`) is derived
 so new KV cannot reuse the previous checkpoint's objects. When L3 is on, a
 new `weight_version` requires `flush_cache=True`; intermediate updates may
-omit the version until the last call flushes.
+pass `None` until the last call flushes.
 
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
@@ -329,11 +330,11 @@ reject, and the update RPC then fails so the caller retries instead of
 serving new weights against the previous checkpoint. Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the
-new checkpoint. If the update omits `weight_version`
+new checkpoint. If the update passes `weight_version=None`
 while L3 is enabled, a unique successor (`{current}-uN`) is derived so
 `Engine.update_weights_from_distributed` cannot republish under the
 startup namespace. A successful Engine update stamps that successor into
-frontend `server_args` so the next omitted-version call cannot reuse it.
+frontend `server_args` so a later `weight_version=None` call cannot reuse it.
 Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}`.
 `global_segment_size` is split across

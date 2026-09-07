@@ -54,8 +54,9 @@ def resolve_l3_weight_version(
     """Choose the namespace to publish after a successful weight load.
 
     An explicit ``requested`` version always wins. When L3 is enabled and
-    the caller asked to flush, a missing version is derived so new KV cannot
-    reuse the previous checkpoint's objects. A later commit still requires
+    the caller asked to flush, ``requested is None`` derives a successor so
+    new KV cannot reuse the previous checkpoint's objects. Callers must
+    pass ``None`` deliberately; a later commit still requires
     ``flush_cache`` before applying a version that differs from ``current``.
     """
 
