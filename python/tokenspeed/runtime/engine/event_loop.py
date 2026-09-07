@@ -599,9 +599,19 @@ class EventLoop:
                 group_ids, content_hashes, page_offsets
             )
         ]
-        exists = self._converge_l3_exists(
-            self._l3_exists_or_miss(pages, expected_len=len(group_ids))
-        )
+        local_exists = self._l3_exists_or_miss(pages, expected_len=len(group_ids))
+        local_readable = [
+            present
+            and not self._device.l3_key_is_unread(
+                group_id=int(group_id),
+                content_hash=str(content_hash),
+                page_offset=int(page_offset),
+            )
+            for group_id, content_hash, page_offset, present in zip(
+                group_ids, content_hashes, page_offsets, local_exists
+            )
+        ]
+        exists = self._converge_l3_exists(local_readable)
         hit_groups = []
         hit_hashes = []
         hit_offsets = []
@@ -611,14 +621,9 @@ class EventLoop:
         for group_id, content_hash, page_offset, present in zip(
             group_ids, content_hashes, page_offsets, exists
         ):
-            readable = present and not self._device.l3_key_is_unread(
-                group_id=int(group_id),
-                content_hash=str(content_hash),
-                page_offset=int(page_offset),
-            )
             target = (
                 (hit_groups, hit_hashes, hit_offsets)
-                if readable
+                if present
                 else (miss_groups, miss_hashes, miss_offsets)
             )
             target[0].append(int(group_id))
@@ -643,9 +648,10 @@ class EventLoop:
         Failed keys stay unread: a later ``batch_exists`` hit must not
         re-register them and retry the same prefetch. Only pages whose
         replica-converged ``batch_get_into`` missed are blacklisted;
-        successfully restored leading pages stay readable. A later
-        successful Host backup forgets that unread entry so L3 reuse can
-        resume. The whole
+        successfully restored leading pages stay readable. Replica admission
+        MIN-reduces local readability so one rank cannot re-register a key
+        while a peer still blacklists it. A later Host backup forgets an
+        unread entry only when this put created a missing object. The whole
         forward is skipped so ranks stay aligned; mixed prefill/decode
         partners retract rather than finish with an error.
         """

@@ -40,7 +40,11 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
-from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet, l3_unread_key_capacity
+from tokenspeed.runtime.cache.l3.backend import (
+    L3UnreadKeySet,
+    l3_pages_newly_published,
+    l3_unread_key_capacity,
+)
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
@@ -501,7 +505,7 @@ class L2CacheExecutor:
     def forget_l3_unread_keys(
         self, groups: list[int], hashes: list[str], offsets: list[int]
     ) -> None:
-        """Allow a key to hit L3 again after a successful republish."""
+        """Allow a key to hit L3 again after this put created a missing object."""
 
         self._l3_unread.forget(groups=groups, hashes=hashes, offsets=offsets)
 
@@ -796,13 +800,22 @@ class L2CacheExecutor:
         l3_store = getattr(self, "l3_store", None)
         if not pages or l3_store is None:
             return
+        existed: list[bool]
+        try:
+            existed = list(l3_store.exists(pages))
+        except Exception:
+            logger.exception(
+                "L3 existence probe before backup failed; leaving unread keys "
+                "in place so an unreadable object cannot be re-admitted"
+            )
+            existed = [True] * len(pages)
         results = l3_store.backup(pages)
         if len(results) != len(pages) or not all(results):
             ok = sum(1 for flag in results if flag)
             raise RuntimeError(
                 f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
             )
-        self._l3_unread.forget_pages(pages)
+        self._l3_unread.forget_pages(l3_pages_newly_published(pages, existed))
 
     @staticmethod
     def _split_ready(queue):

@@ -36,6 +36,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
+    l3_pages_newly_published,
     l3_unread_key_capacity,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
@@ -747,6 +748,16 @@ class L3UnreadKeySetTest(unittest.TestCase):
         unread.mark([1], ["h5"], [2])
         unread.forget_pages([(1, 99, "h5", 2)])
         self.assertFalse(unread.contains(1, "h5", 2))
+
+    def test_newly_published_pages_exclude_objects_that_already_existed(self):
+        missing = (0, 1, "h-new", 0)
+        present = (0, 2, "h-old", 0)
+        self.assertEqual(
+            l3_pages_newly_published([missing, present], [False, True]),
+            [missing],
+        )
+        self.assertEqual(l3_pages_newly_published([present], [True]), [])
+        self.assertEqual(l3_pages_newly_published([missing], [False, True]), [])
 
     def test_capacity_counts_packed_cache_blocks_not_lcm_parents(self):
         self.assertEqual(

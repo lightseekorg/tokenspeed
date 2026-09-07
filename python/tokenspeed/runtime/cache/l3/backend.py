@@ -480,14 +480,32 @@ def l3_unread_key_capacity(
     return max(int(num_host_pages) * packed, 1)
 
 
+def l3_pages_newly_published(
+    pages: Sequence[tuple], existed: Sequence[bool]
+) -> list[tuple]:
+    """Return pages that were absent before backup and may leave the unread set.
+
+    Mooncake puts are create-only. An object that ``batch_exists`` already
+    reports cannot be overwritten, so a failed ``batch_get_into`` of that
+    object must stay unread. Length mismatch returns no pages so a
+    truncated existence probe cannot clear the blacklist.
+    """
+
+    if len(existed) != len(pages):
+        return []
+    return [page for page, present in zip(pages, existed) if not present]
+
+
 class L3UnreadKeySet:
     """Failed L3 gets that must not be re-admitted from ``batch_exists``.
 
     A vanished or unreadable object can stay visible to ``batch_exists``.
-    Those keys stay unread until the same page is successfully published
-    again, a namespace delete succeeds, or the set exceeds Host CacheBlock
+    Those keys stay unread until a Host backup creates a replacement
+    object (not a create-only skip of the existing one), a namespace
+    delete succeeds, or the set exceeds Host CacheBlock
     capacity (oldest first) so a long-lived process cannot accumulate
-    every historical failure.
+    every historical failure. Replica admission MIN-reduces local
+    readability so one rank cannot forget earlier than its peers.
     """
 
     def __init__(self, *, capacity: int) -> None:

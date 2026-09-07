@@ -486,8 +486,11 @@ Its responsibilities:
   pages whose replica-converged `batch_get_into` missed stay
   unread: a later `batch_exists` hit must not re-register them and retry
   the same prefetch. Successfully restored pages in a mixed prefetch
-  stay readable. A later successful Host backup of a failed page
-  forgets that unread entry so L3 reuse can resume; the unread set is
+  stay readable. Replica admission MIN-reduces local readability
+  (exists and not unread) so one rank cannot re-register a key while a
+  peer still blacklists it. A later Host backup forgets an unread entry
+  only when the object was absent and this put created it; a create-only
+  skip of an unreadable object keeps the blacklist. The unread set is
   also bounded to Host CacheBlock capacity (LCM parents times each
   group's `cache_blocks_per_lcm_block`). Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks

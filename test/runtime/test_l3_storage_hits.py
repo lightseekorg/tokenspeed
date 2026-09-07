@@ -387,6 +387,25 @@ def test_failed_l3_prefetch_is_not_reregistered_while_exists_stays_true(
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
 
 
+def test_unread_miss_is_min_reduced_with_exists() -> None:
+    """Local unread must enter the replica MIN, not filter after it."""
+
+    loop = _Loop(exists_flags=[True])
+    loop._device.mark_l3_keys_unread([0], ["h4"], [0])
+    probed: list[list[bool]] = []
+    bound = loop._converge_l3_exists
+
+    def wrapped(exists):
+        probed.append(list(exists))
+        return bound(exists)
+
+    loop._converge_l3_exists = wrapped
+    loop._submit_scheduler_requests([_spec("r0", [1, 2, 3, 4])])
+    assert probed == [[False]]
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
 def test_namespace_delete_forgets_unread_l3_keys(monkeypatch) -> None:
     monkeypatch.setattr(
         "tokenspeed.runtime.engine.event_loop.make_retract_event",
@@ -549,7 +568,7 @@ def test_mixed_l3_prefetch_blacklists_only_failed_pages(monkeypatch) -> None:
 
 
 def test_successful_republish_clears_unread_l3_key(monkeypatch) -> None:
-    """A later Host backup of the failed page must restore L3 reuse."""
+    """A Host backup that creates a missing object may restore L3 reuse."""
 
     monkeypatch.setattr(
         "tokenspeed.runtime.engine.event_loop.make_retract_event",

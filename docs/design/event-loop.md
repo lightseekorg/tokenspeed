@@ -319,9 +319,11 @@ For orientation, one iteration of `event_loop`:
   snapshot-less retract of the batch so the next admit recomputes.
   Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
   cannot re-register them; only the replica-converged misses are
-  blacklisted, so a restored prefix page stays readable. A later
-  successful Host backup forgets that unread entry so L3 reuse can
-  resume; the unread set is bounded to Host CacheBlock capacity
+  blacklisted, so a restored prefix page stays readable. Replica
+  admission MIN-reduces local readability (exists and not unread). A
+  later Host backup forgets an unread entry only when it created a
+  missing object; a create-only skip of an unreadable object keeps the
+  blacklist. The unread set is bounded to Host CacheBlock capacity
   (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN; raising would

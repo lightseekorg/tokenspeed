@@ -483,9 +483,10 @@ class DeviceHandle:
         """Remember keys whose ``batch_get_into`` failed after Admit.
 
         ``batch_exists`` can still report these present. The next admit
-        must treat them as misses so the request recomputes instead of
-        retrying the same prefetch. A later successful Host backup of the
-        same page forgets the entry so L3 reuse can resume.
+        MIN-reduces local readability (exists and not unread) so every
+        replica rank admits the same prefix. A later Host backup forgets
+        the entry only when the object was absent and this put created it;
+        a create-only skip of an unreadable object keeps the blacklist.
         """
 
         l2 = self._l2
@@ -510,7 +511,7 @@ class DeviceHandle:
     def forget_l3_unread_keys(
         self, groups: list[int], hashes: list[str], offsets: list[int]
     ) -> None:
-        """Allow a key to hit L3 again after a successful republish."""
+        """Allow a key to hit L3 again after this put created a missing object."""
 
         l2 = self._l2
         if l2 is None:

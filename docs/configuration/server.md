@@ -355,8 +355,10 @@ skips publishing empty Host pages, and retracts the batch snapshot-less
 so the next admit recomputes those tokens. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
 retry the same prefetch; only replica-converged misses are blacklisted.
-A later successful Host backup forgets that unread entry so L3 reuse can
-resume; the unread set is bounded to Host CacheBlock capacity (LCM
+Replica admission MIN-reduces local readability (exists and not unread).
+A later Host backup forgets an unread entry only when it created a
+missing object; a create-only skip of an unreadable object keeps the
+blacklist. The unread set is bounded to Host CacheBlock capacity (LCM
 parents times each group's `cache_blocks_per_lcm_block`).
 A backend exception or malformed result is a
 local miss so every replica rank still enters the MIN-reduce. Clients
