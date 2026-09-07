@@ -335,7 +335,11 @@ Its responsibilities:
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
   An L3 Host-prefetch shortage is different: `Admit` may return a shorter
-  `host_prefix_tokens` than the probe, and `schedulePrefillFirstChunk`
+  `host_prefix_tokens` than the probe, rounded down to `prefix_granularity`
+  so every group keeps a reusable identity boundary. A finer
+  `block_granularity` group that runs out of Host pages mid-prefix must not
+  leave `hit_tokens` between grains — a 64-token group would then be
+  trimmed empty while the forward skipped 48 tokens. `schedulePrefillFirstChunk`
   retries from that clamped boundary rather than forwarding a window that
   skips the discarded prefix.
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history

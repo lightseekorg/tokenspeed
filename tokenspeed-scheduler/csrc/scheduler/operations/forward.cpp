@@ -325,6 +325,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         if (match.probe.host.num_common_tokens > host_prefix_cap) {
             match.probe.host.num_common_tokens = host_prefix_cap;
         }
+        match.probe.host.num_common_tokens -= match.probe.host.num_common_tokens % prefix_granularity;
+        host_prefix_cap = match.probe.host.num_common_tokens;
         hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
         promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
         _assert(promotion_boundary_tokens == 0 ||
@@ -408,6 +410,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             discardUncachedKvEventPages(event_keys);
             return std::nullopt;
         }
+        _assert(admission->host_prefix_tokens % prefix_granularity == 0,
+                "admitted host prefix must land on a prefix boundary");
         const std::int32_t admitted_hit_tokens =
             std::max(admission->device_prefix_tokens, admission->host_prefix_tokens);
         if (admitted_hit_tokens >= hit_tokens) {
@@ -415,6 +419,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
         coordinator_.Free(tables);
         host_prefix_cap = admission->host_prefix_tokens;
+        host_prefix_cap -= host_prefix_cap % prefix_granularity;
     }
 
     _assert(admission.has_value(), "first-chunk admission must produce a result");

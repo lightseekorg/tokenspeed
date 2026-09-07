@@ -4470,4 +4470,43 @@ TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
     EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
 }
 
+class L3MixedGranularityHostPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 32;
+        cfg.host_allocator.total_pages = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full_fine", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_coarse", /*block_granularity=*/4, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/1);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_EQ(hashes.size(), 1u);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    ASSERT_EQ(op->input_lengths.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "a 2-token Host shortage must round down to the 4-token prefix grain";
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+}
+
 }  // namespace tokenspeed::test

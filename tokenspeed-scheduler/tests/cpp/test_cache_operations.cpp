@@ -657,4 +657,80 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     coordinator.Free(tables);
 }
 
+TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(pinned);
+
+    const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
+    ASSERT_EQ(keys.size(), 2u);
+    coordinator.RegisterStorageKeys(keys);
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 4);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 4}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->host_prefix_tokens, 0)
+        << "a mid-prefix Host shortage must round down to prefix_granularity, not keep 2 tokens";
+    EXPECT_TRUE(admission->load_pairs.empty());
+
+    admission.reset();
+    coordinator.Free(tables);
+}
+
+TEST(CacheOperationTest, L3HostShortageDoesNotSkipACoarserGroup) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 4,
+        },
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(pinned);
+
+    const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
+    coordinator.RegisterStorageKeys(keys);
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 4);
+
+    std::vector<BlockTable> tables(2);
+    std::vector<GroupDemand> demands{
+        {.table = &tables[0], .num_tokens = 4},
+        {.table = &tables[1], .num_tokens = 4},
+    };
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->host_prefix_tokens, 0)
+        << "rounding to prefix_granularity must drop the fine-group partial hit so the "
+           "coarse group is not skipped without KV";
+    EXPECT_TRUE(admission->load_pairs.empty());
+
+    admission.reset();
+    coordinator.Free(tables);
+}
+
 }  // namespace tokenspeed::test

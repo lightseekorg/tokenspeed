@@ -19,10 +19,11 @@ this chunk's tokens, and the coordinator either grants the pages or the
 request stays put.
 
 When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
-`host_prefix_tokens`. `schedulePrefillFirstChunk` then frees that attempt
-and retries from the shortened probe so `hit_tokens` / `tokens_this_round`
-match the tables. Re-probing is not enough: the same L3 keys would look
-like a full hit again.
+`host_prefix_tokens` and rounds that length down to `prefix_granularity`
+(the identity boundary every group's `block_granularity` divides).
+`schedulePrefillFirstChunk` then frees that attempt and retries from the
+shortened probe so `hit_tokens` / `tokens_this_round` match the tables.
+Re-probing is not enough: the same L3 keys would look like a full hit again.
 
 Two adjustments ride on top of the raw chunk size:
 

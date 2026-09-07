@@ -316,6 +316,11 @@ CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vect
             match.blocks[hit_index] = std::move(host_block_ref);
         }
     }
+    // Shortage is counted in the failing group's block_granularity, which may
+    // be finer than prefix identity. Round down so every group keeps a
+    // reusable prefix boundary; otherwise a 64-token group is trimmed to
+    // empty while hit_tokens stays at 48.
+    out.num_common_tokens -= out.num_common_tokens % prefix_granularity_;
     // A later group can lower the shared boundary after earlier groups have
     // already pinned pages. Trim every group to the final boundary so those
     // excess pins are released and no stale KV is admitted past the common

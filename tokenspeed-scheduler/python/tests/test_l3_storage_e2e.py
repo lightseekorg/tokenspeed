@@ -172,6 +172,51 @@ def test_l3_short_host_pool_retries_first_chunk_from_admitted_prefix() -> None:
     assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
 
 
+def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
+    """A fine-group Host shortage must not skip a coarser group's prefix KV."""
+
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 4
+    cfg.num_device_pages = 32
+    cfg.num_host_pages = 2
+    cfg.max_scheduled_tokens = 64
+    cfg.max_batch_size = 8
+    cfg.enable_l3_storage = True
+    cfg.disable_l2_cache = False
+    cfg.disable_prefix_cache = False
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full_fine",
+            rows_per_page=2,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.History,
+        ),
+        ts.CacheGroupConfig(
+            group_id="full_coarse",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.History,
+        ),
+    ]
+    scheduler = ts.Scheduler(cfg)
+    tokens = list(range(1, 5))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)
+
+    scheduler.submit_requests([_spec("r1", tokens)])
+    plan = scheduler.next_execution_plan()
+    assert plan.forward
+    op = plan.forward[0]
+    assert list(op.extend_prefix_lens) == [0]
+    assert list(op.input_lengths) == [4]
+    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
+
+
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     scheduler = ts.Scheduler(_l3_config())
     tokens = list(range(1, 9))
