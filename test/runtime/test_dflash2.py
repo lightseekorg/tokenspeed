@@ -40,7 +40,7 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
     _walk_greedy_path,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.models.dflash import get_dflash_layer_cache_group_id
+from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -105,11 +105,53 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
-def test_dflash_layer_cache_group_follows_the_draft_layer_types() -> None:
-    labeled = SimpleNamespace(layer_types=["sliding_attention", FULL_ATTENTION])
-    assert get_dflash_layer_cache_group_id(labeled, 0) == "sliding_attention"
-    assert get_dflash_layer_cache_group_id(labeled, 1) == FULL_ATTENTION
-    assert get_dflash_layer_cache_group_id(SimpleNamespace(), 0) == FULL_ATTENTION
+@pytest.mark.parametrize(
+    ("attention_config", "expected_sliding_window"),
+    (
+        ({"layer_types": ["sliding_attention"], "sliding_window": 1024}, 1023),
+        ({}, -1),
+    ),
+)
+def test_block_drafter_uses_full_cache_group_regardless_of_sliding_mask(
+    attention_config: dict[str, object], expected_sliding_window: int
+) -> None:
+    config = SimpleNamespace(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        **attention_config,
+    )
+    mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None))
+    paged_attention = mock.Mock(return_value=torch.nn.Identity())
+
+    def identity_module(*args, **kwargs):
+        return torch.nn.Identity()
+
+    with (
+        mock.patch.object(
+            dflash_model, "QKVParallelLinear", side_effect=identity_module
+        ),
+        mock.patch.object(
+            dflash_model, "RowParallelLinear", side_effect=identity_module
+        ),
+        mock.patch.object(dflash_model, "RMSNorm", side_effect=identity_module),
+        mock.patch.object(dflash_model, "get_rope", side_effect=identity_module),
+        mock.patch.object(dflash_model, "PagedAttention", paged_attention),
+    ):
+        dflash_model.DFlashAttention(
+            config,
+            mapping,
+            layer_id=0,
+            quant_config=None,
+            prefix="",
+        )
+
+    assert paged_attention.call_args.kwargs["group_id"] == FULL_ATTENTION
+    assert (
+        paged_attention.call_args.kwargs["sliding_window_size"]
+        == expected_sliding_window
+    )
 
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
