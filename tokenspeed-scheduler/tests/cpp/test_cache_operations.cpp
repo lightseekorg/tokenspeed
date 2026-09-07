@@ -598,6 +598,10 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
     ASSERT_EQ(admission->load_pairs.size(), 1u);
     EXPECT_FALSE(admission->load_pairs[0].prefetch_from_storage);
     EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
+
+    TierTransferManager transfers(coordinator);
+    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    transfers.CompleteLoadBack(op.op_id, true);
 }
 
 TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {

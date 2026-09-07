@@ -356,7 +356,9 @@ Its responsibilities:
   `CacheDeviceBlock`; publishing them earlier would cache empty KV.
   When one prefix hash is mixed (Host-warm in one group, L3 in another),
   admit skips `CacheFullBlocks` for that hash and `CompleteLoadBack`
-  publishes every filled Device destination.
+  publishes every keyed filled Device destination. Host-only L2 load-backs
+  leave `BlockTransfer.key` empty and stay on the admit-time
+  `CacheFullBlocks` path.
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
