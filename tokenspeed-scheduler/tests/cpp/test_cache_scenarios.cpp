@@ -156,6 +156,25 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
         << "all pages returned to the pool after a chunked-prefill request finishes";
 }
 
+TEST_F(ChunkedPrefillSuite, FirstChunkPrepaysPromptHeadroomOnlyInFullHistoryGroup) {
+    // 16 tokens in 4-token chunks with a declared budget of 6: the first
+    // chunk prepays the 12 unscheduled prompt tokens plus 6 tokens of decode
+    // headroom. The full-history group holds all of it (4 + 18 tokens -> 11
+    // pages); the sliding-window group recycles slid-out pages and holds only
+    // the chunk itself. An intermediate chunk banks no tail and no decode
+    // slot, so it reserves nothing there.
+    RequestSpec request = MakeRequestSpec("r1", /*num_pages=*/8);
+    request.max_new_tokens = 6;
+    Submit(request);
+
+    ExecutionPlan chunk1 = PlanOnce();
+    const ForwardBatch* op1 = FindForwardBatch(chunk1);
+    ASSERT_NE(op1, nullptr);
+    ASSERT_EQ(op1->input_lengths, (std::vector<std::int32_t>{4}));
+    EXPECT_EQ(op1->block_tables.at("full").at(0).size(), 11u);
+    EXPECT_EQ(op1->block_tables.at("swa").at(0).size(), 2u);
+}
+
 class MambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -226,7 +245,7 @@ TEST_F(MambaStateCheckpointSplitSuite, ReservesAndBatchesDependentTails) {
     EXPECT_EQ(tail_op->input_lengths, (std::vector<std::int32_t>{2, 2}));
 }
 
-TEST(MambaStateCheckpointCapacityTest, CountsInputBodyAndReservedTailCheckpoints) {
+TEST(MambaStateCheckpointCapacityTest, CountsEndpointGrowthAndChunkedInputCheckpoint) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable state blocks
@@ -234,6 +253,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsInputBodyAndReservedTailCheckpoints
     cfg.max_scheduled_tokens = 8;
     cfg.max_batch_size = 1;
     cfg.disable_l2_cache = true;
+    cfg.disable_prefix_cache = true;  // no cached checkpoint can be retained by a first chunk
     cfg.cache_groups = {
         MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
@@ -241,9 +261,9 @@ TEST(MambaStateCheckpointCapacityTest, CountsInputBodyAndReservedTailCheckpoints
 
     Scheduler scheduler{std::move(cfg)};
 
-    // Up to eight prompt tokens plus the decode reservation fit in two
-    // blocks. A longer prompt can reuse one input checkpoint while exposing an
-    // aligned body and reserving its sub-page tail, which needs three.
+    // Up to eight prompt tokens plus the decode reservation fit in two blocks
+    // (endpoint + banked growth block). A longer prompt is chunked and also
+    // retains the previous chunk's input checkpoint, which needs three.
     EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
     RequestSpec too_long{
         .request_id = "too-long",
@@ -267,13 +287,14 @@ TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
 
     Scheduler scheduler{std::move(cfg)};
 
-    // A seven-token prompt would split into a four-token body and a
-    // three-token tail. The body checkpoint plus the reserved tail need four
-    // state blocks, so three usable blocks cannot admit it and its decode.
-    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 7);
+    // A six-token prompt would split into a four-token body and a two-token
+    // tail. With the prefix cache on the body may retain a cached input
+    // checkpoint (one block) beside its own checkpoint, and the reserved tail
+    // takes two more, so three usable blocks cannot admit it and its decode.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec too_long{
         .request_id = "too-long",
-        .tokens = std::vector<std::int32_t>(7, 1),
+        .tokens = std::vector<std::int32_t>(6, 1),
     };
     EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
 }
@@ -465,16 +486,20 @@ TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompl
 
     EXPECT_EQ(RealPages(op->block_tables.at("full")).size(), 4u);
 
+    // Aligned prompt, no tail: endpoint checkpoint (slot 2) + banked growth block (slot 3).
     const auto& state = op->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 3u);
+    ASSERT_EQ(state.size(), 4u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_GT(state[2], 0);  // final prefill checkpoint
-    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 1u);
+    EXPECT_GT(state[3], 0);  // banked growth block
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
 
     ASSERT_EQ(plan.pages_to_zero.count("state"), 1u);
-    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 1u);
+    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 2u);
+    const std::int64_t free_after_prefill = scheduler_->PoolFreeBlocks();
 
+    // The first decode runs on the banked block: nothing acquired, nothing zeroed.
     SendForwardDone("r1", {42});
     ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan);
@@ -483,8 +508,11 @@ TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompl
     ASSERT_EQ(decode_state.size(), 4u);
     EXPECT_GT(decode_state[2], 0);
     EXPECT_GT(decode_state[3], 0);
-    ASSERT_EQ(decode_plan.pages_to_zero.count("state"), 1u);
-    EXPECT_EQ(decode_plan.pages_to_zero.at("state").size(), 1u);
+    EXPECT_EQ(decode_state[3], state[3]);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_prefill);
+    if (decode_plan.pages_to_zero.count("state") != 0) {
+        EXPECT_TRUE(decode_plan.pages_to_zero.at("state").empty());
+    }
 }
 
 class MambaOverlapRollingStateSuite : public MambaSparsePrefillSuite {
@@ -496,22 +524,32 @@ protected:
     }
 };
 
-TEST_F(MambaOverlapRollingStateSuite, FinalPrefillUsesInputAndOutputWithoutDecodeReserve) {
+TEST_F(MambaOverlapRollingStateSuite, FinalPrefillUsesInputAndOutputAndBanksGrowth) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));  // 16 tokens
 
-    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    // Intermediate chunk: endpoint checkpoint only, no growth block.
+    ExecutionPlan first_prefill = PlanOnce();
+    const ForwardBatch* first_op = FindForwardBatch(first_prefill);
+    ASSERT_NE(first_op, nullptr);
+    const auto& first_state = first_op->block_tables.at("state").at(0);
+    ASSERT_EQ(first_state.size(), 3u);
+    EXPECT_GT(first_state[2], 0);
+    EXPECT_EQ(RealPages(first_op->block_tables.at("state")).size(), 1u);
+
     ExecutionPlan final_prefill = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(final_prefill);
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->input_lengths, std::vector<std::int32_t>{4});
 
+    // Completing chunk: rolling input checkpoint + output checkpoint + banked growth block.
     const auto& state = op->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 4u);
+    ASSERT_EQ(state.size(), 5u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_GT(state[2], 0);  // rolling input
     EXPECT_GT(state[3], 0);  // final prefill output
-    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
+    EXPECT_GT(state[4], 0);  // banked growth block
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 3u);
 }
 
 class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {
@@ -1492,8 +1530,10 @@ class MambaFusedRetractionDrainSuite : public MambaSparsePrefillSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 9;
-        cfg.host_allocator.total_pages = 9;
+        // Exactly two 8-token prompts fit: each takes 3 full pages (prompt +
+        // decode reserve) and 2 state blocks (endpoint + banked growth).
+        cfg.device_allocator.total_pages = 11;
+        cfg.host_allocator.total_pages = 11;
         cfg.max_scheduled_tokens = 64;
         for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
@@ -1503,7 +1543,7 @@ protected:
 };
 
 TEST_F(MambaFusedRetractionDrainSuite, RetractionFreesCapacityWithoutPausingTheEngine) {
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 10);
 
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
     Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));

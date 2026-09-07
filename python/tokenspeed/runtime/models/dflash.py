@@ -52,6 +52,10 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class DFlashAttention(nn.Module):
+    # Block drafters share the target's cache locations. A sliding window is
+    # their compute mask, not a separate cache-retention group.
+    cache_group_id = FULL_ATTENTION
+
     def __init__(
         self,
         config,
@@ -125,14 +129,15 @@ class DFlashAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        sliding_window_size = _get_dflash_layer_sliding_window(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=_get_dflash_layer_sliding_window(config, layer_id),
-            group_id=get_dflash_layer_cache_group_id(config, layer_id),
+            sliding_window_size=sliding_window_size,
+            group_id=self.cache_group_id,
         )
 
     def _apply_qk_norm(
@@ -549,20 +554,6 @@ def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
             "DFLASH config.layer_types must be a sequence of attention type strings."
         )
     return layer_types
-
-
-def get_dflash_layer_cache_group_id(config: Any, layer_id: int) -> str:
-    """The cache group a draft layer's KV lives in: its ``layer_types`` label.
-
-    The merged cache plan groups draft layers by the draft config's own
-    ``layer_types`` (single window, so the published group id is the bare
-    label) and falls back to the full-history group when the config carries
-    no labels.
-    """
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return FULL_ATTENTION
-    return str(layer_types[layer_id])
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
