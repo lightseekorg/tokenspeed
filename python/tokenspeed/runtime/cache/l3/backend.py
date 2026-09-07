@@ -33,22 +33,27 @@ def storage_object_key(
     group_id: int,
     page_offset: int,
     *,
-    prefix: str = "",
-    rank: int = 0,
+    prefix: str,
+    rank: int,
+    cp_rank: int,
 ) -> str:
     """Return the L3 object key for one packed Host CacheBlock.
 
     TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
     object stores the packed bytes of a single CacheBlock, keyed by the
     scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Rank isolation matches SGLang/vLLM: each TP rank owns a
-    different KV slice.
+    the shard. Attention TP and context-parallel ranks each own a different
+    physical KV slice; ``ENABLE_CP`` folds requested TP into CP and leaves
+    every worker at ``attn_tp_rank == 0``, so the CP rank must be in the key.
     """
 
     if not content_hash:
         raise ValueError("content_hash must be non-empty")
     tagged = f"{prefix}_{content_hash}" if prefix else content_hash
-    return f"{tagged}|g{int(group_id)}|o{int(page_offset)}|r{int(rank)}"
+    return (
+        f"{tagged}|g{int(group_id)}|o{int(page_offset)}"
+        f"|r{int(rank)}|c{int(cp_rank)}"
+    )
 
 
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:

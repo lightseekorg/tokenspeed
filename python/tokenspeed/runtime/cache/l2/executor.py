@@ -151,11 +151,14 @@ class L2CacheExecutor:
             num_host_lcm_blocks=host_lcm_blocks,
         )
         self.l3_store = None
+        self._l3_prefix_for_weight_version = None
         if storage_backend is not None:
             self.attach_l3_storage(
                 storage_backend,
                 key_prefix=storage_key_prefix,
                 rank=storage_rank,
+                cp_rank=0,
+                prefix_for_weight_version=lambda _version: storage_key_prefix,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
@@ -215,23 +218,53 @@ class L2CacheExecutor:
         *,
         key_prefix: str,
         rank: int,
+        cp_rank: int,
+        prefix_for_weight_version,
     ) -> None:
         """Bind an L3 backend to the compact Host buffer after allocation.
 
         Mooncake Store must ``register_buffer`` against the pinned Host L2
         allocation, so the backend is constructed after ``HostCacheStorage``.
+        ``prefix_for_weight_version`` rebuilds the hashed namespace after a
+        live weight load so new KV is not published under the old checkpoint.
         """
 
         if self.l3_store is not None:
             raise RuntimeError("L3 storage backend is already attached")
         if storage_backend is None:
             raise ValueError("storage_backend is required")
+        if prefix_for_weight_version is None:
+            raise ValueError("prefix_for_weight_version is required")
+        self._l3_prefix_for_weight_version = prefix_for_weight_version
         self.l3_store = L3HostStore(
             storage_backend,
             self.host_storage,
             key_prefix=key_prefix,
             rank=rank,
+            cp_rank=cp_rank,
         )
+
+    def set_l3_weight_version(self, weight_version: str) -> None:
+        """Repoint L3 puts/gets at the namespace for ``weight_version``."""
+
+        l3_store = self.l3_store
+        if l3_store is None:
+            return
+        factory = self._l3_prefix_for_weight_version
+        if factory is None:
+            raise RuntimeError("L3 prefix cannot be rebuilt without a factory")
+        self._wait_l3_backups()
+        l3_store.set_key_prefix(factory(str(weight_version)))
+
+    def _wait_l3_backups(self) -> None:
+        lock = getattr(self, "_ack_lock", None)
+        if lock is None:
+            inflight = list(getattr(self, "_backup_futures", ()))
+        else:
+            with lock:
+                inflight = list(getattr(self, "_backup_futures", ()))
+        for future, _op_ids, _pages in inflight:
+            future.result()
 
     def submit_write_backs(self, plan) -> None:
         """Enqueue the plan's D2H snapshot copies on the current stream.
@@ -368,8 +401,10 @@ class L2CacheExecutor:
 
     def rotate_l3_namespace(self) -> None:
         l3_store = getattr(self, "l3_store", None)
-        if l3_store is not None:
-            l3_store.rotate_namespace()
+        if l3_store is None:
+            return
+        self._wait_l3_backups()
+        l3_store.rotate_namespace()
 
     def _transfer_ranges(
         self,

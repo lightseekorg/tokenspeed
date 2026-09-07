@@ -270,6 +270,8 @@ class RequestHandler:
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
                 ok, msg = self._device.update_weights(recv_req)
+                if ok:
+                    self._commit_l3_weight_version(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
@@ -282,6 +284,23 @@ class RequestHandler:
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    def _commit_l3_weight_version(self, recv_req) -> None:
+        """Flush the old L3 namespace, then publish under the new checkpoint.
+
+        ``flush_cache`` deletes objects under the *current* prefix. The
+        prefix is rebuilt afterwards so newly computed KV cannot land in a
+        peer still serving the previous ``weight_version``.
+        """
+
+        flush_cache = bool(getattr(recv_req, "flush_cache", False))
+        if flush_cache and self.clear_cache_fn is not None:
+            self.clear_cache_fn()
+        version = getattr(recv_req, "weight_version", None)
+        if version is None:
+            return
+        self.server_args.weight_version = str(version)
+        self._device.set_l3_weight_version(str(version))
 
     def handle_generate_request(
         self,

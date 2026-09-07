@@ -446,6 +446,12 @@ class DeviceHandle:
         if self._l2 is not None:
             self._l2.rotate_l3_namespace()
 
+    def set_l3_weight_version(self, weight_version: str) -> None:
+        """Publish subsequent Host pages under the new checkpoint identity."""
+
+        if self._l2 is not None:
+            self._l2.set_l3_weight_version(weight_version)
+
     def shutdown_cache(self) -> None:
         """Join queued cache submissions, then close L2/L3 on the data plane."""
 
@@ -799,26 +805,34 @@ def build_device_side(
                     server_args.mapping.pp_size if server_args.mapping.has_pp else 1
                 ),
             )
+            cache_signature = cache_layout_signature(
+                l2_cache_executor.layout,
+                cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+            )
+            revision = server_args.revision or ""
+            pipeline_rank = (
+                server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
+            )
+            draft_model = server_args.speculative_draft_model_path or ""
+
+            def prefix_for_weight_version(weight_version: str) -> str:
+                return storage_key_prefix(
+                    server_args.model,
+                    revision=revision,
+                    weight_version=weight_version,
+                    cache_signature=cache_signature,
+                    pipeline_rank=pipeline_rank,
+                    draft_model=draft_model,
+                    draft_revision=revision,
+                    draft_weight_version=weight_version,
+                )
+
             l2_cache_executor.attach_l3_storage(
                 storage_backend,
-                key_prefix=storage_key_prefix(
-                    server_args.model,
-                    revision=server_args.revision or "",
-                    weight_version=server_args.weight_version,
-                    cache_signature=cache_layout_signature(
-                        l2_cache_executor.layout,
-                        cache_dtype=(
-                            f"{server_args.kv_cache_dtype}:{model_config.dtype}"
-                        ),
-                    ),
-                    pipeline_rank=(
-                        server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
-                    ),
-                    draft_model=server_args.speculative_draft_model_path or "",
-                    draft_revision=server_args.revision or "",
-                    draft_weight_version=server_args.weight_version,
-                ),
+                key_prefix=prefix_for_weight_version(server_args.weight_version),
                 rank=attn_tp_rank,
+                cp_rank=server_args.mapping.attn.cp_rank,
+                prefix_for_weight_version=prefix_for_weight_version,
             )
 
     kv_transfer = _build_kv_transfer(

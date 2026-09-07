@@ -359,11 +359,14 @@ Its responsibilities:
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
   Host CacheBlock; a later Host miss that is known to exist in L3 allocates
   a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
-  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}`.
+  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
   (`model` + `--revision` + `--weight-version`), the packed CacheBlock
   layout (dtype and field geometry), the pipeline stage, and the speculative
-  draft checkpoint when a separate draft pool is present. Host eviction does
+  draft checkpoint when a separate draft pool is present. A live weight
+  load rebuilds that prefix after the GPU update so new KV is not published
+  under the previous checkpoint; `ENABLE_CP` workers share `attn_tp_rank==0`
+  and are distinguished by `c{cp_rank}`. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then

@@ -45,15 +45,29 @@ class L3HostStore:
         *,
         key_prefix: str,
         rank: int,
+        cp_rank: int,
     ):
         self.backend = backend
         self.host_storage = host_storage
         self._base_key_prefix = key_prefix
         self.rank = int(rank)
+        self.cp_rank = int(cp_rank)
 
     @property
     def key_prefix(self) -> str:
         return self._base_key_prefix
+
+    def set_key_prefix(self, key_prefix: str) -> None:
+        """Publish and restore under a new namespace without deleting it.
+
+        Live weight updates change ``weight_version`` after the GPU load.
+        Flush / ``rotate_namespace`` still deletes the *current* prefix
+        first so stale KV is gone before this switches the writers.
+        """
+
+        if not key_prefix:
+            raise ValueError("key_prefix must be non-empty")
+        self._base_key_prefix = key_prefix
 
     def rotate_namespace(self) -> None:
         """Delete objects under this stable namespace.
@@ -73,6 +87,7 @@ class L3HostStore:
             page_offset,
             prefix=self.key_prefix,
             rank=self.rank,
+            cp_rank=self.cp_rank,
         )
 
     def exists(self, pages: Sequence[StoragePage]) -> list[bool]:

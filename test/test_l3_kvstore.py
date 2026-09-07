@@ -55,12 +55,19 @@ class _FakeHost:
 
 
 class StorageKeyTest(unittest.TestCase):
-    def test_object_key_includes_group_offset_and_rank(self):
+    def test_object_key_includes_group_offset_and_ranks(self):
         self.assertEqual(
-            storage_object_key("abc", 1, 2, prefix="model", rank=3),
-            "model_abc|g1|o2|r3",
+            storage_object_key("abc", 1, 2, prefix="model", rank=3, cp_rank=4),
+            "model_abc|g1|o2|r3|c4",
         )
-        self.assertEqual(storage_object_key("abc", 0, 0), "abc|g0|o0|r0")
+        self.assertEqual(
+            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=0),
+            "abc|g0|o0|r0|c0",
+        )
+        self.assertNotEqual(
+            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=0),
+            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=1),
+        )
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
@@ -146,7 +153,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_backups_and_prefetches_packed_pages(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh")
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])
@@ -165,27 +172,44 @@ class L3HostStoreTest(unittest.TestCase):
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh")
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
         self.assertEqual(old_key, l3.object_key("h0", 0, 0))
         self.assertEqual(l3.exists(pages), [False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
+        restarted = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
         self.assertEqual(restarted.exists(pages), [False])
 
     def test_clear_raises_when_remote_delete_fails_and_keeps_the_prefix(self):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
-        l3 = L3HostStore(backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1)
+        l3 = L3HostStore(
+            backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1, cp_rank=0
+        )
         old_key = l3.object_key("h0", 0, 0)
 
         with self.assertRaisesRegex(RuntimeError, "delete failed"):
             l3.rotate_namespace()
 
         self.assertEqual(old_key, l3.object_key("h0", 0, 0))
+
+    def test_set_key_prefix_republishes_under_the_new_namespace(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh")
+        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, cp_rank=0)
+        pages = [(0, 1, "h0", 0)]
+        self.assertEqual(l3.backup(pages), [True])
+        old_key = l3.object_key("h0", 0, 0)
+        l3.rotate_namespace()
+        l3.set_key_prefix("v2")
+        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
+        self.assertEqual(l3.exists(pages), [False])
+        self.assertEqual(l3.backup(pages), [True])
+        self.assertTrue(l3.object_key("h0", 0, 0).startswith("v2_"))
+        self.assertEqual(backend.batch_exists([old_key]), [False])
 
 
 class FactoryTest(unittest.TestCase):

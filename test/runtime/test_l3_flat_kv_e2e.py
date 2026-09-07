@@ -108,7 +108,13 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 io_backend="direct",
             )
         store = self.MemoryKvStore()
-        executor.attach_l3_storage(store, key_prefix="e2e", rank=0)
+        executor.attach_l3_storage(
+            store,
+            key_prefix="e2e",
+            rank=0,
+            cp_rank=0,
+            prefix_for_weight_version=lambda version: f"e2e-{version}",
+        )
 
         first[16:20].fill_(0x11)
         second[28:34].fill_(0x12)
