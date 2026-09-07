@@ -1388,10 +1388,10 @@ def gather_page_table_with_padding(
 def _kv_transfer_per_layer_capped_kernel(
     k_cache_dst_ptr,
     v_cache_dst_ptr,
-    indices_dst_ptr,
+    indices_dst_ptr: tl.const,
     k_cache_src_ptr,
     v_cache_src_ptr,
-    indices_src_ptr,
+    indices_src_ptr: tl.const,
     kv_cache_src_stride,
     kv_cache_dst_stride,
     length,
@@ -1452,12 +1452,12 @@ def _kv_transfer_per_layer_kernel(
 
 @triton.jit
 def _kv_transfer_all_layer_kernel(
-    k_ptr_dst_ptr,
-    v_ptr_dst_ptr,
-    indices_dst_ptr,
-    k_ptr_src_ptr,
-    v_ptr_src_ptr,
-    indices_src_ptr,
+    k_ptr_dst_ptr: tl.const,
+    v_ptr_dst_ptr: tl.const,
+    indices_dst_ptr: tl.const,
+    k_ptr_src_ptr: tl.const,
+    v_ptr_src_ptr: tl.const,
+    indices_src_ptr: tl.const,
     length,
     num_layers: tl.constexpr,
     kv_cache_src_stride_words,
@@ -1730,10 +1730,10 @@ def _kv_transfer_per_layer_mla_kernel(
 
 @triton.jit
 def _kv_transfer_all_layer_mla_kernel(
-    ptr_dst_ptr,
-    indices_dst_ptr,
-    ptr_src_ptr,
-    indices_src_ptr,
+    ptr_dst_ptr: tl.const,
+    indices_dst_ptr: tl.const,
+    ptr_src_ptr: tl.const,
+    indices_src_ptr: tl.const,
     length,
     num_layers: tl.constexpr,
     cache_src_stride_words,
