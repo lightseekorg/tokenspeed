@@ -41,8 +41,10 @@ struct CacheGroupConfig {
     };
 
     std::string group_id;
-    std::int32_t rows_per_page{};
-    std::int32_t entry_stride_tokens{};
+    // Tokens covered by one block-table slot. The Python declaration shape
+    // (row geometry or state checkpoint) folds to this span before crossing
+    // the bridge; the scheduler never sees rows, strides or checkpoints.
+    std::int32_t block_granularity{};
     std::int32_t total_pages{};
     // Number of this group's CacheBlocks packed into one physical LCM block.
     std::int32_t cache_blocks_per_lcm_block{1};
@@ -51,12 +53,12 @@ struct CacheGroupConfig {
     CacheGroupFamily family{CacheGroupFamily::History};
     CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
 
-    std::int32_t BlockGranularity() const { return rows_per_page * entry_stride_tokens; }
-
     // A State group WITHOUT SlidingWindow retention keeps one recurrent-state
     // checkpoint per block instead of a token history: the mamba-style group
-    // whose PD destination layout is a LatestSnapshot. family=State alone is
-    // not enough -- it also covers linear-attention sliding groups.
+    // (GDN linear attention, conv columns) whose PD destination layout is a
+    // LatestSnapshot. family=State alone is not enough -- it also covers
+    // sliding-window tail buffers (DeepSeek V4 SWA kv / compressor state),
+    // whose blocks hold real window rows rather than snapshots.
     bool IsSnapshotStateGroup() const {
         return family == CacheGroupFamily::State && retention != Retention::SlidingWindow;
     }

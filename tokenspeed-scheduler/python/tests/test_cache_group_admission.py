@@ -70,8 +70,7 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="overlap.history",
-            rows_per_page=1,
-            entry_stride_tokens=1,
+            block_granularity=1,
             total_pages=total_pages,
             retention=CacheRetention.FullHistory,
             family=CacheGroupFamily.History,
@@ -97,8 +96,7 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="history",
-            rows_per_page=cfg.prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
         )
     ]
@@ -125,8 +123,7 @@ def test_sliding_release_before_admit_prevents_oom():
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="swa.test",
-            rows_per_page=2,
-            entry_stride_tokens=1,
+            block_granularity=2,
             total_pages=8,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
@@ -153,8 +150,7 @@ def test_batch_admission_debits_simulated_free_pages():
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id=f"swa.g{i}",
-            rows_per_page=2,
-            entry_stride_tokens=1,
+            block_granularity=2,
             total_pages=12,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
@@ -178,16 +174,14 @@ def test_group_tables_use_each_groups_block_granularity():
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="history",
-            rows_per_page=8,
-            entry_stride_tokens=1,
+            block_granularity=8,
             total_pages=17,
             retention=CacheRetention.FullHistory,
             family=CacheGroupFamily.History,
         ),
         CacheGroupConfig(
             group_id="state",
-            rows_per_page=2,
-            entry_stride_tokens=1,
+            block_granularity=2,
             total_pages=65,
             cache_blocks_per_lcm_block=4,
             retention=CacheRetention.SlidingWindow,
@@ -217,16 +211,14 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="history",
-            rows_per_page=4,
-            entry_stride_tokens=1,
+            block_granularity=4,
             total_pages=cfg.num_device_pages,
             retention=CacheRetention.FullHistory,
             family=CacheGroupFamily.History,
         ),
         CacheGroupConfig(
             group_id="swa",
-            rows_per_page=4,
-            entry_stride_tokens=1,
+            block_granularity=4,
             total_pages=cfg.num_device_pages,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,

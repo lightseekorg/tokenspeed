@@ -32,11 +32,8 @@ void CacheGroupConfig::Validate() const {
     // Every remaining message names the group: a model mixes several of them,
     // and the offending one is the only actionable part of the diagnostic.
     const std::string where = "Cache group '" + group_id + "': ";
-    if (rows_per_page <= 0) {
-        throw std::invalid_argument(where + "rows_per_page must be > 0");
-    }
-    if (entry_stride_tokens <= 0) {
-        throw std::invalid_argument(where + "entry_stride_tokens must be > 0");
+    if (block_granularity <= 0) {
+        throw std::invalid_argument(where + "block_granularity must be > 0");
     }
     if (total_pages < 1) {
         throw std::invalid_argument(where + "total_pages must include the null page");

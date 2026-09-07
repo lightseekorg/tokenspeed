@@ -70,7 +70,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-                .block_granularity = group.BlockGranularity(),
+                .block_granularity = group.block_granularity,
             });
             continue;
         }
@@ -81,7 +81,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-            .block_granularity = group.BlockGranularity(),
+            .block_granularity = group.block_granularity,
         });
     }
     return specs;

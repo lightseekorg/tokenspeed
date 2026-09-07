@@ -112,25 +112,26 @@ Python  CacheGroupSpec     declaration shape (rows | checkpoint) + policy
   ↓     pool_to_cache_groups                      the single folding point
 C++     CacheGroupConfig   boundary config, nanobind-exposed (SchedulerConfig.cache_groups)
   ↓     MakeSpecsFromConfig
-C++     CacheGroupSpec     folded scheduling form (block_granularity only)
+C++     CacheGroupSpec     scheduling form (block_granularity + kind)
 ```
 
 The first and third share a name and differ in fields, so always qualify
 which side you mean; `CacheGroupConfig` in between is the only one visible
 from both.
 
-The same boundary holds for `checkpoint_granularity`: the identifier never
-enters `tokenspeed-scheduler` at all. It is a Python-side *declaration
-shape* on `CacheGroupSpec`, and the bridge
-(`scheduler_utils.pool_to_cache_groups`) is the single folding point:
-a snapshot declaration folds to `(rows = checkpoint_granularity,
-stride = 1)` and crosses into C++ as `CacheGroupSpec.block_granularity` — so
-a snapshot group's `block_granularity` equals its `checkpoint_granularity`
-numerically, and the scheduler has no "checkpoint" word, only "how many
-tokens one block-table slot covers". The row-geometry shape
-(`rows_per_page`, `entry_stride_tokens`) folds away at the same point.
 Declaration-shape vocabulary stops at the bridge; only the generic span
-crosses it.
+crosses it. Neither `checkpoint_granularity` nor `rows_per_page` /
+`entry_stride_tokens` enters `tokenspeed-scheduler` at all: they are
+Python-side *declaration shapes* on `CacheGroupSpec`, and the bridge
+(`scheduler_utils.pool_to_cache_groups`) folds both to
+`CacheGroupSpec.block_granularity` before constructing the C++
+`CacheGroupConfig`, whose only span field is `block_granularity`. So a
+snapshot group's `block_granularity` equals its `checkpoint_granularity`
+numerically, a paged group's equals `rows_per_page × entry_stride_tokens`,
+and the scheduler has no "checkpoint", "row" or "stride" word — only "how
+many tokens one block-table slot covers". Carrying a fictional
+`(rows = P, stride = 1)` across the bridge for a snapshot group would be a
+claim its contents contradict, the same way a `Paged` type name would.
 
 `CacheGroupSpec.block_granularity` is **required and explicit**: a positive
 divisor of `prefix_granularity`, rejected by `SchedulerConfig::Validate()`
@@ -573,9 +574,11 @@ cache layer enumerates LCM block ids.
 
 Enforced:
 
-* the identifier `page_size` is grep-zero across `tokenspeed-scheduler`
+* the identifiers `page_size`, `rows_per_page`, `entry_stride_tokens` and
+  `checkpoint_granularity` are grep-zero across `tokenspeed-scheduler`
   (csrc, tests, python bindings) — the slot span is spelled
-  `block_granularity` everywhere;
+  `block_granularity` everywhere, and `CacheGroupConfig` carries it as its
+  only span field;
 * `CacheGroupSpec.block_granularity` is required and explicit: every group
   states its span, with no zero-means-default fallback, and the coordinator
   asserts a positive divisor of P at construction;

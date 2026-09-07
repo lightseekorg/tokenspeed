@@ -41,8 +41,7 @@ def _group(
 ) -> CacheGroupConfig:
     kwargs = dict(
         group_id=group_id,
-        rows_per_page=page_size,
-        entry_stride_tokens=1,
+        block_granularity=page_size,
         total_pages=8,
         retention=retention,
         family=family,
