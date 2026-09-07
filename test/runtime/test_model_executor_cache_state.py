@@ -26,6 +26,13 @@ import torch
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 
+def test_decode_autotune_buckets_cover_speculation_and_attention_dp():
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.forward_step = SimpleNamespace(max_tokens_per_req=5)
+    executor.config = SimpleNamespace(data_parallel_size=8)
+    assert executor._decode_autotune_buckets((1, 3)) == (1, 3, 5, 15, 40, 120)
+
+
 class _RuntimeStates:
     def __init__(self):
         self.valid_cache_lengths = torch.arange(20, dtype=torch.int32)

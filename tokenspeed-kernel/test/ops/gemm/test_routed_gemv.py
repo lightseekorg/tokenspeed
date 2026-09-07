@@ -132,7 +132,7 @@ def test_capture_of_a_warmed_shape_replays_correctly():
     same capture must fall back rather than JIT."""
     from tokenspeed_kernel.ops.gemm import routed_gemv as route
 
-    m, n, k = 1, 3648, 7168  # skinny-routed
+    m, n, k = 1, 3648, 7168
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
@@ -259,13 +259,31 @@ def test_unlisted_shapes_keep_the_generic_selection():
     _select.cache_clear()
     impl = _select(1, 999, 4096, True)
     assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3216, 7168, True)
+    impl = _select(4, 3217, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
     # A width no call site produces.
     impl = _select(3, 6289, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2304, 1536, True)
+    impl = _select(1, 2305, 1536, True)
     assert "rowcta" in getattr(impl, "__name__", "")
+
+
+@pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
+def test_large_m_projections_honor_measured_routes(monkeypatch, projection, n):
+    from tokenspeed_kernel.ops.gemm import kimi3, triton_gemv
+
+    x = torch.empty(64, 7168, device="meta", dtype=torch.bfloat16)
+    weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
+    output = torch.empty(64, n, device="meta", dtype=torch.bfloat16)
+    monkeypatch.setattr(kimi3, "decode_gemv_routed", lambda *_: True)
+    monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
+    if projection == "kda":
+        assert kimi3.kimi3_qkvfab_projection(x, weight) is output
+    else:
+        result = kimi3.kimi3_mla_qkv_gate_projection(x, weight, 2112)
+        assert result.packed is output
+        assert result.qkv.shape == (64, 2112)
+        assert result.gate.shape == (64, 1536)
 
 
 def test_qwen38_route_keeps_unstable_shapes_on_fallback():
@@ -380,7 +398,7 @@ def test_measured_route_source_has_no_duplicate_keys():
         assert not cfg_dupes, f"duplicate {name} keys in source: {cfg_dupes}"
         assert len(table) == len(cfg_keys), name
     # Exact-M keying: entries may only exist in the gap-free swept range.
-    assert all(m <= 32 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+    assert all(m <= 64 for m, _, _ in routed_gemv.MEASURED_ROUTE)
 
 
 def test_skinny_config_route_entries_are_valid():
@@ -409,7 +427,7 @@ def test_skinny_config_prefers_the_measured_table_over_the_heuristic():
     )
 
     routed_gemv._skinny_config.cache_clear()
-    m, n, k = 2, 768, 1536
+    m, n, k = 2, 320, 2560
     config = routed_gemv._skinny_config(m, n, k)
     assert (
         config.block_size,
@@ -418,7 +436,7 @@ def test_skinny_config_prefers_the_measured_table_over_the_heuristic():
         config.vector_width,
     ) == routed_gemv.SKINNY_CONFIG_ROUTE[(m, n, k)]
 
-    unmeasured = (7, 768, 1536)
+    unmeasured = (7, 320, 2560)
     assert unmeasured not in routed_gemv.SKINNY_CONFIG_ROUTE
     assert routed_gemv._skinny_config(*unmeasured) == (
         shape_dynamic_skinny_gemm.default_config(*unmeasured)
@@ -437,7 +455,7 @@ def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset
     from tokenspeed_kernel.ops.gemm import routed_gemv
     from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
 
-    m, n, k = 2, 768, 1536  # tuned entry (96, 2, 1, 16)
+    m, n, k = 2, 320, 2560  # tuned entry (160, 2, 1, 16)
     xbuf = torch.randn(m * k + offset, device="cuda", dtype=torch.bfloat16)
     wbuf = torch.randn(n * k + offset, device="cuda", dtype=torch.bfloat16)
     x = (xbuf[offset:] if misalign == "x" else xbuf[:-offset]).view(m, k)

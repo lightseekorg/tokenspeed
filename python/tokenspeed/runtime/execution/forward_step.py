@@ -568,8 +568,11 @@ class ForwardStepRunner:
 
         return graph, out
 
-    def prewarm_comm_states(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
-        """Initialize lazy comm state with capture-style dummy forwards."""
+    def warmup_decode_path(
+        self,
+        batch_sizes: tuple[int, ...],
+    ) -> None:
+        """Run capture-style eager full-model decode for each batch size."""
         if self._forward_func is None:
             return
 
@@ -630,12 +633,20 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.add_batch(
+                        grammars=[None] * bs,
+                        bs=bs,
+                        has_candidates=False,
+                    )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
                 self.device_module.synchronize()
                 dist.barrier()
 
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.reset_state()
                 if self.sampling_backend is not None:
                     self.sampling_backend.reset_capture_state()
         finally:
