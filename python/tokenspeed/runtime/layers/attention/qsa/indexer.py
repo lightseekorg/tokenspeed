@@ -48,7 +48,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.runtime import (
-    QSARuntime,
     require_qsa_runtime,
 )
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -125,7 +124,6 @@ class QSAIndexer(nn.Module):
         # Draft QSA indexers can publish step-0 top-k through backend scratch
         # and reuse the target-aligned rows on later MTP steps.
         self.share_topk_for_mtp_iteration = False
-        self.qsa_runtime: QSARuntime | None = None
         self._draft_scratch: dict[
             tuple[int, torch.device],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -138,22 +136,12 @@ class QSAIndexer(nn.Module):
             persistent=False,
         )
 
-    @staticmethod
-    def _runtime(ctx: ForwardContext) -> QSARuntime:
-        return require_qsa_runtime(ctx.attn_backend)
-
     def _fields(self, pool):
         layer_id = pool._field_layer_id(self.layer_id)
         raw = pool.arena.field(qsa_raw_key_field(layer_id))
         compressed = pool.arena.field(qsa_compressed_field(layer_id))
         rope_positions = pool.arena.field(qsa_rope_position_field(layer_id))
         return raw, compressed, rope_positions
-
-    def verify_commit_fields(self, pool) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return this layer's raw-key and group-start position fields."""
-
-        raw, _, position_cache = self._fields(pool)
-        return raw, position_cache
 
     def _project_qk_raw(self, hidden_states):
         """Project packed raw index queries and keys without materializing copies."""
@@ -179,29 +167,6 @@ class QSAIndexer(nn.Module):
             else rope_positions.unsqueeze(0).expand(3, -1)
         )
         return values.reshape(3, -1).T
-
-    def _verify_staging_buffers(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        logical_positions: torch.Tensor,
-        recent_locs: torch.Tensor,
-        bs: int,
-        pool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return this layer's views into backend-owned verify staging."""
-
-        if self.qsa_runtime is None:
-            raise RuntimeError("QSA verify staging ran before indexers were bound")
-        return self.qsa_runtime.verify_staging_buffers(
-            self,
-            token_k,
-            position_values,
-            logical_positions,
-            recent_locs,
-            bs,
-            pool,
-        )
 
     def _draft_scratch_buffers(
         self,
@@ -449,7 +414,7 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        runtime = self._runtime(ctx)
+        runtime = require_qsa_runtime(ctx.attn_backend)
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
@@ -462,14 +427,13 @@ class QSAIndexer(nn.Module):
         is_draft_decode_step = (
             is_draft and ctx.draft_narrowing is None and ctx.forward_mode.is_decode()
         )
-        position_values = self._position_values(positions)
         draft_scratch = None
         if is_draft_decode_step and token_k.shape[0] != ctx.bs:
             raise RuntimeError("QSA draft decode requires one row per request")
         if is_draft_first_step or is_draft_decode_step:
             draft_scratch = self._draft_scratch_buffers(
                 token_k,
-                position_values,
+                self._position_values(positions),
                 None,
                 ctx.bs,
             )
@@ -515,14 +479,7 @@ class QSAIndexer(nn.Module):
             verify_tokens = verify_bs * runtime.spec_num_tokens
             if verify_tokens > token_k.shape[0]:
                 raise RuntimeError("QSA verify rows exceed the current input")
-            verify_scratch = self._verify_staging_buffers(
-                token_k[-verify_tokens:],
-                position_values[-verify_tokens:],
-                logical[-verify_tokens:],
-                recent_locs[-verify_tokens:],
-                verify_bs,
-                pool,
-            )
+            verify_scratch = runtime.verify_staging_buffers(self.layer_id, verify_bs)
         q = self._write_and_compress(
             token_k,
             positions,

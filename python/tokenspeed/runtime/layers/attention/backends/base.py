@@ -44,7 +44,7 @@ from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -63,22 +63,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
-
-
-class SpeculativeStateBackend(Protocol):
-    """Model side-state that consumes speculative verification results."""
-
-    def commit_after_mtp_verify(
-        self,
-        accepted_lengths: torch.Tensor,
-        *,
-        num_extends: int,
-    ) -> None: ...
-
-
-_SpeculativeStateBackendT = TypeVar(
-    "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
-)
 
 
 @dataclass
@@ -137,7 +121,6 @@ class AttentionBackend(ABC):
         self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.head_dim = spec.head_dim
         self.cache_pool: CachePool | None = None
-        self._speculative_state_backends: list[SpeculativeStateBackend] = []
 
     # ------------------------------------------------------------------
     # Structure
@@ -386,40 +369,13 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def register_speculative_state_backend(
-        self, backend: SpeculativeStateBackend
-    ) -> None:
-        """Register a model side-state consumer of MTP verification results."""
-        backends = getattr(self, "_speculative_state_backends", None)
-        if backends is None:
-            backends = []
-            self._speculative_state_backends = backends
-        if backend not in backends:
-            backends.append(backend)
-
-    def find_speculative_state_backend(
-        self, backend_type: type[_SpeculativeStateBackendT]
-    ) -> _SpeculativeStateBackendT | None:
-        """The registered side backend of ``backend_type``, or None."""
-        return next(
-            (
-                backend
-                for backend in getattr(self, "_speculative_state_backends", ())
-                if isinstance(backend, backend_type)
-            ),
-            None,
-        )
-
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Publish acceptance to local runtimes and runner-facing children.
+        """Publish acceptance to runner-facing children.
 
-        Each runtime registers with its owning node once at construction.
         Paged compute leaves carry no post-verify lifecycle.
         """
-        for backend in getattr(self, "_speculative_state_backends", ()):
-            backend.commit_after_mtp_verify(accepted_lengths, num_extends=num_extends)
         for child in self.child_backends():
             if isinstance(child, AttentionBackend):
                 child.commit_speculative_state_after_verify(

@@ -348,17 +348,19 @@ QSA follows the ordinary router + leaf path. Its registered paged leaf
 inherits MHA's metadata refresh and capture; `attention/qsa/runtime.py`
 owns its cross-group layout and verify staging. The registry calls the leaf
 class's `create_runtime(config, router)` once per router, before verify
-workspace allocation and model binding. The runtime consumes
+workspace allocation. The runtime consumes
 `router.group_view(gid, bs)`, whose table and expansion come from the same
 stacks the leaf metadata uses. It never builds another block-table route.
 QSA compute leaf instances hold no shared runtime or router reference.
 
-Verify workspace allocation delegates from the router to its runtime. The
-runtime registers its post-verify commit on that router at construction;
-`AttentionBackend.commit_speculative_state_after_verify` visits local
-registrations and runner-facing children, so bare draft/target routers and
-hybrid wrappers use the same lifecycle. Model binding supplies the local
-indexers only; it neither creates a runtime nor registers another commit.
+Verify workspace allocation and post-verify commit delegate directly from
+the router to its runtime. `AttentionBackend.commit_speculative_state_after_verify`
+visits runner-facing children, so bare routers and hybrid wrappers use the
+same lifecycle without a separate callback registry. QSA derives its owned
+layers, cache views and commit addresses from the bound cache plan; it does
+not bind model indexers. Staging and address tables are budgeted and allocated
+before capture. Every forward takes views of this one capacity-sized workspace;
+neither eager execution nor graph capture allocates a second staging buffer.
 
 ## One block-table route: router + leaves
 

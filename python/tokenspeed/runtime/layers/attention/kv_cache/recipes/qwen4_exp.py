@@ -220,7 +220,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         Mirrors ``QSARuntime.preallocate_verify_workspace``: one
         layer-major key buffer (model dtype) plus the three shared tensors
         (int64 positions, int64 logical positions, int32 recent locations),
-        sized once for the verify batch bound and the single verify width.
+        sized once for the verify batch bound and the single verify width,
+        plus two uint64 cache addresses per layer for the batched commit.
         """
         layers = self._qsa_target_layers
         width = int(self.attn_config.speculative_num_draft_tokens)
@@ -231,7 +232,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         dtype_bytes = torch.empty((), dtype=self.attn_config.dtype).element_size()
         key_bytes = len(layers) * capacity * width * index_dim * dtype_bytes
         shared_bytes = capacity * width * ((3 + 1) * 8 + 4)
-        return key_bytes + shared_bytes
+        address_bytes = len(layers) * 2 * 8
+        return key_bytes + shared_bytes + address_bytes
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:

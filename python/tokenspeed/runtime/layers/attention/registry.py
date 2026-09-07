@@ -468,8 +468,6 @@ def create_paged_router(
         device=config.device,
     )
     router.runtime = leaf_cls.create_runtime(config, router)
-    if router.runtime is not None:
-        router.register_speculative_state_backend(router.runtime)
     return router
 
 
