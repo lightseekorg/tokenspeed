@@ -344,9 +344,25 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     """Exercise every compression phase, empty splits and tail-only attention."""
     if current_platform().arch_version != ArchVersion(10, 0):
         pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
-    from ops.bench_qsa_sparse_attention import make_inputs
+    torch.manual_seed(83)
+    seq_len, page_size, num_pages = 65539, 256, 1024
+    cache_slots = (num_pages + 1) * page_size
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
+    k_cache = (
+        torch.randn(cache_slots, 1, 256, device=device, dtype=torch.bfloat16) * 0.25
+    ).to(cache_dtype)
+    v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
+    # Scatter 512 four-token groups and the three-token remainder over physical
+    # pages spanning the full 256K capacity, with page zero reserved.
+    pages = torch.randperm(num_pages, device=device, dtype=torch.int32) + 1
+    slots = torch.empty((rows, 2051), device=device, dtype=torch.int32)
+    offsets = torch.arange(4, device=device, dtype=torch.int32)
+    tail = torch.arange(seq_len // 4 * 4, seq_len, device=device, dtype=torch.int32)
+    for row in range(rows):
+        groups = torch.randperm(seq_len // 4, device=device, dtype=torch.int32)[:512]
+        logical = torch.cat(((groups[:, None] * 4 + offsets).flatten(), tail))
+        slots[row] = pages[logical // page_size] * page_size + logical % page_size
 
-    q, k_cache, v_cache, slots = make_inputs(rows, 65539, 262144, cache_dtype, 83)
     k_scale, v_scale = 1.75, 0.25
     kwargs = {
         "scale": 256**-0.5,
