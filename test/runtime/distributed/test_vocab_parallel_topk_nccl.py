@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""DFlash2's shard-local candidate selection, over a real NCCL all-gather.
+"""Shard-local candidate selection, over a real NCCL all-gather.
 
 The single-process test stands a hand-computed peer in for the other rank.
 This one runs the actual collective on two GPUs, so the packing, the global-id
@@ -27,7 +27,7 @@ offset and the rank-major to row-major fold are checked against the layout
 NCCL really delivers rather than against the one the mock reproduces.
 
 Usage:
-    python -m pytest test/runtime/distributed/test_dflash2_distributed_topk.py -v
+    python -m pytest test/runtime/distributed/test_vocab_parallel_topk_nccl.py -v
 """
 
 import os
@@ -99,45 +99,49 @@ def _quantized_head(shard, device, logits):
     return head
 
 
-def _drafter(rank, world_size, device, group, quantized=False):
-    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+def _selector(rank, world_size, device, group, quantized=False):
+    """The production selector, planned against this rank's shard."""
+    from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
 
     weight, _ = _inputs(device)
     shard = VOCAB // world_size
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.selector_top_k = TOP_K
-    drafter.spec_num_tokens = ROWS + 1
-    drafter.input_buffers = SimpleNamespace(max_bs=1)
-    drafter._candidate_gather_buffers = None
-    drafter._distributed_topk_enabled = True
-    drafter._radix_topk = None
-    drafter._shard_seq_lens = None
     if quantized:
         _, hidden = _inputs(device)
         rank_logits = torch.matmul(hidden, weight[rank * shard : (rank + 1) * shard].T)
-        drafter.lm_head = _quantized_head(shard, device, rank_logits)
+        head = _quantized_head(shard, device, rank_logits)
     else:
-        drafter.lm_head = SimpleNamespace(
+        head = SimpleNamespace(
             weight=weight[rank * shard : (rank + 1) * shard], quant_method=None
         )
-    drafter.lm_head.shard_indices = SimpleNamespace(
-        num_org_elements=shard, org_vocab_start_index=rank * shard
+    head.shard_indices = SimpleNamespace(
+        num_org_elements=shard,
+        num_org_elements_padded=shard,
+        num_added_elements=0,
+        org_vocab_start_index=rank * shard,
     )
-    drafter.candidate_logits_processor = SimpleNamespace(
+    selector = VocabParallelTopK(
+        head,
         tp_size=world_size,
+        tp_rank=rank,
         tp_group=group,
+        vocab_size=VOCAB,
+        top_k=TOP_K,
+        max_rows=ROWS,
         logit_scale=None,
-        final_logit_softcapping=None,
+        softcapping=None,
+        skip_all_gather=False,
+        dp_sampling_enabled=False,
     )
-    return drafter
+    assert selector.enabled, "this shard geometry must reach the packed gather"
+    return selector
 
 
 def _check_candidates(rank, world_size, device, group, quantized=False, **_):
     """Every rank must agree with one top-k over the whole vocabulary."""
     weight, hidden = _inputs(device)
-    drafter = _drafter(rank, world_size, device, group, quantized=quantized)
+    selector = _selector(rank, world_size, device, group, quantized=quantized)
 
-    candidate_ids, unary_logits = drafter._distributed_topk_candidates(hidden)
+    candidate_ids, unary_logits = selector(hidden)
 
     reference = torch.matmul(hidden, weight.T).float()
     want = torch.topk(reference, TOP_K, dim=-1).values
@@ -149,17 +153,17 @@ def _check_candidates(rank, world_size, device, group, quantized=False, **_):
 def _check_capture_and_replay(rank, world_size, device, group, **_):
     """The staging and landing buffers must survive graph capture and replay."""
     weight, hidden = _inputs(device)
-    drafter = _drafter(rank, world_size, device, group)
+    selector = _selector(rank, world_size, device, group)
 
     # Warm: allocates the resident buffers and runs NCCL eagerly once, which
     # capture requires.
-    drafter._distributed_topk_candidates(hidden)
-    resident = drafter._candidate_gather_buffers
+    selector(hidden)
+    resident = selector._gather_buffers
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_ids, captured_logits = drafter._distributed_topk_candidates(hidden)
-    assert drafter._candidate_gather_buffers is resident, "capture reallocated"
+        captured_ids, captured_logits = selector(hidden)
+    assert selector._gather_buffers is resident, "capture reallocated"
 
     graph.replay()
     torch.cuda.synchronize()

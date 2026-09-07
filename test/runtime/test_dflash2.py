@@ -197,6 +197,9 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
+    drafter.selector_top_k = 4
+    drafter.spec_num_tokens = 8
+    drafter.input_buffers = SimpleNamespace(max_bs=2)
     drafter.lm_head = SimpleNamespace()
     drafter.logits_processor = SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None)
 
@@ -206,12 +209,15 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     assert drafter.candidate_logits_processor is not None
     assert drafter.candidate_logits_processor.logit_scale == 1.25
     assert drafter.candidate_logits_processor.final_logit_softcapping == 8.0
+    # tp_size == 1 leaves nothing to gather, so the shard-local path stays off.
+    assert not drafter.candidate_topk.enabled
 
 
 def test_candidate_unary_logits_are_promoted_to_fp32() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.selector_top_k = 2
     drafter.lm_head = object()
+    drafter.candidate_topk = SimpleNamespace(enabled=False)
     drafter.candidate_logits_processor = mock.Mock()
     drafter.candidate_logits_processor._get_logits.return_value = torch.tensor(
         [[1.0, 4.0, 3.0]], dtype=torch.bfloat16
@@ -538,198 +544,3 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
-
-
-@_CUDA_ONLY
-def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
-    """The selector's shard top-k, on the vendored single-pass radix kernel.
-
-    ``sorted=False`` either way, so only the candidate set has to match -- but
-    it has to match exactly, since these are the tokens the drafter proposes.
-    """
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.selector_top_k = 16
-    drafter.spec_num_tokens = 8
-    drafter.input_buffers = SimpleNamespace(max_bs=8)
-    drafter._shard_seq_lens = None
-    drafter.lm_head = SimpleNamespace(
-        weight=torch.zeros(1, device="cuda", dtype=torch.bfloat16)
-    )
-    drafter._radix_topk = drafter._probe_radix_topk(20480)
-    if drafter._radix_topk is None:
-        pytest.skip("vendored radix top-k is not built here")
-
-    torch.manual_seed(0)
-    for rows in (7, 56):
-        logits = torch.randn(rows, 20480, device="cuda", dtype=torch.bfloat16)
-        values, ids = drafter._shard_topk(logits, 16)
-        want = torch.topk(logits.float(), 16, dim=-1).values
-        got = torch.gather(logits.float(), 1, ids.long())
-        assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
-        torch.testing.assert_close(values.float(), got, atol=1e-2, rtol=0)
-
-
-def _nvfp4_head(shard: int, hidden: int, logits: torch.Tensor):
-    """A head the production predicate accepts as genuinely quantized.
-
-    Same shape as the NextN fixture: a packed uint8 weight plus the runtime
-    attributes ``should_apply_lm_head_quant_method`` requires. Only ``apply``
-    is stood in for, so the dispatch is checked against the real quant method.
-    """
-    from torch import nn
-
-    from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
-
-    head = nn.Module()
-    head.register_parameter(
-        "weight",
-        nn.Parameter(
-            torch.empty((shard, hidden // 2), dtype=torch.uint8), requires_grad=False
-        ),
-    )
-    head.register_parameter(
-        "weight_scale",
-        nn.Parameter(torch.ones((1,), dtype=torch.float32), requires_grad=False),
-    )
-    head.alpha = torch.ones((1,), dtype=torch.float32)
-    head.input_size_per_partition = hidden
-    head.output_size_per_partition = shard
-    head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
-    head.quant_method.apply = mock.Mock(return_value=logits)
-    return head
-
-
-def test_a_quantized_head_reaches_its_quant_method_not_a_matmul() -> None:
-    """A packed weight must never be matmul'd, on the fast path either."""
-    from tokenspeed.runtime.layers.logits_processor import (
-        should_apply_lm_head_quant_method,
-    )
-
-    torch.manual_seed(11)
-    rows, hidden, shard = 3, 6, 20
-    hidden_states = torch.randn(rows, hidden)
-    dense = torch.randn(rows, shard)
-
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.lm_head = _nvfp4_head(shard, hidden, dense)
-    # The production predicate, not our own opinion, is what must say "quantized".
-    assert should_apply_lm_head_quant_method(
-        drafter.lm_head, drafter.lm_head.quant_method
-    )
-
-    logits = drafter._shard_logits(hidden_states)
-
-    drafter.lm_head.quant_method.apply.assert_called_once()
-    torch.testing.assert_close(logits, dense)
-
-
-def test_a_quantized_head_picks_candidates_through_the_padding_slice(
-    monkeypatch,
-) -> None:
-    """The whole fast path on a quantized head: apply, slice, gather, select."""
-    from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime
-
-    torch.manual_seed(13)
-    rows, hidden, shard, pad, top_k, tp_size = 3, 6, 20, 4, 4, 2
-    hidden_states = torch.randn(rows, hidden)
-    # apply() answers over the padded partition; only the first `shard`
-    # columns are real token ids, so the slice is what keeps ids meaningful.
-    padded = torch.randn(rows, shard + pad)
-    padded[:, shard:] = 1e4  # would win every slot if the slice were dropped
-
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.selector_top_k = top_k
-    drafter.spec_num_tokens = 3
-    drafter.input_buffers = SimpleNamespace(max_bs=2)
-    drafter._candidate_gather_buffers = None
-    drafter._distributed_topk_enabled = True
-    drafter._radix_topk = None
-    drafter._shard_seq_lens = None
-    drafter.lm_head = _nvfp4_head(shard, hidden, padded)
-    drafter.lm_head.shard_indices = SimpleNamespace(
-        num_org_elements=shard, org_vocab_start_index=0
-    )
-    drafter.candidate_logits_processor = SimpleNamespace(
-        tp_size=tp_size, tp_group=None, logit_scale=None, final_logit_softcapping=None
-    )
-
-    peer = torch.full((rows, shard), -1e4)
-    peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
-    peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
-
-    def fake_all_gather(out, src, group):
-        out[: src.shape[0]].copy_(src)
-        out[src.shape[0] :].copy_(peer_packed)
-
-    monkeypatch.setattr(dflash2_runtime, "all_gather_into_tensor", fake_all_gather)
-    candidate_ids, _ = drafter._distributed_topk_candidates(hidden_states)
-
-    # Every winner is a real token of this shard, never one of the pad columns
-    # and never the peer's deliberately-losing rows.
-    assert candidate_ids.max().item() < shard
-    want = torch.topk(padded[:, :shard], top_k, dim=-1).values
-    got = torch.gather(padded[:, :shard], 1, candidate_ids)
-    assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
-
-
-def test_shard_logits_matmuls_an_unquantized_head() -> None:
-    """The dense head keeps the plain matmul, unchanged."""
-    torch.manual_seed(12)
-    rows, hidden, shard = 3, 6, 20
-    weight = torch.randn(shard, hidden)
-    hidden_states = torch.randn(rows, hidden)
-
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.lm_head = SimpleNamespace(weight=weight, quant_method=None)
-
-    torch.testing.assert_close(
-        drafter._shard_logits(hidden_states), hidden_states @ weight.T
-    )
-
-
-def test_distributed_topk_picks_what_a_whole_vocabulary_topk_would(monkeypatch) -> None:
-    """Two shard-local top-16s must agree with one top-16 over the vocabulary."""
-    from tokenspeed.runtime.execution.drafter import dflash2 as dflash2_runtime
-
-    torch.manual_seed(7)
-    rows, hidden, vocab, top_k, tp_size = 3, 6, 40, 4, 2
-    weight = torch.randn(vocab, hidden)
-    hidden_states = torch.randn(rows, hidden)
-    shard = vocab // tp_size
-
-    drafter = DFlash2.__new__(DFlash2)
-    drafter.selector_top_k = top_k
-    drafter.spec_num_tokens = 3
-    drafter.input_buffers = SimpleNamespace(max_bs=2)
-    drafter._candidate_gather_buffers = None
-    drafter._distributed_topk_enabled = True
-    drafter.lm_head = SimpleNamespace(
-        weight=weight[:shard],
-        shard_indices=SimpleNamespace(num_org_elements=shard, org_vocab_start_index=0),
-    )
-    drafter.candidate_logits_processor = SimpleNamespace(
-        tp_size=tp_size, tp_group=None, logit_scale=None, final_logit_softcapping=None
-    )
-
-    # Stand in for rank 1: its own shard-local top-k, packed as this rank
-    # packs its own -- values then global ids, one fp32 row.
-    peer = torch.matmul(hidden_states, weight[shard:].T)
-    peer_values, peer_ids = torch.topk(peer, top_k, dim=-1, sorted=False)
-    peer_packed = torch.cat((peer_values, (peer_ids + shard).float()), dim=-1)
-
-    calls = []
-
-    def fake_all_gather(out, src, group):
-        calls.append(src.shape)
-        out[: src.shape[0]].copy_(src)
-        out[src.shape[0] :].copy_(peer_packed)
-
-    monkeypatch.setattr(dflash2_runtime, "all_gather_into_tensor", fake_all_gather)
-    candidate_ids, unary_logits = drafter._distributed_topk_candidates(hidden_states)
-
-    expected = torch.topk(torch.matmul(hidden_states, weight.T), top_k, dim=-1)
-    assert candidate_ids.dtype == torch.int64
-    assert candidate_ids.tolist() == expected.indices.tolist()
-    torch.testing.assert_close(unary_logits, expected.values.float())
-    # One collective carrying both halves, not one per half.
-    assert calls == [(rows, 2 * top_k)]
