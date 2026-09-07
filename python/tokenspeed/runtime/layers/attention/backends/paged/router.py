@@ -144,7 +144,6 @@ class CacheGroupRouter(AttentionBackend):
         self.device = device
         self.cache_pool: CachePool | None = None
         self.runtime: PagedAttentionRuntime | None = None
-        self._speculative_state_backends = []
         self._stacks: GroupTableStacks | None = None
         # Published write locations: the decode slot (graph-recorded views,
         # refreshed in place) and the extend slot (fresh per round).
@@ -214,6 +213,15 @@ class CacheGroupRouter(AttentionBackend):
         if self.runtime is None:
             return 0
         return self.runtime.preallocate_verify_workspace(max_bs, draft_token_num)
+
+    def commit_speculative_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        """Publish acceptance to this router's shared runtime."""
+        if self.runtime is not None:
+            self.runtime.commit_after_mtp_verify(
+                accepted_lengths, num_extends=num_extends
+            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():

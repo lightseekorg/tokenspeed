@@ -521,7 +521,7 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
     _qsa_extend_round(router, tables, seq_lens=[300])
     ctx = SimpleNamespace(attn_backend=hybrid, forward_mode=ForwardMode.EXTEND)
     assert router.runtime._metadata(ctx) is leaf.forward_extend_metadata
-    assert router.runtime._seq_lens(router.runtime._metadata(ctx)).tolist() == [300]
+    assert router.runtime._metadata(ctx).seq_lens.tolist() == [300]
 
     router.refresh_decode_metadata(
         1,
@@ -533,7 +533,7 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
     )
     ctx = SimpleNamespace(attn_backend=router, forward_mode=ForwardMode.DECODE)
     assert router.runtime._metadata(ctx) is leaf.forward_decode_metadata
-    assert router.runtime._seq_lens(router.runtime._metadata(ctx)).tolist() == [301]
+    assert router.runtime._metadata(ctx).seq_lens.tolist() == [301]
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -726,7 +726,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
     qsa_table = stacks.table(QWEN4_EXP_QSA_CACHE_GROUP, 2)
     recent_table = stacks.table(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 2)
     prepared = QSALayout(
-        metadata=SimpleNamespace(),
         seq_lens=torch.tensor([8, 9], dtype=torch.int32),
         logical_positions=logical,
         request_indices=requests,
@@ -735,8 +734,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
         complete_blocks=torch.ones(2, dtype=torch.int32),
         qsa_page_table=qsa_table,
         qsa_page_expansion=4,
-        recent_page_table=recent_table,
-        recent_page_expansion=1,
         full_page_table=stacks.table(FULL_ATTENTION, 2),
         full_kernel_page_size=64,
         reset_draft_tags=None,
@@ -1212,66 +1209,6 @@ def test_qwen4_exp_qsa_does_not_mix_adjacent_requests() -> None:
     torch.testing.assert_close(
         compressed[2, 0, 0].cpu(), _qsa_norm(torch.tensor([51.5, 51.5]))
     )
-
-
-@_requires_cuda
-def test_qwen4_exp_qsa_commits_only_accepted_verify_raw_keys() -> None:
-    device = "cuda"
-    indexer, pool, _, _, _ = _qsa_cache_test_indexer(device)
-    indexer.layer_id = 0
-    indexer.qsa_runtime = None
-    raw = torch.zeros((3, 4, 1, 2), dtype=torch.bfloat16, device=device)
-    rope_cache = torch.zeros((3, 3), dtype=torch.int64, device=device)
-    indexer._fields = lambda actual_pool: (raw, None, rope_cache)
-    raw[1, :, 0] = torch.tensor(
-        [[20.0, 40.0], [21.0, 42.0], [-2.0, -4.0], [-3.0, -6.0]],
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    rope_cache[1] = 20
-    logical = torch.arange(22, 26, dtype=torch.long, device=device)
-    token_k = (
-        torch.stack((logical.to(torch.float32), logical.to(torch.float32) * 2), dim=-1)
-        .to(torch.bfloat16)
-        .view(4, 1, 2)
-    )
-    positions = logical.unsqueeze(-1).expand(-1, 3).clone()
-    recent_locs = (64 + logical).to(torch.int32)
-    backend = _qsa_router(kernel_page_size=64, max_bs=1, spec=1)
-    backend.runtime.bind_indexers([indexer])
-    staging = backend.runtime.verify_staging_buffers(
-        indexer,
-        token_k,
-        positions,
-        logical,
-        recent_locs,
-        1,
-        pool,
-    )
-    staging[0].copy_(token_k.view(1, 4, 1, 2))
-    staging[1].copy_(positions.view(1, 4, 3))
-    staging[2].copy_(logical.view(1, 4))
-    staging[3].copy_(recent_locs.view(1, 4))
-
-    backend.commit_speculative_state_after_verify(
-        torch.tensor([1], dtype=torch.int32, device=device), num_extends=0
-    )
-
-    torch.testing.assert_close(
-        raw[1, :, 0].float().cpu(),
-        torch.tensor([[20.0, 40.0], [21.0, 42.0], [22.0, 44.0], [-3.0, -6.0]]),
-    )
-    torch.testing.assert_close(rope_cache[1].cpu(), torch.full((3,), 20))
-
-    backend.commit_speculative_state_after_verify(
-        torch.tensor([3], dtype=torch.int32, device=device), num_extends=0
-    )
-
-    torch.testing.assert_close(
-        raw[1, :, 0].float().cpu(),
-        torch.tensor([[24.0, 48.0], [21.0, 42.0], [22.0, 44.0], [23.0, 46.0]]),
-    )
-    torch.testing.assert_close(rope_cache[1].cpu(), torch.full((3,), 24))
 
 
 @_requires_cuda

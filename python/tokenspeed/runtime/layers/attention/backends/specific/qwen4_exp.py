@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     qwen4_exp_ple_conv_field,
 )
-from tokenspeed.runtime.layers.attention.qsa.runtime import bind_qsa_indexers
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -44,7 +43,6 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
-    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
     from tokenspeed.runtime.layers.qwen4_exp_ple import Qwen4ExpPLELayer
 
 
@@ -294,23 +292,7 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         )
 
 
-def bind_qwen4_exp_side_state(
-    attn_backend: AttentionBackend,
-    ple_layers: Iterable[Qwen4ExpPLELayer],
-    qsa_indexers: Iterable[QSAIndexer],
-) -> None:
-    """Bind Qwen4-Exp PLE and QSA state to their owning backends."""
-
-    ple_layers = tuple(ple_layers)
-    qsa_indexers = tuple(qsa_indexers)
-    if ple_layers:
-        qwen4_exp_linear_backend(attn_backend).bind_ple_layers(ple_layers)
-    if qsa_indexers:
-        bind_qsa_indexers(attn_backend, qsa_indexers)
-
-
 __all__ = [
     "Qwen4ExpMambaAttnBackend",
-    "bind_qwen4_exp_side_state",
     "qwen4_exp_linear_backend",
 ]

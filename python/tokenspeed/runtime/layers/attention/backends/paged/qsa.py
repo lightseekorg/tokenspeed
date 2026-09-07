@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    current_forward_ctx,
     current_valid_rows,
     slice_to_real_tokens,
 )
@@ -88,16 +87,13 @@ class QSAAttnBackend(MHAAttnBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         topk_indices: torch.Tensor,
-        ctx: ForwardContext | None,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         num_real = current_valid_rows()
         if num_real is not None:
             q, k, v, out_cache_loc, topk_indices = slice_to_real_tokens(
                 num_real, q, k, v, out_cache_loc, topk_indices
             )
-        ctx = ctx or current_forward_ctx()
-        if ctx is None:
-            raise RuntimeError("QSA sparse attention requires a forward context")
         full_locs = out_cache_loc[: k.shape[0]]
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)

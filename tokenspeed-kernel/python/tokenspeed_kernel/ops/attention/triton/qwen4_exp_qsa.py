@@ -1172,44 +1172,6 @@ def _qwen4_exp_qsa_verify_row_mask(
 
 
 @triton.jit
-def _qwen4_exp_qsa_verify_row_writes(
-    logical_positions,
-    accepted_lengths,
-    recent_locs,
-    row,
-    rows,
-    verify_width,
-    compress_ratio,
-):
-    """Combine acceptance, valid-location, and ring-shadow predicates."""
-
-    write = _qwen4_exp_qsa_verify_row_mask(
-        logical_positions, accepted_lengths, row, verify_width, compress_ratio
-    )
-    write &= tl.load(recent_locs + row).to(tl.int64) > 0
-    if write:
-        future = row + compress_ratio
-        if future < rows:
-            has_future = _qwen4_exp_qsa_verify_row_mask(
-                logical_positions,
-                accepted_lengths,
-                future,
-                verify_width,
-                compress_ratio,
-            )
-            has_future &= tl.load(recent_locs + future).to(tl.int64) > 0
-            if has_future:
-                has_future &= future // verify_width == row // verify_width
-            if has_future:
-                has_future &= (
-                    tl.load(logical_positions + future).to(tl.int64)
-                    == tl.load(logical_positions + row).to(tl.int64) + compress_ratio
-                )
-            write &= not has_future
-    return write
-
-
-@triton.jit
 def _qwen4_exp_qsa_commit_verify_layers_kernel(
     raw_addresses,
     position_addresses,
@@ -1218,7 +1180,6 @@ def _qwen4_exp_qsa_commit_verify_layers_kernel(
     recent_locs,
     position_values,
     accepted_lengths,
-    rows,
     head_dim,
     recent_page_size,
     verify_width,
@@ -1234,17 +1195,13 @@ def _qwen4_exp_qsa_commit_verify_layers_kernel(
 ):
     row = tl.program_id(0)
     layer = tl.program_id(1)
-    write = _qwen4_exp_qsa_verify_row_writes(
-        logical_positions,
-        accepted_lengths,
-        recent_locs,
-        row,
-        rows,
-        verify_width,
-        COMPRESS_RATIO,
+    # The accepted trailing window has at most one writer per ring slot.
+    write = _qwen4_exp_qsa_verify_row_mask(
+        logical_positions, accepted_lengths, row, verify_width, COMPRESS_RATIO
     )
+    loc = tl.load(recent_locs + row).to(tl.int64)
+    write &= loc > 0
     if write:
-        loc = tl.load(recent_locs + row).to(tl.int64)
         position = tl.load(logical_positions + row).to(tl.int64)
         slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
         page = loc // recent_page_size
@@ -1307,7 +1264,8 @@ def qwen4_exp_qsa_commit_verify_layers(
         raw_addresses: CUDA uint64 base address for each raw-key cache field.
         position_addresses: CUDA uint64 base address for each position field.
         staged_k: Keys shaped ``[layers, capacity, width, 1, head_dim]``.
-        logical_positions: Request-major logical positions for live rows.
+        logical_positions: Consecutive logical positions within each request,
+            in request-major order.
         recent_locs: Recent-cache locations for live rows.
         position_values: RoPE positions shaped ``[rows, 3]``.
         accepted_lengths: Accepted width for each request.
@@ -1384,7 +1342,6 @@ def qwen4_exp_qsa_commit_verify_layers(
         recent_locs,
         position_values,
         accepted_lengths,
-        rows,
         head_dim,
         recent_page_size,
         verify_width,

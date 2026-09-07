@@ -493,9 +493,10 @@ Two consequences worth remembering when touching this boundary:
   views go to the backend-owned QSA runtime; the compute leaf receives the
   selected physical slots and its own KV write locations. Persisted QSA
   fields stay in the cache recipe and LCM arena; the runtime owns only
-  derived layout and transient verification staging. Its staging is included
-  in `workspace_bytes` and preallocated before graph capture, even though
-  the model's indexers are bound later. Duplicating group conversion in the
+  derived layout and transient verification staging. Staging and commit
+  address tables are included in `workspace_bytes` and preallocated from the
+  bound cache plan before graph capture. Model indexers only request their
+  staging views by local layer id; they do not bind or populate cache addresses. Duplicating group conversion in the
   runtime, model or hybrid wrapper would fork the single source of truth.
 
 ## Code placement

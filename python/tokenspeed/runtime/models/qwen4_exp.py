@@ -39,7 +39,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    bind_qwen4_exp_side_state,
+    qwen4_exp_linear_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
@@ -551,11 +551,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
-        bind_qwen4_exp_side_state(
-            ctx.attn_backend,
-            self.ple_layers,
-            self.qsa_indexers,
-        )
+        if self.ple_layers:
+            qwen4_exp_linear_backend(ctx.attn_backend).bind_ple_layers(self.ple_layers)
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
