@@ -332,7 +332,7 @@ each retraction raises the decode headroom the next admission must secure:
 
 ```
 Request::AdmissionHeadroom(safe_steps)
-    = min(max_new_tokens, safe_steps * (1 + retraction_count))
+    = min(RemainingNewTokens(), safe_steps * (1 + retraction_count))
 ```
 
 with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
@@ -344,6 +344,13 @@ to completion — at which point `ReserveCoversGeneration` exempts it from the
 victim policy and it **cannot be retracted again**. This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
 over-optimistic, and never makes anyone else wait.
+
+The exemption is latched only when a successful admission actually prepays
+the request's whole then-remaining generation budget. It must not be
+recomputed from the current remaining budget: decode consumes the prepaid
+headroom while reducing that budget, and treating spent headroom as if it
+were still reserved can leave every capacity-blocked request exempt from
+retraction, with no request able to free the next page.
 
 ## 5. Invariants a change must preserve
 
@@ -372,6 +379,6 @@ over-optimistic, and never makes anyone else wait.
   window of an incomplete prefill rather than its whole token count.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
-- A request whose reserve covers its remaining generation is never a victim
-  (2); with the fresh-admission prepay this bounds retraction to requests
-  whose `max_new_tokens` exceeds one safe-step window (or is undeclared).
+- A request whose last successful admission prepaid its remaining generation
+  is never a victim (2); consuming a partial reserve cannot make that
+  admission retroactively qualify for the exemption.

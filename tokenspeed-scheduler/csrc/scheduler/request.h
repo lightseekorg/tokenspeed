@@ -63,16 +63,20 @@ public:
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
-    void NoteRetracted() { ++retraction_count_; }
+    void RecordAdmittedGenerationHeadroom(std::int32_t admitted_headroom) {
+        reserve_covers_generation_ = max_new_tokens_ > 0 && admitted_headroom >= RemainingNewTokens();
+    }
+    void NoteRetracted() {
+        ++retraction_count_;
+        reserve_covers_generation_ = false;
+    }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
     // freed -- so the victim policy skips it. (An undeclared budget is
     // never covered: nothing was reserved for it.)
-    bool ReserveCoversGeneration(std::int32_t safe_steps) const {
-        return max_new_tokens_ > 0 && AdmissionHeadroom(safe_steps) >= RemainingNewTokens();
-    }
+    bool ReserveCoversGeneration() const { return reserve_covers_generation_; }
 
     // Tokens generated so far / still permitted. Both survive retraction's
     // RebasePrefill (which folds generated tokens into the prefill window):
@@ -197,6 +201,7 @@ private:
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t retraction_count_{0};
+    bool reserve_covers_generation_{false};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;
