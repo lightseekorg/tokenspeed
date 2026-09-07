@@ -25,7 +25,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 import tokenspeed.runtime.execution.factory as factory  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    UpdateWeightsFromDistributedReqInput,
+)
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
+from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter import get_drafter_impl  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
@@ -209,6 +213,8 @@ def test_dflash_wire_target_installs_capture_layers():
 def test_dspark_wire_target_installs_capture_layers():
     drafter = mock.MagicMock(spec=DeepseekV4DSpark)
     drafter.target_layer_ids = [10, 20]
+    draft_head = mock.MagicMock()
+    drafter.draft_model = mock.MagicMock(lm_head=draft_head)
     target_model = mock.MagicMock(
         spec=["lm_head", "logits_processor", "set_dspark_layers_to_capture"]
     )
@@ -216,7 +222,65 @@ def test_dspark_wire_target_installs_capture_layers():
     DeepseekV4DSpark.wire_target(drafter, target_model)
 
     target_model.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
-    assert drafter.lm_head is target_model.lm_head
+    assert drafter.lm_head is draft_head
+
+
+def test_dspark_weight_update_forces_cached_head_refresh():
+    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
+    head = mock.MagicMock()
+    drafter.lm_head = mock.MagicMock(weight=head)
+    drafter.model = mock.MagicMock()
+    drafter.model.replicate_vocab_heads = False
+
+    DeepseekV4DSpark.on_target_weights_updated(drafter)
+
+    drafter.model.refresh_local_base_logits_head.assert_called_once_with(
+        head,
+        force=True,
+    )
+
+
+def test_dspark_weight_update_refreshes_replicated_vocab_weights():
+    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
+    drafter.model = mock.MagicMock(replicate_vocab_heads=True)
+    drafter.draft_model = mock.MagicMock()
+    drafter.target_model = mock.MagicMock()
+    embed = mock.MagicMock()
+    head = mock.MagicMock()
+    drafter.target_model.get_embed_and_head.return_value = (embed, head)
+
+    DeepseekV4DSpark.on_target_weights_updated(drafter)
+
+    drafter.draft_model.refresh_replicated_embed_and_head.assert_called_once_with(
+        embed,
+        head,
+    )
+    drafter.model.refresh_local_base_logits_head.assert_not_called()
+
+
+def test_device_weight_update_notifies_drafter_before_returning():
+    runner = mock.MagicMock()
+    runner.update_weights_from_distributed.return_value = (True, "updated")
+    drafter = mock.MagicMock(spec=BaseDrafter)
+    forward_thread = mock.MagicMock()
+    forward_thread.run.side_effect = lambda callback: callback()
+    executor = SimpleNamespace(
+        model_runner=runner,
+        drafter=drafter,
+        forward_thread=forward_thread,
+    )
+    handle = DeviceHandle(executor)
+    request = UpdateWeightsFromDistributedReqInput(
+        names=[],
+        dtype_names=[],
+        shapes=[],
+        group_name="weight_update_group",
+        flush_cache=True,
+        weight_version=None,
+    )
+
+    assert handle.update_weights(request) == (True, "updated")
+    drafter.on_target_weights_updated.assert_called_once_with()
 
 
 # --------------------------------------------------------------------------

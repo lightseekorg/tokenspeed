@@ -418,6 +418,13 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "mhc_big_fuse",
+        [
+            CUDA_CSRC_DIR / "mhc_big_fuse.cu",
+        ],
+        [],
+    ),
+    (
         "flashinfer_softmax",
         [
             CUDA_CSRC_DIR / "flashinfer_softmax.cu",

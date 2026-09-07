@@ -70,7 +70,7 @@ def test_tiled_hc4_prefill_matches_reference() -> None:
     hc_base = torch.randn(24, device="cuda", dtype=torch.float32, generator=generator)
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-5, 3)
 
-    actual = triton_mhc_pre(*args)
+    actual = triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
     expected = _reference(*args)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):

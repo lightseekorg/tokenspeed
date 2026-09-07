@@ -52,6 +52,13 @@ class DeepseekV4ForwardSlotMappings:
     def clear(self) -> None:
         self._entries.clear()
 
+    def first_use(self, key: Hashable) -> bool:
+        """Return whether ``key`` is observed for the first time this forward."""
+        if key in self._entries:
+            return False
+        self._entries[key] = True
+        return True
+
     def get_or_compute(self, key: Hashable, compute: Callable[[], T]) -> T:
         """Return the mapping memoized under ``key``, computing it on the
         first request of the forward.

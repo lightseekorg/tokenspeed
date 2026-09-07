@@ -21,9 +21,17 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling.cute_dsl import _invoke_kernel as _cute_local_argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    is_available as _local_cute_argmax_available,
+)
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    supports_dist_argmax_shape as _supports_dist_argmax_shape,
+)
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -31,9 +39,11 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.layers.logits_processor import _force_deterministic_rsag
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     sample_dspark_block_greedy,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -41,6 +51,13 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+
+
+logger = get_colorful_logger(__name__)
+_DIST_ARGMAX_UNSET = object()
+_LOCAL_ARGMAX_UNSET = object()
+_DSPARK_DIST_ARGMAX_ENV = "TOKENSPEED_DSPARK_DISTRIBUTED_ARGMAX"
+_DSPARK_LOCAL_ARGMAX_ENV = "TOKENSPEED_DSPARK_LOCAL_CUTE_ARGMAX"
 
 
 def _dspark_decode_position_plan(
@@ -187,17 +204,141 @@ class DeepseekV4DSpark(BaseDrafter):
         self.gathered_ids = torch.empty(
             (tp_size, max_bs), dtype=torch.int64, device=self.device
         )
+        self._dist_argmax_state: object = _DIST_ARGMAX_UNSET
+        self._dist_argmax_max = torch.empty(
+            (max_bs,), dtype=torch.float32, device=self.device
+        )
+        self._dist_argmax_ids = torch.empty(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self._local_argmax_ready: object = _LOCAL_ARGMAX_UNSET
+        self._local_argmax_max = torch.empty(
+            (self.block_size, max_bs), dtype=torch.float32, device=self.device
+        )
+        self._local_argmax_ids = torch.empty(
+            (self.block_size, max_bs), dtype=torch.int64, device=self.device
+        )
 
     def wire_target(self, target_model) -> None:
         self.target_model = target_model
-        self.lm_head = target_model.lm_head
-        self.tp_group = target_model.logits_processor.tp_group
+        # Model wiring may replace the draft head with a reconstructed full
+        # vocabulary tensor. Keep the draft module so sampling metadata and
+        # refreshes describe the exact weight used by local_base_logits.
+        self.lm_head = self.draft_model.lm_head
+        self.logits_processor = target_model.logits_processor
+        self.tp_group = self.logits_processor.tp_group
         if not hasattr(target_model, "set_dspark_layers_to_capture"):
             raise ValueError(
                 "DSPARK requires the target model to support "
                 "set_dspark_layers_to_capture."
             )
         target_model.set_dspark_layers_to_capture(self.target_layer_ids)
+
+    def _probe_dist_argmax_state(self):
+        """Create the optional FP32 DSpark state outside graph capture."""
+        head = self.lm_head
+        shard = getattr(head, "shard_indices", None)
+        tp_size = int(self.logits_processor.tp_size)
+        enabled = os.getenv(_DSPARK_DIST_ARGMAX_ENV, "0") == "1"
+        local_vocab = int(getattr(shard, "num_org_elements", 0))
+        local_padded = int(getattr(shard, "num_org_elements_padded", -1))
+        added = int(getattr(shard, "num_added_elements", -1))
+        org_vocab = int(getattr(head, "org_vocab_size", 0))
+        base_only = (
+            shard is not None
+            and added == 0
+            and local_padded == local_vocab
+            and int(head.weight.shape[0]) == local_vocab
+            and int(getattr(head, "num_embeddings", 0)) == org_vocab
+            and local_vocab * tp_size == org_vocab
+        )
+        eligible = (
+            enabled
+            and not _force_deterministic_rsag()
+            and 2 <= tp_size <= 32
+            and base_only
+            and _supports_dist_argmax_shape(local_vocab, torch.float32, tp_size)
+        )
+        state = None
+        if eligible:
+            state = self.logits_processor.acquire_dist_argmax_state(
+                head,
+                max_M=int(self.input_buffers.max_bs),
+                skip_ping_pong=False,
+                dtype=torch.float32,
+            )
+        logger.info(
+            "DSPARK_DISTRIBUTED_ARGMAX rank=%d requested=%s enabled=%s "
+            "dtype=float32 local_vocab=%d tp=%d base_only=%s",
+            int(self.draft_model.mapping.rank),
+            enabled,
+            state is not None,
+            local_vocab,
+            tp_size,
+            base_only,
+        )
+        return state
+
+    def _ensure_dist_argmax_state(self):
+        """Probe once during warmup; never rendezvous from graph capture."""
+        if self._dist_argmax_state is _DIST_ARGMAX_UNSET:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._dist_argmax_state = self._probe_dist_argmax_state()
+        return self._dist_argmax_state
+
+    def _probe_local_argmax_ready(self, local_logits: torch.Tensor) -> bool:
+        """Compile the optional local CuTe argmax before graph capture."""
+        head = self.lm_head
+        shard = getattr(head, "shard_indices", None)
+        requested = os.getenv(_DSPARK_LOCAL_ARGMAX_ENV, "0") == "1"
+        dist_requested = os.getenv(_DSPARK_DIST_ARGMAX_ENV, "0") == "1"
+        local_vocab = int(getattr(shard, "num_org_elements", 0))
+        local_padded = int(getattr(shard, "num_org_elements_padded", -1))
+        added = int(getattr(shard, "num_added_elements", -1))
+        probe_logits = local_logits.contiguous()
+        eligible = (
+            requested
+            and not dist_requested
+            and _local_cute_argmax_available()
+            and probe_logits.is_cuda
+            and probe_logits.ndim == 2
+            and probe_logits.dtype == torch.float32
+            and probe_logits.shape[0] > 0
+            and probe_logits.shape[1] == local_vocab
+            and local_vocab == local_padded
+            and added == 0
+            and local_vocab >= 4096
+            and local_vocab % 32 == 0
+        )
+        if eligible:
+            rows = probe_logits.shape[0]
+            _cute_local_argmax(
+                probe_logits,
+                self._local_argmax_max[0, :rows],
+                self._local_argmax_ids[0, :rows],
+            )
+            torch.cuda.synchronize(self.device)
+        logger.info(
+            "DSPARK_LOCAL_CUTE_ARGMAX rank=%d requested=%s enabled=%s "
+            "dtype=%s local_vocab=%d tp=%d base_only=%s",
+            int(self.draft_model.mapping.rank),
+            requested,
+            eligible,
+            str(probe_logits.dtype).removeprefix("torch."),
+            local_vocab,
+            int(self.logits_processor.tp_size),
+            local_vocab == local_padded and added == 0,
+        )
+        return eligible
+
+    def _ensure_local_argmax_ready(self, local_logits: torch.Tensor) -> bool:
+        """Probe once during warmup; never compile from graph capture."""
+        if self._local_argmax_ready is _LOCAL_ARGMAX_UNSET:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            self._local_argmax_ready = self._probe_local_argmax_ready(local_logits)
+        return bool(self._local_argmax_ready)
 
     def prepare_request_state(
         self,
@@ -206,6 +347,12 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
+
+        if hasattr(self, "lm_head"):
+            self.model.refresh_local_base_logits_head(
+                self.lm_head.weight,
+                force=False,
+            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -249,6 +396,17 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
+
+    def on_target_weights_updated(self) -> None:
+        """Refresh target-derived weights after an in-place target reload."""
+        if self.model.replicate_vocab_heads:
+            embed, head = self.target_model.get_embed_and_head()
+            self.draft_model.refresh_replicated_embed_and_head(embed, head)
+            return
+        self.model.refresh_local_base_logits_head(
+            self.lm_head.weight,
+            force=True,
+        )
 
     @staticmethod
     def _bonus_tokens_from_output(
@@ -405,7 +563,9 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head)
+        local_logits = self.model.local_base_logits(draft_hidden, None)
+        dist_argmax_state = self._ensure_dist_argmax_state()
+        local_cute_argmax = self._ensure_local_argmax_ready(local_logits[:, 0])
         sample_dspark_block_greedy(
             local_logits,
             bonus,
@@ -415,6 +575,12 @@ class DeepseekV4DSpark(BaseDrafter):
             self.gathered_values,
             self.gathered_ids,
             self.draft_tokens_buf[:num_decodes],
+            dist_argmax_state,
+            self._dist_argmax_max,
+            self._dist_argmax_ids,
+            local_cute_argmax,
+            self._local_argmax_max,
+            self._local_argmax_ids,
         )
         next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
 

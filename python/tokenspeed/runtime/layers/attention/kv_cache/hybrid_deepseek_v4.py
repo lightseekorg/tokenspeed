@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsv4 import dsv4_compressed_slot_mapping
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_compact_compressed_slot_mapping,
+    dsv4_compressed_slot_mapping,
+)
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
@@ -134,39 +137,18 @@ class DeepseekV4CacheMetadata:
 
         page_table = self.compressed_page_table(compress_ratio)
         if page_table is not self.page_table:
-            req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
-            query_starts = query_start_loc[req_idx].to(torch.int64)
-            query_lens = query_start_loc[req_idx + 1].to(torch.int64) - query_starts
-            seq_lens_for_token = seq_lens[req_idx].to(torch.int64)
-            token_offsets = torch.arange(
-                num_tokens,
-                dtype=torch.int64,
-                device=seq_lens.device,
+            return dsv4_compact_compressed_slot_mapping(
+                num_tokens=num_tokens,
+                token_to_req_indices=token_to_req_indices,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                block_table=page_table,
+                block_size=kv_cache_block_size,
+                compress_ratio=compress_ratio,
+                block_table_base_offsets=None,
+                is_valid_token=is_valid_token,
+                out=out,
             )
-            positions = seq_lens_for_token - query_lens + token_offsets - query_starts
-            compressed_pos = torch.div(
-                positions,
-                compress_ratio,
-                rounding_mode="floor",
-            )
-            page_indices = torch.div(
-                compressed_pos,
-                kv_cache_block_size,
-                rounding_mode="floor",
-            )
-            offsets = compressed_pos % kv_cache_block_size
-            page_ids = _safe_page_ids(page_table, req_idx, page_indices)
-            valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
-                positions,
-                compress_ratio,
-            )
-            slot_mapping = torch.where(
-                valid_slots,
-                page_ids * kv_cache_block_size + offsets,
-                torch.full_like(page_ids, -1),
-            )
-            out.copy_(_mask_invalid_graph_tokens(slot_mapping, is_valid_token))
-            return out
 
         mapping = dsv4_compressed_slot_mapping(
             num_tokens=num_tokens,

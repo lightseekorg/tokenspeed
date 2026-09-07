@@ -9,7 +9,7 @@ from dataclasses import replace
 from io import StringIO
 from types import MethodType, SimpleNamespace
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,6 +109,10 @@ from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     Mxfp4Config,
 )
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
@@ -143,15 +147,21 @@ from tokenspeed.runtime.models.deepseek_v4_dspark import (
     DeepseekV4ForCausalLMDSpark,
     _apply_dspark_hc_head,
     _is_zero_initialized_expert_bias,
+    _replicate_dspark_vocab_weight,
     count_dspark_stages,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     _dspark_output_projection,
+    _normalize_query_per_head,
     _quantize_dspark_non_rope,
     dspark_fp8_quant_dequant,
+    dspark_rmsnorm,
     get_dspark_topk_idxs_batched,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    DSparkVanillaMarkov,
+    _local_vocab_argmax,
+)
 from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -647,7 +657,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             setattr(moe, name, MethodType(getattr(DeepseekV4MoE, name), moe))
         return moe
 
-    def _make_fake_deepseek_v4_moe(self, hidden_states, input_ids, stream_fork, calls):
+    def _make_fake_deepseek_v4_moe(
+        self,
+        hidden_states,
+        input_ids,
+        stream_fork,
+        calls,
+        *,
+        bypassed_topk_output,
+        norm_topk_prob,
+    ):
         def select_experts(states, ids):
             calls.append("select")
             self.assertIs(states, hidden_states)
@@ -662,7 +681,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         def make_topk_output(states, weights, ids, scores):
             del weights, ids, scores
             calls.append("topk")
-            return states
+            return SimpleNamespace(
+                hidden_states=states,
+                format=SimpleNamespace(
+                    is_bypassed=lambda: bypassed_topk_output,
+                ),
+            )
 
         def routed_experts(**kwargs):
             calls.append("routed")
@@ -680,6 +704,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             shared_experts=shared_experts,
             stream_fork=stream_fork,
             routed_scaling_factor=2.0,
+            config=SimpleNamespace(norm_topk_prob=norm_topk_prob),
             experts=routed_experts,
             _select_experts=select_experts,
             _make_topk_output=make_topk_output,
@@ -691,7 +716,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(None), calls
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         actual = DeepseekV4MoE.forward(
@@ -706,6 +736,92 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
+
+    def test_deepseek_v4_moe_preserves_unnormalized_kernel_route_weights(self):
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+
+        for bypassed_topk_output, norm_topk_prob, routed_multiplier in (
+            (True, False, 4),
+            (True, True, 2),
+            (False, False, 2),
+        ):
+            with self.subTest(
+                bypassed_topk_output=bypassed_topk_output,
+                norm_topk_prob=norm_topk_prob,
+            ):
+                calls = []
+                moe = self._make_fake_deepseek_v4_moe(
+                    hidden_states,
+                    input_ids,
+                    StreamFork(None),
+                    calls,
+                    bypassed_topk_output=bypassed_topk_output,
+                    norm_topk_prob=norm_topk_prob,
+                )
+
+                actual = DeepseekV4MoE.forward(
+                    moe,
+                    hidden_states,
+                    input_ids,
+                    num_global_tokens=2,
+                    max_num_tokens_per_gpu=2,
+                )
+
+                expected = (hidden_states + 1) * routed_multiplier + hidden_states + 3
+                self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
+        captured = {}
+
+        class FakeExperts:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.topk_output_format = object()
+
+        backend = SimpleNamespace(
+            is_mega_moe=lambda: False,
+            is_flashinfer_trtllm=lambda: True,
+        )
+        config = SimpleNamespace(
+            n_shared_experts=None,
+            routed_scaling_factor=2.5,
+            scoring_func="sqrtsoftplus",
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            hidden_size=256,
+            moe_intermediate_size=128,
+            hidden_act="silu",
+            norm_topk_prob=True,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=1),
+            moe=SimpleNamespace(
+                ep_size=1,
+                tp_size=1,
+                tp_ep_size=1,
+                tp_rank=0,
+                ep_rank=0,
+            ),
+        )
+        gate = SimpleNamespace(e_score_correction_bias=None)
+
+        with (
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", return_value=gate),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_routed_expert_quant_config",
+                return_value=(None, False),
+            ),
+            patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK"),
+        ):
+            moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
+
+        self.assertEqual(moe.routed_scaling_factor, 2.5)
+        self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -866,7 +982,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3, device="cuda")
         input_ids = torch.arange(2, device="cuda")
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(torch.cuda.Stream()), calls
+            hidden_states,
+            input_ids,
+            StreamFork(torch.cuda.Stream()),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         with patch.object(deepseek_v4_model, "get_is_capture_mode", return_value=True):
@@ -1949,6 +2070,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values,
                 gathered_ids,
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
             )
 
         self.assertEqual(gather.call_count, 2)
@@ -1961,7 +2088,186 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values[:, :1],
                 gathered_ids[:, :1],
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
             )
+
+    def test_dspark_replicated_argmax_bypasses_collective_workspaces(self):
+        local_logits = torch.tensor([[1.0, 7.0, 3.0, 4.0]])
+        lm_head = SimpleNamespace(
+            tp_size=1,
+            shard_indices=SimpleNamespace(
+                num_org_elements=4,
+                num_org_elements_padded=4,
+                num_added_elements=0,
+                org_vocab_start_index=0,
+                added_vocab_start_index=4,
+            ),
+        )
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_into_tensor"
+        ) as gather:
+            token_ids = _local_vocab_argmax(
+                local_logits,
+                lm_head,
+                object(),
+                torch.empty(0),
+                torch.empty(0, dtype=torch.int64),
+                None,
+                None,
+                None,
+                False,
+                None,
+                None,
+            )
+
+        gather.assert_not_called()
+        self.assertTrue(torch.equal(token_ids, torch.tensor([1], dtype=torch.int32)))
+
+    def test_dspark_replicated_markov_embedding_preserves_local_projection(self):
+        full_embedding = torch.arange(192, dtype=torch.float32).reshape(64, 3)
+        full_projection = torch.arange(192, 384, dtype=torch.float32).reshape(64, 3)
+        embedding = VocabParallelEmbedding(
+            64,
+            3,
+            params_dtype=torch.float32,
+        )
+        projection = ParallelLMHead(
+            64,
+            3,
+            params_dtype=torch.float32,
+            tp_rank=1,
+            tp_size=2,
+            tp_group=(0, 1),
+        )
+        with torch.no_grad():
+            embedding.weight.copy_(full_embedding)
+            projection.weight.copy_(full_projection[32:])
+        markov = DSparkVanillaMarkov(embedding, projection)
+
+        with patch(
+            "tokenspeed.runtime.layers.vocab_parallel_embedding.all_reduce"
+        ) as reduce:
+            actual = markov.local_bias(torch.tensor([1, 46], dtype=torch.int32))
+
+        reduce.assert_not_called()
+        expected = full_embedding[[1, 46]] @ full_projection[32:].T
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(embedding.tp_size, 1)
+        self.assertEqual(projection.tp_size, 2)
+
+    def test_dspark_vocab_replication_reconstructs_tp_rank_order(self):
+        local_weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        module = SimpleNamespace(
+            tp_size=1,
+            num_added_embeddings=0,
+            org_vocab_size=8,
+            org_vocab_size_padded=8,
+            num_embeddings_padded=8,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=2, tp_group=(0, 1)),
+        )
+
+        def fake_all_gather(weight, group, dim):
+            self.assertTrue(weight.is_contiguous())
+            self.assertEqual(group, (0, 1))
+            self.assertEqual(dim, 0)
+            return torch.cat((weight, weight + 100), dim=0)
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.all_gather",
+            side_effect=fake_all_gather,
+        ) as gather:
+            full_weight = _replicate_dspark_vocab_weight(
+                local_weight,
+                module,
+                mapping,
+                label="LM head",
+            )
+
+        gather.assert_called_once()
+        self.assertTrue(
+            torch.equal(
+                full_weight,
+                torch.cat((local_weight, local_weight + 100), dim=0),
+            )
+        )
+
+    def test_dspark_vocab_replication_rejects_padded_layout(self):
+        module = SimpleNamespace(
+            tp_size=1,
+            num_added_embeddings=0,
+            org_vocab_size=7,
+            org_vocab_size_padded=8,
+            num_embeddings_padded=8,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=2, tp_group=(0, 1)),
+        )
+        with self.assertRaisesRegex(ValueError, "unpadded base-only"):
+            _replicate_dspark_vocab_weight(
+                torch.ones(4, 3),
+                module,
+                mapping,
+                label="embedding",
+            )
+
+    def test_dspark_replicated_weight_refresh_preserves_graph_buffers(self):
+        old_embed = torch.zeros(8, 3)
+        old_head = torch.zeros(8, 3)
+        new_embed = torch.full((8, 3), 2.0)
+        new_head = torch.full((8, 3), 3.0)
+        model = SimpleNamespace(
+            replicate_vocab_heads=True,
+            embed_tokens=SimpleNamespace(weight=old_embed),
+            refresh_local_base_logits_head=Mock(),
+        )
+        draft = object.__new__(DeepseekV4ForCausalLMDSpark)
+        draft.model = model
+        draft.lm_head = SimpleNamespace(weight=old_head)
+        draft.mapping = SimpleNamespace()
+        embed_ptr = old_embed.data_ptr()
+        head_ptr = old_head.data_ptr()
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark._replicate_dspark_vocab_weight",
+            side_effect=(new_embed, new_head),
+        ) as replicate:
+            draft.refresh_replicated_embed_and_head(object(), object())
+
+        self.assertEqual(replicate.call_count, 2)
+        self.assertEqual(old_embed.data_ptr(), embed_ptr)
+        self.assertEqual(old_head.data_ptr(), head_ptr)
+        self.assertTrue(torch.equal(old_embed, new_embed))
+        self.assertTrue(torch.equal(old_head, new_head))
+        model.refresh_local_base_logits_head.assert_called_once_with(
+            old_head,
+            force=True,
+        )
+
+    def test_dspark_wire_target_keeps_reconstructed_draft_head(self):
+        draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)
+        target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
+        drafter = object.__new__(DeepseekV4DSpark)
+        drafter.draft_model = SimpleNamespace(lm_head=draft_head)
+        drafter.target_layer_ids = [1, 3]
+        target_model = SimpleNamespace(
+            lm_head=target_head,
+            logits_processor=SimpleNamespace(tp_group=(0, 1)),
+            set_dspark_layers_to_capture=Mock(),
+        )
+
+        drafter.wire_target(target_model)
+
+        self.assertIs(drafter.lm_head, draft_head)
+        self.assertEqual(drafter.tp_group, (0, 1))
+        target_model.set_dspark_layers_to_capture.assert_called_once_with([1, 3])
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
         mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
@@ -1979,6 +2285,11 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.device = torch.device("cpu")
+        drafter.lm_head = SimpleNamespace(weight=torch.ones(2, 2))
+        refresh_head = Mock(return_value=False)
+        drafter.model = SimpleNamespace(
+            refresh_local_base_logits_head=refresh_head,
+        )
         drafter.first_padding_slot = 3
         drafter.padding_slots = torch.arange(3, 7, dtype=torch.int64)
         drafter.slot_indices_buf = drafter.padding_slots.clone()
@@ -2035,6 +2346,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.zeros_like(drafter.context_lengths[3:]),
             )
         )
+        self.assertEqual(refresh_head.call_count, 11)
+        refresh_head.assert_called_with(drafter.lm_head.weight, force=False)
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
         values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
@@ -2055,6 +2368,46 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(actual, expected))
         with self.assertRaisesRegex(ValueError, "must be divisible"):
             dspark_fp8_quant_dequant(values[:, :-1], 64)
+
+    def test_dspark_rmsnorm_cpu_matches_reference(self):
+        values = torch.linspace(-7.0, 7.0, 1024, dtype=torch.bfloat16).reshape(2, 512)
+        weight = torch.linspace(-0.5, 0.5, 512, dtype=torch.bfloat16)
+
+        actual = dspark_rmsnorm(values, weight, 1e-6)
+        normalized = values.float()
+        normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
+        expected = (weight.float() * normalized).to(values.dtype)
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_dspark_query_per_head_norm_cpu_matches_reference(self):
+        values = torch.linspace(-7.0, 7.0, 2 * 3 * 4 * 8).reshape(2, 3, 4, 8)
+        expected = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+
+        actual = _normalize_query_per_head(values.clone(), head_dim=8, eps=1e-6)
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_rmsnorm_cuda_graph_replays_exact_reference(self):
+        torch.manual_seed(7)
+        values = torch.randn((8, 5, 512), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((512,), device="cuda", dtype=torch.bfloat16)
+
+        dspark_rmsnorm(values, weight, 1e-6)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = dspark_rmsnorm(values, weight, 1e-6)
+
+        values.copy_(torch.randn_like(values))
+        graph.replay()
+        torch.cuda.synchronize()
+        normalized = values.float()
+        normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
+        expected = (weight.float() * normalized).to(values.dtype)
+
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_dspark_kv_quantizes_only_non_rope_channels(self):
         tensor = torch.linspace(-8.0, 8.0, 512, dtype=torch.float32).reshape(1, 1, 512)
@@ -2128,6 +2481,99 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.equal(logits, hidden.float() @ head.weight.float().T))
+
+    def test_dspark_base_logits_reuse_and_refresh_stable_fp32_head(self):
+        model = object.__new__(DeepseekV4DSparkModel)
+        torch.nn.Module.__init__(model)
+        model.register_buffer("_local_base_head_fp32", None, persistent=False)
+        model._local_base_head_source_ptr = None
+        model._local_base_head_source_version = None
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        head = torch.tensor(
+            [[0.5, 0.25], [-1.0, 2.0]],
+            dtype=torch.bfloat16,
+        )
+
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
+        cached_ptr = model._local_base_head_fp32.data_ptr()
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ head.float().T,
+            )
+        )
+
+        head.add_(1)
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ head.float().T,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "shape or device changed"):
+            model.refresh_local_base_logits_head(torch.ones(3, 2), force=False)
+
+        original_version = int(head._version)
+        replacement = torch.full_like(head, 3)
+        head.data.copy_(replacement)
+        self.assertEqual(int(head._version), original_version)
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=True))
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ replacement.float().T,
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_cached_base_logits_survive_cuda_graph_refresh(self):
+        model = object.__new__(DeepseekV4DSparkModel)
+        torch.nn.Module.__init__(model)
+        model.register_buffer("_local_base_head_fp32", None, persistent=False)
+        model._local_base_head_source_ptr = None
+        model._local_base_head_source_version = None
+        hidden = torch.tensor(
+            [[1.0, -2.0]],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        head = torch.tensor(
+            [[0.5, 0.25], [-1.0, 2.0]],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        model.refresh_local_base_logits_head(head, force=False)
+        cached_ptr = model._local_base_head_fp32.data_ptr()
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                model.local_base_logits(hidden, None)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = model.local_base_logits(hidden, None)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(logits, hidden.float() @ head.float().T),
+        )
+
+        head.add_(1)
+        model.refresh_local_base_logits_head(head, force=False)
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(logits, hidden.float() @ head.float().T),
+        )
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
@@ -2466,6 +2912,96 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
         )
+
+    def test_deepseek_v4_decode_query_padding_reuses_zero_tailed_workspace(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=4,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=2)
+        first_q = torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4)
+        first_padded = backend._pad_decode_query(first_q, padded_heads=64)
+
+        self.assertEqual(first_padded.shape, (2, 64, 4))
+        self.assertTrue(torch.equal(first_padded[:, :16], first_q))
+        self.assertTrue(torch.count_nonzero(first_padded[:, 16:]) == 0)
+
+        second_q = torch.full_like(first_q, 7)
+        second_padded = backend._pad_decode_query(second_q, padded_heads=64)
+
+        self.assertEqual(second_padded.data_ptr(), first_padded.data_ptr())
+        self.assertTrue(torch.equal(second_padded[:, :16], second_q))
+        self.assertTrue(torch.count_nonzero(second_padded[:, 16:]) == 0)
+
+        different_shape = backend._pad_decode_query(first_q[:1], padded_heads=64)
+        self.assertEqual(different_shape.data_ptr(), first_padded.data_ptr())
+        self.assertEqual(
+            tuple(backend._decode_q_padding_workspace.shape),
+            (8, 64, 4),
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds.*workspace"):
+            backend._pad_decode_query(
+                torch.empty(9, 16, 4, dtype=torch.bfloat16),
+                padded_heads=64,
+            )
+
+    def test_deepseek_v4_decode_query_padding_validates_shape_and_head_width(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=4,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            backend._pad_decode_query(torch.empty(16, 4), padded_heads=64)
+        with self.assertRaisesRegex(ValueError, "must cover all local heads"):
+            backend._pad_decode_query(torch.empty(1, 65, 4), padded_heads=64)
+
+    def test_deepseek_v4_decode_query_padding_keeps_native_width_contiguous(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        q = torch.empty(2, 64, 4, dtype=torch.bfloat16)
+
+        padded = backend._pad_decode_query(q, padded_heads=64)
+
+        self.assertEqual(padded.data_ptr(), q.data_ptr())
+        self.assertTrue(padded.is_contiguous())
+        self.assertIsNone(backend._decode_q_padding_workspace)
 
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
         backend = _v4_backend(
@@ -4991,6 +5527,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             (2, 1),
             dtype=torch.int32,
         )
+        metadata.indexer.decode_schedule_metadata_refreshed_keys.add((8, 8, 8))
 
         with patch.object(deepseek_v4_backend, "dsv4_plan", side_effect=fake_dsv4_plan):
             deepseek_v4_backend._refresh_decode_indexer_schedule_metadata(metadata)
@@ -5010,6 +5547,36 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.full((2, 1), 9, dtype=torch.int32),
             )
         )
+        self.assertEqual(
+            metadata.indexer.decode_schedule_metadata_refreshed_keys,
+            {key},
+        )
+
+    def test_deepseek_v4_indexer_schedule_metadata_reuses_refreshed_cache(self):
+        key = (4, 4, 2)
+        metadata = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            page_table=torch.tensor([[0], [0]], dtype=torch.int32),
+            seq_lens=torch.tensor([5, 1], dtype=torch.int32),
+            query_lens=torch.tensor([1, 1], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
+        )
+        cached = torch.full((2, 1), 7, dtype=torch.int32)
+        metadata.indexer.decode_schedule_metadata_cache[key] = cached
+        metadata.indexer.decode_schedule_metadata_refreshed_keys.add(key)
+
+        with patch.object(deepseek_v4_model, "dsv4_plan") as plan:
+            actual = deepseek_v4_model._deepseek_v4_indexer_decode_schedule_metadata(
+                positions=torch.tensor([4, 0], dtype=torch.int64),
+                cache_block_size=4,
+                compress_ratio=4,
+                metadata=metadata,
+                context_lens=torch.tensor([[1], [0]], dtype=torch.int32),
+            )
+
+        self.assertIs(actual, cached)
+        plan.assert_not_called()
 
     def test_deepseek_v4_cuda_graph_decode_uses_packed_metadata(self):
         backend = _v4_backend(
@@ -6022,6 +6589,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rms_eps=1e-6,
                 hc_eps=1e-6,
                 sinkhorn_iters=2,
+                norm_weight=None,
+                norm_eps=None,
             )
         with self.assertRaises(RuntimeError):
             mhc_post(hidden_states, residual, post, comb)
@@ -6052,6 +6621,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6088,6 +6658,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            hash_table_values_validated=False,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6097,6 +6668,66 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(topk_ids, expected_ids))
         self.assertTrue(torch.allclose(topk_weights, expected_weights))
+
+    def test_deepseek_v4_hash_gate_validates_complete_loaded_table(self):
+        config = SimpleNamespace(
+            n_routed_experts=4,
+            hidden_size=8,
+            num_hash_layers=1,
+            vocab_size=3,
+            num_experts_per_tok=2,
+            topk_method=None,
+        )
+        gate = DeepseekV4MoEGate(config, layer_index=0)
+        with torch.no_grad():
+            gate.tid2eid.copy_(
+                torch.tensor([[0, 1], [2, 3], [1, 2]], dtype=torch.int32)
+            )
+        gate.validate_hash_indices_table(config.n_routed_experts)
+
+        for invalid in (-1, config.n_routed_experts):
+            with torch.no_grad():
+                gate.tid2eid[1, 0] = invalid
+            with self.assertRaisesRegex(ValueError, r"entries must be in \[0, 4\)"):
+                gate.validate_hash_indices_table(config.n_routed_experts)
+
+    def test_deepseek_v4_hash_router_forwards_validated_table_contract(self):
+        logits = torch.tensor([[0.5, 1.0, -0.5, 0.1]], dtype=torch.float32)
+        input_ids = torch.tensor([1], dtype=torch.long)
+        table = torch.tensor([[0, 1], [3, 2]], dtype=torch.int32)
+        observed = []
+
+        def fake_kernel(*args, **kwargs):
+            observed.append(kwargs["hash_table_values_validated"])
+            selected = args[4][args[5].reshape(-1).long()]
+            weights = torch.ones(selected.shape, dtype=torch.float32)
+            return weights, selected, args[0]
+
+        original = deepseek_v4_model._kernel_dsv4_select_experts
+        deepseek_v4_model._kernel_dsv4_select_experts = fake_kernel
+        try:
+            default = dsv4_select_experts(
+                logits,
+                top_k=2,
+                renormalize=True,
+                hash_indices_table=table,
+                input_ids=input_ids,
+                hash_table_values_validated=False,
+            )
+            trusted = dsv4_select_experts(
+                logits,
+                top_k=2,
+                renormalize=True,
+                hash_indices_table=table,
+                input_ids=input_ids,
+                hash_table_values_validated=True,
+            )
+        finally:
+            deepseek_v4_model._kernel_dsv4_select_experts = original
+
+        self.assertEqual(observed, [False, True])
+        for default_tensor, trusted_tensor in zip(default, trusted, strict=True):
+            self.assertTrue(torch.equal(default_tensor, trusted_tensor))
 
     def test_deepseek_v4_gate_cpu_returns_fp32_logits(self):
         config = SimpleNamespace(
@@ -6179,6 +6810,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()

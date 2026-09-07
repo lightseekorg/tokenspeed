@@ -26,7 +26,10 @@
 
 from __future__ import annotations
 
+import atexit
+import logging
 import os
+import threading
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -37,11 +40,187 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
 _HOST_CACHE_BLOCK_SIZE = 4096
 
+
+def _parse_boolean_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+_ZERO_RANGE_STAGING_ENABLED = _parse_boolean_env(
+    "TOKENSPEED_ZERO_CACHE_RANGE_TABLE_STAGING", False
+)
+_ZERO_RANGE_STAGING_CAPACITY = int(
+    os.environ.get("TOKENSPEED_ZERO_CACHE_RANGE_TABLE_CAPACITY", "256")
+)
+_ZERO_RANGE_STAGING_MIN_ROWS = int(
+    os.environ.get("TOKENSPEED_ZERO_CACHE_RANGE_TABLE_MIN_ROWS", "0")
+)
+if _ZERO_RANGE_STAGING_ENABLED and _ZERO_RANGE_STAGING_CAPACITY <= 0:
+    raise ValueError("TOKENSPEED_ZERO_CACHE_RANGE_TABLE_CAPACITY must be positive")
+if _ZERO_RANGE_STAGING_ENABLED and _ZERO_RANGE_STAGING_MIN_ROWS < 0:
+    raise ValueError("TOKENSPEED_ZERO_CACHE_RANGE_TABLE_MIN_ROWS must be nonnegative")
+
+logger = logging.getLogger(__name__)
+
 _is_nvidia = current_platform().is_nvidia
 
 
 def _use_pdl(enable_pdl: bool | None) -> bool:
     return bool((pdl_enabled() if enable_pdl is None else enable_pdl) and _is_nvidia)
+
+
+class _ZeroRangeTableSlot:
+    __slots__ = ("host", "device", "event", "event_recorded", "reserved")
+
+    def __init__(self, device: torch.device, capacity: int) -> None:
+        self.host = torch.empty(
+            (capacity, 2), dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self.device = torch.empty((capacity, 2), dtype=torch.int64, device=device)
+        self.event = torch.cuda.Event(enable_timing=False, blocking=False)
+        self.event_recorded = False
+        self.reserved = False
+
+    def available(self) -> bool:
+        return not self.reserved and (not self.event_recorded or self.event.query())
+
+
+class _ZeroRangeTableStager:
+    """Stage descriptors without reusing any of four in-flight buffers."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._lock = threading.Lock()
+        self._slots_by_device: dict[tuple[str, int], list[_ZeroRangeTableSlot]] = {}
+        self._next_by_device: dict[tuple[str, int], int] = {}
+        self.stats = {
+            "staged": 0,
+            "busy_fallback": 0,
+            "oversize_fallback": 0,
+            "capture_fallback": 0,
+        }
+
+    @staticmethod
+    def _device_key(device: torch.device) -> tuple[str, int]:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        return device.type, int(index)
+
+    def _slots(
+        self, device: torch.device
+    ) -> tuple[tuple[str, int], list[_ZeroRangeTableSlot]]:
+        key = self._device_key(device)
+        slots = self._slots_by_device.get(key)
+        if slots is None:
+            slots = [_ZeroRangeTableSlot(device, self.capacity) for _ in range(4)]
+            self._slots_by_device[key] = slots
+            self._next_by_device[key] = 0
+        return key, slots
+
+    def _record_fallback(self, kind: str, message: str) -> None:
+        with self._lock:
+            self.stats[kind] += 1
+            if self.stats[kind] == 1:
+                logger.warning(message)
+
+    def try_stage(
+        self, ranges: list[tuple[int, int]], device: torch.device
+    ) -> tuple[torch.Tensor, _ZeroRangeTableSlot, torch.cuda.Stream] | None:
+        count = len(ranges)
+        if count > self.capacity:
+            self._record_fallback(
+                "oversize_fallback",
+                "ZERO_CACHE_RANGE_TABLE_STAGING fallback=oversize "
+                f"rows={count} capacity={self.capacity}",
+            )
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            self._record_fallback(
+                "capture_fallback", "ZERO_CACHE_RANGE_TABLE_STAGING fallback=capture"
+            )
+            return None
+        with self._lock:
+            key, slots = self._slots(device)
+            start = self._next_by_device[key]
+            selected = None
+            for offset in range(4):
+                slot_index = (start + offset) % 4
+                if slots[slot_index].available():
+                    selected = slots[slot_index]
+                    selected.reserved = True
+                    self._next_by_device[key] = (slot_index + 1) % 4
+                    break
+            if selected is None:
+                self.stats["busy_fallback"] += 1
+                if self.stats["busy_fallback"] == 1:
+                    logger.warning("ZERO_CACHE_RANGE_TABLE_STAGING fallback=busy")
+                return None
+        stream = torch.cuda.current_stream(device)
+        try:
+            cpu_values = torch.as_tensor(ranges, dtype=torch.int64, device="cpu")
+            selected.host[:count].copy_(cpu_values)
+            selected.device[:count].copy_(selected.host[:count], non_blocking=True)
+        except Exception:
+            self.finish(selected, stream)
+            raise
+        with self._lock:
+            self.stats["staged"] += 1
+            if self.stats["staged"] == 1:
+                logger.warning(
+                    "ZERO_CACHE_RANGE_TABLE_STAGING staged_first rows=%d device=%s",
+                    count,
+                    device,
+                )
+        return selected.device[:count], selected, stream
+
+    def finish(self, slot: _ZeroRangeTableSlot, stream: torch.cuda.Stream) -> None:
+        slot.event.record(stream)
+        with self._lock:
+            slot.event_recorded = True
+            slot.reserved = False
+
+    def snapshot_stats(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self.stats)
+
+
+_ZERO_RANGE_TABLE_STAGER = _ZeroRangeTableStager(_ZERO_RANGE_STAGING_CAPACITY)
+
+
+def _log_zero_range_staging_summary() -> None:
+    stats = _ZERO_RANGE_TABLE_STAGER.snapshot_stats()
+    logger.warning(
+        "ZERO_CACHE_RANGE_TABLE_STAGING summary capacity=%d min_rows=%d slots=4 "
+        "staged=%d busy_fallback=%d oversize_fallback=%d capture_fallback=%d",
+        _ZERO_RANGE_STAGING_CAPACITY,
+        _ZERO_RANGE_STAGING_MIN_ROWS,
+        stats["staged"],
+        stats["busy_fallback"],
+        stats["oversize_fallback"],
+        stats["capture_fallback"],
+    )
+
+
+if _ZERO_RANGE_STAGING_ENABLED:
+    logger.warning(
+        "ZERO_CACHE_RANGE_TABLE_STAGING enabled capacity=%d min_rows=%d slots=4",
+        _ZERO_RANGE_STAGING_CAPACITY,
+        _ZERO_RANGE_STAGING_MIN_ROWS,
+    )
+    atexit.register(_log_zero_range_staging_summary)
+
+
+def _should_stage_zero_ranges(count: int) -> bool:
+    """Return whether this descriptor table is large enough for reuse."""
+    return _ZERO_RANGE_STAGING_ENABLED and count >= _ZERO_RANGE_STAGING_MIN_ROWS
 
 
 __all__ = [
@@ -199,23 +378,35 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
 
-    range_table = (
-        torch.tensor(ranges, dtype=torch.int64)
-        .pin_memory()
-        .to(backing.device, non_blocking=True)
+    staged = (
+        _ZERO_RANGE_TABLE_STAGER.try_stage(ranges, backing.device)
+        if _should_stage_zero_ranges(len(ranges))
+        else None
     )
+    if staged is None:
+        range_table = (
+            torch.tensor(ranges, dtype=torch.int64)
+            .pin_memory()
+            .to(backing.device, non_blocking=True)
+        )
+        staging_slot = None
+        staging_stream = None
+    else:
+        range_table, staging_slot, staging_stream = staged
 
-    block_size = 1024
-    max_size = max(size for _, size in ranges)
-
-    grid = (len(ranges), triton.cdiv(max_size, block_size))
-
-    _zero_byte_ranges_kernel[grid](
-        backing,
-        range_table,
-        BLOCK_SIZE=block_size,
-        num_warps=4,
-    )
+    try:
+        block_size = 1024
+        max_size = max(size for _, size in ranges)
+        grid = (len(ranges), triton.cdiv(max_size, block_size))
+        _zero_byte_ranges_kernel[grid](
+            backing,
+            range_table,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
+    finally:
+        if staging_slot is not None:
+            _ZERO_RANGE_TABLE_STAGER.finish(staging_slot, staging_stream)
 
 
 # -----------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads as v4_heads
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.models.dspark import VanillaMarkov
@@ -339,6 +340,132 @@ def test_proposals_are_valid_token_ids() -> None:
         torch.zeros((1, spec), dtype=torch.int32),
     )
     assert int(out.min()) >= 0
+
+
+def test_v4_markov_walk_routes_every_step_through_distributed_argmax(
+    monkeypatch,
+) -> None:
+    """The opt-in V4 path preserves the Markov chain and reuses graph scratch."""
+    rows, steps, local_vocab, rank = 3, 5, 8, 2
+    torch.manual_seed(17)
+    local_base = torch.randn(rows, steps, local_vocab)
+    bonus = torch.tensor([1, 2, 3], dtype=torch.int32)
+    projection = SimpleNamespace(
+        weight=torch.randn(local_vocab, RANK, dtype=torch.float32)
+    )
+    embedding_weight = torch.randn(64, RANK, dtype=torch.float32)
+    markov = SimpleNamespace(
+        local_bias=lambda ids: embedding_weight[ids.long()] @ projection.weight.T
+    )
+    shard = SimpleNamespace(
+        num_org_elements=local_vocab,
+        num_org_elements_padded=local_vocab,
+        num_added_elements=0,
+        org_vocab_start_index=0,
+        added_vocab_start_index=64,
+    )
+    lm_head = SimpleNamespace(shard_indices=shard, tp_size=4)
+    output = torch.empty((rows, steps), dtype=torch.int32)
+    max_scratch = torch.empty(rows, dtype=torch.float32)
+    id_scratch = torch.empty(rows, dtype=torch.int32)
+    calls = []
+
+    def fake_dist(state, logits, *, out_max, out_idx):
+        del state
+        calls.append(logits.clone())
+        max_values, ids = logits.max(dim=-1)
+        out_max.copy_(max_values)
+        out_idx.copy_(ids)
+        return out_max, out_idx
+
+    monkeypatch.setattr(v4_heads, "distributed_argmax", fake_dist)
+    v4_heads.sample_dspark_block_greedy(
+        local_base,
+        bonus,
+        markov,
+        lm_head,
+        tp_group=(0, 1, 2, 3),
+        gathered_values=torch.empty((4, rows)),
+        gathered_ids=torch.empty((4, rows), dtype=torch.int64),
+        output=output,
+        dist_argmax_state=object(),
+        dist_argmax_max=max_scratch,
+        dist_argmax_ids=id_scratch,
+        local_cute_argmax=False,
+        local_argmax_max=None,
+        local_argmax_ids=None,
+    )
+
+    previous = bonus
+    expected = []
+    for step in range(steps):
+        corrected = local_base[:, step] + markov.local_bias(previous)
+        previous = corrected.argmax(dim=-1).to(torch.int32)
+        expected.append(previous)
+    assert len(calls) == steps
+    assert torch.equal(output, torch.stack(expected, dim=1))
+
+
+def test_v4_markov_walk_routes_every_step_through_local_cute_argmax(
+    monkeypatch,
+) -> None:
+    """The opt-in local path reuses per-step scratch and preserves chaining."""
+    rows, steps, local_vocab = 3, 5, 8
+    torch.manual_seed(23)
+    local_base = torch.randn(rows, steps, local_vocab)
+    bonus = torch.tensor([1, 2, 3], dtype=torch.int32)
+    projection = SimpleNamespace(
+        weight=torch.randn(local_vocab, RANK, dtype=torch.float32)
+    )
+    embedding_weight = torch.randn(64, RANK, dtype=torch.float32)
+    markov = SimpleNamespace(
+        local_bias=lambda ids: embedding_weight[ids.long()] @ projection.weight.T
+    )
+    shard = SimpleNamespace(
+        num_org_elements=local_vocab,
+        num_org_elements_padded=local_vocab,
+        num_added_elements=0,
+        org_vocab_start_index=0,
+        added_vocab_start_index=64,
+    )
+    lm_head = SimpleNamespace(shard_indices=shard, tp_size=1)
+    output = torch.empty((rows, steps), dtype=torch.int32)
+    max_scratch = torch.empty((steps, rows), dtype=torch.float32)
+    id_scratch = torch.empty((steps, rows), dtype=torch.int64)
+    calls = []
+
+    def fake_local(logits, out_max, out_idx):
+        calls.append(logits.clone())
+        max_values, ids = logits.max(dim=-1)
+        out_max.copy_(max_values)
+        out_idx.copy_(ids)
+
+    monkeypatch.setattr(v4_heads, "_cute_local_argmax", fake_local)
+    v4_heads.sample_dspark_block_greedy(
+        local_base,
+        bonus,
+        markov,
+        lm_head,
+        tp_group=None,
+        gathered_values=torch.empty((1, rows)),
+        gathered_ids=torch.empty((1, rows), dtype=torch.int64),
+        output=output,
+        dist_argmax_state=None,
+        dist_argmax_max=None,
+        dist_argmax_ids=None,
+        local_cute_argmax=True,
+        local_argmax_max=max_scratch,
+        local_argmax_ids=id_scratch,
+    )
+
+    previous = bonus
+    expected = []
+    for step in range(steps):
+        corrected = local_base[:, step] + markov.local_bias(previous)
+        previous = corrected.argmax(dim=-1).to(torch.int32)
+        expected.append(previous)
+    assert len(calls) == steps
+    assert torch.equal(output, torch.stack(expected, dim=1))
 
 
 # --------------------------------------------------------------------------

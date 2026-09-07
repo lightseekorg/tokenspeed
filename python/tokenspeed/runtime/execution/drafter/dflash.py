@@ -285,6 +285,7 @@ class DFlash(BaseDrafter):
             # Back-to-back walk rounds carry no cross-rank sync between them,
             # which skip_ping_pong would require.
             skip_ping_pong=False,
+            dtype=dtype,
         )
 
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):

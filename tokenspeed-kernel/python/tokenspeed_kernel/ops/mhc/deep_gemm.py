@@ -35,6 +35,11 @@ try:
 except Exception:
     tf32_hc_prenorm_gemm = None  # type: ignore[assignment]
 
+try:
+    from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
+except Exception:
+    mhc_big_fuse = None  # type: ignore[assignment]
+
 
 if tf32_hc_prenorm_gemm is not None:
 
@@ -68,6 +73,8 @@ if tf32_hc_prenorm_gemm is not None:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run mHC pre-mapping with DeepGEMM prenorm and Triton mixing."""
         if get_pdl() != pdl_enabled():
@@ -81,4 +88,7 @@ if tf32_hc_prenorm_gemm is not None:
             hc_eps,
             sinkhorn_iters,
             tf32_hc_prenorm_gemm,
+            pre_reduce_apply_impl=mhc_big_fuse,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )

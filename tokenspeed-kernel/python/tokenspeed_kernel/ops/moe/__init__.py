@@ -47,6 +47,7 @@ __all__ = [
     "latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
+    "pack_topk_router_logits",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
     "moe_softmax_topk",
@@ -60,6 +61,7 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
+from tokenspeed_kernel.ops.moe.pack_topk import pack_topk_router_logits  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
 
@@ -358,6 +360,8 @@ def dsv4_select_experts(
     need_scores: bool = True,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    hash_table_values_validated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 experts from sqrt-softplus router scores.
 
@@ -375,6 +379,9 @@ def dsv4_select_experts(
             kernels avoid materializing it when false.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        hash_table_values_validated: Whether the caller has already validated
+            every expert id in the immutable hash table. This only skips the
+            repeated table-value check; runtime token ids are always checked.
 
     Returns:
         FP32 weights, INT32 expert ids, and a tensor shaped [tokens, experts].
@@ -389,6 +396,10 @@ def dsv4_select_experts(
     tokens, experts = router_logits.shape
     if not 0 < top_k <= experts:
         raise ValueError(f"top_k must be in [1, {experts}], got {top_k}")
+    if not isinstance(hash_table_values_validated, bool):
+        raise TypeError("hash_table_values_validated must be a bool")
+    if hash_table_values_validated and hash_indices_table is None:
+        raise ValueError("hash_table_values_validated requires hash_indices_table")
     if correction_bias is not None and correction_bias.shape != (experts,):
         raise ValueError(f"correction_bias must have shape [{experts}]")
     if hash_indices_table is not None:
@@ -414,8 +425,9 @@ def dsv4_select_experts(
             raise ValueError("input_ids must be on the same device as router_logits")
         _assert_indices_in_range(input_ids, hash_indices_table.shape[0], "input_ids")
         safe_input_ids = input_ids.clamp(0, hash_indices_table.shape[0] - 1)
-        selected_experts = hash_indices_table[safe_input_ids.reshape(-1).long()]
-        _assert_indices_in_range(selected_experts, experts, "hash_indices_table")
+        if not hash_table_values_validated:
+            selected_experts = hash_indices_table[safe_input_ids.reshape(-1).long()]
+            _assert_indices_in_range(selected_experts, experts, "hash_indices_table")
         input_ids = safe_input_ids
 
     routing_kind = _routing_kind(correction_bias, hash_indices_table)

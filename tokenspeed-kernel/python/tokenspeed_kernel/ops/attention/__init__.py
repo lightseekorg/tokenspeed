@@ -3453,6 +3453,8 @@ def dsv4_swa_cache_insert(
     q_out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
 
@@ -3471,6 +3473,9 @@ def dsv4_swa_cache_insert(
             When provided, ``q`` is left unchanged.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        validate_positions: Check that every position indexes ``cos_sin_cache``.
+            Runtime integrations may disable this only after validating the same
+            positions once for an equal cache capacity in the current forward.
 
     Returns:
         None. Q and the selected cache rows are written in place.
@@ -3517,13 +3522,16 @@ def dsv4_swa_cache_insert(
     tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
     if any(tensor.device != q.device for tensor in tensors):
         raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
-    positions_valid = ((positions >= 0) & (positions < cos_sin_cache.shape[0])).all()
-    position_error = "positions entries must index cos_sin_cache"
-    if positions.device.type == "cpu":
-        if not bool(positions_valid.item()):
-            raise ValueError(position_error)
-    else:
-        torch._assert_async(positions_valid, position_error)
+    if validate_positions:
+        positions_valid = (
+            (positions >= 0) & (positions < cos_sin_cache.shape[0])
+        ).all()
+        position_error = "positions entries must index cos_sin_cache"
+        if positions.device.type == "cpu":
+            if not bool(positions_valid.item()):
+                raise ValueError(position_error)
+        else:
+            torch._assert_async(positions_valid, position_error)
     if q_out is not None and (
         q_out.shape != q.shape
         or q_out.dtype != q.dtype

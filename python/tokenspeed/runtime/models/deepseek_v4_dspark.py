@@ -17,6 +17,7 @@ from tokenspeed_kernel import mhc_fused_hc, mhc_post, mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -116,10 +117,66 @@ _ZERO_INITIALIZED_EXPERT_BIAS_SUFFIXES = (
     ".experts.w13_weight_bias",
     ".experts.w2_weight_bias",
 )
+_REPLICATE_VOCAB_HEADS_ENV = "TOKENSPEED_DSPARK_REPLICATE_VOCAB_HEADS"
+_REPLICATE_MARKOV_EMBEDDING_ENV = "TOKENSPEED_DSPARK_REPLICATE_MARKOV_EMBEDDING"
 
 
 def _is_zero_initialized_expert_bias(name: str) -> bool:
     return name.endswith(_ZERO_INITIALIZED_EXPERT_BIAS_SUFFIXES)
+
+
+def _replicate_dspark_vocab_weight(
+    local_weight: torch.Tensor,
+    module: VocabParallelEmbedding,
+    mapping: Mapping,
+    *,
+    label: str,
+) -> torch.Tensor:
+    """Reconstruct an unpadded vocabulary weight in TP-rank order.
+
+    This candidate intentionally supports only the DeepSeek V4 checkpoint
+    layout with no base-vocabulary padding or added vocabulary. Other layouts
+    need an explicit reindexing step and therefore fail closed here.
+    """
+
+    tp_size = int(mapping.attn.tp_size)
+    if int(module.tp_size) != 1:
+        raise ValueError(f"Replicated DSpark {label} module must use tp_size=1.")
+    if local_weight.ndim != 2:
+        raise ValueError(
+            f"DSpark target {label} weight must be rank 2; "
+            f"got {tuple(local_weight.shape)}."
+        )
+    if int(module.num_added_embeddings) != 0 or int(
+        module.org_vocab_size_padded
+    ) != int(module.org_vocab_size):
+        raise ValueError(
+            f"Replicated DSpark {label} requires an unpadded base-only vocabulary."
+        )
+    expected_full_rows = int(module.num_embeddings_padded)
+    if expected_full_rows % tp_size != 0:
+        raise ValueError(
+            f"Replicated DSpark {label} vocabulary size {expected_full_rows} "
+            f"is not divisible by TP size {tp_size}."
+        )
+    expected_local_rows = expected_full_rows // tp_size
+    if local_weight.shape[0] != expected_local_rows:
+        raise ValueError(
+            f"DSpark target {label} shard has {local_weight.shape[0]} rows; "
+            f"expected {expected_local_rows} for TP{tp_size}."
+        )
+    full_weight = all_gather(
+        local_weight.contiguous(),
+        mapping.attn.tp_group,
+        dim=0,
+    )
+    expected_shape = (expected_full_rows, local_weight.shape[1])
+    if tuple(full_weight.shape) != expected_shape:
+        raise RuntimeError(
+            f"DSpark replicated {label} shape mismatch: "
+            f"expected {expected_shape}, got {tuple(full_weight.shape)}."
+        )
+    return full_weight.contiguous()
 
 
 def count_dspark_stages(
@@ -310,6 +367,22 @@ class DeepseekV4DSparkModel(nn.Module):
                 "Week-0 DSpark supports only the vanilla Markov head; "
                 f"got {markov_kind!r}."
             )
+        self.replicate_vocab_heads = os.getenv(_REPLICATE_VOCAB_HEADS_ENV, "0") == "1"
+        self.replicate_markov_embedding = self.replicate_vocab_heads or (
+            os.getenv(_REPLICATE_MARKOV_EMBEDDING_ENV, "0") == "1"
+        )
+        target_vocab_parallel_kwargs = (
+            {}
+            if self.replicate_vocab_heads
+            else {
+                "tp_rank": mapping.attn.tp_rank,
+                "tp_size": mapping.attn.tp_size,
+                "tp_group": mapping.attn.tp_group,
+            }
+        )
+        markov_embedding_parallel_kwargs = (
+            {} if self.replicate_markov_embedding else target_vocab_parallel_kwargs
+        )
 
         self.stages = nn.ModuleList(
             [
@@ -328,33 +401,36 @@ class DeepseekV4DSparkModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             int(config.vocab_size),
             self.hidden_size,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("embed_tokens", prefix),
+            **target_vocab_parallel_kwargs,
         )
         self.markov_embedding = VocabParallelEmbedding(
             int(config.vocab_size),
             self.markov_rank,
             params_dtype=torch.float32,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("markov_embedding", prefix),
+            **markov_embedding_parallel_kwargs,
         )
         self.markov_projection = ParallelLMHead(
             int(config.vocab_size),
             self.markov_rank,
             params_dtype=torch.float32,
             quant_config=None,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("markov_projection", prefix),
+            **target_vocab_parallel_kwargs,
         )
         self.markov_head = DSparkVanillaMarkov(
             self.markov_embedding,
             self.markov_projection,
+        )
+        logger.info(
+            "DSPARK_VOCAB_LAYOUT rank=%d target_embedding_tp=%d "
+            "target_lm_head_tp=pending markov_embedding_tp=%d "
+            "markov_projection_tp=%d",
+            mapping.rank,
+            self.embed_tokens.tp_size,
+            self.markov_embedding.tp_size,
+            self.markov_projection.tp_size,
         )
         self.confidence_projection = ReplicatedLinear(
             self.hidden_size + self.markov_rank,
@@ -365,6 +441,9 @@ class DeepseekV4DSparkModel(nn.Module):
             prefix=add_prefix("confidence_projection", prefix),
         )
         self.confidence_head = DSparkConfidenceHead(self.confidence_projection)
+        self.register_buffer("_local_base_head_fp32", None, persistent=False)
+        self._local_base_head_source_ptr: int | None = None
+        self._local_base_head_source_version: int | None = None
 
         head_dim = int(getattr(config, "head_dim"))
         self.attention_params = {
@@ -420,6 +499,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.attn_norm(layer_input)
         attention_output = dspark_attention_forward_batched(
@@ -443,6 +524,8 @@ class DeepseekV4DSparkModel(nn.Module):
             block.rms_norm_eps,
             block.hc_eps,
             block.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=None,
         )
         layer_input = block.ffn_norm(layer_input)
         flat_input = layer_input.reshape(batch * block_size, hidden_size)
@@ -531,9 +614,71 @@ class DeepseekV4DSparkModel(nn.Module):
     def local_base_logits(
         self,
         hidden_states: torch.Tensor,
-        lm_head: nn.Module,
+        lm_head: nn.Module | None,
     ) -> torch.Tensor:
-        return torch.matmul(hidden_states.float(), lm_head.weight.float().T)
+        """Compute public FP32 base logits from the local vocabulary shard.
+
+        Production DSpark replay uses a stable FP32 head buffer initialized by
+        ``set_embed_and_head``. Passing a head keeps the uncached reference
+        path available; production callers pass ``None`` for the replay buffer.
+        """
+
+        if lm_head is not None:
+            head_fp32 = lm_head.weight.float()
+        else:
+            head_fp32 = getattr(self, "_local_base_head_fp32", None)
+            if head_fp32 is None:
+                raise RuntimeError(
+                    "DSpark local base logits require a cached target LM head."
+                )
+        return torch.matmul(hidden_states.float(), head_fp32.T)
+
+    def refresh_local_base_logits_head(
+        self,
+        head: torch.Tensor,
+        *,
+        force: bool,
+    ) -> bool:
+        """Refresh the stable FP32 local-head buffer after a weight update.
+
+        Returns ``True`` when the buffer was initialized or updated. Once the
+        buffer exists, its storage address and shape stay fixed so CUDA Graph
+        replays remain valid.
+        """
+
+        if head.ndim != 2:
+            raise ValueError(
+                "DSpark target LM-head weight must be rank 2; "
+                f"got shape {tuple(head.shape)}."
+            )
+        source_ptr = head.data_ptr()
+        source_version = int(head._version)
+        cached = self._local_base_head_fp32
+        if cached is None:
+            cached = torch.empty(
+                head.shape,
+                dtype=torch.float32,
+                device=head.device,
+            )
+            with torch.no_grad():
+                cached.copy_(head)
+            self._local_base_head_fp32 = cached
+        elif not force and (
+            source_ptr == self._local_base_head_source_ptr
+            and source_version == self._local_base_head_source_version
+        ):
+            return False
+        else:
+            if cached.shape != head.shape or cached.device != head.device:
+                raise RuntimeError(
+                    "DSpark target LM-head shape or device changed after the "
+                    "FP32 replay buffer was initialized."
+                )
+            with torch.no_grad():
+                cached.copy_(head)
+        self._local_base_head_source_ptr = source_ptr
+        self._local_base_head_source_version = source_version
+        return True
 
     def write_context_windows_batched(
         self,
@@ -605,10 +750,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             int(config.vocab_size),
             int(config.hidden_size),
             quant_config=quant_config,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
             prefix=add_prefix("lm_head", prefix),
+            **(
+                {}
+                if self.model.replicate_vocab_heads
+                else {
+                    "tp_rank": mapping.attn.tp_rank,
+                    "tp_size": mapping.attn.tp_size,
+                    "tp_group": mapping.attn.tp_group,
+                }
+            ),
+        )
+        logger.info(
+            "DSPARK_TARGET_LM_HEAD_LAYOUT rank=%d target_lm_head_tp=%d",
+            mapping.rank,
+            self.lm_head.tp_size,
         )
 
     def get_hot_token_id(self):
@@ -618,12 +774,69 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+        if self.model.replicate_vocab_heads:
+            embed = _replicate_dspark_vocab_weight(
+                embed,
+                self.model.embed_tokens,
+                self.mapping,
+                label="embedding",
+            )
+            head = _replicate_dspark_vocab_weight(
+                head,
+                self.lm_head,
+                self.mapping,
+                label="LM head",
+            )
+            logger.info(
+                "DSPARK_REPLICATED_VOCAB_HEADS_PASS rank=%d tp=%d "
+                "embedding_shape=%s head_shape=%s",
+                self.mapping.rank,
+                self.mapping.attn.tp_size,
+                tuple(embed.shape),
+                tuple(head.shape),
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        self.model.refresh_local_base_logits_head(head, force=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def refresh_replicated_embed_and_head(
+        self,
+        embed: torch.Tensor,
+        head: torch.Tensor,
+    ) -> None:
+        """Refresh graph-stable replicated vocabulary buffers from TP shards."""
+
+        if not self.model.replicate_vocab_heads:
+            raise RuntimeError("DSpark vocabulary heads are not replicated.")
+        replicated_embed = _replicate_dspark_vocab_weight(
+            embed,
+            self.model.embed_tokens,
+            self.mapping,
+            label="embedding",
+        )
+        replicated_head = _replicate_dspark_vocab_weight(
+            head,
+            self.lm_head,
+            self.mapping,
+            label="LM head",
+        )
+        destinations = (
+            ("embedding", self.model.embed_tokens.weight, replicated_embed),
+            ("LM head", self.lm_head.weight, replicated_head),
+        )
+        with torch.no_grad():
+            for label, destination, source in destinations:
+                if destination.shape != source.shape:
+                    raise RuntimeError(
+                        f"DSpark replicated {label} shape changed after initialization: "
+                        f"expected {tuple(destination.shape)}, got {tuple(source.shape)}."
+                    )
+                destination.copy_(source)
+        self.model.refresh_local_base_logits_head(self.lm_head.weight, force=True)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         match = _DSPARK_WEIGHT_RE.match(name)
