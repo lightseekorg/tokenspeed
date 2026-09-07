@@ -276,7 +276,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         num_extends: int = 0,
         for_graph_replay: bool = False,
     ) -> None:
-        del num_extends
         if self.block_decode_active:
             # DFLASH draft block: replicate the page table to each request's
             # block positions. Under replay the seq_lens are re-derived
@@ -293,9 +292,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
         self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
-        # Verify (and the draft's multi-token step 1) reads the prefill slot's
-        # clamped seqlens; refresh it whenever speculation is on.
-        if self.spec_num_tokens > 1:
+        # Pure verify (and the draft's multi-token step 1) reads the prefill
+        # slot. An extend/mixed draft refresh only seeds later decode steps and
+        # must preserve the ragged prefill metadata built immediately before it.
+        if self.spec_num_tokens > 1 and num_extends == 0:
             torch.clamp_min(
                 seq_lens[:bs],
                 self.spec_num_tokens,

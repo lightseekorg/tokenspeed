@@ -38,8 +38,7 @@ expensive here).
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,

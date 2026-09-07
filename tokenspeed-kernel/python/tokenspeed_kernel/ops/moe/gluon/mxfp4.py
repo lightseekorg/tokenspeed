@@ -337,7 +337,10 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        # The A8 preprocessor replaces the linear weights required by Kimi's
+        # joint routed/shared M<=4 decode pipeline. Keep the A16 plan as the
+        # automatic EP8 choice until the A8 plan can preserve that fast path.
+        priority=Priority.SPECIALIZED - 1,
     )
     def gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply(
         plan: dict,

@@ -59,7 +59,6 @@ def _linear_attnres_partials_kernel(
 ):
     """Run shared-weight projection CTAs and one dual-AttnRes CTA per token."""
     pid = gl.program_id(0)
-    projection_programs: gl.constexpr = output_size // _BLOCK_N
     is_attnres = (pid >= attnres_program_offset) & (
         pid < attnres_program_offset + num_tokens
     )

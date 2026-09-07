@@ -239,7 +239,9 @@ SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
 `multimodal/inputs.py::multimodal_context_for_forward` (which also snapshots
 each request's multimodal inputs, per Principle 1's capture contract), and
 P-side layerwise KV streaming setup, which happens inside the device builder
-(the step counter is backend surgery; the sender just receives it).
+(the step counter is backend surgery; the sender just receives it). Dest-
+contiguous CachePD fragments are 2D-packed in the Prefill transfer path
+before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.

@@ -26,6 +26,9 @@ installing `triton` into it.
    changes.
 6. Once confirmed a upstream commit causes regression, start `git bisect` flow
    to identify the exact root cause.
+   If `git bisect` points to an LLVM bump commit, then bisect the LLVM commit
+   range to find the problematic commit. Ask where the LLVM source codebase
+   is and where the build directory is.
 7. Once identified, reinstall the recorded `triton` (or `triton-rocm` package)
    to the original version and revert local changes.
 
@@ -37,3 +40,6 @@ In Triton codebase, do the following
 pip install -r python/requirements.txt
 pip install .
 ```
+
+To build with custom LLVM, set `LLVM_LIBRARY_DIR` and `LLVM_SYSPATH` to the
+LLVM build directory.

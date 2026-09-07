@@ -17,7 +17,22 @@ if [ "$#" -eq 0 ]; then
 fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workers="${MI450_SIM_WORKERS:-6}"
+# MI450_SIM_WORKERS is a ceiling, not a target. Cap the count at what
+# this runner's CPU allocation can actually feed.
+cores_per_emulator=2
+cores="$(nproc)"
+requested_workers="${MI450_SIM_WORKERS:-6}"
+affordable_workers=$((cores / cores_per_emulator))
+if [ "${affordable_workers}" -lt 1 ]; then
+    affordable_workers=1
+fi
+if [ "${requested_workers}" -lt "${affordable_workers}" ]; then
+    workers="${requested_workers}"
+else
+    workers="${affordable_workers}"
+fi
+echo "running ${workers} rocJITsu workers" \
+    "(ceiling ${requested_workers}, nproc ${cores})" >&2
 test_root="${MI450_SIM_TEST_ROOT:-tokenspeed-kernel/test}"
 log_dir="${RUNNER_TEMP:-/tmp}/mi450-sim"
 # An emulator that aborts mid-kernel leaves its worker blocked in a HIP call

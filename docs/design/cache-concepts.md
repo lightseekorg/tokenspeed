@@ -676,7 +676,11 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   mandatory `group_id`, checked against the pool's published specs at startup
   (`validate_cache_group_ids`, single-group pools included), and backends
   index their learned geometry by it with no fallback
-  (`CacheGroupGeometry.granularity_of` raises on unknown ids). ✓
+  (`CacheGroupGeometry.granularity_of` raises on unknown ids).
+  Block drafters that write at target cache locations therefore use the
+  target's `full_attention` storage group even when a draft layer applies a
+  sliding-window compute mask; visibility and cache retention are separate
+  contracts. ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

@@ -20,32 +20,25 @@
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon, tl
+from types import SimpleNamespace
 
-_INV_LN2_VALUE = 1.4426950408889634
-_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
-_LN2_VALUE = 0.6931471805599453
-_LN2 = tl.constexpr(_LN2_VALUE)
+import pytest
 
 
-@gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
-    return gl.maximum(a, b, propagate_nan=propagate_nan)
+def test_memcpy_2d_async_rejects_non_nvidia(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tokenspeed_kernel.ops.copy.cuda import memcpy_2d_async
 
-
-@gluon.jit
-def max(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
-
-
-@gluon.aggregate
-class InputStrides:
-    stride_t: gl.constexpr
-    stride_h: gl.constexpr
-    stride_d: gl.constexpr
-
-    @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.copy.cuda.current_platform",
+        lambda: SimpleNamespace(is_nvidia=False),
+    )
+    with pytest.raises(RuntimeError, match="NVIDIA-only"):
+        memcpy_2d_async(
+            dst=1,
+            dst_pitch=8,
+            src=2,
+            src_pitch=16,
+            width=8,
+            height=2,
+            stream_ptr=0,
         )
