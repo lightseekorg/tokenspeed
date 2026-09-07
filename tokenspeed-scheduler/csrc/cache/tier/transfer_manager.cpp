@@ -130,9 +130,17 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
     if (it == load_backs_.end()) {
         return;
     }
+    // A missed batch_get_into must not publish empty Host or Device pages.
+    // Host-warm H2D destinations were already CacheFullBlocks'd at admit.
     for (BlockTransfer& transfer : it->second) {
-        if (success && transfer.prefetch_from_storage && transfer.source) {
+        if (!success || !transfer.prefetch_from_storage) {
+            continue;
+        }
+        if (transfer.source) {
             coordinator_.CacheHostBlock(transfer.source, transfer.key);
+        }
+        if (transfer.destination) {
+            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
         }
     }
     load_backs_.erase(it);

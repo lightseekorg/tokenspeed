@@ -434,6 +434,8 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     TokenContainer container(tokens);
     std::vector<std::span<const std::int32_t>> prefix_pages =
         container.FullPrefixPages(config_.prefix_granularity, false);
+    // The last prompt token is always recomputed. Admission probes the same
+    // (n - 1) / prefix_granularity candidate pages.
     const std::int32_t candidate_prefix_pages =
         std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));

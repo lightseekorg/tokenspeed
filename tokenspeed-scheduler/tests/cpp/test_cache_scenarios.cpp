@@ -4547,7 +4547,8 @@ protected:
 TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
     RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
     std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
-    ASSERT_EQ(hashes.size(), 4u);
+    // 8 tokens, grain 2: (8 - 1) / 2 = 3 candidate prefix pages.
+    ASSERT_EQ(hashes.size(), 3u);
     std::vector<CacheKey> keys;
     keys.reserve(hashes.size());
     for (const std::string& content_hash : hashes) {
@@ -4639,8 +4640,10 @@ TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenPoolCannotAdmit) {
 }
 
 TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {
-    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/1);
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/2);
     std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    // 8 tokens, grain 4: (8 - 1) / 4 = 1 candidate prefix page. A 4-token
+    // prompt yields zero hashes, so Host shortage would never run.
     ASSERT_EQ(hashes.size(), 1u);
     scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
 
@@ -4651,7 +4654,7 @@ TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutK
     ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
     ASSERT_EQ(op->input_lengths.size(), 1u);
     EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "a 2-token Host shortage must round down to the 4-token prefix grain";
-    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
     EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
 }
 

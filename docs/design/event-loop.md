@@ -315,5 +315,6 @@ For orientation, one iteration of `event_loop`:
   hashed and remotely probed on every token step.
   After Admit, vanished L3 objects are recovered on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
-  publishing empty Host pages, snapshot-less retract of the batch so
-  the next admit recomputes. Clients are not failed.
+  publishing empty Host pages and empty Device prefetch destinations,
+  snapshot-less retract of the batch so the next admit recomputes.
+  Clients are not failed.

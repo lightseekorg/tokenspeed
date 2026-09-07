@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <iterator>
+#include <utility>
 
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
@@ -914,8 +915,25 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
+                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                           /*newly_cached=*/nullptr);
     rememberStorageKey(key);
+}
+
+void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key) {
+    _assert(block_ref, "CacheDeviceBlock requires a destination block");
+    _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
+    std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, /*logical_block_index=*/-1,
+                                           CacheBoundaryKind::kChunk, &newly_cached);
+    if (!cache_mutation_sink_) {
+        return;
+    }
+    for (const auto& [cached_key, cached_block] : newly_cached) {
+        (void)cached_block;
+        cache_mutation_sink_(cached_key, CacheMutation::kStored);
+    }
 }
 
 void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {

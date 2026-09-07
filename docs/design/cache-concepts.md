@@ -351,6 +351,9 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  Host-warm first-chunk extensions call `CacheFullBlocks` at admit.
+  L3 prefetch destinations wait for `LoadBackDone.success` and
+  `CacheDeviceBlock`; publishing them earlier would cache empty KV.
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
@@ -449,6 +452,7 @@ Its responsibilities:
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced
   across the replica, and a miss unregisters the keys, skips H2D /
   skips publishing empty Host pages (`LoadBackDone.success=false`),
+  skips Device prefix publication for those prefetch destinations,
   skips the model forward, and retracts the batch snapshot-less so the
   next admit recomputes those tokens. Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks

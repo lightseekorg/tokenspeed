@@ -216,6 +216,11 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Publishes a filled Device destination after a successful L3 prefetch
+    // ACK. First-chunk admit must not CacheFullBlocks those pages: they are
+    // empty until LoadBackDone.success, and a vanished object must not leave
+    // Device prefix hits for the next admit to reuse.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
     // the remote store, with no local Host block. Probe treats them as Host

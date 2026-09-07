@@ -210,8 +210,9 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
         ),
     ]
     scheduler = ts.Scheduler(cfg)
-    tokens = list(range(1, 5))
+    tokens = list(range(1, 9))
     hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    assert hashes, "grain-4 prompts need more than 4 tokens for a candidate prefix page"
     group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
     scheduler.register_storage_keys(group_ids, expanded, offsets)
 
@@ -220,7 +221,7 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
     assert plan.forward
     op = plan.forward[0]
     assert list(op.extend_prefix_lens) == [0]
-    assert list(op.input_lengths) == [4]
+    assert list(op.input_lengths) == [8]
     assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
 
 

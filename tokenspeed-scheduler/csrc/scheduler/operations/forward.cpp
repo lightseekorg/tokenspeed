@@ -35,6 +35,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "cache/core/cache_types.h"
 #include "cache/tier/transfer.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
@@ -71,6 +72,15 @@ bool admitsLikeNewPrompt(const Request& request) {
 bool holdsHeadOfLine(const Request& request) {
     const auto* prefilling = request.GetIf<fsm::Prefilling>();
     return prefilling != nullptr && !prefilling->TailCheckpointReserved();
+}
+
+bool prefixHashPrefetchesFromStorage(std::span<const BlockTransfer> load_pairs, const std::string& content_hash) {
+    for (const BlockTransfer& transfer : load_pairs) {
+        if (transfer.prefetch_from_storage && transfer.key.content_hash == content_hash) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <typename Operation>
@@ -501,8 +511,18 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     if (!match.extension_hashes.empty()) {
-        coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
-                                     admission->device_prefix_tokens / prefix_granularity);
+        // Host-warm H2D destinations are already filled on Host. L3 prefetch
+        // destinations are empty until LoadBackDone.success, so publishing
+        // them here would leave Device prefix hits after a vanished object.
+        const std::int32_t first_extension_slot = admission->device_prefix_tokens / prefix_granularity;
+        for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
+            if (prefixHashPrefetchesFromStorage(admission->load_pairs, match.extension_hashes[i])) {
+                continue;
+            }
+            coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
+                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
+                                         CacheBoundaryKind::kChunk);
+        }
     }
     discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{

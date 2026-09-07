@@ -484,6 +484,8 @@ TEST(CacheOperationTest, FailedLoadBackDoesNotPublishPrefetchedHost) {
     transfers.CompleteLoadBack(op.op_id, false);
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_FALSE(coordinator.AcquireDeviceCachedBlock(key))
+        << "failed L3 prefetch must not leave empty Device prefix hits";
 }
 
 TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
@@ -511,6 +513,8 @@ TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
     LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
     transfers.CompleteLoadBack(op.op_id, true);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(key))
+        << "successful L3 prefetch must publish filled Device destinations";
 }
 
 TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
