@@ -110,11 +110,12 @@ def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
     tuner, calls = _install_fake_flashinfer(monkeypatch, metadata={})
 
     with autotune(
+        tune_mode=True,
         tuning_buckets=(64, 1, 2, 2),
         round_up=False,
     ):
         pass
-    with autotune(tune_mode=False, tuning_buckets=(1, 2, 4)):
+    with autotune(tune_mode=False, tuning_buckets=(1, 2, 4), round_up=None):
         pass
 
     assert calls == [
@@ -130,7 +131,7 @@ def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
     assert tuner._blocklist._invalid["bf16_gemm::TGVRunner"] == set(range(16, 29))
 
 
-def test_cache_roundtrip_and_miss(monkeypatch, tmp_path) -> None:
+def test_cache_roundtrip_and_load_failure(monkeypatch, tmp_path) -> None:
     tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
     monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
     path = flashinfer_autotune_cache_path({"model": "model-a"})
@@ -140,6 +141,14 @@ def test_cache_roundtrip_and_miss(monkeypatch, tmp_path) -> None:
     assert tuner.active
 
     assert not load_flashinfer_autotune_cache(str(tmp_path / "missing.json"), None, 0)
+    assert not tuner.active
+
+    def failed_load(path):
+        tuner.active = True
+        raise KeyError("malformed tactic")
+
+    monkeypatch.setattr(tuner, "load_configs", failed_load)
+    assert not load_flashinfer_autotune_cache(path, None, 0)
     assert not tuner.active
 
 

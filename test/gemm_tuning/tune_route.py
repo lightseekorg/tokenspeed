@@ -227,7 +227,7 @@ for n, k, label in SHAPES:
         for name, fns, o, ref in candidates(m, n, k):
             try:
                 if name in ("tgv", "ll_bf16"):
-                    with autotune(tuning_buckets=(m,), round_up=False):
+                    with autotune(tune_mode=True, tuning_buckets=(m,), round_up=False):
                         fns[0]()
                 with autotune(tune_mode=False, tuning_buckets=(m,), round_up=False):
                     fns[0]()

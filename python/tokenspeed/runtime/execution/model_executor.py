@@ -591,7 +591,7 @@ class ModelExecutor:
             int(self.config.chunked_prefill_size),
             int(self.config.context_len) * per_rank_max_batch,
         )
-        if num_tokens <= 0 or self.model_runner is None:
+        if self.model_runner is None:
             return
 
         set_autotune_max_num_tokens(num_tokens)
@@ -631,19 +631,20 @@ class ModelExecutor:
         set_autotune_process_group(cpu_group)
         try:
             with maybe_inference_mode():
-                with autotune():
-                    ctx = self.prefill_graph.make_dummy_batch(num_tokens)
-                    positions = (
-                        ib.mrope_positions_buf[:, :num_tokens]
-                        if self.config.model_is_mrope
-                        else ib.positions_buf[:num_tokens]
-                    )
-                    with active_forward(ctx):
-                        self.model_runner.forward(
-                            ctx=ctx,
-                            input_ids=ib.input_ids_buf[:num_tokens],
-                            positions=positions,
+                if num_tokens > 0:
+                    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+                        ctx = self.prefill_graph.make_dummy_batch(num_tokens)
+                        positions = (
+                            ib.mrope_positions_buf[:, :num_tokens]
+                            if self.config.model_is_mrope
+                            else ib.positions_buf[:num_tokens]
                         )
+                        with active_forward(ctx):
+                            self.model_runner.forward(
+                                ctx=ctx,
+                                input_ids=ib.input_ids_buf[:num_tokens],
+                                positions=positions,
+                            )
 
                 if not self.forward_step.disable:
                     # Separate contexts avoid combining sizes with static
@@ -651,6 +652,7 @@ class ModelExecutor:
                     for bs in decode_cases:
                         case_buckets = self._decode_autotune_buckets((bs,))
                         with autotune(
+                            tune_mode=True,
                             tuning_buckets=case_buckets,
                             round_up=False,
                         ):

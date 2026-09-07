@@ -166,9 +166,9 @@ def get_autotune_max_num_tokens() -> int:
 @contextlib.contextmanager
 def autotune(
     *,
-    tune_mode: bool = True,
-    tuning_buckets: tuple[int, ...] | None = None,
-    round_up: bool | None = None,
+    tune_mode: bool,
+    tuning_buckets: tuple[int, ...] | None,
+    round_up: bool | None,
 ) -> Generator[None]:
     """Enable kernel autotuning for the enclosed block, process-wide.
 
@@ -290,7 +290,7 @@ def load_flashinfer_autotune_cache(
         if _mirror_autotune_cache(path, payload, process_group, owner_rank):
             try:
                 loaded = bool(tuner.load_configs(path))
-            except (OSError, ValueError):
+            except Exception:
                 logger.warning(
                     "Could not load FlashInfer cache %s", path, exc_info=True
                 )
