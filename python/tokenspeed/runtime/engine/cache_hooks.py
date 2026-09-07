@@ -30,6 +30,9 @@ which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
 event may only advance once all ranks hold it). L3 Host backups complete
 asynchronously, so a rank-local ``WriteBackDone`` would ``CacheHostBlock``
 on one mirrored scheduler while a CP/PP peer still has the op pending.
+Every rank enters every replica-group gather, including with an empty
+intermediate intersection; skipping a later CP/PP ``all_gather_object``
+hangs ranks whose first group already agreed.
 ``poll_ready_events`` returns events for the event loop to apply —
 feedback into the scheduler stays an explicit ``advance_scheduler`` call
 in the loop body.
@@ -180,6 +183,13 @@ class L2CacheHooks:
         return bool(flag.item())
 
     def _pop_ready_payloads(self) -> list[dict]:
+        """Intersect pending completions across every replica group.
+
+        Attention TP, then CP, then PP, matching L3 exists / flush. Every
+        rank enters every ``all_gather_object``: an empty intermediate
+        intersection still gathers ``[]`` so a peer that is ready on a
+        later group is not left unmatched.
+        """
         ready_payloads = list(self._pending_payloads.values())
         for size, group in self._replica_groups:
             gathered_payloads = [None] * size
@@ -204,8 +214,6 @@ class L2CacheHooks:
                             for payload in ready_payloads
                         ],
                     )
-            if not ready_payloads:
-                break
 
         for payload in ready_payloads:
             self._pending_payloads.pop(cache_event_key(payload), None)

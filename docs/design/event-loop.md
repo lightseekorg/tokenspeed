@@ -300,7 +300,9 @@ For orientation, one iteration of `event_loop`:
   ``LoadBackDone`` completions are intersected the same way before
   ``CompleteWriteBack``: L3 Host backups finish asynchronously, so a
   rank-local ACK would publish a Host block on one mirrored scheduler
-  while a CP/PP peer still has the op pending. Weight-update `flush_cache`
+  while a CP/PP peer still has the op pending. Every rank stays in every
+  replica-group gather, even when an earlier TP/CP intersection is empty;
+  breaking out leaves a peer unmatched on the next ``all_gather_object``. Weight-update `flush_cache`
   and standalone `/flush_cache` MIN-reduce a non-mutating
   `can_clear_cache` probe across the replica, then MIN-reduce an
   error-returning L3 `remove_by_prefix`, before any rank mutates

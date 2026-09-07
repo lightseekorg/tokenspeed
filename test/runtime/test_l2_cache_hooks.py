@@ -285,7 +285,7 @@ def test_gather_order_is_attention_tp_then_cp_then_pp(
     assert events[0].op_id == 7
 
 
-def test_empty_tp_intersection_does_not_gather_cp_or_pp(
+def test_empty_tp_intersection_still_gathers_cp_and_pp(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
@@ -306,21 +306,29 @@ def test_empty_tp_intersection_does_not_gather_cp_or_pp(
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
+    gather_objs: list = []
+    peer_ready = [{"kind": "WriteBackDoneEvent", "op_id": 7}]
 
     def _all_reduce(tensor, op=None, group=None) -> None:
         del tensor, op, group
 
     def _all_gather_object(output, obj, group=None) -> None:
         gather_groups.append(group)
+        gather_objs.append(list(obj))
         output[0] = list(obj)
-        output[1] = []
+        # TP peer has not finished; CP/PP peers whose TP group already
+        # agreed still enter the later gathers.
+        output[1] = [] if group is tp_group else peer_ready
 
     _install_collectives(
         monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
     )
 
     assert hooks.poll_ready_events() == []
-    assert gather_groups == [tp_group]
+    assert gather_groups == [tp_group, cp_group, pp_group]
+    assert len(gather_objs[0]) == 1
+    assert gather_objs[1] == []
+    assert gather_objs[2] == []
     assert ("WriteBackDoneEvent", 7) in hooks._pending_payloads
 
 

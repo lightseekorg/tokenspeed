@@ -371,7 +371,9 @@ Its responsibilities:
   `LoadBackDone` are intersected across every cache-owning rank
   (attention TP, then CP, then PP; not DP) before `CompleteWriteBack`: a
   finished local backup must not `CacheHostBlock` on one mirrored
-  scheduler while a CP/PP peer still has the op pending. A later Host
+  scheduler while a CP/PP peer still has the op pending. Every rank
+  stays in every replica-group gather even when an earlier intersection
+  is empty, so a peer that is ready on CP/PP is not left unmatched. A later Host
   miss that is known to exist in L3 allocates
   a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
