@@ -27,13 +27,15 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
@@ -79,7 +81,7 @@ def _dflash2_mla_rope(config: Any) -> tuple[float, dict[str, Any] | None]:
     return rope_theta, scaling
 
 
-def _grouped_conv(
+def _grouped_conv_torch(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
     base: torch.Tensor,
@@ -88,7 +90,7 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
-    """Apply DFlash2's grouped dynamic depthwise convolution to flat blocks."""
+    """Torch reference for the grouped conv; CUDA rows take the Triton kernel."""
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     output = coefficients[:, 0] * blocks
@@ -105,6 +107,23 @@ def _grouped_conv(
     return output.flatten(-2)
 
 
+def _grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    """Apply DFlash2's grouped dynamic depthwise convolution to flat blocks."""
+    if hidden_states.is_cuda:
+        return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
+    return _grouped_conv_torch(
+        hidden_states, delta, base, block_size, num_groups, group_size, taps
+    )
+
+
 class DFlashGroupedConv(nn.Module):
     """Official DFlash2 grouped convolution, kept as ordinary PyTorch nodes."""
 
@@ -115,6 +134,7 @@ class DFlashGroupedConv(nn.Module):
         group_size: int,
         block_size: int,
         params_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -132,11 +152,15 @@ class DFlashGroupedConv(nn.Module):
         self.base_kernel = nn.Parameter(
             torch.empty(2, self.taps, hidden_size, dtype=params_dtype)
         )
-        self.kernel_projection = nn.Linear(
+        # The repo's linear layer, not nn.Linear: this projection is the
+        # drafter's most frequent GEMM and only this path consults the
+        # measured decode-GEMV route.
+        self.kernel_projection = ReplicatedLinear(
             hidden_size,
             2 * self.taps * self.num_groups,
             bias=False,
-            dtype=params_dtype,
+            params_dtype=params_dtype,
+            prefix=add_prefix("kernel_projection", prefix),
         )
 
     def _convolve(
@@ -153,7 +177,7 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)[0].reshape(
             hidden_states.shape[0], 2, self.taps, self.num_groups
         )
         return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
@@ -197,6 +221,7 @@ class CandidateSelector(nn.Module):
         rank: int,
         top_k: int,
         params_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if rank < 1:
@@ -212,8 +237,12 @@ class CandidateSelector(nn.Module):
         self.successor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype)
         )
-        self.hidden_projection = nn.Linear(
-            hidden_size, rank, bias=False, dtype=params_dtype
+        self.hidden_projection = ReplicatedLinear(
+            hidden_size,
+            rank,
+            bias=False,
+            params_dtype=params_dtype,
+            prefix=add_prefix("hidden_projection", prefix),
         )
 
     def forward(
@@ -223,7 +252,8 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        hidden = self.hidden_projection(hidden_states)
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        hidden = self.hidden_projection(flat)[0].view(*hidden_states.shape[:-1], -1)
         return _score_edges(
             self.predecessor_codebook,
             self.successor_codebook,
@@ -233,6 +263,25 @@ class CandidateSelector(nn.Module):
             anchor_token_ids,
             self.top_k,
         )
+
+
+def _reduce_norm(
+    norm: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    tp: MappingBase,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a shard-local partial, then norm.
+
+    Deliberately the unfused path, matching
+    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
+    from the target's shapes and the draft's block forward is a different
+    width. This puts the reduction where that fusion can absorb it once it has
+    been verified at this width.
+    """
+    if tp.tp_size <= 1:
+        return norm(hidden_states, residual)
+    return norm(all_reduce(hidden_states, tp.tp_group), residual)
 
 
 class DFlash2DecoderLayer(DFlashDecoderLayer):
@@ -301,53 +350,58 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             group_size=int(_dflash2_config_value(config, "conv_group_size")),
             block_size=int(_dflash2_config_value(config, "block_size")),
         )
-        self.attention_conv = DFlashGroupedConv(**conv_args)
-        self.mlp_conv = DFlashGroupedConv(**conv_args)
+        self.attention_conv = DFlashGroupedConv(
+            **conv_args, prefix=add_prefix("attention_conv", prefix)
+        )
+        self.mlp_conv = DFlashGroupedConv(
+            **conv_args, prefix=add_prefix("mlp_conv", prefix)
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if ctx.forward_mode.is_idle():
-            return super().forward(
-                positions, hidden_states, ctx, out_cache_loc, residual
-            )
+            return super().forward(positions, hidden_states, ctx, residual)
 
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            # Borrowed vocab-parallel embeddings are shard-local partials. The
-            # grouped conv needs a complete hidden row, while every later layer
-            # already receives the all-reduced output of the preceding MLP
-            # conv. Reduce exactly once, at the first draft layer.
-            if self.layer_id == 0 and self.mapping.dense.tp_size > 1:
-                hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            # Every layer is handed a shard-local partial: borrowed
+            # vocab-parallel embeddings at layer 0, the preceding MLP conv
+            # afterwards. The conv is linear in its input and its coefficients
+            # come from an already-reduced hidden, so the reduction commutes
+            # with it and lands here, where the norm can absorb it.
+            hidden_states, residual = _reduce_norm(
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.mapping.dense,
+            )
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         attention_kwargs = dict(
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         if self.comm_manager is not None:
             attention_kwargs["comm_manager"] = self.comm_manager
         hidden_states = self.self_attn(**attention_kwargs)
-        if self.mapping.attn.tp_size > 1:
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+        hidden_states, residual = _reduce_norm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+            self.mapping.attn,
+        )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self.mapping.dense.tp_size > 1:
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
         return hidden_states, residual
 
@@ -381,7 +435,22 @@ class DFlash2DraftModel(DFlashDraftModel):
             rank=int(_dflash2_config_value(config, "selector_rank")),
             top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,
+            prefix=add_prefix("candidate_selector", prefix),
         )
+
+    def final_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The last layer hands back its MLP conv's partial; reduce it here."""
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = _reduce_norm(
+            self.norm,
+            hidden_states,
+            residual,
+            self.mapping.dense,
+        )
+        return hidden_states
 
     @property
     def _uses_mla(self) -> bool:

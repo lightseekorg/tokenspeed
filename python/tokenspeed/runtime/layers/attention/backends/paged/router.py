@@ -774,6 +774,14 @@ class CacheGroupRouter(AttentionBackend):
         )
 
     @property
+    def supports_layer_sliding_window(self) -> bool:
+        # A window dropped by any leaf is a window dropped, so this is all().
+        return bool(self.leaves) and all(
+            getattr(leaf, "supports_layer_sliding_window", False)
+            for leaf in self.leaves.values()
+        )
+
+    @property
     def data_type(self):
         return self._sole_leaf("data_type").data_type
 

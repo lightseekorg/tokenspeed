@@ -117,9 +117,9 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --moe-backend flashinfer_trtllm \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path nvidia/MiniMax-M3-DSpark \
-    --speculative-num-steps 7 \
+    --speculative-num-steps 8 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 8 \
+    --speculative-num-draft-tokens 9 \
     --disable-kvstore \
     --block-size 128 \
     --trust-remote-code \
@@ -129,11 +129,13 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
 
 Notes:
 
-- Launch this checkpoint with `--speculative-num-draft-tokens 8` and
-  `--speculative-num-steps 7`: the verify window is one anchor row plus seven
-  draft queries, and the step count is always the verify width minus one. The
-  width is checked against the checkpoint's `block_size` at startup, so a
-  mismatched launch fails fast instead of drafting a wrong-width block.
+- This checkpoint's `block_size` is 8, and a DSpark `block_size` is the drafted
+  token count, so launch it with `--speculative-num-steps 8` and
+  `--speculative-num-draft-tokens 9`: the verify window is one anchor row plus
+  eight draft queries. Both widths are checked against the checkpoint at
+  startup, so a mismatched launch fails fast instead of drafting a wrong-width
+  block. See [Speculative Decoding](../configuration/server.md#speculative-decoding)
+  for the DSpark and DFlash conventions.
 - `--block-size 128` is the target's MSA page size. The draft writes its KV at
   the target's cache locations and shares the target's page table, so it
   inherits that page size; do not set a separate draft block size.
@@ -146,10 +148,12 @@ Notes:
 - The draft checkpoint stores fp32 master weights. It is loaded in the target's
   dtype rather than the standalone fp32-to-fp16 default, because the two
   exchange hidden states and share the target's embedding and LM head.
-- Measured on 4x GB200 with the launch above: gsm8k `mean_acc` 0.9727 versus
-  0.9773 without speculative decoding (paired disagreement 3 vs 9, McNemar
-  p ~ 0.15 -- within run-to-run noise), at a mean accepted length of 4.99 of 8
-  and about 1.7x decode throughput at 16 concurrent requests.
+- Measured on 4x GB200 at an 8-wide verify window (`--speculative-num-steps 7
+  --speculative-num-draft-tokens 8`, one row narrower than this checkpoint
+  calls for): gsm8k `mean_acc` 0.9727 versus 0.9773 without speculative
+  decoding (paired disagreement 3 vs 9, McNemar p ~ 0.15 -- within run-to-run
+  noise), at a mean accepted length of 4.99 of 8 and about 1.7x decode
+  throughput at 16 concurrent requests.
 
 ## Kimi K2.5 / K2.6
 
@@ -205,16 +209,28 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
   --port 8000
 ```
 
-Known limitation: native TokenSpeed DFlash currently uses full-history draft
-attention. It does not yet expose an equivalent of SGLang's
-`--speculative-dflash-draft-window-size`; add such a flag before relying on
-bounded draft attention for long-context deployments.
+Known limitation: native TokenSpeed DFlash bounds draft attention only where the
+draft checkpoint's `layer_types` declare `sliding_attention`; every other layer
+reads the full history. It does not yet expose an equivalent of SGLang's
+`--speculative-dflash-draft-window-size`, so a checkpoint that declares no
+window cannot be bounded at launch for long-context deployments.
 
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
 `--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
-candidate selector are enabled automatically from the draft architecture.
-Draft proposals greedily follow the selector's transition-conditioned path,
-independent of the target sampling backend.
+candidate selector are enabled automatically from the draft architecture. On
+GPU each convolution runs as a single fused Triton kernel; the torch node graph
+stays as the CPU reference. An MLA DFlash2 draft also writes its context KV
+through one stacked projection plus one fused norm/RoPE/scatter launch, which
+lets that write overlap the draft forward and accumulate as the target
+produces each captured layer. The server logs at INFO which of those paths it
+took, and why when it declined one.
+Draft proposals greedily follow the selector's transition-conditioned path.
+Candidate selection takes each vocabulary shard's local top-k and gathers only
+those, instead of gathering whole logits rows, whenever the head's shards carry
+no padding or added tokens.
+A request's `temperature`, `top_k` and `top_p` are applied by the target's
+verification step, never by the proposal, so the served distribution is the
+target's whatever the drafter proposed.
 
 ## Kimi K3
 
@@ -249,6 +265,12 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
+- A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
+  backend that applies per-layer sliding windows: `--drafter-attention-backend
+  mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
+  which walks the KV from the window rather than from token zero, and fall back
+  to the portable Triton kernel anywhere its shape gate does not hold. The
+  draft's full-attention layer is unaffected either way.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head;
   it must not be padded with an eighth, unused mask row.

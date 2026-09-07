@@ -26,6 +26,8 @@ def _run_mla_decode(
     page_size: int = 16,
     draft_block_decode: bool = False,
     sliding_window_size: int = -1,
+    query_blocks: bool = False,
+    block_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     captured = {}
 
@@ -36,19 +38,29 @@ def _run_mla_decode(
     monkeypatch.setattr(
         mla_backend, "mla_decode_with_kvcache", fake_mla_decode_with_kvcache
     )
+    monkeypatch.setattr(
+        mla_backend,
+        "supports_mla_decode_query_blocks",
+        lambda **kwargs: query_blocks,
+    )
     backend = object.__new__(mla_backend.MLAAttnBackend)
-    metadata_rows = bs * q_len_per_req if draft_block_decode else bs
+    spec = block_size or q_len_per_req
+    metadata_rows = bs * spec if draft_block_decode else bs
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    block_seq_lens = seq_lens
     if draft_block_decode:
-        seq_lens = seq_lens.repeat_interleave(q_len_per_req)
+        seq_lens = seq_lens.repeat_interleave(spec)
     backend.forward_decode_metadata = SimpleNamespace(
         num_extends=0,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
         seq_lens=seq_lens,
+        # Built once per forward alongside the expanded rows above.
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=block_seq_lens,
     )
     backend.is_draft = is_draft
     backend.draft_block_decode = draft_block_decode
-    backend.spec_num_tokens = q_len_per_req if draft_block_decode else 1
+    backend.spec_num_tokens = spec if draft_block_decode else 1
     backend.max_context_len = 256
     backend.kernel_page_size = page_size
     backend.kv_lora_rank = 2
@@ -57,6 +69,7 @@ def _run_mla_decode(
     backend.kv_cache_dim = 4
     backend.data_type = data_type
     backend.kernel_solution = None
+    backend._query_block_decode = {}
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
@@ -124,3 +137,135 @@ def test_dflash2_block_decode_passes_exact_sliding_window(monkeypatch):
     assert captured["window_left"] == 4095
     assert captured["noncausal_block_size"] == 8
     assert captured["q"].shape[0] == 16
+
+
+def test_a_windowed_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monkeypatch):
+    """One row per request instead of one per block position, same mask.
+
+    The flattened metadata repeats each request's page table and block-end
+    length once per block position, so the un-expanded rows are the request.
+    Folding is only correct because of that, and only allowed when a kernel
+    says it reads the query-axis form.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        sliding_window_size=4095,
+        query_blocks=True,
+    )
+
+    assert captured["q"].shape[:2] == (2, 8)
+    assert captured["page_table"].shape[0] == 2
+    assert captured["cache_seqlens"].tolist() == [64, 128]
+    assert captured["noncausal_block_size"] == 8
+    assert captured["window_left"] == 4095
+
+
+def test_a_full_attention_block_layer_folds_on_the_same_terms(monkeypatch):
+    """The layout follows the kernel, not the mask.
+
+    A draft mixes windowed and full-attention layers over one metadata buffer,
+    so both ask the same question and a windowless layer folds whenever a
+    kernel reads that form.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        sliding_window_size=-1,
+        query_blocks=True,
+    )
+
+    assert captured["q"].shape[:2] == (2, 8)
+    assert captured["page_table"].shape[0] == 2
+    assert captured["window_left"] == -1
+
+
+def test_a_block_layer_keeps_the_flattened_rows_when_no_kernel_reads_the_fold(
+    monkeypatch,
+):
+    """Declining leaves the contract every other configuration has always sent."""
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        sliding_window_size=4095,
+        query_blocks=False,
+    )
+
+    assert captured["q"].shape[:2] == (16, 1)
+    assert captured["page_table"].shape[0] == 16
+
+
+def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkeypatch):
+    """Un-expanding is only valid on the stride the metadata was built with.
+
+    ``resolve_speculative_num_tokens`` reconciles the draft's forward width
+    with its block for every drafter in tree, so this is the arithmetic's
+    guard rather than a live configuration: a forward narrower than its block
+    would stride into the next request's rows.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=7,
+        draft_block_decode=True,
+        sliding_window_size=-1,
+        query_blocks=True,
+        block_size=8,
+    )
+    assert captured["q"].shape[:2] == (14, 1)
+    assert captured["noncausal_block_size"] == 8
+
+
+def test_the_metadata_carries_the_fold_the_layers_used_to_re_derive() -> None:
+    """Hoisted out of the per-layer path; it must still be the same rows.
+
+    The block entries are the per-request rows repeated ``spec`` times, so the
+    rows the fold reads have to equal every ``spec``-th expanded entry -- which
+    is exactly what the per-layer strided copy used to compute.
+    """
+    bs, spec, pages = 2, 4, 3
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.spec_num_tokens = spec
+    backend.max_context_len = 256
+    backend.max_num_pages = pages
+    backend.draft_block_decode = True  # block_decode_active/_expansion derive
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
+
+    page_table = torch.arange(bs * pages, dtype=torch.int32).view(bs, pages)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
+    backend.fill_block_decode_seq_lens(bs, seq_lens)
+    metadata = backend.forward_decode_metadata
+
+    torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
+    torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens[0::spec])
+
+
+def test_the_cutedsl_drafter_backend_never_reaches_the_shared_dispatcher() -> None:
+    """The K3 DSpark gate runs ``--drafter-attention-backend tokenspeed_mla``.
+
+    That backend calls the CuteDSL decode kernel directly and never imports
+    ``mla_decode_with_kvcache``, so which kernel the shared dispatcher selects
+    is not a variable for that configuration -- registering a new candidate
+    there cannot reach it.
+    """
+    from tokenspeed.runtime.layers.attention.backends import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    assert not hasattr(cutedsl_backend, "mla_decode_with_kvcache")
+    assert hasattr(cutedsl_backend, "tokenspeed_mla_decode")

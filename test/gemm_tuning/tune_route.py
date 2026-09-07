@@ -38,6 +38,7 @@ Emits the MEASURED_ROUTE dict for ops/gemm/routed_gemv.py.
 
 from __future__ import annotations
 
+import collections
 import json
 import sys
 
@@ -96,6 +97,23 @@ SHAPE_SETS = {
         ],
         list(range(1, 33)),
     ),
+    # Kimi-K3 DFlash2 block drafter at TP8. The five draft layers run
+    # M = batch * 8 and the selector and head run M = batch * 7, so the
+    # served M reaches well past the 32 the other sets stop at.
+    "k3_dflash2_tp8": (
+        [
+            (1792, 7168, 10, "conv_kernel_proj"),
+            (2112, 7168, 0, "fused_qkv_a"),
+            (1536, 1536, 5, "q_b_proj"),
+            (7168, 1024, 5, "o_proj"),
+            (3584, 7168, 5, "gate_up_proj"),
+            (7168, 1792, 5, "down_proj"),
+            (256, 7168, 1, "selector_hidden_proj"),
+            (7168, 35840, 1, "context_fc"),
+            (20480, 7168, 1, "lm_head"),
+        ],
+        list(range(1, 9)) + [16, 24, 32, 40, 64],
+    ),
     "qwen38_next_tp2": (
         [
             (512, 2560, 0, "n512_k2560"),
@@ -112,10 +130,19 @@ SHAPE_SETS = {
 }
 SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]
 NUM_COPIES = 8
+# FlashInfer's BF16 backends, and the ones that refuse pdl=True outright.
+FI_BACKENDS = ("cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl")
+_FI_NO_PDL = frozenset({"cutlass", "cublaslt", "cutile"})
+# Only these can be dispatched by ops/gemm/routed_gemv; the rest are measured
+# so the field is visible, but cannot be written into the table.
+ROUTABLE = frozenset({"skinny", "tgv", "ll_bf16"})
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.
 MARGIN = 1.04
-BACKENDS = ("cublas", "rowcta", "skinny", "tgv", "ll_bf16")
+# BF16 accumulation order differs per kernel; 2% clears that without admitting
+# a kernel that computed the wrong thing.
+REL_TOL = 0.02
+BACKENDS = ("cublas", "rowcta", "skinny", "ll_bf16", *FI_BACKENDS)
 
 
 def timed(fns, iters: int = 96, rounds: int = 41) -> float:
@@ -192,17 +219,29 @@ def candidates(m: int, n: int, k: int):
 
     try:
         from flashinfer import mm_bf16
-
-        bias = torch.zeros(n, device="cuda", dtype=torch.bfloat16)
-
-        def tg(i):
-            return lambda: mm_bf16(
-                xs[i], ws[i].t(), bias=bias, pdl=True, backend="tgv", out=o
-            )
-
-        yield "tgv", [tg(i) for i in range(NUM_COPIES)], o, ref
     except ImportError:
-        pass
+        mm_bf16 = None
+    if mm_bf16 is not None:
+        # Only TGV needs a bias operand; routed_gemv keeps a zero one for it.
+        # Handing that same bias to the others would measure a shape serving
+        # never asks for -- cuDNN alone runs 2-3x slower with it.
+        bias = torch.zeros(n, device="cuda", dtype=torch.bfloat16)
+        # Every backend the wheel declares, each at the PDL setting it accepts.
+        # cutlass/cublaslt/cutile REJECT pdl=True rather than ignoring it, so
+        # asking them the way tgv is asked scores a raised exception as a loss
+        # and drops them from the field silently. Measured on GB300: pdl=True
+        # is 1.15-1.36x faster wherever it is allowed, so the others are asked
+        # with pdl=False rather than skipped.
+        for be in FI_BACKENDS:
+            pdl = be not in _FI_NO_PDL
+            operand = bias if be == "tgv" else None
+
+            def fi(i, be=be, pdl=pdl, operand=operand):
+                return lambda: mm_bf16(
+                    xs[i], ws[i].t(), bias=operand, pdl=pdl, backend=be, out=o
+                )
+
+            yield be, [fi(i) for i in range(NUM_COPIES)], o, ref
 
     from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_mm, ll_bf16_mm_supported
 
@@ -215,6 +254,7 @@ def candidates(m: int, n: int, k: int):
 
 
 route: dict[str, str] = {}
+refusals: dict[str, set[str]] = collections.defaultdict(set)
 per_step_gain: dict[int, float] = dict.fromkeys(MS, 0.0)
 print(f"cold-L2 sweep: {NUM_COPIES} weight copies per backend")
 print(f"{'call site':<18}{'NxK':>12} {'M':>2}  ", end="")
@@ -228,14 +268,25 @@ for n, k, calls, label in SHAPES:
             try:
                 fns[0]()
                 torch.cuda.synchronize()
-                err = (o.float() - ref).abs().max().item()
-                if err > 1.5:
+                # Relative, not absolute: at K=7168 the BF16 output's own
+                # rounding is already ~0.4% of a ~400-magnitude entry, so a
+                # fixed 1.5 discards correct results at the widest shapes.
+                err = (o.float() - ref).abs().max().item() / ref.abs().max().item()
+                if err > REL_TOL:
                     times[name] = None
+                    refusals[name].add(f"wrong result (rel {err:.3f})")
                     continue
                 times[name] = timed(fns)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # Record why, so a backend that never competes is a decision
+                # rather than a blank cell. See the legend printed at the end.
                 times[name] = None
-        ok = {t: v for t, v in times.items() if v is not None and t != "cublas"}
+                refusals[name].add(f"{type(exc).__name__}: {str(exc)[:70]}")
+        ok = {
+            t: v
+            for t, v in times.items()
+            if v is not None and t != "cublas" and t in ROUTABLE
+        }
         best = min(ok, key=ok.get) if ok else None
         cells = "  ".join(
             f"{times.get(t):8.3f}" if isinstance(times.get(t), float) else f"{'-':>8}"
@@ -260,6 +311,12 @@ for n, k, calls, label in SHAPES:
             )
 
 print()
+if refusals:
+    print("backends that never produced a number, and why:")
+    for name in sorted(refusals):
+        for why in sorted(refusals[name]):
+            print(f"  {name:<10} {why}")
+    print()
 if any(c for _, _, c, _ in SHAPES):
     # A step runs one M, so the widths are mutually exclusive and never summed.
     for m in MS:

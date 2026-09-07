@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
@@ -48,6 +49,10 @@ from tokenspeed.runtime.layers.logits_processor import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    read_checkpoint_block_size,
+    validate_block_widths,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -67,17 +72,24 @@ def _resolve_aux_hidden_stream(cfg) -> str:
     return str(stream or "prefix").lower()
 
 
-def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
+def _resolve_block_geometry(
+    cfg, spec_num_tokens: int, spec_algorithm: str = "DFLASH"
+) -> tuple[int, int]:
     """Resolve (verify_width, draft_block_size) for a block drafter.
 
-    ``spec_num_tokens`` is the verify width: one anchor row plus one row per
-    drafted token, so ``draft_block_size = spec_num_tokens - 1``.
+    Args:
+        cfg: The draft model's config.
+        spec_num_tokens: The verify width, one anchor row plus one row per
+            drafted token, so ``draft_block_size = spec_num_tokens - 1``.
+        spec_algorithm: ``"DFLASH"`` or ``"DSPARK"``; selects which
+            ``block_size`` convention the checkpoint is held to.
 
-    A checkpoint's ``block_size`` is ambiguous across the two lineages that
-    write it. TorchSpec/DSpark checkpoints store the *draft* count (7), while
-    older DFlash checkpoints store the *verify* width (8). Accept either and
-    reject anything that matches neither, rather than warning and continuing
-    with a silently wrong block.
+    Returns:
+        ``(verify_width, draft_block_size)``.
+
+    Raises:
+        ValueError: The verify width leaves no room for a draft, or the
+            checkpoint was trained at a different block size.
     """
     verify_width = int(spec_num_tokens)
     if verify_width < 2:
@@ -87,22 +99,10 @@ def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
         )
     draft_block_size = verify_width - 1
 
-    dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-    ckpt_block_size = (
-        dflash_cfg.get("block_size") if isinstance(dflash_cfg, dict) else None
-    )
-    if ckpt_block_size is None:
-        ckpt_block_size = getattr(cfg, "block_size", None)
-    if ckpt_block_size is not None and int(ckpt_block_size) not in (
-        draft_block_size,
-        verify_width,
-    ):
-        raise ValueError(
-            f"Block size mismatch: checkpoint block_size={int(ckpt_block_size)} "
-            f"is neither the draft block size ({draft_block_size}) nor the "
-            f"verify width ({verify_width}) implied by "
-            f"--speculative-num-draft-tokens {verify_width}. Launch with "
-            f"--speculative-num-draft-tokens {int(ckpt_block_size) + 1}."
+    ckpt_block_size = read_checkpoint_block_size(cfg)
+    if ckpt_block_size is not None:
+        validate_block_widths(
+            spec_algorithm, ckpt_block_size, draft_block_size, verify_width
         )
     return verify_width, draft_block_size
 
@@ -120,6 +120,7 @@ class DFlash(BaseDrafter):
 
     supports_pd_layerwise_finalization = True
     sample_from_anchor = False
+    spec_algorithm = "DFLASH"
 
     def __init__(
         self,
@@ -171,7 +172,7 @@ class DFlash(BaseDrafter):
             )
         self.mask_token_id = int(mask_token_id)
         self.verify_width, self.draft_block_size = _resolve_block_geometry(
-            cfg, int(spec_num_tokens)
+            cfg, int(spec_num_tokens), self.spec_algorithm
         )
         self.draft_query_width = _resolve_draft_query_width(
             self.verify_width, self.sample_from_anchor
@@ -181,11 +182,48 @@ class DFlash(BaseDrafter):
         self.hidden_size = int(getattr(cfg, "hidden_size"))
         self.idle_forward_steps = 1
         self._init_native_buffers()
+        self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    def _validate_draft_attention_window(self) -> None:
+        """Reject a drafter backend that would drop the draft's window.
+
+        A backend that ignores a layer's ``sliding_window_size`` answers with
+        full-history attention instead, which raises nothing and shows up only
+        as wrong draft hidden states. Ask the built layers, not the config:
+        only the layers know whether this draft family applies the window.
+
+        Raises:
+            ValueError: The draft declares a window the backend cannot apply.
+        """
+        if getattr(self.attn_backend, "supports_layer_sliding_window", False):
+            return
+        windows = {
+            int(window)
+            for window in (
+                getattr(module, "sliding_window_size", None)
+                for module in self.model.modules()
+            )
+            if window is not None and int(window) >= 0
+        }
+        if not windows:
+            return
+        backend_name = (
+            self.draft_model_runner.server_args.drafter_attention_backend
+            or type(self.attn_backend).__name__
+        )
+        raise ValueError(
+            "The draft's attention layers declare a sliding window "
+            f"(window_left={sorted(windows)}), but the {backend_name!r} drafter "
+            "attention backend ignores per-layer sliding windows and would "
+            "silently give those layers full-history attention. Launch with "
+            "--drafter-attention-backend mla ('gluon' on AMD) for MLA drafts, "
+            "or one of mha/fa3/fa4/triton/flashinfer/trtllm_mha for GQA drafts."
+        )
 
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
@@ -534,48 +572,30 @@ class DFlash(BaseDrafter):
             self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
             return
 
-        hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
-        pos_chunks = torch.split(positions, lengths.detach().cpu().tolist(), dim=0)
-        loc_chunks = torch.split(cache_locs, lengths.detach().cpu().tolist(), dim=0)
-
-        selected_hidden = []
-        selected_positions = []
-        selected_cache_locs = []
-        new_seq_lens = torch.empty((bs,), dtype=torch.int32, device=self.device)
-
-        for row, (chunk, pos_chunk, loc_chunk) in enumerate(
-            zip(hidden_chunks, pos_chunks, loc_chunks, strict=True)
-        ):
-            if row < base_ctx.num_extends:
-                take = int(chunk.shape[0])
-            else:
-                take = int(accept_lengths[row].item())
-            if take <= 0:
-                pool_idx = req_pool_indices[row]
-                new_seq_lens[row] = self.runtime_states.valid_cache_lengths[pool_idx]
-                continue
-
-            chunk = chunk[:take].contiguous()
-            pos_chunk = pos_chunk[:take].contiguous()
-            loc_chunk = loc_chunk[:take].contiguous()
-            selected_hidden.append(chunk)
-            selected_positions.append(pos_chunk)
-            selected_cache_locs.append(loc_chunk)
-            new_seq_lens[row] = (pos_chunk[-1] + 1).to(torch.int32)
-
-        self.draft_seq_lens_buf[:bs].copy_(new_seq_lens)
-        if not selected_hidden:
+        if base_ctx.input_num_tokens == 0:
             return
 
-        target_hidden = torch.cat(selected_hidden, dim=0)
-        target_positions = torch.cat(selected_positions, dim=0)
-        target_cache_locs = torch.cat(selected_cache_locs, dim=0)
-        self._write_native_cache(
-            target_hidden,
-            target_positions,
-            target_cache_locs,
-            decode_only=decode_only,
+        # Which rows a request kept is a device-side fact, and slicing per
+        # request to drop the rejected ones cost one device-to-host sync per
+        # request. Write every row instead: a rejected row lands past its
+        # request's new valid length, exactly where the CUDA-graph decode path
+        # above already leaves it, and a later round overwrites that slot.
+        starts = torch.cumsum(lengths, 0) - lengths
+        takes = lengths.clone()
+        if bs > base_ctx.num_extends:
+            takes[base_ctx.num_extends :] = (
+                accept_lengths[base_ctx.num_extends : bs]
+                .to(torch.int64)
+                .clamp(min=0, max=self.spec_num_tokens)
+            )
+        last_row = (starts + takes - 1).clamp(min=0, max=base_ctx.input_num_tokens - 1)
+        old_lens = self.runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices
+        ).to(torch.int32)
+        self.draft_seq_lens_buf[:bs].copy_(
+            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
         )
+        self._write_native_cache(hidden, positions, cache_locs, decode_only=decode_only)
 
     def _write_native_cache(
         self,
@@ -612,6 +632,7 @@ class DFlash(BaseDrafter):
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache at construction."""
         self._fused_kv_enabled = False
+        self._fused_kv_is_mla = False
         self._fused_kv_workspace_capacity = 0
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
@@ -630,9 +651,17 @@ class DFlash(BaseDrafter):
             layers = self.draft_model_runner.model.layers
             if not layers:
                 return
+            if getattr(self.draft_model_runner.model, "_uses_mla", False):
+                self._init_fused_kv_helper_mla(layers)
+                return
             first_attn = layers[0].self_attn
             is_neox = bool(getattr(first_attn.rotary_emb, "is_neox_style", True))
             if not is_neox:
+                logger.info(
+                    "DFLASH fused KV materialization disabled: this draft's RoPE "
+                    "is interleaved (is_neox_style=False), which the stacked "
+                    "GQA kernel does not implement."
+                )
                 return
 
             from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -643,8 +672,16 @@ class DFlash(BaseDrafter):
                     getattr(attn.qkv_proj, "quant_method", None),
                     UnquantizedLinearMethod,
                 ):
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: the draft's "
+                        "QKV projection is quantized."
+                    )
                     return
                 if not hasattr(attn.qkv_proj, "weight"):
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: the draft's "
+                        "QKV projection exposes no dense weight to stack."
+                    )
                     return
 
             num_kv_heads = int(first_attn.num_kv_heads)
@@ -745,6 +782,136 @@ class DFlash(BaseDrafter):
                 e,
             )
             self._fused_kv_enabled = False
+            self._fused_kv_is_mla = False
+
+    def _init_fused_kv_helper_mla(self, layers) -> None:
+        """Stack the MLA draft's latent KV projection and cache planes.
+
+        Every layer's ``fused_qkv_a_proj_with_mqa`` weight contributes its KV
+        half to one ``[hidden, n_layers * (kv_lora + rope)]`` buffer, so
+        context injection becomes one GEMM plus one Triton launch instead of a
+        per-layer chain of slices, norms, RoPE and scatters.
+        """
+        from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+        from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+
+        def decline(reason: str) -> None:
+            logger.info("DFLASH fused MLA KV write disabled: %s", reason)
+
+        pool = self.token_to_kv_pool
+        if not isinstance(pool, MLATokenToKVPool):
+            return decline("the draft KV pool is not an MLA latent pool")
+        if type(pool).set_mla_kv_buffer is not MLATokenToKVPool.set_mla_kv_buffer:
+            # An override adds something this write does not reproduce, and
+            # fusing past it would drop that silently.
+            return decline(f"{type(pool).__name__} overrides the latent write")
+        if getattr(pool, "quant_method", "none") == "per_token_head":
+            return decline("the latent cache is per-token-head quantized")
+
+        first_attn = layers[0].self_attn
+        rotary = getattr(first_attn, "rotary_emb", None)
+        if rotary is None:
+            return decline("the draft's latent RoPE tables are missing")
+        kv_lora_rank = int(first_attn.kv_lora_rank)
+        rope_dim = int(first_attn.qk_rope_head_dim)
+        kv_width = kv_lora_rank + rope_dim
+        if int(rotary.cos_sin_cache.shape[-1]) != rope_dim:
+            return decline("the RoPE table does not cover the whole latent tail")
+
+        ws_dtype = self.draft_model_runner.model.fc.weight.dtype
+        weight_rows, norm_rows, eps_values, latent_buffers = [], [], [], []
+        for layer in layers:
+            attn = layer.self_attn
+            fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+            weight = getattr(fused, "weight", None)
+            if weight is None or weight.dtype != ws_dtype:
+                return decline("the latent down-projection is quantized")
+            if not isinstance(
+                getattr(fused, "quant_method", None), UnquantizedLinearMethod
+            ):
+                return decline("the latent down-projection is quantized")
+            if getattr(attn, "rotary_emb", None) is not rotary:
+                return decline("the draft's layers do not share one RoPE table")
+            start = int(attn.q_lora_rank)
+            weight_rows.append(weight[start : start + kv_width])
+            norm_rows.append(attn.kv_a_layernorm.weight)
+            eps_values.append(float(attn.kv_a_layernorm.variance_epsilon))
+            latent_buffers.append(pool.get_key_buffer(attn.attn_mqa.layer_id))
+
+        plane = latent_buffers[0]
+        if plane.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            return decline(f"latent cache dtype {plane.dtype} is not writable here")
+        if any(
+            buffer.shape[-1] != kv_width
+            or buffer.stride(-1) != 1
+            or buffer.numel() // buffer.shape[0] != kv_width
+            or buffer.stride(0) != plane.stride(0)
+            for buffer in latent_buffers
+        ):
+            return decline("latent cache planes are not uniform dense rows")
+
+        n_layers = len(layers)
+        self._fused_kv_n_layers = n_layers
+        self._fused_kv_layer_out_dim = kv_width
+        self._fused_kv_flat_weight_t = torch.cat(weight_rows, dim=0).t().contiguous()
+        self._fused_kv_k_norm_weight = torch.stack(norm_rows, dim=0).contiguous()
+        self._fused_kv_eps = torch.tensor(
+            eps_values, dtype=torch.float32, device=self.device
+        )
+        self._fused_kv_cos_sin_cache = rotary.cos_sin_cache.to(self.device)
+        self._fused_kv_is_neox = bool(getattr(rotary, "is_neox_style", True))
+        self._fused_kv_sanitize = bool(pool.latent_write_sanitizes)
+        self._fused_kv_latent_dtype = plane.dtype
+        self._fused_kv_latent_row_stride = int(plane.stride(0))
+        self._fused_kv_latent_ptrs = torch.tensor(
+            [buffer.data_ptr() for buffer in latent_buffers],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
+        self._fused_kv_proj_workspace = torch.empty(
+            (max_total_ctx, n_layers * kv_width), dtype=ws_dtype, device=self.device
+        )
+        self._fused_kv_workspace_capacity = max_total_ctx
+        self._fused_kv_workspace_dtype = ws_dtype
+        self._fused_kv_is_mla = True
+        self._fused_kv_enabled = True
+        logger.info(
+            "DFLASH fused MLA KV write enabled. "
+            "n_layers=%d, kv_lora_rank=%d, rope_dim=%d, cache_dtype=%s",
+            n_layers,
+            kv_lora_rank,
+            rope_dim,
+            plane.dtype,
+        )
+
+    def _write_native_cache_fused_mla(
+        self,
+        ctx_hidden: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_cache_locs: torch.Tensor,
+    ) -> None:
+        """One stacked GEMM plus one norm+RoPE+scatter launch for all layers."""
+        total_ctx = int(ctx_hidden.shape[0])
+        self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
+        proj_out = self._fused_kv_proj_workspace[:total_ctx]
+        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out)
+        mla_latent_norm_rope_scatter(
+            proj_out.view(
+                total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
+            ),
+            self._fused_kv_k_norm_weight,
+            self._fused_kv_eps,
+            self._fused_kv_cos_sin_cache,
+            target_positions,
+            target_cache_locs,
+            self._fused_kv_latent_ptrs,
+            self._fused_kv_latent_row_stride,
+            self._fused_kv_latent_dtype,
+            is_neox=self._fused_kv_is_neox,
+            sanitize=self._fused_kv_sanitize,
+        )
 
     def _init_incremental_proj(self) -> None:
         self._incremental_proj_enabled = False
@@ -905,10 +1072,16 @@ class DFlash(BaseDrafter):
     ) -> None:
         """Fused KV materialization for decode-only batches.
 
-        One stacked GEMM for all 6 layers' K|V projection, then one Triton
+        One stacked GEMM for every layer's K|V projection, then one Triton
         kernel for fused RMSNorm + RoPE + direct scatter into KV pool.
-        Total: 1 GEMM + 1 Triton launch.
+        Total: 1 GEMM + 1 Triton launch, in either the GQA or MLA layout.
         """
+        if self._fused_kv_is_mla:
+            self._write_native_cache_fused_mla(
+                ctx_hidden, target_positions, target_cache_locs
+            )
+            return
+
         layers = self.draft_model_runner.model.layers
         if not self._fused_kv_enabled:
             for layer in layers:
