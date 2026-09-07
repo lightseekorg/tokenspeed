@@ -242,6 +242,19 @@ bool Scheduler::ClearCache() {
     return clearCache(true);
 }
 
+bool Scheduler::CanClearCache() const {
+    return cacheIsClearable(true);
+}
+
+bool Scheduler::cacheIsClearable(bool include_host) const {
+    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_pd_transfers || has_tier_transfers) {
+        return false;
+    }
+    return coordinator_.CacheIsClearable(include_host);
+}
+
 bool Scheduler::clearCache(bool include_host) {
     // A live request's pages are protected by their pins, and the coordinator
     // completes its pin check before mutating anything -- so residency is not

@@ -178,6 +178,9 @@ public:
     // Clears both Device and Host prefix indexes. Returns false without
     // mutation when either tier still has a pinned cached block.
     bool ClearCache();
+    // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
+    // include_host selects both tiers (Host is a no-op without a host pool).
+    bool CacheIsClearable(bool include_host) const;
 
     struct StoreCandidate {
         CacheKey key;
@@ -258,6 +261,8 @@ private:
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                             std::uint64_t access_epoch);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    bool deviceCacheIsClearable() const;
+    bool hostCacheIsClearable() const;
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);

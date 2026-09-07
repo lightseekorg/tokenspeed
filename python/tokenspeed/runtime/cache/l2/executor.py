@@ -79,6 +79,7 @@ class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
     backup_pages: list[StoragePage] = []
+    success: bool = True
 
 
 def _num_host_lcm_blocks(
@@ -208,7 +209,8 @@ class L2CacheExecutor:
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
-        self._ready_load_op_ids: list[int] = []
+        self._ready_load_acks: list[tuple[int, bool]] = []
+        self._l3_prefetch_ok: dict[StoragePage, bool] = {}
         self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
         self._l3_workers: ThreadPoolExecutor | None = None
 
@@ -293,10 +295,15 @@ class L2CacheExecutor:
         self._start_writing(op_ids, transfers, write_pages)
 
     def submit_load_backs(self, plan) -> None:
-        """Launch the plan's H2D loads; runs after the plan's page zeroing."""
+        """Launch the plan's H2D loads; runs after the plan's page zeroing.
+
+        L3 ``batch_get_into`` runs on the control plane before this is
+        queued. Failed prefetch pages skip H2D so later FIFO work (including
+        forward) cannot attend over empty destinations as if the copy ran.
+        """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
-        prefetch_pages: list[StoragePage] = []
+        prefetch_ok = True
         for operation in plan.cache:
             if isinstance(operation, Cache.LoadBackOp):
                 self._append_transfers(
@@ -308,16 +315,21 @@ class L2CacheExecutor:
                     transfers=transfers,
                     source_is_device=False,
                 )
-                prefetch_pages.extend(
-                    self._storage_pages(
-                        operation,
-                        host_is_destination=False,
-                        prefetch_only=True,
-                    )
+                prefetch_pages = self._storage_pages(
+                    operation,
+                    host_is_destination=False,
+                    prefetch_only=True,
                 )
-        if prefetch_pages:
-            self._prefetch_from_storage(prefetch_pages)
-        load_index = self._start_loading(op_ids, transfers)
+                if prefetch_pages and not all(
+                    self._l3_prefetch_ok.get(page, False) for page in prefetch_pages
+                ):
+                    prefetch_ok = False
+        if not prefetch_ok:
+            self._start_loading(op_ids, [], success=False)
+            for tracker, _ in self._load_trackers:
+                tracker.set_consumers(-1)
+            return
+        load_index = self._start_loading(op_ids, transfers, success=True)
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
 
@@ -382,16 +394,71 @@ class L2CacheExecutor:
                 )
         return pages
 
-    def _prefetch_from_storage(self, pages: Sequence[StoragePage]) -> None:
+    def prefetch_l3_load_backs(self, plan) -> bool:
+        """Fill Host pages from L3 on the control plane. Returns False on miss.
+
+        ``batch_get_into`` is CPU work against the already-allocated Host
+        pages. Existence is not a lease: an object can vanish after
+        ``batch_exists`` and before this get. Callers MIN-reduce the result
+        across the replica before H2D or forward.
+        """
+        pages = self._plan_prefetch_pages(plan)
+        if not pages:
+            self._l3_prefetch_ok = {}
+            return True
+        results = self._prefetch_from_storage(pages)
+        if len(results) != len(pages):
+            raise RuntimeError(
+                "L3 prefetch result is not aligned with Host pages: "
+                f"ok_flags={len(results)} pages={len(pages)}"
+            )
+        self._l3_prefetch_ok = dict(zip(pages, results))
+        return all(results)
+
+    def invalidate_l3_prefetch(self) -> None:
+        """Force later H2D to skip every L3 source in this plan."""
+        self._l3_prefetch_ok = {
+            page: False for page in getattr(self, "_l3_prefetch_ok", {})
+        }
+
+    def plan_has_l3_prefetch(self, plan) -> bool:
+        return bool(self._plan_prefetch_pages(plan))
+
+    def l3_prefetch_storage_keys(self, plan) -> tuple[list[int], list[str], list[int]]:
+        groups: list[int] = []
+        hashes: list[str] = []
+        offsets: list[int] = []
+        for (
+            group_id,
+            _host_page,
+            content_hash,
+            page_offset,
+        ) in self._plan_prefetch_pages(plan):
+            groups.append(int(group_id))
+            hashes.append(str(content_hash))
+            offsets.append(int(page_offset))
+        return groups, hashes, offsets
+
+    def _plan_prefetch_pages(self, plan) -> list[StoragePage]:
+        pages: list[StoragePage] = []
+        for operation in plan.cache:
+            if isinstance(operation, Cache.LoadBackOp):
+                pages.extend(
+                    self._storage_pages(
+                        operation,
+                        host_is_destination=False,
+                        prefetch_only=True,
+                    )
+                )
+        return pages
+
+    def _prefetch_from_storage(self, pages: Sequence[StoragePage]) -> list[bool]:
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
             raise RuntimeError(
                 "LoadBack requested L3 prefetch but no storage backend is configured"
             )
-        results = l3_store.prefetch(pages)
-        if not all(results):
-            missed = [page for page, ok in zip(pages, results) if not ok]
-            raise RuntimeError(f"L3 prefetch failed for {len(missed)} Host page(s)")
+        return list(l3_store.prefetch(pages))
 
     def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
         l3_store = getattr(self, "l3_store", None)
@@ -490,6 +557,7 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
+        success: bool,
     ) -> int | None:
         if not op_ids:
             return None
@@ -498,7 +566,7 @@ class L2CacheExecutor:
         op_ids = _ordered_unique(op_ids)
         if not transfers:
             with self._ack_lock:
-                self._ready_load_op_ids.extend(op_ids)
+                self._ready_load_acks.extend((op_id, success) for op_id in op_ids)
             return None
         if self.attn_tp_rank == 0:
             logger.info(
@@ -588,15 +656,18 @@ class L2CacheExecutor:
         if finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
         with self._ack_lock:
-            self._load_acks.append(_Ack(finish, op_ids))
+            self._load_acks.append(_Ack(finish, op_ids, success=success))
         return load_index
 
     def poll_results(self) -> list:
         with self._ack_lock:
             results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
             self._ready_write_op_ids.clear()
-            results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
-            self._ready_load_op_ids.clear()
+            results.extend(
+                self._load_done(op_id, success)
+                for op_id, success in self._ready_load_acks
+            )
+            self._ready_load_acks.clear()
             ready_writes, self._write_acks[:] = self._split_ready(self._write_acks)
             self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
         for ack in ready_writes:
@@ -673,7 +744,7 @@ class L2CacheExecutor:
         pending = []
         for ack in queue:
             if ack.finish_event.query():
-                results.extend(done(op_id) for op_id in ack.op_ids)
+                results.extend(done(op_id, ack.success) for op_id in ack.op_ids)
             else:
                 pending.append(ack)
         return pending
@@ -685,9 +756,10 @@ class L2CacheExecutor:
         return event
 
     @staticmethod
-    def _load_done(op_id: int):
+    def _load_done(op_id: int, success: bool):
         event = Cache.LoadBackDoneEvent()
         event.op_id = op_id
+        event.success = success
         return event
 
     def shutdown(self) -> None:
@@ -719,6 +791,7 @@ class L2CacheExecutor:
         self._write_acks.clear()
         self._load_acks.clear()
         self._ready_write_op_ids.clear()
-        self._ready_load_op_ids.clear()
+        self._ready_load_acks.clear()
+        self._l3_prefetch_ok.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()

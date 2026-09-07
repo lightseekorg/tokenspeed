@@ -152,7 +152,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id);
+    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 
 }  // namespace tokenspeed

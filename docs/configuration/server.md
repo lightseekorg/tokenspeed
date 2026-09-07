@@ -327,12 +327,16 @@ width (`cp_size`), and any
 speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
-reject, and the update RPC then fails so the caller retries instead of
-serving new weights against the previous checkpoint. Flush success is
-MIN-reduced across cache-owning ranks in the replica (attention TP, then
-CP, then PP; not DP) before any rank enters the NCCL weight broadcasts:
-an L3 writeback still in flight on one rank must not leave its peers
-inside `update_weights_from_distributed` alone. Supplying a new
+reject. Weight-update `flush_cache` MIN-reduces a non-mutating
+`can_clear_cache` probe across cache-owning ranks in the replica
+(attention TP, then CP, then PP; not DP) before any rank clears, so a
+rank whose writebacks have drained cannot rotate L3 while a peer still
+rejects. The update RPC then fails so the caller retries instead of
+serving new weights against the previous checkpoint or entering NCCL
+weight broadcasts alone. A `batch_exists` hit is not a lease: if
+`batch_get_into` misses after Admit, the runtime unregisters the key,
+skips publishing empty Host pages, and aborts the batch so the next
+admit computes those tokens. Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the
 new checkpoint. Flushed L3 updates require an explicit `weight_version`;

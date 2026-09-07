@@ -31,6 +31,10 @@ struct WriteBackDone {
 
 struct LoadBackDone {
     std::uint32_t op_id{0};
+    // False when L3 prefetch did not fill the Host sources. CompleteLoadBack
+    // must not CacheHostBlock empty pages; default true so existing ACKs
+    // still publish a successful Host restore.
+    bool success{true};
 };
 
 };  // namespace cache

@@ -125,13 +125,13 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     }
 }
 
-void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
+void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
     auto it = load_backs_.find(op_id);
     if (it == load_backs_.end()) {
         return;
     }
     for (BlockTransfer& transfer : it->second) {
-        if (transfer.prefetch_from_storage && transfer.source) {
+        if (success && transfer.prefetch_from_storage && transfer.source) {
             coordinator_.CacheHostBlock(transfer.source, transfer.key);
         }
     }

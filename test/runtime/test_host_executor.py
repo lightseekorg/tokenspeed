@@ -52,30 +52,34 @@ class CacheEventPayloadTest(unittest.TestCase):
         self.to_payload = cache_event_to_payload
         self.pop_common = pop_common_cache_event_payloads
 
-    def test_cache_completion_payload_round_trip_has_no_failure_channel(self):
-        for event_type in (
-            self.Cache.WriteBackDoneEvent,
-            self.Cache.LoadBackDoneEvent,
-        ):
-            with self.subTest(event_type=event_type.__name__):
-                event = event_type()
-                event.op_id = 7
+    def test_cache_completion_payload_round_trips_load_back_success(self):
+        write_back = self.Cache.WriteBackDoneEvent()
+        write_back.op_id = 7
+        write_payload = self.to_payload(write_back)
+        self.assertEqual(write_payload, {"kind": "WriteBackDoneEvent", "op_id": 7})
 
-                payload = self.to_payload(event)
-
-                self.assertEqual(
-                    payload,
-                    {
-                        "kind": event_type.__name__,
-                        "op_id": 7,
-                    },
-                )
-                self.assertEqual(
-                    self.pop_common([[payload], [dict(payload)]]), [payload]
-                )
-                restored = self.from_payload(payload)
-                self.assertIsInstance(restored, event_type)
-                self.assertEqual(int(restored.op_id), 7)
+        load_back = self.Cache.LoadBackDoneEvent()
+        load_back.op_id = 8
+        load_back.success = False
+        load_payload = self.to_payload(load_back)
+        self.assertEqual(
+            load_payload,
+            {"kind": "LoadBackDoneEvent", "op_id": 8, "success": False},
+        )
+        restored = self.from_payload(load_payload)
+        self.assertIsInstance(restored, self.Cache.LoadBackDoneEvent)
+        self.assertEqual(int(restored.op_id), 8)
+        self.assertFalse(restored.success)
+        default_load = self.Cache.LoadBackDoneEvent()
+        default_load.op_id = 9
+        default_payload = self.to_payload(default_load)
+        self.assertEqual(
+            default_payload,
+            {"kind": "LoadBackDoneEvent", "op_id": 9, "success": True},
+        )
+        self.assertEqual(
+            self.pop_common([[load_payload], [dict(load_payload)]]), [load_payload]
+        )
 
 
 class GroupAwareWireTest(unittest.TestCase):
@@ -302,7 +306,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
-        executor._ready_load_op_ids = []
+        executor._ready_load_acks = []
         executor._load_acks = []
         executor.load_stream = object()
         executor.transfer_backend = "dma"
@@ -324,7 +328,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "transfer_cache_ranges"),
             patch.object(executor_module.logger, "info") as log_info,
         ):
-            executor._start_loading([9], [(0, 2, 1), (0, 5, 4)])
+            executor._start_loading([9], [(0, 2, 1), (0, 5, 4)], success=True)
 
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
@@ -342,7 +346,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._verifier = None
         executor.attn_tp_rank = 0
-        executor._ready_load_op_ids = []
+        executor._ready_load_acks = []
         executor._load_acks = []
         executor.load_stream = object()
         executor.transfer_backend = "auto"
@@ -380,7 +384,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module.device_module, "Event", side_effect=finishes),
             patch.object(executor_module, "transfer_cache_ranges") as transfer,
         ):
-            executor._start_loading([9], [(0, 2, 1)])
+            executor._start_loading([9], [(0, 2, 1)], success=True)
 
         workspace.load_range_batches.assert_called_once_with(layer_ranges)
         workspace.commit_ranges.assert_called_once_with(3, device, non_blocking=True)
@@ -466,7 +470,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._write_acks = []
         executor._load_acks = []
         executor._ready_write_op_ids = []
-        executor._ready_load_op_ids = []
+        executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
         executor.l3_store = Mock()
@@ -506,7 +510,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._write_acks = []
         executor._load_acks = []
         executor._ready_write_op_ids = []
-        executor._ready_load_op_ids = []
+        executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
         executor.l3_store = Mock()
@@ -539,7 +543,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertIsNotNone(raised)
         self.assertRegex(str(raised), "L3 backup failed")
 
-    def test_prefetch_failure_raises(self):
+    def test_prefetch_failure_returns_false(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
@@ -548,8 +552,30 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor.l3_store = Mock()
         executor.l3_store.prefetch.return_value = [True, False]
-        with self.assertRaisesRegex(RuntimeError, "L3 prefetch failed"):
-            executor._prefetch_from_storage([(0, 1, "h0", 0), (0, 2, "h1", 0)])
+        self.assertEqual(
+            executor._prefetch_from_storage([(0, 1, "h0", 0), (0, 2, "h1", 0)]),
+            [True, False],
+        )
+
+    def test_failed_prefetch_acks_unsuccessful_without_h2d(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._ready_write_op_ids = []
+        executor._ready_load_acks = []
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._backup_futures = []
+        executor.l3_store = None
+        self.assertIsNone(executor._start_loading([9], [], success=False))
+        events = executor.poll_results()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(int(events[0].op_id), 9)
+        self.assertFalse(events[0].success)
 
     def test_shutdown_persists_completed_d2h_before_closing_l3(self):
         try:
@@ -678,6 +704,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
+            success=True,
         )
         self.assertIsNotNone(load_index)
         pool.load_tracker.set_consumers(load_index)
@@ -727,7 +754,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         device.fill_(0xEE)
         torch.cuda.synchronize()
         load_index = executor._start_loading(  # pylint: disable=protected-access
-            [9], [(0, 2, 1)]
+            [9], [(0, 2, 1)], success=True
         )
         self.assertIsNotNone(load_index)
         target_pool.load_tracker.set_consumers(load_index)

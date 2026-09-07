@@ -153,6 +153,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
+            success=True,
         )
         self.assertIsNotNone(load_index)
         pool.load_tracker.set_consumers(load_index)

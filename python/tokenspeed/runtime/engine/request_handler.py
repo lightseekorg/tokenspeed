@@ -112,6 +112,7 @@ class RequestHandler:
         recv_func,
         send_func,
         clear_cache_fn=None,
+        can_clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
@@ -192,6 +193,7 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
+        self.can_clear_cache_fn = can_clear_cache_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -373,17 +375,26 @@ class RequestHandler:
         indexes with no rollback. A failed flush keeps the previous
         checkpoint intact so the caller can retry.
 
-        Flush success is rank-local until MIN-reduced across the replica.
-        An L3 writeback can still be in flight on one TP/CP/PP rank after
-        it has completed on the others; those successful ranks must not
-        enter ``update_weights_from_distributed`` (ordered NCCL broadcasts)
+        Rank-local ``ClearCache`` is all-or-nothing, but a replica can still
+        split: one rank with no in-flight writebacks would clear and rotate
+        L3 while a peer rejects. Agree that every cache-owning rank can
+        clear (MIN-reduce) before any rank mutates. An L3 writeback can
+        still be in flight on one TP/CP/PP rank after it has completed on
+        the others; those successful ranks must not enter
+        ``update_weights_from_distributed`` (ordered NCCL broadcasts)
         while a peer skips it.
         """
 
         if not recv_req.flush_cache:
             return True, ""
-        local_ok = self.clear_cache_fn is not None and self.clear_cache_fn()
+        local_ok = self.can_clear_cache_fn is not None and self.can_clear_cache_fn()
         if not self._converge_replica_decision(local_ok):
+            return (
+                False,
+                "cache flush failed; retry the update after in-flight "
+                "Host writebacks drain",
+            )
+        if self.clear_cache_fn is None or not self.clear_cache_fn():
             return (
                 False,
                 "cache flush failed; retry the update after in-flight "
@@ -416,6 +427,11 @@ class RequestHandler:
                 buf, op=torch.distributed.ReduceOp.MIN, group=group
             )
         return bool(buf.item())
+
+    def converge_replica_decision(self, local_ok: bool) -> bool:
+        """Public replica MIN-reduce for control-plane yes/no decisions."""
+
+        return self._converge_replica_decision(local_ok)
 
     def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
         """Publish under the new checkpoint after a successful GPU load.

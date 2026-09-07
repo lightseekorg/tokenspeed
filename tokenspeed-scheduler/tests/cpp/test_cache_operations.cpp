@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
@@ -454,6 +455,61 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
     ASSERT_EQ(admission->load_pairs.size(), 1u);
     EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
     EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
+}
+
+TEST(CacheOperationTest, FailedLoadBackDoesNotPublishPrefetchedHost) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.RegisterStorageKeys(std::array{key});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+
+    TierTransferManager transfers(coordinator);
+    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    transfers.CompleteLoadBack(op.op_id, false);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
+}
+
+TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.RegisterStorageKeys(std::array{key});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+
+    TierTransferManager transfers(coordinator);
+    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    transfers.CompleteLoadBack(op.op_id, true);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
 }
 
 TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {

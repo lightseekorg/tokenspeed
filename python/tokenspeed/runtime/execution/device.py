@@ -440,6 +440,42 @@ class DeviceHandle:
             return None
         return l2.l3_exists(pages)
 
+    def plan_has_l3_prefetch(self, execution_plan) -> bool:
+        """True when this plan's load-backs need ``batch_get_into``."""
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        return l2.plan_has_l3_prefetch(execution_plan)
+
+    def prefetch_l3_load_backs(self, execution_plan) -> bool:
+        """Fill Host pages from L3 on the control plane. CPU-only.
+
+        Returns False if any ``batch_get_into`` missed. Existence is not a
+        lease; the event loop MIN-reduces this across the replica before H2D.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return True
+        return l2.prefetch_l3_load_backs(execution_plan)
+
+    def invalidate_l3_prefetch(self) -> None:
+        """Skip H2D for this plan's L3 sources after a replica-wide miss."""
+
+        if self._l2 is not None:
+            self._l2.invalidate_l3_prefetch()
+
+    def l3_prefetch_storage_keys(
+        self, execution_plan
+    ) -> tuple[list[int], list[str], list[int]]:
+        """Content hashes this plan would restore from L3, for unregister."""
+
+        l2 = self._l2
+        if l2 is None:
+            return [], [], []
+        return l2.l3_prefetch_storage_keys(execution_plan)
+
     def rotate_l3_namespace(self) -> None:
         """Invalidate this process's view of objects published before clear."""
 

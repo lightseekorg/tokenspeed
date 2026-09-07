@@ -45,6 +45,7 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
+    make_abort_event,
     make_config,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
@@ -452,6 +453,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             clear_cache_fn=self._clear_cache,
+            can_clear_cache_fn=self._can_clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -619,6 +621,54 @@ class EventLoop:
             )
         if hit_groups:
             self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
+
+    def _recover_if_l3_prefetch_failed(self, execution_plan, forward_op) -> list:
+        """Drop vanished L3 keys and abort the batch instead of killing the runtime.
+
+        ``batch_exists`` is not a lease. After Admit, ``batch_get_into`` can
+        still miss. Prefetch on this control-plane turn, MIN-reduce across
+        the replica, then skip H2D / skip publishing empty Host pages and
+        abort so the next admit computes those tokens.
+        """
+
+        if not self._enable_l3_storage:
+            return []
+        if not self._device.plan_has_l3_prefetch(execution_plan):
+            return []
+        local_ok = self._device.prefetch_l3_load_backs(execution_plan)
+        if not self.request_handler.converge_replica_decision(local_ok):
+            self._device.invalidate_l3_prefetch()
+            groups, hashes, offsets = self._device.l3_prefetch_storage_keys(
+                execution_plan
+            )
+            if groups:
+                self.scheduler.unregister_storage_keys(groups, hashes, offsets)
+            aborted = []
+            if forward_op is not None:
+                for rid in forward_op.request_ids:
+                    self._abort_vanished_l3_request(rid)
+                    aborted.append(make_abort_event(rid))
+            logger.warning(
+                "L3 prefetch missed after admit; unregistered %s key(s) and "
+                "aborted %s request(s)",
+                len(groups),
+                len(aborted),
+            )
+            return aborted
+        return []
+
+    def _abort_vanished_l3_request(self, rid: str) -> None:
+        state = self.output_processor.rid_to_state.get(rid)
+        if state is None:
+            self._request_abort_or_mark(rid, "L3 object vanished before prefetch")
+            return
+        state.set_finish_with_abort(
+            "L3 object vanished before prefetch", notify_client=True
+        )
+        self.output_processor.reap_finished_orphan(rid, state)
+
+    def _can_clear_cache(self) -> bool:
+        return self.scheduler.can_clear_cache()
 
     def _clear_cache(self) -> bool:
         cleared = self.scheduler.clear_cache()
@@ -1103,6 +1153,7 @@ class EventLoop:
                 # An idle round (freeze or DP idle) runs no dispatch and no
                 # kv-transfer event poll.
                 idle_round = False
+                l3_prefetch_aborts = []
 
                 if self._pause.forward_blocked:
                     # Freeze: dispatched forwards can't be un-launched; commit them
@@ -1116,6 +1167,14 @@ class EventLoop:
                     self._cache_hooks.count_plan_ops(execution_plan)
 
                     forward_op = self._get_forward_op(execution_plan)
+                    l3_prefetch_aborts = self._recover_if_l3_prefetch_failed(
+                        execution_plan, forward_op
+                    )
+                    if l3_prefetch_aborts:
+                        # Replica-wide miss: skip the model forward so ranks
+                        # do not attend over empty dest pages. Cache ops still
+                        # run so LoadBackDone can unpin without publishing.
+                        forward_op = None
                     stats = self._get_scheduler_stats()
                     self.load_reporter.observe(stats, self._num_running())
                     num_iter_tokens = (
@@ -1196,6 +1255,10 @@ class EventLoop:
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
+
+                # Vanished-L3 abort events must reach the scheduler even when
+                # DP idled the model forward: the load-backs still ran.
+                request_changes.extend(l3_prefetch_aborts)
 
                 # The forward-result feedback point: everything this round
                 # committed reaches the scheduler here, before the next round

@@ -409,10 +409,13 @@ def cache_event_to_payload(event) -> dict:
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
-    return {
+    payload = {
         "kind": kind,
         "op_id": int(event.op_id),
     }
+    if kind == "LoadBackDoneEvent":
+        payload["success"] = bool(event.success)
+    return payload
 
 
 def cache_event_from_payload(payload: dict):
@@ -421,6 +424,8 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
+    if kind == "LoadBackDoneEvent":
+        event.success = bool(payload["success"])
     return event
 
 

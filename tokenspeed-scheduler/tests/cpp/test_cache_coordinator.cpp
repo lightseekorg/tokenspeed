@@ -480,7 +480,9 @@ TEST(CacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
     CacheForGroup(coordinator, device_pool, hashes[0], /*group_id=*/0);
     CacheForGroup(coordinator, host_pool, hashes[0], /*group_id=*/0);
 
+    ASSERT_TRUE(coordinator.CacheIsClearable(/*include_host=*/true));
     ASSERT_TRUE(coordinator.ClearCache());
+    EXPECT_TRUE(coordinator.CacheIsClearable(/*include_host=*/true));
     const CacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
     EXPECT_EQ(probe.device.num_common_tokens, 0);
     EXPECT_EQ(probe.host.num_common_tokens, 0);
@@ -499,9 +501,11 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutat
     CacheBlockRef pin = coordinator.AcquireDeviceCachedBlock(Key(hashes[0], /*group_id=*/0));
 
     EXPECT_FALSE(coordinator.ClearDeviceCache());
+    EXPECT_FALSE(coordinator.CacheIsClearable(/*include_host=*/false));
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
 
     pin.reset();
+    EXPECT_TRUE(coordinator.CacheIsClearable(/*include_host=*/false));
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 0);
 }

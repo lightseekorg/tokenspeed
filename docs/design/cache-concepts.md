@@ -379,12 +379,16 @@ Its responsibilities:
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
   object key. A live weight
   load flushes Device/Host first so new parameters cannot reuse the
-  previous checkpoint. `ClearCache` rejects in-flight Host writebacks
-  (pause drain does not wait for those); the RPC then fails before the
-  GPU load and the caller retries. Flush success is MIN-reduced across
-  the same cache-owning ranks as L3 exists (attention TP, then CP, then
-  PP; not DP) so a rank whose writebacks have drained cannot enter the
-  NCCL weight broadcasts while a peer is still flushing. After a
+  previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
+  (pause drain does not wait for those). Weight-update `flush_cache`
+  first MIN-reduces a non-mutating `CanClearCache` / `CacheIsClearable`
+  probe across the same cache-owning ranks as L3 exists (attention TP,
+  then CP, then PP; not DP) so no rank mutates Device/Host or rotates L3
+  until every replica agrees the indexes are clearable. Only then does
+  each rank call `ClearCache`. A failed probe or a failed clear keeps
+  the previous checkpoint intact and the caller retries; successful
+  ranks must not enter the NCCL weight broadcasts while a peer is still
+  flushing. After a
   successful flush and GPU
   load, the hashed prefix is rebuilt so new KV is not published under
   the previous checkpoint. An explicit new `weight_version` with
@@ -410,10 +414,16 @@ Its responsibilities:
   `register_storage_keys` / `unregister_storage_keys`. Immediately before
   `next_execution_plan`, the event loop re-probes `waiting_prefix_hashes`
   (Submitted and Retracted) so a queued hit cannot survive deletion,
-  eviction, or a lost object. That probe is skipped
-  when L3 is unset: Host-only and `--disable-kvstore` admission must not
-  hash prefixes or copy `group_keys` for a storage index that does not
-  exist. CI covers this path
+  eviction, or a lost object. That probe is not a lease: after Admit
+  allocates Host pages, `batch_get_into` can still miss. Prefetch runs
+  on the control plane (CPU, same as `batch_exists`), is MIN-reduced
+  across the replica, and a miss unregisters the keys, skips H2D /
+  skips publishing empty Host pages (`LoadBackDone.success=false`),
+  skips the model forward, and aborts the batch so the next admit
+  computes those tokens instead of terminating the runtime. Existence
+  and prefetch are skipped when L3 is unset: Host-only and
+  `--disable-kvstore` admission must not hash prefixes or copy
+  `group_keys` for a storage index that does not exist. CI covers this path
   with the in-process `memory` backend (scheduler tests register keys /
   evict Host then assert `prefetch_from_storage`, and the CUDA runtime suite
   round-trips packed Host bytes through `batch_put_from` / Host wipe /

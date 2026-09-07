@@ -200,7 +200,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
         .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
+        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
 
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -349,6 +350,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
+        .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
         .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
         .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))

@@ -45,11 +45,15 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.pp_size = 1
         handler.pp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
+        handler.can_clear_cache_fn = mock.Mock(return_value=True)
         return handler
 
     def test_successful_update_flushes_then_rebuilds_l3_prefix(self):
         handler = self._handler()
         order = []
+        handler.can_clear_cache_fn = mock.Mock(
+            side_effect=lambda: order.append("preflight") or True
+        )
         handler.clear_cache_fn = mock.Mock(
             side_effect=lambda: order.append("flush") or True
         )
@@ -73,7 +77,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
-        self.assertEqual(order, ["flush", "gpu", ("prefix", "v2")])
+        self.assertEqual(order, ["preflight", "flush", "gpu", ("prefix", "v2")])
         self.assertEqual(handler.server_args.weight_version, "v2")
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertIsInstance(output, UpdateWeightsFromDistributedReqOutput)
@@ -163,7 +167,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
     def test_rejected_flush_does_not_switch_l3_prefix(self):
         handler = self._handler()
-        handler.clear_cache_fn = mock.Mock(return_value=False)
+        handler.can_clear_cache_fn = mock.Mock(return_value=False)
+        handler.clear_cache_fn = mock.Mock(return_value=True)
         handler._device.update_weights.return_value = (True, "ok")
         req = UpdateWeightsFromDistributedReqInput(
             names=["w"],
@@ -175,7 +180,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
-        handler.clear_cache_fn.assert_called_once_with()
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
@@ -186,6 +192,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
     def test_missing_flush_handler_does_not_switch_l3_prefix(self):
         handler = self._handler()
+        handler.can_clear_cache_fn = None
         handler.clear_cache_fn = None
         handler._device.update_weights.return_value = (True, "ok")
         req = UpdateWeightsFromDistributedReqInput(
@@ -257,7 +264,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
             handler.process_requests([req])
 
         self.assertEqual(groups_seen, ["tp", "cp", "pp"])
-        handler.clear_cache_fn.assert_called_once_with()
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
@@ -305,7 +313,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler = self._handler()
         handler._replica_tp_size = 2
         handler._replica_tp_cpu_group = "tp"
-        handler.clear_cache_fn = mock.Mock(return_value=False)
+        handler.can_clear_cache_fn = mock.Mock(return_value=False)
+        handler.clear_cache_fn = mock.Mock(return_value=True)
         handler._device.update_weights.return_value = (True, "ok")
         req = UpdateWeightsFromDistributedReqInput(
             names=["w"],
@@ -319,6 +328,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
             handler.process_requests([req])
 
         self.assertEqual(groups_seen, ["tp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)

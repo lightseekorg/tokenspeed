@@ -68,6 +68,39 @@ bool CacheCoordinator::HasMambaStateGroup() const {
                                [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
 }
 
+bool CacheCoordinator::deviceCacheIsClearable() const {
+    for (const CacheGroup& group : groups_) {
+        const PrefixCacheIndex& index = group.Index();
+        if (static_cast<std::int32_t>(index.EvictableLocations(pool_).size()) != index.NumEntries(pool_)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CacheCoordinator::hostCacheIsClearable() const {
+    if (host_pool_ == nullptr) {
+        return true;
+    }
+    for (const CacheGroup& group : groups_) {
+        const PrefixCacheIndex& index = group.Index();
+        if (static_cast<std::int32_t>(index.EvictableLocations(*host_pool_).size()) != index.NumEntries(*host_pool_)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CacheCoordinator::CacheIsClearable(bool include_host) const {
+    if (!deviceCacheIsClearable()) {
+        return false;
+    }
+    if (!include_host) {
+        return true;
+    }
+    return hostCacheIsClearable();
+}
+
 bool CacheCoordinator::ClearDeviceCache() {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
     for (const CacheGroup& group : groups_) {

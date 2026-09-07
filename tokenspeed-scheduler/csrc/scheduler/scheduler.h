@@ -62,6 +62,9 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
+    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
+    // updates MIN-reduce this across the replica before any rank clears.
+    bool CanClearCache() const;
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -99,6 +102,7 @@ public:
 
 private:
     bool clearCache(bool include_host);
+    bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_prefix_hashes;
