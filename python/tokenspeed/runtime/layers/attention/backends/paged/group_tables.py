@@ -196,6 +196,10 @@ class GroupTableStacks:
         ``page_sizes`` mirror feeds the kernels; reading it back would sync)."""
         return int(self._specs[group_id].kernel_page_size)
 
+    def group_page_expansion(self, group_id: str) -> int:
+        """Return the validated block expansion used by this group's fill."""
+        return self._ratios[self._index[group_id]]
+
     def table(self, group_id: str, bs: int) -> torch.Tensor:
         """``[bs, max_num_pages]`` kernel page table view of one group."""
         i = self._index[group_id]

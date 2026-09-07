@@ -38,7 +38,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.specific.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
@@ -48,7 +47,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.attention.qsa.runtime import (
+    QSARuntime,
+    require_qsa_runtime,
+)
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -123,7 +125,7 @@ class QSAIndexer(nn.Module):
         # Draft QSA indexers can publish step-0 top-k through backend scratch
         # and reuse the target-aligned rows on later MTP steps.
         self.share_topk_for_mtp_iteration = False
-        self.qsa_coordinator: QSAAttnBackend | None = None
+        self.qsa_runtime: QSARuntime | None = None
         self._draft_scratch: dict[
             tuple[int, torch.device],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -137,16 +139,8 @@ class QSAIndexer(nn.Module):
         )
 
     @staticmethod
-    def _full_backend(ctx: ForwardContext) -> QSAAttnBackend:
-        """Return the registered QSA backend behind the optional hybrid node."""
-
-        backend = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
-        if not isinstance(backend, QSAAttnBackend):
-            raise RuntimeError(
-                "Qwen4-Exp QSA requires the qsa attention backend, got "
-                f"{type(backend).__name__}"
-            )
-        return backend
+    def _runtime(ctx: ForwardContext) -> QSARuntime:
+        return require_qsa_runtime(ctx.attn_backend)
 
     def _fields(self, pool):
         layer_id = pool._field_layer_id(self.layer_id)
@@ -197,9 +191,9 @@ class QSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return this layer's views into backend-owned verify staging."""
 
-        if self.qsa_coordinator is None:
+        if self.qsa_runtime is None:
             raise RuntimeError("QSA verify staging ran before indexers were bound")
-        return self.qsa_coordinator.verify_staging_buffers(
+        return self.qsa_runtime.verify_staging_buffers(
             self,
             token_k,
             position_values,
@@ -455,15 +449,15 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        router = self._full_backend(ctx)
+        runtime = self._runtime(ctx)
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
             and verify_bs > 0
-            and router.spec_num_tokens > 1
-            and not router.is_draft
+            and runtime.spec_num_tokens > 1
+            and not runtime.is_draft
         )
-        is_draft = router.is_draft
+        is_draft = runtime.is_draft
         is_draft_first_step = is_draft and ctx.draft_narrowing is not None
         is_draft_decode_step = (
             is_draft and ctx.draft_narrowing is None and ctx.forward_mode.is_decode()
@@ -479,7 +473,7 @@ class QSAIndexer(nn.Module):
                 None,
                 ctx.bs,
             )
-        layout = router.qsa_forward_layout(
+        layout = runtime.qsa_forward_layout(
             ctx,
             hidden_states.shape[0],
             compressed_token_page_size=self.compressed_token_page_size,
@@ -508,7 +502,7 @@ class QSAIndexer(nn.Module):
             )
         shared_topk = None
         if self.share_topk_for_mtp_iteration:
-            shared_topk = router.sparse_topk.decode
+            shared_topk = runtime.sparse_topk.decode
             if (
                 shared_topk is not None
                 and shared_topk.shape[0] < hidden_states.shape[0]
@@ -518,7 +512,7 @@ class QSAIndexer(nn.Module):
                 )
         verify_scratch = None
         if is_target_verify:
-            verify_tokens = verify_bs * router.spec_num_tokens
+            verify_tokens = verify_bs * runtime.spec_num_tokens
             if verify_tokens > token_k.shape[0]:
                 raise RuntimeError("QSA verify rows exceed the current input")
             verify_scratch = self._verify_staging_buffers(
@@ -555,14 +549,14 @@ class QSAIndexer(nn.Module):
             logical,
             requests,
             layout.qsa_page_table,
-            router.stacks.table(FULL_ATTENTION, ctx.bs),
+            layout.full_page_table,
             compressed,
-            full_page_size=router.stacks.group_kernel_page_size(FULL_ATTENTION),
+            full_page_size=layout.full_kernel_page_size,
             qsa_page_expansion=layout.qsa_page_expansion,
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:
-            router.sparse_topk.decode = selected_slots
+            runtime.sparse_topk.decode = selected_slots
         return selected_slots
 
 

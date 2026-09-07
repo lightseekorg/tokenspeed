@@ -217,7 +217,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     def _qsa_staging_bytes(self) -> int:
         """QSA target-verify staging, in closed form.
 
-        Mirrors ``QSAAttnBackend.preallocate_verify_workspace``: one
+        Mirrors ``QSARuntime.preallocate_verify_workspace``: one
         layer-major key buffer (model dtype) plus the three shared tensors
         (int64 positions, int64 logical positions, int32 recent locations),
         sized once for the verify batch bound and the single verify width.

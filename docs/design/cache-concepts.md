@@ -479,19 +479,24 @@ backend. The invariant is the division, not where any helper happens to sit:
 Two consequences worth remembering when touching this boundary:
 
 * **Whoever produces the metadata owns the group route.** `set_cache_pool`
-  binds the producer's `CacheGroupRouter`, whose `init_forward_metadata*`
+  binds the ordinary `CacheGroupRouter`, whose `init_forward_metadata*`
   owns table expansion, per-group write locations, and capture buffers. QSA
-  is a registered router subclass: it creates one MHA leaf per history group
-  and derives the indexer's layout directly from the router stacks. A wrapper
-  inserted above it must forward `set_cache_pool`; there is no parallel group
-  geometry on the model side.
+  is a registered paged leaf using MHA metadata. Its family runtime is
+  constructed once with the router and derives the indexer's layout from
+  resolved `group_view` results, including the full-history table used by
+  top-k selection. A wrapper inserted above it must forward `set_cache_pool`;
+  there is no parallel group geometry on the model side.
 * **Sparse addressing belongs to the consumer of the group.** DSA's index
   rows ride the history group's table and write locations, so its dense
   child stays a pure calculator. QSA's compressed/recent groups are
-  scheduler-owned cache groups with heterogeneous page sizes, so the QSA
-  backend consumes them through its router and MHA leaves — duplicating that
-  machinery in the model or hybrid wrapper would fork the single source of
-  truth the pipeline is built around.
+  scheduler-owned cache groups with heterogeneous page sizes. Their resolved
+  views go to the backend-owned QSA runtime; the compute leaf receives the
+  selected physical slots and its own KV write locations. Persisted QSA
+  fields stay in the cache recipe and LCM arena; the runtime owns only
+  derived layout and transient verification staging. Its staging is included
+  in `workspace_bytes` and preallocated before graph capture, even though
+  the model's indexers are bound later. Duplicating group conversion in the
+  runtime, model or hybrid wrapper would fork the single source of truth.
 
 ## Code placement
 
