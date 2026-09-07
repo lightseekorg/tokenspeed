@@ -31,7 +31,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_K_BLOCK,
-    CDNA4_SCALE_N_BLOCK,
 )
 
 # The gfx950 MXFP4 kernels are dominated by uint8 activation/weight/scale buffer
@@ -121,17 +120,11 @@ _SCALE_LOAD_MODES = ("bypass", "transpose", "swizzle")
 _SCALE_PRESHUFFLE_FACTOR = 32
 
 
-_SCALE_ASYNC_VEC = 4  # 32-bit, smallest direct-to-LDS unit on CDNA4.
-
-
 # Constants matching triton_kernels' CDNA4MXScaleLayout.
 _NON_K_PRESHUFFLE_BLOCK_SIZE = 32
 
 
 _ALIGN_K_SCALE_SWIZZLE = CDNA4_SCALE_K_BLOCK
-
-
-_ALIGN_N_SWIZZLE = CDNA4_SCALE_N_BLOCK
 
 
 # Inner reshape factor for the 7-D unswizzle: K_SCALE_pad must be a

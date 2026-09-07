@@ -60,6 +60,16 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     family = "qwen4_exp"
 
+    @cached_property
+    def _text_config(self):
+        return self.model_config.hf_text_config
+
+    @cached_property
+    def _draft_text_config(self):
+        if self.draft_model_config is None:
+            return None
+        return self.draft_model_config.hf_text_config
+
     @property
     @override
     def prefix_granularity(self) -> int:

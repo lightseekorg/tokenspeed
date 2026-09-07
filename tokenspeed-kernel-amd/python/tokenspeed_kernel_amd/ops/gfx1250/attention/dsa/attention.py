@@ -150,7 +150,7 @@ def _dsa_selected_dense_wmma_kernel(
         0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, q_rope_load_layout)
     )
     q_base = token.to(tl.int64) * stride_q_t
-    q_lora_val = gl.amd.gfx1250.buffer_load(
+    q_lora_val = gl.amd.cdna5.buffer_load(
         q,
         (
             q_base
@@ -160,7 +160,7 @@ def _dsa_selected_dense_wmma_kernel(
         mask=h_lora[:, None] < num_heads,
         other=0.0,
     )
-    q_rope_val = gl.amd.gfx1250.buffer_load(
+    q_rope_val = gl.amd.cdna5.buffer_load(
         q,
         (
             q_base
@@ -195,21 +195,21 @@ def _dsa_selected_dense_wmma_kernel(
         [2, 1, BLOCK_K],
         slot_shared_layout,
     )
-    lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    lora_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=kv_lora,
         shape=[total_slots, KV_LORA_RANK],
         strides=[stride_lora_t, 1],
         block_shape=[BLOCK_K, KV_LORA_RANK],
         layout=kv_lora_shared_layout,
     )
-    rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    rope_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=kv_rope,
         shape=[total_slots, QK_ROPE_HEAD_DIM],
         strides=[stride_rope_t, 1],
         block_shape=[BLOCK_K, QK_ROPE_HEAD_DIM],
         layout=k_rope_shared_layout,
     )
-    slot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    slot_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=topk_slots + token.to(tl.int64) * stride_topk_t,
         shape=[1, TOPK],
         strides=[stride_topk_t, 1],
@@ -233,27 +233,27 @@ def _dsa_selected_dense_wmma_kernel(
     split_tiles = tile_end - tile_start
 
     if tile_start < tile_end:
-        gl.amd.gfx1250.tdm.async_load(
+        gl.amd.cdna5.tdm.async_load(
             slot_desc, [0, tile_start * BLOCK_K], slot_buffers.index(0)
         )
-        gl.amd.gfx1250.tdm.async_load(
+        gl.amd.cdna5.tdm.async_load(
             slot_desc,
             [0, gl.minimum(tile_start + 1, tile_end - 1) * BLOCK_K],
             slot_buffers.index(1),
         )
-        gl.amd.gfx1250.tdm.async_wait(1)
+        gl.amd.cdna5.tdm.async_wait(1)
         slots = slot_buffers.index(0).reshape([BLOCK_K]).load(slot_layout)
         cur_valid = slots >= 0
         safe_slots = gl.where(cur_valid, slots, 0)
-        gl.amd.gfx1250.tdm.async_gather(lora_desc, safe_slots, lora_buffers.index(0))
-        gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slots, rope_buffers.index(0))
+        gl.amd.cdna5.tdm.async_gather(lora_desc, safe_slots, lora_buffers.index(0))
+        gl.amd.cdna5.tdm.async_gather(rope_desc, safe_slots, rope_buffers.index(0))
         buffer_index: tl.int32 = 0
 
         # Slot loads run one tile ahead of the two KV gathers.  Keeping three
         # TDM operations outstanding mirrors the AITER gfx1250 FIFO schedule.
         for tile in tl.range(0, split_tiles - 1):
             next_buffer = 1 - buffer_index
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 slot_desc,
                 [
                     0,
@@ -261,31 +261,31 @@ def _dsa_selected_dense_wmma_kernel(
                 ],
                 slot_buffers.index(tile % 2),
             )
-            gl.amd.gfx1250.tdm.async_wait(3)
+            gl.amd.cdna5.tdm.async_wait(3)
             next_slots = (
                 slot_buffers.index((tile + 1) % 2).reshape([BLOCK_K]).load(slot_layout)
             )
             next_valid = next_slots >= 0
             safe_next_slots = gl.where(next_valid, next_slots, 0)
-            gl.amd.gfx1250.tdm.async_gather(
+            gl.amd.cdna5.tdm.async_gather(
                 lora_desc, safe_next_slots, lora_buffers.index(next_buffer)
             )
-            gl.amd.gfx1250.tdm.async_gather(
+            gl.amd.cdna5.tdm.async_gather(
                 rope_desc, safe_next_slots, rope_buffers.index(next_buffer)
             )
-            gl.amd.gfx1250.tdm.async_wait(3)
+            gl.amd.cdna5.tdm.async_wait(3)
 
             k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
             k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
             if not IS_FP8:
                 k_lora = k_lora.to(gl.bfloat16)
                 k_rope = k_rope.to(gl.bfloat16)
-            scores = gl.amd.gfx1250.wmma(
+            scores = gl.amd.cdna5.wmma(
                 q_lora_dot,
                 k_lora,
                 gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
             )
-            scores = gl.amd.gfx1250.wmma(q_rope_dot, k_rope, scores)
+            scores = gl.amd.cdna5.wmma(q_rope_dot, k_rope, scores)
             if IS_FP8:
                 scores *= SOFTMAX_SCALE * _INV_LN2
             valid_col = gl.convert_layout(cur_valid, valid_col_layout)
@@ -308,24 +308,24 @@ def _dsa_selected_dense_wmma_kernel(
                     lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
                 )
             p_dot = gl.convert_layout(probs, p_dot_layout)
-            acc = gl.amd.gfx1250.wmma(p_dot, v_lora, acc)
+            acc = gl.amd.cdna5.wmma(p_dot, v_lora, acc)
             m_i = m_new
             cur_valid = next_valid
             buffer_index = next_buffer
 
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.cdna5.tdm.async_wait(0)
         final_valid = ((tile_end - 1) * BLOCK_K + slot_offsets < valid_len) & cur_valid
         k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
         k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
         if not IS_FP8:
             k_lora = k_lora.to(gl.bfloat16)
             k_rope = k_rope.to(gl.bfloat16)
-        scores = gl.amd.gfx1250.wmma(
+        scores = gl.amd.cdna5.wmma(
             q_lora_dot,
             k_lora,
             gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
         )
-        scores = gl.amd.gfx1250.wmma(q_rope_dot, k_rope, scores)
+        scores = gl.amd.cdna5.wmma(q_rope_dot, k_rope, scores)
         if IS_FP8:
             scores *= SOFTMAX_SCALE * _INV_LN2
         valid_col = gl.convert_layout(final_valid, valid_col_layout)
@@ -346,7 +346,7 @@ def _dsa_selected_dense_wmma_kernel(
             probs = probs.to(gl.bfloat16)
             v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
         p_dot = gl.convert_layout(probs, p_dot_layout)
-        acc = gl.amd.gfx1250.wmma(p_dot, v_lora, acc)
+        acc = gl.amd.cdna5.wmma(p_dot, v_lora, acc)
         m_i = m_new
 
     h_out = head_base + gl.arange(
@@ -370,7 +370,7 @@ def _dsa_selected_dense_wmma_kernel(
             gl.convert_layout(l_i, gl.SliceLayout(1, q_lora_load_layout)),
             mask=stats_mask,
         )
-        gl.amd.gfx1250.buffer_store(
+        gl.amd.cdna5.buffer_store(
             gl.convert_layout(acc, q_lora_load_layout),
             partial_acc,
             (
@@ -393,7 +393,7 @@ def _dsa_selected_dense_wmma_kernel(
         )
         output_mask = h_out[:, None] < num_heads
         if OUTPUT_WITHIN_2GB:
-            gl.amd.gfx1250.buffer_store(
+            gl.amd.cdna5.buffer_store(
                 result,
                 out,
                 output_offsets.to(tl.int32),
@@ -650,7 +650,7 @@ def _dsa_selected_packed_wmma_kernel(
     )
     d_rope = gl.arange(0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, rope_load_layout))
     q_base = token.to(tl.int64) * stride_q_t
-    q_lora = gl.amd.gfx1250.buffer_load(
+    q_lora = gl.amd.cdna5.buffer_load(
         q,
         (
             q_base
@@ -660,7 +660,7 @@ def _dsa_selected_packed_wmma_kernel(
         mask=h_lora[:, None] < num_heads,
         other=0.0,
     )
-    q_rope_val = gl.amd.gfx1250.buffer_load(
+    q_rope_val = gl.amd.cdna5.buffer_load(
         q,
         (
             q_base
@@ -691,14 +691,14 @@ def _dsa_selected_packed_wmma_kernel(
         [BLOCK_K, KV_LORA_RANK],
         scales_shared_layout,
     )
-    latent_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    latent_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=kv_fp8,
         shape=[total_slots, KV_LORA_RANK],
         strides=[ROW_BYTES, 1],
         block_shape=[BLOCK_K, KV_LORA_RANK],
         layout=latent_shared_layout,
     )
-    rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    rope_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=kv_rope + ROPE_OFFSET_BF16,
         shape=[total_slots, QK_ROPE_HEAD_DIM],
         strides=[ROW_BYTES // 2, 1],
@@ -738,29 +738,29 @@ def _dsa_selected_packed_wmma_kernel(
         )
         cur_valid = cur_valid & (slots >= 0)
         safe_slots = gl.where(cur_valid, slots, 0)
-        gl.amd.gfx1250.tdm.async_gather(latent_desc, safe_slots, latent_buffer)
-        gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slots, rope_buffer)
+        gl.amd.cdna5.tdm.async_gather(latent_desc, safe_slots, latent_buffer)
+        gl.amd.cdna5.tdm.async_gather(rope_desc, safe_slots, rope_buffer)
         scale_slots = gl.convert_layout(safe_slots, gl.SliceLayout(1, q_load_layout))
         scale_ptrs = kv_scale + (
             scale_slots[:, None] * (ROW_BYTES // 4)
             + SCALE_OFFSET_F32
             + scale_dims[None, :]
         )
-        gl.amd.gfx1250.async_copy.global_to_shared(scales_smem, scale_ptrs)
-        gl.amd.gfx1250.async_copy.commit_group()
-        gl.amd.gfx1250.tdm.async_wait(0)
-        gl.amd.gfx1250.async_copy.wait_group(0)
+        gl.amd.cdna5.async_copy.global_to_shared(scales_smem, scale_ptrs)
+        gl.amd.cdna5.async_copy.commit_group()
+        gl.amd.cdna5.tdm.async_wait(0)
+        gl.amd.cdna5.async_copy.wait_group(0)
 
         latent_k_raw = latent_buffer.permute([1, 0]).load(k_dot_layout)
         scales_k = scales_smem.permute([1, 0]).load(k_dot_layout)
         latent_k = (latent_k_raw.to(gl.float32) * scales_k).to(gl.bfloat16)
         rope_k = rope_buffer.permute([1, 0]).load(k_dot_layout)
-        scores = gl.amd.gfx1250.wmma(
+        scores = gl.amd.cdna5.wmma(
             q_lora_dot,
             latent_k,
             gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
         )
-        scores = gl.amd.gfx1250.wmma(q_rope_dot, rope_k, scores)
+        scores = gl.amd.cdna5.wmma(q_rope_dot, rope_k, scores)
         valid_col = gl.convert_layout(cur_valid, valid_col_layout)
         scores = gl.where(valid_col[None, :], scores, -float("inf"))
         m_new = gl.maximum(m_i, gl.max(scores, axis=1))
@@ -773,7 +773,7 @@ def _dsa_selected_packed_wmma_kernel(
         latent_v_raw = latent_buffer.load(v_dot_layout)
         scales_v = scales_smem.load(v_dot_layout)
         latent_v = (latent_v_raw.to(gl.float32) * scales_v).to(gl.bfloat16)
-        acc = gl.amd.gfx1250.wmma(p_dot, latent_v, acc)
+        acc = gl.amd.cdna5.wmma(p_dot, latent_v, acc)
         m_i = m_new
 
     h_store = head_base + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_load_layout))
@@ -788,7 +788,7 @@ def _dsa_selected_packed_wmma_kernel(
     gl.store(partial_m + partial_base, m_store, mask=h_store < num_heads)
     gl.store(partial_l + partial_base, l_store, mask=h_store < num_heads)
     acc_store = gl.convert_layout(acc, q_load_layout)
-    gl.amd.gfx1250.buffer_store(
+    gl.amd.cdna5.buffer_store(
         acc_store,
         partial_acc,
         (
@@ -840,7 +840,7 @@ def _dsa_selected_wmma_reduce_kernel(
     token = gl.program_id(0)
     head = gl.program_id(1)
     partial_base = token.to(tl.int64) * stride_pa_t + head.to(tl.int64) * stride_pa_h
-    partial_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    partial_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=partial_acc + partial_base,
         shape=[KV_SPLITS, 1, BLOCK_D],
         strides=[stride_pa_s, stride_pa_h, 1],
@@ -852,7 +852,7 @@ def _dsa_selected_wmma_reduce_kernel(
         [KV_SPLITS, 1, BLOCK_D],
         partial_shared_layout,
     )
-    gl.amd.gfx1250.tdm.async_load(partial_desc, [0, 0, 0], partial_smem)
+    gl.amd.cdna5.tdm.async_load(partial_desc, [0, 0, 0], partial_smem)
 
     split_offsets = gl.arange(0, KV_SPLITS, layout=gl.SliceLayout(1, split_head_layout))
     stats_base = (
@@ -867,7 +867,7 @@ def _dsa_selected_wmma_reduce_kernel(
     alpha = gl.where(dead, 0.0, gl.exp2(m_partial - m_max[None, :]))
     l_total = gl.sum(l_partial * alpha, axis=0)
 
-    gl.amd.gfx1250.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_wait(0)
     acc_partial = partial_smem.load(partial_layout)
     alpha_3d = gl.convert_layout(alpha, split_head_layout)[:, :, None]
     dead_3d = gl.convert_layout(dead, split_head_layout)[:, :, None]
@@ -885,7 +885,7 @@ def _dsa_selected_wmma_reduce_kernel(
     )
     result = result.to(out.dtype.element_ty)
     if OUTPUT_WITHIN_2GB:
-        gl.amd.gfx1250.buffer_store(
+        gl.amd.cdna5.buffer_store(
             result,
             out,
             output_offsets.to(tl.int32),

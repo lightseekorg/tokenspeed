@@ -74,8 +74,6 @@ in for indexing only; the C-side is ``I_r``.
 
 from __future__ import annotations
 
-from typing import Optional  # noqa: F401  (kept for downstream type hints)
-
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
@@ -566,7 +564,6 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
     BLOCK_K_HALF: gl.constexpr = 128
     BLOCK_K_PACKED_HALF: gl.constexpr = 64
     BLOCK_K_SCALE_HALF: gl.constexpr = 4
-    NUM_WARPS: gl.constexpr = 4
     NUM_BUFFERS: gl.constexpr = 2
     NUM_K_TILES: gl.constexpr = K_PACKED_TOTAL // 128
 

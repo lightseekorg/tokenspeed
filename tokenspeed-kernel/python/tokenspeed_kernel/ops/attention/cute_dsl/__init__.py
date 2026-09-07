@@ -27,6 +27,12 @@ from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
 from tokenspeed_kernel.registry import error_fn
 
 try:
+    import tokenspeed_kernel.ops.attention.cute_dsl.qsa_sparse  # noqa: F401
+except ImportError:
+    # Keep importing the attention package when CuTe DSL is unavailable.
+    pass
+
+try:
     from tokenspeed_kernel.ops.attention.cute_dsl import rel_mha
     from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha import (
         CuBlocksToBatchKernel,

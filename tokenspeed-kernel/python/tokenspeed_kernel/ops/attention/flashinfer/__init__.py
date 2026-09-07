@@ -71,6 +71,7 @@ def _with_pdl_default(function):
 
 
 if platform.is_nvidia:
+    import tokenspeed_kernel.ops.attention.flashinfer.qsa_sparse  # noqa: F401
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
     )

@@ -124,7 +124,9 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         # The indexer published the accepted prefix once its verify-window
         # layout was done; the sparse attention reads it for the live rows.
         kwargs["q"] = kwargs["q"].index_select(0, ctx.gather_ids)
-        kwargs["topk_indices"] = kwargs["topk_indices"].index_select(0, ctx.gather_ids)
+        kwargs["selected_slots"] = kwargs["selected_slots"].index_select(
+            0, ctx.gather_ids
+        )
         if kwargs["gate"] is not None:
             kwargs["gate"] = kwargs["gate"].index_select(0, ctx.gather_ids)
         return super()._qsa_attention(**kwargs)
@@ -239,7 +241,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         *,
         num_prefill_rows: int = 0,
     ) -> tuple[Any | None, Any | None]:
-        """Select one target-aligned QSA top-k row per draft request."""
+        """Select one target-aligned QSA physical-slot row per draft request."""
 
         del num_prefill_rows
         prefill_topk, decode_topk = dsa_topk

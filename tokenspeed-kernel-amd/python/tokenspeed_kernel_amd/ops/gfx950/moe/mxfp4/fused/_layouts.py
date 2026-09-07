@@ -193,28 +193,6 @@ def get_mfma_layout(
 
 
 @gluon.constexpr_function
-def get_bitwidth(dtype):
-    if isinstance(dtype, gl.pointer_type):
-        dtype = dtype.element_ty
-    return dtype.primitive_bitwidth
-
-
-@gluon.constexpr_function
-def get_blocked_layout(num_warps: gl.constexpr, dtype: gl.constexpr, order):
-    bitwidth = get_bitwidth(dtype)
-    vector_size = (
-        [1, max(1, 128 // bitwidth)] if order[1] == 0 else [max(1, 128 // bitwidth), 1]
-    )
-    warps_per_cta = [num_warps // 2, 2] if order[1] == 0 else [2, num_warps // 2]
-    return gl.BlockedLayout(vector_size, [8, 8], warps_per_cta, order)
-
-
-@gluon.constexpr_function
-def get_scale_blocked_layout(num_warps: gl.constexpr):
-    return gl.BlockedLayout([1, 8], [1, 64], [num_warps // 2, 2], [1, 0])
-
-
-@gluon.constexpr_function
 def _scale_async_blocked_layout(
     BLOCK_NONK_PS: gl.constexpr, BLOCK_K_PS: gl.constexpr, NUM_WARPS: gl.constexpr
 ):
@@ -260,26 +238,6 @@ def _group_m_swizzle(
         pid_m = group_id * GROUP_M + (intra % group_size)
         pid_n = intra // group_size
     return pid_m, pid_n
-
-
-@gluon.jit
-def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
-    """Byte offset into a CDNA4-swizzled MXFP4 scale tensor.
-
-    Storage is (..., K_SCALE_PAD*32, N_PAD/32); the swizzle packs the 32-wide N
-    block and the K-scale position into one linear axis.
-    """
-    row = n_idx.to(gl.uint32)
-    # CDNA4 e8m0 swizzle: K-scale group stride 256, (k%4) stride 64. Using
-    # 128/32 would alias K-scale offsets with the N-part (wrong scale read).
-    lin = (
-        (k_scale_idx // 8) * 256
-        + (k_scale_idx % 4) * 64
-        + (row % 16) * 4
-        + ((k_scale_idx % 8) // 4) * 2
-        + ((row % 32) // 16)
-    )
-    return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
 
 
 @gluon.jit
@@ -449,9 +407,3 @@ def _moe_partial_reduce_shared(
             SharedOut + shared_token * stride_som + shared_n * stride_son,
             shared_acc.to(SharedOut.dtype.element_ty),
         )
-
-
-def _route_small_m(logits, topk, dtype):
-    """1-kernel stable-order fused route for bounded M and G=M*topk."""
-    M, E = logits.shape
-    G = M * topk

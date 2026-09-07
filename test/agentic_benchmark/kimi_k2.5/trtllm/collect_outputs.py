@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -23,6 +24,33 @@ def num_gpus_from_config(config: str) -> int:
     if not m:
         raise ValueError(f"Cannot infer GPU count from config name: {config}")
     return int(m.group(1))
+
+
+def decoded_tok_per_iter(run_dir: Path) -> float:
+    """Iteration-weighted accept length: sum(completion-1) / sum(n_chunks-1).
+
+    The "Decoded Tok/Iter" in benchmark_summary.json is an unweighted
+    per-request mean; high-accept requests take fewer iterations, so that
+    mean overstates the aggregate and is inconsistent with TPOT/ITL.
+    """
+    db_path = run_dir / "benchmark_data.db"
+    if not db_path.is_file():
+        return -1.0
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT completion_tokens, inter_token_latencies"
+            " FROM result WHERE success = 1"
+        ).fetchall()
+    finally:
+        con.close()
+    toks = iters = 0
+    for ctok, itl_json in rows:
+        n_gaps = len(json.loads(itl_json))  # == n_chunks - 1
+        if ctok and ctok > 1 and n_gaps > 0:
+            toks += ctok - 1
+            iters += n_gaps
+    return toks / iters if iters else -1.0
 
 
 def collect(sweep_dir: Path):
@@ -45,7 +73,7 @@ def collect(sweep_dir: Path):
                     "Latency (tps/user)": round(decode_tps_user, 2),
                     "Throughput (tps/gpu)": round(tps_gpu, 2),
                     "Approx Cache Hit": round(s["KV Cache Hit Rate (%)"], 2),
-                    "Decoded Tok/Iter": round(s["Decoded Tok/Iter"], 4),
+                    "Decoded Tok/Iter": round(decoded_tok_per_iter(run_dir), 4),
                 }
             )
     rows.sort(key=lambda r: (r["config"], r["Conc."]))

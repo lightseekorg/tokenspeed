@@ -97,15 +97,18 @@ class SparseTopKShare:
     steps the drafter carries it across explicitly.
 
     ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
-    verify window); each family stores its own record type.
+    verify window); each family stores its own record type. ``qsa_metadata``
+    holds QSA's layer-invariant row geometry so it is built once per forward.
     """
 
     prefill: Any | None = None
     decode: Any | None = None
+    qsa_metadata: Any | None = None
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
+        self.qsa_metadata = None
 
 
 class AttentionBackend(ABC):

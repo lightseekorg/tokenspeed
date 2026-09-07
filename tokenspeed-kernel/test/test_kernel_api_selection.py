@@ -232,7 +232,6 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
-        "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 3,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
     }
@@ -2464,15 +2463,15 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             None,
-            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
-            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
+            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
+            "validate_linear_mxfp4_moe_weights",
         ),
         (
             8,
             3072,
             "gluon",
-            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
-            "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
+            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
+            "validate_linear_mxfp4_moe_weights",
         ),
     ],
 )

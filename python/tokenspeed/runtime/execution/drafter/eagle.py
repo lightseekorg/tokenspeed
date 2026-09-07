@@ -159,6 +159,9 @@ class Eagle(BaseDrafter):
         Always written: the draft backend's share is per forward, and the
         drafter, not a metadata refresh, is what separates its steps."""
         share = self.attn_backend.sparse_topk
+        # QSA row geometry belongs to one model invocation. Draft steps reuse
+        # the selected slots below, but must rebuild their new row layout.
+        share.qsa_metadata = None
         if self._model_shares_mtp_topk():
             share.prefill, share.decode = dsa_topk
         else:

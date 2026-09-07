@@ -226,12 +226,12 @@ class OutputProcessor:
                     state.text += incremental_emit
                     if state.obj.stream:
                         state.logprobs_info = logprobs_info
-                        state.output_ids.extend(recv_obj.decode_ids[i])
+                        state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         state.last_output_offset = len(state.output_ids)
                     else:
                         state.logprobs_info.update(logprobs_info)
-                        state.output_ids.extend(recv_obj.decode_ids[i])
+                        state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
 
                     out_dict = {

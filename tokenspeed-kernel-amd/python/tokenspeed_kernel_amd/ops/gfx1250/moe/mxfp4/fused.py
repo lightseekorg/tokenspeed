@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -49,6 +48,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
     MoEProgramBase,
+    _enforce_wave_uniform_i32,
     _situ_gfx1250,
     _swiglu_gfx1250,
     composition,
@@ -87,32 +87,6 @@ class _NamedScaleLayout:
     name: str
 
 
-def _parse_amdgcn_metric(amdgcn: str, key: str) -> int | None:
-    m = re.search(rf"\.{key}:\s+(\d+)", amdgcn)
-    if m is not None:
-        return int(m.group(1))
-    m = re.search(rf";\s+{key}\s*[:=]?\s+(\d+)", amdgcn)
-    return int(m.group(1)) if m is not None else None
-
-
-def static_profile(kernel: Any, *, label: str = "") -> dict:
-    """Return basic AMDGCN resource metrics from a compiled kernel object."""
-
-    amdgcn = kernel.asm.get("amdgcn", "")
-    profile = {
-        "sgpr_count": _parse_amdgcn_metric(amdgcn, "sgpr_count"),
-        "sgpr_spill_count": _parse_amdgcn_metric(amdgcn, "sgpr_spill_count"),
-        "vgpr_count": _parse_amdgcn_metric(amdgcn, "vgpr_count"),
-        "vgpr_spill_count": _parse_amdgcn_metric(amdgcn, "vgpr_spill_count"),
-        "scratch_size": _parse_amdgcn_metric(amdgcn, "ScratchSize"),
-        "code_len_in_byte": _parse_amdgcn_metric(amdgcn, "codeLenInByte"),
-        "occupancy": _parse_amdgcn_metric(amdgcn, "Occupancy"),
-    }
-    if label:
-        profile["label"] = label
-    return profile
-
-
 @composition
 @aggregate
 class MoESliceKProgram:
@@ -124,10 +98,10 @@ class MoESliceKProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    w_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor
@@ -415,10 +389,10 @@ class MoESliceNKProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    w_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.cdna5.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor
@@ -523,16 +497,16 @@ class MoESliceNKProgram:
 
         if cfg.USE_GATHER:
             col_offset_x = self.off_k_x + load_idx * BLOCK_K_PACKED_X
-            x_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
                 self.x_desc, add_offsets=[0, col_offset_x], pred=pred, clamp_bounds=True
             )
-            gl.amd.gfx1250.tdm.async_gather(
+            gl.amd.cdna5.tdm.async_gather(
                 x_desc_k,
                 self.gathered_m,
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.x_desc,
                 [0, load_idx * BLOCK_K_PACKED_X],
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -545,19 +519,19 @@ class MoESliceNKProgram:
                     self.off_k_x * cfg.DIV_FACTOR_X // cfg.SCALE_BLOCK
                     + load_idx * BLOCK_K_SCALE
                 )
-                x_scale_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                x_scale_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
                     self.x_scale_desc,
                     add_offsets=[0, col_offset_x_scale],
                     pred=pred,
                     clamp_bounds=True,
                 )
-                gl.amd.gfx1250.tdm.async_gather(
+                gl.amd.cdna5.tdm.async_gather(
                     x_scale_desc_k,
                     self.gathered_m,
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 )
             else:
-                gl.amd.gfx1250.tdm.async_load(
+                gl.amd.cdna5.tdm.async_load(
                     self.x_scale_desc,
                     [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -571,14 +545,14 @@ class MoESliceNKProgram:
         BLOCK_K_PACKED_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
         if cfg.W_TRANSPOSE:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_desc,
                 [0, load_idx * BLOCK_K_PACKED_W],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_desc,
                 [load_idx * BLOCK_K_PACKED_W, 0],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -586,7 +560,7 @@ class MoESliceNKProgram:
             )
 
         if cfg.WITH_W_MX_SCALE:
-            gl.amd.gfx1250.tdm.async_load(
+            gl.amd.cdna5.tdm.async_load(
                 self.w_scale_desc,
                 [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -1123,7 +1097,7 @@ def _matmul(
         )
         out_smem.store(out)
 
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
@@ -1131,12 +1105,12 @@ def _matmul(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
-        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(cfg.index_type)
+        y_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
-        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.cdna5.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
+        gl.amd.cdna5.tdm.async_wait(0)
     else:
         offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
@@ -1152,7 +1126,7 @@ def _matmul(
             + offs_y_n.to(cfg.index_type)[None, :] * stride_y_n
         )
         y_mask = mask_m[:, None] & mask_n[None, :]
-        gl.amd.gfx1250.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
+        gl.amd.cdna5.buffer_store(out, Y_ptr, y_offs, mask=y_mask)
 
 
 def _can_overflow_int32(tensor: Any) -> bool:
