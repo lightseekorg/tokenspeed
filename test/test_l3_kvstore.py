@@ -293,29 +293,55 @@ class StorageKeyTest(unittest.TestCase):
             with open(same_copy, "w") as handle:
                 handle.write('{"scale":1}')
             first_id = l3_cache_quantization_id(
-                quantization="fp8", quantization_param_path=first
+                quantization="fp8",
+                quantization_param_path=first,
+                draft_quantization="",
             )
             self.assertNotEqual(
                 first_id,
                 l3_cache_quantization_id(
-                    quantization="fp8", quantization_param_path=second
+                    quantization="fp8",
+                    quantization_param_path=second,
+                    draft_quantization="",
                 ),
             )
             self.assertEqual(
                 first_id,
                 l3_cache_quantization_id(
-                    quantization="fp8", quantization_param_path=same_copy
+                    quantization="fp8",
+                    quantization_param_path=same_copy,
+                    draft_quantization="",
                 ),
             )
             self.assertNotEqual(
                 first_id,
-                l3_cache_quantization_id(quantization="", quantization_param_path=""),
+                l3_cache_quantization_id(
+                    quantization="",
+                    quantization_param_path="",
+                    draft_quantization="",
+                ),
+            )
+            self.assertNotEqual(
+                first_id,
+                l3_cache_quantization_id(
+                    quantization="fp8",
+                    quantization_param_path=first,
+                    draft_quantization="fp8",
+                ),
             )
             signature = inspect.signature(l3_cache_quantization_id)
             self.assertIs(
                 signature.parameters["quantization_param_path"].default,
                 inspect.Parameter.empty,
             )
+            self.assertIs(
+                signature.parameters["draft_quantization"].default,
+                inspect.Parameter.empty,
+            )
+            with self.assertRaises(TypeError):
+                l3_cache_quantization_id(
+                    quantization="fp8", quantization_param_path=first
+                )
 
     def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
         self.assertIsNone(
@@ -599,9 +625,26 @@ class MooncakeConfigTest(unittest.TestCase):
                 {"master_server_address": "127.0.0.1:50051"}
             )
             self.assertEqual(config.global_segment_size, 4 * 1024**3)
+            self.assertEqual(config.tenant_id, "default")
         finally:
             if saved is not None:
                 os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = saved
+
+    def test_tenant_id_has_no_constructor_default(self):
+        signature = inspect.signature(MooncakeStoreConfig)
+        self.assertIs(
+            signature.parameters["tenant_id"].default, inspect.Parameter.empty
+        )
+        with self.assertRaises(TypeError):
+            MooncakeStoreConfig(
+                "localhost",
+                "P2PHANDSHAKE",
+                4 * 1024**3,
+                "tcp",
+                "",
+                "127.0.0.1:50051",
+                "",
+            )
 
 
 class MooncakeKvStoreTest(unittest.TestCase):

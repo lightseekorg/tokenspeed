@@ -328,7 +328,8 @@ HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity
 device arena offsets), the
 cache-quantization config (including `quantization_param_path` scale-file
-bytes), the pipeline stage, the context-parallel
+bytes and `--speculative-draft-model-quantization` when a draft pool is
+present), the pipeline stage, the context-parallel
 width (`cp_size`), and any
 speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`

@@ -382,7 +382,8 @@ Its responsibilities:
   Host CacheBlock layout (dtype and field payload geometry, not device
   arena offsets that follow GPU cache capacity), the effective
   cache-quantization config (`quantization` plus the
-  `quantization_param_path` scale-file digest), `--hf-overrides` as applied
+  `quantization_param_path` scale-file digest, and
+  `--speculative-draft-model-quantization` when a draft pool is present), `--hf-overrides` as applied
   to the HF text config (rope_theta, rope_scaling, and other architecture
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), and the speculative

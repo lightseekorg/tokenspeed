@@ -891,17 +891,20 @@ def build_device_side(
                 world_size=world_size,
                 broadcast=broadcast_checkpoint_ids,
             )
-            cache_quantization = l3_cache_quantization_id(
-                quantization=str(model_config.quantization or ""),
-                quantization_param_path=str(server_args.quantization_param_path or ""),
-            )
             pipeline_rank = (
                 server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
             )
             if draft_model_config is not None:
                 draft_model = str(draft_model_config.model_path)
+                draft_quantization = str(draft_model_config.quantization or "")
             else:
                 draft_model = ""
+                draft_quantization = ""
+            cache_quantization = l3_cache_quantization_id(
+                quantization=str(model_config.quantization or ""),
+                quantization_param_path=str(server_args.quantization_param_path or ""),
+                draft_quantization=draft_quantization,
+            )
             cp_size = int(server_args.mapping.attn.cp_size)
 
             def prefix_for_weight_version(weight_version: str) -> str:

@@ -133,13 +133,17 @@ def l3_cache_quantization_id(
     *,
     quantization: str,
     quantization_param_path: str,
+    draft_quantization: str,
 ) -> str:
     """Return the cache-quantization identity that shapes packed KV bytes.
 
     FP8 deployments that share ``kv_cache_dtype`` can still load different
-    ``quantization_param_path`` scale files. Mooncake puts are create-only,
-    so those deployments must not share a namespace. Callers pass empty
-    strings when quantization or the scale file is unset.
+    ``quantization_param_path`` scale files. A speculative draft pool packs
+    its fields into the same Host CacheBlocks, so ``draft_quantization``
+    (``--speculative-draft-model-quantization``) is required: two
+    deployments that share a draft checkpoint but quantize it differently
+    must not share Mooncake keys. Callers pass empty strings when
+    quantization, the scale file, or the draft pool is unset.
     """
 
     scale_id = ""
@@ -152,6 +156,7 @@ def l3_cache_quantization_id(
         {
             "quantization": str(quantization),
             "scale_id": scale_id,
+            "draft_quantization": str(draft_quantization),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -301,16 +306,17 @@ def storage_key_prefix(
 
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, context-parallel width, draft
-    pool, cache-quantization config, or runtime HF overrides and silently
-    collide with an incompatible deployment. ``revision`` is the resolved
-    immutable checkpoint (Hugging Face commit or local fingerprint), not a
-    moving branch name. ``model_overrides`` is the ``--hf-overrides`` dict
-    applied to the HF text config (rope_theta, rope_scaling, and the rest
-    of the effective architecture). Empty strings and an empty override
-    dict are valid and mean "unset" (no draft pool, no extra cache scales,
-    no HF overrides). ``cp_size`` belongs here rather than only in the
-    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
-    blocks to the same rank under different widths.
+    pool, cache-quantization config (target and draft), or runtime HF
+    overrides and silently collide with an incompatible deployment.
+    ``revision`` is the resolved immutable checkpoint (Hugging Face commit
+    or local fingerprint), not a moving branch name. ``model_overrides``
+    is the ``--hf-overrides`` dict applied to the HF text config
+    (rope_theta, rope_scaling, and the rest of the effective architecture).
+    Empty strings and an empty override dict are valid and mean "unset"
+    (no draft pool, no extra cache scales, no HF overrides). ``cp_size``
+    belongs here rather than only in the per-object ``c{cp_rank}`` shard
+    id: zigzag CP assigns different token blocks to the same rank under
+    different widths.
     """
 
     if not isinstance(model_overrides, dict):

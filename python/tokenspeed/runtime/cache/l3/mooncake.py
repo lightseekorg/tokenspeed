@@ -78,7 +78,8 @@ class MooncakeStoreConfig:
     device_name: str
     master_server_address: str
     client_server_address: str
-    tenant_id: str = _DEFAULT_TENANT_ID
+    # Required so a missed argument cannot silently join the shared default tenant.
+    tenant_id: str
 
     @staticmethod
     def from_mapping(extra_config: dict[str, Any] | None) -> MooncakeStoreConfig:
