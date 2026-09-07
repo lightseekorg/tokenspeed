@@ -28,6 +28,9 @@ so an arch that never runs a listed shape simply never matches.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
@@ -469,33 +472,36 @@ def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
 
 def test_the_shared_vendor_module_is_never_touched():
     """The adapter owns its instance; mm_bf16's own path never sees the change."""
-    import sys
-
-    from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as vendor
-    from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
-    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
-
-    if not flashinfer_splitk.is_available():
-        pytest.skip("flashinfer split-K BF16 GEMM is not available here")
-
-    m, n, k = 64, 1792, 7168
-    tactic = SPLITK_TACTIC_ROUTE[(m, n, k)]
-
-    # A separate namespace, so there is no shared state to race over.
-    private = flashinfer_splitk._module()
-    assert private is not vendor
-    assert sys.modules[flashinfer_splitk._VENDOR_MODULE] is vendor
-
-    assert flashinfer_splitk.supports(m, n, k, tactic)
-    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
-    w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-    flashinfer_splitk.splitk_mm(x, w, tactic, None)
-
-    # Unchanged throughout: the vendor's own policy still refuses this M, which
-    # is what keeps every other mm_bf16 caller on the behaviour it had.
-    assert vendor._MAX_M == 32
-    with pytest.raises(ValueError, match="low-M policy"):
-        vendor.validate_tactic(vendor.SplitKTactic(*tactic), m, n, k)
+    # A subprocess that has NOT imported the vendor module: importing it first
+    # puts its name in sys.modules, which is exactly what the private instance
+    # needs for @dataclass to resolve while the vendor source runs. An
+    # in-process check would therefore pass even when the production path --
+    # nothing has imported it yet -- cannot build one at all.
+    script = """
+import importlib.util, sys
+V = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
+if importlib.util.find_spec(V) is None:
+    print("skip"); raise SystemExit(0)
+assert V not in sys.modules, "vendor already imported; the check would be void"
+from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
+from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk as fs
+assert fs.is_available(), "adapter disabled itself"
+refused = [key for key, t in SPLITK_TACTIC_ROUTE.items() if not fs.supports(*key, t)]
+assert not refused, f"refused {refused}"
+assert V not in sys.modules, "building the private instance imported the vendor"
+import flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk as vendor
+assert fs._module() is not vendor, "not a private instance"
+assert vendor._MAX_M == 32, f"vendor cutover moved to {vendor._MAX_M}"
+print("ok")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    if tail == "skip":
+        pytest.skip("flashinfer split-K BF16 GEMM is not installed here")
+    assert tail == "ok", proc.stdout
 
 
 def test_splitk_tactic_route_entries_are_valid():

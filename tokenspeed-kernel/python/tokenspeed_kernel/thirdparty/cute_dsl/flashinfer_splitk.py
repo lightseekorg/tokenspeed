@@ -59,6 +59,9 @@ import torch
 __all__ = ["MAX_M", "is_available", "splitk_mm", "supports"]
 
 _VENDOR_MODULE = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
+#: Where this adapter's private instance is registered. Never the vendor's own
+#: key, so ``import flashinfer...`` keeps returning the vendor's module.
+_PRIVATE_MODULE = f"{__name__}._vendor_splitk"
 
 #: Largest M this adapter serves. The vendor cutover is 32; the kernel itself
 #: tiles public M and stays exact to here.
@@ -85,17 +88,30 @@ def _module():
     """
     import dataclasses
     import importlib.util
+    import sys
+    import types
 
     try:
         spec = importlib.util.find_spec(_VENDOR_MODULE)
-    except (ImportError, ValueError):
+        source = spec.loader.get_source(_VENDOR_MODULE) if spec else None
+    except (ImportError, ValueError, AttributeError, OSError):
         return None
-    if spec is None or spec.loader is None:
+    if source is None:
         return None
-    mod = importlib.util.module_from_spec(spec)
+    # Compiled into a module of our own rather than loaded through the vendor's
+    # spec: the loader refuses to execute a spec under a different name, and
+    # @dataclass resolves ``sys.modules[cls.__module__]`` while the source
+    # runs, so the instance has to be registered under the name it carries.
+    # That name is ours, so the vendor's own sys.modules entry is never
+    # written and ``import flashinfer...`` still yields the vendor's module.
+    mod = types.ModuleType(_PRIVATE_MODULE)
+    mod.__file__ = spec.origin
+    mod.__package__ = _VENDOR_MODULE.rpartition(".")[0]
+    sys.modules[_PRIVATE_MODULE] = mod
     try:
-        spec.loader.exec_module(mod)
+        exec(compile(source, spec.origin, "exec"), mod.__dict__)  # noqa: S102
     except Exception:  # noqa: BLE001  (any import-time failure disables us)
+        sys.modules.pop(_PRIVATE_MODULE, None)
         return None
     for name, value in _EXPECTED.items():
         if getattr(mod, name, None) != value:
