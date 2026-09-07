@@ -247,6 +247,7 @@ def storage_key_prefix(
     *,
     revision: str,
     weight_version: str,
+    model_overrides: dict,
     cache_signature: str,
     pipeline_rank: int,
     cp_size: int,
@@ -259,20 +260,26 @@ def storage_key_prefix(
 
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, context-parallel width, draft
-    pool, or cache-quantization config and silently collide with an
-    incompatible deployment. ``revision`` is the resolved immutable
-    checkpoint (Hugging Face commit or local fingerprint), not a moving
-    branch name. Empty strings are valid and mean "unset" (no draft pool,
-    no extra cache scales). ``cp_size`` belongs here rather than only in
-    the per-object ``c{cp_rank}`` shard id: zigzag CP assigns different
-    token blocks to the same rank under different widths.
+    pool, cache-quantization config, or runtime HF overrides and silently
+    collide with an incompatible deployment. ``revision`` is the resolved
+    immutable checkpoint (Hugging Face commit or local fingerprint), not a
+    moving branch name. ``model_overrides`` is the ``--hf-overrides`` dict
+    applied to the HF text config (rope_theta, rope_scaling, and the rest
+    of the effective architecture). Empty strings and an empty override
+    dict are valid and mean "unset" (no draft pool, no extra cache scales,
+    no HF overrides). ``cp_size`` belongs here rather than only in the
+    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
+    blocks to the same rank under different widths.
     """
 
+    if not isinstance(model_overrides, dict):
+        raise TypeError("model_overrides must be a dict")
     payload = json.dumps(
         {
             "model": str(model_name),
             "revision": str(revision),
             "weight_version": str(weight_version),
+            "model_overrides": model_overrides,
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
             "cp_size": int(cp_size),

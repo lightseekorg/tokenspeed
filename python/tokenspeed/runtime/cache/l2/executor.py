@@ -790,10 +790,7 @@ class L2CacheExecutor:
 
     @staticmethod
     def _load_done(op_id: int, success: bool):
-        event = Cache.LoadBackDoneEvent()
-        event.op_id = op_id
-        event.success = success
-        return event
+        return Cache.LoadBackDoneEvent(op_id, success)
 
     def shutdown(self) -> None:
         # Write-backs ride the default stream (shared per device, so this

@@ -322,7 +322,9 @@ Mooncake Store (L3)
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
-immutable revision, `--weight-version`), the packed layout, the
+immutable revision, `--weight-version`), `--hf-overrides` (the effective
+HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
+fields), the packed layout, the
 cache-quantization config (including `quantization_param_path` scale-file
 bytes), the pipeline stage, the context-parallel
 width (`cp_size`), and any

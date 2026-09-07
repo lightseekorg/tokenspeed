@@ -81,6 +81,7 @@ class StorageKeyTest(unittest.TestCase):
                 "model_name": "org/model",
                 "revision": "abc",
                 "weight_version": "v1",
+                "model_overrides": {},
                 "cache_signature": "layout",
                 "pipeline_rank": 0,
                 "cp_size": 1,
@@ -104,13 +105,27 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(prefix(cp_size=2), prefix(cp_size=4))
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
         self.assertNotEqual(base, prefix(cache_quantization='{"quantization":"fp8"}'))
+        self.assertNotEqual(base, prefix(model_overrides={"rope_theta": 10000.0}))
+        self.assertNotEqual(
+            prefix(model_overrides={"rope_theta": 10000.0}),
+            prefix(model_overrides={"rope_scaling": {"type": "linear"}}),
+        )
+        self.assertEqual(
+            prefix(model_overrides={"b": 2, "a": 1}),
+            prefix(model_overrides={"a": 1, "b": 2}),
+        )
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
+        with self.assertRaises(TypeError):
+            prefix(model_overrides=["rope_theta"])
         signature = inspect.signature(storage_key_prefix)
         self.assertIs(
             signature.parameters["cache_quantization"].default, inspect.Parameter.empty
         )
         self.assertIs(signature.parameters["revision"].default, inspect.Parameter.empty)
+        self.assertIs(
+            signature.parameters["model_overrides"].default, inspect.Parameter.empty
+        )
 
     def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
         commit = "a" * 40

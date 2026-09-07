@@ -99,9 +99,7 @@ def _ack_write_back(scheduler, op_id: int) -> None:
 
 
 def _ack_load_back(scheduler, op_id: int, success: bool) -> None:
-    event = ts.Cache.LoadBackDoneEvent()
-    event.op_id = int(op_id)
-    event.success = success
+    event = ts.Cache.LoadBackDoneEvent(int(op_id), success)
     execution_event = ts.ExecutionEvent()
     execution_event.add_event(event)
     scheduler.advance(execution_event)

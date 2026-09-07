@@ -59,9 +59,7 @@ class CacheEventPayloadTest(unittest.TestCase):
         write_payload = self.to_payload(write_back)
         self.assertEqual(write_payload, {"kind": "WriteBackDoneEvent", "op_id": 7})
 
-        load_back = self.Cache.LoadBackDoneEvent()
-        load_back.op_id = 8
-        load_back.success = False
+        load_back = self.Cache.LoadBackDoneEvent(8, False)
         load_payload = self.to_payload(load_back)
         self.assertEqual(
             load_payload,
@@ -71,11 +69,16 @@ class CacheEventPayloadTest(unittest.TestCase):
         self.assertIsInstance(restored, self.Cache.LoadBackDoneEvent)
         self.assertEqual(int(restored.op_id), 8)
         self.assertFalse(restored.success)
-        default_load = self.Cache.LoadBackDoneEvent()
-        default_load.op_id = 9
-        default_payload = self.to_payload(default_load)
+        with self.assertRaises(TypeError):
+            self.Cache.LoadBackDoneEvent()
+        with self.assertRaises(TypeError):
+            self.Cache.LoadBackDoneEvent(9)
+        with self.assertRaises(KeyError):
+            self.from_payload({"kind": "LoadBackDoneEvent", "op_id": 9})
+        explicit_load = self.Cache.LoadBackDoneEvent(9, True)
+        explicit_payload = self.to_payload(explicit_load)
         self.assertEqual(
-            default_payload,
+            explicit_payload,
             {"kind": "LoadBackDoneEvent", "op_id": 9, "success": True},
         )
         self.assertEqual(

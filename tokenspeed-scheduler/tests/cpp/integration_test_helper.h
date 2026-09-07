@@ -123,14 +123,9 @@ protected:
         }
     }
 
-    void SendLoadBackDone(std::uint32_t op_id) { SendLoadBackDone(op_id, /*success=*/true); }
-
     void SendLoadBackDone(std::uint32_t op_id, bool success) {
         ExecutionEvent event;
-        event.With(cache::LoadBackDone{
-            .op_id = op_id,
-            .success = success,
-        });
+        event.With(cache::LoadBackDone(op_id, success));
         scheduler_->Advance(std::move(event));
     }
 

@@ -4185,7 +4185,7 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
 
     // The 6 matched host entries stay load-pinned until LoadBackDone retires the op.
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
     // r2 holds 6 loaded blocks and 4 fresh blocks.
@@ -4248,7 +4248,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
     SendForwardDone("r2", {9001});
     ExecutionPlan finalize = PlanOnce();
@@ -4280,7 +4280,7 @@ TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6) << "in-flight load destinations must not be reusable";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the host sources stay pinned too";
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "LoadBackDone releases the destinations";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 }
@@ -4313,7 +4313,7 @@ TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r3 stays intact in the waiting set";
 
     // LoadBackDone frees the 6 destinations: r3's 10-block gate now clears.
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
     ExecutionPlan admitted = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(admitted);
@@ -4335,12 +4335,12 @@ TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
     ASSERT_TRUE(lb.has_value());
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 10);
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
     const std::int32_t free_after_first = scheduler_->PoolFreeBlocks();
     EXPECT_EQ(free_after_first, free_at_start - 10) << "destinations still table-held: no free-list change";
 
-    SendLoadBackDone(lb->op_ids.at(0));  // duplicate
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);  // duplicate
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_first) << "a duplicate Done must not double-free";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
@@ -4441,7 +4441,7 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the copy is still in flight";
 
     // LoadBackDone releases exactly the 2 punched destinations (the other 4 stay table-held).
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
@@ -4503,7 +4503,7 @@ TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsPrefetchLoadBack) {
         << "Host-evicted L3 hits must prefetch, not treat leftover Host pages as warm";
     EXPECT_FALSE(lb->content_hashes.at(0).empty());
 
-    SendLoadBackDone(lb->op_ids.at(0));
+    SendLoadBackDone(lb->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 
     SendForwardDone("r3", {9001});

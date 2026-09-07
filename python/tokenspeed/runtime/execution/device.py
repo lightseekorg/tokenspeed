@@ -883,6 +883,7 @@ def build_device_side(
                     server_args.model,
                     revision=checkpoint_id,
                     weight_version=weight_version,
+                    model_overrides=dict(model_config.model_override_args),
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
                     cp_size=cp_size,

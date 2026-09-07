@@ -381,7 +381,9 @@ Its responsibilities:
   (`model` + resolved immutable revision + `--weight-version`), the packed
   CacheBlock layout (dtype and field geometry), the effective
   cache-quantization config (`quantization` plus the
-  `quantization_param_path` scale-file digest), the pipeline stage, the
+  `quantization_param_path` scale-file digest), `--hf-overrides` as applied
+  to the HF text config (rope_theta, rope_scaling, and other architecture
+  fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
   Hugging Face branch or local path is fingerprinted from the commit or

@@ -658,7 +658,7 @@ TEST_F(DecodeRetractionMixedPrefillTestSuite, LocalRecoveryDoesNotBatchWithRemot
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
             const auto& load = std::get<LoadBackBatch>(operation);
             for (std::uint32_t op_id : load.op_ids) {
-                SendLoadBackDone(op_id);
+                SendLoadBackDone(op_id, /*success=*/true);
             }
         }
         const ForwardBatch* forward = FindForwardBatch(recovery.Operations());

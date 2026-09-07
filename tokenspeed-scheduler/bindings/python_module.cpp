@@ -203,7 +203,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
 
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
-        .def(nb::init<>())
+        .def(nb::init<std::uint32_t, bool>(), nb::arg("op_id"), nb::arg("success"))
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
         .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
 
