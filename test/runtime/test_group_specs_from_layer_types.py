@@ -523,18 +523,41 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 checkpoint_granularity=0,
             )
 
-    def test_state_family_may_keep_row_geometry(self):
-        # V4-style row-buffer groups are state-family with real rows.
+    def test_state_family_requires_checkpoint_shape(self):
+        # Rows of token history -- V4's compressor tails included -- are a
+        # history group whatever their retention; the state family names the
+        # checkpoint shape and nothing else.
+        with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
+            CacheGroupSpec(
+                group_id="v4.compressor",
+                retention="sliding_window",
+                rows_per_page=16,
+                entry_stride_tokens=4,
+                sliding_window_tokens=256,
+                family="state",
+            )
         spec = CacheGroupSpec(
             group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=256,
-            family="state",
+            family="history",
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
+
+    def test_state_family_rides_full_history(self):
+        # A checkpoint summarizes everything before it, so nothing in a state
+        # group ever slides out.
+        with self.assertRaisesRegex(ValueError, "full_history"):
+            CacheGroupSpec(
+                group_id="state",
+                retention="sliding_window",
+                sliding_window_tokens=256,
+                family="state",
+                checkpoint_granularity=64,
+            )
 
 
 def _fake_pool(specs, *, packing=1) -> SimpleNamespace:
