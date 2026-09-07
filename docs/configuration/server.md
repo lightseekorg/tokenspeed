@@ -56,7 +56,9 @@ The SGLang-compatible `update_weights_from_distributed`,
 optional `weight_version`. The version changes only after the update succeeds.
 Omitting it preserves the current value, except when L3 is enabled and the
 update flushes the cache: then a unique successor (`{current}-uN`) is derived
-so new KV cannot reuse the previous checkpoint's objects.
+so new KV cannot reuse the previous checkpoint's objects. When L3 is on, a
+new `weight_version` requires `flush_cache=True`; intermediate updates may
+omit the version until the last call flushes.
 
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
@@ -324,7 +326,10 @@ speculative draft checkpoint. Live weight updates rebuild that prefix
 after the GPU load. A requested `flush_cache` must succeed before the
 prefix switches: in-flight Host writebacks cause `ClearCache` to reject,
 and the update RPC then fails so the caller retries instead of publishing
-new KV under a mixed namespace. If the update omits `weight_version`
+new KV under a mixed namespace. Supplying a new `weight_version` with
+`flush_cache=False` is rejected when L3 is on so stale Device/Host KV
+and in-flight D2H copies cannot be treated as the new checkpoint.
+If the update omits `weight_version`
 while L3 is enabled, a unique successor (`{current}-uN`) is derived so
 `Engine.update_weights_from_distributed` cannot republish under the
 startup namespace. A successful Engine update stamps that successor into

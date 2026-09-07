@@ -100,6 +100,51 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertTrue(output.success)
 
+    def test_l3_rejects_version_switch_without_flush(self):
+        handler = self._handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=False,
+            weight_version="v2",
+        )
+
+        handler.process_requests([req])
+
+        handler._device.update_weights.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+        self.assertIn("cannot change without flush_cache", output.message)
+
+    def test_l3_intermediate_update_keeps_namespace_when_version_omitted(self):
+        handler = self._handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=False,
+            weight_version=None,
+        )
+
+        handler.process_requests([req])
+
+        handler._device.update_weights.assert_called_once_with(req)
+        handler.clear_cache_fn.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
+
     def test_rejected_flush_does_not_switch_l3_prefix(self):
         handler = self._handler()
         handler.clear_cache_fn = mock.Mock(return_value=False)

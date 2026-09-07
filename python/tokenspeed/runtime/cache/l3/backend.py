@@ -55,7 +55,8 @@ def resolve_l3_weight_version(
 
     An explicit ``requested`` version always wins. When L3 is enabled and
     the caller asked to flush, a missing version is derived so new KV cannot
-    reuse the previous checkpoint's objects.
+    reuse the previous checkpoint's objects. A later commit still requires
+    ``flush_cache`` before applying a version that differs from ``current``.
     """
 
     if requested is not None:

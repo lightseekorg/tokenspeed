@@ -377,7 +377,11 @@ Its responsibilities:
   load rebuilds that prefix after the GPU update so new KV is not published
   under the previous checkpoint; a requested cache flush must succeed
   first, because `ClearCache` rejects in-flight Host writebacks (pause
-  drain does not wait for those). When L3 is on and the update omits
+  drain does not wait for those). An explicit new `weight_version` with
+  `flush_cache=False` is rejected before the GPU load when L3 is on:
+  Device/Host still hold the previous checkpoint, and D2H copies not yet
+  in `_backup_futures` would later be stored under the new namespace.
+  When L3 is on and the update omits
   `weight_version`, a unique successor (`{current}-uN`) is derived so the
   Engine `update_weights_from_distributed` path cannot republish under the
   startup namespace. After a successful RPC the Engine facade stamps that
