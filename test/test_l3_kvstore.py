@@ -257,17 +257,25 @@ class L3HostStoreTest(unittest.TestCase):
 class FactoryTest(unittest.TestCase):
     def test_memory_and_unknown_backend(self):
         backend = create_kvstore_storage_backend(
-            "memory", None, host_buffer=object(), tp_size=1, pp_size=1
+            "memory", None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
         )
         self.assertIsInstance(backend, MemoryKvStore)
         self.assertIsNone(
             create_kvstore_storage_backend(
-                None, None, host_buffer=object(), tp_size=1, pp_size=1
+                None, None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
             )
         )
         with self.assertRaisesRegex(ValueError, "unsupported"):
             create_kvstore_storage_backend(
-                "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
+                "nfs", None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
+            )
+
+    def test_cp_size_has_no_default(self):
+        param = inspect.signature(create_kvstore_storage_backend).parameters["cp_size"]
+        self.assertIs(param.default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            create_kvstore_storage_backend(
+                "memory", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 
 
@@ -330,8 +338,12 @@ class MooncakeKvStoreTest(unittest.TestCase):
     def test_extra_config_has_no_default(self):
         param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
         self.assertIs(param.default, inspect.Parameter.empty)
+        cp_param = inspect.signature(MooncakeKvStore.__init__).parameters["cp_size"]
+        self.assertIs(cp_param.default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
-            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
+            MooncakeKvStore(host_buffer=object(), tp_size=1, cp_size=1, pp_size=1)
+        with self.assertRaises(TypeError):
+            MooncakeKvStore(None, host_buffer=object(), tp_size=1, pp_size=1)
 
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
@@ -359,6 +371,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
                     },
                     host_buffer=host,
                     tp_size=1,
+                    cp_size=1,
                     pp_size=1,
                 )
 
@@ -397,7 +410,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Failed to clear"):
             adapter.remove_by_prefix("model_")
 
-    def test_segment_is_divided_across_tp_and_pp_ranks(self):
+    def test_segment_is_divided_across_tp_cp_and_pp_ranks(self):
         captured = {}
 
         class _Store:
@@ -416,17 +429,30 @@ class MooncakeKvStoreTest(unittest.TestCase):
         host = SimpleNamespace(
             data_ptr=lambda: 1, numel=lambda: 8, element_size=lambda: 1
         )
+        extra = {
+            "master_server_address": "127.0.0.1:50051",
+            "global_segment_size": 8 * 1024**3,
+        }
         with mock.patch.dict(
             sys.modules, {"mooncake": package, "mooncake.store": store_module}
         ):
             MooncakeKvStore(
-                {
-                    "master_server_address": "127.0.0.1:50051",
-                    "global_segment_size": 8 * 1024**3,
-                },
+                extra,
                 host_buffer=host,
                 tp_size=2,
+                cp_size=2,
                 pp_size=2,
+            )
+        self.assertEqual(captured["segment"], 1 * 1024**3)
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                extra,
+                host_buffer=host,
+                tp_size=1,
+                cp_size=4,
+                pp_size=1,
             )
         self.assertEqual(captured["segment"], 2 * 1024**3)
 

@@ -381,7 +381,11 @@ Its responsibilities:
   load flushes Device/Host first so new parameters cannot reuse the
   previous checkpoint. `ClearCache` rejects in-flight Host writebacks
   (pause drain does not wait for those); the RPC then fails before the
-  GPU load and the caller retries. After a successful flush and GPU
+  GPU load and the caller retries. Flush success is MIN-reduced across
+  the same cache-owning ranks as L3 exists (attention TP, then CP, then
+  PP; not DP) so a rank whose writebacks have drained cannot enter the
+  NCCL weight broadcasts while a peer is still flushing. After a
+  successful flush and GPU
   load, the hashed prefix is rebuilt so new KV is not published under
   the previous checkpoint. An explicit new `weight_version` with
   `flush_cache=False` is rejected before the GPU load when L3 is on:
@@ -394,7 +398,10 @@ Its responsibilities:
   server's objects in place. After a successful RPC the Engine facade
   stamps the supplied version into `server_args.weight_version`.
   `ENABLE_CP` workers share `attn_tp_rank==0`
-  and are distinguished by `c{cp_rank}` and `cp_size`. Host eviction does
+  and are distinguished by `c{cp_rank}` and `cp_size`. Mooncake
+  `global_segment_size` is divided by attention TP × CP × PP; passing
+  `server_args.attn_tp_size` when `ENABLE_CP` inferred `cp_size` would
+  over-mount the store. Host eviction does
   **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
   that stable prefix rather than minting a process-local generation.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then

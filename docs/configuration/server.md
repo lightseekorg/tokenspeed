@@ -328,7 +328,11 @@ speculative draft checkpoint. Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
 reject, and the update RPC then fails so the caller retries instead of
-serving new weights against the previous checkpoint. Supplying a new
+serving new weights against the previous checkpoint. Flush success is
+MIN-reduced across cache-owning ranks in the replica (attention TP, then
+CP, then PP; not DP) before any rank enters the NCCL weight broadcasts:
+an L3 writeback still in flight on one rank must not leave its peers
+inside `update_weights_from_distributed` alone. Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the
 new checkpoint. Flushed L3 updates require an explicit `weight_version`;
@@ -339,8 +343,11 @@ Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
 in the hashed namespace.
 `global_segment_size` is split across
-attention-TP × pipeline-parallel ranks so the mounted total matches the
-configured size. L3 requires Host L2 (do not pass `--disable-kvstore`).
+attention-TP × context-parallel × pipeline-parallel ranks so the
+mounted total matches the configured size. Use the resolved mapping
+(`mapping.attn.tp_size` and `mapping.attn.cp_size`), not `--attn-tp-size`
+alone: `ENABLE_CP` with an omitted `--attn-tp-size` infers `cp_size = N`
+and `tp_size = 1`. L3 requires Host L2 (do not pass `--disable-kvstore`).
 Pass Mooncake client settings as JSON
 in `--kvstore-storage-backend-extra-config`, for example:
 

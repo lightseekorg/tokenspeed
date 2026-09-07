@@ -2,6 +2,8 @@ import inspect
 import unittest
 from unittest import mock
 
+import torch
+
 from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -36,6 +38,13 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
             weight_version="v1", kvstore_storage_backend=None
         )
         handler._device = mock.Mock()
+        handler._replica_tp_size = 1
+        handler._replica_tp_cpu_group = None
+        handler.attn_cp_size = 1
+        handler.attn_cp_cpu_group = None
+        handler.pp_size = 1
+        handler.pp_cpu_group = None
+        handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
         return handler
 
     def test_successful_update_flushes_then_rebuilds_l3_prefix(self):
@@ -218,6 +227,102 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
         self.assertIn("require weight_version", output.message)
+
+    def test_flush_min_reduces_tp_then_cp_then_pp(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del op
+            groups_seen.append(group)
+            buf.fill_(0)
+
+        handler = self._handler()
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+        handler.attn_cp_size = 2
+        handler.attn_cp_cpu_group = "cp"
+        handler.pp_size = 2
+        handler.pp_cpu_group = "pp"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([req])
+
+        self.assertEqual(groups_seen, ["tp", "cp", "pp"])
+        handler.clear_cache_fn.assert_called_once_with()
+        handler._device.update_weights.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+        self.assertIn("cache flush failed", output.message)
+
+    def test_enable_cp_flush_min_uses_cp_group_when_tp_is_one(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del buf, op
+            groups_seen.append(group)
+
+        handler = self._handler()
+        handler._replica_tp_size = 1
+        handler._replica_tp_cpu_group = "tp"
+        handler.attn_cp_size = 4
+        handler.attn_cp_cpu_group = "cp"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([req])
+
+        self.assertEqual(groups_seen, ["cp"])
+        handler._device.update_weights.assert_called_once_with(req)
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
+
+    def test_failed_flush_still_min_reduces_before_skipping_nccl(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del buf, op
+            groups_seen.append(group)
+
+        handler = self._handler()
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+        handler.clear_cache_fn = mock.Mock(return_value=False)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([req])
+
+        self.assertEqual(groups_seen, ["tp"])
+        handler._device.update_weights.assert_not_called()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+        self.assertIn("cache flush failed", output.message)
 
     def test_without_l3_omitted_version_keeps_the_startup_namespace(self):
         handler = self._handler()

@@ -294,6 +294,8 @@ For orientation, one iteration of `event_loop`:
   not pay: a round is microseconds, and agentic history is tens of thousands
   of tokens. When L3 is on, existence is MIN-reduced across every
   cache-owning rank in the replica (attention TP, then CP, then PP) so
-  those ranks admit the same prefix pages. Queued Submitted/Retracted
+  those ranks admit the same prefix pages. Weight-update `flush_cache`
+  uses the same replica MIN-reduce on the request-handler control path
+  before any rank enters the NCCL weight broadcasts. Queued Submitted/Retracted
   hashes are re-probed immediately before `next_execution_plan` so a hit
   registered at submit cannot be admitted after the object is gone.

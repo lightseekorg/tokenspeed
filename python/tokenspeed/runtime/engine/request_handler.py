@@ -150,6 +150,27 @@ class RequestHandler:
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        # Cache-owning ranks in this DP replica (attention TP × CP × PP).
+        # Distinct from attn_tp_* above: with PP those become WORLD so the
+        # request stream is identical across stages, which would also pull
+        # DP ranks into a flush MIN-reduce. Weight-update NCCL is replica-
+        # local; L3 exists uses the same groups (see EventLoop).
+        self._replica_tp_size = mapping.attn.tp_size
+        self._replica_tp_cpu_group = pg_manager.get_process_group(
+            "gloo", mapping.attn.tp_group
+        )
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
         self.req_broadcaster = (
             PipelinedPyobjBroadcaster(
                 self.attn_global_rank,
@@ -164,6 +185,8 @@ class RequestHandler:
         # transitions run on the control-plane thread, where allocating is what
         # Principle 1 forbids -- see _profile_sync.
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
+        self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -349,17 +372,50 @@ class RequestHandler:
         ``update_weights`` would leave new parameters on the old prefix
         indexes with no rollback. A failed flush keeps the previous
         checkpoint intact so the caller can retry.
+
+        Flush success is rank-local until MIN-reduced across the replica.
+        An L3 writeback can still be in flight on one TP/CP/PP rank after
+        it has completed on the others; those successful ranks must not
+        enter ``update_weights_from_distributed`` (ordered NCCL broadcasts)
+        while a peer skips it.
         """
 
         if not recv_req.flush_cache:
             return True, ""
-        if self.clear_cache_fn is None or not self.clear_cache_fn():
+        local_ok = self.clear_cache_fn is not None and self.clear_cache_fn()
+        if not self._converge_replica_decision(local_ok):
             return (
                 False,
                 "cache flush failed; retry the update after in-flight "
                 "Host writebacks drain",
             )
         return True, ""
+
+    def _converge_replica_decision(self, local_ok: bool) -> bool:
+        """MIN-reduce a yes/no across every cache-owning rank in this replica.
+
+        Same group order as ``EventLoop._converge_l3_exists``: attention TP,
+        then CP, then PP. DP ranks hold different sequences and are not
+        reduced. CPU-tensor gloo all_reduce, not a barrier: see
+        ``_profile_sync``.
+        """
+
+        groups = []
+        if self._replica_tp_size > 1 and self._replica_tp_cpu_group is not None:
+            groups.append(self._replica_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if not groups:
+            return local_ok
+        buf = self._replica_decision_buf
+        buf[0] = 1 if local_ok else 0
+        for group in groups:
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        return bool(buf.item())
 
     def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
         """Publish under the new checkpoint after a successful GPU load.

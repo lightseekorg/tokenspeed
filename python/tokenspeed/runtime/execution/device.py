@@ -800,7 +800,8 @@ def build_device_side(
                 server_args.kvstore_storage_backend,
                 server_args.kvstore_storage_backend_extra_config,
                 host_buffer=l2_cache_executor.host_storage.host_buffer,
-                tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+                tp_size=server_args.mapping.attn.tp_size,
+                cp_size=server_args.mapping.attn.cp_size,
                 pp_size=(
                     server_args.mapping.pp_size if server_args.mapping.has_pp else 1
                 ),
