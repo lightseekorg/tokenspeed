@@ -94,15 +94,20 @@ def storage_object_key(
 
 
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
-    """Return a stable fingerprint of the bytes stored in one L3 page."""
+    """Return a stable fingerprint of the bytes stored in one L3 page.
+
+    The signature is the packed Host CacheBlock: dtype, group packing, and
+    each field's payload geometry. Device arena offsets
+    (``device_block_zero_offset_bytes``, buffer index) are omitted; later
+    planes sit at ``(num_lcm_blocks + 1) * bytes_per_lcm_block``, so GPU
+    capacity would otherwise split otherwise identical Mooncake objects.
+    """
 
     groups = []
     for group in layout.groups:
         fields = [
             {
                 "id": field.field_id,
-                "buffer": int(field.device_buffer_index),
-                "zero": int(field.device_block_zero_offset_bytes),
                 "stride": int(field.block_stride_bytes),
                 "payload": int(field.payload_bytes),
             }

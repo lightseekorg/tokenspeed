@@ -379,7 +379,8 @@ Its responsibilities:
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
   (`model` + resolved immutable revision + `--weight-version`), the packed
-  CacheBlock layout (dtype and field geometry), the effective
+  Host CacheBlock layout (dtype and field payload geometry, not device
+  arena offsets that follow GPU cache capacity), the effective
   cache-quantization config (`quantization` plus the
   `quantization_param_path` scale-file digest), `--hf-overrides` as applied
   to the HF text config (rope_theta, rope_scaling, and other architecture

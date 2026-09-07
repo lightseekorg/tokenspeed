@@ -324,7 +324,8 @@ Each packed Host CacheBlock is one Mooncake object, keyed as
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
 immutable revision, `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
-fields), the packed layout, the
+fields), the packed Host layout (field payloads, not GPU-capacity
+device arena offsets), the
 cache-quantization config (including `quantization_param_path` scale-file
 bytes), the pipeline stage, the context-parallel
 width (`cp_size`), and any

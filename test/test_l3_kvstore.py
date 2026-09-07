@@ -300,6 +300,38 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(
             fp16, cache_layout_signature(changed, cache_dtype="float16")
         )
+        strided = SimpleNamespace(
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=1,
+                    fields=(
+                        SimpleNamespace(**{**vars(field), "block_stride_bytes": 64}),
+                    ),
+                ),
+            )
+        )
+        self.assertNotEqual(
+            fp16, cache_layout_signature(strided, cache_dtype="float16")
+        )
+        shifted = SimpleNamespace(
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=1,
+                    fields=(
+                        SimpleNamespace(
+                            **{
+                                **vars(field),
+                                "device_buffer_index": 1,
+                                "device_block_zero_offset_bytes": 4096,
+                            }
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(fp16, cache_layout_signature(shifted, cache_dtype="float16"))
 
 
 class MemoryKvStoreTest(unittest.TestCase):
