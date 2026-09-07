@@ -396,7 +396,8 @@ Its responsibilities:
   `--speculative-draft-model-quantization` when a draft pool is present), `--hf-overrides` as applied
   to the HF text config (rope_theta, rope_scaling, and other architecture
   fields that change cached keys), the pipeline stage, the
-  context-parallel width (`cp_size`), and the speculative
+  context-parallel width (`cp_size`), the resolved attention-TP width
+  (`attn.tp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
   Hugging Face branch or local path is fingerprinted from a snapshot
   directory commit or the contents of the local checkpoint actually
@@ -414,7 +415,11 @@ Its responsibilities:
   produced by a different encoding. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
-  object key. A live weight
+  object key. GQA with TP above the KV-head count keeps one local KV
+  head per rank, so packed Host geometry is unchanged, while
+  `tp_rank // num_kv_head_replicas` assigns different heads to the same
+  `r{tp_rank}`; `attn_tp_size` is therefore part of the namespace. Use
+  the resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone. A live weight
   load flushes Device/Host first so new parameters cannot reuse the
   previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
   (pause drain does not wait for those). Weight-update `flush_cache` and
@@ -479,7 +484,9 @@ Its responsibilities:
   pages whose replica-converged `batch_get_into` missed stay
   unread: a later `batch_exists` hit must not re-register them and retry
   the same prefetch. Successfully restored pages in a mixed prefetch
-  stay readable. Clients are not failed; mixed
+  stay readable. A later successful Host backup of a failed page
+  forgets that unread entry so L3 reuse can resume; the unread set is
+  also bounded to Host page capacity. Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks
   stay aligned. Existence and prefetch are skipped when L3 is unset:
   Host-only and

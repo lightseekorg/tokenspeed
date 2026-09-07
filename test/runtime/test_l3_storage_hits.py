@@ -40,6 +40,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 
 
@@ -87,7 +88,7 @@ class _Device:
         self.prefetch_pages = False
         self.prefetch_calls = 0
         self.invalidations = 0
-        self._l3_unread_keys: set[tuple[int, str, int]] = set()
+        self._l3_unread = L3UnreadKeySet(capacity=8)
 
     def query_l3_storage(self, pages):
         self.pages = list(pages)
@@ -95,21 +96,21 @@ class _Device:
 
     def delete_l3_namespace(self) -> bool:
         self.rotations += 1
-        self._l3_unread_keys.clear()
+        self._l3_unread.clear()
         return True
 
     def mark_l3_keys_unread(self, groups, hashes, offsets) -> None:
-        for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-            self._l3_unread_keys.add(
-                (int(group_id), str(content_hash), int(page_offset))
-            )
+        self._l3_unread.mark(groups=groups, hashes=hashes, offsets=offsets)
 
     def l3_key_is_unread(self, group_id, content_hash, page_offset) -> bool:
-        return (
-            int(group_id),
-            str(content_hash),
-            int(page_offset),
-        ) in self._l3_unread_keys
+        return self._l3_unread.contains(
+            group_id=int(group_id),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+
+    def forget_l3_unread_keys(self, groups, hashes, offsets) -> None:
+        self._l3_unread.forget(groups=groups, hashes=hashes, offsets=offsets)
 
     def plan_has_l3_prefetch(self, plan) -> bool:
         del plan
@@ -545,6 +546,30 @@ def test_mixed_l3_prefetch_blacklists_only_failed_pages(monkeypatch) -> None:
     loop._revalidate_queued_l3_hits()
     assert loop.scheduler.registered == ([0], ["h4"], [0])
     assert loop.scheduler.unregistered == ([0], ["h5"], [0])
+
+
+def test_successful_republish_clears_unread_l3_key(monkeypatch) -> None:
+    """A later Host backup of the failed page must restore L3 reuse."""
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = False
+    events = loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert events
+    assert loop._device.l3_key_is_unread(0, "h4", 0) is True
+    loop._device.forget_l3_unread_keys([0], ["h4"], [0])
+    loop.scheduler.registered = None
+    loop.scheduler.unregistered = None
+    loop.scheduler.waiting_hashes = ["h4"]
+    loop._revalidate_queued_l3_hits()
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
+    assert loop.scheduler.unregistered is None
 
 
 if __name__ == "__main__":

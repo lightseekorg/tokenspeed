@@ -319,7 +319,9 @@ For orientation, one iteration of `event_loop`:
   snapshot-less retract of the batch so the next admit recomputes.
   Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
   cannot re-register them; only the replica-converged misses are
-  blacklisted, so a restored prefix page stays readable. A backend
+  blacklisted, so a restored prefix page stays readable. A later
+  successful Host backup forgets that unread entry so L3 reuse can
+  resume; the unread set is bounded to Host page capacity. A backend
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN; raising would
   hang healthy peers. Clients are not failed.

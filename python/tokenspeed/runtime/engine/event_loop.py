@@ -643,7 +643,9 @@ class EventLoop:
         Failed keys stay unread: a later ``batch_exists`` hit must not
         re-register them and retry the same prefetch. Only pages whose
         replica-converged ``batch_get_into`` missed are blacklisted;
-        successfully restored leading pages stay readable. The whole
+        successfully restored leading pages stay readable. A later
+        successful Host backup forgets that unread entry so L3 reuse can
+        resume. The whole
         forward is skipped so ranks stay aligned; mixed prefill/decode
         partners retract rather than finish with an error.
         """

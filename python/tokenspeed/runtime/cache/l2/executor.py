@@ -40,6 +40,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
+from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
@@ -162,6 +163,7 @@ class L2CacheExecutor:
         # prefix across ranks.
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
+        self._l3_unread = L3UnreadKeySet(capacity=self.num_host_pages)
         logger.info(
             "Allocated %.2f GB compact Host L2 (%s LCM blocks, %s bytes/block)",
             requested_host_bytes / 1e9,
@@ -470,6 +472,31 @@ class L2CacheExecutor:
             )
         return list(l3_store.prefetch(pages))
 
+    def mark_l3_keys_unread(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Remember keys whose ``batch_get_into`` failed after Admit."""
+
+        self._l3_unread.mark(groups=groups, hashes=hashes, offsets=offsets)
+
+    def l3_key_is_unread(
+        self, group_id: int, content_hash: str, page_offset: int
+    ) -> bool:
+        """True when this key already failed ``batch_get_into``."""
+
+        return self._l3_unread.contains(
+            group_id=int(group_id),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+
+    def forget_l3_unread_keys(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Allow a key to hit L3 again after a successful republish."""
+
+        self._l3_unread.forget(groups=groups, hashes=hashes, offsets=offsets)
+
     def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
@@ -486,13 +513,17 @@ class L2CacheExecutor:
 
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
+            self._l3_unread.clear()
             return True
         try:
             self._wait_l3_backups()
         except Exception:
             logger.exception("L3 backup wait failed before namespace delete")
             return False
-        return l3_store.rotate_namespace()
+        deleted = l3_store.rotate_namespace()
+        if deleted:
+            self._l3_unread.clear()
+        return deleted
 
     def _transfer_ranges(
         self,
@@ -763,6 +794,7 @@ class L2CacheExecutor:
             raise RuntimeError(
                 f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
             )
+        self._l3_unread.forget_pages(pages)
 
     @staticmethod
     def _split_ready(queue):
@@ -826,5 +858,6 @@ class L2CacheExecutor:
         self._ready_write_op_ids.clear()
         self._ready_load_acks.clear()
         self._l3_prefetch_ok.clear()
+        self._l3_unread.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()

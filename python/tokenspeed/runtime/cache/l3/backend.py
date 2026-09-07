@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -372,6 +374,7 @@ def storage_key_prefix(
     model_overrides: dict,
     cache_signature: str,
     pipeline_rank: int,
+    attn_tp_size: int,
     cp_size: int,
     draft_model: str,
     draft_revision: str,
@@ -381,9 +384,10 @@ def storage_key_prefix(
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, context-parallel width, draft
-    pool, cache-quantization config (target and draft), or runtime HF
-    overrides and silently collide with an incompatible deployment.
+    identity, cache layout, pipeline stage, attention-TP width,
+    context-parallel width, draft pool, cache-quantization config (target
+    and draft), or runtime HF overrides and silently collide with an
+    incompatible deployment.
     ``revision`` is the resolved immutable checkpoint (Hugging Face commit
     or local fingerprint), not a moving branch name. ``model_overrides``
     is the ``--hf-overrides`` dict applied to the HF text config
@@ -392,7 +396,11 @@ def storage_key_prefix(
     (no draft pool, no extra cache scales, no HF overrides). ``cp_size``
     belongs here rather than only in the per-object ``c{cp_rank}`` shard
     id: zigzag CP assigns different token blocks to the same rank under
-    different widths.
+    different widths. ``attn_tp_size`` belongs here rather than only in
+    the per-object ``r{tp_rank}`` shard id: GQA with TP above the KV-head
+    count keeps one local KV head per rank, so packed Host geometry is
+    unchanged, while ``tp_rank // num_kv_head_replicas`` assigns different
+    heads to the same rank.
     """
 
     if not isinstance(model_overrides, dict):
@@ -405,6 +413,7 @@ def storage_key_prefix(
             "model_overrides": model_overrides,
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
+            "attn_tp_size": int(attn_tp_size),
             "cp_size": int(cp_size),
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
@@ -433,6 +442,73 @@ def copy_host_bytes(host_buffer: Any, offset: int, size: int) -> bytes:
     if callable(numpy):
         return bytes(numpy())
     return bytes(view)
+
+
+class L3UnreadKeySet:
+    """Failed L3 gets that must not be re-admitted from ``batch_exists``.
+
+    A vanished or unreadable object can stay visible to ``batch_exists``.
+    Those keys stay unread until the same page is successfully published
+    again, a namespace delete succeeds, or the set exceeds Host page
+    capacity (oldest first) so a long-lived process cannot accumulate
+    every historical failure.
+    """
+
+    def __init__(self, *, capacity: int) -> None:
+        if int(capacity) <= 0:
+            raise ValueError("L3 unread capacity must be positive")
+        self._capacity = int(capacity)
+        self._keys: OrderedDict[tuple[int, str, int], None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def mark(
+        self,
+        groups: Sequence[int],
+        hashes: Sequence[str],
+        offsets: Sequence[int],
+    ) -> None:
+        with self._lock:
+            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
+                key = (int(group_id), str(content_hash), int(page_offset))
+                self._keys.pop(key, None)
+                self._keys[key] = None
+            while len(self._keys) > self._capacity:
+                self._keys.popitem(last=False)
+
+    def contains(self, group_id: int, content_hash: str, page_offset: int) -> bool:
+        with self._lock:
+            return (
+                int(group_id),
+                str(content_hash),
+                int(page_offset),
+            ) in self._keys
+
+    def forget(
+        self,
+        groups: Sequence[int],
+        hashes: Sequence[str],
+        offsets: Sequence[int],
+    ) -> None:
+        with self._lock:
+            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
+                self._keys.pop(
+                    (int(group_id), str(content_hash), int(page_offset)),
+                    None,
+                )
+
+    def forget_pages(self, pages: Sequence[tuple]) -> None:
+        groups = []
+        hashes = []
+        offsets = []
+        for group_id, _host_block, content_hash, page_offset in pages:
+            groups.append(int(group_id))
+            hashes.append(str(content_hash))
+            offsets.append(int(page_offset))
+        self.forget(groups=groups, hashes=hashes, offsets=offsets)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._keys.clear()
 
 
 def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:

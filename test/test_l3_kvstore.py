@@ -31,6 +31,7 @@ from unittest import mock
 
 from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    L3UnreadKeySet,
     MemoryKvStore,
     cache_layout_signature,
     l3_cache_quantization_id,
@@ -85,6 +86,7 @@ class StorageKeyTest(unittest.TestCase):
                 "model_overrides": {},
                 "cache_signature": "layout",
                 "pipeline_rank": 0,
+                "attn_tp_size": 1,
                 "cp_size": 1,
                 "draft_model": "",
                 "draft_revision": "",
@@ -102,6 +104,8 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(base, prefix(weight_version="v2"))
         self.assertNotEqual(base, prefix(cache_signature="other"))
         self.assertNotEqual(base, prefix(pipeline_rank=1))
+        self.assertNotEqual(base, prefix(attn_tp_size=8))
+        self.assertNotEqual(prefix(attn_tp_size=8), prefix(attn_tp_size=16))
         self.assertNotEqual(base, prefix(cp_size=2))
         self.assertNotEqual(prefix(cp_size=2), prefix(cp_size=4))
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
@@ -126,6 +130,9 @@ class StorageKeyTest(unittest.TestCase):
         self.assertIs(signature.parameters["revision"].default, inspect.Parameter.empty)
         self.assertIs(
             signature.parameters["model_overrides"].default, inspect.Parameter.empty
+        )
+        self.assertIs(
+            signature.parameters["attn_tp_size"].default, inspect.Parameter.empty
         )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
@@ -695,6 +702,38 @@ class StorageKeyTest(unittest.TestCase):
             )
         )
         self.assertEqual(fp16, cache_layout_signature(shifted, cache_dtype="float16"))
+
+
+class L3UnreadKeySetTest(unittest.TestCase):
+    def test_forget_after_mark_allows_reuse(self):
+        unread = L3UnreadKeySet(capacity=4)
+        unread.mark([0], ["h4"], [0])
+        self.assertTrue(unread.contains(0, "h4", 0))
+        unread.forget([0], ["h4"], [0])
+        self.assertFalse(unread.contains(0, "h4", 0))
+
+    def test_forget_pages_matches_backup_tuples(self):
+        unread = L3UnreadKeySet(capacity=4)
+        unread.mark([1], ["h5"], [2])
+        unread.forget_pages([(1, 99, "h5", 2)])
+        self.assertFalse(unread.contains(1, "h5", 2))
+
+    def test_capacity_evicts_oldest_failure(self):
+        unread = L3UnreadKeySet(capacity=2)
+        unread.mark([0, 0, 0], ["h1", "h2", "h3"], [0, 0, 0])
+        self.assertFalse(unread.contains(0, "h1", 0))
+        self.assertTrue(unread.contains(0, "h2", 0))
+        self.assertTrue(unread.contains(0, "h3", 0))
+
+    def test_clear_forgets_every_key(self):
+        unread = L3UnreadKeySet(capacity=2)
+        unread.mark([0], ["h4"], [0])
+        unread.clear()
+        self.assertFalse(unread.contains(0, "h4", 0))
+
+    def test_capacity_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "capacity must be positive"):
+            L3UnreadKeySet(capacity=0)
 
 
 class MemoryKvStoreTest(unittest.TestCase):

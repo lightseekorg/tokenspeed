@@ -354,6 +354,8 @@ skips publishing empty Host pages, and retracts the batch snapshot-less
 so the next admit recomputes those tokens. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
 retry the same prefetch; only replica-converged misses are blacklisted.
+A later successful Host backup forgets that unread entry so L3 reuse can
+resume; the unread set is bounded to Host page capacity.
 A backend exception or malformed result is a
 local miss so every replica rank still enters the MIN-reduce. Clients
 are not failed.
@@ -371,7 +373,9 @@ A successful Engine update stamps that version into
 frontend `server_args`.
 Context-parallel workers (`ENABLE_CP`) share
 `attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
-in the hashed namespace.
+in the hashed namespace. GQA with TP above the KV-head count assigns
+different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
+`mapping.attn.tp_size`) is also in the namespace.
 `global_segment_size` is split across
 attention-TP × context-parallel × pipeline-parallel ranks so the
 mounted total matches the configured size. Use the resolved mapping

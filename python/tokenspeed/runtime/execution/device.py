@@ -258,9 +258,6 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
-        # Prefetch get-failures stay unread so a later batch_exists hit
-        # cannot re-register the same key and retry the failed load.
-        self._l3_unread_keys: set[tuple[int, str, int]] = set()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -487,24 +484,38 @@ class DeviceHandle:
 
         ``batch_exists`` can still report these present. The next admit
         must treat them as misses so the request recomputes instead of
-        retrying the same prefetch.
+        retrying the same prefetch. A later successful Host backup of the
+        same page forgets the entry so L3 reuse can resume.
         """
 
-        for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-            self._l3_unread_keys.add(
-                (int(group_id), str(content_hash), int(page_offset))
-            )
+        l2 = self._l2
+        if l2 is None:
+            return
+        l2.mark_l3_keys_unread(groups=groups, hashes=hashes, offsets=offsets)
 
     def l3_key_is_unread(
         self, group_id: int, content_hash: str, page_offset: int
     ) -> bool:
         """True when this key already failed ``batch_get_into``."""
 
-        return (
-            int(group_id),
-            str(content_hash),
-            int(page_offset),
-        ) in self._l3_unread_keys
+        l2 = self._l2
+        if l2 is None:
+            return False
+        return l2.l3_key_is_unread(
+            group_id=int(group_id),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+
+    def forget_l3_unread_keys(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Allow a key to hit L3 again after a successful republish."""
+
+        l2 = self._l2
+        if l2 is None:
+            return
+        l2.forget_l3_unread_keys(groups=groups, hashes=hashes, offsets=offsets)
 
     def delete_l3_namespace(self) -> bool:
         """Delete L3 objects under the current prefix. Device/Host stay intact.
@@ -517,12 +528,8 @@ class DeviceHandle:
         """
 
         if self._l2 is None:
-            self._l3_unread_keys.clear()
             return True
-        deleted = self._l2.delete_l3_namespace()
-        if deleted:
-            self._l3_unread_keys.clear()
-        return deleted
+        return self._l2.delete_l3_namespace()
 
     def set_l3_weight_version(self, weight_version: str) -> None:
         """Publish subsequent Host pages under the new checkpoint identity."""
@@ -943,6 +950,7 @@ def build_device_side(
                 quantization_param_path=str(server_args.quantization_param_path or ""),
                 draft_quantization=draft_quantization,
             )
+            attn_tp_size = int(server_args.mapping.attn.tp_size)
             cp_size = int(server_args.mapping.attn.cp_size)
 
             def prefix_for_weight_version(weight_version: str) -> str:
@@ -953,6 +961,7 @@ def build_device_side(
                     model_overrides=dict(model_config.model_override_args),
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
+                    attn_tp_size=attn_tp_size,
                     cp_size=cp_size,
                     draft_model=draft_model,
                     draft_revision=draft_revision,
