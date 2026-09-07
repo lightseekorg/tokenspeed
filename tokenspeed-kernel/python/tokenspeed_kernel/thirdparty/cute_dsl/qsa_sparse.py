@@ -53,12 +53,11 @@ cpy_dice = (None,) + mma_dice  # (CPY, #CPY_MMA, #CPY_M, #CPY_K)
 warp_threads = 32
 warpgroup_warps = 4
 warpgroup_threads = 128
-_NUM_HEADS = 6
 _HEAD_DIM = 256
 _GROUPED_HEAD_TILE = 8
 _CONVERT_WARPGROUPS = 2
 _SELECTED_WIDTH = 2051
-_SMALL_MAX_ROWS = 8
+_SMALL_MAX_CLUSTERS = 8
 _SMALL_NUM_SPLITS = 8
 _WIDE_NUM_SPLITS = 16
 _LARGE_NUM_SPLITS = 4
@@ -87,9 +86,13 @@ def _wide_cluster_capacity(device_index: int) -> int:
             return 0
 
 
-def _num_splits(rows: int, wide_cluster_capacity: int) -> int:
-    if rows <= _SMALL_MAX_ROWS:
-        return _WIDE_NUM_SPLITS if rows <= wide_cluster_capacity else _SMALL_NUM_SPLITS
+def _num_splits(num_clusters: int, wide_cluster_capacity: int) -> int:
+    if num_clusters <= _SMALL_MAX_CLUSTERS:
+        return (
+            _WIDE_NUM_SPLITS
+            if num_clusters <= wide_cluster_capacity
+            else _SMALL_NUM_SPLITS
+        )
     return _LARGE_NUM_SPLITS
 
 
@@ -202,7 +205,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 if candidate > 0:
                     slot = candidate
             slot = cute.arch.shuffle_sync(slot, lane_idx - lane_idx % 8)
-            source = cache_iter + slot * 256 + dim_offset + col
+            source = (
+                cache_iter + slot * self.problem_shape[2] * _HEAD_DIM + dim_offset + col
+            )
             logical_address = smem_base + row * 128 + col + smem_stage * 16384
             swizzled_address = logical_address ^ ((logical_address >> 3) & 0x70)
             destination = cute.make_ptr(
@@ -241,7 +246,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 if candidate > 0:
                     slot = candidate
             slot = cute.arch.shuffle_sync(slot, lane_idx - lane_idx % 16)
-            source = cache_iter + slot * 256 + dim_offset + col
+            source = (
+                cache_iter + slot * self.problem_shape[2] * _HEAD_DIM + dim_offset + col
+            )
             logical_address = (
                 smem_base
                 + row * 128
@@ -518,6 +525,18 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Read special registers
         kv_splits, tiles_hr, tiles_hb = cute.arch.grid_dim()
         kv_split_idx, coord_hr, coord_hb = cute.arch.block_idx()
+        num_rows, num_q_heads, num_kv_heads, cache_slots, head_dim = self.problem_shape
+        heads_per_kv = num_q_heads // num_kv_heads
+        head_tiles = cute.ceil_div(heads_per_kv, _GROUPED_HEAD_TILE)
+        row_idx = coord_hb // num_kv_heads
+        kv_head_idx = coord_hb % num_kv_heads
+        # Canonicalize singleton dimensions so the original one-KV-head,
+        # one-head-tile case folds to its original addressing at compile time.
+        head_offset = (coord_hr % head_tiles) * _GROUPED_HEAD_TILE
+        q_head_offset = kv_head_idx * heads_per_kv + head_offset
+        reduction_heads = min(heads_per_kv, _GROUPED_HEAD_TILE)
+        k_iter = k_iter + kv_head_idx * head_dim
+        v_iter = v_iter + kv_head_idx * head_dim
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(tidx // warp_threads)
@@ -880,7 +899,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self._issue_sparse_tile_for_dtype(
                 k_iter,
                 selected_slots,
-                coord_hb,
+                row_idx,
                 kv_split_idx,
                 convert_phase * mma_tile_k,
                 sKV_vector_address,
@@ -905,7 +924,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     k_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx + kv_splits,
                                     convert_phase * mma_tile_k,
                                     sKV_vector_address,
@@ -919,7 +938,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     v_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx,
                                     convert_phase * mma_tile_m,
                                     sKV_vector_address,
@@ -932,7 +951,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             self._issue_sparse_tile_for_dtype(
                                 v_iter,
                                 selected_slots,
-                                coord_hb,
+                                row_idx,
                                 kv_split_idx + (s - 1) * kv_splits,
                                 convert_phase * mma_tile_m,
                                 sKV_vector_address,
@@ -989,7 +1008,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     k_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx + (s + 1) * kv_splits,
                                     convert_phase * mma_tile_k,
                                     sKV_vector_address,
@@ -1002,7 +1021,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     v_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx + s * kv_splits,
                                     convert_phase * mma_tile_m,
                                     sKV_vector_address,
@@ -1242,8 +1261,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     score_coord = tScS[i]
                     selected_idx = selected_tile * blk_tile_s + score_coord[0]
                     valid = cutlass.Boolean(False)
-                    if selected_idx < selected_slots.shape[1] and score_coord[1] < 6:
-                        valid = selected_slots[coord_hb, selected_idx] > 0
+                    if (
+                        selected_idx < selected_slots.shape[1]
+                        and head_offset + score_coord[1] < heads_per_kv
+                    ):
+                        valid = selected_slots[row_idx, selected_idx] > 0
                     tSrValid[i] = cutlass.Int32(1) if valid else cutlass.Int32(0)
                     if not valid:
                         tSrS[i] = cutlass.Float32(-1.0e30)
@@ -1372,15 +1394,17 @@ class MixedInputFusedMultiHeadAttentionDecode:
             # one paired with the TMEM fragment, avoiding swizzle inversion.
             local_partial = cute.make_tensor(
                 cute.recast_ptr(tAsK.iterator, dtype=acc_dtype),
-                cute.make_layout((6, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)),
+                cute.make_layout(
+                    (reduction_heads, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)
+                ),
             )
             for i in cutlass.range_constexpr(cute.size(tSrO)):
                 coord = tScO[i]
                 dim = coord[0]
                 head = coord[1]
-                if head < 6:
+                if head < reduction_heads:
                     local_partial[head, dim] = tSrO[i]
-            if warpgroup_widx == 0 and lane_idx < 6:
+            if warpgroup_widx == 0 and lane_idx < reduction_heads:
                 local_partial[lane_idx, blk_tile_d] = sM[0, lane_idx]
                 local_partial[lane_idx, blk_tile_d + 1] = sL[0, lane_idx, 0]
 
@@ -1393,25 +1417,32 @@ class MixedInputFusedMultiHeadAttentionDecode:
         cta_rank = cute.arch.block_idx_in_cluster()
         local_partial = cute.make_tensor(
             cute.recast_ptr(tAsK.iterator, dtype=acc_dtype),
-            cute.make_layout((6, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)),
+            cute.make_layout(
+                (reduction_heads, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)
+            ),
         )
         tail_count = selected_slots.shape[1] % blk_tile_s
         tail_start = selected_slots.shape[1] - tail_count
         mQuery = cute.make_tensor(
-            q_source, cute.make_layout((256, 6, self.problem_shape[0]))
+            q_source, cute.make_layout((head_dim, num_q_heads, num_rows))
         )
-        mKey = cute.make_tensor(k_iter, cute.make_layout((256, self.problem_shape[3])))
-        mValue = cute.make_tensor(
-            v_iter, cute.make_layout((256, self.problem_shape[3]))
+        kv_layout = cute.make_layout(
+            (head_dim, cache_slots), stride=(1, num_kv_heads * head_dim)
         )
-        for head_group in cutlass.range_constexpr(cute.ceil_div(6, cluster_splits)):
+        mKey = cute.make_tensor(k_iter, kv_layout)
+        mValue = cute.make_tensor(v_iter, kv_layout)
+        for head_group in cutlass.range_constexpr(
+            cute.ceil_div(reduction_heads, cluster_splits)
+        ):
             head = cta_rank + head_group * cluster_splits
+            valid_head = head < reduction_heads and head_offset + head < heads_per_kv
+            q_head = q_head_offset + head
             numerator = cutlass.Float32(0.0)
             tail_values = cute.make_rmem_tensor(tail_count, cutlass.Float32)
             tail_values.fill(0.0)
             tail_dots = cute.make_rmem_tensor(tail_count, cutlass.Float32)
             tail_dots.fill(0.0)
-            if head < 6:
+            if valid_head:
                 if warp_idx == 0:
                     split_max = -cutlass.Float32.inf
                     split_sum = cutlass.Float32(0.0)
@@ -1437,31 +1468,31 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         sM[0, 0] = denominator
                         sM[0, 1] = global_max
                 if tidx < blk_tile_d:
-                    query_value = cutlass.Float32(mQuery[tidx, head, coord_hb])
+                    query_value = cutlass.Float32(mQuery[tidx, q_head, row_idx])
                     for tail in cutlass.range_constexpr(tail_count):
-                        slot = selected_slots[coord_hb, tail_start + tail]
+                        slot = selected_slots[row_idx, tail_start + tail]
                         if slot > 0:
                             tail_dots[tail] = query_value * cutlass.Float32(
                                 mKey[tidx, slot]
                             )
                             tail_values[tail] = cutlass.Float32(mValue[tidx, slot])
             cute.arch.sync_threads()
-            if head < 6 and tidx < blk_tile_d:
+            if valid_head and tidx < blk_tile_d:
                 for split in cutlass.range_constexpr(cluster_splits):
                     value_ptr = cute.domain_offset((head, tidx), local_partial).iterator
                     split_value = ld_shared_remote_f32(set_block_rank(value_ptr, split))
                     numerator += sL[0, split % 8, split // 8] * split_value
             cute.arch.sync_threads()
-            if head < 6 and tidx < blk_tile_d:
+            if valid_head and tidx < blk_tile_d:
                 for tail in cutlass.range_constexpr(tail_count):
                     dot = cute.arch.warp_reduction_sum(tail_dots[tail])
                     if lane_idx == 0:
                         sL[0, warp_idx, tail] = dot
             cute.arch.sync_threads()
-            if head < 6 and warp_idx == 0:
+            if valid_head and warp_idx == 0:
                 tail_score = -cutlass.Float32.inf
                 if lane_idx < tail_count:
-                    if selected_slots[coord_hb, tail_start + lane_idx] > 0:
+                    if selected_slots[row_idx, tail_start + lane_idx] > 0:
                         tail_score = cutlass.Float32(0.0)
                         for warp in cutlass.range_constexpr(8):
                             tail_score += sL[0, warp, lane_idx]
@@ -1480,11 +1511,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     sM[0, 0] = sM[0, 0] * main_correction + tail_sum
                     sM[0, 1] = main_correction
             cute.arch.sync_threads()
-            if head < 6 and tidx < blk_tile_d:
+            if valid_head and tidx < blk_tile_d:
                 numerator *= sM[0, 1]
                 for tail in cutlass.range_constexpr(tail_count):
                     numerator += sL[0, tail, 0] * tail_values[tail]
-                mOut[tidx, head, coord_hb] = mOut.element_type(
+                mOut[tidx, q_head, row_idx] = mOut.element_type(
                     scale_o * numerator / sM[0, 0] if sM[0, 0] > 0.0 else 0.0
                 )
             cute.arch.sync_threads()
@@ -1530,8 +1561,8 @@ def _compile_kernel(
 ):
     problem_shape = (
         query.shape[0],
-        _NUM_HEADS,
-        1,
+        query.shape[1],
+        key_cache.shape[1],
         key_cache.shape[0],
         _HEAD_DIM,
     )
@@ -1562,12 +1593,21 @@ def kernel(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run direct-slot QSA attention with adaptive SM100 CTA clusters."""
+    """Run direct-slot QSA GQA with adaptive SM100 CTA clusters.
 
-    if query.ndim != 3 or query.shape[1:] != (_NUM_HEADS, _HEAD_DIM):
-        raise ValueError("candidate requires query shape [tokens, 6, 256]")
-    if key_cache.ndim != 3 or key_cache.shape[1:] != (1, _HEAD_DIM):
-        raise ValueError("candidate requires key cache shape [slots, 1, 256]")
+    Query heads form contiguous groups for each KV head. Groups must contain
+    at least two query heads so the swizzled Q TMA retains its head dimension.
+    """
+
+    if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:
+        raise ValueError("candidate requires query shape [tokens, query_heads, 256]")
+    if key_cache.ndim != 3 or key_cache.shape[-1] != _HEAD_DIM:
+        raise ValueError("candidate requires key cache shape [slots, kv_heads, 256]")
+    num_q_heads, num_kv_heads = query.shape[1], key_cache.shape[1]
+    if num_q_heads < 1 or num_kv_heads < 1 or num_q_heads % num_kv_heads:
+        raise ValueError("query heads must be a positive multiple of KV heads")
+    if num_q_heads == num_kv_heads:
+        raise ValueError("candidate requires at least two query heads per KV head")
     if value_cache.shape != key_cache.shape:
         raise ValueError("candidate requires matching K/V cache shapes")
     if selected_slots.shape != (query.shape[0], _SELECTED_WIDTH):
@@ -1598,17 +1638,25 @@ def kernel(
     )
     scale_qs = float(scale) * _scalar(k_scale, 1.0)
     scale_o = _scalar(v_scale, 1.0)
+    heads_per_kv = num_q_heads // num_kv_heads
+    num_clusters = (
+        query.shape[0]
+        * num_kv_heads
+        * ((heads_per_kv + _GROUPED_HEAD_TILE - 1) // _GROUPED_HEAD_TILE)
+    )
     kv_splits = _num_splits(
-        query.shape[0],
+        num_clusters,
         (
             _wide_cluster_capacity(query.device.index)
-            if query.shape[0] <= _SMALL_MAX_ROWS
+            if num_clusters <= _SMALL_MAX_CLUSTERS
             else 0
         ),
     )
     cache_key = (
         query.device.index,
         query.shape[0],
+        num_q_heads,
+        num_kv_heads,
         key_cache.shape[0],
         key_cache.dtype,
         kv_splits,
