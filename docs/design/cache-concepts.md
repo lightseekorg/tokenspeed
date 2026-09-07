@@ -426,17 +426,22 @@ Its responsibilities:
   previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
   (pause drain does not wait for those). Weight-update `flush_cache` and
   standalone `/flush_cache` first MIN-reduce a non-mutating
-  `CanClearCache` / `CacheIsClearable` probe across the same cache-owning
-  ranks as L3 exists (attention TP, then CP, then PP; not DP) so no rank
-  mutates Device/Host until every replica agrees the indexes are
-  clearable. Remote L3 deletion is then an error-returning phase (no
+  `CanClearCache` / `CacheIsClearable` probe across cache-owning ranks
+  (attention TP, then CP, then PP) and then across attention DP so no
+  rank mutates Device/Host until every replica that shares the Mooncake
+  namespace agrees the indexes are clearable. Exists, prefetch, and
+  `WriteBackDone` stay TP/CP/PP: DP ranks hold different sequences.
+  Flush includes DP because object keys omit DP rank. Remote L3 deletion
+  is then an error-returning phase (no
   raise into the event loop): each rank waits in-flight Host-to-store
   backups, `remove_by_prefix`, and MIN-reduces that result. Only then
   does each rank call `ClearCache`. A failed probe, a failed delete, or
   a failed clear keeps Device/Host (and the previous checkpoint, on a
   weight update) intact and the caller retries; a split flush would
   leave mirrored schedulers selecting different prefix boundaries.
-  Successful weight-update ranks must not enter the NCCL broadcasts
+  The frontend ANDs every DP worker's `/flush_cache` reply; returning
+  only replica 0 would hide a peer that rejected after the shared
+  namespace was already deleted. Successful weight-update ranks must not enter the NCCL broadcasts
   while a peer is still flushing or has died on a Mooncake error. After a
   successful flush and GPU
   load, the hashed prefix is rebuilt so new KV is not published under

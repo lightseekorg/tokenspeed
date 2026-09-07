@@ -339,12 +339,16 @@ before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
 reject. Weight-update `flush_cache` and standalone `/flush_cache`
 MIN-reduce a non-mutating `can_clear_cache` probe across cache-owning
-ranks in the replica (attention TP, then CP, then PP; not DP) before any
-rank clears. Remote L3 deletion is the next replica-wide phase: it
+ranks (attention TP, then CP, then PP) and then across attention DP
+before any rank clears. Exists, prefetch, and `WriteBackDone` stay
+TP/CP/PP because DP ranks hold different sequences; flush includes DP
+because object keys omit DP rank. Remote L3 deletion is the next
+cluster-wide phase: it
 returns success/failure instead of raising, is MIN-reduced, and only
 then does `ClearCache` destroy Device/Host. A rank whose writebacks have
 drained cannot rotate L3 or drop local indexes while a peer still
-rejects or while Mooncake `remove_by_regex` failed on another rank. A
+rejects or while Mooncake `remove_by_regex` failed on another rank. The
+frontend ANDs every DP worker's `/flush_cache` reply. A
 split flush would leave mirrored
 schedulers with different prefix indexes. The weight-update RPC then
 fails so the caller retries instead of serving new weights against the

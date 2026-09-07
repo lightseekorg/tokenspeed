@@ -6,10 +6,15 @@ import torch
 
 from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
+    FlushCacheReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.engine.scheduler_control_client import (
+    SchedulerControlClient,
+    combined_flush_cache_output,
+)
 from tokenspeed.runtime.entrypoints.engine import Engine
 
 
@@ -26,6 +31,8 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler.attn_cp_cpu_group = None
         handler.pp_size = 1
         handler.pp_cpu_group = None
+        handler.attn_dp_size = 1
+        handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
         handler._device = mock.Mock()
         handler._device.delete_l3_namespace.return_value = True
@@ -112,6 +119,76 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertTrue(output.success)
 
+    def test_min_reduces_tp_then_cp_then_pp_then_dp_before_clear(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del op
+            groups_seen.append(group)
+            buf.fill_(0)
+
+        handler = self._handler(can_clear=True, clear_result=True)
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+        handler.attn_cp_size = 2
+        handler.attn_cp_cpu_group = "cp"
+        handler.pp_size = 2
+        handler.pp_cpu_group = "pp"
+        handler.attn_dp_size = 2
+        handler.attn_dp_cpu_group = "dp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["tp", "cp", "pp", "dp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler._device.delete_l3_namespace.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+
+    def test_dp_flush_min_prevents_l3_delete(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del op
+            groups_seen.append(group)
+            buf.fill_(0)
+
+        handler = self._handler(can_clear=True, clear_result=True)
+        handler.attn_dp_size = 2
+        handler.attn_dp_cpu_group = "dp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["dp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler._device.delete_l3_namespace.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+
+    def test_agreed_dp_preflight_clears(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del buf, op
+            groups_seen.append(group)
+
+        handler = self._handler(can_clear=True, clear_result=True)
+        handler.attn_dp_size = 2
+        handler.attn_dp_cpu_group = "dp"
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([FlushCacheReqInput()])
+
+        self.assertEqual(groups_seen, ["dp", "dp"])
+        handler._device.delete_l3_namespace.assert_called_once_with()
+        handler.clear_cache_fn.assert_called_once_with()
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertTrue(output.success)
+
     def test_failed_l3_delete_does_not_clear(self):
         handler = self._handler(can_clear=True, clear_result=True)
         handler._device.delete_l3_namespace.return_value = False
@@ -162,6 +239,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.attn_cp_cpu_group = None
         handler.pp_size = 1
         handler.pp_cpu_group = None
+        handler.attn_dp_size = 1
+        handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
         handler.can_clear_cache_fn = mock.Mock(return_value=True)
         handler._device.delete_l3_namespace.return_value = True
@@ -402,6 +481,47 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
 
+    def test_flush_min_reduces_tp_then_cp_then_pp_then_dp(self):
+        groups_seen = []
+
+        def fake_all_reduce(buf, op=None, group=None):
+            del op
+            groups_seen.append(group)
+            buf.fill_(0)
+
+        handler = self._handler()
+        handler._replica_tp_size = 2
+        handler._replica_tp_cpu_group = "tp"
+        handler.attn_cp_size = 2
+        handler.attn_cp_cpu_group = "cp"
+        handler.pp_size = 2
+        handler.pp_cpu_group = "pp"
+        handler.attn_dp_size = 2
+        handler.attn_dp_cpu_group = "dp"
+        handler.clear_cache_fn = mock.Mock(return_value=True)
+        handler._device.update_weights.return_value = (True, "ok")
+        req = UpdateWeightsFromDistributedReqInput(
+            names=["w"],
+            dtype_names=["float16"],
+            shapes=[[1]],
+            flush_cache=True,
+            weight_version="v2",
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
+            handler.process_requests([req])
+
+        self.assertEqual(groups_seen, ["tp", "cp", "pp", "dp"])
+        handler.can_clear_cache_fn.assert_called_once_with()
+        handler._device.delete_l3_namespace.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        handler._device.update_weights.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
+        self.assertEqual(handler.server_args.weight_version, "v1")
+        output = handler.send_func.send_pyobj.call_args.args[0]
+        self.assertFalse(output.success)
+        self.assertIn("cache flush failed", output.message)
+
     def test_enable_cp_flush_min_uses_cp_group_when_tp_is_one(self):
         groups_seen = []
 
@@ -601,6 +721,60 @@ class TestEngineStampsL3Version(unittest.TestCase):
                 dtype_names=["float16"],
                 shapes=[[1]],
             )
+
+
+class TestCombinedFlushCacheOutput(unittest.TestCase):
+    def test_empty_results_are_failure(self):
+        output = combined_flush_cache_output([])
+        self.assertFalse(output.success)
+
+    def test_ands_every_dp_replica(self):
+        output = combined_flush_cache_output(
+            [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=False),
+            ]
+        )
+        self.assertFalse(output.success)
+
+    def test_all_success_is_success(self):
+        output = combined_flush_cache_output(
+            [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=True),
+            ]
+        )
+        self.assertTrue(output.success)
+
+
+class TestSchedulerControlFlushCache(unittest.IsolatedAsyncioTestCase):
+    async def test_ands_dp_replica_replies(self):
+        client = SchedulerControlClient.__new__(SchedulerControlClient)
+
+        async def fake_comm(req):
+            del req
+            return [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=False),
+            ]
+
+        client.flush_cache_communicator = fake_comm
+        output = await SchedulerControlClient.flush_cache(client)
+        self.assertFalse(output.success)
+
+    async def test_all_replicas_success(self):
+        client = SchedulerControlClient.__new__(SchedulerControlClient)
+
+        async def fake_comm(req):
+            del req
+            return [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=True),
+            ]
+
+        client.flush_cache_communicator = fake_comm
+        output = await SchedulerControlClient.flush_cache(client)
+        self.assertTrue(output.success)
 
 
 if __name__ == "__main__":

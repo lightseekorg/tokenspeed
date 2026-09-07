@@ -61,8 +61,6 @@ from tokenspeed.runtime.engine.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
-    FlushCacheReqInput,
-    FlushCacheReqOutput,
     GenerateReqInput,
     HealthCheckOutput,
     OpenSessionReqInput,
@@ -502,9 +500,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
-
-    async def flush_cache(self) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:

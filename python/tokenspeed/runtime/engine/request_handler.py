@@ -154,8 +154,8 @@ class RequestHandler:
         # Cache-owning ranks in this DP replica (attention TP × CP × PP).
         # Distinct from attn_tp_* above: with PP those become WORLD so the
         # request stream is identical across stages, which would also pull
-        # DP ranks into a flush MIN-reduce. Weight-update NCCL is replica-
-        # local; L3 exists uses the same groups (see EventLoop).
+        # DP ranks into the TP MIN. Exists uses these replica groups;
+        # flush appends attention DP as its own group afterwards.
         self._replica_tp_size = mapping.attn.tp_size
         self._replica_tp_cpu_group = pg_manager.get_process_group(
             "gloo", mapping.attn.tp_group
@@ -170,6 +170,16 @@ class RequestHandler:
         self.pp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.pp_group)
             if mapping.has_pp
+            else None
+        )
+        # Flush MIN includes attention DP after TP/CP/PP: object keys omit
+        # DP rank, so DP replicas share the Mooncake namespace. Exists,
+        # prefetch, and WriteBackDone stay TP/CP/PP only (EventLoop /
+        # L2CacheHooks); those ranks hold different sequences.
+        self.attn_dp_size = mapping.attn.dp_size
+        self.attn_dp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.dp_group)
+            if mapping.has_attn_dp
             else None
         )
         self.req_broadcaster = (
@@ -379,7 +389,7 @@ class RequestHandler:
         split: one rank with no in-flight writebacks would clear Device/Host
         while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces the
         probe, then MIN-reduces L3 deletion, then clears. An L3 writeback
-        can still be in flight on one TP/CP/PP rank after it has completed
+        can still be in flight on one TP/CP/PP/DP rank after it has completed
         on the others; those successful ranks must not enter
         ``update_weights_from_distributed`` (ordered NCCL broadcasts)
         while a peer skips it.
@@ -400,11 +410,12 @@ class RequestHandler:
 
         Mirrored schedulers must keep the same prefix indexes. A rank whose
         Host writebacks have drained must not ``ClearCache`` while a TP, CP,
-        or PP peer still rejects. Remote L3 deletion is its own
+        PP, or DP peer still rejects. Remote L3 deletion is its own
         error-returning phase: it runs after the probe agrees and before
         the irreversible local clear, then MIN-reduces so a Mooncake
         failure cannot leave one rank cleared and another in NCCL.
-        Same groups as L3 exists (attention TP, then CP, then PP; not DP).
+        Exists uses attention TP, then CP, then PP. Flush appends DP
+        because DP replicas share Mooncake objects.
         """
 
         if not self._converge_replica_decision(self.can_clear_cache_fn()):
@@ -420,12 +431,15 @@ class RequestHandler:
         return bool(device.delete_l3_namespace())
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
-        """MIN-reduce a yes/no across every cache-owning rank in this replica.
+        """MIN-reduce a yes/no across every rank that shares this flush.
 
-        Same group order as ``EventLoop._converge_l3_exists``: attention TP,
-        then CP, then PP. DP ranks hold different sequences and are not
-        reduced. CPU-tensor gloo all_reduce, not a barrier: see
-        ``_profile_sync``.
+        Attention TP, then CP, then PP (same order as
+        ``EventLoop._converge_l3_exists``), then attention DP. Exists and
+        WriteBackDone omit DP because those ranks hold different sequences.
+        Flush includes DP: ``storage_object_key`` has no DP rank, so a
+        replica that is clearable must not ``remove_by_prefix`` while
+        another DP replica still has in-flight Host-to-store backups.
+        CPU-tensor gloo all_reduce, not a barrier: see ``_profile_sync``.
         """
 
         groups = []
@@ -435,6 +449,8 @@ class RequestHandler:
             groups.append(self.attn_cp_cpu_group)
         if self.pp_size > 1 and self.pp_cpu_group is not None:
             groups.append(self.pp_cpu_group)
+        if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
+            groups.append(self.attn_dp_cpu_group)
         if not groups:
             return local_ok
         buf = self._replica_decision_buf

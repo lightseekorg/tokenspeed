@@ -304,9 +304,11 @@ For orientation, one iteration of `event_loop`:
   replica-group gather, even when an earlier TP/CP intersection is empty;
   breaking out leaves a peer unmatched on the next ``all_gather_object``. Weight-update `flush_cache`
   and standalone `/flush_cache` MIN-reduce a non-mutating
-  `can_clear_cache` probe across the replica, then MIN-reduce an
-  error-returning L3 `remove_by_prefix`, before any rank mutates
-  Device/Host. Queued Submitted/Retracted
+  `can_clear_cache` probe across the replica (attention TP, then CP,
+  then PP) and then across attention DP — DP replicas share Mooncake
+  objects — then MIN-reduce an error-returning L3 `remove_by_prefix`,
+  before any rank mutates Device/Host. The frontend ANDs every DP
+  worker's reply. Queued Submitted/Retracted
   hashes of requests that can take a batch slot and Device pages this
   round are re-probed immediately before `next_execution_plan` so a hit
   registered at submit cannot be admitted after the object is gone. A
