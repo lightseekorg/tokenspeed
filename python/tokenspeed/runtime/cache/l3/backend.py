@@ -22,11 +22,12 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -167,11 +168,19 @@ def l3_checkpoint_id(
 
     ``--revision`` may be a moving branch or omitted. Two instances that
     resolve different commits (or local trees) must not share Mooncake
-    keys. Prefer the Hugging Face commit on the loaded config, then a
-    snapshot directory name, then a local fingerprint of config/index
-    bytes and weight-file contents.
+    keys. A local directory is identified from the snapshot folder name
+    or a fingerprint of weight-file contents — never from
+    ``hf_config._commit_hash``, which a copied or fine-tuned tree can
+    inherit from its source. Hugging Face hub ids still prefer the
+    loaded config commit, then a cached snapshot directory, then a
+    pinned ``--revision``.
     """
 
+    if os.path.isdir(model_path):
+        snapshot = _snapshot_commit_hash(model_path)
+        if snapshot is not None:
+            return snapshot
+        return "local-" + _local_checkpoint_fingerprint(model_path)
     commit = getattr(hf_config, "_commit_hash", None)
     if isinstance(commit, str) and _HF_COMMIT_HASH_RE.fullmatch(commit):
         return commit
@@ -187,6 +196,27 @@ def l3_checkpoint_id(
         "L3 namespace needs an immutable checkpoint id; pin --revision to a "
         "commit or load from a local snapshot"
     )
+
+
+def share_l3_checkpoint_ids(
+    ids: list[str],
+    *,
+    rank: int,
+    world_size: int,
+    broadcast: Callable[[list], list],
+) -> list[str]:
+    """Return ``ids`` from rank 0 so every worker hashes local weights once.
+
+    ``broadcast`` must implement a replica-wide object broadcast that
+    returns the source payload on every rank. When ``world_size`` is 1
+    the ids are returned unchanged and ``broadcast`` is not called.
+    """
+
+    if world_size <= 1:
+        return list(ids)
+    payload = list(ids) if rank == 0 else [None] * len(ids)
+    shared = broadcast(payload)
+    return [str(item) for item in shared]
 
 
 def _snapshot_commit_hash(snapshot_path: str) -> str | None:
@@ -210,8 +240,14 @@ def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
         return None
 
 
+@functools.cache
 def _local_checkpoint_fingerprint(model_dir: str) -> str:
-    """Hash config/index bytes and every local weight file's contents."""
+    """Hash config/index bytes and every local weight file's contents.
+
+    Cached by directory path so a process that resolves the same local
+    checkpoint more than once (target plus draft, or a repeated prefix
+    rebuild) does not re-read every shard.
+    """
     hasher = hashlib.sha256()
     try:
         names = sorted(os.listdir(model_dir))

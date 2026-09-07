@@ -387,9 +387,10 @@ Its responsibilities:
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
-  Hugging Face branch or local path is fingerprinted from the commit or
-  the contents of the local checkpoint actually loaded, so two instances
-  cannot share a Mooncake
+  Hugging Face branch or local path is fingerprinted from a snapshot
+  directory commit or the contents of the local checkpoint actually
+  loaded — a copied config's inherited `_commit_hash` is not trusted —
+  so two instances cannot share a Mooncake
   key while serving incompatible KV. Zigzag CP assigns
   different token blocks to the same `cp_rank` under different widths, so
   `cp_size` is part of the namespace rather than only `c{cp_rank}` in the

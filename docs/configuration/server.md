@@ -322,7 +322,8 @@ Mooncake Store (L3)
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
-immutable revision, `--weight-version`), `--hf-overrides` (the effective
+immutable revision or a local weight-byte fingerprint — never an inherited
+config `_commit_hash` — and `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity
 device arena offsets), the

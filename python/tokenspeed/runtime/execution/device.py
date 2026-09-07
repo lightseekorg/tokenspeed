@@ -834,6 +834,7 @@ def build_device_side(
                 cache_layout_signature,
                 l3_cache_quantization_id,
                 l3_checkpoint_id,
+                share_l3_checkpoint_ids,
                 storage_key_prefix,
             )
             from tokenspeed.runtime.cache.l3.factory import (
@@ -854,10 +855,41 @@ def build_device_side(
                 l2_cache_executor.layout,
                 cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
             )
-            checkpoint_id = l3_checkpoint_id(
-                model_config.model_path,
-                hf_config=model_config.hf_config,
-                revision=str(model_config.revision or ""),
+            import torch.distributed as dist
+
+            world_size = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+            rank = dist.get_rank() if world_size > 1 else 0
+            if rank == 0:
+                checkpoint_id = l3_checkpoint_id(
+                    model_config.model_path,
+                    hf_config=model_config.hf_config,
+                    revision=str(model_config.revision or ""),
+                )
+                if draft_model_config is not None:
+                    draft_revision = l3_checkpoint_id(
+                        draft_model_config.model_path,
+                        hf_config=draft_model_config.hf_config,
+                        revision=str(draft_model_config.revision or ""),
+                    )
+                else:
+                    draft_revision = ""
+            else:
+                checkpoint_id = ""
+                draft_revision = ""
+
+            def broadcast_checkpoint_ids(payload: list) -> list:
+                dist.broadcast_object_list(payload, src=0)
+                return payload
+
+            checkpoint_id, draft_revision = share_l3_checkpoint_ids(
+                [checkpoint_id, draft_revision],
+                rank=rank,
+                world_size=world_size,
+                broadcast=broadcast_checkpoint_ids,
             )
             cache_quantization = l3_cache_quantization_id(
                 quantization=str(model_config.quantization or ""),
@@ -868,14 +900,8 @@ def build_device_side(
             )
             if draft_model_config is not None:
                 draft_model = str(draft_model_config.model_path)
-                draft_revision = l3_checkpoint_id(
-                    draft_model_config.model_path,
-                    hf_config=draft_model_config.hf_config,
-                    revision=str(draft_model_config.revision or ""),
-                )
             else:
                 draft_model = ""
-                draft_revision = ""
             cp_size = int(server_args.mapping.attn.cp_size)
 
             def prefix_for_weight_version(weight_version: str) -> str:

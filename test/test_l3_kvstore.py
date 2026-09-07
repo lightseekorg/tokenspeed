@@ -36,6 +36,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     l3_cache_quantization_id,
     l3_checkpoint_id,
     resolve_l3_weight_version,
+    share_l3_checkpoint_ids,
     storage_key_prefix,
     storage_object_key,
 )
@@ -188,7 +189,91 @@ class StorageKeyTest(unittest.TestCase):
                 ).startswith("local-")
             )
 
-    def test_checkpoint_id_rejects_unpinned_remote_without_commit(self):
+    def test_checkpoint_id_ignores_inherited_commit_on_local_dir(self):
+        inherited = "a" * 40
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(payload)
+            first_id = l3_checkpoint_id(
+                first,
+                hf_config=SimpleNamespace(_commit_hash=inherited),
+                revision="",
+            )
+            second_id = l3_checkpoint_id(
+                second,
+                hf_config=SimpleNamespace(_commit_hash=inherited),
+                revision="",
+            )
+            self.assertNotEqual(first_id, second_id)
+            self.assertNotEqual(first_id, inherited)
+            self.assertTrue(first_id.startswith("local-"))
+
+    def test_local_fingerprint_is_cached_per_directory(self):
+        from tokenspeed.runtime.cache.l3 import backend as l3_backend
+
+        l3_backend._local_checkpoint_fingerprint.cache_clear()
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                handle.write(b"weights")
+            with mock.patch.object(
+                l3_backend,
+                "_update_file_digest",
+                wraps=l3_backend._update_file_digest,
+            ) as digest:
+                first = l3_checkpoint_id(
+                    directory, hf_config=SimpleNamespace(), revision=""
+                )
+                second = l3_checkpoint_id(
+                    directory, hf_config=SimpleNamespace(), revision=""
+                )
+            self.assertEqual(first, second)
+            self.assertEqual(digest.call_count, 2)
+
+    def test_share_l3_checkpoint_ids_broadcasts_from_rank_zero(self):
+        seen = []
+
+        def broadcast(payload):
+            seen.append(list(payload))
+            return ["shared-target", "shared-draft"]
+
+        self.assertEqual(
+            share_l3_checkpoint_ids(
+                ["local-a", "local-b"],
+                rank=0,
+                world_size=1,
+                broadcast=broadcast,
+            ),
+            ["local-a", "local-b"],
+        )
+        self.assertEqual(seen, [])
+        self.assertEqual(
+            share_l3_checkpoint_ids(
+                ["local-a", "local-b"],
+                rank=0,
+                world_size=8,
+                broadcast=broadcast,
+            ),
+            ["shared-target", "shared-draft"],
+        )
+        self.assertEqual(seen, [["local-a", "local-b"]])
+        seen.clear()
+        self.assertEqual(
+            share_l3_checkpoint_ids(
+                ["ignored", "ignored"],
+                rank=3,
+                world_size=8,
+                broadcast=broadcast,
+            ),
+            ["shared-target", "shared-draft"],
+        )
+        self.assertEqual(seen, [[None, None]])
+
+    def test_checkpoint_id_rejects_unpinned_remote_without_commit(self) -> None:
         with self.assertRaises(ValueError):
             l3_checkpoint_id(
                 "org/unpinned-model",

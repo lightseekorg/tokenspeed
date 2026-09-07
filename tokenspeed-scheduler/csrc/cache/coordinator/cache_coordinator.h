@@ -58,10 +58,11 @@ public:
 
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
-    // enable_l3_storage is required so a caller cannot silently skip L3 key
-    // tagging on Host hits.
+    // enable_l3_storage, host_pool, and stream_device_cache_to_host have no
+    // defaults: a four-argument call would convert a Host-pool pointer to
+    // bool and silently disable L2 instead of failing to compile.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     bool enable_l3_storage, BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     bool enable_l3_storage, BlockPool* host_pool, bool stream_device_cache_to_host);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -294,7 +295,7 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool = nullptr,
-                                 bool stream_device_cache_to_host = true);
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 bool stream_device_cache_to_host);
 
 }  // namespace tokenspeed
