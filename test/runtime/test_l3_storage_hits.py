@@ -87,6 +87,7 @@ class _Device:
         self.prefetch_pages = False
         self.prefetch_calls = 0
         self.invalidations = 0
+        self._l3_unread_keys: set[tuple[int, str, int]] = set()
 
     def query_l3_storage(self, pages):
         self.pages = list(pages)
@@ -94,7 +95,21 @@ class _Device:
 
     def delete_l3_namespace(self) -> bool:
         self.rotations += 1
+        self._l3_unread_keys.clear()
         return True
+
+    def mark_l3_keys_unread(self, groups, hashes, offsets) -> None:
+        for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
+            self._l3_unread_keys.add(
+                (int(group_id), str(content_hash), int(page_offset))
+            )
+
+    def l3_key_is_unread(self, group_id, content_hash, page_offset) -> bool:
+        return (
+            int(group_id),
+            str(content_hash),
+            int(page_offset),
+        ) in self._l3_unread_keys
 
     def plan_has_l3_prefetch(self, plan) -> bool:
         del plan
@@ -334,6 +349,55 @@ def test_vanished_l3_prefetch_unregisters_and_retracts(monkeypatch) -> None:
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
     assert retracts == ["r0", "r1"]
     assert events == ["retract:r0", "retract:r1"]
+
+
+def test_failed_l3_prefetch_is_not_reregistered_while_exists_stays_true(
+    monkeypatch,
+) -> None:
+    """A get-failure must not be re-admitted from a later batch_exists hit."""
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True])
+    spec = _spec("r0", [1, 2, 3, 4])
+    loop._submit_scheduler_requests([spec])
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
+
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = False
+    events = loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert events
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+    loop.scheduler.registered = None
+    loop.scheduler.unregistered = None
+    loop.scheduler.waiting_hashes = ["h4"]
+    loop._revalidate_queued_l3_hits()
+
+    assert loop.scheduler.registered is None
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+
+
+def test_namespace_delete_forgets_unread_l3_keys(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: f"retract:{rid}",
+    )
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = False
+    loop._recover_if_l3_prefetch_failed(
+        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+    )
+    assert loop._delete_l3_namespace()
+    loop.scheduler.registered = None
+    loop.scheduler.unregistered = None
+    loop.scheduler.waiting_hashes = ["h4"]
+    loop._revalidate_queued_l3_hits()
+    assert loop.scheduler.registered == ([0], ["h4"], [0])
 
 
 def test_l3_prefetch_success_does_not_retract() -> None:

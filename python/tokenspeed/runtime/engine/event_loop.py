@@ -614,9 +614,14 @@ class EventLoop:
         for group_id, content_hash, page_offset, present in zip(
             group_ids, content_hashes, page_offsets, exists
         ):
+            readable = present and not self._device.l3_key_is_unread(
+                group_id=int(group_id),
+                content_hash=str(content_hash),
+                page_offset=int(page_offset),
+            )
             target = (
                 (hit_groups, hit_hashes, hit_offsets)
-                if present
+                if readable
                 else (miss_groups, miss_hashes, miss_offsets)
             )
             target[0].append(int(group_id))
@@ -636,8 +641,10 @@ class EventLoop:
         still miss. Prefetch on this control-plane turn, MIN-reduce across
         the replica, then skip H2D / skip publishing empty Host pages and
         retract (snapshot-less) so the next admit recomputes those tokens.
-        The whole forward is skipped so ranks stay aligned; mixed
-        prefill/decode partners retract rather than finish with an error.
+        Failed keys stay unread: a later ``batch_exists`` hit must not
+        re-register them and retry the same prefetch. The whole forward is
+        skipped so ranks stay aligned; mixed prefill/decode partners retract
+        rather than finish with an error.
         """
 
         if not self._enable_l3_storage:
@@ -649,6 +656,9 @@ class EventLoop:
             self._device.invalidate_l3_prefetch()
             groups, hashes, offsets = self._device.l3_prefetch_storage_keys(
                 execution_plan
+            )
+            self._device.mark_l3_keys_unread(
+                groups=groups, hashes=hashes, offsets=offsets
             )
             if groups:
                 self.scheduler.unregister_storage_keys(groups, hashes, offsets)

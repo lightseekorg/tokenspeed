@@ -258,6 +258,9 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        # Prefetch get-failures stay unread so a later batch_exists hit
+        # cannot re-register the same key and retry the failed load.
+        self._l3_unread_keys: set[tuple[int, str, int]] = set()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -476,17 +479,49 @@ class DeviceHandle:
             return [], [], []
         return l2.l3_prefetch_storage_keys(execution_plan)
 
+    def mark_l3_keys_unread(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Remember keys whose ``batch_get_into`` failed after Admit.
+
+        ``batch_exists`` can still report these present. The next admit
+        must treat them as misses so the request recomputes instead of
+        retrying the same prefetch.
+        """
+
+        for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
+            self._l3_unread_keys.add(
+                (int(group_id), str(content_hash), int(page_offset))
+            )
+
+    def l3_key_is_unread(
+        self, group_id: int, content_hash: str, page_offset: int
+    ) -> bool:
+        """True when this key already failed ``batch_get_into``."""
+
+        return (
+            int(group_id),
+            str(content_hash),
+            int(page_offset),
+        ) in self._l3_unread_keys
+
     def delete_l3_namespace(self) -> bool:
         """Delete L3 objects under the current prefix. Device/Host stay intact.
 
         Returns True when L2/L3 is unset or the store reports the prefix
         is gone. Call this before ``ClearCache``; a False must leave
-        every rank's Device/Host indexes untouched.
+        every rank's Device/Host indexes untouched. A successful delete
+        also forgets unread prefetch keys so a new namespace can restore
+        the same content hashes.
         """
 
         if self._l2 is None:
+            self._l3_unread_keys.clear()
             return True
-        return self._l2.delete_l3_namespace()
+        deleted = self._l2.delete_l3_namespace()
+        if deleted:
+            self._l3_unread_keys.clear()
+        return deleted
 
     def set_l3_weight_version(self, weight_version: str) -> None:
         """Publish subsequent Host pages under the new checkpoint identity."""

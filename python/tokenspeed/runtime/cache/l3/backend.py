@@ -46,6 +46,8 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "mistral": (("consolidated*.safetensors",),),
     "pt": (("*.pt",),),
     "npcache": (("*.bin",),),
+    "sharded_state": (("model-rank-*-part-*.safetensors",), ("*.safetensors",)),
+    "dummy": (),
 }
 
 
@@ -288,9 +290,18 @@ def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozens
     Pattern groups match ``DefaultModelLoader._prepare_weights``: the first
     group that matches any file wins, so ``auto`` hashes ``*.safetensors``
     when those exist and does not mix in leftover ``*.bin`` / ``*.pt``.
+    ``sharded_state`` hashes ``model-rank-*-part-*.safetensors`` (all ranks,
+    because rank 0 broadcasts the id) and falls back to ``*.safetensors``.
+    Unknown loaders raise rather than hashing metadata alone.
     """
 
-    groups = _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS.get(load_format, ())
+    groups = _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS.get(load_format)
+    if groups is None:
+        raise ValueError(
+            "L3 cannot fingerprint load-format "
+            f"{load_format!r}; unsupported loaders cannot share a Mooncake "
+            "namespace"
+        )
     for patterns in groups:
         matched = frozenset(
             name

@@ -317,4 +317,5 @@ For orientation, one iteration of `event_loop`:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,
   snapshot-less retract of the batch so the next admit recomputes.
-  Clients are not failed.
+  Failed `batch_get_into` keys stay unread so a later `batch_exists` hit
+  cannot re-register them. Clients are not failed.

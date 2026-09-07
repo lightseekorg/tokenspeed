@@ -351,7 +351,9 @@ previous checkpoint or entering NCCL weight broadcasts alone. A
 `batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
 skips publishing empty Host pages, and retracts the batch snapshot-less
-so the next admit recomputes those tokens. Clients are not failed.
+so the next admit recomputes those tokens. Failed `batch_get_into` keys
+stay unread so a later `batch_exists` hit cannot re-register them and
+retry the same prefetch. Clients are not failed.
 L2 write-back ACKs use the same replica groups: `WriteBackDone` is
 emitted only after every cache-owning rank holds the completion, so an
 ENABLE_CP worker cannot publish Host while a CP peer's Mooncake put is

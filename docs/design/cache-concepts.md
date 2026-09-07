@@ -402,7 +402,8 @@ Its responsibilities:
   and local fingerprints include `hf_quant_config.json` (ModelOpt
   mixed-precision maps and KV quantization live there, not in the
   weight tensors) plus only the weight files `--load-format` selects
-  (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`). The
+  (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
+  `sharded_state` hashes `model-rank-*-part-*.safetensors`). The
   returned checkpoint id also records that load format, so two
   deployments that share a directory or commit cannot restore KV
   produced by a different encoding. Zigzag CP assigns
@@ -464,7 +465,9 @@ Its responsibilities:
   skips publishing empty Host pages (`LoadBackDone.success=false`),
   skips Device prefix publication for those prefetch destinations,
   skips the model forward, and retracts the batch snapshot-less so the
-  next admit recomputes those tokens. Clients are not failed; mixed
+  next admit recomputes those tokens. Failed `batch_get_into` keys stay
+  unread: a later `batch_exists` hit must not re-register them and retry
+  the same prefetch. Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks
   stay aligned. Existence and prefetch are skipped when L3 is unset:
   Host-only and

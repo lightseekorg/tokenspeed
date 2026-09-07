@@ -362,6 +362,43 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
 
+    def test_checkpoint_id_fingerprints_sharded_state_weight_files(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, payload in ((first, b"rank0-a"), (second, b"rank0-b")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write("{}")
+                with open(
+                    os.path.join(directory, "model-rank-0-part-0.safetensors"),
+                    "wb",
+                ) as handle:
+                    handle.write(payload)
+            self.assertNotEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="sharded_state",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="sharded_state",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
+    def test_checkpoint_id_rejects_unsupported_load_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "config.json"), "w") as handle:
+                handle.write("{}")
+            with self.assertRaises(ValueError):
+                self._checkpoint_id(
+                    directory,
+                    load_format="extensible",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+
     def test_checkpoint_id_requires_load_format(self):
         signature = inspect.signature(l3_checkpoint_id)
         self.assertIs(
