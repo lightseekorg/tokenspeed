@@ -387,6 +387,44 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
 
+    def test_checkpoint_id_fingerprints_mistral_shard_index(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, mapped in (
+                (first, "consolidated.00.safetensors"),
+                (second, "consolidated.01.safetensors"),
+            ):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write("{}")
+                with open(
+                    os.path.join(directory, "consolidated.00.safetensors"),
+                    "wb",
+                ) as handle:
+                    handle.write(b"shard-a")
+                with open(
+                    os.path.join(directory, "consolidated.01.safetensors"),
+                    "wb",
+                ) as handle:
+                    handle.write(b"shard-b")
+                with open(
+                    os.path.join(directory, "consolidated.safetensors.index.json"),
+                    "w",
+                ) as handle:
+                    handle.write(f'{{"weight_map":{{"w":"{mapped}"}}}}')
+            self.assertNotEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="mistral",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="mistral",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
     def test_checkpoint_id_rejects_unsupported_load_format(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as handle:

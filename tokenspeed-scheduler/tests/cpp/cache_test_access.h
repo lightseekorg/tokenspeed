@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -37,6 +38,10 @@ struct CacheCoordinatorTestAccess {
     }
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
+
+    static std::size_t NumStorageKeyOrder(const CacheCoordinator& coordinator) {
+        return coordinator.storage_key_order_.size();
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {

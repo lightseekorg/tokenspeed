@@ -251,6 +251,7 @@ private:
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     void rememberStorageKey(const CacheKey& key);
     void evictStorageKeysToLimit();
+    void compactStorageKeyOrder();
     bool evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys);
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>

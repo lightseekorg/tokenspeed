@@ -37,6 +37,7 @@ _CHECKPOINT_METADATA_FILES = (
     "hf_quant_config.json",
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
+    "consolidated.safetensors.index.json",
 )
 # First matching group wins, matching DefaultModelLoader._prepare_weights.
 _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -322,7 +323,9 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     repeated prefix rebuild) does not re-read every shard.
     ``hf_quant_config.json`` is hashed with ``config.json``: ModelOpt
     mixed-precision maps, group sizes, and KV quantization live there,
-    not in the weight tensors. Weight bytes are limited to the files
+    not in the weight tensors. ``consolidated.safetensors.index.json`` is
+    hashed so two Mistral dumps with the same ``consolidated*.safetensors``
+    candidates but different shard maps cannot share a namespace.
     ``--load-format`` selects so a directory that contains more than one
     checkpoint encoding cannot share a namespace across loaders.
     """

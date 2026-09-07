@@ -403,7 +403,10 @@ Its responsibilities:
   mixed-precision maps and KV quantization live there, not in the
   weight tensors) plus only the weight files `--load-format` selects
   (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
-  `sharded_state` hashes `model-rank-*-part-*.safetensors`). The
+  `sharded_state` hashes `model-rank-*-part-*.safetensors`). Mistral
+  fingerprints include `consolidated.safetensors.index.json` so two dumps
+  with the same `consolidated*.safetensors` candidates but different shard
+  maps cannot share a namespace. The
   returned checkpoint id also records that load format, so two
   deployments that share a directory or commit cannot restore KV
   produced by a different encoding. Zigzag CP assigns
@@ -457,7 +460,10 @@ Its responsibilities:
   scheduler's L3 key shadow is bounded to Host page capacity. A single
   registration keeps the earliest contiguous prefix keys so prefix-closed
   matchers still hit; later unrelated keys LRU-evict older prompts.
-  Admit-time registration restores keys that were dropped from the shadow.
+  Unregister removes keys from both the live set and the LRU order deque
+  so vanished-object recovery cannot accumulate tombstones while the live
+  set stays below capacity. Admit-time registration restores keys that
+  were dropped from the shadow.
   That probe is not a lease: after Admit
   allocates Host pages, `batch_get_into` can still miss. Prefetch runs
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced

@@ -625,6 +625,31 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 1>{"h0"}).host.num_common_tokens, 0);
 }
 
+TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/true, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        coordinator.RegisterStorageKeys(std::array{key});
+        ASSERT_TRUE(coordinator.ContainsStorageKey(key));
+        coordinator.UnregisterStorageKeys(std::array{key});
+        EXPECT_FALSE(coordinator.ContainsStorageKey(key));
+        EXPECT_EQ(CacheCoordinatorTestAccess::NumStorageKeyOrder(coordinator), 0u)
+            << "unregister must drop LRU tombstones, not leave them until the live set hits capacity";
+    }
+    coordinator.RegisterStorageKeys(std::array{key});
+    EXPECT_EQ(coordinator.NumStorageKeys(), 1);
+    EXPECT_EQ(CacheCoordinatorTestAccess::NumStorageKeyOrder(coordinator), 1u);
+}
+
 TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
     BlockPool device_pool{8};
     BlockPool host_pool{1};
