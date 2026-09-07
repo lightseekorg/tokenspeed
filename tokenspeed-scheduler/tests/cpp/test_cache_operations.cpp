@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -696,16 +697,56 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     const CacheKey key_h2{.group_id = 0, .content_hash = "h2"};
     coordinator.RegisterStorageKeys(std::array{key_h0, key_h1, key_h2});
 
-    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h0))
-        << "the shadow must drop the oldest key once it exceeds Host page capacity";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0))
+        << "a prompt longer than Host capacity must keep the prefix-start keys";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h2))
+        << "the shadow must drop the tail once it exceeds Host page capacity";
+    EXPECT_EQ(coordinator.NumStorageKeys(), 2);
+    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).host.num_common_tokens, 4)
+        << "prefix-closed matching must still see the retained L3 prefix";
+
+    coordinator.RegisterStorageKeys(std::array{key_h2});
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h0)) << "a later prompt may LRU-evict an older prefix key";
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2));
-    EXPECT_EQ(coordinator.NumStorageKeys(), 2);
 
     coordinator.RegisterStorageKeys(std::array{key_h0});
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0)) << "admit-time registration restores a shadow-evicted key";
     EXPECT_FALSE(coordinator.ContainsStorageKey(key_h1));
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2));
+}
+
+TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+        CacheGroupSpec{
+            .kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        },
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const std::array hashes{std::string{"h0"}, std::string{"h1"}, std::string{"h2"}};
+    coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
+
+    EXPECT_EQ(coordinator.NumStorageKeys(), 4);
+    EXPECT_TRUE(coordinator.ContainsStorageKey(CacheKey{.group_id = 0, .content_hash = "h0"}));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(CacheKey{.group_id = 1, .content_hash = "h0"}));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(CacheKey{.group_id = 0, .content_hash = "h1"}));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(CacheKey{.group_id = 1, .content_hash = "h1"}));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(CacheKey{.group_id = 0, .content_hash = "h2"}));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(CacheKey{.group_id = 1, .content_hash = "h2"}));
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 4)
+        << "both groups must keep the same prefix-hash boundary";
 }
 
 TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {

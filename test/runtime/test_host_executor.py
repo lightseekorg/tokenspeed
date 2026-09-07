@@ -281,7 +281,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module.device_module, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_ranges") as transfer,
         ):
-            executor._start_writing([7], [(0, 5, 9)])
+            executor._start_writing([7], [(0, 5, 9)], backup_pages=[])
 
         # On the CALLER's current stream: the copy must read the source pages
         # before anything later in the plan (zeroing, the granted request's
@@ -461,7 +461,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_ack_requires_backup_pages_and_success(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import _Ack
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -474,6 +474,12 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             _Ack(object(), [1])
         with self.assertRaises(TypeError):
             _Ack(object(), [1], [])
+        start_writing = inspect.signature(L2CacheExecutor._start_writing)
+        self.assertIs(
+            start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
+        )
+        with self.assertRaises(TypeError):
+            L2CacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
 
     def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
         try:
@@ -752,6 +758,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
+            backup_pages=[],
         )
         torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
@@ -809,7 +816,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         device[16:20].fill_(0x11)
         device[56:60].fill_(0x12)
         torch.cuda.synchronize()
-        executor._start_writing([7], [(0, 1, 1)])  # pylint: disable=protected-access
+        executor._start_writing(  # pylint: disable=protected-access
+            [7], [(0, 1, 1)], backup_pages=[]
+        )
         torch.cuda.synchronize()
         self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
 

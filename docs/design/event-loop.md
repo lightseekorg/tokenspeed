@@ -307,11 +307,12 @@ For orientation, one iteration of `event_loop`:
   `can_clear_cache` probe across the replica, then MIN-reduce an
   error-returning L3 `remove_by_prefix`, before any rank mutates
   Device/Host. Queued Submitted/Retracted
-  hashes of requests that can take a batch slot this round are re-probed
-  immediately before `next_execution_plan` so a hit registered at submit
-  cannot be admitted after the object is gone. A full decode batch or a
-  head-of-line incomplete prefill skips the rest of the wait queue so a
-  long prompt is not hashed and remotely probed on every token step.
+  hashes of requests that can take a batch slot and Device pages this
+  round are re-probed immediately before `next_execution_plan` so a hit
+  registered at submit cannot be admitted after the object is gone. A
+  full decode batch, a head-of-line incomplete prefill, or an exhausted
+  Device pool skips the rest of the wait queue so a long prompt is not
+  hashed and remotely probed on every token step.
   After Admit, vanished L3 objects are recovered on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages, snapshot-less retract of the batch so

@@ -220,8 +220,10 @@ public:
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
     // the remote store, with no local Host block. Probe treats them as Host
     // hits that require prefetch. Capacity tracks Host pages so the set
-    // cannot grow with every historical writeback; admit-time revalidation
-    // re-inserts keys that were LRU-evicted.
+    // cannot grow with every historical writeback. A single registration
+    // keeps the earliest contiguous prefix keys so prefix-closed matchers
+    // still hit; later unrelated keys LRU-evict older prompts. Admit-time
+    // revalidation re-inserts keys that were dropped from the shadow.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
     void UnregisterStorageKeys(std::span<const CacheKey> keys);
@@ -244,6 +246,7 @@ private:
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     void rememberStorageKey(const CacheKey& key);
     void evictStorageKeysToLimit();
+    bool evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys);
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();

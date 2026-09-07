@@ -478,7 +478,7 @@ std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
     if (readmission != nullptr) {
         append_hashes(*readmission);
     }
-    if (free_slots <= 0 || hol_blocks_new_prompts) {
+    if (free_slots <= 0 || hol_blocks_new_prompts || PoolFreeBlocks() <= 0) {
         return hashes;
     }
     std::int32_t remaining = free_slots;

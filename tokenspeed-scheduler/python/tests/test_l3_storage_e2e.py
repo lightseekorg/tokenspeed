@@ -249,6 +249,38 @@ def test_waiting_prefix_hashes_skip_when_batch_cannot_admit() -> None:
     assert scheduler.waiting_prefix_hashes() == []
 
 
+def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
+    """An exhausted Device pool must not rehash a waiter that still has a slot."""
+
+    cfg = _l3_config(num_device_pages=11, num_host_pages=11)
+    cfg.disable_prefix_cache = True
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            rows_per_page=cfg.prefix_granularity,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.History,
+        ),
+        ts.CacheGroupConfig(
+            group_id="swa",
+            rows_per_page=cfg.prefix_granularity,
+            entry_stride_tokens=1,
+            total_pages=cfg.num_device_pages,
+            retention=ts.CacheRetention.SlidingWindow,
+            sliding_window_tokens=4,
+            family=ts.CacheGroupFamily.State,
+        ),
+    ]
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests([_spec("r1", list(range(1, 9)))])
+    scheduler.next_execution_plan()
+    assert scheduler.available_kv_pages() == 0
+    scheduler.submit_requests([_spec("r2", list(range(100, 108)))])
+    assert scheduler.waiting_prefix_hashes() == []
+
+
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     scheduler = ts.Scheduler(_l3_config())
     tokens = list(range(1, 9))

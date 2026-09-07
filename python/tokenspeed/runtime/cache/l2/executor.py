@@ -79,7 +79,7 @@ class _Ack(NamedTuple):
     """One in-flight Host copy whose CUDA event has not yet been polled.
 
     ``backup_pages`` and ``success`` are required so a write cannot omit
-    success and a load cannot omit the L3 page list.
+    the L3 page list and a load cannot omit success.
     """
 
     finish_event: object
@@ -531,12 +531,13 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
-        backup_pages: Sequence[StoragePage] | None = None,
+        backup_pages: Sequence[StoragePage],
     ) -> None:
+        """Record a D2H copy. ``backup_pages`` is required; pass ``()`` when L3 is unset."""
         if not op_ids:
             return
         op_ids = _ordered_unique(op_ids)
-        backup_pages = list(backup_pages or ())
+        backup_pages = list(backup_pages)
         if not transfers:
             self._backup_to_storage(backup_pages)
             with self._ack_lock:

@@ -4469,9 +4469,11 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
 // ---------------------------------------------------------------------------
 // Mooncake L3 under flat KV: Host writeback inserts storage_keys_; Host
 // eviction must not drop Mooncake objects. The scheduler shadow is bounded
-// to Host page capacity, so admit-time RegisterStorageKeys restores keys
-// the LRU dropped. A later Device+Host miss that is still in L3 allocates
-// a Host page and emits LoadBack with prefetch_from_storage.
+// to Host page capacity. A registration longer than that bound keeps the
+// prefix-start keys so prefix-closed matching still hits; later unrelated
+// keys LRU-evict older prompts. Admit-time RegisterStorageKeys restores
+// keys the shadow dropped. A later Device+Host miss that is still in L3
+// allocates a Host page and emits LoadBack with prefetch_from_storage.
 // ---------------------------------------------------------------------------
 class L3StorageHitSuite : public HostHitSuite {
 protected:
@@ -4608,6 +4610,32 @@ TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenBatchCannotAdmit) {
     Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/100));
     EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty())
         << "a full batch must not rehash a waiter that cannot be admitted";
+}
+
+TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenPoolCannotAdmit) {
+    config_.device_allocator.total_pages = 11;
+    config_.host_allocator.total_pages = 11;
+    config_.enable_l3_storage = true;
+    config_.disable_prefix_cache = true;
+    config_.max_batch_size = 8;
+    config_.cache_groups = {
+        MakeGroup("full", /*block_granularity=*/2, config_.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        MakeGroup("swa", /*block_granularity=*/2, config_.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                  /*sliding_window_tokens=*/4),
+    };
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    PlanOnce();
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/100));
+    EXPECT_GT(
+        config_.max_batch_size - static_cast<std::int32_t>(scheduler_->PrefillSize() + scheduler_->DecodingSize()), 0)
+        << "the waiter still has a free batch slot";
+    EXPECT_TRUE(scheduler_->WaitingPrefixHashes().empty())
+        << "an exhausted Device pool must not rehash a waiter that cannot obtain pages";
 }
 
 TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutKv) {

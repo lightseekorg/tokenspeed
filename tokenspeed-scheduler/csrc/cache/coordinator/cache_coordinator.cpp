@@ -919,9 +919,41 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
 }
 
 void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
-    for (const CacheKey& key : keys) {
+    if (!enable_l3_storage_ || storage_key_limit_ == 0) {
+        return;
+    }
+    std::vector<CacheKey> ordered(keys.begin(), keys.end());
+    std::unordered_map<ContentHash, std::size_t> hash_index;
+    for (const CacheKey& key : ordered) {
+        hash_index.emplace(key.content_hash, hash_index.size());
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [&hash_index](const CacheKey& left, const CacheKey& right) {
+        const std::size_t left_hash = hash_index.at(left.content_hash);
+        const std::size_t right_hash = hash_index.at(right.content_hash);
+        if (left_hash != right_hash) {
+            return left_hash < right_hash;
+        }
+        if (left.page_offset != right.page_offset) {
+            return left.page_offset < right.page_offset;
+        }
+        return left.group_id < right.group_id;
+    });
+    std::unordered_set<CacheKey, CacheKeyHash> batch(ordered.begin(), ordered.end());
+    for (const CacheKey& key : ordered) {
         _assert(key.group_id < groups_.size(), "storage key group id out of range");
-        rememberStorageKey(key);
+        if (storage_keys_.contains(key)) {
+            continue;
+        }
+        while (storage_keys_.size() >= storage_key_limit_) {
+            if (!evictOldestUnprotectedKey(batch)) {
+                break;
+            }
+        }
+        if (storage_keys_.size() >= storage_key_limit_) {
+            break;
+        }
+        storage_keys_.insert(key);
+        storage_key_order_.push_back(key);
     }
 }
 
@@ -953,6 +985,23 @@ void CacheCoordinator::evictStorageKeysToLimit() {
         storage_keys_.erase(storage_key_order_.front());
         storage_key_order_.pop_front();
     }
+}
+
+bool CacheCoordinator::evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys) {
+    for (auto it = storage_key_order_.begin(); it != storage_key_order_.end();) {
+        if (!storage_keys_.contains(*it)) {
+            it = storage_key_order_.erase(it);
+            continue;
+        }
+        if (protected_keys.contains(*it)) {
+            ++it;
+            continue;
+        }
+        storage_keys_.erase(*it);
+        storage_key_order_.erase(it);
+        return true;
+    }
+    return false;
 }
 
 std::vector<CacheKey> CacheCoordinator::ExpandPrefixKeys(std::span<const std::string> content_hashes) const {

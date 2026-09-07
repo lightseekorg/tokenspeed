@@ -384,10 +384,10 @@ in `--kvstore-storage-backend-extra-config`, for example:
 
 Constructing `MooncakeKvStore` requires `extra_config`; pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
-Queued requests that can take a batch slot this round re-probe L3
-immediately before admission so a hit that waited for capacity cannot
-keep a deleted or evicted object as a Host hit. A full decode batch
-does not rehash the rest of the wait queue.
+Queued requests that can take a batch slot and Device pages this round
+re-probe L3 immediately before admission so a hit that waited for capacity
+cannot keep a deleted or evicted object as a Host hit. A full decode batch
+or exhausted Device pool does not rehash the rest of the wait queue.
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA
