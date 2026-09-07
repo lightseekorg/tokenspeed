@@ -498,6 +498,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -519,7 +520,9 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
+        executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
+        executor.l3_store.exists.return_value = [False]
         executor.l3_store.backup.side_effect = backup
         finish = Mock()
         finish.query.return_value = True
@@ -555,6 +558,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
     def test_backup_failure_does_not_ack_writeback(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -566,7 +570,9 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
+        executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
+        executor.l3_store.exists.return_value = [False]
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
         finish.query.return_value = True
@@ -641,6 +647,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -657,7 +664,9 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._backup_futures = []
         executor._l3_workers = None
         executor.load_stream = Mock()
+        executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
+        executor.l3_store.exists.return_value = [False]
         executor.l3_store.backup.return_value = [True]
         default_stream = Mock()
         with patch.object(
