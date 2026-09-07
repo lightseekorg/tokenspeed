@@ -183,6 +183,8 @@ struct RetractEvent : InvalidTransitionHandler<RetractEvent> {
 
     Retracted operator()(Prefilling&& state);
     Retracted operator()(PrefillDone&& state);
+    Retracted operator()(PrefillAwaitingResult&& state);
+    Retracted operator()(RemotePrefilling&& state);
     Retracted operator()(Decoding&& state);
 
 private:

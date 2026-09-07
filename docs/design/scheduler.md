@@ -320,9 +320,13 @@ Prefilling again, but its generated tokens still exist (an earlier
 retraction rebased them into its prefill window), and its standing survives.
 A store-less fused retraction is not in this ordering at all — it has no L2
 pages to load back, so it re-prefills through the ordinary admission path
-(`admitsLikeNewPrompt`). There is no queue to keep in step with the FSM: a
-request that finishes or aborts while retracted simply stops qualifying,
-with no bookkeeping to prune.
+(`admitsLikeNewPrompt`). The runtime can also emit `forward::Retract` without
+a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
+not filled, so publishing would cache empty KV; the request re-prefills
+the same way. Mixed partners in that forward retract together so ranks
+stay aligned, and the client is not failed. There is no queue to keep in
+step with the FSM: a request that finishes or aborts while retracted
+simply stops qualifying, with no bookkeeping to prune.
 
 **A readmission that does not fit, waits.** Its failed admission never
 triggers retraction (it is never recorded as the capacity blocker): when the

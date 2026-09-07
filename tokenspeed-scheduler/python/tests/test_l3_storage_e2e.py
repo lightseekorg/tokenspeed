@@ -98,9 +98,18 @@ def _ack_write_back(scheduler, op_id: int) -> None:
     scheduler.advance(execution_event)
 
 
-def _ack_load_back(scheduler, op_id: int) -> None:
+def _ack_load_back(scheduler, op_id: int, success: bool) -> None:
     event = ts.Cache.LoadBackDoneEvent()
     event.op_id = int(op_id)
+    event.success = success
+    execution_event = ts.ExecutionEvent()
+    execution_event.add_event(event)
+    scheduler.advance(execution_event)
+
+
+def _retract(scheduler, request_id: str) -> None:
+    event = ts.ForwardEvent.Retract()
+    event.request_id = request_id
     execution_event = ts.ExecutionEvent()
     execution_event.add_event(event)
     scheduler.advance(execution_event)
@@ -151,7 +160,7 @@ def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
     assert flags
     assert all(flag != 0 for flag in flags)
     assert any(row for row in load.content_hashes)
-    _ack_load_back(scheduler, load.op_ids[0])
+    _ack_load_back(scheduler, load.op_ids[0], success=True)
 
 
 def test_l3_short_host_pool_retries_first_chunk_from_admitted_prefix() -> None:
@@ -288,4 +297,39 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
     flags = _prefetch_flags(load)
     assert flags
     assert all(flag != 0 for flag in flags), "replaced Host pages must prefetch from L3"
-    _ack_load_back(scheduler, load.op_ids[0])
+    _ack_load_back(scheduler, load.op_ids[0], success=True)
+
+
+def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
+    """A missed batch_get_into retracts snapshot-less; the next admit recomputes."""
+
+    scheduler = ts.Scheduler(_l3_config())
+    tokens = list(range(1, 9))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)
+
+    scheduler.submit_requests([_spec("r1", tokens)])
+    plan = scheduler.next_execution_plan()
+    load = _find_load_back(plan)
+    assert load is not None, "registered L3 keys must emit LoadBackOp"
+    assert list(load.op_ids)
+    flags = _prefetch_flags(load)
+    assert flags
+    assert all(flag != 0 for flag in flags)
+    assert plan.forward
+    first = plan.forward[0]
+    assert list(first.request_ids) == ["r1"]
+    assert first.extend_prefix_lens[0] > 0
+
+    scheduler.unregister_storage_keys(group_ids, expanded, offsets)
+    _retract(scheduler, "r1")
+    _ack_load_back(scheduler, load.op_ids[0], success=False)
+
+    retry = scheduler.next_execution_plan()
+    assert _find_load_back(retry) is None, "unregistered L3 keys must not prefetch"
+    assert retry.forward
+    op = retry.forward[0]
+    assert list(op.request_ids) == ["r1"]
+    assert list(op.extend_prefix_lens) == [0]
+    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]

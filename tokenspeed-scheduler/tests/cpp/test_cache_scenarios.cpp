@@ -2709,6 +2709,44 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     EXPECT_EQ(request.PrefillSize(), 5) << "prompt + generated rebase into the prefill window";
 }
 
+// Drive the FSM directly to pin the PrefillAwaitingResult retract overload.
+TEST(RetractEvent, PrefillAwaitingResultVictimReleasesPagesAndRequeues) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::optional<CacheCoordinator::AdmissionResult> admission =
+        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    ASSERT_TRUE(admission);
+
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0,
+                                                      fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*load_pairs=*/{},
+                                                      /*awaits_result=*/true});
+    ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
+    ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
+
+    request.Apply(
+        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/false, request.HasGeneratedOutput()});
+    EXPECT_TRUE(request.Is<fsm::Retracted>());
+    const auto* retracted = request.GetIf<fsm::Retracted>();
+    ASSERT_NE(retracted, nullptr);
+    EXPECT_FALSE(retracted->HasRecoverableSnapshot());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the retract must release every page";
+    EXPECT_EQ(request.TokenSize(), 4);
+    EXPECT_EQ(request.PrefillSize(), 4) << "no generated token has landed yet";
+}
+
 // ---------------------------------------------------------------------------
 // Abort-mid-flight pool balance: abort mid-chunked-prefill or mid-decode must
 // return every page to the pool.
@@ -4558,6 +4596,53 @@ TEST_F(L3MixedGranularityHostPoolSuite, FirstChunkDoesNotSkipCoarseGroupWithoutK
     ASSERT_EQ(op->input_lengths.size(), 1u);
     EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "a 2-token Host shortage must round down to the 4-token prefix grain";
     EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+}
+
+class L3PrefetchRetractSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(L3PrefetchRetractSuite, VanishedKeysRetractThenReadmitAsColdMiss) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
+    ASSERT_FALSE(hashes.empty());
+    const std::vector<CacheKey> keys = scheduler_->ExpandPrefixKeys(hashes);
+    scheduler_->RegisterStorageKeys(keys);
+
+    Submit(spec);
+    ExecutionPlan plan = PlanOnce();
+    auto load_ops = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
+    ASSERT_EQ(load_ops.size(), 1u) << "registered L3 keys must emit a prefetch load-back";
+    const auto& load = std::get<LoadBackBatch>(load_ops.front());
+    ASSERT_FALSE(load.op_ids.empty());
+    const ForwardBatch* first = FindForwardBatch(plan);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids, std::vector<std::string>{"r1"});
+    ASSERT_FALSE(first->extend_prefix_lens.empty());
+    EXPECT_GT(first->extend_prefix_lens.at(0), 0);
+
+    scheduler_->UnregisterStorageKeys(keys);
+    SendRetractEvent("r1");
+    SendLoadBackDone(load.op_ids.at(0), /*success=*/false);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+    ExecutionPlan retry = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(retry).empty())
+        << "unregistered L3 keys must not prefetch on the next admit";
+    const ForwardBatch* op = FindForwardBatch(retry);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    ASSERT_FALSE(op->extend_prefix_lens.empty());
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "the next admit must recompute the vanished prefix";
     EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
 }
 

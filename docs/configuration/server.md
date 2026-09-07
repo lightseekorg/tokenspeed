@@ -335,8 +335,9 @@ rejects. The update RPC then fails so the caller retries instead of
 serving new weights against the previous checkpoint or entering NCCL
 weight broadcasts alone. A `batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
-skips publishing empty Host pages, and aborts the batch so the next
-admit computes those tokens. Supplying a new
+skips publishing empty Host pages, and retracts the batch snapshot-less
+so the next admit recomputes those tokens. Clients are not failed.
+Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
 stale Device/Host KV and in-flight D2H copies cannot be treated as the
 new checkpoint. Flushed L3 updates require an explicit `weight_version`;

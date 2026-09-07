@@ -360,6 +360,17 @@ def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     return fe
 
 
+def make_retract_event(request_id: str) -> "ForwardEvent.Retract":
+    """Release pages and requeue as prefill without finishing the client.
+
+    Snapshot-less: dest pages were not filled. The next admit recomputes
+    missing prefix tokens from Device/Host plus remaining L3 keys.
+    """
+    fe = ForwardEvent.Retract()
+    fe.request_id = request_id
+    return fe
+
+
 def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: int):
     fe = ForwardEvent.UpdateReserveNumTokens()
     fe.request_id = request_id

@@ -51,9 +51,16 @@ struct UpdateReserveNumTokens {
 struct Abort {
     std::string request_id;
 };
+
+// Snapshot-less retract: release request-owned pages and requeue as prefill.
+// Used when an admitted L3 prefetch missed; dest pages were not filled, so
+// the next admit recomputes those tokens instead of finishing the client.
+struct Retract {
+    std::string request_id;
+};
 }  // namespace forward
 
-using ForwardEvent =
-    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens>;
+using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::Retract,
+                                  forward::UpdateReserveNumTokens>;
 
 }  // namespace tokenspeed

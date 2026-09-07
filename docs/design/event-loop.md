@@ -303,4 +303,5 @@ For orientation, one iteration of `event_loop`:
   registered at submit cannot be admitted after the object is gone.
   After Admit, vanished L3 objects are recovered on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
-  publishing empty Host pages, abort the batch.
+  publishing empty Host pages, snapshot-less retract of the batch so
+  the next admit recomputes. Clients are not failed.

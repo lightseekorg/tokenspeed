@@ -123,7 +123,6 @@ class _Loop:
     _clear_cache = EventLoop._clear_cache
     _can_clear_cache = EventLoop._can_clear_cache
     _recover_if_l3_prefetch_failed = EventLoop._recover_if_l3_prefetch_failed
-    _abort_vanished_l3_request = EventLoop._abort_vanished_l3_request
 
     def __init__(self, exists_flags=None) -> None:
         self._device = _Device(exists_flags)
@@ -138,14 +137,6 @@ class _Loop:
         self.request_handler = SimpleNamespace(
             converge_replica_decision=lambda local_ok: local_ok
         )
-        self.output_processor = SimpleNamespace(rid_to_state={})
-        self.marked_aborts: list[tuple[str, str]] = []
-
-    def _request_abort_or_mark(
-        self, request_id: str, reason: str, *, notify_client: bool = False
-    ) -> None:
-        del notify_client
-        self.marked_aborts.append((request_id, reason))
 
 
 def _spec(rid: str, tokens: list[int]):
@@ -303,30 +294,29 @@ def test_revalidate_skipped_without_l3() -> None:
     assert loop.scheduler.unregistered is None
 
 
-def test_vanished_l3_prefetch_unregisters_and_aborts(monkeypatch) -> None:
-    aborts: list[str] = []
+def test_vanished_l3_prefetch_unregisters_and_retracts(monkeypatch) -> None:
+    retracts: list[str] = []
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.event_loop.make_abort_event",
-        lambda rid: aborts.append(rid) or f"abort:{rid}",
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: retracts.append(rid) or f"retract:{rid}",
     )
 
     loop = _Loop(exists_flags=[True])
     loop._device.prefetch_pages = True
     loop._device.prefetch_ok = False
-    forward_op = SimpleNamespace(request_ids=["r0"])
+    forward_op = SimpleNamespace(request_ids=["r0", "r1"])
 
     events = loop._recover_if_l3_prefetch_failed(SimpleNamespace(), forward_op)
 
     assert loop._device.prefetch_calls == 1
     assert loop._device.invalidations == 1
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
-    assert loop.marked_aborts == [("r0", "L3 object vanished before prefetch")]
-    assert aborts == ["r0"]
-    assert events == ["abort:r0"]
+    assert retracts == ["r0", "r1"]
+    assert events == ["retract:r0", "retract:r1"]
 
 
-def test_l3_prefetch_success_does_not_abort() -> None:
+def test_l3_prefetch_success_does_not_retract() -> None:
     loop = _Loop(exists_flags=[True])
     loop._device.prefetch_pages = True
     loop._device.prefetch_ok = True

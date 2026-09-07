@@ -419,9 +419,11 @@ Its responsibilities:
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced
   across the replica, and a miss unregisters the keys, skips H2D /
   skips publishing empty Host pages (`LoadBackDone.success=false`),
-  skips the model forward, and aborts the batch so the next admit
-  computes those tokens instead of terminating the runtime. Existence
-  and prefetch are skipped when L3 is unset: Host-only and
+  skips the model forward, and retracts the batch snapshot-less so the
+  next admit recomputes those tokens. Clients are not failed; mixed
+  prefill/decode partners in the same forward retract together so ranks
+  stay aligned. Existence and prefetch are skipped when L3 is unset:
+  Host-only and
   `--disable-kvstore` admission must not hash prefixes or copy
   `group_keys` for a storage index that does not exist. CI covers this path
   with the in-process `memory` backend (scheduler tests register keys /

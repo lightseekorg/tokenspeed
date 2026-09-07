@@ -111,8 +111,8 @@ class RequestHandler:
         vocab_size: int,
         recv_func,
         send_func,
+        can_clear_cache_fn,
         clear_cache_fn=None,
-        can_clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
@@ -387,7 +387,7 @@ class RequestHandler:
 
         if not recv_req.flush_cache:
             return True, ""
-        local_ok = self.can_clear_cache_fn is not None and self.can_clear_cache_fn()
+        local_ok = self.can_clear_cache_fn()
         if not self._converge_replica_decision(local_ok):
             return (
                 False,

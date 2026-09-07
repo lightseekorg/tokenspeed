@@ -183,6 +183,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::Abort::request_id);
 
+    nb::class_<tokenspeed::forward::Retract>(forward_event, "Retract")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::Retract::request_id);
+
     nb::class_<tokenspeed::forward::UpdateReserveNumTokens>(forward_event, "UpdateReserveNumTokens")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::UpdateReserveNumTokens::request_id)

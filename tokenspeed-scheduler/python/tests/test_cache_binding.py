@@ -45,18 +45,19 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(ts.Forward.Batch, "hist_token_lens")
     assert not hasattr(ts.Scheduler, "get_request_paged_cache_page_ids")
 
-    def test_cache_event_fields_are_bound():
-        write_back = Cache.WriteBackDoneEvent()
-        write_back.op_id = 7
-        assert write_back.op_id == 7
 
-        load_back = Cache.LoadBackDoneEvent()
-        load_back.op_id = 8
-        load_back.success = False
-        assert load_back.op_id == 8
-        assert load_back.success is False
-        default_load = Cache.LoadBackDoneEvent()
-        assert default_load.success is True
+def test_cache_event_fields_are_bound():
+    write_back = Cache.WriteBackDoneEvent()
+    write_back.op_id = 7
+    assert write_back.op_id == 7
+
+    load_back = Cache.LoadBackDoneEvent()
+    load_back.op_id = 8
+    load_back.success = False
+    assert load_back.op_id == 8
+    assert load_back.success is False
+    default_load = Cache.LoadBackDoneEvent()
+    assert default_load.success is True
 
 
 def test_execution_event_accepts_cache_events():
@@ -67,3 +68,11 @@ def test_execution_event_accepts_cache_events():
 
     load_back = Cache.LoadBackDoneEvent()
     assert execution_event.add_event(load_back) is execution_event
+
+
+def test_forward_retract_event_is_bound():
+    retract = ts.ForwardEvent.Retract()
+    retract.request_id = "r0"
+    assert retract.request_id == "r0"
+    execution_event = ExecutionEvent()
+    assert execution_event.add_event(retract) is execution_event

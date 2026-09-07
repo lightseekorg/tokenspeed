@@ -176,6 +176,7 @@ private:
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
+    void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 

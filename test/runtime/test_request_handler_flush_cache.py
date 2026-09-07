@@ -192,7 +192,6 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
     def test_missing_flush_handler_does_not_switch_l3_prefix(self):
         handler = self._handler()
-        handler.can_clear_cache_fn = None
         handler.clear_cache_fn = None
         handler._device.update_weights.return_value = (True, "ok")
         req = UpdateWeightsFromDistributedReqInput(
@@ -205,12 +204,19 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
 
         handler.process_requests([req])
 
+        handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_not_called()
         handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
+
+    def test_can_clear_cache_fn_is_required(self):
+        param = inspect.signature(RequestHandler.__init__).parameters[
+            "can_clear_cache_fn"
+        ]
+        self.assertIs(param.default, inspect.Parameter.empty)
 
     def test_l3_flush_without_version_is_rejected(self):
         handler = self._handler()
