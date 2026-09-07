@@ -21,9 +21,88 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+import tokenspeed.runtime.execution.model_executor as model_executor_module
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+
+def test_decode_autotune_buckets_cover_speculation_and_attention_dp():
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.forward_step = SimpleNamespace(max_tokens_per_req=5)
+    executor.config = SimpleNamespace(data_parallel_size=8)
+    assert executor._decode_autotune_buckets((1, 3)) == (1, 3, 5, 15, 40, 120)
+
+
+@pytest.mark.parametrize("disable_autotune", [False, True])
+@pytest.mark.parametrize("disable_graph", [False, True])
+def test_decode_tuning_without_chunked_prefill(
+    monkeypatch, disable_autotune, disable_graph
+):
+    monkeypatch.setenv("TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE", "1")
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(
+        chunked_prefill_size=-1,
+        max_num_seqs=8,
+        data_parallel_size=1,
+        context_len=4096,
+        world_size=1,
+        world_group=(0,),
+        global_rank=0,
+        pp_size=1,
+        disable_autotune=disable_autotune,
+        autotune_cache_key={},
+    )
+    executor.model_runner = object()
+    executor.input_buffers = None
+    executor.device = "cpu"
+    calls = []
+    metadata = []
+
+    def warmup_decode_path(batch_sizes, graph_phase):
+        assert not torch.is_grad_enabled()
+        assert graph_phase is (not disable_graph)
+        calls.append("decode")
+        metadata.append(torch.zeros(1))
+
+    executor.forward_step = SimpleNamespace(
+        capture_bs=(1,),
+        disable=disable_graph,
+        max_tokens_per_req=1,
+        warmup_decode_path=warmup_decode_path,
+    )
+    monkeypatch.setattr(
+        model_executor_module,
+        "flashinfer_autotune_cache_path",
+        lambda key: "cache.json",
+    )
+    monkeypatch.setattr(
+        model_executor_module,
+        "load_flashinfer_autotune_cache",
+        lambda path, group, rank: calls.append(("load", path)),
+    )
+    monkeypatch.setattr(
+        model_executor_module,
+        "save_flashinfer_autotune_cache",
+        lambda path, group, rank: calls.append(("save", path)),
+    )
+    monkeypatch.setattr(
+        model_executor_module, "autotune", lambda **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        model_executor_module, "set_autotune_process_group", lambda group: None
+    )
+
+    executor._autotune()
+
+    assert calls == (
+        [("load", "cache.json")]
+        if disable_autotune
+        else [("load", "cache.json"), "decode", ("save", "cache.json")]
+    )
+    for tensor in metadata:
+        tensor.fill_(1)
 
 
 class _RuntimeStates:

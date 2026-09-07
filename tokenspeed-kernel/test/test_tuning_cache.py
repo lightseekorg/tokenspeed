@@ -18,107 +18,189 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""load_flashinfer_tuning_cache never fails startup.
-
-Every failure mode -- missing file, corrupt JSON, a table swept on a different
-GPU model -- must come back as ``False`` (with a warning) so the startup
-autotune window tunes those shapes instead of engine startup aborting over a
-stale table.
-"""
-
 from __future__ import annotations
 
-import json
-from importlib.util import find_spec
+import contextlib
+import sys
+import threading
+import types
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
+import torch
+from tokenspeed_kernel.ops import tuning
 from tokenspeed_kernel.ops.tuning import (
-    flashinfer_tuning_cache_filename,
-    load_flashinfer_tuning_cache,
-    set_autotune_process_group,
-)
-
-requires_flashinfer = pytest.mark.skipif(
-    find_spec("flashinfer") is None, reason="requires flashinfer"
+    autotune,
+    flashinfer_autotune_cache_path,
+    load_flashinfer_autotune_cache,
+    save_flashinfer_autotune_cache,
 )
 
 
-def test_flashinfer_tuning_cache_filename_includes_cudnn() -> None:
-    assert flashinfer_tuning_cache_filename(
-        "kimi-k3",
-        8,
-        1,
-        "NVIDIA B300 SXM6 AC",
-        "0.6.16",
-        92400,
-    ) == (
-        "kimi-k3,ep=8,tp=1,device_name=NVIDIA_B300_SXM6_AC,"
-        "flashinfer=0.6.16,cudnn=92400.json"
-    )
+class _FakeTuner:
+    def __init__(self) -> None:
+        self.active = False
+        self._blocklist = types.SimpleNamespace(_invalid={})
+
+    def load_configs(self, path: str) -> bool:
+        assert Path(path).read_bytes() == b"tactics"
+        self.active = True
+        return True
+
+    def save_configs(self, path: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"tactics")
+
+    def clear_cache(self) -> None:
+        self.active = False
 
 
-@requires_flashinfer
-def test_missing_file_returns_false(tmp_path) -> None:
-    assert load_flashinfer_tuning_cache(str(tmp_path / "absent.json")) is False
+def _install_fake_flashinfer(monkeypatch, *, metadata):
+    tuner = _FakeTuner()
+    calls = []
+
+    autotuner_module = types.ModuleType("flashinfer.autotuner")
+
+    class AutoTuner:
+        choose_one = Mock()
+
+        @staticmethod
+        def get():
+            return tuner
+
+    @contextlib.contextmanager
+    def fake_autotune(tune_mode, **kwargs):
+        calls.append((tune_mode, kwargs))
+        yield
+
+    autotuner_module.AutoTuner = AutoTuner
+    autotuner_module.autotune = fake_autotune
+    autotuner_module._collect_metadata = lambda: metadata
+
+    flashinfer_module = types.ModuleType("flashinfer")
+    flashinfer_module.__path__ = []
+    flashinfer_module.autotuner = autotuner_module
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", autotuner_module)
+    return tuner, calls
 
 
-@requires_flashinfer
-def test_corrupt_file_returns_false(tmp_path) -> None:
-    path = tmp_path / "corrupt.json"
-    path.write_text("{ not json")
-    assert load_flashinfer_tuning_cache(str(path)) is False
+def test_cache_path_is_environment_and_config_scoped(monkeypatch, tmp_path) -> None:
+    metadata = {"gpu": "GB300"}
+    _install_fake_flashinfer(monkeypatch, metadata=metadata)
+    monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+
+    config = {"model": "model-a", "tp": 8, "ep": 1}
+    first = flashinfer_autotune_cache_path(config)
+    same = flashinfer_autotune_cache_path({"ep": 1, "tp": 8, "model": "model-a"})
+    other = flashinfer_autotune_cache_path({**config, "tp": 1, "ep": 8})
+
+    assert first == same
+    assert first != other
+    assert first is not None
+    assert Path(first).parent.parent == tmp_path
+    assert Path(first).name == "autotune_configs.json"
+    metadata["gpu"] = "B300"
+    assert flashinfer_autotune_cache_path(config) != first
 
 
-@requires_flashinfer
-def test_packaged_lookup_miss_returns_false() -> None:
-    import torch
-    from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
+def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
+    tuner, calls = _install_fake_flashinfer(monkeypatch, metadata={})
 
-    if not torch.cuda.is_available():
-        pytest.skip("device-name lookup requires CUDA")
-    # No table ships for this made-up model; the miss must be a quiet False
-    # (INFO log), leaving the startup autotune window to tune these shapes.
-    assert (
-        load_packaged_flashinfer_tuning_cache("no-such-model-unit-test", 999, 1)
-        is False
-    )
+    with autotune(
+        tune_mode=True,
+        tuning_buckets=(64, 1, 2, 2),
+        round_up=False,
+    ):
+        pass
+    with autotune(tune_mode=False, tuning_buckets=(1, 2, 4), round_up=None):
+        pass
 
-
-@requires_flashinfer
-def test_set_autotune_process_group_sets_and_clears() -> None:
-    import flashinfer.autotuner as fi
-
-    sentinel = object()
-    set_autotune_process_group(sentinel)
-    try:
-        assert fi.get_autotune_process_group() is sentinel
-    finally:
-        set_autotune_process_group(None)
-    assert fi.get_autotune_process_group() is None
-
-
-def test_set_autotune_process_group_tolerates_missing_backend() -> None:
-    # Like autotune(), a no-op without flashinfer installed.
-    set_autotune_process_group(None)
-
-
-@requires_flashinfer
-def test_mismatched_gpu_metadata_returns_false(tmp_path) -> None:
-    # A definite metadata conflict (wrong GPU model) must reject the whole
-    # table -- this is the guard that keeps a B300-swept table off other SKUs.
-    path = tmp_path / "wrong_gpu.json"
-    path.write_text(
-        json.dumps(
+    assert calls == [
+        (
+            True,
             {
-                "_metadata": {
-                    "flashinfer_version": "0.0.1",
-                    "cuda_version": "0.0",
-                    "cublas_version": "0",
-                    "cudnn_version": "0",
-                    "cudnn_frontend_version": "0",
-                    "gpu": "NVIDIA UnitTest GPU That Does Not Exist",
-                },
-            }
-        )
+                "tuning_buckets": (64, 1, 2, 2),
+                "round_up": False,
+            },
+        ),
+        (False, {"tuning_buckets": (1, 2, 4), "round_up": None}),
+    ]
+    assert tuner._blocklist._invalid["bf16_gemm::TGVRunner"] == set(range(16, 29))
+
+
+def test_cache_roundtrip_and_failures(monkeypatch, tmp_path) -> None:
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+    monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    path = flashinfer_autotune_cache_path({"model": "model-a"})
+    assert save_flashinfer_autotune_cache(path, None, 0)
+    assert Path(path).read_bytes() == b"tactics"
+    assert load_flashinfer_autotune_cache(path, None, 0)
+    assert tuner.active
+
+    assert not load_flashinfer_autotune_cache(str(tmp_path / "missing.json"), None, 0)
+    assert not tuner.active
+
+    def failed_load(path):
+        tuner.active = True
+        raise KeyError("malformed tactic")
+
+    monkeypatch.setattr(tuner, "load_configs", failed_load)
+    assert not load_flashinfer_autotune_cache(path, None, 0)
+    assert not tuner.active
+
+    monkeypatch.setattr(
+        tuner, "save_configs", Mock(side_effect=TypeError("invalid tactic"))
     )
-    assert load_flashinfer_tuning_cache(str(path)) is False
+    assert not save_flashinfer_autotune_cache(path, None, 0)
+
+
+@pytest.mark.parametrize(
+    "tokens,local,queries",
+    [(512, 112, [512, 64]), (513, 112, [513, 65]), (512, 896, [512])],
+)
+def test_ep_candidates_keep_full_profile_inputs(monkeypatch, tokens, local, queries):
+    seen = []
+    inputs = [torch.empty(tokens), torch.empty(tokens, 4)]
+
+    class MoERunner:
+        num_experts, num_local_experts = 896, local
+        num_fused_shared_experts = 0
+
+        def get_valid_tactics(self, tensors, profile):
+            seen.append(tensors[1].shape[0])
+            assert tensors[0] is inputs[0]
+            return [(128, 17)] if tensors[1].shape[0] > 100 else [(16, 377), (128, 17)]
+
+    class AutoTuner:
+        _lock = threading.RLock()
+
+        def choose_one(self, op, runners, config, tensors, **kwargs):
+            candidates = runners[0].get_valid_tactics(tensors, None)
+            assert tensors is inputs and tensors[1].shape[0] == tokens
+            if kwargs.get("fail"):
+                raise RuntimeError("profile failed")
+            return candidates
+
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.autotuner", types.SimpleNamespace(AutoTuner=AutoTuner)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.fused_moe.core",
+        types.SimpleNamespace(
+            MoeRunnerInputs=types.SimpleNamespace(idx=lambda name: 1)
+        ),
+    )
+    original_choose, original_valid = AutoTuner.choose_one, MoERunner.get_valid_tactics
+    with tuning._ep_moe_candidates():
+        args = ("flashinfer::trtllm_fp4_block_scale_moe", [MoERunner()], None, inputs)
+        result = AutoTuner().choose_one(*args)
+        assert seen == queries
+        assert result == ([(128, 17), (16, 377)] if local < 896 else [(128, 17)])
+        with pytest.raises(RuntimeError, match="profile failed"):
+            AutoTuner().choose_one(*args, fail=True)
+        assert MoERunner.get_valid_tactics is original_valid
+    assert AutoTuner.choose_one is original_choose

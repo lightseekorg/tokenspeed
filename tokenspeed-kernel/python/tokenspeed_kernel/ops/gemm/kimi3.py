@@ -16,6 +16,7 @@ from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
 from tokenspeed_kernel.platform import Platform, pdl_enabled
 
 # FP8 storage dtypes served by the w8a8 projection branch (matches the
@@ -26,7 +27,6 @@ KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
 KIMI3_ROUTER_SIZE = 896
-from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
 
 KIMI3_SHARED_LOCAL_SIZE = 768
 
@@ -413,7 +413,9 @@ def kimi3_mla_qkv_gate_projection(
     if solution not in {"auto", "fused", "split"}:
         raise ValueError(f"unknown Kimi K3 MLA projection solution {solution!r}")
     if solution == "auto":
-        solution = "split" if m > 32 else "fused"
+        solution = (
+            "fused" if m <= 32 or decode_gemv_routed(hidden_states, weight) else "split"
+        )
 
     if solution == "fused":
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
@@ -881,7 +883,7 @@ def kimi3_qkvfab_projection(
     if solution == "auto":
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
-        elif specialized:
+        elif specialized or decode_gemv_routed(hidden_states, weight):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "decode_gemv"
         else:

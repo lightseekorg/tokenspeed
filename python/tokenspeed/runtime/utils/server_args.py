@@ -1857,9 +1857,9 @@ class ServerArgs:
             "--disable-autotune",
             "--disable-flashinfer-autotune",
             action="store_true",
-            help="Skip the startup kernel-tuning pass; tunable kernels use each "
-            "library's heuristic tactics instead. Speeds up startup for "
-            "debugging at the cost of serving performance.",
+            help="Skip profiling missing kernel tactics during startup. A matching "
+            "persistent FlashInfer cache is still loaded; uncovered shapes use "
+            "the library's heuristic fallback.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

@@ -26,9 +26,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 from tokenspeed_kernel.ops.tuning import (
     autotune,
+    flashinfer_autotune_cache_path,
+    load_flashinfer_autotune_cache,
+    save_flashinfer_autotune_cache,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
 )
@@ -140,6 +142,30 @@ def _cache_arena_attr(pool, name: str, default):
     return getattr(getattr(pool, "arena", None), name, default)
 
 
+def _autotune_cache_key(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+) -> dict[str, object]:
+    """Rank-independent identity for tactics that may safely share a cache."""
+    mapping = server_args.mapping
+    return {
+        "model": model_config.model_path,
+        "revision": model_config.revision,
+        "architectures": getattr(model_config.hf_config, "architectures", None),
+        "quantization": model_config.quantization,
+        "dtype": server_args.dtype,
+        "moe_backend": str(server_args.moe_backend),
+        "attention_backend": str(server_args.attention_backend),
+        "attention": (mapping.attn.tp_size, mapping.attn.cp_size, mapping.attn.dp_size),
+        "dense": (mapping.dense.tp_size, mapping.dense.dp_size),
+        "moe": (mapping.moe.tp_size, mapping.moe.ep_size, mapping.moe.dp_size),
+        "linear_attention_tp": mapping.linear_attn.tp_size,
+        "pipeline_parallel": mapping.pp_size,
+        "speculative_algorithm": server_args.speculative_algorithm,
+        "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
+    }
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -173,6 +199,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    autotune_cache_key: dict[str, object] | None
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -274,6 +301,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
+            autotune_cache_key=_autotune_cache_key(server_args, model_config),
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
@@ -463,7 +491,7 @@ class ModelExecutor:
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         if config.enforce_eager:
             logger.info("Prewarming Triton RSAG communication states")
-            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+            self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -484,7 +512,15 @@ class ModelExecutor:
         workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
-            self.forward_step.capture()
+            # Capture must use the same bucket mapper as decode tuning.
+            with autotune(
+                tune_mode=False,
+                tuning_buckets=self._decode_autotune_buckets(
+                    tuple(self.forward_step.capture_bs)
+                ),
+                round_up=False,
+            ):
+                self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
 
@@ -520,22 +556,32 @@ class ModelExecutor:
 
         logger.info("ModelExecutor initialized")
 
+    def _decode_autotune_buckets(
+        self,
+        request_buckets: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """FI dynamic buckets covering the requested decode token counts."""
+        # Most decode kernels see one token per request. Speculative target
+        # verification and cross-attention-DP MoE gathers can see fixed
+        # multiples of that count, so include those exact cases too.
+        tokens_per_req = self.forward_step.max_tokens_per_req
+        factors = {
+            1,
+            tokens_per_req,
+            tokens_per_req * self.config.data_parallel_size,
+        }
+        return tuple(
+            sorted(
+                {
+                    request_bs * factor
+                    for request_bs in request_buckets
+                    for factor in factors
+                }
+            )
+        )
+
     def _autotune(self) -> None:
-        """Profile tunable kernels over one dummy prefill before graph capture.
-
-        The dummy batch is capped by both the chunked-prefill token budget and
-        rank-local request capacity. ``make_dummy_batch`` splits tokens into
-        requests of at most ``context_len``, while request-indexed buffers
-        contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
-        token count within their product prevents autotuning from constructing
-        a batch that cannot fit those buffers.
-
-        The tuner enumerates every smaller shape bucket from this pass, so a
-        separate decode-sized pass is unnecessary. This must run before graph
-        capture because a captured graph retains the tactic selected during
-        capture. On distributed boots, per-tactic timings are averaged across
-        ranks so every rank selects the same tactic.
-        """
+        """Tune missing prefill/decode configs and persist the shared cache."""
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
@@ -545,55 +591,81 @@ class ModelExecutor:
             int(self.config.chunked_prefill_size),
             int(self.config.context_len) * per_rank_max_batch,
         )
-        if num_tokens <= 0 or self.model_runner is None:
-            return
-        if self.config.pp_size > 1:
-            # The tuning forward drives the model directly (no stage recv/send
-            # threading), which a mid-pipeline stage cannot run. Fall back to
-            # heuristic tactics on every rank so the world-averaged tactic
-            # collective is skipped consistently.
-            set_autotune_max_num_tokens(num_tokens)
-            logger.info(
-                "Kernel tuning skipped under pipeline parallelism; tunable "
-                "kernels use heuristic tactics"
-            )
+        if self.model_runner is None:
             return
 
-        # The bucket mapper keys serving-time tactic lookups, so it must match
-        # any pre-swept table loaded earlier even when tuning itself is off.
         set_autotune_max_num_tokens(num_tokens)
-        if self.config.disable_autotune:
-            logger.info(
-                "Kernel tuning disabled (--disable-autotune); tunable kernels "
-                "use heuristic tactics"
-            )
-            return
-
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+        owner_rank = (
+            self.config.world_group[0]
+            if self.config.world_group
+            else self.config.global_rank
+        )
 
-        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
+        cache_path = (
+            flashinfer_autotune_cache_path(self.config.autotune_cache_key)
+            if self.config.autotune_cache_key is not None
+            else None
+        )
+        load_flashinfer_autotune_cache(cache_path, cpu_group, owner_rank)
+
+        if self.config.pp_size > 1:
+            # These dummy forwards do not perform pipeline stage transfers.
+            logger.info("Kernel tuning skipped under pipeline parallelism")
+            return
+        if self.config.disable_autotune:
+            logger.info("Kernel tuning disabled (--disable-autotune)")
+            return
+
+        decode_cases = tuple(sorted(self.forward_step.capture_bs))
+        logger.info(
+            f"FlashInfer startup tuning: prefill={num_tokens} tokens, "
+            f"decode cases={decode_cases}"
+        )
+
         ib = self.input_buffers
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        with autotune(), maybe_inference_mode():
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
-            positions = (
-                ib.mrope_positions_buf[:, :num_tokens]
-                if self.config.model_is_mrope
-                else ib.positions_buf[:num_tokens]
-            )
-            with active_forward(ctx):
-                self.model_runner.forward(
-                    ctx=ctx,
-                    input_ids=ib.input_ids_buf[:num_tokens],
-                    positions=positions,
-                )
-        set_autotune_process_group(None)
+        try:
+            # Warmup metadata must remain mutable outside inference mode
+            # when capture refreshes it later.
+            with torch.no_grad():
+                if num_tokens > 0:
+                    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+                        ctx = self.prefill_graph.make_dummy_batch(num_tokens)
+                        positions = (
+                            ib.mrope_positions_buf[:, :num_tokens]
+                            if self.config.model_is_mrope
+                            else ib.positions_buf[:num_tokens]
+                        )
+                        with active_forward(ctx):
+                            self.model_runner.forward(
+                                ctx=ctx,
+                                input_ids=ib.input_ids_buf[:num_tokens],
+                                positions=positions,
+                            )
+
+                # Separate contexts avoid combining sizes with static
+                # branches that never occur together.
+                for bs in decode_cases:
+                    case_buckets = self._decode_autotune_buckets((bs,))
+                    with autotune(
+                        tune_mode=True,
+                        tuning_buckets=case_buckets,
+                        round_up=False,
+                    ):
+                        self.forward_step.warmup_decode_path(
+                            batch_sizes=(bs,), graph_phase=not self.forward_step.disable
+                        )
+        finally:
+            set_autotune_process_group(None)
+
         torch.get_device_module(self.device).synchronize()
-        dist.barrier()
-        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
+        save_flashinfer_autotune_cache(cache_path, cpu_group, owner_rank)
+
+        logger.info(f"FlashInfer startup tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):
