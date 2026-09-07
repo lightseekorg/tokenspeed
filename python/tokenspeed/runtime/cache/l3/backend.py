@@ -189,10 +189,12 @@ def l3_checkpoint_id(
 
     ``--revision`` may be a moving branch or omitted. Two instances that
     resolve different commits (or local trees) must not share Mooncake
-    keys. A local directory is identified from the snapshot folder name
-    or a fingerprint of the weight files ``--load-format`` actually
+    keys.     A local directory is identified from a Hugging Face
+    ``snapshots/<commit>`` path or a fingerprint of the weight files
+    ``--load-format`` actually
     selects — never from ``hf_config._commit_hash``, which a copied or
-    fine-tuned tree can inherit from its source. Local fingerprints also
+    fine-tuned tree can inherit from its source, and never from a
+    40-character hex basename outside that snapshot layout. Local fingerprints also
     hash ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
     quantization cannot collide under identical weight bytes. Hugging Face
     hub ids still prefer the
@@ -254,8 +256,20 @@ def share_l3_checkpoint_ids(
 
 
 def _snapshot_commit_hash(snapshot_path: str) -> str | None:
-    candidate = os.path.basename(os.path.normpath(snapshot_path))
-    return candidate if _HF_COMMIT_HASH_RE.fullmatch(candidate) else None
+    """Return the commit only for a Hugging Face ``snapshots/<hash>`` path.
+
+    A 40-character hex basename is not enough: a copied or fine-tuned
+    local tree can keep that folder name while holding different bytes.
+    """
+
+    normalized = os.path.normpath(snapshot_path)
+    candidate = os.path.basename(normalized)
+    if not _HF_COMMIT_HASH_RE.fullmatch(candidate):
+        return None
+    parent = os.path.basename(os.path.dirname(normalized))
+    if parent != "snapshots":
+        return None
+    return candidate
 
 
 def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:

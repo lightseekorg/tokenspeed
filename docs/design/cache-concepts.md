@@ -399,10 +399,12 @@ Its responsibilities:
   context-parallel width (`cp_size`), the resolved attention-TP width
   (`attn.tp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
-  Hugging Face branch or local path is fingerprinted from a snapshot
-  directory commit or the contents of the local checkpoint actually
-  loaded — a copied config's inherited `_commit_hash` is not trusted —
-  and local fingerprints include `hf_quant_config.json` (ModelOpt
+  Hugging Face branch or local path is identified from a Hugging Face
+  `snapshots/<commit>` directory or fingerprinted from the contents of
+  the local checkpoint actually loaded. A copied config's inherited
+  `_commit_hash` is not trusted, and a 40-character hex folder name
+  outside that snapshot layout is not treated as a commit. Local
+  fingerprints include `hf_quant_config.json` (ModelOpt
   mixed-precision maps and KV quantization live there, not in the
   weight tensors) plus only the weight files `--load-format` selects
   (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;

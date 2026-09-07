@@ -238,6 +238,35 @@ class StorageKeyTest(unittest.TestCase):
                 ).startswith("local-")
             )
 
+    def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
+        commit = "d" * 40
+        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+            first = os.path.join(first_root, commit)
+            second = os.path.join(second_root, commit)
+            os.makedirs(first)
+            os.makedirs(second)
+            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(payload)
+            first_id = self._checkpoint_id(
+                first,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            second_id = self._checkpoint_id(
+                second,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertTrue(first_id.startswith("local-"))
+            self.assertTrue(second_id.startswith("local-"))
+            self.assertNotEqual(first_id, second_id)
+            self.assertNotEqual(first_id, f"{commit}:auto")
+
     def test_checkpoint_id_ignores_inherited_commit_on_local_dir(self):
         inherited = "a" * 40
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
