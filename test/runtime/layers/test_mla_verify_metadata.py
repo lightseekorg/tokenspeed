@@ -29,6 +29,7 @@ def _run_mla_decode(
     sliding_window_size: int = -1,
     query_blocks: bool = False,
     block_size: int | None = None,
+    num_extends: int = 0,
 ) -> dict[str, torch.Tensor]:
     captured = {}
 
@@ -52,7 +53,7 @@ def _run_mla_decode(
     if draft_block_decode:
         seq_lens = seq_lens.repeat_interleave(spec)
     backend.forward_decode_metadata = SimpleNamespace(
-        num_extends=0,
+        num_extends=num_extends,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
         seq_lens=seq_lens,
         # Built once per forward alongside the expanded rows above.
@@ -205,6 +206,30 @@ def test_a_block_layer_keeps_the_flattened_rows_when_no_kernel_reads_the_fold(
     assert captured["page_table"].shape[0] == 16
 
 
+def test_a_flattened_block_never_skips_metadata_rows_for_extends(monkeypatch):
+    """A block round has no extend split to apply.
+
+    ``refresh_decode_metadata`` expands rows ``[0, bs)`` into
+    ``[0, bs * block)`` and the drafter's query covers those same requests, so
+    skipping metadata rows while keeping every query row runs the kernel off
+    the end of both. A drafter that is not ``kimi_mla`` reports
+    ``num_extends == bs``, which is what used to empty the slice.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        query_blocks=False,
+        num_extends=2,
+    )
+
+    assert captured["q"].shape[0] == 16
+    assert captured["page_table"].shape[0] == 16
+    assert captured["cache_seqlens"].shape[0] == 16
+
+
 def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkeypatch):
     """Un-expanding is only valid on the stride the metadata was built with.
 
@@ -280,6 +305,7 @@ def _run_cutedsl_decode(
     draft_block_decode: bool = True,
     block_size: int = 8,
     sliding_window_size: int = -1,
+    num_extends: int = 0,
 ) -> dict:
     """The CuteDSL leaf's decode call, with the kernel replaced by a probe."""
     from tokenspeed.runtime.layers.attention.backends.paged import (
@@ -299,7 +325,7 @@ def _run_cutedsl_decode(
     spec = block_size if draft_block_decode else 1
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
     backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(
-        num_extends=0,
+        num_extends=num_extends,
         page_table=torch.zeros(bs * spec, 1, dtype=torch.int32),
         max_seq_len_k=256,
         seq_lens_k=seq_lens.repeat_interleave(spec),
@@ -373,6 +399,16 @@ def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeyp
 def test_a_narrower_cutedsl_draft_forward_refuses_to_drop_the_window(monkeypatch):
     with pytest.raises(ValueError, match="query axis"):
         _run_cutedsl_decode(monkeypatch, q_len_per_req=7, sliding_window_size=4095)
+
+
+def test_a_flattened_cutedsl_block_never_skips_metadata_rows_for_extends(monkeypatch):
+    captured = _run_cutedsl_decode(
+        monkeypatch, q_len_per_req=7, sliding_window_size=-1, num_extends=2
+    )
+
+    assert captured["query"].shape[0] == 14
+    assert captured["block_tables"].shape[0] == 16
+    assert captured["seq_lens"].shape[0] == 16
 
 
 def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None:

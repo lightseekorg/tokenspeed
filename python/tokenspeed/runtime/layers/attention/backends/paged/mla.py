@@ -444,7 +444,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         noncausal_block_size = self.spec_num_tokens if self.block_decode_active else 1
 
         if self.block_decode_active:
-            rows = num_extends * q_len_per_req
             if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
                 layer.tp_q_head_num, q_len_per_req, window_left >= 0
             ):
@@ -467,10 +466,13 @@ class MLAAttnBackend(PagedAttentionBackend):
                 # the block-end length, so the block is non-causal. Adding the
                 # causal offsets below would re-impose exactly the ordering the
                 # draft must not have, and re-expanding the rows would square
-                # the batch.
+                # the batch. No extend offset either: refresh_decode_metadata
+                # expanded rows [0, bs), which is exactly what this query
+                # covers, so skipping metadata rows while keeping every query
+                # row indexes past the end of both.
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
-                page_table = metadata.page_table[rows:]
-                cache_seqlens = metadata.seq_lens[rows:]
+                page_table = metadata.page_table
+                cache_seqlens = metadata.seq_lens
             max_seqlen_k = self.max_context_len
         elif q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
