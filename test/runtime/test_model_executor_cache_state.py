@@ -40,6 +40,7 @@ def test_decode_autotune_buckets_cover_speculation_and_attention_dp():
 def test_decode_tuning_without_chunked_prefill(
     monkeypatch, disable_autotune, disable_graph
 ):
+    monkeypatch.setenv("TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE", "1")
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.config = SimpleNamespace(
         chunked_prefill_size=-1,
@@ -57,11 +58,18 @@ def test_decode_tuning_without_chunked_prefill(
     executor.input_buffers = None
     executor.device = "cpu"
     calls = []
+    metadata = []
+
+    def warmup_decode_path(batch_sizes):
+        assert not torch.is_grad_enabled()
+        calls.append("decode")
+        metadata.append(torch.zeros(1))
+
     executor.forward_step = SimpleNamespace(
         capture_bs=(1,),
         disable=disable_graph,
         max_tokens_per_req=1,
-        warmup_decode_path=lambda batch_sizes: calls.append("decode"),
+        warmup_decode_path=warmup_decode_path,
     )
     monkeypatch.setattr(
         model_executor_module,
@@ -92,6 +100,8 @@ def test_decode_tuning_without_chunked_prefill(
         if disable_autotune
         else [("load", "cache.json"), "decode", ("save", "cache.json")]
     )
+    for tensor in metadata:
+        tensor.fill_(1)
 
 
 class _RuntimeStates:

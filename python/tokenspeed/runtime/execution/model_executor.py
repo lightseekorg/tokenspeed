@@ -629,7 +629,9 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         try:
-            with maybe_inference_mode():
+            # Warmup metadata must remain mutable outside inference mode
+            # when capture refreshes it later.
+            with torch.no_grad():
                 if num_tokens > 0:
                     with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
                         ctx = self.prefill_graph.make_dummy_batch(num_tokens)
