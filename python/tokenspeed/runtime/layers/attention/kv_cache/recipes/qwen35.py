@@ -57,7 +57,7 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def target_layer_types(self) -> tuple[str, ...]:
-        return tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
+        return tuple(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:

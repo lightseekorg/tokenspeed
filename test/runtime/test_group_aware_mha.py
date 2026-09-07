@@ -6,7 +6,8 @@ kernel-page table and write locations. These tests build a router over two
 real MHA leaves at different kernel page sizes and pin: per-group table
 isolation in the leaves' persistent buffers, write locations landing in the
 layer's own group pages, and the unknown-group KeyError (the old sole-group
-fallback is gone). Layer-side group_id validation stays at the bottom.
+fallback is gone). Layer-side binding and its retention/visibility check
+live in ``test_bind_cache_groups.py``.
 """
 
 from __future__ import annotations
@@ -167,103 +168,6 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             router.write_locations(_layer("nope"), ForwardMode.DECODE)
         with self.assertRaisesRegex(KeyError, "names cache group ''"):
             router.write_locations(_layer(""), ForwardMode.DECODE)
-
-
-class ValidateCacheGroupIdsTest(unittest.TestCase):
-    """Init-time fail-fast: every layer must name a published cache group."""
-
-    def setUp(self):
-        try:
-            import torch  # noqa: F401
-            from torch import nn
-
-            from tokenspeed.runtime.layers.paged_attention import (
-                PagedAttention,
-                validate_cache_group_ids,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
-        self.nn = nn
-        self.PagedAttention = PagedAttention
-        self.validate = validate_cache_group_ids
-
-    def _model(self, group_ids):
-        nn, PagedAttention = self.nn, self.PagedAttention
-
-        class TinyModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.attns = nn.ModuleList(
-                    PagedAttention(
-                        num_heads=1,
-                        head_dim=4,
-                        scaling=1.0,
-                        num_kv_heads=1,
-                        layer_id=i,
-                        group_id=gid,
-                    )
-                    for i, gid in enumerate(group_ids)
-                )
-
-        return TinyModel()
-
-    def _specs(self, group_ids):
-        from types import SimpleNamespace
-
-        return tuple(SimpleNamespace(group_id=gid) for gid in group_ids)
-
-    def test_multi_group_all_labeled_passes(self):
-        self.validate(
-            self._model(["full_attention", "sliding_attention"]),
-            self._specs(["full_attention", "sliding_attention"]),
-        )
-
-    def test_constructor_rejects_empty_group_id(self):
-        # group_id is mandatory at construction; there is no backend fallback
-        # for an unlabeled layer.
-        with self.assertRaisesRegex(ValueError, r"layer_id=1.*nonempty"):
-            self._model(["full_attention", ""])
-
-    def test_multi_group_unknown_group_id_raises(self):
-        with self.assertRaisesRegex(ValueError, r"TinyModel.*'nope'"):
-            self.validate(
-                self._model(["full_attention", "nope"]),
-                self._specs(["full_attention", "sliding_attention"]),
-            )
-
-    def test_single_group_unknown_group_id_raises(self):
-        # Single-group pools validate too: backends index their learned
-        # geometry by the layer's group_id with no fallback.
-        with self.assertRaisesRegex(ValueError, r"TinyModel.*'nope'"):
-            self.validate(self._model(["nope"]), self._specs(["full_attention"]))
-        self.validate(self._model(["full_attention"]), self._specs(["full_attention"]))
-
-    def test_no_published_groups_is_fine(self):
-        # A pool without a published contract has nothing to validate against.
-        self.validate(
-            self._model(["full_attention", "full_attention"]), self._specs([])
-        )
-
-
-class GptOssGroupIdTest(unittest.TestCase):
-    """PagedAttention built by GptOssAttention must carry group_id == layer_type.
-    Constructing the model layer needs torch/model deps, so skip otherwise."""
-
-    def test_paged_attention_group_id_equals_layer_type(self):
-        try:
-            from tokenspeed.runtime.layers.paged_attention import PagedAttention
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
-        layer = PagedAttention(
-            num_heads=4,
-            head_dim=8,
-            scaling=1.0,
-            num_kv_heads=4,
-            layer_id=0,
-            sliding_window_size=128,
-            group_id="sliding_attention",
-        )
-        self.assertEqual(layer.group_id, "sliding_attention")
 
 
 if __name__ == "__main__":

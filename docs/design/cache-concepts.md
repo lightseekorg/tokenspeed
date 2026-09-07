@@ -418,7 +418,12 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
 ```
 
 * **layers** — the family's layer vocabulary: a `layer_types` label and a
-  `group_ids` assignment per layer, target layers then draft layers.
+  `group_ids` assignment per layer, target layers then draft layers. The
+  labels are the *storage* vocabulary (`AttnConfig`'s `cache_layer_types`,
+  resolved once by `configs/base.py:resolve_cache_layer_types`), never the
+  checkpoint's compute labels: a label names what the scheduler retains, and
+  a layer's compute mask is a separate contract (see *Storage vs.
+  visibility* below).
 * **`group`** (`recipes/spec.py`) walks those layers **once** and returns
   `(CacheGroupSpec, fields)` pairs — one per distinct group. The pairing is
   the point: a group id is spelled exactly once, in its spec, next to the
@@ -455,6 +460,41 @@ would otherwise need cross-checking cannot differ:
 
 If you find yourself writing a check that two derived views agree, the
 design is wrong: make one of them the source.
+
+### Storage vs. visibility
+
+An attention layer has two contracts that a single `layer_types` string used
+to carry at once, and they are kept apart on purpose:
+
+* **Storage** — which cache group the layer's KV rides, hence how long the
+  scheduler retains it (`CacheGroupSpec.retention`, `sliding_window_tokens`).
+  Owned by the cache plan: the recipe assigns `group_ids` per layer, `pack`
+  places the fields, and the model never spells a group id. At executor
+  startup `bind_cache_groups` (`layers/paged_attention.py`) reads
+  layer → group back from the planned KV fields
+  (`CachePool.history_group_by_layer`) and stamps it onto each
+  `PagedAttention`; before that the layer's `group_id` is unbound and any read
+  raises.
+* **Visibility** — how far back the kernel may look. Owned by the layer
+  (`PagedAttention.sliding_window_size`, a `window_left` mask the model derives
+  from its own config) and read by the backends only as a kernel argument;
+  it never influences tables or write locations.
+
+The one relation between them is an inequality, not an equality: **a group
+must retain every token its layers can see.** `bind_cache_groups` enforces it —
+a full-visibility layer cannot ride a sliding group, and a sliding mask must
+fit inside the group's retention window (`window_left + 1 <=
+sliding_window_tokens`, matching `GroupGeometry::ExpiredBlocksAt`). Everything
+off the diagonal is therefore legal by construction rather than by special
+case: a sliding-masked layer on a full-history group (a block drafter, DSA's
+sparse compute over a fully retained cache) simply retains more than it reads.
+
+Block drafters (DFLASH / DSPARK) write their KV at the target's cache
+locations, so their storage *is* the target's full-history group whatever mask
+their layers apply. `resolve_cache_layer_types` labels every block-draft layer
+full-history, and `check_block_drafter_storage` verifies at startup that the
+group the draft bound is one the target's own layers share — a target without
+a full-history group has nothing for a block drafter to borrow.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
@@ -702,15 +742,13 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
   packing: the declaring group is positional, and packing is the layout's
   answer, so neither can be stated twice and disagree. ✓
-* The model side names the same ids: every `PagedAttention` layer carries a
-  mandatory `group_id`, checked against the pool's published specs at startup
-  (`validate_cache_group_ids`, single-group pools included), and backends
-  index their learned geometry by it with no fallback
-  (`CacheGroupGeometry.granularity_of` raises on unknown ids).
-  Block drafters that write at target cache locations therefore use the
-  target's `full_attention` storage group even when a draft layer applies a
-  sliding-window compute mask; visibility and cache retention are separate
-  contracts. ✓
+* The model side names no ids: a `PagedAttention` layer declares only its
+  compute mask, and `bind_cache_groups` stamps its group from the pool's plan
+  at startup, checking that the group's retention covers the mask (see
+  *Storage vs. visibility*). Backends index their learned geometry by the
+  bound id with no fallback (`CacheGroupGeometry.granularity_of` raises on
+  unknown ids). Block drafters ride the target's full-history group whatever
+  mask their layers apply (`check_block_drafter_storage`). ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

@@ -41,7 +41,6 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     bind_qwen4_exp_side_state,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
@@ -411,7 +410,6 @@ class Qwen4ExpAttentionDecoderLayer(
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,

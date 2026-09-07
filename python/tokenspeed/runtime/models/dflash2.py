@@ -33,7 +33,6 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
@@ -280,12 +279,10 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
                 prefix=add_prefix("self_attn", prefix),
                 reduce_attn_results=False,
             )
+            # The draft's window is its compute visibility; storage is the
+            # cache plan's (bound at startup, the target's full-history group).
             sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
             for attention in (self.self_attn.attn_mqa, self.self_attn.attn_mha):
-                attention.cache_group_id = FULL_ATTENTION
-                attention.group_id = FULL_ATTENTION
-                # Storage remains in Kimi-K3's full-attention group. This field
-                # is only the compute visibility contract for the MLA backend.
                 attention.sliding_window_size = sliding_window
             self.comm_manager = CommManager(
                 mapping=mapping,

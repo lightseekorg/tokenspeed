@@ -488,11 +488,10 @@ def layer_group_ids(
     layer_types: Sequence[str],
     sliding_window_tokens: SlidingWindowTokens,
 ) -> list[str]:
-    """Per-layer cache group id — the single derivation the recipes
-    and multi-window models assign ``PagedAttention(group_id=...)`` from
-    (today gpt_oss.py assigns group_id=layer_type, identical in the
-    single-window case), so ``block_tables`` keys line up with the
-    published group specs.
+    """Per-layer cache group id, derived once from the storage labels; the
+    model side never spells these (``bind_cache_groups`` stamps each
+    ``PagedAttention`` from the plan), so ``block_tables`` keys line up with
+    the published group specs by construction.
 
     The id is the bare label unless sliding layers carry more than one
     distinct window (then ``label_<window>``), so single-window models keep
