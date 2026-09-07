@@ -131,7 +131,7 @@ def test_autotune_forwards_decode_bucket_override(monkeypatch) -> None:
     assert tuner._blocklist._invalid["bf16_gemm::TGVRunner"] == set(range(16, 29))
 
 
-def test_cache_roundtrip_and_load_failure(monkeypatch, tmp_path) -> None:
+def test_cache_roundtrip_and_failures(monkeypatch, tmp_path) -> None:
     tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
     monkeypatch.setenv("TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
     path = flashinfer_autotune_cache_path({"model": "model-a"})
@@ -150,6 +150,11 @@ def test_cache_roundtrip_and_load_failure(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(tuner, "load_configs", failed_load)
     assert not load_flashinfer_autotune_cache(path, None, 0)
     assert not tuner.active
+
+    monkeypatch.setattr(
+        tuner, "save_configs", Mock(side_effect=TypeError("invalid tactic"))
+    )
+    assert not save_flashinfer_autotune_cache(path, None, 0)
 
 
 @pytest.mark.parametrize(

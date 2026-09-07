@@ -36,7 +36,10 @@ def test_decode_autotune_buckets_cover_speculation_and_attention_dp():
 
 
 @pytest.mark.parametrize("disable_autotune", [False, True])
-def test_decode_tuning_without_chunked_prefill(monkeypatch, disable_autotune):
+@pytest.mark.parametrize("disable_graph", [False, True])
+def test_decode_tuning_without_chunked_prefill(
+    monkeypatch, disable_autotune, disable_graph
+):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.config = SimpleNamespace(
         chunked_prefill_size=-1,
@@ -56,7 +59,7 @@ def test_decode_tuning_without_chunked_prefill(monkeypatch, disable_autotune):
     calls = []
     executor.forward_step = SimpleNamespace(
         capture_bs=(1,),
-        disable=False,
+        disable=disable_graph,
         max_tokens_per_req=1,
         warmup_decode_path=lambda batch_sizes: calls.append("decode"),
     )

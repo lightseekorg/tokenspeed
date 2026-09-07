@@ -273,8 +273,14 @@ def load_flashinfer_autotune_cache(
         from flashinfer.autotuner import AutoTuner
     except ImportError:
         return False
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
+    try:
+        tuner = AutoTuner.get()
+        tuner.clear_cache()
+    except Exception:
+        if process_group is not None:
+            raise
+        logger.warning("Could not initialize FlashInfer autotune cache", exc_info=True)
+        return False
     loaded = False
     if path is not None:
         payload = None
@@ -334,6 +340,6 @@ def save_flashinfer_autotune_cache(
         try:
             AutoTuner.get().save_configs(path)
             payload = Path(path).read_bytes()
-        except OSError:
+        except Exception:
             logger.warning("Could not save FlashInfer cache %s", path, exc_info=True)
     return _mirror_autotune_cache(path, payload, process_group, owner_rank)

@@ -199,10 +199,10 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    autotune_cache_key: dict[str, object] | None
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
-    autotune_cache_key: dict[str, object] | None = None
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -623,7 +623,7 @@ class ModelExecutor:
         logger.info(
             "FlashInfer startup tuning: prefill=%d tokens, decode cases=%s",
             num_tokens,
-            decode_cases if not self.forward_step.disable else (),
+            decode_cases,
         )
 
         ib = self.input_buffers
@@ -646,17 +646,16 @@ class ModelExecutor:
                                 positions=positions,
                             )
 
-                if not self.forward_step.disable:
-                    # Separate contexts avoid combining sizes with static
-                    # branches that never occur together.
-                    for bs in decode_cases:
-                        case_buckets = self._decode_autotune_buckets((bs,))
-                        with autotune(
-                            tune_mode=True,
-                            tuning_buckets=case_buckets,
-                            round_up=False,
-                        ):
-                            self.forward_step.warmup_decode_path(batch_sizes=(bs,))
+                # Separate contexts avoid combining sizes with static
+                # branches that never occur together.
+                for bs in decode_cases:
+                    case_buckets = self._decode_autotune_buckets((bs,))
+                    with autotune(
+                        tune_mode=True,
+                        tuning_buckets=case_buckets,
+                        round_up=False,
+                    ):
+                        self.forward_step.warmup_decode_path(batch_sizes=(bs,))
         finally:
             set_autotune_process_group(None)
 
