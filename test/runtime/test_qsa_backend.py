@@ -368,34 +368,6 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
     assert torch.count_nonzero(pool.arena.field(qsa_rope_position_field(4))) == 0
 
 
-def test_qsa_runtime_is_shared_only_with_its_models_indexers(runtime) -> None:
-    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
-
-    def model() -> torch.nn.ModuleList:
-        indexers = []
-        for layer_id in (1, 3):
-            indexer = QSAIndexer.__new__(QSAIndexer)
-            torch.nn.Module.__init__(indexer)
-            indexer.layer_id = layer_id
-            indexer.runtime = None
-            indexers.append(indexer)
-        return torch.nn.ModuleList([*indexers, torch.nn.Identity()])
-
-    target, draft = model(), model()
-    draft_runtime = QSAIndexerRuntime(
-        _qsa_config(max_bs=8, is_draft=True, device="cpu"),
-        _qsa_pool(device="cpu", layer_offset=5),
-    )
-    workspace = runtime._verify_workspace
-    runtime.bind_indexers(target)
-    draft_runtime.bind_indexers(draft)
-    assert all(indexer.runtime is runtime for indexer in target[:2])
-    assert all(indexer.runtime is draft_runtime for indexer in draft[:2])
-    assert runtime._verify_workspace is workspace
-    assert draft_runtime.preallocate_verify_workspace(8, 4) == 0
-    assert target.state_dict() == draft.state_dict() == {}
-
-
 def test_qsa_without_speculation_needs_no_verify_workspace() -> None:
     import dataclasses
 

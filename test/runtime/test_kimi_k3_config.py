@@ -647,6 +647,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         ctx = ForwardContext(
             attn_backend=backend,
             token_to_kv_pool=None,
+            indexer_runtime=None,
             bs=3,
             num_extends=1,
             input_num_tokens=4,

@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -243,6 +244,8 @@ class Mtp(BaseDrafter):
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         vocab_size: int | None = None,
+        *,
+        indexer_runtime: QSAIndexerRuntime | None,
     ) -> None:
 
         super().__init__(
@@ -253,6 +256,7 @@ class Mtp(BaseDrafter):
             input_buffers=input_buffers,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
+            indexer_runtime=indexer_runtime,
             vocab_size=vocab_size,
         )
 
@@ -387,6 +391,7 @@ class Mtp(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
+                indexer_runtime=self.indexer_runtime,
                 input_num_tokens=bs * k,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -494,6 +499,7 @@ class Mtp(BaseDrafter):
                 num_extends=bs,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
+                indexer_runtime=self.indexer_runtime,
                 input_num_tokens=input_num_tokens,
                 forward_mode=draft_input.forward_mode,
                 capture_hidden_mode=capture_mode,

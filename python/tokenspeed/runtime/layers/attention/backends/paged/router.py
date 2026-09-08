@@ -192,6 +192,11 @@ class CacheGroupRouter(AttentionBackend):
         and build one leaf per paged group of this view (``paged_group_ids``)."""
         self.cache_pool = cache_pool
         geometry = learn_cache_group_geometry(cache_pool.arena.cache_group_specs)
+        # Include indexer-only history groups (QSA compressed/recent keys).
+        # They receive no PagedAttention forwards, but _table_specs still uses
+        # their leaves to size the shared tables exposed through group_view.
+        # Omitting these leaves, and their unused attention graph buffers,
+        # requires separating table geometry from compute-leaf construction.
         self.bind(
             geometry,
             {

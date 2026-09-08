@@ -54,7 +54,6 @@ from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.speculative_state import SpeculativeState
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
@@ -95,6 +94,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -315,7 +315,8 @@ class ModelExecutor:
         attn_backend: AttentionBackend,
         token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
-        speculative_states: tuple[SpeculativeState, ...],
+        indexer_runtime: QSAIndexerRuntime | None,
+        draft_indexer_runtime: QSAIndexerRuntime | None,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
@@ -326,7 +327,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        self.speculative_states = speculative_states
+        self.indexer_runtime = indexer_runtime
         # Every pool runs on the shared cache arena and publishes a runtime
         # contract; the per-group tables travel as CacheBatchMetadata. Fail
         # fast here rather than at the first forward or, worse, a CUDA-graph
@@ -376,6 +377,7 @@ class ModelExecutor:
                 input_buffers=self.input_buffers,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
+                indexer_runtime=draft_indexer_runtime,
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
@@ -454,7 +456,10 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            speculative_states=self.speculative_states,
+            speculative_states=(
+                (indexer_runtime,) if indexer_runtime is not None else ()
+            ),
+            indexer_runtime=indexer_runtime,
             drafter=self.drafter,
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,
@@ -477,6 +482,7 @@ class ModelExecutor:
             model_runner=self.model_runner,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
+            indexer_runtime=indexer_runtime,
             input_buffers=self.input_buffers,
             config=config,
             drafter=self.drafter,
@@ -1001,6 +1007,7 @@ class ModelExecutor:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            indexer_runtime=self.indexer_runtime,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
@@ -1077,6 +1084,7 @@ class ModelExecutor:
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
+                    indexer_runtime=self.drafter.indexer_runtime,
                     bs=0,
                     num_extends=0,
                     input_num_tokens=0,
@@ -1339,6 +1347,7 @@ class ModelExecutor:
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
+                    indexer_runtime=self.indexer_runtime,
                     bs=bs,
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,

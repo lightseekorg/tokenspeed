@@ -720,12 +720,6 @@ def build_device_side(
         overlap_schedule_depth=overlap_schedule_depth,
     )
 
-    # Indexer verification state is shared by the side's model layers and
-    # the executor, independently of the attention backend tree.
-    for runner, runtime in ((target, indexer_runtime), (draft, draft_indexer_runtime)):
-        if runtime is not None:
-            runtime.bind_indexers(runner.model)
-
     cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)
     cache_groups = pool_to_cache_groups(token_to_kv_pool)
     # Lowering the limit is safe; a configured chunk smaller than one
@@ -760,7 +754,8 @@ def build_device_side(
         draft_model_runner=draft,
         attn_backend=attn_backend,
         token_to_kv_pool=token_to_kv_pool,
-        speculative_states=(indexer_runtime,) if indexer_runtime is not None else (),
+        indexer_runtime=indexer_runtime,
+        draft_indexer_runtime=draft_indexer_runtime,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )

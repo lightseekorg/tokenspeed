@@ -188,7 +188,6 @@ class TestQwen3MoeConfig(unittest.TestCase):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             ):
@@ -202,6 +201,7 @@ class TestQwen3MoeConfig(unittest.TestCase):
         ctx = ForwardContext(
             attn_backend=None,
             token_to_kv_pool=None,
+            indexer_runtime=None,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
@@ -212,7 +212,6 @@ class TestQwen3MoeConfig(unittest.TestCase):
             input_ids=torch.empty(0, dtype=torch.long),
             positions=torch.empty(0, dtype=torch.long),
             ctx=ctx,
-            out_cache_loc=torch.empty(0, dtype=torch.long),
         )
 
         self.assertEqual(hidden_states.shape, (0, 16))

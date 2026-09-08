@@ -350,18 +350,34 @@ derives the indexer's layer-shared layout from `router.group_view(gid, bs)`
 and the full-KV leaf's live metadata. It never builds another block-table
 route. The per-forward layout stays in `SparseTopKShare`, retaining the
 router/drafter invalidation and MTP reuse boundaries.
+The leaf requires explicit `ctx` and `topk_indices` arguments; only an
+explicit `topk_indices=None` selects its dense MHA path. The router currently
+creates leaves for the indexer-only compressed/recent groups too: their
+geometry supplies the shared table stacks, even though no `PagedAttention`
+layer dispatches to them. Removing their unused attention graph buffers
+requires separating table specifications from compute-leaf construction.
 
 `attention/qsa/runtime.py::QSAIndexerRuntime` owns target-verify staging and
 batched commit. Attention-component assembly creates one independent runtime
 per applicable target/draft cache view, binds its cache plan and budgets and
-preallocates its workspace before capture. The device builder shares that
-instance with the side's loaded indexers. Indexer binding only lends access
-to staging; owned layers, field shapes and commit addresses come exclusively
-from the bound cache plan, not model modules. Every forward takes views of
-one capacity-sized workspace, without allocating a second staging buffer.
+preallocates its workspace before capture. The device builder passes both
+runtimes to execution. Every `ForwardContext` explicitly carries the runtime
+for its cache view (`None` for a side without QSA), including eager, idle,
+warmup, decode capture, prefill capture and draft forwards. Indexers obtain
+it from `ctx.indexer_runtime`; model construction needs no runtime binding
+or module traversal. Owned layers, field shapes and commit addresses come
+exclusively from the bound cache plan. Every forward takes views of one
+capacity-sized workspace, without allocating a second staging buffer.
+
+Like `attn_backend` and `token_to_kv_pool`, `indexer_runtime` is a borrowed
+reference to a long-lived subsystem. `ForwardContext` does not own its
+workspace or carry per-forward Tensor payloads: QSA row layouts and top-k
+remain in the backend's `SparseTopKShare`, and verify staging stays in the
+preallocated runtime. The target context references the same runtime that
+the executor commits; draft contexts reference their own side's runtime.
 
 Verification state follows `execution/speculative_state.py::SpeculativeState`,
-independently of the attention backend tree. The executor receives a fixed
+independently of the attention backend tree. The executor assembles a fixed
 tuple of target verification participants at construction and passes it to
 `ForwardStepRunner`. After eager execution or graph replay produces the live
 acceptance lengths, the runner commits each participant once, passing the
@@ -369,6 +385,13 @@ leading extend count for mixed batches. Draft runtimes are separate and are
 not target-acceptance participants. No callback registration happens during
 forward. Paged leaves and the router neither construct nor hold an indexer
 runtime, allocate its workspace, or forward verification results.
+
+PLE's batched state commit preallocates source/destination row ids for
+`max_decode_bs * num_ple_layers` entries alongside its verify scratch. Each
+batch uses a contiguous prefix of those flat buffers, with no per-batch
+allocation or retained storage buckets. The cache recipe reserves these
+row-id bytes before sizing the arena, and workspace setup checks that the
+allocation matches the reservation.
 
 ## One block-table route: router + leaves
 

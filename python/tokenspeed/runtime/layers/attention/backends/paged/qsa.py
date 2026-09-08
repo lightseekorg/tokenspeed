@@ -152,8 +152,9 @@ class QSAAttnBackend(MHAAttnBackend):
         bs,
         save_kv_cache: bool,
         *,
-        topk_indices,
-        ctx,
+        # Both are required; explicit topk_indices=None selects dense MHA.
+        topk_indices: torch.Tensor | None,
+        ctx: ForwardContext,
         **kwargs,
     ):
         if topk_indices is None:
@@ -183,8 +184,9 @@ class QSAAttnBackend(MHAAttnBackend):
         bs,
         save_kv_cache: bool,
         *,
-        topk_indices,
-        ctx,
+        # Both are required; explicit topk_indices=None selects dense MHA.
+        topk_indices: torch.Tensor | None,
+        ctx: ForwardContext,
         **kwargs,
     ):
         if topk_indices is None:

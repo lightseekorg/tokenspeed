@@ -141,10 +141,6 @@ class TrimKvToLocsTest(unittest.TestCase):
         self.assertEqual(self.trim(locs, None, None), (None, None))
 
 
-class _StopAfterSpy(Exception):
-    """Raised by the spy to stop make_dummy_batch at the seam under test."""
-
-
 class DummyGroupTablesTest(unittest.TestCase):
     """Capture-time dummy tables: every group gets a real, writable block;
     none get the reserved null block 0."""
@@ -162,6 +158,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.attn_backend = backend
         pg.token_to_kv_pool = pool
+        pg.indexer_runtime = None
         pg.config = SimpleNamespace(
             device="cpu",
             physical_context_len=1000,
@@ -437,6 +434,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.attn_backend = _backend()
         pg.token_to_kv_pool = _fake_pool(specs=tuple(specs), runtime_contract=contract)
+        pg.indexer_runtime = object()
         pg.config = SimpleNamespace(
             device="cpu",
             context_len=context_len,
@@ -467,15 +465,10 @@ class DummyGroupTablesTest(unittest.TestCase):
             # The row-constant table is legal only for a prefix-free extend:
             # with history the state gather resolves in == out and refuses.
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
-            raise _StopAfterSpy
 
         pg.attn_backend.init_forward_metadata = _record
-        with mock.patch(
-            "tokenspeed.runtime.execution.prefill_graph.ForwardContext",
-            lambda **kw: SimpleNamespace(**kw),
-        ):
-            with self.assertRaises(_StopAfterSpy):
-                pg.make_dummy_batch(num_tokens)
+        ctx = pg.make_dummy_batch(num_tokens)
+        self.assertIs(ctx.indexer_runtime, pg.indexer_runtime)
         return seen
 
     def test_make_dummy_batch_tables_survive_the_cache_contract(self):
@@ -618,6 +611,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 model_runner=model_runner,
                 attn_backend=object(),
                 token_to_kv_pool=pool,
+                indexer_runtime=None,
                 input_buffers=object(),
                 config=config,
             )

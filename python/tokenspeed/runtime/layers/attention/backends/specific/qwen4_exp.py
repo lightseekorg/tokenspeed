@@ -72,15 +72,16 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
         self._ple_verify_tables: dict | None = None
         self._ple_verify_tables_key: tuple | None = None
-        self._ple_rows_cache: dict[
-            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._ple_commit_rows: torch.Tensor | None = None
 
     def _preallocate_aux_verify_workspace(
         self, max_bs: int, draft_token_num: int
     ) -> int:
         self._ensure_ple_verify_scratch(max_bs, draft_token_num)
-        return sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
+        total = sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
+        if self._ple_commit_rows is not None:
+            total += self._ple_commit_rows.nbytes
+        return total
 
     def _ensure_ple_verify_scratch(self, max_bs: int, draft_token_num: int) -> None:
         """Allocate graph-stable PLE context and convolution rollback rows."""
@@ -95,6 +96,16 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         ]
         if not fields:
             return
+        num_layers = sum(field.field_id.endswith(".conv") for field in fields)
+        commit_rows = max_bs * num_layers
+        if self._ple_commit_rows is None:
+            # Keep the layer-major rows flat: each batch takes a contiguous
+            # prefix without a strided [layers, :bs] view or a flatten copy.
+            self._ple_commit_rows = torch.empty(
+                (2, commit_rows), dtype=torch.int64, device=self.device
+            )
+        elif self._ple_commit_rows.shape[1] < commit_rows:
+            raise RuntimeError("PLE commit rows exceed the preallocated capacity")
         rows = max_bs * (draft_token_num + 1)
         if self._ple_verify_scratch and all(
             tensor.shape[0] >= rows for tensor in self._ple_verify_scratch.values()
@@ -108,7 +119,6 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
             )
         self._ple_verify_tables = None
         self._ple_verify_tables_key = None
-        self._ple_rows_cache = {}
         self._ple_verify_scratch = scratch
 
     def ple_verify_scratch(
@@ -220,19 +230,6 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         self._ple_verify_tables_key = key
         return tables
 
-    def _ple_verify_rows(
-        self, bs: int, num_layers: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (bs, num_layers)
-        rows = self._ple_rows_cache.get(key)
-        if rows is None:
-            rows = (
-                torch.empty(num_layers * bs, dtype=torch.int64, device=self.device),
-                torch.empty(num_layers * bs, dtype=torch.int64, device=self.device),
-            )
-            self._ple_rows_cache[key] = rows
-        return rows
-
     def _commit_aux_verified_state(
         self,
         accepted_length: torch.Tensor,
@@ -257,7 +254,11 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         width = bucket[0][1]
         tables = self._ple_verify_tables_get()
         num_layers = tables["num_layers"]
-        src_rows, dst_rows = self._ple_verify_rows(bs, num_layers)
+        row_count = bs * num_layers
+        rows = self._ple_commit_rows
+        if rows is None or rows.shape[1] < row_count:
+            raise RuntimeError("PLE commit rows exceed the preallocated capacity")
+        src_rows, dst_rows = rows[0, :row_count], rows[1, :row_count]
         from tokenspeed_kernel.ops.kvcache.triton import (
             copy_state_rows,
             state_verify_commit_rows,

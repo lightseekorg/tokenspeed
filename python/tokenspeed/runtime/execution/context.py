@@ -34,6 +34,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
 
 
 class TargetCaptureSink(Protocol):
@@ -78,9 +79,11 @@ class ForwardContext:
     """Do not contain Tensor.
 
     The context describes a forward (mode, counts, DP layout) and points at
-    the two long-lived subsystems it runs against; data travels as forward
-    arguments or through those subsystems (attention metadata, the backend's
-    per-forward scratch, the KV pool). The collaborators a drafter attaches
+    the long-lived subsystems it runs against: the attention backend, cache
+    pool and optional indexer runtime. The executor owns the indexer runtime
+    across forwards; this context only borrows its reference. Data travels as
+    forward arguments or through those subsystems, including preallocated
+    indexer workspace. The collaborators a drafter attaches
     per forward (``draft_narrowing``, ``target_capture_sink``) lend behavior,
     not buffers. ``gather_ids`` is the one tensor left, pending its move to a
     forward argument beside ``positions``.
@@ -89,6 +92,7 @@ class ForwardContext:
     # --- attention infrastructure ---
     attn_backend: AttentionBackend
     token_to_kv_pool: CachePool
+    indexer_runtime: QSAIndexerRuntime | None
 
     # --- meta data ---
     bs: int
