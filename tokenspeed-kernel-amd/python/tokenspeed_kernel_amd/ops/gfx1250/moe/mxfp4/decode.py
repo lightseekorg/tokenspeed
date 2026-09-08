@@ -238,7 +238,12 @@ def _matmul_decode(
 
     descriptor_m = M
     if not cfg.USE_GATHER:
-        descriptor_m = eM - off_m
+        # A TDM descriptor extent is a 32-bit row count, not an address. The
+        # expert base pointers above may need the wide index type because the
+        # expert weight slab can exceed the signed 32-bit range, but the rows
+        # remaining in this expert cannot, so narrowing is legal here and only
+        # here.
+        descriptor_m = (eM - off_m).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -360,9 +365,10 @@ def _matmul_decode(
             layout=SCATTER_SHARED_LAYOUT,
         )
 
-        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(
-            address_index_type
-        )
+        # A descriptor offset is a 32-bit element coordinate inside the block
+        # grid, so it narrows here even though pid_n itself carries the wide
+        # address index type used for base-pointer arithmetic elsewhere.
+        col_offset = (OUT_BLOCK_N * _enforce_wave_uniform_i32(pid_n)).to(gl.int32)
         y_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
@@ -378,9 +384,13 @@ def _matmul_decode(
 
         Y_ptr += start_m * stride_y_m
 
+        # buffer_store takes an i32/u32 offset operand. Form the offset in the
+        # wide index type first, because Y_ptr above was advanced by start_m
+        # rows and that arithmetic can leave the 32-bit range, then narrow the
+        # finished value: it is expert-local and bounded by the block tile.
         y_offs = (
             offs_y_m.to(address_index_type)[:, None] * stride_y_m
             + offs_y_n.to(address_index_type)[None, :] * stride_y_n
-        )
+        ).to(gl.int32)
         y_mask = mask_m[:, None] & mask_n[None, :]
         gl.amd.cdna5.buffer_store(out, Y_ptr, y_offs, mask=y_mask)

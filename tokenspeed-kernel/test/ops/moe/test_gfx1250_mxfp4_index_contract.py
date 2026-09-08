@@ -175,3 +175,141 @@ def test_either_direction_alone_can_force_the_wide_index(
         scatter_writeback_rows=scatter_writeback_rows,
     )
     assert bits == expected_bits
+
+
+# ---------------------------------------------------------------------------
+# Index narrowing: which values narrow at a 32-bit operand
+# ---------------------------------------------------------------------------
+#
+# The kernels address expert weight slabs that can exceed the signed 32-bit
+# range, so their pointer arithmetic stays wide. Three values are nonetheless
+# handed to instructions whose operand is 32-bit: the TDM descriptor row
+# extent, the TDM descriptor column offset and the buffer_store element offset.
+# Each narrows at the instruction boundary and nowhere earlier. Those are
+# compile-time properties of kernels that need a gfx1250 device to run, so they
+# are pinned structurally, and only to the shape of the invariant: which value
+# a narrowing cast wraps, and which arithmetic is left symbolic. Where a name
+# matters it is recovered from the kernel, so a rename cannot break the test.
+
+
+DECODE_SOURCE = MXFP4_ROOT / "decode.py"
+FUSED_SOURCE = MXFP4_ROOT / "fused.py"
+KERNEL_SOURCES = (DECODE_SOURCE, FUSED_SOURCE)
+
+# Concrete integer widths, as opposed to a symbolic type name that a build
+# resolves at launch.
+FIXED_WIDTHS = frozenset({"int8", "int16", "int32", "int64"})
+
+
+def calls_named(scope: ast.AST, attr: str) -> list[ast.Call]:
+    """Return every ``<obj>.attr(...)`` call reachable from ``scope``."""
+    return [
+        node
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+    ]
+
+
+def cast_target_id(node: ast.AST) -> str | None:
+    """Return the trailing identifier of a ``.to(<target>)`` cast, if any.
+
+    ``.to(gl.int32)``, ``.to(cfg.index_type)`` and ``.to(address_index_type)``
+    all reduce to their last name component, so callers do not care how a type
+    is spelled or which object it is reached through.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "to":
+        return None
+    if len(node.args) != 1 or node.keywords:
+        return None
+    target = node.args[0]
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Name):
+        return target.id
+    return None
+
+
+def cast_width(node: ast.AST) -> str | None:
+    """Return the width name if ``node`` casts to a fixed width, else ``None``."""
+    target_id = cast_target_id(node)
+    return target_id if target_id in FIXED_WIDTHS else None
+
+
+def last_binding(scope: ast.AST, name: str) -> ast.expr:
+    """Return the value last bound to ``name`` inside ``scope``."""
+    bindings = [
+        node.value
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        )
+    ]
+    assert bindings, f"{name} is never assigned"
+    return bindings[-1]
+
+
+def matmul_kernel(path: Path) -> ast.FunctionDef:
+    """Return the matmul kernel in ``path``, identified by the ops it issues."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    kernels = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and calls_named(node, "buffer_store")
+        and calls_named(node, "update_tensor_descriptor")
+    ]
+    assert len(kernels) == 1, f"expected one matmul kernel in {path}"
+    return kernels[0]
+
+
+def store_offset_expr(kernel: ast.FunctionDef) -> ast.expr:
+    """Return the expression bound to the ``buffer_store`` offset operand."""
+    stores = calls_named(kernel, "buffer_store")
+    assert len(stores) == 1, f"expected one buffer store in {kernel.name}"
+    offset = stores[0].args[2]
+    assert isinstance(offset, ast.Name)
+    return last_binding(kernel, offset.id)
+
+
+def descriptor_offset_exprs(kernel: ast.FunctionDef) -> list[ast.expr]:
+    """Return the expressions bound to the descriptor ``add_offsets`` operands."""
+    updates = calls_named(kernel, "update_tensor_descriptor")
+    assert len(updates) == 1, f"expected one descriptor update in {kernel.name}"
+    offsets = [
+        keyword.value for keyword in updates[0].keywords if keyword.arg == "add_offsets"
+    ]
+    assert len(offsets) == 1
+    assert isinstance(offsets[0], ast.List)
+    return [
+        last_binding(kernel, element.id)
+        for element in offsets[0].elts
+        if isinstance(element, ast.Name)
+    ]
+
+
+def descriptor_extent_expr(kernel: ast.FunctionDef) -> ast.expr:
+    """Return the expression bound to the descriptor row extent."""
+    # The extent is the argument the kernel recomputes for the no-gather path;
+    # it is the only expert-local rebinding of the descriptor row count.
+    return last_binding(kernel, "descriptor_m")
+
+
+@pytest.mark.parametrize("path", KERNEL_SOURCES, ids=lambda path: path.name)
+def test_narrows_every_32_bit_instruction_operand(path: Path) -> None:
+    """Each value fed to a 32-bit operand is narrowed where it is handed over."""
+    kernel = matmul_kernel(path)
+
+    operands = [
+        descriptor_extent_expr(kernel),
+        store_offset_expr(kernel),
+        *descriptor_offset_exprs(kernel),
+    ]
+    assert len(operands) == 3, "expected extent, store offset and column offset"
+    for operand in operands:
+        assert cast_width(operand) == "int32", ast.dump(operand)
