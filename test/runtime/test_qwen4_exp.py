@@ -26,6 +26,7 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
+import tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp as qwen4_exp_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
@@ -1478,8 +1479,6 @@ def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
         def verify_scratch_bucket(self, bs):
             return (bs, 3), *self.bucket[1:]
 
-    import tokenspeed_kernel.ops.kvcache.triton as kvcache_ops
-
     context_field_id = qwen4_exp_ple_context_field(0)
     context = torch.empty((5, 2), dtype=torch.int64)
     conv = {
@@ -1516,12 +1515,12 @@ def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
     row_calls = []
     copy_calls = []
     monkeypatch.setattr(
-        kvcache_ops,
+        qwen4_exp_backend_module,
         "state_verify_commit_rows",
         lambda *args, **kwargs: row_calls.append((args, kwargs)),
     )
     monkeypatch.setattr(
-        kvcache_ops,
+        qwen4_exp_backend_module,
         "copy_state_rows",
         lambda *args, **kwargs: copy_calls.append((args, kwargs)),
     )
