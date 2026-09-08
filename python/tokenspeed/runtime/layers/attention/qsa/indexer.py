@@ -48,6 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
+from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -283,7 +284,7 @@ class QSAIndexer(nn.Module):
             return prepared_query
         if recent_request_limit == 0:
             # Pure target verification must not commit speculative raw keys;
-            # the backend commits accepted rows after sampling.
+            # the root backend's side state commits accepted rows after execution.
             return prepared_query
         qwen4_exp_qsa_recent_write(
             token_k,
@@ -412,17 +413,15 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        runtime = ctx.indexer_runtime
-        if runtime is None:
-            raise RuntimeError("QSA forward requires an indexer runtime in its context")
+        router = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
             and verify_bs > 0
-            and runtime.spec_num_tokens > 1
-            and not runtime.is_draft
+            and router.spec_num_tokens > 1
+            and not router.is_draft
         )
-        is_draft = runtime.is_draft
+        is_draft = router.is_draft
         is_draft_first_step = is_draft and ctx.draft_narrowing is not None
         is_draft_decode_step = (
             is_draft and ctx.draft_narrowing is None and ctx.forward_mode.is_decode()
@@ -476,10 +475,15 @@ class QSAIndexer(nn.Module):
                 )
         verify_scratch = None
         if is_target_verify:
-            verify_tokens = verify_bs * runtime.spec_num_tokens
+            verify_tokens = verify_bs * router.spec_num_tokens
             if verify_tokens > token_k.shape[0]:
                 raise RuntimeError("QSA verify rows exceed the current input")
-            verify_scratch = runtime.verify_staging_buffers(self.layer_id, verify_bs)
+            state = ctx.attn_backend.find_speculative_state_backend(QSAVerifyState)
+            if state is None:
+                raise RuntimeError(
+                    "QSA target verify requires a registered verify state"
+                )
+            verify_scratch = state.verify_staging_buffers(self.layer_id, verify_bs)
         q = self._write_and_compress(
             token_k,
             positions,

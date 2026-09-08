@@ -679,8 +679,6 @@ def build_device_side(
         token_to_kv_pool,
         draft_attn_backend,
         draft_token_to_kv_pool,
-        indexer_runtime,
-        draft_indexer_runtime,
         cache_storage,
     ) = create_attn_components(
         server_args,
@@ -728,8 +726,6 @@ def build_device_side(
         draft_model_runner=draft,
         attn_backend=attn_backend,
         token_to_kv_pool=token_to_kv_pool,
-        indexer_runtime=indexer_runtime,
-        draft_indexer_runtime=draft_indexer_runtime,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )

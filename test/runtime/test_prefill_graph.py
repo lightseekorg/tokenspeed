@@ -158,7 +158,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.attn_backend = backend
         pg.token_to_kv_pool = pool
-        pg.indexer_runtime = None
         pg.config = SimpleNamespace(
             device="cpu",
             physical_context_len=1000,
@@ -434,7 +433,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.attn_backend = _backend()
         pg.token_to_kv_pool = _fake_pool(specs=tuple(specs), runtime_contract=contract)
-        pg.indexer_runtime = object()
         pg.config = SimpleNamespace(
             device="cpu",
             context_len=context_len,
@@ -468,7 +466,8 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         pg.attn_backend.init_forward_metadata = _record
         ctx = pg.make_dummy_batch(num_tokens)
-        self.assertIs(ctx.indexer_runtime, pg.indexer_runtime)
+        self.assertIs(ctx.attn_backend, pg.attn_backend)
+        self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
 
     def test_make_dummy_batch_tables_survive_the_cache_contract(self):
@@ -611,7 +610,6 @@ class DummyGroupTablesTest(unittest.TestCase):
                 model_runner=model_runner,
                 attn_backend=object(),
                 token_to_kv_pool=pool,
-                indexer_runtime=None,
                 input_buffers=object(),
                 config=config,
             )

@@ -96,7 +96,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             spec_num_steps=3,
             draft_model_runner=model_runner,
             attn_backend=backend,
-            indexer_runtime=None,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
         )

@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -59,8 +58,6 @@ class BaseDrafter:
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
-        *,
-        indexer_runtime: QSAIndexerRuntime | None,
     ):
         self.spec_num_tokens = spec_num_tokens
         self.spec_num_steps = spec_num_steps
@@ -75,7 +72,6 @@ class BaseDrafter:
         self.round_block_tables = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        self.indexer_runtime = indexer_runtime
         self.vocab_size = vocab_size
 
     def wire_target(self, target_model: torch.nn.Module) -> None:

@@ -74,6 +74,7 @@ from tokenspeed.runtime.layers.attention.qsa.metadata import (
     qsa_attention_metadata,
     qsa_forward_layout,
 )
+from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
     GroupedGemmaRMSNorm,
@@ -766,7 +767,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         draft_narrowing=None,
         attn_backend=HybridLinearAttnBackend(router, SimpleNamespace(), []),
         token_to_kv_pool=pool,
-        indexer_runtime=SimpleNamespace(is_draft=False, spec_num_tokens=1),
     )
 
     actual = indexer(torch.zeros((2, 4)), torch.tensor([7, 8]), ctx)
@@ -812,8 +812,10 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     assert updates[1][1]["query"] is None
 
 
-def test_qsa_forward_uses_its_context_runtime_without_model_binding(
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_qsa_forward_uses_root_verify_state_without_model_binding(
     monkeypatch,
+    hybrid,
 ) -> None:
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
@@ -851,10 +853,18 @@ def test_qsa_forward_uses_its_context_runtime_without_model_binding(
         verify_calls.append((layer_id, bs))
         return verify_scratch
 
-    target_runtime = SimpleNamespace(
-        is_draft=False, spec_num_tokens=4, verify_staging_buffers=staging
+    target_router = _qsa_router(kernel_page_size=64, max_bs=4, spec=4)
+    target_backend = (
+        HybridLinearAttnBackend(target_router, SimpleNamespace(), [3])
+        if hybrid
+        else target_router
     )
-    draft_runtime = SimpleNamespace(is_draft=True, spec_num_tokens=1)
+    state = object.__new__(QSAVerifyState)
+    state.verify_staging_buffers = staging
+    target_backend.register_speculative_state_backend(state)
+    draft_backend = _qsa_router(kernel_page_size=64, max_bs=4, spec=1)
+    draft_backend.is_draft = True
+    ordinary_backend = _qsa_router(kernel_page_size=64, max_bs=4, spec=1)
     writes = []
 
     def write(*args, **kwargs):
@@ -862,29 +872,42 @@ def test_qsa_forward_uses_its_context_runtime_without_model_binding(
         return kwargs["query"]
 
     indexer._write_and_compress = write
-    for runtime, rows in ((target_runtime, 8), (draft_runtime, 2), (target_runtime, 8)):
+    for backend, rows, mode, num_extends in (
+        (target_backend, 8, ForwardMode.DECODE, 0),
+        (draft_backend, 2, ForwardMode.DECODE, 0),
+        (target_backend, 8, ForwardMode.DECODE, 0),
+        (target_backend, 5, ForwardMode.MIXED, 1),
+        (ordinary_backend, 2, ForwardMode.DECODE, 0),
+    ):
         ctx = ForwardContext(
-            attn_backend=None,
+            attn_backend=backend,
             token_to_kv_pool=pool,
-            indexer_runtime=runtime,
             bs=2,
-            num_extends=0,
+            num_extends=num_extends,
             input_num_tokens=rows,
-            forward_mode=ForwardMode.DECODE,
+            forward_mode=mode,
         )
         result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
-    assert verify_calls == [(3, 2), (3, 2)]
+    assert verify_calls == [(3, 2), (3, 2), (3, 1)]
     assert writes[0]["stage_verify_buffers"] is verify_scratch
     assert writes[1]["stage_verify_buffers"] is None
     assert writes[1]["draft_scratch"] is draft_scratch
     assert writes[1]["stage_draft"]
     assert writes[2]["stage_verify_buffers"] is verify_scratch
-    assert "runtime" not in vars(indexer)
-    ctx.indexer_runtime = None
-    with pytest.raises(RuntimeError, match="runtime in its context"):
+    assert writes[3]["stage_verify_buffers"] is verify_scratch
+    assert writes[3]["recent_request_limit"] == 1
+    assert writes[4]["stage_verify_buffers"] is None
+    assert not writes[4]["stage_draft"]
+    assert draft_backend.find_speculative_state_backend(QSAVerifyState) is None
+    ctx.attn_backend = _qsa_router(kernel_page_size=64, max_bs=4, spec=4)
+    with pytest.raises(RuntimeError, match="registered verify state"):
         indexer(torch.ones((8, 4)), torch.arange(8), ctx)
+    ctx.forward_mode = ForwardMode.EXTEND
+    ctx.num_extends = ctx.bs
+    indexer(torch.ones((2, 4)), torch.arange(2), ctx)
+    assert writes[-1]["stage_verify_buffers"] is None
 
 
 def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) -> None:

@@ -49,8 +49,8 @@ if TYPE_CHECKING:
 class QSAAttnBackend(MHAAttnBackend):
     """Sparse MHA leaf over the ordinary router's resolved pages and slots.
 
-    MHA supplies the unified metadata path. Cross-group indexing and verify
-    commits belong to the execution-owned indexer runtime, outside this leaf.
+    MHA supplies the unified metadata path. The indexer owns cross-group
+    indexing; the root backend's side state owns verify commits outside this leaf.
     """
 
     def __init__(

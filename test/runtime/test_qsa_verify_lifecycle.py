@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The target context's QSA runtime commits after eager forward or graph replay."""
+"""The target backend commits side state after eager forward or graph replay."""
 
 from types import SimpleNamespace
 
@@ -27,26 +27,27 @@ import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 
 
 def _runner(
-    *, use_graph: bool, has_drafter: bool, has_indexer_runtime: bool, fail_forward: bool
+    *, use_graph: bool, has_drafter: bool, has_verify_state: bool, fail_forward: bool
 ):
     events = []
     commits = []
     wrapper = object.__new__(ForwardStepRunner)
     wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8)
     wrapper.device = "cpu"
-    wrapper.drafter = (
+    draft_backend = object.__new__(AttentionBackend)
+    draft_backend.register_speculative_state_backend(
         SimpleNamespace(
-            indexer_runtime=SimpleNamespace(
-                commit_after_verify=lambda *args, **kwargs: events.append(
-                    "draft_commit"
-                )
+            commit_after_mtp_verify=lambda *args, **kwargs: events.append(
+                "draft_commit"
             )
         )
-        if has_drafter
-        else None
+    )
+    wrapper.drafter = (
+        SimpleNamespace(attn_backend=draft_backend) if has_drafter else None
     )
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
@@ -57,9 +58,9 @@ def _runner(
     wrapper.token_to_kv_pool = SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=())
     )
-    # The backend deliberately has no indexer verification hook.
-    wrapper.attn_backend = SimpleNamespace(
-        update_mamba_state_after_mtp_verify=lambda lengths: events.append("recurrent")
+    wrapper.attn_backend = object.__new__(AttentionBackend)
+    wrapper.attn_backend.update_mamba_state_after_mtp_verify = (
+        lambda lengths: events.append("recurrent")
     )
     wrapper._can_use_graph = lambda bs, ctx: use_graph
     wrapper._padded_bs = lambda bs, ctx: 4
@@ -87,15 +88,16 @@ def _runner(
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
     wrapper.output_buffers = {4: result}
-    wrapper.indexer_runtime = (
-        SimpleNamespace(commit_after_verify=commit) if has_indexer_runtime else None
-    )
+    if has_verify_state:
+        wrapper.attn_backend.register_speculative_state_backend(
+            SimpleNamespace(commit_after_mtp_verify=commit)
+        )
     return wrapper, events, commits
 
 
 def _run(wrapper, mode):
     ctx = SimpleNamespace(
-        indexer_runtime=wrapper.indexer_runtime,
+        attn_backend=wrapper.attn_backend,
         bs=2,
         num_extends=1 if mode.is_mixed() else (2 if mode.is_extend() else 0),
         forward_mode=mode,
@@ -122,7 +124,7 @@ def _run(wrapper, mode):
 
 
 @pytest.mark.parametrize(
-    "mode,use_graph,has_drafter,has_indexer_runtime,expected",
+    "mode,use_graph,has_drafter,has_verify_state,expected",
     [
         (ForwardMode.DECODE, False, True, True, [([3, 1], 0)]),
         (ForwardMode.DECODE, True, True, True, [([3, 1], 0)]),
@@ -135,12 +137,12 @@ def _run(wrapper, mode):
     ],
 )
 def test_runner_commits_live_acceptance_once_after_execution(
-    mode, use_graph, has_drafter, has_indexer_runtime, expected
+    mode, use_graph, has_drafter, has_verify_state, expected
 ):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
         has_drafter=has_drafter,
-        has_indexer_runtime=has_indexer_runtime,
+        has_verify_state=has_verify_state,
         fail_forward=False,
     )
     _run(wrapper, mode)
@@ -158,7 +160,7 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
         has_drafter=True,
-        has_indexer_runtime=True,
+        has_verify_state=True,
         fail_forward=True,
     )
     with pytest.raises(RuntimeError, match="forward failed"):

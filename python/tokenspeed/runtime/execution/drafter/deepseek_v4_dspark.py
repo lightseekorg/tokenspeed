@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -92,8 +91,6 @@ class DeepseekV4DSpark(BaseDrafter):
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         vocab_size: int | None = None,
-        *,
-        indexer_runtime: QSAIndexerRuntime | None,
     ) -> None:
         super().__init__(
             spec_num_tokens=spec_num_tokens,
@@ -103,7 +100,6 @@ class DeepseekV4DSpark(BaseDrafter):
             input_buffers=input_buffers,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
-            indexer_runtime=indexer_runtime,
             vocab_size=vocab_size,
         )
         if draft_model_runner is None or input_buffers is None:
@@ -394,7 +390,6 @@ class DeepseekV4DSpark(BaseDrafter):
         draft_ctx = ForwardContext(
             attn_backend=base_ctx.attn_backend,
             token_to_kv_pool=base_ctx.token_to_kv_pool,
-            indexer_runtime=base_ctx.indexer_runtime,
             bs=num_decodes,
             num_extends=0,
             input_num_tokens=num_decodes * self.block_size,

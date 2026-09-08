@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Execution-owned verification state shared by a model's QSA indexers.
+"""Target verification state shared by a model's QSA indexers.
 
-Persistent request caches belong to the LCM arena. This runtime binds only
-its side's cache fields and owns the temporary, capacity-sized verify
-workspace. The executor commits acceptance after eager execution or graph
-replay; paged attention backends have no reference to this object.
+Persistent request caches belong to the LCM arena. The root attention backend
+owns this state's temporary, capacity-sized workspace, bound at startup to
+the target's local cache fields. Its side-state hook commits acceptance after
+eager execution or graph replay; paged leaves do not own or dispatch it.
 """
 
 from __future__ import annotations
@@ -78,15 +78,16 @@ class _QSAVerifyWorkspace:
         )
 
 
-class QSAIndexerRuntime:
-    """One side's shared QSA staging and batched post-verification commit."""
+class QSAVerifyState:
+    """Target-side QSA staging and batched post-verification commit."""
 
     def __init__(self, config: AttnConfig, cache_pool: CachePool) -> None:
+        if config.is_draft or config.speculative_num_draft_tokens <= 1:
+            raise ValueError("QSA verify state requires a speculative target")
         self.cache_pool = cache_pool
         self.dtype = config.dtype
         self.device = config.device
-        self.is_draft = bool(config.is_draft)
-        self.spec_num_tokens = max(int(config.speculative_num_draft_tokens or 1), 1)
+        self.spec_num_tokens = int(config.speculative_num_draft_tokens)
         self._recent_page_size = next(
             spec.block_granularity
             for spec in cache_pool.arena.cache_group_specs
@@ -98,8 +99,8 @@ class QSAIndexerRuntime:
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate staging and commit addresses from the bound cache plan."""
-        if self.is_draft or draft_token_num <= 1:
-            return 0
+        if draft_token_num != self.spec_num_tokens:
+            raise ValueError("QSA verify workspace width differs from the target width")
         if self._verify_workspace is not None:
             return self._verify_workspace.nbytes
 
@@ -181,7 +182,7 @@ class QSAIndexerRuntime:
             workspace.recent_locs[:bs],
         )
 
-    def commit_after_verify(
+    def commit_after_mtp_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
         """Commit accepted target-verify candidates for all QSA layers once."""
@@ -211,4 +212,4 @@ class QSAIndexerRuntime:
         )
 
 
-__all__ = ["QSAIndexerRuntime"]
+__all__ = ["QSAVerifyState"]

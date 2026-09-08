@@ -489,19 +489,22 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
-## Sparse indexers: model weights, backend dispatch, execution-owned verification
+## Sparse indexers: model weights, backend dispatch and verification
 
 * The **model** owns indexer weights and top-k selection, passing
   `topk_indices` through `PagedAttention.forward` to the backend.
 * The **backend** owns attention dispatch and cache addressing. The
   `CacheGroupRouter` expands scheduler tables once; indexers consume its
   resolved `group_view` results and the compute leaf's live metadata.
-* The **indexer runtime** owns transient verification workspace and accepted
-  state commits, independently of the backend tree. See the
+* The **root backend's registered QSA verify state** owns transient
+  verification workspace and accepted-state commits. Registry construction
+  creates and preallocates it only for a speculative target with local QSA
+  fields. The runner triggers its commit through the root's side-state hook;
+  child backends and draft backends do not borrow or dispatch this state. See the
   [execution lifecycle](unified_path.md#backend-package-layout).
 
 LCM owns persistent allocation, prefix matching, transfer and retention,
-including QSA's full-KV, compressed and recent cache groups. Runtime layer
+including QSA's full-KV, compressed and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.

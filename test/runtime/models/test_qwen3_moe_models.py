@@ -201,7 +201,6 @@ class TestQwen3MoeConfig(unittest.TestCase):
         ctx = ForwardContext(
             attn_backend=None,
             token_to_kv_pool=None,
-            indexer_runtime=None,
             bs=0,
             num_extends=0,
             input_num_tokens=0,

@@ -37,8 +37,9 @@ scheduler bridge and the kernels that expands raw group tables:
 
 Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. Indexers consume
 resolved ``group_view`` results for cross-group indexing. Their verification
-state belongs to the execution side, outside the router. A single-group
-model is a router with one leaf; there is no single-table special case.
+state is registered at startup on the outermost backend and committed through
+its side-state hook, independently of these leaves. A single-group model is a
+router with one leaf; there is no single-table special case.
 """
 
 from __future__ import annotations

@@ -70,7 +70,7 @@ _ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
+    from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -952,19 +952,18 @@ def _prepare_verify_workspace(
     config,
     backend,
     draft_backend,
-    indexer_runtime: QSAIndexerRuntime | None,
-    draft_indexer_runtime: QSAIndexerRuntime | None,
+    qsa_verify_state: QSAVerifyState | None,
     uses_paged_state_verify: bool,
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
-    model_name = "execution"
-    actual_bytes = sum(
-        runtime.preallocate_verify_workspace(
+    model_name = "QSA"
+    actual_bytes = (
+        qsa_verify_state.preallocate_verify_workspace(
             config.max_bs, int(server_args.speculative_num_draft_tokens or 1)
         )
-        for runtime in (indexer_runtime, draft_indexer_runtime)
-        if runtime is not None
+        if qsa_verify_state is not None
+        else 0
     )
     if uses_paged_state_verify and expected_bytes:
         model_name = "paged-state"
@@ -977,7 +976,7 @@ def _prepare_verify_workspace(
         actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
-    elif indexer_runtime is None and draft_indexer_runtime is None:
+    elif qsa_verify_state is None:
         return
     if actual_bytes != expected_bytes:
         raise RuntimeError(
@@ -986,20 +985,22 @@ def _prepare_verify_workspace(
         )
 
 
-def _create_indexer_runtime(
+def _create_qsa_verify_state(
     config: AttnConfig | None, pool: CachePool | None
-) -> QSAIndexerRuntime | None:
-    """Build QSA execution state only for a side whose fields use its cache."""
+) -> QSAVerifyState | None:
+    """Build verify state only for a speculative target with local QSA fields."""
     from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
         QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     )
-    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
+    from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 
     if config is None or pool is None:
         return None
+    if config.is_draft or config.speculative_num_draft_tokens <= 1:
+        return None
     if QWEN4_EXP_QSA_RECENT_CACHE_GROUP not in pool.paged_group_ids:
         return None
-    return QSAIndexerRuntime(config, pool)
+    return QSAVerifyState(config, pool)
 
 
 # ---------- public API ----------
@@ -1036,8 +1037,6 @@ def create_attn_components(
     CachePool,
     AttentionBackend | None,
     CachePool | None,
-    QSAIndexerRuntime | None,
-    QSAIndexerRuntime | None,
     dict | None,
 ]:
     target = _resolve_attn_side(model_config, server_args.attention_backend)
@@ -1196,19 +1195,19 @@ def create_attn_components(
             continue
         side_backend.set_cache_pool(side_pool)
 
-    indexer_runtime = _create_indexer_runtime(config, pool)
-    draft_indexer_runtime = _create_indexer_runtime(draft_attn_config, draft_pool)
+    qsa_verify_state = _create_qsa_verify_state(config, pool)
     _prepare_verify_workspace(
         server_args=server_args,
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
-        indexer_runtime=indexer_runtime,
-        draft_indexer_runtime=draft_indexer_runtime,
+        qsa_verify_state=qsa_verify_state,
         uses_paged_state_verify=cache_family in ("qwen4_exp", "qwen_gdn", "kimi_k3"),
         is_inkling=cache_family == "inkling",
         expected_bytes=fixed_workspace_bytes,
     )
+    if qsa_verify_state is not None:
+        backend.register_speculative_state_backend(qsa_verify_state)
 
     cache_storage = _cache_storage_report(
         configured_cache_bytes=cache_budget_bytes,
@@ -1221,7 +1220,5 @@ def create_attn_components(
         pool,
         draft_attn_backend,
         draft_pool,
-        indexer_runtime,
-        draft_indexer_runtime,
         cache_storage,
     )

@@ -329,22 +329,34 @@ TRT-LLM MLA, TokenSpeed MLA, DSA, MSA, QSA); `state/` holds the recurrent consum
 (DeepSeek V4, Qwen4-Exp's GDN extension, and Inkling's dense + conv-state
 wrapper). A new leaf goes under `paged/`, a new recurrent family under
 `state/`. A model-shaped backend earns `specific/` only when the ordinary
-router, paged leaves and execution-owned indexer state cannot express it; use by one
+router, paged leaves and registered side state cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
 QSA uses the ordinary router and an MHA-derived leaf. Its indexer layout
 comes from `router.group_view` and full-KV metadata, and stays in
 `SparseTopKShare` with the existing forward and MTP reuse boundaries.
 
-Execution owns a separate `QSAIndexerRuntime` for each target/draft cache
-view. Every `ForwardContext.indexer_runtime` borrows the matching runtime
-(`None` without QSA); Tensor workspace stays on the runtime. Indexers read
-this reference directly, with no model binding.
+The target's root `AttentionBackend` owns a registered `QSAVerifyState`
+when its bound cache view has local QSA fields and its verify width exceeds
+one. Registry construction binds this state from the cache plan and
+preallocates its workspace before model forward or graph capture. Draft
+and non-speculative backends have no QSA verify state. This is transient
+staging, not a second owner of the persistent request cache.
 
-`ForwardStepRunner` commits `ctx.indexer_runtime` once after eager verify
-or graph replay, excluding leading extend requests in mixed batches. Only
-the target runtime is committed here; the backend tree does not dispatch
-indexer lifecycle calls.
+Indexers read the target/draft role and token width from their full-attention
+router. Only target verify looks up `QSAVerifyState` through the existing
+`ctx.attn_backend` reference; missing startup registration is an error, never
+a reason to bind a model or allocate workspace lazily during forward.
+
+`ForwardStepRunner` calls `commit_speculative_state_after_verify` on the
+target root once after eager verify or graph replay, with acceptance sliced
+to the real batch. QSA excludes leading extend requests in mixed batches.
+Registration, lookup and commit stay local to this one root, whether it is
+a hybrid composite or a standalone router; they never walk child backends.
+Registered state cannot be replaced with a different instance of the same
+type, preserving workspace addresses captured by graphs. Mamba/GDN and PLE
+retain their existing decode-only commit lifecycle independently of this
+side-state hook.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
@@ -361,7 +373,7 @@ vocabulary is fixed, with exactly one conversion point:
 | bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
 | **`CacheGroupRouter`** | group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, ALL write-location slot math | kernel calls |
 | QSA indexer metadata | resolved group views and full-KV leaf metadata | raw scheduler table expansion |
-| execution-owned indexer runtime (QSA) | bound cache fields and transient verification workspace | attention backend ownership, allocation of persistent request caches |
+| root-backend-owned QSA verify state | bound cache fields and transient verification workspace | allocation of persistent request caches, scheduler table expansion |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 

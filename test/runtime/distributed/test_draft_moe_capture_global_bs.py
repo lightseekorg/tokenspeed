@@ -53,7 +53,6 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
     return ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
-        indexer_runtime=None,
         bs=bs,
         num_extends=0,
         input_num_tokens=bs,

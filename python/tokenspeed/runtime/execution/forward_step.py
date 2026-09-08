@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -188,7 +187,6 @@ class ForwardStepRunner:
         token_to_kv_pool: CachePool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
-        indexer_runtime: QSAIndexerRuntime | None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
         drafter: BaseDrafter | None = None,
@@ -203,7 +201,6 @@ class ForwardStepRunner:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.token_to_kv_pool = token_to_kv_pool
-        self.indexer_runtime = indexer_runtime
         self.drafter = drafter
         self.sampling_backend = sampling_backend
         self.input_buffers = input_buffers
@@ -415,7 +412,6 @@ class ForwardStepRunner:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            indexer_runtime=self.indexer_runtime,
             bs=bs,
             num_extends=0,
             input_num_tokens=bs * self.max_tokens_per_req,
@@ -585,7 +581,6 @@ class ForwardStepRunner:
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
-                    indexer_runtime=self.indexer_runtime,
                     bs=bs,
                     num_extends=0,
                     input_num_tokens=bs * self.max_tokens_per_req,
@@ -1018,12 +1013,10 @@ class ForwardStepRunner:
         # Update mamba/GDN state after speculative verify (base default no-op).
         if self.drafter is not None and ctx.forward_mode.is_decode():
             self.attn_backend.update_mamba_state_after_mtp_verify(result[1])
-        if (
-            self.drafter is not None
-            and ctx.indexer_runtime is not None
-            and (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
+        if self.drafter is not None and (
+            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):
-            ctx.indexer_runtime.commit_after_verify(
+            self.attn_backend.commit_speculative_state_after_verify(
                 result[1], num_extends=ctx.num_extends
             )
 
