@@ -180,13 +180,13 @@ def test_group_tables_use_each_groups_block_granularity():
             family=CacheGroupFamily.History,
         ),
         CacheGroupConfig(
-            group_id="state",
+            group_id="swa",
             block_granularity=2,
             total_pages=65,
             cache_blocks_per_lcm_block=4,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.State,
+            family=CacheGroupFamily.History,
         ),
     ]
     scheduler = Scheduler(cfg)
@@ -198,7 +198,7 @@ def test_group_tables_use_each_groups_block_granularity():
 
     # The first round covers eight prompt tokens plus one decode-reserve token.
     assert len(tables["history"][0]) == 2
-    assert len(tables["state"][0]) == 5
+    assert len(tables["swa"][0]) == 5
 
 
 def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
@@ -222,7 +222,7 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
             total_pages=cfg.num_device_pages,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.State,
+            family=CacheGroupFamily.History,
         ),
     ]
     return Scheduler(cfg)

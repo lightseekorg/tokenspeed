@@ -55,7 +55,7 @@ def _make_config() -> ts.SchedulerConfig:
         total_pages=cfg.num_device_pages,
         retention=ts.CacheRetention.SlidingWindow,
         sliding_window_tokens=4,
-        family=ts.CacheGroupFamily.State,
+        family=ts.CacheGroupFamily.History,
     )
     cfg.cache_groups = [full, swa]
     return cfg
