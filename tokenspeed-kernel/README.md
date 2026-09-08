@@ -137,6 +137,10 @@ iteration.
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
 
+The [persistent hyperconnection design](../docs/design/hyperconnection.md)
+documents its stream-private workspace protocol, correctness checks and
+reproducible mix/chain benchmarks, including resident and rotating weights.
+
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.

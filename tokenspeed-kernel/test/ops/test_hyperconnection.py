@@ -159,7 +159,7 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("rows", [1, 8, 16])
+@pytest.mark.parametrize("rows", [1, 3, 4, 8, 15, 16])
 def test_persistent_mix_matches_fp64_reference(rows: int, dtype: torch.dtype) -> None:
     if not current_platform().is_nvidia:
         pytest.skip("the persistent grid barrier is NVIDIA-only")
@@ -536,13 +536,16 @@ def test_grouped_gemma_rmsnorm_validates_out_for_zero_rows() -> None:
     assert grouped_gemma_rmsnorm(x, weight, HIDDEN_SIZE, 1e-6, out=out) is out
 
 
+@pytest.mark.parametrize("rows", [1, 4, 8, 16])
 @pytest.mark.parametrize("enable_pdl", [False, True])
-def test_persistent_mix_full_chain_cuda_graph_replays(enable_pdl: bool) -> None:
+def test_persistent_mix_full_chain_cuda_graph_replays(
+    rows: int, enable_pdl: bool
+) -> None:
     if not current_platform().is_nvidia:
         pytest.skip("the persistent grid barrier is NVIDIA-only")
     if enable_pdl and not current_platform().is_hopper_plus:
         pytest.skip("PDL requires NVIDIA Hopper or newer")
-    residual, projection, up = _inputs(8, torch.bfloat16)
+    residual, projection, up = _inputs(rows, torch.bfloat16, seed=17)
     generator = torch.Generator(device="cuda").manual_seed(71)
     norm_weight = (
         torch.randn(WIDE, dtype=torch.bfloat16, device="cuda", generator=generator)
@@ -611,6 +614,7 @@ def test_persistent_mix_uses_stream_private_barriers() -> None:
 
     # First calls compile and create one barrier workspace per stream.
     for stream, values in zip(streams, (inputs_a, inputs_b), strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             gated_residual_mix(
                 *values,
@@ -634,6 +638,34 @@ def test_persistent_mix_uses_stream_private_barriers() -> None:
                     override="triton_persistent_hyperconnection_mix",
                 )
             )
+    for stream in streams:
+        stream.synchronize()
+    for values, (mixed, inject) in zip((inputs_a, inputs_b), outputs, strict=True):
+        expected, expected_inject = _mix_reference(*values, 1.0)
+        torch.testing.assert_close(mixed, expected, rtol=4e-2, atol=4e-2)
+        torch.testing.assert_close(inject, expected_inject, rtol=4e-2, atol=4e-2)
+
+    graphs = []
+    outputs = []
+    for stream, values in zip(streams, (inputs_a, inputs_b), strict=True):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(3):
+                result = gated_residual_mix(
+                    *values,
+                    HC_COUNT,
+                    HIDDEN_SIZE,
+                    LOWRANK,
+                    projection_scale=1.0,
+                    override="triton_persistent_hyperconnection_mix",
+                    solution=None,
+                )
+        graphs.append(graph)
+        outputs.append(result)
+    for _ in range(16):
+        for stream, graph in zip(streams, graphs, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
     for stream in streams:
         stream.synchronize()
     for values, (mixed, inject) in zip((inputs_a, inputs_b), outputs, strict=True):
@@ -700,3 +732,146 @@ def test_deterministic_mode_filters_atomic_persistent_mix() -> None:
         torch.use_deterministic_algorithms(previous_deterministic)
         capture.enabled = previous_capture
         capture.clear()
+
+
+@pytest.mark.parametrize("has_inject", [False, True])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_persistent_mix_reuses_workspace_across_shapes(
+    has_inject: bool, enable_pdl: bool
+) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("the persistent grid barrier is NVIDIA-only")
+    if enable_pdl and not current_platform().is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA Hopper or newer")
+    previous_pdl = pdl_enabled(None)
+    try:
+        pdl_enabled(enable_pdl)
+        # These calls share the same stream workspace, including across dtypes.
+        # Every call must leave scratch ready for a different subsequent shape.
+        for index, rows in enumerate((4, 1, 16, 3, 8, 15, 4)):
+            dtype = torch.bfloat16 if index % 2 == 0 else torch.float16
+            normalized, projection, up = _inputs(rows, dtype, seed=101 + index)
+            if not has_inject:
+                projection = projection[:LOWRANK]
+            mixed, inject = gated_residual_mix(
+                normalized,
+                projection,
+                up,
+                HC_COUNT,
+                HIDDEN_SIZE,
+                LOWRANK,
+                projection_scale=0.25,
+                override="triton_persistent_hyperconnection_mix",
+                solution=None,
+            )
+            expected, expected_inject = _mix_reference(normalized, projection, up, 0.25)
+            tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
+            torch.testing.assert_close(mixed, expected, rtol=tolerance, atol=tolerance)
+            if has_inject:
+                torch.testing.assert_close(
+                    inject, expected_inject, rtol=tolerance, atol=tolerance
+                )
+            else:
+                assert inject is None
+    finally:
+        pdl_enabled(previous_pdl)
+
+
+@pytest.mark.parametrize("calls_per_replay", [1, 3, 4])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_persistent_mix_graph_observes_changed_inputs(
+    enable_pdl: bool, calls_per_replay: int
+) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("the persistent grid barrier is NVIDIA-only")
+    if enable_pdl and not current_platform().is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA Hopper or newer")
+    normalized, projection, up = _inputs(4, torch.bfloat16, seed=113)
+
+    def mix() -> tuple[torch.Tensor, torch.Tensor | None]:
+        return gated_residual_mix(
+            normalized,
+            projection,
+            up,
+            HC_COUNT,
+            HIDDEN_SIZE,
+            LOWRANK,
+            projection_scale=1.0,
+            override="triton_persistent_hyperconnection_mix",
+            solution=None,
+        )
+
+    previous_pdl = pdl_enabled(None)
+    try:
+        pdl_enabled(enable_pdl)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        # Create the workspace before capture, so graph replay advances the
+        # device generation rather than replaying workspace initialization.
+        with torch.cuda.stream(stream):
+            mix()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = [mix() for _ in range(calls_per_replay)]
+        for _ in range(4):
+            normalized.mul_(-0.75)
+            projection.mul_(0.5)
+            up.mul_(-0.5)
+            graph.replay()
+            expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
+            for mixed, inject in outputs:
+                torch.testing.assert_close(mixed, expected, rtol=4e-2, atol=4e-2)
+                torch.testing.assert_close(
+                    inject, expected_inject, rtol=4e-2, atol=4e-2
+                )
+    finally:
+        pdl_enabled(previous_pdl)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_persistent_mix_generation_crosses_uint32(enable_pdl: bool) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("the persistent grid barrier is NVIDIA-only")
+    if enable_pdl and not current_platform().is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA Hopper or newer")
+    from tokenspeed_kernel.ops.residual.triton import _persistent_workspace
+
+    normalized, projection, up = _inputs(4, torch.bfloat16, seed=127)
+    raw, counters = _persistent_workspace(normalized.device, LOWRANK + HC_COUNT)
+    num_ctas = torch.cuda.get_device_properties(normalized.device).multi_processor_count
+    generation = (1 << 32) - 1
+    previous_pdl = pdl_enabled(None)
+    try:
+        pdl_enabled(enable_pdl)
+        raw.zero_()
+        counters.copy_(
+            torch.tensor(
+                [generation * num_ctas, generation],
+                device=counters.device,
+                dtype=torch.int64,
+            )
+        )
+        expected, expected_inject = _mix_reference(normalized, projection, up, 1.0)
+        for step in range(3):
+            mixed, inject = gated_residual_mix(
+                normalized,
+                projection,
+                up,
+                HC_COUNT,
+                HIDDEN_SIZE,
+                LOWRANK,
+                projection_scale=1.0,
+                override="triton_persistent_hyperconnection_mix",
+                solution=None,
+            )
+            torch.testing.assert_close(mixed, expected, rtol=4e-2, atol=4e-2)
+            torch.testing.assert_close(inject, expected_inject, rtol=4e-2, atol=4e-2)
+            next_generation = generation + step + 1
+            assert counters.tolist() == [next_generation * num_ctas, next_generation]
+            assert torch.count_nonzero(raw[next_generation & 1]).item() == 0
+    finally:
+        torch.cuda.synchronize()
+        raw.zero_()
+        counters.zero_()
+        pdl_enabled(previous_pdl)
