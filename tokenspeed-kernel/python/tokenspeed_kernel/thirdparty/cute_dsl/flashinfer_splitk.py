@@ -23,7 +23,7 @@
 ``mm_bf16(backend="cute-dsl")`` reaches the same kernel under two policies a
 block drafter should not inherit: the tactic comes from ``default_tactic``, a
 generic occupancy heuristic, and ``_MAX_M`` refuses M above 32. These
-projections are cold-weight and grid-starved, so the tactic that wins is the
+projections are cold-weight and grid-starved, so the tactic they need is the
 one that fills the machine, and a block drafter's M is its batch times its
 block width, which reaches 64. Public M rides the kernel's MMA-N axis, so M
 past the cutover is tiled and not truncated: a policy bound, not a correctness

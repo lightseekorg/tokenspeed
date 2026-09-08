@@ -134,11 +134,9 @@ class VocabParallelTopK:
     def _probe_radix_topk(self, num_cols: int):
         """The vendored single-pass radix top-k, if it serves this shard.
 
-        torch's multi-block radix select spends eight launches on a
-        ``[rows, vocab/tp]`` top-16; the vendored TensorRT-LLM kernel does it
-        in one and measured 3.1-4.2x faster at this shape. Probed here, at the
-        widest row count, so its scratch arena is allocated before the caller
-        is ever captured.
+        The vendored TensorRT-LLM kernel takes the ``[rows, vocab/tp]``
+        top-16 in one pass. Probed here, at the widest row count, so its
+        scratch arena is allocated before the caller is ever captured.
 
         Args:
             num_cols: Columns in this rank's vocabulary shard.
@@ -170,8 +168,8 @@ class VocabParallelTopK:
             logger.info("Radix top-k unavailable (%s); using torch.topk", exc)
             return None
         if indices is None or values is None:
-            # Cluster capacity refused the shape; the base runner is only ~1.4x
-            # over torch here, so it is not worth a second code path.
+            # Cluster capacity refused the shape; the base runner does not
+            # earn a second code path here.
             logger.info(
                 "Radix top-k declined rows=%d cols=%d; using torch.topk",
                 self.max_rows,

@@ -21,8 +21,8 @@
 """Measured split-K tactics for the DFlash2 draft's GEMM shapes.
 
 flashinfer's ``default_tactic`` is a generic occupancy heuristic; these shapes
-are cold-weight and grid-starved, so the pick that wins here is not the pick it
-makes. Run as ``tune_splitk_tactic.py [shape_set] [tactic.json]``; the set names
+are cold-weight and grid-starved, so the pick these shapes need is not the one
+it makes. Run as ``tune_splitk_tactic.py [shape_set] [tactic.json]``; the set names
 a key of ``_bench.SHAPE_SETS`` and defaults to the TP8 draft. Emits the table
 for ops/gemm/, plus the incumbent it has to beat.
 
@@ -58,8 +58,8 @@ def reachable(m: int, n: int, k: int, xs, ws, o):
     """The backends ops/gemm/routed_gemv can actually DISPATCH at this shape.
 
     A backend the router has no wrapper for cannot be the thing a tactic has to
-    beat -- scoring against tinygemm, which wins 1536x1536 but is unroutable,
-    silently suppresses real entries.
+    beat -- scoring against tinygemm, which is unroutable, silently suppresses
+    real entries.
 
     Args:
         m: Rows of the activation.

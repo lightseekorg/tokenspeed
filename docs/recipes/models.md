@@ -150,8 +150,7 @@ Notes:
   exchange hidden states and share the target's embedding and LM head.
 - Measured on 4x GB300 with the launch above: gsm8k `mean_acc` 0.9719 versus
   0.9704 without speculative decoding (paired disagreement 10 vs 8, McNemar
-  p ~ 0.81 -- within run-to-run noise), at a mean accepted length of 5.25 of 9
-  and about 2.2x decode throughput at 16 concurrent requests.
+  p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
 ## Kimi K2.5 / K2.6
 

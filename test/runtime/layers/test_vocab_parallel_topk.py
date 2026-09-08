@@ -61,6 +61,13 @@ def _selector(lm_head, tp_size: int, top_k: int, max_rows: int, vocab_size: int)
     return selector
 
 
+#: The real quant method refuses to construct off Blackwell.
+_needs_nvfp4 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    reason="NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer",
+)
+
+
 def _nvfp4_head(shard: int, hidden: int, logits: torch.Tensor):
     """A head the production predicate accepts as genuinely quantized.
 
@@ -136,6 +143,7 @@ def test_a_padded_or_offset_shard_declines_the_shard_local_topk() -> None:
         ).enabled
 
 
+@_needs_nvfp4
 def test_a_quantized_head_reaches_its_quant_method_not_a_matmul() -> None:
     """A packed weight must never be matmul'd, on the fast path either."""
     from tokenspeed.runtime.layers.logits_processor import (
@@ -171,6 +179,7 @@ def test_shard_logits_matmuls_an_unquantized_head() -> None:
     )
 
 
+@_needs_nvfp4
 def test_a_quantized_head_picks_candidates_through_the_padding_slice(
     monkeypatch,
 ) -> None:

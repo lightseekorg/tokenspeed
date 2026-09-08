@@ -26,8 +26,7 @@ The shapes are the exact (N, K) that the decode path hands the routed GEMV,
 extracted from a trace of the serving path (rowcta's launch grid is ``(N,)``,
 so gridX identifies each call site). Every measurement cycles through
 NUM_COPIES independent weight tensors so the L2 never holds the operand between
-calls -- hot-L2 numbers at 6288x7168 ran 1.9x faster than the serving trace's,
-and cold-L2 reproduces the serving per-shape times within ~5%.
+calls, which is the state the serving path hands each shape.
 
 A backend earns a routing entry only by beating the incumbent (the kernel
 dispatch picks today) by at least MARGIN.
@@ -103,14 +102,13 @@ def candidates(m: int, n: int, k: int):
     if mm_bf16 is not None:
         # Only TGV needs a bias operand; routed_gemv keeps a zero one for it.
         # Handing that same bias to the others would measure a shape serving
-        # never asks for -- cuDNN alone runs 2-3x slower with it.
+        # never asks for.
         bias = torch.zeros(n, device="cuda", dtype=torch.bfloat16)
         # Every backend the wheel declares, each at the PDL setting it accepts.
         # cutlass/cublaslt/cutile REJECT pdl=True rather than ignoring it, so
         # asking them the way tgv is asked scores a raised exception as a loss
-        # and drops them from the field silently. Measured on GB300: pdl=True
-        # is 1.15-1.36x faster wherever it is allowed, so the others are asked
-        # with pdl=False rather than skipped.
+        # and drops them from the field silently, so the others are asked with
+        # pdl=False rather than skipped.
         for be in FI_BACKENDS:
             pdl = be not in _FI_NO_PDL
             operand = bias if be == "tgv" else None

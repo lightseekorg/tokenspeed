@@ -114,8 +114,7 @@ SHAPE_SETS = {
 #: between calls: serving streams a different layer's weight each launch, and a
 #: single-tensor benchmark distorts the ranking.
 NUM_COPIES = 8
-#: 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
-#: the consistent 6-11% wins.
+#: A margin wide enough to sit outside the harness's round-to-round noise.
 MARGIN = 1.04
 #: BF16 accumulation order differs per kernel; 2% clears that without admitting
 #: a kernel that computed the wrong thing. Relative, not absolute: at K=7168 the

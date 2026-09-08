@@ -480,7 +480,13 @@ def test_the_shared_vendor_module_is_never_touched():
     script = """
 import importlib.util, sys
 V = "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk"
-if importlib.util.find_spec(V) is None:
+try:
+    # find_spec imports the parents, so a missing flashinfer raises here
+    # rather than answering None.
+    found = importlib.util.find_spec(V) is not None
+except ModuleNotFoundError:
+    found = False
+if not found:
     print("skip"); raise SystemExit(0)
 assert V not in sys.modules, "vendor already imported; the check would be void"
 from tokenspeed_kernel.ops.gemm.routed_gemv import SPLITK_TACTIC_ROUTE
