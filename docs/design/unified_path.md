@@ -82,6 +82,13 @@ never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
 
+Helpers that memoize tensors created inside capture must not return those
+tensors to eager callers. Keeping a Python reference preserves the allocation,
+but an earlier graph sharing the same private pool can overwrite its contents
+on replay. PLE's uniform index bundles are reused during capture only; eager
+prefill and decode construct their indices through the same builder outside
+the capture pool.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base

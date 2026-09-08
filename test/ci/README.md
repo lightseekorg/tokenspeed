@@ -48,7 +48,7 @@ a score of at least 0.90.
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
-of at least 0.90.
+of at least 0.96.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -107,6 +107,11 @@ the two directories are created beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
+unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
+TokenSpeed use separate Triton distributions in the same process, and this
+path is accepted by both while still resolving to the same TheRock runtime.
 
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository

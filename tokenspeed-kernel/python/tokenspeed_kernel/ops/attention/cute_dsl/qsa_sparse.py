@@ -31,7 +31,6 @@ from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
 )
 
 _HEAD_DIM = 256
-_NUM_Q_HEADS = 6
 _SELECTED_WIDTH = 2051
 
 
@@ -62,8 +61,8 @@ _SELECTED_WIDTH = 2051
     traits={
         "head_dim": frozenset({_HEAD_DIM}),
         "value_head_dim": frozenset({_HEAD_DIM}),
-        "num_q_heads": frozenset({_NUM_Q_HEADS}),
-        "num_kv_heads": frozenset({1}),
+        "num_q_heads": frozenset({6, 12, 24}),
+        "num_kv_heads": frozenset({1, 2, 4}),
         "selected_width": frozenset({_SELECTED_WIDTH}),
     },
     priority=Priority.SPECIALIZED + 2,
@@ -84,11 +83,12 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     """Run the adaptive workspace-free B200 QSA specialization.
 
     Args:
-        q: BF16 query tensor shaped ``[tokens, 6, 256]``.
+        q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,
+            12 or 24 query heads. The count must be divisible by ``kv_heads``.
         k_cache: BF16 or FP8 E4M3 key cache shaped
-            ``[cache_slots, 1, 256]``.
+            ``[cache_slots, kv_heads, 256]``, with 1, 2 or 4 KV heads.
         v_cache: BF16 or FP8 E4M3 value cache shaped
-            ``[cache_slots, 1, 256]``. Its dtype must match ``k_cache``.
+            ``[cache_slots, kv_heads, 256]``. Its dtype must match ``k_cache``.
         selected_slots: Physical cache slots shaped ``[tokens, 2051]``;
             non-positive values are ignored.
         scale: Softmax scale applied to query-key scores.
@@ -100,13 +100,21 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         v_scale: Scalar value-cache descale, applied to the output.
 
     Returns:
-        BF16 attention output shaped ``[tokens, 6, 256]``.
+        BF16 attention output shaped ``[tokens, query_heads, 256]``.
 
-    The kernel uses eight sequence-split CTAs for at most eight query rows and
-    four sequence-split CTAs for larger launches. Both paths pipeline K and V
-    through the same two-stage asynchronous ring. The eight-way path assigns
-    the final DSM softmax combine across six head-owning CTA ranks; the
-    four-way path retains its rank-zero combine.
+    Each KV head owns a contiguous group of query heads, divided into tiles
+    of up to eight heads. One CTA cluster handles each (row, KV head, head
+    tile), sharing that row's selected slots. Head counts and cache strides
+    are compile-time parameters; a six-query-head, one-KV-head launch retains
+    its original tile geometry. This also covers the twelve- and twenty-four-
+    query-head shapes used with smaller tensor-parallel sizes.
+
+    Small launches use sixteen sequence-split CTAs when the device occupancy
+    probe allows all clusters to fit in one wave, otherwise eight CTAs for up
+    to eight clusters and four for larger launches. All split counts use the
+    same asynchronous K/V ring and head-owning DSM softmax combine. The final
+    three selected entries are computed in that combine, avoiding a mostly
+    empty tensor-core tile. BF16 V staging uses transposed matrix loads.
     """
 
     del metadata_capacity_rows  # The workspace-free specialization has no metadata.

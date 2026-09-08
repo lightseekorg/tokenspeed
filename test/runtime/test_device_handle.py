@@ -130,6 +130,7 @@ def _handle(trace, **kwargs):
     return DeviceHandle(
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
+            order_cache_operations=lambda: trace.append("order_cache"),
             execute_forward_op=lambda *a, **k: trace.append("forward"),
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
@@ -259,6 +260,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
 
     assert trace == [
         "submit",
+        "order_cache",
         ("write_backs", ["op"]),
         "submit",
         ("zero", (3, 4)),

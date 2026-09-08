@@ -171,6 +171,8 @@ def _batch_token_id_out(
         "generated_time": 0,
     }
     defaults.update(overrides)
+    if defaults["output_ids"] is None:
+        defaults["output_ids"] = [list(ids) for ids in decode_ids]
     return BatchTokenIDOut(
         rids=rids,
         finished_reasons=(
@@ -399,6 +401,26 @@ class TestOutputIdsShape(unittest.TestCase):
         self.assertEqual(out2["output_ids"], ids_b)
         # Cumulative state carries the full list.
         self.assertEqual(state.output_ids, ids_a + ids_b)
+
+    def test_prompt_tail_in_decode_ids_is_not_exposed_as_output_ids(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_state(stream=False, rid="r1")
+        _register(mgr, state)
+
+        prompt_tail = self.tok.encode("prompt context ")
+        generated = self.tok.encode("answer")
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[prompt_tail + generated],
+            read_offsets=[len(prompt_tail)],
+            output_ids=[generated],
+            finished_reasons=[{"type": "stop", "matched": None}],
+        )
+        mgr.output_processor.handle_batch_output(recv)
+
+        out = state.collector.take()
+        self.assertEqual(out["output_ids"], generated)
+        self.assertEqual(state.output_ids, generated)
 
     def test_non_stream_mode_emits_full_cumulative_output_ids(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)

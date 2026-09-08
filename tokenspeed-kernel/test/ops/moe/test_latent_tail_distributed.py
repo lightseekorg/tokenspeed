@@ -50,8 +50,12 @@ pytestmark = pytest.mark.skipif(
 def _require_latent_tail():
     # Collectively-agreed probe: skips must match across ranks, or the
     # remaining ranks hang in the op's rendezvous.
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
     from tokenspeed_kernel.ops.moe.latent_tail import latent_tail_supported
 
+    # A server does this at distributed init; the gate refuses to gather it
+    # itself, because it is also asked from dispatch where only a group is present.
+    gather_fabric_map()
     ok = latent_tail_supported(
         tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
     )

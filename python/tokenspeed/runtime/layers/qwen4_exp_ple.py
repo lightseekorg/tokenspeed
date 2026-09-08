@@ -65,8 +65,9 @@ _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # (bs, max_len) pair is fixed per bucket, so entries are bounded by the capture
 # set. Entries are never evicted: a replay reads the addresses its capture
 # recorded, so freeing one would let the allocator hand that memory to someone
-# else and feed a replay another tensor's bytes. Eager calls compute fresh
-# tensors instead of caching, so varied prefill lengths cannot grow this dict.
+# else and feed a replay another tensor's bytes. Other graphs sharing the
+# capture pool can overwrite their contents, so eager calls neither read nor
+# populate this cache. They compute fresh tensors instead.
 _UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
 
 
@@ -604,7 +605,10 @@ class Qwen4ExpPLELayer(nn.Module):
         max_len = max(lengths) if lengths else 0
         if bs and max_len > 0 and max_len * bs == total:
             key = (bs, max_len, device)
-            bundle = _UNIFORM_INDEX_CACHE.get(key)
+            capturing = (
+                device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+            )
+            bundle = _UNIFORM_INDEX_CACHE.get(key) if capturing else None
             if bundle is None:
                 positions = torch.arange(total, device=device, dtype=torch.long)
                 req = positions // max_len
@@ -612,7 +616,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
                 starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
                 bundle = (req, col, lengths_t, starts)
-                if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                if capturing:
                     _UNIFORM_INDEX_CACHE[key] = bundle
             req, col, lengths_t, starts = bundle
         else:

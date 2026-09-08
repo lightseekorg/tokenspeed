@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_batched_replay_uses_raw_gate,
+    kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
 )
@@ -38,6 +39,7 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
@@ -48,12 +50,14 @@ from tokenspeed_kernel.ops.attention.triton.capture_payload import (
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -110,6 +114,9 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_active = False
         self._batched_replay_kernel = None
         self._replay_uses_raw_gate = False
+        self._verify_split_producers = False
+        self._verify_producer_stream: torch.cuda.Stream | None = None
+        self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
         self._replay_descriptors = None
@@ -149,6 +156,14 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_uses_raw_gate = self._replay_active and (
             kda_batched_replay_uses_raw_gate(self.dtype, **shape)
         )
+        self._verify_split_producers = self._replay_active and (
+            kda_fused_paged_verify_uses_split_producers(
+                self.dtype,
+                store_states=False,
+                recurrent_layout=self.kda_recurrent_layout,
+                **shape,
+            )
+        )
         if self._replay_active and self.speculative_num_draft_tokens > 1:
             rows = self.max_bs * self.speculative_num_draft_tokens
             layer_ids = tuple(self._state_layer_ids())
@@ -172,6 +187,14 @@ class KdaAttnBackend(MambaAttnBackend):
                     device=self.device,
                 )
                 first_conv, first_ssm = self._state_components(layer_ids[0])
+                if self._verify_split_producers and first_conv.is_cuda:
+                    self._verify_producer_stream = torch.cuda.Stream(
+                        device=first_conv.device, priority=-1
+                    )
+                    self._verify_producer_forks = {
+                        layer_id: StreamFork(self._verify_producer_stream)
+                        for layer_id in layer_ids
+                    }
                 hv, head_dim = first_ssm.shape[1:3]
                 for layer_id in layer_ids[1:]:
                     conv, ssm = self._state_components(layer_id)
@@ -458,6 +481,7 @@ class KdaAttnBackend(MambaAttnBackend):
             norm_eps,
             num_value_heads,
             head_v_dim,
+            enable_pdl=pdl_enabled(),
         ).view(1, -1, num_value_heads, head_v_dim)
 
     @override
@@ -520,6 +544,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 norm_eps,
                 num_value_heads,
                 head_v_dim,
+                enable_pdl=pdl_enabled(),
             ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
 
@@ -557,6 +582,7 @@ class KdaAttnBackend(MambaAttnBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             replay_payload = {}
+            split_producers = {}
             if self._replay_uses_raw_gate:
                 # Fused verify writes QKV, raw-g, and beta directly into the
                 # persistent replay payload, avoiding a separate capture launch.
@@ -565,6 +591,39 @@ class KdaAttnBackend(MambaAttnBackend):
                     "replay_gate": gate[:rows],
                     "replay_beta": beta[:rows, : beta_raw.shape[-1]],
                 }
+            elif self._verify_split_producers:
+                fork = self._verify_producer_forks[layer_id]
+                with fork.scope(enable=True) as producer_fork:
+                    with producer_fork.branch():
+                        capture_replay_payload(
+                            (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
+                            (
+                                qkv[:rows, : mixed_qkv.shape[-1]],
+                                f_a[:rows, : f_a_out.shape[-1]],
+                                beta[:rows, : beta_raw.shape[-1]],
+                            ),
+                            rows,
+                        )
+                        g_raw = torch.nn.functional.linear(f_a_out[:rows], f_b_weight)
+                    conv_qkv = kda_verify_conv_update(
+                        mixed_qkv[:rows],
+                        conv_weights,
+                        conv_comp,
+                        state_in_blocks[:batch_size],
+                        num_heads=value_dim // attn_tp_size // head_v_dim,
+                        head_dim=head_v_dim,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout=self.kda_recurrent_layout,
+                    )
+                # The graph capture pool owns captured allocations. In eager
+                # mode the producer tensors outlive this Python scope while
+                # verify runs on the main stream, so register that use with
+                # the caching allocator before launching its consumer.
+                if not torch.cuda.is_current_stream_capturing():
+                    consumer_stream = torch.cuda.current_stream()
+                    g_raw.record_stream(consumer_stream)
+                    conv_qkv.record_stream(consumer_stream)
+                split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
             else:
                 capture_replay_payload(
                     (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
@@ -610,6 +669,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 **replay_payload,
+                **split_producers,
             )
             if fused_out is None:
                 raise RuntimeError(

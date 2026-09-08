@@ -213,6 +213,36 @@ this rank forwards are bound to it. Moving such a commit earlier than the end of
 the forward, or binding layers the rank does not forward, breaks the fence
 guarantee without any call site visibly dropping a wait.
 
+The Host-transfer workspace resolves transport capability for its buffer
+binding before publishing consumer waits. NVIDIA mapped-Host transfers can
+use a single full-geometry H2D launch with per-layer ready flags; other paths
+publish per-layer events. Device-resident geometry is metadata, not evidence
+that a particular completion protocol is supported. Automatic DMA fallback
+is limited to unavailable Host-pointer mapping, scoped to that workspace and
+buffer binding; validation, allocation, and kernel-launch failures propagate.
+Transfer callers explicitly select the backend, staging synchronization,
+grid cap, and optional layer flags. For an unflagged layer with no matching
+blocks, the transfer boundary validates the loaded block count and returns
+before mapping Host pointers or touching the accelerator runtime. Flagged
+loads still publish readiness for empty consumers.
+
+Writeback uploads block metadata asynchronously on the caller stream. An
+event recorded after both metadata copies protects the pinned CPU staging
+tables: before refilling them, the next submission waits only if that event
+is incomplete. This does not wait for the payload transfer or publish a
+writeback ACK. Device metadata reuse stays ordered after the previous payload
+by caller-stream FIFO; the forward-to-cache and cache-to-page-reuse fences
+remain unchanged. Even a partially submitted metadata upload records its
+retirement event before propagating a staging failure.
+
+Ready flags are valid only for a full-geometry H2D transfer. Consumers first
+wait for the current generation's flag initialization event, then its layer
+flag. Workspace reuse also waits for the previous transfer's completion;
+layer readiness alone does not retire metadata still read by the transfer.
+On submission failure, retirement fences protect reuse without publishing a
+successful load ACK. If neither event publication nor stream synchronization
+can establish retirement, the executor must reject further loads.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under
@@ -702,7 +732,11 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   mandatory `group_id`, checked against the pool's published specs at startup
   (`validate_cache_group_ids`, single-group pools included), and backends
   index their learned geometry by it with no fallback
-  (`CacheGroupGeometry.granularity_of` raises on unknown ids). ✓
+  (`CacheGroupGeometry.granularity_of` raises on unknown ids).
+  Block drafters that write at target cache locations therefore use the
+  target's `full_attention` storage group even when a draft layer applies a
+  sliding-window compute mask; visibility and cache retention are separate
+  contracts. ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

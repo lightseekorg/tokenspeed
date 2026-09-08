@@ -47,6 +47,11 @@ from tokenspeed.runtime.pd.mooncake.entities import (
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.mooncake.pack import (
+    PackedCopy,
+    PrefillPackScratch,
+    flatten_transfer_blocks,
+)
 from tokenspeed.runtime.pd.transfer_plan import (
     CacheTransferFragment,
     CacheTransferPlanner,
@@ -340,10 +345,34 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 "Cache-transfer room destination ranks disagree with the typed route plan"
             )
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        block_iter = iter(transfer_blocks)
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
+        """WRITE descriptors in bounded batches, packing PackedCopy items per batch."""
+        pending: list[object] = []
+        for item in transfer_blocks:
+            pending.append(item)
+            if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
+                ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                pending = []
+                if ret != 0:
+                    return ret
+        if pending:
+            return self._write_sge_batch(mooncake_session_id, pending, packer)
+        return 0
+
+    def _write_sge_batch(self, mooncake_session_id, pending, packer) -> int:
+        if packer is not None:
+            sges = packer.materialize(pending)
+        else:
+            sges = flatten_transfer_blocks(pending)
+        started = time.monotonic()
+        n_sge = 0
+        n_bytes = 0
+        ret = 0
+        block_iter = iter(sges)
         while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
             src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
+            n_sge += len(batch)
+            n_bytes += sum(lengths)
             ret = self.engine.batch_transfer_sync(
                 mooncake_session_id,
                 list(src_addrs),
@@ -351,8 +380,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 list(lengths),
             )
             if ret != 0:
-                return ret
-        return 0
+                break
+        logger.info(
+            "CachePD WRITE n_sge=%d bytes=%d wait_ms=%.1f ret=%s",
+            n_sge,
+            n_bytes,
+            (time.monotonic() - started) * 1e3,
+            ret,
+        )
+        return ret
 
     def _cache_transfer_blocks(
         self,
@@ -364,7 +400,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
-    ) -> Iterator[tuple[int, int, int]]:
+    ) -> Iterator[PackedCopy | tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
 
         cache_fragments = tuple(transfer_fragments)
@@ -439,11 +475,27 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             + int(dst_page) * dst_segment.page_stride_bytes
                             + fragment.dst_byte_offset
                         )
-                        for row in range(fragment.rows_per_page):
+                        width = fragment.bytes_per_row
+                        rows = fragment.rows_per_page
+                        src_pitch = fragment.src_row_stride_bytes
+                        dst_pitch = fragment.dst_row_stride_bytes
+                        if rows > 1 and dst_pitch == width:
+                            if src_pitch == width:
+                                yield (src_page_addr, dst_page_addr, width * rows)
+                                continue
+                            yield PackedCopy(
+                                src=src_page_addr,
+                                dst=dst_page_addr,
+                                width=width,
+                                src_pitch=src_pitch,
+                                rows=rows,
+                            )
+                            continue
+                        for row in range(rows):
                             yield (
-                                src_page_addr + row * fragment.src_row_stride_bytes,
-                                dst_page_addr + row * fragment.dst_row_stride_bytes,
-                                fragment.bytes_per_row,
+                                src_page_addr + row * src_pitch,
+                                dst_page_addr + row * dst_pitch,
+                                width,
                             )
                 continue
 
@@ -512,9 +564,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             time.sleep(1e-4)
 
     @staticmethod
-    def _prime_transfer_blocks(
-        transfer_blocks: Iterator[tuple[int, int, int]],
-    ) -> Iterator[tuple[int, int, int]]:
+    def _prime_transfer_blocks(transfer_blocks) -> Iterator:
         """Start a lazy descriptor before any destination begins DMA."""
         iterator = iter(transfer_blocks)
         try:
@@ -527,6 +577,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self,
         kv_chunk: TransferKVChunk,
         reqs: tuple[TransferInfo, ...],
+        packer=None,
     ) -> bool:
         """Wait one producer interval, then fan it out to every Decode peer."""
         block_selection = kv_chunk.cache_block_selection
@@ -594,7 +645,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
 
             for req, registration, blocks, started_at in prepared:
-                ret = self._transfer_data(req.mooncake_session_id, blocks)
+                ret = self._transfer_data(req.mooncake_session_id, blocks, packer)
                 if self.kv_transfer_metrics:
                     self.kv_transfer_metrics.observe_kv_transfer_latency(
                         time.monotonic() - started_at
@@ -734,6 +785,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         queue: FastQueue,
         _executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        packer = None
+        engine = getattr(self, "engine", None)
+        if engine is not None and hasattr(engine, "register"):
+            gpu_id = getattr(getattr(self, "kv_args", None), "gpu_id", None)
+            packer = PrefillPackScratch(
+                engine, gpu_id=None if gpu_id is None else int(gpu_id)
+            )
         while True:
             kv_chunk = queue.get()
             try:
@@ -747,7 +805,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     continue
 
                 if kv_chunk.cache_block_selection is not None:
-                    self._send_cache_layerwise_fanout(kv_chunk, reqs)
+                    self._send_cache_layerwise_fanout(kv_chunk, reqs, packer=packer)
                     if kv_chunk.room not in self.request_status or self.check_status(
                         kv_chunk.room
                     ) in (TransferPoll.Success, TransferPoll.Failed):
@@ -784,7 +842,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     )
 
                 for req, registration, blocks, started_at in prepared:
-                    ret = self._transfer_data(req.mooncake_session_id, blocks)
+                    ret = self._transfer_data(req.mooncake_session_id, blocks, packer)
                     if ret != 0:
                         with self.session_lock:
                             self.session_failures[req.mooncake_session_id] += 1

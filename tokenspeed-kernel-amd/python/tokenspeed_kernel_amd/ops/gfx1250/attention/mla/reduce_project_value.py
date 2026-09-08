@@ -98,7 +98,7 @@ def _mla_reduce_project_value_kernel(
     # Preserve both materialized BF16 boundaries: the latent reducer output
     # and the following value projection.
     attention = gl.where(e_sum == 0.0, 0.0, acc / e_sum).to(gl.bfloat16)
-    weight = gl.amd.gfx1250.buffer_load(
+    weight = gl.amd.cdna5.buffer_load(
         weight_ptr,
         (
             head * LATENT * VALUE

@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
-gfx1250 = gl.amd.gfx1250
+cdna5 = gl.amd.cdna5
 _BLOCK_H = gl.constexpr(8192)
 _LOAD_ELEMS = gl.constexpr(2)
 
@@ -46,7 +46,7 @@ def _load_candidate(
         return prefix
     # The stride fits int32, but candidate * stride can exceed it at large T.
     ptr = block_residual + candidate * stride_block_n.to(gl.int64)
-    return gfx1250.buffer_load(
+    return cdna5.buffer_load(
         ptr,
         (token * stride_block_t + hidden).to(gl.int32),
         mask=hidden_mask,
@@ -84,21 +84,21 @@ def _attn_res_rmsnorm_kernel(
     hidden = gl.arange(0, _BLOCK_H, layout=hidden_layout)
     hidden_mask = hidden < H
 
-    prefix = gfx1250.buffer_load(
+    prefix = cdna5.buffer_load(
         layer_residual,
         (token * stride_layer_t + hidden).to(gl.int32),
         mask=hidden_mask,
         other=0.0,
     ).to(gl.float32)
     if HAS_DELTA:
-        prefix += gfx1250.buffer_load(
+        prefix += cdna5.buffer_load(
             delta,
             (token * stride_delta_t + hidden).to(gl.int32),
             mask=hidden_mask,
             other=0.0,
         ).to(gl.float32)
         prefix = prefix.to(layer_residual.dtype.element_ty).to(gl.float32)
-        gfx1250.buffer_store(
+        cdna5.buffer_store(
             prefix.to(layer_residual.dtype.element_ty),
             layer_residual,
             (token * stride_layer_t + hidden).to(gl.int32),
@@ -106,7 +106,7 @@ def _attn_res_rmsnorm_kernel(
         )
     if WRITE_BLOCK:
         block_write_ptr = block_residual + BLOCK_WRITE_IDX * stride_block_n.to(gl.int64)
-        gfx1250.buffer_store(
+        cdna5.buffer_store(
             prefix.to(block_residual.dtype.element_ty),
             block_write_ptr,
             (token * stride_block_t + hidden).to(gl.int32),
@@ -116,13 +116,13 @@ def _attn_res_rmsnorm_kernel(
     if N == 1:
         mixed = prefix
     else:
-        scorer = gfx1250.buffer_load(
+        scorer = cdna5.buffer_load(
             res_weight,
             hidden.to(gl.int32),
             mask=hidden_mask,
             other=0.0,
         ).to(gl.float32)
-        scorer *= gfx1250.buffer_load(
+        scorer *= cdna5.buffer_load(
             score_rms_weight,
             hidden.to(gl.int32),
             mask=hidden_mask,
@@ -158,13 +158,13 @@ def _attn_res_rmsnorm_kernel(
     # Preserve the AttnRes BF16 boundary before output RMSNorm.
     mixed = mixed.to(gl.bfloat16).to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
-    output_weight = gfx1250.buffer_load(
+    output_weight = cdna5.buffer_load(
         output_rms_weight,
         hidden.to(gl.int32),
         mask=hidden_mask,
         other=0.0,
     ).to(gl.float32)
-    gfx1250.buffer_store(
+    cdna5.buffer_store(
         (mixed * inverse_rms * output_weight).to(output.dtype.element_ty),
         output,
         (token * stride_output_t + hidden).to(gl.int32),

@@ -42,8 +42,7 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    # Leave setup and reporting headroom around the simulator's 30-minute run.
-    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 45 || inputs.timeout_minutes }}
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 15 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
