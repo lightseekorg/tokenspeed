@@ -25,11 +25,15 @@ CDNA4-swizzles their ``(E, K / 32, N)`` scales.  Decode can consume those
 existing buffers directly: one wave reduces K for a small output-column block,
 without sorting routes or padding each one to a 64-row grouped GEMM. gfx950's
 native scaled upcast expands each E2M1/UE8M0 tile directly to exact BF16 weight
-values, avoiding scalar nibble and exponent decoding in both GEMVs.
+values, avoiding scalar nibble and exponent decoding in both GEMVs. Its scale
+operand stays compact--one e8m0 byte per 32-value block.
 
 Kimi K3's 1792-byte packed hidden dimension uses a masked 1024-byte W13 tile.
 The 14.3% padded tail is cheaper than five additional loop iterations on
-gfx950; masked values and scales are zero-filled before the reduction.
+gfx950; masked values and scales are zero-filled before the reduction. The
+compact scale tile matters most here: an expanded tile carries a distinct tail
+predicate per weight, which keeps the redundant per-weight scale loads from
+being merged, while a compact one masks whole blocks.
 
 Stage 1 writes one BF16 activated row per local route. Stage 2 visits the original
 top-k slots, skips remote EP ids (``-1``), preserves the per-route BF16 W2
@@ -42,6 +46,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _cdna4_swizzled_mxfp4_scale_offset,
+    _compact_mxfp4_scale_tile,
     _gluon_dot_preshuffled_w_offset,
 )
 
@@ -218,8 +223,14 @@ def _stage1_a16w4_situ_warp_gemv(
     )
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_layout: gl.constexpr = scale_tile[0]
+    SCALE_GROUP: gl.constexpr = scale_tile[1]
+    scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
+    scale_k_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
     offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
     expanded_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=expanded_n_layout)
+    scale_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=scale_n_layout)
 
     packed_k = hidden_dim // 2
     x_row = token.to(gl.int64) * stride_xm
@@ -228,28 +239,35 @@ def _stage1_a16w4_situ_warp_gemv(
     if LINEAR_WEIGHTS and not W13_INTERLEAVED:
         gate_col = offs_n
         up_col = intermediate_dim + offs_n
-        expanded_gate_col = expanded_offs_n
-        expanded_up_col = intermediate_dim + expanded_offs_n
+        scale_gate_col = scale_offs_n
+        scale_up_col = intermediate_dim + scale_offs_n
     else:
         # Triton's SiTU preprocessor and the optional linear interleaved layout
         # store adjacent gate/up output columns.
         gate_col = 2 * offs_n
         up_col = gate_col + 1
-        expanded_gate_col = 2 * expanded_offs_n
-        expanded_up_col = expanded_gate_col + 1
+        scale_gate_col = 2 * scale_offs_n
+        scale_up_col = scale_gate_col + 1
     gate_acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
     up_acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
 
     for kb0 in range(0, packed_k, BLOCK_KB):
         offs_kb = kb0 + gl.arange(0, BLOCK_KB, layout=k_layout)
         expanded_k = 2 * kb0 + gl.arange(0, 2 * BLOCK_KB, layout=expanded_k_layout)
+        scale_k = 2 * kb0 + SCALE_GROUP * gl.arange(
+            0, (2 * BLOCK_KB) // SCALE_GROUP, layout=scale_k_layout
+        )
         if MASK_K_TAIL:
             packed_k_valid = offs_kb < packed_k
             expanded_k_valid = expanded_k < hidden_dim
+            scale_k_valid = scale_k < hidden_dim
         else:
             packed_k_valid = gl.full([BLOCK_KB], True, gl.int1, layout=k_layout)
             expanded_k_valid = gl.full(
                 [2 * BLOCK_KB], True, gl.int1, layout=expanded_k_layout
+            )
+            scale_k_valid = gl.full(
+                [(2 * BLOCK_KB) // SCALE_GROUP], True, gl.int1, layout=scale_k_layout
             )
         x = gl.amd.cdna4.buffer_load(
             ptr=x_ptr,
@@ -270,26 +288,26 @@ def _stage1_a16w4_situ_warp_gemv(
         if LINEAR_WEIGHTS:
             gate_scale_offsets = (
                 scale_expert
-                + expanded_gate_col[:, None].to(gl.int64) * stride_slin
-                + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
+                + scale_gate_col[:, None].to(gl.int64) * stride_slin
+                + (scale_k[None, :] // 32).to(gl.int64) * stride_snb
             )
             up_scale_offsets = (
                 scale_expert
-                + expanded_up_col[:, None].to(gl.int64) * stride_slin
-                + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
+                + scale_up_col[:, None].to(gl.int64) * stride_slin
+                + (scale_k[None, :] // 32).to(gl.int64) * stride_snb
             )
         else:
             gate_scale_offsets = _cdna4_swizzled_mxfp4_scale_offset(
                 scale_expert,
-                expanded_gate_col[:, None],
-                expanded_k[None, :] // 32,
+                scale_gate_col[:, None],
+                scale_k[None, :] // 32,
                 stride_slin,
                 stride_snb,
             )
             up_scale_offsets = _cdna4_swizzled_mxfp4_scale_offset(
                 scale_expert,
-                expanded_up_col[:, None],
-                expanded_k[None, :] // 32,
+                scale_up_col[:, None],
+                scale_k[None, :] // 32,
                 stride_slin,
                 stride_snb,
             )
@@ -310,7 +328,7 @@ def _stage1_a16w4_situ_warp_gemv(
             gl.amd.cdna4.buffer_load(
                 ptr=w13_scale_ptr,
                 offsets=gate_scale_offsets.to(gl.int32),
-                mask=expanded_k_valid[None, :],
+                mask=scale_k_valid[None, :],
                 other=0,
             ),
             gl.bfloat16,
@@ -321,7 +339,7 @@ def _stage1_a16w4_situ_warp_gemv(
             gl.amd.cdna4.buffer_load(
                 ptr=w13_scale_ptr,
                 offsets=up_scale_offsets.to(gl.int32),
-                mask=expanded_k_valid[None, :],
+                mask=scale_k_valid[None, :],
                 other=0,
             ),
             gl.bfloat16,
@@ -418,8 +436,13 @@ def _stage1_a16w4_situ_gdot_gemv(
     packed_k_layout: gl.constexpr = gl.SliceLayout(0, packed_layout)
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_layout: gl.constexpr = scale_tile[0]
+    SCALE_GROUP: gl.constexpr = scale_tile[1]
+    scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
+    scale_k_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
     offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=packed_n_layout)
-    expanded_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=expanded_n_layout)
+    scale_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=scale_n_layout)
 
     packed_k = hidden_dim // 2
     x_row = token.to(gl.int64) * stride_xm
@@ -430,8 +453,12 @@ def _stage1_a16w4_situ_gdot_gemv(
     for kb0 in range(0, packed_k, BLOCK_KB):
         offs_kb = kb0 + gl.arange(0, BLOCK_KB, layout=packed_k_layout)
         expanded_k = 2 * kb0 + gl.arange(0, 2 * BLOCK_KB, layout=expanded_k_layout)
+        scale_k = 2 * kb0 + SCALE_GROUP * gl.arange(
+            0, (2 * BLOCK_KB) // SCALE_GROUP, layout=scale_k_layout
+        )
         packed_k_valid = offs_kb < packed_k
         expanded_k_valid = expanded_k < hidden_dim
+        scale_k_valid = scale_k < hidden_dim
         x = gl.amd.cdna4.buffer_load(
             ptr=x_ptr,
             offsets=(x_row + expanded_k * stride_xk).to(gl.int32),
@@ -453,12 +480,12 @@ def _stage1_a16w4_situ_gdot_gemv(
             ptr=w13_scale_ptr,
             offsets=_cdna4_swizzled_mxfp4_scale_offset(
                 scale_expert,
-                expanded_offs_n[:, None],
-                expanded_k[None, :] // 32,
+                scale_offs_n[:, None],
+                scale_k[None, :] // 32,
                 stride_slin,
                 stride_snb,
             ).to(gl.int32),
-            mask=expanded_k_valid[None, :],
+            mask=scale_k_valid[None, :],
             other=0,
         )
         weight = gl.amd.cdna4.scaled_upcast(
@@ -624,8 +651,14 @@ def _stage2_a16w4_warp_gemv_combine(
     )
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_layout: gl.constexpr = scale_tile[0]
+    SCALE_GROUP: gl.constexpr = scale_tile[1]
+    scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
+    scale_k_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
     offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
     expanded_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=expanded_n_layout)
+    scale_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=scale_n_layout)
     packed_k = intermediate_dim // 2
     acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
 
@@ -652,13 +685,23 @@ def _stage2_a16w4_warp_gemv_combine(
                 expanded_k = 2 * kb0 + gl.arange(
                     0, 2 * BLOCK_KB, layout=expanded_k_layout
                 )
+                scale_k = 2 * kb0 + SCALE_GROUP * gl.arange(
+                    0, (2 * BLOCK_KB) // SCALE_GROUP, layout=scale_k_layout
+                )
                 if MASK_K_TAIL:
                     packed_k_valid = offs_kb < packed_k
                     expanded_k_valid = expanded_k < intermediate_dim
+                    scale_k_valid = scale_k < intermediate_dim
                 else:
                     packed_k_valid = gl.full([BLOCK_KB], True, gl.int1, layout=k_layout)
                     expanded_k_valid = gl.full(
                         [2 * BLOCK_KB], True, gl.int1, layout=expanded_k_layout
+                    )
+                    scale_k_valid = gl.full(
+                        [(2 * BLOCK_KB) // SCALE_GROUP],
+                        True,
+                        gl.int1,
+                        layout=scale_k_layout,
                     )
                 inter = gl.amd.cdna4.buffer_load(
                     ptr=inter_ptr,
@@ -674,14 +717,14 @@ def _stage2_a16w4_warp_gemv_combine(
                 if LINEAR_WEIGHTS:
                     scale_offsets = (
                         scale_expert
-                        + expanded_offs_n[:, None].to(gl.int64) * stride_slin
-                        + (expanded_k[None, :] // 32).to(gl.int64) * stride_snb
+                        + scale_offs_n[:, None].to(gl.int64) * stride_slin
+                        + (scale_k[None, :] // 32).to(gl.int64) * stride_snb
                     )
                 else:
                     scale_offsets = _cdna4_swizzled_mxfp4_scale_offset(
                         scale_expert,
-                        expanded_offs_n[:, None],
-                        expanded_k[None, :] // 32,
+                        scale_offs_n[:, None],
+                        scale_k[None, :] // 32,
                         stride_slin,
                         stride_snb,
                     )
@@ -696,7 +739,7 @@ def _stage2_a16w4_warp_gemv_combine(
                     gl.amd.cdna4.buffer_load(
                         ptr=w2_scale_ptr,
                         offsets=scale_offsets.to(gl.int32),
-                        mask=expanded_k_valid[None, :],
+                        mask=scale_k_valid[None, :],
                         other=0,
                     ),
                     gl.bfloat16,
@@ -767,8 +810,14 @@ def _stage2_a16w4_gdot_gemv_combine(
     packed_k_layout: gl.constexpr = gl.SliceLayout(0, packed_layout)
     expanded_n_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
     expanded_k_layout: gl.constexpr = gl.SliceLayout(0, expanded_layout)
+    scale_tile: gl.constexpr = _compact_mxfp4_scale_tile(expanded_layout, 1)
+    scale_layout: gl.constexpr = scale_tile[0]
+    SCALE_GROUP: gl.constexpr = scale_tile[1]
+    scale_n_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
+    scale_k_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
     offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=packed_n_layout)
     expanded_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=expanded_n_layout)
+    scale_offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=scale_n_layout)
     packed_k = intermediate_dim // 2
     acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
 
@@ -792,8 +841,12 @@ def _stage2_a16w4_gdot_gemv_combine(
                 expanded_k = 2 * kb0 + gl.arange(
                     0, 2 * BLOCK_KB, layout=expanded_k_layout
                 )
+                scale_k = 2 * kb0 + SCALE_GROUP * gl.arange(
+                    0, (2 * BLOCK_KB) // SCALE_GROUP, layout=scale_k_layout
+                )
                 packed_k_valid = offs_kb < packed_k
                 expanded_k_valid = expanded_k < intermediate_dim
+                scale_k_valid = scale_k < intermediate_dim
                 inter = gl.amd.cdna4.buffer_load(
                     ptr=inter_ptr,
                     offsets=(inter_row + expanded_k * stride_ipk).to(gl.int32),
@@ -815,12 +868,12 @@ def _stage2_a16w4_gdot_gemv_combine(
                     ptr=w2_scale_ptr,
                     offsets=_cdna4_swizzled_mxfp4_scale_offset(
                         scale_expert,
-                        expanded_offs_n[:, None],
-                        expanded_k[None, :] // 32,
+                        scale_offs_n[:, None],
+                        scale_k[None, :] // 32,
                         stride_slin,
                         stride_snb,
                     ).to(gl.int32),
-                    mask=expanded_k_valid[None, :],
+                    mask=scale_k_valid[None, :],
                     other=0,
                 )
                 weight = gl.amd.cdna4.scaled_upcast(
