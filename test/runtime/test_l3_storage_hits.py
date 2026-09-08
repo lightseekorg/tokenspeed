@@ -166,6 +166,10 @@ def _spec(rid: str, tokens: list[int]):
     return SimpleNamespace(request_id=rid, tokens=tokens)
 
 
+def _recover_plan(*, remote_prefill):
+    return SimpleNamespace(remote_prefill=remote_prefill)
+
+
 def test_submit_without_l3_still_admits() -> None:
     loop = _Loop(exists_flags=None)
     spec = _spec("r0", [1, 2, 3, 4])
@@ -348,13 +352,67 @@ def test_vanished_l3_prefetch_unregisters_and_retracts(monkeypatch) -> None:
     loop._device.prefetch_ok = False
     forward_op = SimpleNamespace(request_ids=["r0", "r1"])
 
-    events = loop._recover_if_l3_prefetch_failed(SimpleNamespace(), forward_op)
+    events = loop._recover_if_l3_prefetch_failed(
+        _recover_plan(remote_prefill=None), forward_op
+    )
 
     assert loop._device.prefetch_calls == 1
     assert loop._device.invalidations == 1
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
     assert retracts == ["r0", "r1"]
     assert events == ["retract:r0", "retract:r1"]
+
+
+def test_vanished_l3_prefetch_retracts_remote_prefill(monkeypatch) -> None:
+    """D-role admit has no local forward; vanished L3 must still retract."""
+
+    retracts: list[str] = []
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: retracts.append(rid) or f"retract:{rid}",
+    )
+
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = False
+    remote_prefill = SimpleNamespace(request_ids=["r0", "r1"])
+
+    events = loop._recover_if_l3_prefetch_failed(
+        _recover_plan(remote_prefill=remote_prefill), None
+    )
+
+    assert loop._device.prefetch_calls == 1
+    assert loop._device.invalidations == 1
+    assert loop.scheduler.unregistered == ([0], ["h4"], [0])
+    assert retracts == ["r0", "r1"]
+    assert events == ["retract:r0", "retract:r1"]
+
+
+def test_vanished_l3_prefetch_retracts_forward_and_remote_prefill_once(
+    monkeypatch,
+) -> None:
+    """A D-role round may carry both a local decode and a remote admission."""
+
+    retracts: list[str] = []
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.event_loop.make_retract_event",
+        lambda rid: retracts.append(rid) or f"retract:{rid}",
+    )
+
+    loop = _Loop(exists_flags=[True])
+    loop._device.prefetch_pages = True
+    loop._device.prefetch_ok = False
+    forward_op = SimpleNamespace(request_ids=["r1", "r2"])
+    remote_prefill = SimpleNamespace(request_ids=["r0", "r1"])
+
+    events = loop._recover_if_l3_prefetch_failed(
+        _recover_plan(remote_prefill=remote_prefill), forward_op
+    )
+
+    assert retracts == ["r1", "r2", "r0"]
+    assert events == ["retract:r1", "retract:r2", "retract:r0"]
 
 
 def test_failed_l3_prefetch_is_not_reregistered_while_exists_stays_true(
@@ -374,7 +432,7 @@ def test_failed_l3_prefetch_is_not_reregistered_while_exists_stays_true(
     loop._device.prefetch_pages = True
     loop._device.prefetch_ok = False
     events = loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert events
     assert loop.scheduler.unregistered == ([0], ["h4"], [0])
@@ -415,7 +473,7 @@ def test_namespace_delete_forgets_unread_l3_keys(monkeypatch) -> None:
     loop._device.prefetch_pages = True
     loop._device.prefetch_ok = False
     loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert loop._delete_l3_namespace()
     loop.scheduler.registered = None
@@ -449,7 +507,7 @@ def test_prefetch_rpc_error_converges_then_retracts(monkeypatch) -> None:
     loop._device.prefetch_l3_load_backs = boom
     loop._converge_l3_exists = wrapped
     events = loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert probed == [[False]]
     assert events == ["retract:r0"]
@@ -514,7 +572,7 @@ def test_prefetch_length_mismatch_converges_as_misses(monkeypatch) -> None:
 
     loop._converge_l3_exists = wrapped
     events = loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert probed == [[False]]
     assert events == ["retract:r0"]
@@ -527,7 +585,9 @@ def test_l3_prefetch_success_does_not_retract() -> None:
     loop._device.prefetch_ok = True
     forward_op = SimpleNamespace(request_ids=["r0"])
 
-    events = loop._recover_if_l3_prefetch_failed(SimpleNamespace(), forward_op)
+    events = loop._recover_if_l3_prefetch_failed(
+        _recover_plan(remote_prefill=None), forward_op
+    )
 
     assert events == []
     assert loop._device.invalidations == 0
@@ -552,7 +612,7 @@ def test_mixed_l3_prefetch_blacklists_only_failed_pages(monkeypatch) -> None:
 
     loop._device.l3_prefetch_storage_keys = keys
     events = loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert events == ["retract:r0"]
     assert loop.scheduler.unregistered == ([0], ["h5"], [0])
@@ -578,7 +638,7 @@ def test_successful_republish_clears_unread_l3_key(monkeypatch) -> None:
     loop._device.prefetch_pages = True
     loop._device.prefetch_ok = False
     events = loop._recover_if_l3_prefetch_failed(
-        SimpleNamespace(), SimpleNamespace(request_ids=["r0"])
+        _recover_plan(remote_prefill=None), SimpleNamespace(request_ids=["r0"])
     )
     assert events
     assert loop._device.l3_key_is_unread(0, "h4", 0) is True

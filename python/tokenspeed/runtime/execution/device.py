@@ -264,7 +264,11 @@ class DeviceHandle:
     # ------------------------------------------------------------------
 
     def execute(
-        self, execution_plan, planned: "PlannedForward | None"
+        self,
+        execution_plan,
+        planned: "PlannedForward | None",
+        *,
+        submit_remote_prefill: bool,
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
@@ -274,7 +278,9 @@ class DeviceHandle:
         bytes), then page zeroing (the new owner's sanitization), then
         load-backs (they target zeroed pages), the transfer peer's remote
         streams, and finally the ``ForwardBatch``. The loop hands the round
-        over and does not branch on it.
+        over and does not branch on it, except withholding
+        ``plan.remote_prefill`` after vanished-L3 recovery — the same
+        snapshot-less retract that skips the model forward.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
@@ -288,6 +294,11 @@ class DeviceHandle:
                 collective. Either way the plan's page zeroing and cache
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
+            submit_remote_prefill: Whether to submit ``plan.remote_prefill``.
+                False after vanished-L3 recovery: those requests retract
+                snapshot-less, and pulling suffix-only KV onto empty prefix
+                pages would land invalid cache on the decode node. Cache
+                ops still run so LoadBackDone can unpin without publishing.
 
         Returns:
             The submitted forward's ``PendingExecution``, or None on rounds
@@ -340,7 +351,7 @@ class DeviceHandle:
                 self._thread.submit(lambda: peer.execute(remote_decode))
             )
         remote_prefill = execution_plan.remote_prefill
-        if remote_prefill is not None:
+        if remote_prefill is not None and submit_remote_prefill:
             # D role: the prompt prefills on the peer; pull its KV into the
             # pages this plan admitted (and may be zeroing).
             self._transfer_submissions.append(

@@ -43,7 +43,10 @@ the admitted prompt's KV in), `plan.remote_decode` the peer's on a P node
 (the completed prompt decodes over there, so its KV goes out). The remote
 streams ride beside whatever forward work the round schedules, occupy no
 batch slot, and go out even on rounds with no batch at all — everything
-dispatchable dispatches in one round. The transfer moves
+dispatchable dispatches in one round. Vanished-L3 recovery is the one
+withhold: it retracts `plan.remote_prefill` request ids with the local
+forward and does not submit that stream, so the peer cannot land
+suffix-only KV on empty prefix pages. The transfer moves
 KV-pool device memory over RDMA rather than through a CUDA kernel, but it
 needs the same ordering against forwards and page zeroing — so its execution
 face lives behind the handle too, attached once at startup. Its control face
@@ -331,6 +334,11 @@ For orientation, one iteration of `event_loop`:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,
   snapshot-less retract of the batch so the next admit recomputes.
+  D-role admit rides `plan.remote_prefill` with no local forward: those
+  request ids retract with the same events, and the loop withholds that
+  stream from `DeviceHandle.execute` so the peer does not land
+  suffix-only KV on empty prefix pages. Cache ops still run so
+  LoadBackDone can unpin without publishing.
   Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
   cannot re-register them; only the replica-converged misses are
   blacklisted, so a restored prefix page stays readable. Replica

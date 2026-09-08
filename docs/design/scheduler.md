@@ -329,7 +329,9 @@ pages to load back, so it re-prefills through the ordinary admission path
 a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
 not filled, so publishing would cache empty KV; the request re-prefills
 the same way. Mixed partners in that forward retract together so ranks
-stay aligned, and the client is not failed. There is no queue to keep in
+stay aligned, and a D-role `plan.remote_prefill` admission retracts with
+them — the peer pull is withheld so suffix-only KV cannot land on empty
+prefix pages. The client is not failed. There is no queue to keep in
 step with the FSM: a request that finishes or aborts while retracted
 simply stops qualifying, with no bookkeeping to prune.
 

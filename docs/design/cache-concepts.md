@@ -533,7 +533,10 @@ Its responsibilities:
   skips publishing empty Host pages (`LoadBackDone.success=false`),
   skips Device prefix publication for those prefetch destinations,
   skips the model forward, and retracts the batch snapshot-less so the
-  next admit recomputes those tokens. A backend exception or malformed
+  next admit recomputes those tokens. D-role admit rides
+  `plan.remote_prefill` with no local forward: those request ids retract
+  on the same path, and the loop withholds that stream from execute so
+  the peer does not land suffix-only KV on empty prefix pages. A backend exception or malformed
   result is converted to a local miss before that MIN-reduce so a
   faulted rank cannot skip the collective and hang healthy peers. Only
   pages whose replica-converged `batch_get_into` missed stay

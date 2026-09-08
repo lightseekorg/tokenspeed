@@ -48,9 +48,10 @@ class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned):
+    def execute(self, execution_plan, planned, *, submit_remote_prefill: bool):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
+        del submit_remote_prefill
         if execution_plan.pages_to_zero or execution_plan.cache or planned:
             self._trace.append("execute")
         return None

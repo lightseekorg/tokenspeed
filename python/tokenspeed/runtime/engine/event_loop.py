@@ -653,7 +653,11 @@ class EventLoop:
         while a peer still blacklists it. A later Host backup forgets an
         unread entry only when this put created a missing object. The whole
         forward is skipped so ranks stay aligned; mixed prefill/decode
-        partners retract rather than finish with an error.
+        partners retract rather than finish with an error. D-role admit
+        rides ``plan.remote_prefill`` with no local forward: those request
+        ids retract on the same path, and the loop withholds that stream
+        from ``DeviceHandle.execute`` so the peer does not land suffix-only
+        KV on empty prefix pages.
         """
 
         if not self._enable_l3_storage:
@@ -687,9 +691,20 @@ class EventLoop:
                 failed_groups, failed_hashes, failed_offsets
             )
         retracted = []
-        if forward_op is not None:
-            for rid in forward_op.request_ids:
+        seen = set()
+
+        def _retract(request_ids) -> None:
+            for rid in request_ids:
+                if rid in seen:
+                    continue
+                seen.add(rid)
                 retracted.append(make_retract_event(rid))
+
+        if forward_op is not None:
+            _retract(forward_op.request_ids)
+        remote_prefill = execution_plan.remote_prefill
+        if remote_prefill is not None:
+            _retract(remote_prefill.request_ids)
         logger.warning(
             "L3 prefetch missed after admit; unregistered %s key(s) and "
             "retracted %s request(s) for recompute",
@@ -1262,6 +1277,8 @@ class EventLoop:
                         # Replica-wide miss: skip the model forward so ranks
                         # do not attend over empty dest pages. Cache ops still
                         # run so LoadBackDone can unpin without publishing.
+                        # D-role ``plan.remote_prefill`` is withheld below so
+                        # the peer does not land suffix-only KV on those pages.
                         forward_op = None
                     stats = self._get_scheduler_stats()
                     self.load_reporter.observe(stats, self._num_running())
@@ -1326,7 +1343,11 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan,
+                        planned,
+                        submit_remote_prefill=not l3_prefetch_retracts,
+                    )
                     if idle_round:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:

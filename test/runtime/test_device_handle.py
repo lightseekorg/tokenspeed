@@ -256,7 +256,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
         ("zero", tuple(pages))
     )
 
-    handle.execute(plan, None)
+    handle.execute(plan, None, submit_remote_prefill=True)
 
     assert trace == [
         "submit",
@@ -279,7 +279,7 @@ def test_page_zeroing_without_l2_orders_after_previous_forward():
         ("zero", tuple(pages))
     )
 
-    handle.execute(_plan(pages_to_zero=[3, 4]), None)
+    handle.execute(_plan(pages_to_zero=[3, 4]), None, submit_remote_prefill=True)
 
     assert trace == ["submit", "cache_fence", ("zero", (3, 4))]
 
@@ -288,7 +288,7 @@ def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
     handle = _handle(trace, l2_cache_executor=SimpleNamespace())
 
-    handle.execute(_plan(), None)
+    handle.execute(_plan(), None, submit_remote_prefill=True)
 
     assert trace == []
 
@@ -311,7 +311,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=["op"]), None)
+    handle.execute(_plan(cache=["op"]), None, submit_remote_prefill=True)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
@@ -365,10 +365,11 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     chunk = _planned(num_extends=1, label="CHUNK")
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    handle.execute(_plan(), chunk)
+    handle.execute(_plan(), chunk, submit_remote_prefill=True)
     handle.execute(
         _plan(remote_decode=remote_decode),
         None,
+        submit_remote_prefill=True,
     )
 
     # Arming is enqueued before the forward it arms; the send follows the
