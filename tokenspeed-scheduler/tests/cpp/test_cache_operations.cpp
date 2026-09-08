@@ -873,7 +873,8 @@ TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
     BlockPool host_pool{2};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kSlidingWindow,
-        .sliding_window = 3,
+        // Resuming needs ceil((window - 1) / block_granularity) == 2 pages.
+        .sliding_window = 5,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};

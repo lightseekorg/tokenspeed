@@ -23,7 +23,8 @@ When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
 (the identity boundary every group's `block_granularity` divides).
 `acquireHostWithKeys` re-runs the non-prefix-closed matcher at that bound
 and reconverges the groups: truncating a sliding-window or Mamba hits
-mask (for example `[0, 1, 1]` to `[0, 1]`) can leave the first live
+mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
+two-token blocks requiring two lookback pages) can leave the first live
 lookback page as a hole, and a full re-probe would see the same L3 keys
 as a complete hit again. `schedulePrefillFirstChunk` then frees that
 attempt — including the discarded `AdmissionResult`, whose `load_pairs`
