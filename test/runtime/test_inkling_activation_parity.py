@@ -315,6 +315,11 @@ class _Harness:
         # set_cache_pool would.
         for leaf in leaves.values():
             leaf.set_cache_pool(self.kv_pool)
+        # Production binds each layer's cache group from the pool's plan
+        # (bind_cache_groups); this harness plans a plain pool and hand-binds
+        # the router per label, so stamp the labels the same way.
+        for layer_id, layer in enumerate(self.model.model.layers):
+            layer.attn.attn.bind_cache_group(text.cache_layer_types[layer_id])
         self.backend.init_cuda_graph_state(max_bs=4)
 
     def _ctx(self, mode):

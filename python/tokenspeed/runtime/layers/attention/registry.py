@@ -352,7 +352,7 @@ def _has_state_layers(config: AttnConfig) -> bool:
         return False
     return any(
         layer_type in STATE_LAYER_TYPES
-        for layer_type in config.component(SoftmaxAttnConfig).layer_types
+        for layer_type in config.component(SoftmaxAttnConfig).cache_layer_types
     )
 
 

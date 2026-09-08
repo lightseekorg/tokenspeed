@@ -102,14 +102,14 @@ def aligned_max_scheduled_tokens(
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
-    Recurrent-state groups (family=State, retention=FullHistory — the C++
-    ``final_state_manager`` criterion) register their state snapshot only when
-    a prefill chunk ends exactly on a CacheBlock boundary
-    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
-    state write. A chunk size that is not a multiple of every such group's
-    CacheBlock token span therefore never registers a state block. Since the
-    admission probe takes the minimum hit across groups, prefix-cache reuse
-    silently degrades to zero for the whole model.
+    Recurrent-state groups (family=State, the C++ ``IsSnapshotStateGroup``
+    criterion) register their state snapshot only when a prefill chunk ends
+    exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
+    interior boundaries never received a state write. A chunk size that is
+    not a multiple of every such group's CacheBlock token span therefore
+    never registers a state block. Since the admission probe takes the
+    minimum hit across groups, prefix-cache reuse silently degrades to zero
+    for the whole model.
 
     Args:
         max_scheduled_tokens: Requested per-step token budget
@@ -131,12 +131,7 @@ def aligned_max_scheduled_tokens(
     for group in cache_groups or ():
         if group.family != CacheGroupFamily.State:
             continue
-        if group.retention == CacheRetention.SlidingWindow:
-            continue
-        grain = math.lcm(
-            grain,
-            int(group.rows_per_page) * int(group.entry_stride_tokens),
-        )
+        grain = math.lcm(grain, int(group.block_granularity))
     if grain == 1:
         return max_scheduled_tokens
     if max_scheduled_tokens < grain:
@@ -227,19 +222,11 @@ def pool_to_cache_groups(pool: Any) -> list:
                 f"pool_to_cache_groups: unsupported family "
                 f"{spec.family!r} for group {spec.group_id!r}"
             )
-        # The C++ scheduler config only carries row geometry. A snapshot-state
-        # group folds to (rows=checkpoint_granularity, stride=1) at this single
-        # mapping point; both encode the same block_granularity.
-        if spec.checkpoint_granularity is not None:
-            rows_per_page = int(spec.checkpoint_granularity)
-            entry_stride_tokens = 1
-        else:
-            rows_per_page = int(spec.rows_per_page)
-            entry_stride_tokens = int(spec.entry_stride_tokens)
+        # The declaration shape (row geometry or state checkpoint) stops here:
+        # the scheduler only learns how many tokens one block-table slot spans.
         kwargs = dict(
             group_id=spec.group_id,
-            rows_per_page=rows_per_page,
-            entry_stride_tokens=entry_stride_tokens,
+            block_granularity=int(spec.block_granularity),
             total_pages=int(counts[spec.group_id]),
             retention=retention,
             family=family,

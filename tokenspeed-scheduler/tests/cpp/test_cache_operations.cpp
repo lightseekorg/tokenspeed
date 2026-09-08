@@ -102,8 +102,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
-            .rows_per_page = 2,
-            .entry_stride_tokens = 1,
+            .block_granularity = 2,
             .total_pages = 4,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -132,8 +131,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
-            .rows_per_page = 2,
-            .entry_stride_tokens = 1,
+            .block_granularity = 2,
             .total_pages = 9,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -346,8 +344,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     config.role = Role::kD;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
@@ -374,8 +371,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.role = Role::kP;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
@@ -402,8 +398,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
     config.enable_l3_storage = true;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
@@ -421,8 +416,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     config.enable_l3_storage = true;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,

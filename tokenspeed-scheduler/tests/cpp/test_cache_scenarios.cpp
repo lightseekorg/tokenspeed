@@ -70,8 +70,7 @@ CacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity
                            std::int32_t sliding_window_tokens = 0) {
     CacheGroupConfig g;
     g.group_id = id;
-    g.rows_per_page = block_granularity;
-    g.entry_stride_tokens = 1;
+    g.block_granularity = block_granularity;
     g.total_pages = total_pages;
     g.retention = retention;
     g.family = family;
@@ -114,7 +113,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -644,10 +643,10 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa_small", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
             MakeGroup("swa_big", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/8),
         };
         return cfg;
@@ -705,10 +704,10 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa_w3", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/3),
             MakeGroup("swa_w5", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/5),
         };
         return cfg;
@@ -840,7 +839,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -1020,7 +1019,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -1134,7 +1133,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/2),
         };
         return cfg;
@@ -1206,7 +1205,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -1272,7 +1271,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -2378,7 +2377,7 @@ TEST_F(RetractExactFitSuite, ReportsSingleRequestTokenCapacity) {
 
 TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
     SchedulerConfig config = MakeConfig();
-    config.cache_groups[1].rows_per_page = 1;
+    config.cache_groups[1].block_granularity = 1;
     Scheduler scheduler{std::move(config)};
 
     // Eight parents fit ceil(tokens / 2) pages for the first group and one
@@ -2408,13 +2407,12 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
 
     CacheGroupConfig sliding;
     sliding.group_id = "sliding";
-    sliding.rows_per_page = 2;  // group q=2 while scheduler P=4
-    sliding.entry_stride_tokens = 1;
-    sliding.total_pages = 5;  // null + two parents packing two children each
+    sliding.block_granularity = 2;  // group q=2 while scheduler P=4
+    sliding.total_pages = 5;        // null + two parents packing two children each
     sliding.cache_blocks_per_lcm_block = 2;
     sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
     sliding.sliding_window_tokens = 4;
-    sliding.family = CacheGroupFamily::State;
+    sliding.family = CacheGroupFamily::History;
     sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
     cfg.cache_groups = {sliding};
 
@@ -3128,7 +3126,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State, SlidingWindowTokens()),
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History, SlidingWindowTokens()),
         };
         return cfg;
     }
@@ -3453,7 +3451,7 @@ protected:
         CacheGroupConfig history = MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages,
                                              CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History);
         CacheGroupConfig state = MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages,
-                                           CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                                           CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                                            /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;
         cfg.cache_groups = {history, state};
@@ -4013,7 +4011,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -4739,7 +4737,7 @@ TEST_F(SchedulerTestSuite, WaitingPrefixHashesSkipWhenPoolCannotAdmit) {
         MakeGroup("full", /*block_granularity=*/2, config_.device_allocator.total_pages,
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         MakeGroup("swa", /*block_granularity=*/2, config_.device_allocator.total_pages,
-                  CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                  CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                   /*sliding_window_tokens=*/4),
     };
     scheduler_ = std::make_unique<Scheduler>(config_);

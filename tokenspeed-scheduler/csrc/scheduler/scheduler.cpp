@@ -86,7 +86,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.prefix_granularity / group.BlockGranularity();
+        const std::int32_t child_entries = config_.prefix_granularity / group.block_granularity;
         if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
             throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
         }

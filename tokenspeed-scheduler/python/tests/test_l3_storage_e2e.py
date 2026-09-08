@@ -53,8 +53,7 @@ def _l3_config(
     groups = [
         ts.CacheGroupConfig(
             group_id="full",
-            rows_per_page=cfg.prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.History,
@@ -64,12 +63,11 @@ def _l3_config(
         groups.append(
             ts.CacheGroupConfig(
                 group_id="swa",
-                rows_per_page=cfg.prefix_granularity,
-                entry_stride_tokens=1,
+                block_granularity=cfg.prefix_granularity,
                 total_pages=cfg.num_device_pages,
                 retention=ts.CacheRetention.SlidingWindow,
                 sliding_window_tokens=4,
-                family=ts.CacheGroupFamily.State,
+                family=ts.CacheGroupFamily.History,
             )
         )
     cfg.cache_groups = groups
@@ -194,16 +192,14 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="full_fine",
-            rows_per_page=2,
-            entry_stride_tokens=1,
+            block_granularity=2,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.History,
         ),
         ts.CacheGroupConfig(
             group_id="full_coarse",
-            rows_per_page=4,
-            entry_stride_tokens=1,
+            block_granularity=4,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.History,
@@ -258,20 +254,18 @@ def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="full",
-            rows_per_page=cfg.prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.History,
         ),
         ts.CacheGroupConfig(
             group_id="swa",
-            rows_per_page=cfg.prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
-            family=ts.CacheGroupFamily.State,
+            family=ts.CacheGroupFamily.History,
         ),
     ]
     scheduler = ts.Scheduler(cfg)

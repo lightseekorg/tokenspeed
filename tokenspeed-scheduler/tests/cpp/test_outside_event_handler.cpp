@@ -242,8 +242,7 @@ protected:
 
         CacheGroupConfig full;
         full.group_id = "full";
-        full.rows_per_page = cfg.prefix_granularity;
-        full.entry_stride_tokens = 1;
+        full.block_granularity = cfg.prefix_granularity;
         full.total_pages = cfg.device_allocator.total_pages;
         full.retention = CacheGroupConfig::Retention::FullHistory;
         full.family = CacheGroupFamily::History;
@@ -791,7 +790,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
         auto& state = cfg.cache_groups[1];
-        state.rows_per_page = 1;
+        state.block_granularity = 1;
         state.total_pages = 13;
         state.cache_blocks_per_lcm_block = 2;
         return cfg;
@@ -822,12 +821,11 @@ protected:
 
         CacheGroupConfig sliding;
         sliding.group_id = "sliding";
-        sliding.rows_per_page = 2;
-        sliding.entry_stride_tokens = 1;
+        sliding.block_granularity = 2;
         sliding.total_pages = cfg.device_allocator.total_pages;
         sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
         sliding.sliding_window_tokens = 4;
-        sliding.family = CacheGroupFamily::State;
+        sliding.family = CacheGroupFamily::History;
         sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {sliding};
         return cfg;

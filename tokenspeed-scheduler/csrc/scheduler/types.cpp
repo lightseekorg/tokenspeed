@@ -30,7 +30,7 @@ namespace {
 void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group) {
     group.Validate();
     const std::string where = "Cache group '" + group.group_id + "': ";
-    if (config.prefix_granularity % group.BlockGranularity() != 0) {
+    if (config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
     if (config.role == Role::kFused) {

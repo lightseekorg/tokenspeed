@@ -29,6 +29,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.mla import (
     resolve_mla_kv_cache_dtype,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.models.dspark import _get_markov_params
@@ -329,12 +330,13 @@ def test_block_draft_shares_the_targets_retention() -> None:
     Its KV rows are written at the target's cache locations, so they live and
     die with the target's pages; a sliding cache group of its own would both
     evict rows the target still owns and collide with the target's planes.
+    The storage labels say so explicitly: every draft layer is full-history.
     """
     spec = _draft_attn_config("DSPARK", ("sliding_attention",) * 6).component(
         SoftmaxAttnConfig
     )
 
-    assert spec.layer_types == ()
+    assert spec.cache_layer_types == (FULL_ATTENTION,) * 6
     assert spec.sliding_window_tokens is None
 
 
@@ -343,7 +345,7 @@ def test_a_non_block_draft_keeps_its_own_labels() -> None:
         SoftmaxAttnConfig
     )
 
-    assert spec.layer_types == ("sliding_attention",) * 6
+    assert spec.cache_layer_types == ("sliding_attention",) * 6
     assert spec.sliding_window_tokens == 1024
 
 

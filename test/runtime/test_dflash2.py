@@ -39,7 +39,6 @@ from tokenspeed.runtime.execution.drafter.dflash2 import (
     DFlash2,
     _walk_greedy_path,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
@@ -112,9 +111,11 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
         ({}, -1),
     ),
 )
-def test_block_drafter_uses_full_cache_group_regardless_of_sliding_mask(
+def test_block_drafter_declares_only_its_sliding_mask(
     attention_config: dict[str, object], expected_sliding_window: int
 ) -> None:
+    """The draft layer states its compute visibility and nothing about
+    storage: the cache plan binds it to the target's full-history group."""
     config = SimpleNamespace(
         hidden_size=64,
         num_attention_heads=4,
@@ -147,7 +148,7 @@ def test_block_drafter_uses_full_cache_group_regardless_of_sliding_mask(
             prefix="",
         )
 
-    assert paged_attention.call_args.kwargs["group_id"] == FULL_ATTENTION
+    assert "group_id" not in paged_attention.call_args.kwargs
     assert (
         paged_attention.call_args.kwargs["sliding_window_size"]
         == expected_sliding_window

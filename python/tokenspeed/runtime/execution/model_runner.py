@@ -93,9 +93,6 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
-        self.sliding_window_size = getattr(
-            model_config.hf_config, "sliding_window", None
-        )
 
         draft_moe_override = (
             self.is_draft_worker

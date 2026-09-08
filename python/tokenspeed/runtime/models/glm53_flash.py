@@ -58,7 +58,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -929,10 +928,6 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
             alt_stream=alt_stream,
             skip_rope=True,
         )
-        # DSA uses the same latent-history cache group as K3 MLA. The inherited
-        # PagedAttention modules are created without a group id.
-        self.attn_mqa.group_id = FULL_ATTENTION
-        self.attn_mha.group_id = FULL_ATTENTION
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=1e-6)
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=1e-6)
         self.fused_qk_layernorm = FusedRMSNorm(

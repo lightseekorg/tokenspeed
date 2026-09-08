@@ -33,7 +33,6 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -42,7 +41,10 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -52,10 +54,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class DFlashAttention(nn.Module):
-    # Block drafters share the target's cache locations. A sliding window is
-    # their compute mask, not a separate cache-retention group.
-    cache_group_id = FULL_ATTENTION
-
     def __init__(
         self,
         config,
@@ -137,7 +135,6 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
-            group_id=self.cache_group_id,
         )
 
     def _apply_qk_norm(
@@ -570,8 +567,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
             "DFLASH sliding_attention layers require config.sliding_window."
         )
 
-    # HF sliding windows include the current token; TokenSpeed stores window_left.
-    return int(sliding_window) - 1
+    return hf_sliding_window_to_window_left(sliding_window)
 
 
 def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:
