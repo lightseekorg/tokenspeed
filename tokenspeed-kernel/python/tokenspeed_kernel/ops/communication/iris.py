@@ -410,15 +410,24 @@ class IrisAllReduce(object):
             all_reduce_distribution=1,
         )
 
+        # Whether this state can ever dispatch a two-stage reduction. Both the
+        # kernel's CDNA4 intrinsics and its partitioning are fixed properties of
+        # the state, so deciding once here keeps the buffers, the heap estimate
+        # and the dispatch from disagreeing.
+        self._two_stage_supported = _platform.is_cdna4 and group.size() in (4, 8)
+
         # Leave generous heap headroom for the symmetric input and Iris
         # bookkeeping such as ring/spinlock flags.
         if heap_size is None:
             buf_bytes = max_numel * dtype.itemsize
             # _input_buf, _attnres_input_buf (2), _producer_direct_scratch_buf,
-            # the staged path's rotating slots (_STAGED_SLOTS), the two-stage
-            # path's single staging buffer, and its scratch partition --
-            # counted as a whole buffer since world_size is not known yet.
-            heap_size = max(1 << 28, (6 + _STAGED_SLOTS) * buf_bytes + (16 << 20))
+            # and the staged path's rotating slots (_STAGED_SLOTS).
+            buffers = 4 + _STAGED_SLOTS
+            if self._two_stage_supported:
+                # its staging buffer, plus the scratch partition counted as a
+                # whole buffer rather than 1/world_size
+                buffers += 2
+            heap_size = max(1 << 28, buffers * buf_bytes + (16 << 20))
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -460,12 +469,21 @@ class IrisAllReduce(object):
         # survive graph capture, which records the staging copy's address and
         # replays it unchanged. The kernel's exit barrier is what makes one
         # buffer safe -- see EXIT_BARRIER.
-        self._two_stage_input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
-        # Each rank reduces only its own partition and peers read it at the same
-        # offset, so scratch holds one partition rather than the whole payload.
-        self._two_stage_scratch_buf = self._ctx.zeros(
-            (max_numel // self.world_size,), dtype=dtype
-        )
+        #
+        # Skipped entirely where dispatch could never reach them: a CDNA3 part
+        # or a group of some other size would otherwise reserve a payload
+        # buffer and a scratch partition it can never use, and an explicit
+        # heap_size sized for the previous allocations would fail to fit them.
+        if self._two_stage_supported:
+            self._two_stage_input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
+            # Each rank reduces only its own partition and peers read it at the
+            # same offset, so scratch holds one partition, not the whole payload.
+            self._two_stage_scratch_buf = self._ctx.zeros(
+                (max_numel // self.world_size,), dtype=dtype
+            )
+        else:
+            self._two_stage_input_buf = None
+            self._two_stage_scratch_buf = None
         self._producer_direct_block_size = 512
         # Use one program per tile for small payloads, capped to limit contention.
         self._producer_direct_max_programs = 84
@@ -478,9 +496,13 @@ class IrisAllReduce(object):
         # Separate epochs from the producer-direct reduce: in a tensor-parallel
         # MoE both collectives run inside one layer, and a shared counter would
         # let one path's epoch satisfy the other's barrier.
-        self._two_stage_ready_flags = self._ctx.zeros(
-            (self._producer_direct_max_programs, self.world_size),
-            dtype=torch.int32,
+        self._two_stage_ready_flags = (
+            self._ctx.zeros(
+                (self._producer_direct_max_programs, self.world_size),
+                dtype=torch.int32,
+            )
+            if self._two_stage_supported
+            else None
         )
         heap_bases = self._ctx.get_heap_bases()
         self._group_heap_bases = heap_bases[group_ranks].contiguous()
@@ -529,7 +551,7 @@ class IrisAllReduce(object):
         # The two-stage kernel stores through a CDNA4 buffer intrinsic, so it is
         # gated the same way the producer-direct reduce is; older AMD parts keep
         # the portable one-shot path.
-        if _platform.is_cdna4 and _use_two_stage_plain(
+        if self._two_stage_supported and _use_two_stage_plain(
             self.world_size, numel, self.dtype
         ):
             return self._all_reduce_two_stage(tensor, numel, safe=safe)
