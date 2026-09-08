@@ -943,6 +943,9 @@ def build_device_side(
                 hf_config=model_config.hf_config,
                 revision=str(model_config.revision or ""),
                 load_format=str(server_args.load_format),
+                # LoadConfig currently gets the same empty extra-config;
+                # both must stay aligned if a shard pattern is wired through.
+                model_loader_extra_config={},
             )
             if draft_model_config is not None:
                 draft_revision = l3_checkpoint_id(
@@ -950,6 +953,7 @@ def build_device_side(
                     hf_config=draft_model_config.hf_config,
                     revision=str(draft_model_config.revision or ""),
                     load_format=str(server_args.load_format),
+                    model_loader_extra_config={},
                 )
             else:
                 draft_revision = ""

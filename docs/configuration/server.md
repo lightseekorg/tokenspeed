@@ -329,8 +329,9 @@ config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
 `refs` directory (a directory merely named `snapshots` is fingerprinted)
 — plus `--load-format` so a directory that contains
 more than one weight encoding cannot share objects across loaders
-(`sharded_state` combines every rank's local `model-rank-*-part-*`
-digest, not only rank 0's), and
+(`sharded_state` combines every rank's local files matching the
+configured shard pattern, default `model-rank-*-part-*`, not only rank
+0's; `npcache` fingerprints the NumPy cache when present), and
 `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity

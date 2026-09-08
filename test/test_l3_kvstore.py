@@ -143,6 +143,7 @@ class StorageKeyTest(unittest.TestCase):
             hf_config=hf_config,
             revision=revision,
             load_format=load_format,
+            model_loader_extra_config={},
         )
 
     def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
@@ -540,6 +541,95 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
 
+    def test_checkpoint_id_fingerprints_sharded_state_pattern_files(self):
+        """Custom shard patterns must hash the files the loader would open."""
+
+        from tokenspeed.runtime.cache.l3 import backend as l3_backend
+
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "config.json"), "w") as handle:
+                handle.write("{}")
+            default_shard = os.path.join(directory, "model-rank-0-part-0.safetensors")
+            alt_shard = os.path.join(directory, "alt-rank-0-part-0.bin")
+            with open(default_shard, "wb") as handle:
+                handle.write(b"default-shard")
+            with open(alt_shard, "wb") as handle:
+                handle.write(b"alt-shard-a")
+            default_id = l3_checkpoint_id(
+                directory,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="sharded_state",
+                model_loader_extra_config={},
+            )
+            extra = {"pattern": "alt-rank-{rank}-part-{part}.bin"}
+            alt_id = l3_checkpoint_id(
+                directory,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="sharded_state",
+                model_loader_extra_config=extra,
+            )
+            self.assertNotEqual(default_id, alt_id)
+            with open(default_shard, "wb") as handle:
+                handle.write(b"default-shard-changed")
+            l3_backend._local_checkpoint_fingerprint.cache_clear()
+            self.assertEqual(
+                alt_id,
+                l3_checkpoint_id(
+                    directory,
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                    load_format="sharded_state",
+                    model_loader_extra_config=extra,
+                ),
+            )
+            with open(alt_shard, "wb") as handle:
+                handle.write(b"alt-shard-b")
+            l3_backend._local_checkpoint_fingerprint.cache_clear()
+            self.assertNotEqual(
+                alt_id,
+                l3_checkpoint_id(
+                    directory,
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                    load_format="sharded_state",
+                    model_loader_extra_config=extra,
+                ),
+            )
+
+    def test_checkpoint_id_fingerprints_npcache_numpy_files(self):
+        """When np/ exists, npcache loads it and must not hash only *.bin."""
+
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, np_payload in ((first, b"np-a"), (second, b"np-b")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write("{}")
+                with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
+                    handle.write(b"same-bin")
+                os.makedirs(os.path.join(directory, "np"))
+                with open(
+                    os.path.join(directory, "np", "weight_names.json"),
+                    "w",
+                ) as handle:
+                    handle.write('["w"]')
+                with open(os.path.join(directory, "np", "w"), "wb") as handle:
+                    handle.write(np_payload)
+            self.assertNotEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="npcache",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="npcache",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
     def test_checkpoint_id_fingerprints_mistral_shard_index(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             for directory, mapped in (
@@ -594,6 +684,10 @@ class StorageKeyTest(unittest.TestCase):
         signature = inspect.signature(l3_checkpoint_id)
         self.assertIs(
             signature.parameters["load_format"].default, inspect.Parameter.empty
+        )
+        self.assertIs(
+            signature.parameters["model_loader_extra_config"].default,
+            inspect.Parameter.empty,
         )
         with self.assertRaises(TypeError):
             l3_checkpoint_id(
@@ -711,6 +805,7 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="main",
                 load_format="auto",
+                model_loader_extra_config={},
             )
 
     def test_cache_quantization_id_hashes_scale_file_contents(self):

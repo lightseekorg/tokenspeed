@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import glob
 import hashlib
 import json
 import os
@@ -50,9 +51,12 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "mistral": (("consolidated*.safetensors",),),
     "pt": (("*.pt",),),
     "npcache": (("*.bin",),),
-    "sharded_state": (("model-rank-*-part-*.safetensors",), ("*.safetensors",)),
+    "sharded_state": (("model-rank-*-part-*.safetensors",),),
     "dummy": (),
 }
+# Keep in lockstep with ShardedStateLoader.DEFAULT_PATTERN.
+_SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
+_SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
 
 
 def resolve_l3_weight_version(
@@ -185,6 +189,7 @@ def l3_checkpoint_id(
     hf_config: Any,
     revision: str,
     load_format: str,
+    model_loader_extra_config: dict,
 ) -> str:
     """Return an immutable identity for the loaded checkpoint bytes.
 
@@ -202,7 +207,12 @@ def l3_checkpoint_id(
     ``*.py`` (top-level modules and imported package subdirectories) so
     ``--trust-remote-code`` configuration/modeling helpers that derive
     architecture fields cannot share a namespace with identical
-    JSON/weights. Hugging Face hub ids still prefer the
+    JSON/weights. ``sharded_state`` fingerprints the files
+    ``model_loader_extra_config["pattern"]`` selects
+    (``ShardedStateLoader.DEFAULT_PATTERN`` when unset), not leftover
+    default-named shards. ``npcache`` fingerprints ``np/weight_names.json``
+    and the listed NumPy files when that cache exists, because the loader
+    then skips the ``*.bin`` bytes. Hugging Face hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
     pinned ``--revision``. The returned id always includes the
     normalized load format so two deployments that share a directory
@@ -210,29 +220,44 @@ def l3_checkpoint_id(
     ``.pt`` sets cannot restore each other's KV.
     """
 
+    if not isinstance(model_loader_extra_config, dict):
+        raise TypeError("model_loader_extra_config must be a dict")
+    extra_json = json.dumps(
+        model_loader_extra_config, sort_keys=True, separators=(",", ":")
+    )
     fmt = _normalize_load_format(load_format)
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:
-            return _checkpoint_id_with_load_format(snapshot, load_format=fmt)
+            return _checkpoint_id_with_load_format(
+                snapshot, load_format=fmt, extra_config=model_loader_extra_config
+            )
         return _checkpoint_id_with_load_format(
-            "local-" + _local_checkpoint_fingerprint(model_path, fmt),
+            "local-" + _local_checkpoint_fingerprint(model_path, fmt, extra_json),
             load_format=fmt,
+            extra_config=model_loader_extra_config,
         )
     commit = getattr(hf_config, "_commit_hash", None)
     if isinstance(commit, str) and _HF_COMMIT_HASH_RE.fullmatch(commit):
-        return _checkpoint_id_with_load_format(commit, load_format=fmt)
+        return _checkpoint_id_with_load_format(
+            commit, load_format=fmt, extra_config=model_loader_extra_config
+        )
     model_dir = _resolved_model_dir(model_path, revision=revision)
     if model_dir is not None:
         snapshot = _snapshot_commit_hash(model_dir)
         if snapshot is not None:
-            return _checkpoint_id_with_load_format(snapshot, load_format=fmt)
+            return _checkpoint_id_with_load_format(
+                snapshot, load_format=fmt, extra_config=model_loader_extra_config
+            )
         return _checkpoint_id_with_load_format(
-            "local-" + _local_checkpoint_fingerprint(model_dir, fmt),
+            "local-" + _local_checkpoint_fingerprint(model_dir, fmt, extra_json),
             load_format=fmt,
+            extra_config=model_loader_extra_config,
         )
     if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
-        return _checkpoint_id_with_load_format(revision, load_format=fmt)
+        return _checkpoint_id_with_load_format(
+            revision, load_format=fmt, extra_config=model_loader_extra_config
+        )
     raise ValueError(
         "L3 namespace needs an immutable checkpoint id; pin --revision to a "
         "commit or load from a local snapshot"
@@ -338,8 +363,14 @@ def _normalize_load_format(load_format: str) -> str:
     return normalized
 
 
-def _checkpoint_id_with_load_format(identity: str, *, load_format: str) -> str:
-    return f"{identity}:{load_format}"
+def _checkpoint_id_with_load_format(
+    identity: str, *, load_format: str, extra_config: dict
+) -> str:
+    base = f"{identity}:{load_format}"
+    if extra_config:
+        payload = json.dumps(extra_config, sort_keys=True, separators=(",", ":"))
+        return f"{base}:{hashlib.sha256(payload.encode()).hexdigest()}"
+    return base
 
 
 def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozenset[str]:
@@ -348,10 +379,11 @@ def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozens
     Pattern groups match ``DefaultModelLoader._prepare_weights``: the first
     group that matches any file wins, so ``auto`` hashes ``*.safetensors``
     when those exist and does not mix in leftover ``*.bin`` / ``*.pt``.
-    ``sharded_state`` hashes ``model-rank-*-part-*.safetensors`` (every
-    rank's local files; replica gather combines those digests) and falls
-    back to ``*.safetensors``.
-    Unknown loaders raise rather than hashing metadata alone.
+    ``sharded_state`` hashes the files the configured shard pattern
+    selects (``model-rank-*-part-*.safetensors`` when
+    ``model_loader_extra_config`` omits ``pattern``). Each rank
+    fingerprints the files it can read; replica gather combines those
+    digests. Unknown loaders raise rather than hashing metadata alone.
     """
 
     groups = _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS.get(load_format)
@@ -419,12 +451,14 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
 
 
 @functools.cache
-def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
+def _local_checkpoint_fingerprint(
+    model_dir: str, load_format: str, extra_config_json: str
+) -> str:
     """Hash config/index/quant-config bytes and the selected weight files.
 
-    Cached by directory path and load format so a process that resolves
-    the same local checkpoint more than once (target plus draft, or a
-    repeated prefix rebuild) does not re-read every shard.
+    Cached by directory path, load format, and loader extra-config so a
+    process that resolves the same local checkpoint more than once (target
+    plus draft, or a repeated prefix rebuild) does not re-read every shard.
     ``hf_quant_config.json`` is hashed with ``config.json``: ModelOpt
     mixed-precision maps, group sizes, and KV quantization live there,
     not in the weight tensors. ``consolidated.safetensors.index.json`` is
@@ -435,14 +469,22 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     different ``--trust-remote-code`` configuration modules cannot share
     a namespace. ``--load-format`` selects so a directory that contains
     more than one checkpoint encoding cannot share a namespace across
-    loaders.
+    loaders. ``sharded_state`` uses ``model_loader_extra_config["pattern"]``
+    when set. ``npcache`` hashes the NumPy cache when
+    ``np/weight_names.json`` exists, because that is what the loader
+    reads.
     """
     hasher = hashlib.sha256()
     try:
         names = tuple(sorted(os.listdir(model_dir)))
     except OSError:
         return hasher.hexdigest()
-    selected_weights = _selected_weight_names(names, load_format=load_format)
+    extra_config = json.loads(extra_config_json)
+    if not isinstance(extra_config, dict):
+        raise TypeError("model_loader_extra_config must be a dict")
+    selected_weights, extra_weight_files = _selected_weight_targets(
+        model_dir, names=names, load_format=load_format, extra_config=extra_config
+    )
     for rel, path in _local_checkpoint_code_files(model_dir):
         hasher.update(rel.encode())
         _update_file_digest(hasher, path)
@@ -457,7 +499,87 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
         if name in selected_weights:
             hasher.update(name.encode())
             _update_file_digest(hasher, path)
+    for rel, path in extra_weight_files:
+        hasher.update(rel.encode())
+        _update_file_digest(hasher, path)
     return hasher.hexdigest()
+
+
+def _sharded_state_pattern(extra_config: dict) -> str:
+    pattern = extra_config.get("pattern")
+    if pattern is None:
+        return _SHARDED_STATE_DEFAULT_PATTERN
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ValueError("sharded_state pattern must be a non-empty str")
+    return pattern
+
+
+def _sharded_state_match_glob(pattern: str) -> str:
+    return _SHARDED_STATE_FIELD_RE.sub("*", pattern)
+
+
+def _sharded_state_weight_files(
+    model_dir: str, *, pattern: str
+) -> tuple[tuple[str, str], ...]:
+    match_glob = _sharded_state_match_glob(pattern)
+    matched = glob.glob(os.path.join(model_dir, match_glob))
+    found: list[tuple[str, str]] = []
+    for path in sorted(matched):
+        if not os.path.isfile(path):
+            continue
+        rel = os.path.relpath(path, model_dir).replace(os.sep, "/")
+        found.append((rel, path))
+    return tuple(found)
+
+
+def _npcache_weight_files(model_dir: str) -> tuple[tuple[str, str], ...] | None:
+    names_file = os.path.join(model_dir, "np", "weight_names.json")
+    if not os.path.isfile(names_file):
+        return None
+    with open(names_file) as handle:
+        weight_names = json.load(handle)
+    if not isinstance(weight_names, list):
+        raise ValueError("np/weight_names.json must be a JSON list")
+    found: list[tuple[str, str]] = [("np/weight_names.json", names_file)]
+    for name in weight_names:
+        rel = "np/" + str(name)
+        path = os.path.join(model_dir, "np", str(name))
+        if os.path.isfile(path):
+            found.append((rel, path))
+    return tuple(found)
+
+
+def _selected_weight_targets(
+    model_dir: str,
+    *,
+    names: Sequence[str],
+    load_format: str,
+    extra_config: dict,
+) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+    """Return top-level weight names and extra (relative, path) weight files.
+
+    Top-level names are hashed in directory order with metadata so default
+    loaders keep a stable fingerprint. Nested npcache / sharded-state files
+    are hashed after that pass.
+    """
+
+    if load_format == "npcache":
+        np_files = _npcache_weight_files(model_dir)
+        if np_files is not None:
+            return frozenset(), np_files
+        return _selected_weight_names(names, load_format=load_format), ()
+    if load_format == "sharded_state":
+        pattern = _sharded_state_pattern(extra_config)
+        shard_files = _sharded_state_weight_files(model_dir, pattern=pattern)
+        top_level: list[str] = []
+        nested: list[tuple[str, str]] = []
+        for rel, path in shard_files:
+            if "/" in rel:
+                nested.append((rel, path))
+            else:
+                top_level.append(rel)
+        return frozenset(top_level), tuple(nested)
+    return _selected_weight_names(names, load_format=load_format), ()
 
 
 def _update_file_digest(hasher, path: str) -> None:
