@@ -132,7 +132,7 @@ class _PtrBuffer:
 
 
 class _Host:
-    def __init__(self, *, nbytes: int = 4096, page: int = 64):
+    def __init__(self, *, nbytes: int, page: int):
         self.host_buffer = _PtrBuffer(nbytes)
         self._page = int(page)
 
@@ -145,6 +145,13 @@ class WaitTcpTimeoutTest(unittest.TestCase):
     def test_wait_tcp_requires_timeout(self) -> None:
         param = inspect.signature(_wait_tcp).parameters["timeout_s"]
         self.assertIs(param.default, inspect.Parameter.empty)
+
+
+class HostGeometryTest(unittest.TestCase):
+    def test_host_requires_nbytes_and_page(self) -> None:
+        signature = inspect.signature(_Host.__init__)
+        self.assertIs(signature.parameters["nbytes"].default, inspect.Parameter.empty)
+        self.assertIs(signature.parameters["page"].default, inspect.Parameter.empty)
 
 
 class MooncakeMasterLiveTest(unittest.TestCase):
@@ -258,7 +265,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         }
 
     def test_l3_host_store_round_trips_through_mooncake_master(self) -> None:
-        host = _Host()
+        host = _Host(nbytes=4096, page=64)
         payload = b"mooncake-l3-bytes"
         host.host_buffer[0 : len(payload)] = payload
         backend = create_kvstore_storage_backend(

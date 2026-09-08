@@ -53,7 +53,7 @@ from tokenspeed.runtime.cache.l3.mooncake import (
 
 
 class _FakeHost:
-    def __init__(self, payload: bytes, *, size: int = 64):
+    def __init__(self, payload: bytes, *, size: int):
         self.host_buffer = bytearray(size)
         self.host_buffer[: len(payload)] = payload
         self._payload_size = len(payload)
@@ -62,6 +62,12 @@ class _FakeHost:
         del group_index
         offset = (int(block_id) - 1) * self._payload_size
         return offset, self._payload_size
+
+
+class FakeHostTest(unittest.TestCase):
+    def test_fake_host_requires_buffer_size(self):
+        param = inspect.signature(_FakeHost.__init__).parameters["size"]
+        self.assertIs(param.default, inspect.Parameter.empty)
 
 
 class StorageKeyTest(unittest.TestCase):
@@ -1058,7 +1064,7 @@ class MemoryKvStoreTest(unittest.TestCase):
 class L3HostStoreTest(unittest.TestCase):
     def test_backups_and_prefetches_packed_pages(self):
         backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh")
+        host = _FakeHost(b"abcdefgh", size=64)
         l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
@@ -1079,7 +1085,7 @@ class L3HostStoreTest(unittest.TestCase):
 
     def test_present_keys_requires_exists_mask(self):
         backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh")
+        host = _FakeHost(b"abcdefgh", size=64)
         l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         signature = inspect.signature(l3.present_keys)
         self.assertIs(signature.parameters["exists"].default, inspect.Parameter.empty)
@@ -1089,7 +1095,7 @@ class L3HostStoreTest(unittest.TestCase):
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh")
+        host = _FakeHost(b"abcdefgh", size=64)
         l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
@@ -1105,7 +1111,7 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.return_value = False
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1, cp_rank=0
+            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1, cp_rank=0
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1117,7 +1123,7 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh"), key_prefix="m", rank=1, cp_rank=0
+            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1, cp_rank=0
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1127,7 +1133,7 @@ class L3HostStoreTest(unittest.TestCase):
 
     def test_set_key_prefix_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh")
+        host = _FakeHost(b"abcdefgh", size=64)
         l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, cp_rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])

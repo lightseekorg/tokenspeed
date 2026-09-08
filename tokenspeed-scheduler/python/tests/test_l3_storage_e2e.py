@@ -29,6 +29,8 @@ after ``batch_exists``, write-back object keys, and L3-only load-back with
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 from conftest import _advance, _finish, _spec
 
@@ -37,9 +39,9 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 
 def _l3_config(
     *,
-    num_device_pages: int = 32,
-    num_host_pages: int = 32,
-    with_swa: bool = False,
+    num_device_pages: int,
+    num_host_pages: int,
+    with_swa: bool,
 ) -> ts.SchedulerConfig:
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 2
@@ -128,8 +130,16 @@ def _prefetch_flags(load_op) -> list[int]:
     return [int(flag) for row in load_op.prefetch_from_storage for flag in row]
 
 
+def test_l3_config_requires_device_host_and_swa() -> None:
+    parameters = inspect.signature(_l3_config).parameters
+    for name in ("num_device_pages", "num_host_pages", "with_swa"):
+        assert parameters[name].default is inspect.Parameter.empty
+
+
 def test_l3_cold_miss_does_not_prefetch() -> None:
-    scheduler = ts.Scheduler(_l3_config())
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
+    )
     scheduler.submit_requests([_spec("r1", list(range(1, 9)))])
     plan = scheduler.next_execution_plan()
     assert _find_load_back(plan) is None
@@ -139,7 +149,9 @@ def test_l3_cold_miss_does_not_prefetch() -> None:
 def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
     """Cross-instance Mooncake path: batch_exists → register → prefetch H2D."""
 
-    scheduler = ts.Scheduler(_l3_config())
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
+    )
     tokens = list(range(1, 9))
     hashes = scheduler.prefix_hashes_for_tokens(tokens)
     assert hashes
@@ -162,7 +174,9 @@ def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
 def test_l3_short_host_pool_retries_first_chunk_from_admitted_prefix() -> None:
     """A Host-starved L3 hit must not skip the unallocated prefix tokens."""
 
-    scheduler = ts.Scheduler(_l3_config(num_host_pages=3))
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=3, with_swa=False)
+    )
     tokens = list(range(1, 9))
     hashes = scheduler.prefix_hashes_for_tokens(tokens)
     group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
@@ -224,7 +238,9 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
 def test_waiting_prefix_hashes_match_submitted_prompt() -> None:
     """Queued requests expose the same hashes the event loop revalidates."""
 
-    scheduler = ts.Scheduler(_l3_config())
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
+    )
     tokens = list(range(1, 9))
     expected = scheduler.prefix_hashes_for_tokens(tokens)
     assert expected
@@ -237,7 +253,7 @@ def test_waiting_prefix_hashes_match_submitted_prompt() -> None:
 def test_waiting_prefix_hashes_skip_when_batch_cannot_admit() -> None:
     """A full decode/prefill batch must not rehash a waiter that cannot join."""
 
-    cfg = _l3_config()
+    cfg = _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
     cfg.max_batch_size = 1
     scheduler = ts.Scheduler(cfg)
     scheduler.submit_requests([_spec("r1", list(range(1, 5)))])
@@ -249,7 +265,7 @@ def test_waiting_prefix_hashes_skip_when_batch_cannot_admit() -> None:
 def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
     """An exhausted Device pool must not rehash a waiter that still has a slot."""
 
-    cfg = _l3_config(num_device_pages=11, num_host_pages=11)
+    cfg = _l3_config(num_device_pages=11, num_host_pages=11, with_swa=False)
     cfg.disable_prefix_cache = True
     cfg.cache_groups = [
         ts.CacheGroupConfig(
@@ -277,7 +293,9 @@ def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
 
 
 def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
-    scheduler = ts.Scheduler(_l3_config())
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
+    )
     tokens = list(range(1, 9))
     hashes = scheduler.prefix_hashes_for_tokens(tokens)
     group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
@@ -290,7 +308,9 @@ def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
 
 
 def test_l3_writeback_carries_object_keys() -> None:
-    scheduler = ts.Scheduler(_l3_config(with_swa=True))
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=True)
+    )
     spec = _spec("r1", list(range(1, 9)))
     finalize = _run_to_finalize(scheduler, spec)
     write_back = _find_write_back(finalize)
@@ -344,7 +364,9 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
 def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
     """A missed batch_get_into retracts snapshot-less; the next admit recomputes."""
 
-    scheduler = ts.Scheduler(_l3_config())
+    scheduler = ts.Scheduler(
+        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
+    )
     tokens = list(range(1, 9))
     hashes = scheduler.prefix_hashes_for_tokens(tokens)
     group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)

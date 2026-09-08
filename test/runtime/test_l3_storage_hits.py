@@ -28,6 +28,7 @@ of queued hits) can be checked without a model or GPU.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from types import SimpleNamespace
@@ -147,7 +148,7 @@ class _Loop:
     _delete_l3_namespace = EventLoop._delete_l3_namespace
     _recover_if_l3_prefetch_failed = EventLoop._recover_if_l3_prefetch_failed
 
-    def __init__(self, exists_flags=None) -> None:
+    def __init__(self, exists_flags) -> None:
         self._device = _Device(exists_flags)
         self.scheduler = _Scheduler()
         self.attn_tp_size = 1
@@ -160,6 +161,11 @@ class _Loop:
         self.request_handler = SimpleNamespace(
             converge_replica_decision=lambda local_ok: local_ok
         )
+
+
+def test_loop_requires_exists_flags() -> None:
+    param = inspect.signature(_Loop.__init__).parameters["exists_flags"]
+    assert param.default is inspect.Parameter.empty
 
 
 def _spec(rid: str, tokens: list[int]):
