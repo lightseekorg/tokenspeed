@@ -54,6 +54,7 @@ from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.speculative_state import SpeculativeState
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
@@ -314,6 +315,7 @@ class ModelExecutor:
         attn_backend: AttentionBackend,
         token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
+        speculative_states: tuple[SpeculativeState, ...],
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
@@ -324,6 +326,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
+        self.speculative_states = speculative_states
         # Every pool runs on the shared cache arena and publishes a runtime
         # contract; the per-group tables travel as CacheBatchMetadata. Fail
         # fast here rather than at the first forward or, worse, a CUDA-graph
@@ -451,6 +454,7 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
+            speculative_states=self.speculative_states,
             drafter=self.drafter,
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,

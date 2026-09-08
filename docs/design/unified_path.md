@@ -341,26 +341,34 @@ TRT-LLM MLA, TokenSpeed MLA, DSA, MSA, QSA); `state/` holds the recurrent consum
 (DeepSeek V4, Qwen4-Exp's GDN extension, and Inkling's dense + conv-state
 wrapper). A new leaf goes under `paged/`, a new recurrent family under
 `state/`. A model-shaped backend earns `specific/` only when the ordinary
-router, paged leaves and shared runtime hooks cannot express it; use by one
+router, paged leaves and execution-owned indexer state cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
 QSA follows the ordinary router + leaf path. Its registered paged leaf
-inherits MHA's metadata refresh and capture; `attention/qsa/runtime.py`
-owns its cross-group layout and verify staging. The registry calls the leaf
-class's `create_runtime(config, router)` once per router, before verify
-workspace allocation. The runtime consumes
-`router.group_view(gid, bs)`, whose table and expansion come from the same
-stacks the leaf metadata uses. It never builds another block-table route.
-QSA compute leaf instances hold no shared runtime or router reference.
+inherits MHA's metadata refresh and capture. `attention/qsa/metadata.py`
+derives the indexer's layer-shared layout from `router.group_view(gid, bs)`
+and the full-KV leaf's live metadata. It never builds another block-table
+route. The per-forward layout stays in `SparseTopKShare`, retaining the
+router/drafter invalidation and MTP reuse boundaries.
 
-Verify workspace allocation and post-verify commit delegate directly from
-the router to its runtime. `AttentionBackend.commit_speculative_state_after_verify`
-visits runner-facing children, so bare routers and hybrid wrappers use the
-same lifecycle without a separate callback registry. QSA derives its owned
-layers, cache views and commit addresses from the bound cache plan; it does
-not bind model indexers. Staging and address tables are budgeted and allocated
-before capture. Every forward takes views of this one capacity-sized workspace;
-neither eager execution nor graph capture allocates a second staging buffer.
+`attention/qsa/runtime.py::QSAIndexerRuntime` owns target-verify staging and
+batched commit. Attention-component assembly creates one independent runtime
+per applicable target/draft cache view, binds its cache plan and budgets and
+preallocates its workspace before capture. The device builder shares that
+instance with the side's loaded indexers. Indexer binding only lends access
+to staging; owned layers, field shapes and commit addresses come exclusively
+from the bound cache plan, not model modules. Every forward takes views of
+one capacity-sized workspace, without allocating a second staging buffer.
+
+Verification state follows `execution/speculative_state.py::SpeculativeState`,
+independently of the attention backend tree. The executor receives a fixed
+tuple of target verification participants at construction and passes it to
+`ForwardStepRunner`. After eager execution or graph replay produces the live
+acceptance lengths, the runner commits each participant once, passing the
+leading extend count for mixed batches. Draft runtimes are separate and are
+not target-acceptance participants. No callback registration happens during
+forward. Paged leaves and the router neither construct nor hold an indexer
+runtime, allocate its workspace, or forward verification results.
 
 ## One block-table route: router + leaves
 
@@ -372,7 +380,8 @@ vocabulary is fixed, with exactly one conversion point:
 | C++ scheduler | per-group `BlockTable`s: rows in `block_granularity` logical index, entries are `CacheBlock` ids | kernel pages, backends |
 | bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
 | **`CacheGroupRouter`** | group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, ALL write-location slot math | kernel calls |
-| backend-owned paged runtime (QSA) | resolved views of its groups, leaf metadata and transient verification workspace | raw scheduler block tables, allocation of persistent request caches |
+| QSA indexer metadata | resolved group views and full-KV leaf metadata | raw scheduler table expansion |
+| execution-owned indexer runtime (QSA) | bound cache fields and transient verification workspace | attention backend ownership, allocation of persistent request caches |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 

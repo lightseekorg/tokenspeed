@@ -47,9 +47,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
-from tokenspeed.runtime.layers.attention.qsa.runtime import (
-    require_qsa_runtime,
-)
+from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
+from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -89,6 +88,7 @@ class QSAIndexer(nn.Module):
         }
         if invalid:
             raise ValueError(f"Qwen4-Exp QSA config values must be positive: {invalid}")
+        self.runtime: QSAIndexerRuntime | None = None
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
@@ -414,7 +414,9 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        runtime = require_qsa_runtime(ctx.attn_backend)
+        runtime = self.runtime
+        if runtime is None:
+            raise RuntimeError("QSA indexer runtime must be bound before forward")
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
@@ -437,7 +439,7 @@ class QSAIndexer(nn.Module):
                 None,
                 ctx.bs,
             )
-        layout = runtime.qsa_forward_layout(
+        layout = qsa_forward_layout(
             ctx,
             hidden_states.shape[0],
             compressed_token_page_size=self.compressed_token_page_size,
@@ -466,7 +468,7 @@ class QSAIndexer(nn.Module):
             )
         shared_topk = None
         if self.share_topk_for_mtp_iteration:
-            shared_topk = runtime.sparse_topk.decode
+            shared_topk = ctx.attn_backend.sparse_topk.decode
             if (
                 shared_topk is not None
                 and shared_topk.shape[0] < hidden_states.shape[0]
@@ -513,7 +515,7 @@ class QSAIndexer(nn.Module):
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:
-            runtime.sparse_topk.decode = selected_slots
+            ctx.attn_backend.sparse_topk.decode = selected_slots
         return selected_slots
 
 

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -45,34 +45,12 @@ from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.backends.paged.router import (
-        CacheGroupRouter,
-    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-
-
-class PagedAttentionRuntime(Protocol):
-    """Backend-owned work shared by a router's paged groups and model layers.
-
-    The registry constructs this alongside the router, before pool binding
-    and workspace allocation. It consumes the router's resolved group views;
-    paged leaves remain independent of group geometry and side-state commits.
-    """
-
-    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
-        """Allocate persistent verification scratch and return its byte size."""
-        ...
-
-    def commit_after_mtp_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
-    ) -> None:
-        """Commit accepted decode candidates, excluding leading extend requests."""
-        ...
 
 
 class PagedAttentionBackend(ABC):
@@ -107,22 +85,6 @@ class PagedAttentionBackend(ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
-
-    @classmethod
-    def create_runtime(
-        cls, config: AttnConfig, router: CacheGroupRouter
-    ) -> PagedAttentionRuntime | None:
-        """Construct optional shared work for this paged backend family.
-
-        Args:
-            config: Target or draft attention configuration.
-            router: The owner of group views and per-forward sparse sharing.
-
-        Returns:
-            A backend-owned runtime, or None when the leaves need none.
-            Called once by the registry, never once per group or model layer.
-        """
-        return None
 
     @classmethod
     def resolve_kernel_page_size(

@@ -27,7 +27,7 @@ import torch
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
-import tokenspeed.runtime.layers.attention.qsa.runtime as qsa_runtime_module
+import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -66,9 +66,11 @@ from tokenspeed.runtime.layers.attention.qsa import (
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
-from tokenspeed.runtime.layers.attention.qsa.runtime import (
+from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
     decode_query_lengths,
+    qsa_attention_metadata,
+    qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
@@ -539,8 +541,8 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
 
     _qsa_extend_round(router, tables, seq_lens=[300])
     ctx = SimpleNamespace(attn_backend=hybrid, forward_mode=ForwardMode.EXTEND)
-    assert router.runtime._metadata(ctx) is leaf.forward_extend_metadata
-    assert router.runtime._metadata(ctx).seq_lens.tolist() == [300]
+    assert qsa_attention_metadata(ctx) is leaf.forward_extend_metadata
+    assert qsa_attention_metadata(ctx).seq_lens.tolist() == [300]
 
     router.refresh_decode_metadata(
         1,
@@ -551,8 +553,8 @@ def test_qwen4_exp_qsa_metadata_follows_the_full_attention_leaf_slot() -> None:
         block_tables=tables,
     )
     ctx = SimpleNamespace(attn_backend=router, forward_mode=ForwardMode.DECODE)
-    assert router.runtime._metadata(ctx) is leaf.forward_decode_metadata
-    assert router.runtime._metadata(ctx).seq_lens.tolist() == [301]
+    assert qsa_attention_metadata(ctx) is leaf.forward_decode_metadata
+    assert qsa_attention_metadata(ctx).seq_lens.tolist() == [301]
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -703,7 +705,7 @@ def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
     assert "_persistent_topk_workspace" not in indexer.state_dict()
 
 
-def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
+def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
@@ -762,7 +764,8 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
         prepare_calls.append((args, kwargs))
         return prepared
 
-    router.runtime.qsa_forward_layout = prepare
+    monkeypatch.setattr(qsa_indexer_module, "qsa_forward_layout", prepare)
+    indexer.runtime = SimpleNamespace(is_draft=False, spec_num_tokens=1)
 
     def write_and_compress(*args, **kwargs):
         updates.append((args, kwargs))
@@ -779,7 +782,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk() -> None:
         num_extends=2,
         forward_mode=ForwardMode.EXTEND,
         draft_narrowing=None,
-        attn_backend=SimpleNamespace(full_attn_backend=router),
+        attn_backend=HybridLinearAttnBackend(router, SimpleNamespace(), []),
         token_to_kv_pool=pool,
     )
 
@@ -851,11 +854,11 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         kwargs["draft_logical_positions"].fill_(torch.iinfo(torch.int64).min)
         return outputs
 
-    monkeypatch.setattr(qsa_runtime_module, "qwen4_exp_qsa_prepare_metadata", prepare)
+    monkeypatch.setattr(qsa_metadata_module, "qwen4_exp_qsa_prepare_metadata", prepare)
     first_tags = torch.zeros((2, 4), dtype=torch.int64)
     second_tags = torch.zeros_like(first_tags)
 
-    first = router.runtime.qsa_forward_layout(
+    first = qsa_forward_layout(
         ctx,
         8,
         compressed_token_page_size=256,
@@ -863,7 +866,7 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
         compress_ratio=4,
         reset_draft_tags=first_tags,
     )
-    second = router.runtime.qsa_forward_layout(
+    second = qsa_forward_layout(
         ctx,
         8,
         compressed_token_page_size=256,
