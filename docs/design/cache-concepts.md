@@ -477,10 +477,13 @@ backend. The invariant is the division, not where any helper happens to sit:
   for each applicable target/draft cache view, separately from the backend
   tree. The recipe budgets staging and address tables in `workspace_bytes`;
   attention-component assembly preallocates them from the bound plan. The
-  device builder shares the runtime with the side's indexers and hands the
-  target's verification participant to the executor. Indexers take local
-  layer views; the execution runner commits acceptance after the complete
-  eager forward or graph replay, once for all owned layers.
+  device builder passes the target and draft runtimes to execution, which
+  lends the corresponding runtime through `ForwardContext.indexer_runtime`
+  on every forward. Model layers hold no runtime reference and require no
+  post-construction binding. The context borrows the long-lived object;
+  Tensor workspace remains owned by the runtime. Indexers take local layer
+  views; the execution runner commits the same target runtime after the
+  complete eager forward or graph replay, once for all owned layers.
 
 Two consequences worth remembering when touching this boundary:
 
@@ -498,8 +501,8 @@ Two consequences worth remembering when touching this boundary:
   receives selected physical slots and its own KV write locations. Persisted
   QSA fields stay in the cache recipe and LCM arena. The indexer runtime
   derives owned layers and commit addresses from the bound plan's layer
-  window, including under PP and target/draft sharing. Model binding never
-  populates cache addresses. Moving verification out of the backend does not
+  window, including under PP and target/draft sharing. Model modules never
+  populate cache addresses. Moving verification out of the backend does not
   move persistent cache allocation, prefix matching, transfer or retention
   into model modules.
 

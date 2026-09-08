@@ -48,7 +48,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
-from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -88,7 +87,6 @@ class QSAIndexer(nn.Module):
         }
         if invalid:
             raise ValueError(f"Qwen4-Exp QSA config values must be positive: {invalid}")
-        self.runtime: QSAIndexerRuntime | None = None
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
@@ -414,9 +412,9 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        runtime = self.runtime
+        runtime = ctx.indexer_runtime
         if runtime is None:
-            raise RuntimeError("QSA indexer runtime must be bound before forward")
+            raise RuntimeError("QSA forward requires an indexer runtime in its context")
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())

@@ -34,6 +34,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
@@ -746,7 +747,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         return prepared
 
     monkeypatch.setattr(qsa_indexer_module, "qsa_forward_layout", prepare)
-    indexer.runtime = SimpleNamespace(is_draft=False, spec_num_tokens=1)
 
     def write_and_compress(*args, **kwargs):
         updates.append((args, kwargs))
@@ -765,6 +765,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         draft_narrowing=None,
         attn_backend=HybridLinearAttnBackend(router, SimpleNamespace(), []),
         token_to_kv_pool=pool,
+        indexer_runtime=SimpleNamespace(is_draft=False, spec_num_tokens=1),
     )
 
     actual = indexer(torch.zeros((2, 4)), torch.tensor([7, 8]), ctx)
@@ -808,6 +809,81 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     ]
     assert len(updates) == 2
     assert updates[1][1]["query"] is None
+
+
+def test_qsa_forward_uses_its_context_runtime_without_model_binding(
+    monkeypatch,
+) -> None:
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_id = 3
+    indexer.share_topk_for_mtp_iteration = False
+    indexer.compressed_token_page_size = 256
+    indexer.recent_page_size = 64
+    indexer.compress_ratio = 4
+    pool = SimpleNamespace(layerwise_load_tracker=None)
+    indexer._fields = lambda pool: (None, torch.empty(0), None)
+    indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
+    indexer._select_slots = lambda q, *args, **kwargs: torch.zeros(
+        (q.shape[0], 1), dtype=torch.int32
+    )
+    draft_scratch = tuple(torch.empty(2) for _ in range(3))
+    indexer._draft_scratch_buffers = lambda *args: draft_scratch
+    prepared = SimpleNamespace(
+        logical_positions=torch.arange(8),
+        request_indices=torch.zeros(8, dtype=torch.int64),
+        qsa_locs=torch.ones(8, dtype=torch.int32),
+        recent_locs=torch.ones(8, dtype=torch.int32),
+        complete_blocks=torch.ones(8, dtype=torch.int32),
+        qsa_page_table=torch.ones((2, 1), dtype=torch.int32),
+        full_page_table=torch.ones((2, 1), dtype=torch.int32),
+        qsa_page_expansion=4,
+        full_kernel_page_size=64,
+    )
+    monkeypatch.setattr(
+        qsa_indexer_module, "qsa_forward_layout", lambda *args, **kwargs: prepared
+    )
+    verify_scratch = tuple(torch.empty(8) for _ in range(4))
+    verify_calls = []
+
+    def staging(layer_id, bs):
+        verify_calls.append((layer_id, bs))
+        return verify_scratch
+
+    target_runtime = SimpleNamespace(
+        is_draft=False, spec_num_tokens=4, verify_staging_buffers=staging
+    )
+    draft_runtime = SimpleNamespace(is_draft=True, spec_num_tokens=1)
+    writes = []
+
+    def write(*args, **kwargs):
+        writes.append(kwargs)
+        return kwargs["query"]
+
+    indexer._write_and_compress = write
+    for runtime, rows in ((target_runtime, 8), (draft_runtime, 2), (target_runtime, 8)):
+        ctx = ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=pool,
+            indexer_runtime=runtime,
+            bs=2,
+            num_extends=0,
+            input_num_tokens=rows,
+            forward_mode=ForwardMode.DECODE,
+        )
+        result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
+        assert result.shape == (rows, 1)
+
+    assert verify_calls == [(3, 2), (3, 2)]
+    assert writes[0]["stage_verify_buffers"] is verify_scratch
+    assert writes[1]["stage_verify_buffers"] is None
+    assert writes[1]["draft_scratch"] is draft_scratch
+    assert writes[1]["stage_draft"]
+    assert writes[2]["stage_verify_buffers"] is verify_scratch
+    assert "runtime" not in vars(indexer)
+    ctx.indexer_runtime = None
+    with pytest.raises(RuntimeError, match="runtime in its context"):
+        indexer(torch.ones((8, 4)), torch.arange(8), ctx)
 
 
 def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) -> None:
@@ -1347,8 +1423,9 @@ def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
     )
     backend.device = torch.device("cpu")
     backend._ple_verify_scratch = {}
+    backend._ple_commit_rows = None
 
-    backend._ensure_ple_verify_scratch(max_bs=2, draft_token_num=3)
+    nbytes = backend._preallocate_aux_verify_workspace(max_bs=2, draft_token_num=3)
     first = backend.ple_verify_scratch(context_field, 0)
     second = backend.ple_verify_scratch(context_field, 2)
 
@@ -1359,6 +1436,17 @@ def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
     assert first[1].shape == (8, 16, 9)
     assert first[1].dtype == torch.bfloat16
     assert second[1].shape == (8, 16, 9)
+    rows = backend._ple_commit_rows
+    assert rows.shape == (2, 2 * 2)
+    assert rows.dtype == torch.int64
+    assert nbytes == 8 * (2 * 8 + 2 * 16 * 9 * 2) + 2 * 2 * 2 * 8
+    assert (
+        backend._preallocate_aux_verify_workspace(max_bs=1, draft_token_num=3) == nbytes
+    )
+    assert backend._ple_commit_rows is rows
+    assert backend.ple_verify_scratch(context_field, 0)[0] is first[0]
+    with pytest.raises(RuntimeError, match="preallocated capacity"):
+        backend._preallocate_aux_verify_workspace(max_bs=3, draft_token_num=3)
 
 
 def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
@@ -1369,8 +1457,7 @@ def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
             self.bucket = bucket
 
         def verify_scratch_bucket(self, bs):
-            assert bs == 2
-            return self.bucket
+            return (bs, 3), *self.bucket[1:]
 
     import tokenspeed_kernel.ops.kvcache.triton as kvcache_ops
 
@@ -1379,39 +1466,34 @@ def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
     conv = {
         layer_id: torch.empty((5, 4, 3), dtype=torch.bfloat16) for layer_id in (0, 2)
     }
-    context_scratch = torch.empty((8, 2), dtype=torch.int64)
-    conv_scratch = {
-        layer_id: torch.empty((8, 4, 3), dtype=torch.bfloat16) for layer_id in (0, 2)
-    }
-    bucket = ((2, 3), context_scratch, conv_scratch[0])
-    layers = tuple(PLELayer(layer_id, context_field_id, bucket) for layer_id in (0, 2))
     fields = {context_field_id: context}
     fields.update(
         {qwen4_exp_ple_conv_field(layer_id): value for layer_id, value in conv.items()}
     )
     backend = object.__new__(Qwen4ExpMambaAttnBackend)
     backend._ple_layers = ()
-    backend._ple_verify_scratch = {context_field_id: context_scratch}
-    backend._ple_verify_scratch.update(
-        {
-            qwen4_exp_ple_conv_field(layer_id): value
-            for layer_id, value in conv_scratch.items()
-        }
-    )
-    backend._ple_verify_tables = None
-    backend._ple_verify_tables_key = None
-    backend._ple_rows_cache = {}
+    backend._ple_verify_scratch = {}
+    backend._ple_commit_rows = None
     backend.device = torch.device("cpu")
     backend.kv_pool = SimpleNamespace(
         arena=SimpleNamespace(
+            plan=SimpleNamespace(
+                fields=tuple(
+                    SimpleNamespace(group_id=QWEN4_EXP_PLE_CACHE_GROUP, field_id=name)
+                    for name in fields
+                )
+            ),
             field=fields.__getitem__,
             buffer=torch.empty(1, dtype=torch.uint8),
         )
     )
+    backend._preallocate_aux_verify_workspace(max_bs=4, draft_token_num=3)
+    bucket = ((4, 3), *backend.ple_verify_scratch(context_field_id, 0))
+    layers = tuple(PLELayer(layer_id, context_field_id, bucket) for layer_id in (0, 2))
     backend.bind_ple_layers(layers)
     backend.bind_ple_layers(layers)
-    accepted = torch.tensor([1, 3], dtype=torch.int32)
-    pages = torch.tensor([4, 5], dtype=torch.int32)
+    accepted = torch.tensor([1, 3, 2, 1], dtype=torch.int32)
+    pages = torch.tensor([4, 3, 2, 1], dtype=torch.int32)
     row_calls = []
     copy_calls = []
     monkeypatch.setattr(
@@ -1425,18 +1507,35 @@ def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
         lambda *args, **kwargs: copy_calls.append((args, kwargs)),
     )
 
-    backend._commit_aux_verified_state(
-        accepted,
-        {QWEN4_EXP_PLE_CACHE_GROUP: pages},
-    )
+    rows = backend._ple_commit_rows
+    for bs in (1, 4, 2, 3, 4):
+        row_calls.clear()
+        copy_calls.clear()
+        backend._commit_aux_verified_state(
+            accepted[:bs],
+            {QWEN4_EXP_PLE_CACHE_GROUP: pages[:bs]},
+        )
 
-    assert len(row_calls) == 1
-    assert row_calls[0][1] == {"verify_width": 3, "num_layers": 2}
-    assert len(copy_calls) == 2
-    assert copy_calls[0][0][0].numel() == 1
-    assert copy_calls[1][0][0].numel() == 2
-    assert copy_calls[0][1]["row_bytes"] == 16
-    assert copy_calls[1][1]["row_bytes"] == 24
+        assert len(row_calls) == 1
+        assert row_calls[0][1] == {"verify_width": 3, "num_layers": 2}
+        src_rows, dst_rows = row_calls[0][0][2:]
+        assert src_rows.shape == dst_rows.shape == (2 * bs,)
+        assert src_rows.is_contiguous() and dst_rows.is_contiguous()
+        assert src_rows.data_ptr() == rows[0].data_ptr()
+        assert dst_rows.data_ptr() == rows[1].data_ptr()
+        assert backend._ple_commit_rows is rows
+        assert len(copy_calls) == 2
+        assert copy_calls[0][0][0].numel() == 1
+        assert copy_calls[1][0][0].numel() == 2
+        assert copy_calls[0][0][2].numel() == bs
+        assert copy_calls[1][0][2] is src_rows
+        assert copy_calls[0][1]["row_bytes"] == 16
+        assert copy_calls[1][1]["row_bytes"] == 24
+    with pytest.raises(RuntimeError, match="preallocated capacity"):
+        backend._commit_aux_verified_state(
+            torch.ones(5, dtype=torch.int32),
+            {QWEN4_EXP_PLE_CACHE_GROUP: torch.ones(5, dtype=torch.int32)},
+        )
     with pytest.raises(RuntimeError, match="cannot be rebound"):
         backend.bind_ple_layers((PLELayer(4, context_field_id, bucket),))
 

@@ -127,6 +127,7 @@ def test_forward_step_runner_uses_existing_route_for_padding():
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
+        indexer_runtime=None,
         bs=30,
         num_extends=0,
         input_num_tokens=30,
@@ -169,6 +170,7 @@ def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
+        indexer_runtime=None,
         bs=0,
         num_extends=0,
         input_num_tokens=0,
@@ -191,6 +193,7 @@ def test_cuda_graph_route_respects_disable_padding_with_global_batch():
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
+        indexer_runtime=None,
         bs=0,
         num_extends=0,
         input_num_tokens=0,

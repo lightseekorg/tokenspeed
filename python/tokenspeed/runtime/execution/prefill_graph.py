@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
 
 
 # Smallest prefill bucket; below this, denser rungs would only add capture time.
@@ -215,6 +216,7 @@ class PrefillGraph:
         token_to_kv_pool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
+        indexer_runtime: QSAIndexerRuntime | None,
         drafter=None,
         num_warmup: int = 3,
         graph_supported: bool = True,
@@ -233,6 +235,7 @@ class PrefillGraph:
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
+        self.indexer_runtime = indexer_runtime
         self.input_buffers = input_buffers
         self.config = config
         self.drafter = drafter
@@ -503,6 +506,7 @@ class PrefillGraph:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            indexer_runtime=self.indexer_runtime,
             bs=bs,
             num_extends=bs,
             input_num_tokens=num_tokens,

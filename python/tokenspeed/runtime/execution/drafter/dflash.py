@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 logger = get_colorful_logger(__name__)
@@ -131,6 +132,8 @@ class DFlash(BaseDrafter):
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         vocab_size: int | None = None,
+        *,
+        indexer_runtime: QSAIndexerRuntime | None,
     ) -> None:
         super().__init__(
             spec_num_tokens=spec_num_tokens,
@@ -140,6 +143,7 @@ class DFlash(BaseDrafter):
             input_buffers=input_buffers,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
+            indexer_runtime=indexer_runtime,
             vocab_size=vocab_size,
         )
         if draft_model_runner is None:
@@ -1044,6 +1048,7 @@ class DFlash(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            indexer_runtime=self.indexer_runtime,
             bs=bs,
             num_extends=metadata_num_extends,
             input_num_tokens=bs * self.draft_query_width,

@@ -96,19 +96,6 @@ class QSAIndexerRuntime:
         self._verify_workspace: _QSAVerifyWorkspace | None = None
         self._verify_staged = False
 
-    def bind_indexers(self, model: torch.nn.Module) -> None:
-        """Share this runtime with the loaded model's indexers at startup.
-
-        Args:
-            model: This side's loaded model, restricted to the local PP stage.
-                Binding never derives cache addresses from model modules.
-        """
-        from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
-
-        for module in model.modules():
-            if isinstance(module, QSAIndexer):
-                module.runtime = self
-
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate staging and commit addresses from the bound cache plan."""
         if self.is_draft or draft_token_num <= 1:

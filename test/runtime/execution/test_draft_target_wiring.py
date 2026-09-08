@@ -230,6 +230,7 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
             decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens)
         ),
         token_to_kv_pool=None,
+        indexer_runtime=None,
         bs=2,
         num_extends=num_extends,
         input_num_tokens=num_tokens,

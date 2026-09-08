@@ -129,12 +129,14 @@ class IdleReplayScrubTest(unittest.TestCase):
                 # with placeholders before this call; snapshot what the
                 # drafter's recorded kernels would read.
                 captured["extend_kwargs"] = extend_kwargs
+                captured["indexer_runtime"] = ctx.indexer_runtime
                 _refresh(router, padded_bs, 0, None)
                 captured["rows"] = router.draft_history_view().table[:padded_bs].clone()
 
         ex = SimpleNamespace(
             attn_backend=None,
             token_to_kv_pool=None,
+            indexer_runtime=object(),
             input_buffers=SimpleNamespace(
                 req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
                 extend_prefix_lens_buf=torch.zeros(8, dtype=torch.int32),
@@ -164,6 +166,7 @@ class IdleReplayScrubTest(unittest.TestCase):
             ),
         )
         self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
+        self.assertIs(captured["indexer_runtime"], ex.indexer_runtime)
         # The idle replay hands the runner empty extend slices, never None.
         extend_kwargs = captured["extend_kwargs"]
         self.assertIs(extend_kwargs["extend_with_prefix"], False)
