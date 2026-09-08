@@ -268,7 +268,7 @@ class DeviceHandle:
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
-        The whole plan on the FIFO -- one thread, one stream -- in an order
+        The whole plan on the FIFO -- one thread, explicitly ordered streams -- in an order
         that IS the correctness argument for same-round page reuse:
         retraction write-backs first (they must read the reused pages' old
         bytes), then page zeroing (the new owner's sanitization), then
@@ -306,15 +306,19 @@ class DeviceHandle:
         if l2 is not None:
             # Ahead of the zeroing: a retraction's snapshot sources may be
             # this very plan's pages_to_zero.
-            self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_write_backs(execution_plan))
-            )
+            def _write_backs():
+                executor.order_cache_operations()
+                l2.submit_write_backs(execution_plan)
+
+            self._l2_submissions.append(self._thread.submit(_write_backs))
         pages = execution_plan.pages_to_zero
-        zero_future = (
-            self._thread.submit(lambda: executor.zero_cache_pages(pages))
-            if pages
-            else None
-        )
+
+        def _zero_pages():
+            if l2 is None:
+                executor.order_cache_operations()
+            return executor.zero_cache_pages(pages)
+
+        zero_future = self._thread.submit(_zero_pages) if pages else None
         if l2 is not None:
             self._l2_submissions.append(
                 self._thread.submit(lambda: l2.submit_load_backs(execution_plan))

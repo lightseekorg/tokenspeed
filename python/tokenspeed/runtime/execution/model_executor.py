@@ -1080,6 +1080,15 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
+    def order_cache_operations(self) -> None:
+        """Order caller-stream cache work after previously submitted forwards.
+
+        Called on the forward thread before D2H or page reuse. This inserts
+        a GPU dependency, not a host synchronization; the forward prologue's
+        wait is too late to protect cache operations submitted before it.
+        """
+        self.device_module.current_stream().wait_stream(self.execution_stream)
+
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:

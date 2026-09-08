@@ -5224,6 +5224,8 @@ def try_kda_fused_paged_verify(
     replay_mixed_qkv: torch.Tensor | None = None,
     replay_gate: torch.Tensor | None = None,
     replay_beta: torch.Tensor | None = None,
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Run a registered pre-convolution KDA target-verify fusion when available.
 
@@ -5238,6 +5240,9 @@ def try_kda_fused_paged_verify(
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
+    split_producers = g_raw is not None or conv_qkv is not None
+    if split_producers and (g_raw is None or conv_qkv is None):
+        raise ValueError("g_raw and conv_qkv must be provided together")
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -5254,6 +5259,7 @@ def try_kda_fused_paged_verify(
                 "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "split_producers": split_producers,
             },
             solution=solution,
             override=override,
@@ -5262,11 +5268,15 @@ def try_kda_fused_paged_verify(
         return None
     kwargs = {}
     if replay_mixed_qkv is not None:
-        kwargs = {
-            "replay_mixed_qkv": replay_mixed_qkv,
-            "replay_gate": replay_gate,
-            "replay_beta": replay_beta,
-        }
+        kwargs.update(
+            {
+                "replay_mixed_qkv": replay_mixed_qkv,
+                "replay_gate": replay_gate,
+                "replay_beta": replay_beta,
+            }
+        )
+    if split_producers:
+        kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -5286,6 +5296,101 @@ def try_kda_fused_paged_verify(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         **kwargs,
+    )
+
+
+def kda_fused_paged_verify_uses_split_producers(
+    dtype: torch.dtype,
+    *,
+    store_states: bool,
+    recurrent_layout: str,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether the selected verify implementation accepts split producers.
+
+    Args:
+        dtype: Activation dtype used to resolve the registered kernel.
+        store_states: Whether verify materializes per-position rollback state.
+        recurrent_layout: Committed recurrent-state layout.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+
+    Returns:
+        True when the selected implementation accepts precomputed convolution
+        and gate tensors.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {
+        "paged_state": True,
+        "store_states": store_states,
+        "recurrent_layout": recurrent_layout,
+    }
+    traits["num_heads"] = num_heads
+    traits["head_dim"] = head_dim
+    try:
+        kernel = select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except NoKernelFoundError:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    return bool(
+        registered is not None
+        and registered.traits.get("split_producers") == frozenset({True})
+    )
+
+
+def kda_verify_conv_update(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    recurrent_layout: str,
+) -> torch.Tensor:
+    """Materialize the convolution producer used by split KDA verification.
+
+    Args:
+        mixed_qkv: Packed raw QKV projection rows.
+        conv_weights: Fused four-tap QKV convolution weights.
+        conv_states: Committed convolution-state pool.
+        read_indices: Committed page index for each request.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+        draft_token_num: Verify positions per request.
+        recurrent_layout: Committed recurrent-state layout.
+
+    Returns:
+        Convolved and SiLU-activated QKV rows.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    kernel = select_kernel(
+        "attention",
+        "kda_verify_conv_update",
+        signature,
+        traits={
+            "paged_state": True,
+            "split_producers": True,
+            "recurrent_layout": recurrent_layout,
+        },
+    )
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        read_indices=read_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
     )
 
 
@@ -5737,6 +5842,8 @@ __all__ = [
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "kda_fused_paged_verify_uses_split_producers",
+    "kda_verify_conv_update",
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
     "kda_batched_replay_uses_raw_gate",

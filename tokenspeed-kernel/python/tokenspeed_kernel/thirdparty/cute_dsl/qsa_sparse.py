@@ -30,7 +30,7 @@
 """B200 direct-slot QSA attention derived from CUTLASS mixed-input FMHA."""
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import Type
 
 import cuda.bindings.driver as cuda
@@ -40,7 +40,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass._mlir import ir as _ir
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
@@ -54,15 +53,48 @@ cpy_dice = (None,) + mma_dice  # (CPY, #CPY_MMA, #CPY_M, #CPY_K)
 warp_threads = 32
 warpgroup_warps = 4
 warpgroup_threads = 128
-_NUM_HEADS = 6
 _HEAD_DIM = 256
 _GROUPED_HEAD_TILE = 8
 _CONVERT_WARPGROUPS = 2
 _SELECTED_WIDTH = 2051
-_SMALL_MAX_ROWS = 8
+_SMALL_MAX_CLUSTERS = 8
 _SMALL_NUM_SPLITS = 8
+_WIDE_NUM_SPLITS = 16
 _LARGE_NUM_SPLITS = 4
 _COMPILED_KERNELS = {}
+
+
+@lru_cache(maxsize=None)
+def _wide_cluster_capacity(device_index: int) -> int:
+    """Number of resident 16-CTA clusters, or zero when unsupported.
+
+    The CuTe occupancy probe reserves one SM's shared memory per CTA, matching
+    this kernel's single-CTA residency. Query under the target device context
+    once, before compilation/capture, and retain portable eight-CTA launches
+    on devices or partitions that cannot accommodate the larger cluster.
+    """
+    with torch.cuda.device(device_index):
+        hardware = utils.HardwareInfo(device_id=device_index)
+        try:
+            return hardware.get_max_active_clusters(
+                cluster_size=_WIDE_NUM_SPLITS,
+                stream=cuda.CUstream(
+                    torch.cuda.current_stream(device_index).cuda_stream
+                ),
+            )
+        except RuntimeError:
+            return 0
+
+
+def _num_splits(num_clusters: int, wide_cluster_capacity: int) -> int:
+    if num_clusters <= _SMALL_MAX_CLUSTERS:
+        return (
+            _WIDE_NUM_SPLITS
+            if num_clusters <= wide_cluster_capacity
+            else _SMALL_NUM_SPLITS
+        )
+    return _LARGE_NUM_SPLITS
+
 
 # Math helpers
 log2_e = math.log2(math.e)  # change exponential base
@@ -78,20 +110,6 @@ smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 def set_block_rank(smem_ptr, peer_rank, *, loc=None, ip=None):
     dsmem_ptr = cute.arch.map_dsmem_ptr(smem_ptr, peer_rank, loc=loc, ip=ip)
     return cutlass.Int32(dsmem_ptr.toint(loc=loc, ip=ip))
-
-
-@dsl_user_op
-def st_shared_remote_f32(remote_addr, value, *, loc=None, ip=None):
-    i32 = _ir.IntegerType.get_signless(32)
-    _llvm.inline_asm(
-        i32,
-        [remote_addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
-        "st.shared::cluster.f32 [$0], $1; mov.u32 $2, 0;",
-        "r,f,=r",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -187,7 +205,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 if candidate > 0:
                     slot = candidate
             slot = cute.arch.shuffle_sync(slot, lane_idx - lane_idx % 8)
-            source = cache_iter + slot * 256 + dim_offset + col
+            source = (
+                cache_iter + slot * self.problem_shape[2] * _HEAD_DIM + dim_offset + col
+            )
             logical_address = smem_base + row * 128 + col + smem_stage * 16384
             swizzled_address = logical_address ^ ((logical_address >> 3) & 0x70)
             destination = cute.make_ptr(
@@ -226,7 +246,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 if candidate > 0:
                     slot = candidate
             slot = cute.arch.shuffle_sync(slot, lane_idx - lane_idx % 16)
-            source = cache_iter + slot * 256 + dim_offset + col
+            source = (
+                cache_iter + slot * self.problem_shape[2] * _HEAD_DIM + dim_offset + col
+            )
             logical_address = (
                 smem_base
                 + row * 128
@@ -442,6 +464,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             smem_layout_q,
             tma_atom_q,
             tma_tensor_q,
+            q_iter,
             k_iter.dtype,
             smem_layout_k,
             k_iter,
@@ -481,6 +504,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         smem_layout_q: cute.ComposedLayout,
         tma_atom_q: cute.CopyAtom,
         mQ: cute.Tensor,
+        q_source: cute.Pointer,
         # K
         k_dtype: Type[cutlass.Numeric],
         smem_layout_k: cute.ComposedLayout,
@@ -501,6 +525,18 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Read special registers
         kv_splits, tiles_hr, tiles_hb = cute.arch.grid_dim()
         kv_split_idx, coord_hr, coord_hb = cute.arch.block_idx()
+        num_rows, num_q_heads, num_kv_heads, cache_slots, head_dim = self.problem_shape
+        heads_per_kv = num_q_heads // num_kv_heads
+        head_tiles = cute.ceil_div(heads_per_kv, _GROUPED_HEAD_TILE)
+        row_idx = coord_hb // num_kv_heads
+        kv_head_idx = coord_hb % num_kv_heads
+        # Canonicalize singleton dimensions so the original one-KV-head,
+        # one-head-tile case folds to its original addressing at compile time.
+        head_offset = (coord_hr % head_tiles) * _GROUPED_HEAD_TILE
+        q_head_offset = kv_head_idx * heads_per_kv + head_offset
+        reduction_heads = min(heads_per_kv, _GROUPED_HEAD_TILE)
+        k_iter = k_iter + kv_head_idx * head_dim
+        v_iter = v_iter + kv_head_idx * head_dim
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(tidx // warp_threads)
@@ -527,8 +563,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
         tiles_dk, tiles_sm = cute.ceil_div(
             (blk_tile_d, blk_tile_s), (mma_tile_k, mma_tile_m)
         )
-        tiles_s = cute.ceil_div(selected_slots.shape[1], blk_tile_s)
-        iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
+        tiles_s = selected_slots.shape[1] // blk_tile_s
+        # The 2048 full entries form 16 tiles, evenly split over 4/8/16 CTAs.
+        # Keep the quotient static so the single-tile pipeline folds away its
+        # unused prefetch/online-update arms. The three-entry tail is handled
+        # in the same kernel's final combine.
+        assert tiles_s % self.kv_splits == 0
+        iters_s = tiles_s // self.kv_splits
         prefetch_iters = self.sp_stages - 1
         if iters_s < prefetch_iters:
             prefetch_iters = iters_s
@@ -830,11 +871,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 tcgen05.St16x256bOp(tcgen05.Repetition(mma_k_bits // 256)), mma_dtype
             )
             if cutlass.const_expr(v_dtype is cutlass.BFloat16):
-                # The transposed V partition is scalar-strided in this layout.
                 smem_load_atom_v = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(),
+                    cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
                     kv_smem_dtype,
-                    num_bits_per_copy=16,
                 )
             else:
                 smem_load_op_v = cute.nvgpu.warp.LdMatrix16x16x8bOp(
@@ -860,7 +899,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self._issue_sparse_tile_for_dtype(
                 k_iter,
                 selected_slots,
-                coord_hb,
+                row_idx,
                 kv_split_idx,
                 convert_phase * mma_tile_k,
                 sKV_vector_address,
@@ -881,23 +920,38 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         # consuming K_s. One pending cp.async group overlaps
                         # its latency with conversion and UMMA.
                         if s == 0:
-                            self._issue_sparse_tile_for_dtype(
-                                k_iter,
-                                selected_slots,
-                                coord_hb,
-                                kv_split_idx + kv_splits,
-                                convert_phase * mma_tile_k,
-                                sKV_vector_address,
-                                _CONVERT_WARPGROUPS + convert_phase,
-                                warpgroup_tidx,
-                                lane_idx,
-                                kv_smem_dtype,
-                            )
+                            if iters_s > 1:
+                                self._issue_sparse_tile_for_dtype(
+                                    k_iter,
+                                    selected_slots,
+                                    row_idx,
+                                    kv_split_idx + kv_splits,
+                                    convert_phase * mma_tile_k,
+                                    sKV_vector_address,
+                                    _CONVERT_WARPGROUPS + convert_phase,
+                                    warpgroup_tidx,
+                                    lane_idx,
+                                    kv_smem_dtype,
+                                )
+                            else:
+                                # With one tile, the next ring item is V0.
+                                self._issue_sparse_tile_for_dtype(
+                                    v_iter,
+                                    selected_slots,
+                                    row_idx,
+                                    kv_split_idx,
+                                    convert_phase * mma_tile_m,
+                                    sKV_vector_address,
+                                    _CONVERT_WARPGROUPS + convert_phase,
+                                    warpgroup_tidx,
+                                    lane_idx,
+                                    kv_smem_dtype,
+                                )
                         else:
                             self._issue_sparse_tile_for_dtype(
                                 v_iter,
                                 selected_slots,
-                                coord_hb,
+                                row_idx,
                                 kv_split_idx + (s - 1) * kv_splits,
                                 convert_phase * mma_tile_m,
                                 sKV_vector_address,
@@ -921,6 +975,10 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tKrK,
                         )
                         cute.arch.fence_view_async_shared()
+                        if cutlass.const_expr(iters_s > 1):
+                            # A faster warp may otherwise refill this ring
+                            # slot while a peer warp still reads its K tile.
+                            cvt_load_nbar.arrive_and_wait()
 
                         tKrK_ssa = tKrK.load().to(cvt_type).to(mma_dtype)
                         tKrK_cvt.store(tKrK_ssa.reshape(tKrK_cvt_shape))
@@ -950,7 +1008,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     k_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx + (s + 1) * kv_splits,
                                     convert_phase * mma_tile_k,
                                     sKV_vector_address,
@@ -963,7 +1021,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 self._issue_sparse_tile_for_dtype(
                                     v_iter,
                                     selected_slots,
-                                    coord_hb,
+                                    row_idx,
                                     kv_split_idx + s * kv_splits,
                                     convert_phase * mma_tile_m,
                                     sKV_vector_address,
@@ -989,6 +1047,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             tVrV,
                         )
                         cute.arch.fence_view_async_shared()
+                        if cutlass.const_expr(iters_s > 1):
+                            cvt_load_nbar.arrive_and_wait()
 
                         tVrV_ssa = tVrV.load().to(cvt_type).to(mma_dtype)
                         tVrV_cvt.store(tVrV_ssa.reshape(tVrV_cvt_shape))
@@ -1201,8 +1261,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     score_coord = tScS[i]
                     selected_idx = selected_tile * blk_tile_s + score_coord[0]
                     valid = cutlass.Boolean(False)
-                    if selected_idx < selected_slots.shape[1] and score_coord[1] < 6:
-                        valid = selected_slots[coord_hb, selected_idx] > 0
+                    if (
+                        selected_idx < selected_slots.shape[1]
+                        and head_offset + score_coord[1] < heads_per_kv
+                    ):
+                        valid = selected_slots[row_idx, selected_idx] > 0
                     tSrValid[i] = cutlass.Int32(1) if valid else cutlass.Int32(0)
                     if not valid:
                         tSrS[i] = cutlass.Float32(-1.0e30)
@@ -1331,168 +1394,137 @@ class MixedInputFusedMultiHeadAttentionDecode:
             # one paired with the TMEM fragment, avoiding swizzle inversion.
             local_partial = cute.make_tensor(
                 cute.recast_ptr(tAsK.iterator, dtype=acc_dtype),
-                cute.make_layout((6, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)),
+                cute.make_layout(
+                    (reduction_heads, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)
+                ),
             )
             for i in cutlass.range_constexpr(cute.size(tSrO)):
                 coord = tScO[i]
                 dim = coord[0]
                 head = coord[1]
-                if head < 6:
+                if head < reduction_heads:
                     local_partial[head, dim] = tSrO[i]
-            if warpgroup_widx == 0 and lane_idx < 6:
+            if warpgroup_widx == 0 and lane_idx < reduction_heads:
                 local_partial[lane_idx, blk_tile_d] = sM[0, lane_idx]
                 local_partial[lane_idx, blk_tile_d + 1] = sL[0, lane_idx, 0]
 
-        # All split-local numerators now reside at the same offset in each
-        # CTA's DSM.  The eight-way small-row specialization has enough ranks
-        # to assign one output head to each of ranks 0..5.  Those ranks reduce
-        # their head directly from peer DSM, avoiding the gather into rank zero
-        # and one cluster barrier.  Keep the compact gather/reduce path for the
-        # four-way large-row specialization.
+        # One head-owning combine for every cluster size. The last three
+        # selected entries are reduced here without another full MMA tile.
         cute.arch.sync_threads()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         cluster_splits = self.kv_splits
-        reduction_heads = 6
+        cta_rank = cute.arch.block_idx_in_cluster()
         local_partial = cute.make_tensor(
             cute.recast_ptr(tAsK.iterator, dtype=acc_dtype),
             cute.make_layout(
                 (reduction_heads, blk_tile_d + 2), stride=(blk_tile_d + 2, 1)
             ),
         )
-        cta_rank = cute.arch.block_idx_in_cluster()
-        if cutlass.const_expr(self.kv_splits == 8):
-            if cta_rank < reduction_heads:
-                head = cta_rank
-                if tidx == 0:
-                    global_max = -cutlass.Float32.inf
-                    for split in cutlass.range_constexpr(cluster_splits):
-                        max_ptr = cute.domain_offset(
-                            (head, blk_tile_d), local_partial
-                        ).iterator
-                        split_max = ld_shared_remote_f32(set_block_rank(max_ptr, split))
-                        global_max = cute.arch.fmax(global_max, split_max)
-                    denominator = cutlass.Float32(0.0)
-                    for split in cutlass.range_constexpr(cluster_splits):
+        tail_count = selected_slots.shape[1] % blk_tile_s
+        tail_start = selected_slots.shape[1] - tail_count
+        mQuery = cute.make_tensor(
+            q_source, cute.make_layout((head_dim, num_q_heads, num_rows))
+        )
+        kv_layout = cute.make_layout(
+            (head_dim, cache_slots), stride=(1, num_kv_heads * head_dim)
+        )
+        mKey = cute.make_tensor(k_iter, kv_layout)
+        mValue = cute.make_tensor(v_iter, kv_layout)
+        for head_group in cutlass.range_constexpr(
+            cute.ceil_div(reduction_heads, cluster_splits)
+        ):
+            head = cta_rank + head_group * cluster_splits
+            valid_head = head < reduction_heads and head_offset + head < heads_per_kv
+            q_head = q_head_offset + head
+            numerator = cutlass.Float32(0.0)
+            tail_values = cute.make_rmem_tensor(tail_count, cutlass.Float32)
+            tail_values.fill(0.0)
+            tail_dots = cute.make_rmem_tensor(tail_count, cutlass.Float32)
+            tail_dots.fill(0.0)
+            if valid_head:
+                if warp_idx == 0:
+                    split_max = -cutlass.Float32.inf
+                    split_sum = cutlass.Float32(0.0)
+                    if lane_idx < cluster_splits:
                         max_ptr = cute.domain_offset(
                             (head, blk_tile_d), local_partial
                         ).iterator
                         sum_ptr = cute.domain_offset(
                             (head, blk_tile_d + 1), local_partial
                         ).iterator
-                        split_max = ld_shared_remote_f32(set_block_rank(max_ptr, split))
-                        split_sum = ld_shared_remote_f32(set_block_rank(sum_ptr, split))
-                        correction = exp2(log2_e * (split_max - global_max))
-                        denominator += correction * split_sum
-                    sM[0, head] = global_max
-                    sL[0, head, 0] = denominator
-
-            cute.arch.sync_threads()
-            if cta_rank < reduction_heads and tidx < blk_tile_d:
-                head = cta_rank
-                dim = tidx
-                numerator = cutlass.Float32(0.0)
-                for split in cutlass.range_constexpr(cluster_splits):
-                    max_ptr = cute.domain_offset(
-                        (head, blk_tile_d), local_partial
-                    ).iterator
-                    value_ptr = cute.domain_offset((head, dim), local_partial).iterator
-                    split_max = ld_shared_remote_f32(set_block_rank(max_ptr, split))
-                    split_value = ld_shared_remote_f32(set_block_rank(value_ptr, split))
-                    correction = exp2(log2_e * (split_max - sM[0, head]))
-                    numerator += correction * split_value
-                mOut[dim, head, coord_hb] = mOut.element_type(
-                    scale_o * numerator / sL[0, head, 0]
-                    if sL[0, head, 0] > 0.0
-                    else 0.0
-                )
-        else:
-            ranked_partial = cute.make_tensor(
-                cute.recast_ptr(tAsK.iterator, dtype=acc_dtype),
-                cute.make_layout(
-                    (cluster_splits, reduction_heads, blk_tile_d + 2),
-                    stride=(
-                        reduction_heads * (blk_tile_d + 2),
-                        blk_tile_d + 2,
-                        1,
-                    ),
-                ),
-            )
-            elems = reduction_heads * blk_tile_d
-            elems_per_thread = cute.ceil_div(elems, self.threads_per_cta)
-            for i in cutlass.range_constexpr(elems_per_thread):
-                elem = tidx + i * self.threads_per_cta
-                if elem < elems:
-                    head = elem // blk_tile_d
-                    dim = elem - head * blk_tile_d
-                    dst = cute.domain_offset(
-                        (cta_rank, head, dim), ranked_partial
-                    ).iterator
-                    st_shared_remote_f32(
-                        set_block_rank(dst, cutlass.Int32(0)),
-                        local_partial[head, dim],
-                    )
-            if tidx < reduction_heads:
-                for stat in cutlass.range_constexpr(2):
-                    dim = blk_tile_d + stat
-                    dst = cute.domain_offset(
-                        (cta_rank, tidx, dim), ranked_partial
-                    ).iterator
-                    st_shared_remote_f32(
-                        set_block_rank(dst, cutlass.Int32(0)),
-                        local_partial[tidx, dim],
-                    )
-
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-
-            if cta_rank == 0:
-                if tidx < reduction_heads:
-                    global_max = -cutlass.Float32.inf
-                    for split in cutlass.range_constexpr(cluster_splits):
-                        global_max = cute.arch.fmax(
-                            global_max, ranked_partial[split, tidx, blk_tile_d]
+                        split_max = ld_shared_remote_f32(
+                            set_block_rank(max_ptr, lane_idx)
                         )
-                    denominator = cutlass.Float32(0.0)
-                    for split in cutlass.range_constexpr(cluster_splits):
-                        correction = exp2(
-                            log2_e
-                            * (ranked_partial[split, tidx, blk_tile_d] - global_max)
+                        split_sum = ld_shared_remote_f32(
+                            set_block_rank(sum_ptr, lane_idx)
                         )
-                        denominator += (
-                            correction * ranked_partial[split, tidx, blk_tile_d + 1]
-                        )
-                    sM[0, tidx] = global_max
-                    sL[0, tidx, 0] = denominator
-
-                cute.arch.sync_threads()
-                for i in cutlass.range_constexpr(elems_per_thread):
-                    elem = tidx + i * self.threads_per_cta
-                    if elem < elems:
-                        head = elem // blk_tile_d
-                        dim = elem - head * blk_tile_d
-                        numerator = cutlass.Float32(0.0)
-                        for split in cutlass.range_constexpr(cluster_splits):
-                            correction = exp2(
-                                log2_e
-                                * (
-                                    ranked_partial[split, head, blk_tile_d]
-                                    - sM[0, head]
-                                )
+                    global_max = warp_fmax(split_max)
+                    correction = exp2(log2_e * (split_max - global_max))
+                    denominator = cute.arch.warp_reduction_sum(correction * split_sum)
+                    if lane_idx < cluster_splits:
+                        sL[0, lane_idx % 8, lane_idx // 8] = correction
+                    if lane_idx == 0:
+                        sM[0, 0] = denominator
+                        sM[0, 1] = global_max
+                if tidx < blk_tile_d:
+                    query_value = cutlass.Float32(mQuery[tidx, q_head, row_idx])
+                    for tail in cutlass.range_constexpr(tail_count):
+                        slot = selected_slots[row_idx, tail_start + tail]
+                        if slot > 0:
+                            tail_dots[tail] = query_value * cutlass.Float32(
+                                mKey[tidx, slot]
                             )
-                            numerator += correction * ranked_partial[split, head, dim]
-                        mOut[dim, head, coord_hb] = mOut.element_type(
-                            scale_o * numerator / sL[0, head, 0]
-                            if sL[0, head, 0] > 0.0
-                            else 0.0
-                        )
-
+                            tail_values[tail] = cutlass.Float32(mValue[tidx, slot])
+            cute.arch.sync_threads()
+            if valid_head and tidx < blk_tile_d:
+                for split in cutlass.range_constexpr(cluster_splits):
+                    value_ptr = cute.domain_offset((head, tidx), local_partial).iterator
+                    split_value = ld_shared_remote_f32(set_block_rank(value_ptr, split))
+                    numerator += sL[0, split % 8, split // 8] * split_value
+            cute.arch.sync_threads()
+            if valid_head and tidx < blk_tile_d:
+                for tail in cutlass.range_constexpr(tail_count):
+                    dot = cute.arch.warp_reduction_sum(tail_dots[tail])
+                    if lane_idx == 0:
+                        sL[0, warp_idx, tail] = dot
+            cute.arch.sync_threads()
+            if valid_head and warp_idx == 0:
+                tail_score = -cutlass.Float32.inf
+                if lane_idx < tail_count:
+                    if selected_slots[row_idx, tail_start + lane_idx] > 0:
+                        tail_score = cutlass.Float32(0.0)
+                        for warp in cutlass.range_constexpr(8):
+                            tail_score += sL[0, warp, lane_idx]
+                        tail_score *= scale_qs
+                new_max = cute.arch.fmax(sM[0, 1], warp_fmax(tail_score))
+                tail_weight = exp2(log2_e * (tail_score - new_max))
+                main_correction = exp2(log2_e * (sM[0, 1] - new_max))
+                tail_sum = cute.arch.warp_reduction_sum(tail_weight)
+                # The weight stores alias the dot-product scratch, and the
+                # new statistics alias the main maximum read by every lane.
+                # Shuffle reductions do not order shared-memory accesses.
+                cute.arch.sync_warp()
+                if lane_idx < tail_count:
+                    sL[0, lane_idx, 0] = tail_weight
+                if lane_idx == 0:
+                    sM[0, 0] = sM[0, 0] * main_correction + tail_sum
+                    sM[0, 1] = main_correction
+            cute.arch.sync_threads()
+            if valid_head and tidx < blk_tile_d:
+                numerator *= sM[0, 1]
+                for tail in cutlass.range_constexpr(tail_count):
+                    numerator += sL[0, tail, 0] * tail_values[tail]
+                mOut[tidx, q_head, row_idx] = mOut.element_type(
+                    scale_o * numerator / sM[0, 0] if sM[0, 0] > 0.0 else 0.0
+                )
+            cute.arch.sync_threads()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         return
 
 
-def _to_tvm_meta(tensor: torch.Tensor, assumed_align: int = 16) -> cute.Tensor:
+def _to_tvm_meta(tensor: torch.Tensor, assumed_align: int) -> cute.Tensor:
     """Create one compile-time tensor descriptor for direct Torch TVM FFI."""
 
     storage = tensor
@@ -1525,29 +1557,28 @@ def _compile_kernel(
     value_cache: torch.Tensor,
     selected_slots: torch.Tensor,
     output: torch.Tensor,
+    kv_splits: int,
 ):
     problem_shape = (
         query.shape[0],
-        _NUM_HEADS,
-        1,
+        query.shape[1],
+        key_cache.shape[1],
         key_cache.shape[0],
         _HEAD_DIM,
     )
-    small_batch = query.shape[0] <= _SMALL_MAX_ROWS
-    kv_splits = _SMALL_NUM_SPLITS if small_batch else _LARGE_NUM_SPLITS
     fmha = MixedInputFusedMultiHeadAttentionDecode(kv_splits)
     fmha.problem_shape = problem_shape
     return cute.compile(
         fmha,
-        _to_tvm_meta(query),
-        _to_tvm_meta(key_cache),
-        _to_tvm_meta(value_cache),
-        _to_tvm_meta(selected_slots),
-        _to_tvm_meta(output),
+        _to_tvm_meta(query, 16),
+        _to_tvm_meta(key_cache, 16),
+        _to_tvm_meta(value_cache, 16),
+        _to_tvm_meta(selected_slots, 16),
+        _to_tvm_meta(output, 16),
         1.0,
         1.0,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi --opt-level 2",
+        options="--enable-tvm-ffi --opt-level 3",
     )
 
 
@@ -1558,16 +1589,25 @@ def kernel(
     selected_slots: torch.Tensor,
     *,
     scale: float,
-    max_seqlen_q: int = 1,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
+    max_seqlen_q: int,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run direct-slot QSA attention with adaptive SM100 CTA clusters."""
+    """Run direct-slot QSA GQA with adaptive SM100 CTA clusters.
 
-    if query.ndim != 3 or query.shape[1:] != (_NUM_HEADS, _HEAD_DIM):
-        raise ValueError("candidate requires query shape [tokens, 6, 256]")
-    if key_cache.ndim != 3 or key_cache.shape[1:] != (1, _HEAD_DIM):
-        raise ValueError("candidate requires key cache shape [slots, 1, 256]")
+    Query heads form contiguous groups for each KV head. Groups must contain
+    at least two query heads so the swizzled Q TMA retains its head dimension.
+    """
+
+    if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:
+        raise ValueError("candidate requires query shape [tokens, query_heads, 256]")
+    if key_cache.ndim != 3 or key_cache.shape[-1] != _HEAD_DIM:
+        raise ValueError("candidate requires key cache shape [slots, kv_heads, 256]")
+    num_q_heads, num_kv_heads = query.shape[1], key_cache.shape[1]
+    if num_q_heads < 1 or num_kv_heads < 1 or num_q_heads % num_kv_heads:
+        raise ValueError("query heads must be a positive multiple of KV heads")
+    if num_q_heads == num_kv_heads:
+        raise ValueError("candidate requires at least two query heads per KV head")
     if value_cache.shape != key_cache.shape:
         raise ValueError("candidate requires matching K/V cache shapes")
     if selected_slots.shape != (query.shape[0], _SELECTED_WIDTH):
@@ -1598,12 +1638,28 @@ def kernel(
     )
     scale_qs = float(scale) * _scalar(k_scale, 1.0)
     scale_o = _scalar(v_scale, 1.0)
+    heads_per_kv = num_q_heads // num_kv_heads
+    num_clusters = (
+        query.shape[0]
+        * num_kv_heads
+        * ((heads_per_kv + _GROUPED_HEAD_TILE - 1) // _GROUPED_HEAD_TILE)
+    )
+    kv_splits = _num_splits(
+        num_clusters,
+        (
+            _wide_cluster_capacity(query.device.index)
+            if num_clusters <= _SMALL_MAX_CLUSTERS
+            else 0
+        ),
+    )
     cache_key = (
         query.device.index,
         query.shape[0],
+        num_q_heads,
+        num_kv_heads,
         key_cache.shape[0],
         key_cache.dtype,
-        _SMALL_NUM_SPLITS if query.shape[0] <= _SMALL_MAX_ROWS else _LARGE_NUM_SPLITS,
+        kv_splits,
         tuple(selected_slots.stride()),
     )
     compiled = _COMPILED_KERNELS.get(cache_key)
@@ -1614,6 +1670,7 @@ def kernel(
             value_cache,
             selected_slots,
             output,
+            kv_splits,
         )
         _COMPILED_KERNELS[cache_key] = compiled
     compiled(

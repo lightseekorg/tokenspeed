@@ -732,6 +732,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     HAS_PRECOMPUTED_CONV: tl.constexpr,
     STORE_STATES: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Run target verify, optionally storing each position's rollback state."""
     pid = tl.program_id(0)
@@ -807,6 +808,13 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         b_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(
             tl.float32
         )
+
+    if ENABLE_PDL:
+        # The state and weights above do not depend on the split producers.
+        # Fence before reading conv_qkv/g_raw, then release gated RMSNorm so
+        # it can prefetch its independent gate and weight during recurrence.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i_t in range(T):
         tok = bos + i_t
@@ -1102,6 +1110,7 @@ def fused_recurrent_kda_verify_megafuse(
     conv_qkv: torch.Tensor | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Run target-verify recurrence with inline or precomputed producers.
 
@@ -1122,6 +1131,8 @@ def fused_recurrent_kda_verify_megafuse(
             128-wide heads and avoids wide V-major tiles when storing tapes.
         num_warps/num_stages: Optional launch overrides. Defaults route to
             1/3 for the fully split producer path and 4/2 otherwise.
+        enable_pdl: Whether this grid releases a programmatic-launch dependent
+            after its producer-independent prologue.
 
     Returns:
         o: ``[N*T, HV, V]`` attention output in ``qkv_raw``'s dtype.
@@ -1172,6 +1183,7 @@ def fused_recurrent_kda_verify_megafuse(
         raise ValueError(f"bv={bv} must be a positive power of two")
     BV = bv
     grid = (triton.cdiv(V, BV) * N * HV,)
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     fused_recurrent_kda_verify_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
@@ -1213,8 +1225,10 @@ def fused_recurrent_kda_verify_megafuse(
         HAS_PRECOMPUTED_GATE=g_raw is not None,
         HAS_PRECOMPUTED_CONV=conv_qkv is not None,
         STORE_STATES=store_states,
+        ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     return out
 

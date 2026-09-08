@@ -130,6 +130,7 @@ def _handle(trace, **kwargs):
     return DeviceHandle(
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
+            order_cache_operations=lambda: trace.append("cache_fence"),
             execute_forward_op=lambda *a, **k: trace.append("forward"),
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
@@ -259,6 +260,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
 
     assert trace == [
         "submit",
+        "cache_fence",
         ("write_backs", ["op"]),
         "submit",
         ("zero", (3, 4)),
@@ -268,6 +270,18 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
+
+
+def test_page_zeroing_without_l2_orders_after_previous_forward():
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
+    )
+
+    handle.execute(_plan(pages_to_zero=[3, 4]), None)
+
+    assert trace == ["submit", "cache_fence", ("zero", (3, 4))]
 
 
 def test_a_plan_with_no_device_work_submits_nothing():

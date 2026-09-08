@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.attention import (
     kda_paged_prefill,
     kda_recurrent_layout,
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
     try_kda_replay_commit,
@@ -220,8 +221,77 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "recurrent_layout": recurrent_layout,
         "num_heads": 1,
         "head_dim": 1,
+        "split_producers": False,
     }
     assert selected == expected
+
+
+def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
+    monkeypatch,
+) -> None:
+    selected = {}
+
+    def fake_select_kernel(*_args, **kwargs):
+        selected.update(kwargs["traits"])
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = try_kda_fused_paged_verify(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        state_scratch=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout="v_major",
+        store_states=False,
+        g_raw=tensor,
+        conv_qkv=tensor,
+    )
+    assert result is tensor
+    assert selected["split_producers"] is True
+
+
+def test_kda_verify_conv_update_resolves_registered_producer(monkeypatch) -> None:
+    selected = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        selected["operator"] = args[1]
+        selected["traits"] = kwargs["traits"]
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = kda_verify_conv_update(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout="v_major",
+    )
+    assert result is tensor
+    assert selected == {
+        "operator": "kda_verify_conv_update",
+        "traits": {
+            "paged_state": True,
+            "split_producers": True,
+            "recurrent_layout": "v_major",
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -284,6 +354,15 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({True}),
+                "split_producers": frozenset({False}),
+                "recurrent_layout": frozenset({"v_major"}),
+            },
+        ),
+        (
+            "triton_nvidia_kda_verify_conv_update",
+            {
+                "paged_state": frozenset({True}),
+                "split_producers": frozenset({True}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -292,6 +371,7 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({False}),
+                "split_producers": frozenset({False}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -400,6 +480,7 @@ def test_kda_split_verify_registration_traits() -> None:
     assert spec.traits == {
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     }
 
@@ -1109,6 +1190,7 @@ def _run_megafuse(inp, *, fused: bool):
         NORM_EPS,
         heads,
         head_dim,
+        enable_pdl=False,
     ).view_as(out)
 
 

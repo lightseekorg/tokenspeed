@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel import mhc_post, mhc_pre
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid, silu_and_mul
 from tokenspeed_kernel.ops.transform import hadamard_transform
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.glm53_flash_config import (
@@ -770,6 +771,7 @@ class Glm53FlashKDA(nn.Module):
                 self.o_norm.variance_epsilon,
                 self.local_num_heads,
                 self.head_dim,
+                enable_pdl=pdl_enabled(),
             )
         return self.o_proj(core_output)[0]
 

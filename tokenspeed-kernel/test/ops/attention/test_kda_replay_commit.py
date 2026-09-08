@@ -746,6 +746,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
         store_states=True,
+        enable_pdl=False,
     ).view(1, -1, HV, V)
     torch.testing.assert_close(no_store, stored, atol=0.0, rtol=0.0)
     assert not torch.equal(conv_tape, conv_before)
@@ -783,6 +784,9 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
         triton_nvidia_kda_fused_paged_verify_no_store,
         triton_nvidia_kda_fused_paged_verify_split,
     )
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_kda_verify_conv_update,
+    )
 
     t = 3
     x = _window(n, t, seed=49 + n)
@@ -812,7 +816,69 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
     )
     fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
     split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    conv_qkv = fused_kda_verify_conv_update(
+        x["qkv_raw"],
+        x["conv_w"],
+        x["conv_pool"],
+        x["read_indices"],
+        num_heads=HV,
+        head_dim=V,
+        draft_token_num=t,
+    )
+    g_raw = torch.mm(x["f_a"], x["w_fb"].t())
+    precomputed = triton_nvidia_kda_fused_paged_verify_split(
+        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv
+    )
     torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(precomputed, split, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not current_platform().is_hopper_plus, reason="PDL requires SM90+")
+def test_verify_to_gated_norm_pdl_chain_matches_serial():
+    """The early verify trigger remains fenced before gated-norm reads."""
+    from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+
+    n, t = 4, 4
+    x = _window(n, t, seed=57)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    gate = torch.randn(n * t, P, device=DEV, dtype=torch.bfloat16)
+    weight = torch.randn(V, device=DEV, dtype=torch.bfloat16)
+
+    def run(enable_pdl: bool) -> torch.Tensor:
+        out = fused_recurrent_kda_verify_megafuse(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            x["conv_pool"],
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            x["h_pool"],
+            x["h_pool"],
+            x["read_indices"],
+            writes,
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=t,
+            lower_bound=LOWER_BOUND,
+            store_states=False,
+            enable_pdl=enable_pdl,
+        )
+        return rmsnorm_gated_sigmoid(
+            out.reshape(-1, P),
+            gate,
+            weight,
+            1e-6,
+            HV,
+            V,
+            enable_pdl=enable_pdl,
+        )
+
+    serial = run(False)
+    pdl = run(True)
+    torch.testing.assert_close(pdl, serial, atol=0.0, rtol=0.0)
 
 
 def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
@@ -843,6 +909,7 @@ def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
                 head_dim=V,
                 draft_token_num=3,
                 lower_bound=LOWER_BOUND,
+                enable_pdl=False,
                 **kwargs,
             )
         )
@@ -884,6 +951,7 @@ def test_fused_verify_routed_bv_matches_bv32(n, t):
             lower_bound=LOWER_BOUND,
             store_states=False,
             bv=bv,
+            enable_pdl=False,
         )
         results.append(out)
     torch.testing.assert_close(results[0], results[1], atol=1e-5, rtol=8e-3)
@@ -921,6 +989,7 @@ def test_fused_verify_store_follows_permuted_write_rows():
                 draft_token_num=t,
                 lower_bound=LOWER_BOUND,
                 store_states=True,
+                enable_pdl=False,
             )
         )
         convs.append(conv)
@@ -955,4 +1024,5 @@ def test_fused_verify_rejects_non_power_of_two_bv():
             draft_token_num=3,
             lower_bound=LOWER_BOUND,
             bv=48,
+            enable_pdl=False,
         )
