@@ -23,7 +23,7 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterator
 from dataclasses import replace
 from itertools import chain, islice
@@ -120,6 +120,16 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
         self.start_transfer_thread(transfer_thread_pool_size, transfer_queue_size)
         self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        # Last time any decode made bootstrap progress with this prefill; the
+        # bootstrap deadline is measured from this as well as from arrival.
+        self.last_decode_progress = time.time()
+        # Rooms this prefill gave up on (room -> monotonic stamp), kept so a
+        # late pre-allocation for one of them is rejected instead of accepted.
+        self.failed_rooms: OrderedDict[int, float] = OrderedDict()
+        self.failed_room_ttl = max(
+            envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get(), 0
+        )
+        self.failed_room_lock = threading.Lock()
         # Publish this manager only after every field used by its bootstrap and
         # transfer threads has been initialized.
         self.start_prefill_thread()
@@ -178,6 +188,42 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.bootstrap_token_cond.notify_all()
+
+    def note_decode_progress(self) -> None:
+        """Record that a decode just made bootstrap progress with this prefill."""
+        self.last_decode_progress = time.time()
+
+    def _reap_failed_rooms(self) -> None:
+        """Drop expired tombstones; callers hold ``failed_room_lock``."""
+        if self.failed_room_ttl <= 0:
+            self.failed_rooms.clear()
+            return
+        now = time.monotonic()
+        while self.failed_rooms:
+            room, failed_at = next(iter(self.failed_rooms.items()))
+            if now - failed_at < self.failed_room_ttl:
+                return
+            del self.failed_rooms[room]
+
+    def _mark_room_failed(self, room: int) -> None:
+        """Tombstone one aborted room so a late pre-allocation is rejected."""
+        if self.failed_room_ttl <= 0:
+            return
+        with self.failed_room_lock:
+            # Re-insert at the tail so insertion order stays expiry order.
+            self.failed_rooms.pop(room, None)
+            self.failed_rooms[room] = time.monotonic()
+            self._reap_failed_rooms()
+
+    def _is_room_failed(self, room: int) -> bool:
+        """True when the room was failed, whether still tracked or tombstoned."""
+        if self.request_status.get(room) == TransferPoll.Failed:
+            return True
+        if self.failed_room_ttl <= 0:
+            return False
+        with self.failed_room_lock:
+            self._reap_failed_rooms()
+            return room in self.failed_rooms
 
     def _wait_prefill_metadata(
         self,
@@ -742,10 +788,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         status to every decode endpoint that already pre-allocated for this room
         (mirrors the in-transfer failure path), so the decode raises a FailedEvent and
         the client gets an error instead of hanging. A room whose decode has not
-        pre-allocated yet is only marked Failed locally (no endpoint to notify).
+        pre-allocated yet is only marked Failed locally (no endpoint to notify)
+        -- but the verdict is tombstoned, so if that decode does pre-allocate
+        later, ``_handle_bootstrap_message`` rejects the manifest and pushes
+        Failed to it then, rather than accepting a room that has no sender.
         """
         self.record_failure(room, reason)
         self.update_status(room, TransferPoll.Failed)
+        self._mark_room_failed(room)
         for req in list(self.transfer_infos.get(room, {}).values()):
             if not req.is_dummy:
                 try:
@@ -934,6 +984,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.rejected_decode_sessions.pop(session_id, None)
             with self.session_lock:
                 self._clear_failed_session(session_id)
+            self.note_decode_progress()
             logger.info(
                 "[Prefill bootstrap_thread] registered kv_args from decode session=%s",
                 session_id,
@@ -949,7 +1000,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             registration = self.get_decode_registration(transfer_info)
             if transfer_info.is_dummy != registration.is_dummy:
                 raise ValueError("CachePD request kind disagrees with its registration")
-            if self.request_status.get(parsed_room) == TransferPoll.Failed:
+            if self._is_room_failed(parsed_room):
                 self.sync_status_to_decode_endpoint(
                     registration.endpoint,
                     registration.dst_port,
@@ -1022,7 +1073,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # A transfer worker can fail and remove the room after the precheck but
         # before this bootstrap-thread commit.  Do not let that interleaving
         # resurrect destination state for a sticky-Failed room.
-        if self.request_status.get(parsed_room) == TransferPoll.Failed:
+        if self._is_room_failed(parsed_room):
             self.transfer_infos.pop(parsed_room, None)
             self.sync_status_to_decode_endpoint(
                 registration.endpoint,
@@ -1032,6 +1083,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self._status_prefill_rank,
             )
             return
+        # The decode is draining its queue: hold off the deadline on waiting rooms.
+        self.note_decode_progress()
         complete = len(candidate_infos) == expected_fanout
         logger.info(
             "[Prefill bootstrap_thread] pre-alloc received: room=%d "

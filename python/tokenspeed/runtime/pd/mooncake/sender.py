@@ -128,16 +128,22 @@ class MooncakeKVSender:
             elif status == TransferPoll.Bootstrapping:
                 if self.init_time is not None:
                     now = time.time()
-                    elapsed = now - self.init_time
-                    if elapsed >= self.kv_mgr.bootstrap_time_out:
+                    waited = now - self.init_time
+                    # Measure from the later of arrival and the last decode progress: the
+                    # deadline catches a silent decode, not one still admitting its queue.
+                    idle = now - max(self.init_time, self.kv_mgr.last_decode_progress)
+                    if idle >= self.kv_mgr.bootstrap_time_out:
                         logger.warning_once(
                             "Some requests timed out when bootstrapping, "
-                            "which means prefill instances fail to receive the cache manifest from the decode instance of this request. "
+                            "which means prefill instances fail to receive the cache manifest from any decode instance for the whole timeout window. "
                             "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
-                        self.kv_mgr.record_failure(
+                        # abort_room frees a decode that already pre-allocated and tombstones
+                        # the room so a late pre-allocation is rejected.
+                        self.kv_mgr.abort_room(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.Bootstrapping",
+                            f"Request {self.bootstrap_room} timed out after {waited:.1f}s in "
+                            f"TransferPoll.Bootstrapping ({idle:.1f}s with no decode bootstrap progress)",
                         )
                         self.conclude_state = TransferPoll.Failed
                         return TransferPoll.Failed

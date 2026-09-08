@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -300,6 +303,67 @@ class _OneChunkQueue:
         return chunk
 
 
+def _bootstrap_manager(*, failed_room_ttl: int = 300):
+    """A prefill manager carrying only the bootstrap-thread surface.
+
+    The real constructor needs a Mooncake engine and starts three threads, so
+    every manager test in this file builds the object directly and fills in
+    the fields the path under test reads.
+    """
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.transfer_infos = {}
+    manager.request_status = {}
+    manager.failure_records = {}
+    manager.failure_lock = threading.Lock()
+    manager.failed_rooms = OrderedDict()
+    manager.failed_room_ttl = failed_room_ttl
+    manager.failed_room_lock = threading.Lock()
+    manager.last_decode_progress = time.time()
+    manager.bootstrap_time_out = 120
+    manager.decode_kv_args_table = {}
+    manager.rejected_decode_sessions = {}
+    manager.prefill_metadata = {}
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.topology = _topology()
+    return manager
+
+
+def _pre_allocating_decode(manager) -> list[tuple]:
+    """Register one decode session on ``manager`` and capture its status pushes."""
+    manager.decode_kv_args_table = {
+        "session": _registration(
+            _layout(),
+            session="session",
+            endpoint="127.0.0.1",
+            pointer=0x1000,
+            expected_decode_ranks=(0,),
+        )
+    }
+    notifications: list[tuple] = []
+    manager.sync_status_to_decode_endpoint = (
+        lambda endpoint, port, room, status, rank: (
+            notifications.append((endpoint, port, room, status, rank))
+        )
+    )
+    return notifications
+
+
+def _waiting_sender(manager, *, waited: float):
+    from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
+
+    sender = object.__new__(MooncakeKVSender)
+    sender.kv_mgr = manager
+    sender.bootstrap_room = 9
+    sender.bootstrap_server_url = "127.0.0.1:9000"
+    sender.conclude_state = None
+    sender._layerwise_chunk_submitted = False
+    sender._layerwise_final_chunk_submitted = False
+    sender.init_time = time.time() - waited
+    return sender
+
+
 def test_decode_receiver_sends_static_registration_then_three_frame_request() -> None:
     from tokenspeed.runtime.pd.base.status import TransferPoll
     from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
@@ -393,42 +457,132 @@ def test_failed_room_fanout_never_restores_state(
     fail_during_commit: bool,
 ) -> None:
     from tokenspeed.runtime.pd.base.status import TransferPoll
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
-    layout = _layout()
-    registration = _registration(
-        layout,
-        session="session",
-        endpoint="127.0.0.1",
-        pointer=0x1000,
-        expected_decode_ranks=(0,),
-    )
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.decode_kv_args_table = {"session": registration}
-    manager.rejected_decode_sessions = {}
-    manager.transfer_infos = {}
+    manager = _bootstrap_manager()
+    notifications = _pre_allocating_decode(manager)
     manager.request_status = {
         9: (TransferPoll.WaitingForInput if fail_during_commit else TransferPoll.Failed)
     }
-    manager.topology = _topology()
     if fail_during_commit:
         manager._validate_cache_room_fanout = lambda _requests: (
             manager.request_status.__setitem__(9, TransferPoll.Failed)
         )
-    notifications = []
-    manager.sync_status_to_decode_endpoint = (
-        lambda endpoint, port, room, status, rank: (
-            notifications.append((endpoint, port, room, status, rank))
-        )
-    )
 
-    manager._handle_bootstrap_message(
-        [b"9", b"session", _destination_block_manifest().to_wire_bytes()]
-    )
+    manager._handle_bootstrap_message(_destination_transfer_frames())
 
     assert manager.transfer_infos == {}
     assert manager.request_status[9] == TransferPoll.Failed
     assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 0)]
+
+
+# --- The bootstrap deadline is a liveness check on the decode, not a deadline
+# on the decode's admission queue: both halves of a room are dispatched at
+# once, but the decode only pre-allocates one when its running window frees a
+# slot. Failing a room for that wait fails a request that is merely queued, and
+# the decode then holds a slot on a room this side has already dropped. ---
+
+
+def test_queued_room_survives_while_the_decode_keeps_pre_allocating() -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    aborts = []
+    manager = _bootstrap_manager()
+    manager.request_status = {9: TransferPoll.Bootstrapping}
+    manager.abort_room = lambda room, reason: aborts.append((room, reason))
+    # Waiting five times the deadline, but the decode committed a
+    # pre-allocation for some other room a moment ago.
+    sender = _waiting_sender(manager, waited=600.0)
+    manager.last_decode_progress = time.time() - 5.0
+
+    assert sender.poll() == TransferPoll.Bootstrapping
+    assert aborts == []
+
+    # The decode goes silent: a full timeout with no progress from any peer.
+    manager.last_decode_progress = time.time() - 600.0
+
+    assert sender.poll() == TransferPoll.Failed
+    assert len(aborts) == 1
+    assert aborts[0][0] == 9
+
+
+def test_bootstrap_timeout_aborts_the_room_and_frees_the_decode() -> None:
+    """A timed-out room must be concluded, not merely recorded.
+
+    ``record_failure`` alone leaves ``request_status`` untouched, so the room
+    never becomes sticky-Failed and any decode that already pre-allocated is
+    never told -- it waits out its own transfer timeout holding a slot.
+    """
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = _bootstrap_manager()
+    notifications = _pre_allocating_decode(manager)
+    manager.request_status = {9: TransferPoll.Bootstrapping}
+    manager.transfer_infos = {9: {"session": _destination_transfer_info()}}
+    sender = _waiting_sender(manager, waited=600.0)
+    manager.last_decode_progress = time.time() - 600.0
+
+    assert sender.poll() == TransferPoll.Failed
+
+    assert manager.request_status[9] == TransferPoll.Failed
+    assert manager.transfer_infos == {}
+    assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 0)]
+    assert 9 in manager.failure_records
+
+
+def test_late_prealloc_for_a_dropped_room_is_rejected_not_bootstrapped() -> None:
+    """The decisive regression: a pre-allocation that arrives after the prefill
+    gave up must be refused. ``discard_room`` erases ``request_status``, so a
+    status-only guard reads ``None`` and the handler would accept the manifest,
+    mark a senderless room Bootstrapped, and leave the decode holding its slot
+    until its own waiting timeout.
+    """
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = _bootstrap_manager()
+    notifications = _pre_allocating_decode(manager)
+    manager.request_status = {9: TransferPoll.Bootstrapping}
+
+    manager.abort_room(9, "timed out while bootstrapping")
+    # What DisaggPrefillExecutor._drop_request_state does on the FailedEvent.
+    manager.discard_room(9)
+    assert 9 not in manager.request_status
+
+    manager._handle_bootstrap_message(_destination_transfer_frames())
+
+    assert manager.transfer_infos == {}
+    assert manager.request_status.get(9) != TransferPoll.Bootstrapped
+    assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 0)]
+
+
+def test_committed_prealloc_stamps_decode_progress() -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = _bootstrap_manager()
+    _pre_allocating_decode(manager)
+    manager.last_decode_progress = 0.0
+
+    manager._handle_bootstrap_message(_destination_transfer_frames())
+
+    assert manager.request_status[9] == TransferPoll.Bootstrapped
+    assert manager.last_decode_progress > 0.0
+
+
+def test_failed_room_tombstone_expires_with_its_ttl() -> None:
+    """The tombstone is bounded: it only has to outlive the window in which a
+    decode could still be waiting on this room."""
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = _bootstrap_manager(failed_room_ttl=30)
+    _pre_allocating_decode(manager)
+    manager.request_status = {9: TransferPoll.Bootstrapping}
+
+    manager.abort_room(9, "timed out while bootstrapping")
+    manager.discard_room(9)
+    assert manager._is_room_failed(9)
+
+    manager.failed_rooms[9] = time.monotonic() - 31.0
+    assert not manager._is_room_failed(9)
+    assert manager.failed_rooms == OrderedDict()
 
 
 def test_cache_factory_exposes_only_typed_arena() -> None:
