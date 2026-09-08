@@ -219,6 +219,29 @@ def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     assert not _use_two_stage_producer_direct(2, min_numel, dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_plain_two_stage_admits_partitionable_shapes(dtype):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    elements_per_word = 8 // dtype.itemsize
+    # The plain path carries no minimum size -- two-stage measured faster than
+    # one-shot at every shape down to 14 KB -- so the predicate is purely the
+    # kernel's partitioning requirement.
+    aligned = 8 * elements_per_word
+    assert _use_two_stage_plain(8, aligned, dtype)
+    assert _use_two_stage_plain(8, aligned * 4096, dtype)
+    # every K3 decode width partitions evenly across 8 ranks
+    for tokens in (1, 8, 16, 32, 64):
+        assert _use_two_stage_plain(8, tokens * 7168, dtype)
+    # a payload that does not split into whole words per rank stays on one-shot
+    assert not _use_two_stage_plain(8, aligned + 1, dtype)
+    # world sizes without a tuned partitioning fall back
+    assert not _use_two_stage_plain(2, aligned, dtype)
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
