@@ -69,7 +69,6 @@ _ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
-    from tokenspeed.runtime.execution.speculative_state import SpeculativeState
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -953,17 +952,19 @@ def _prepare_verify_workspace(
     config,
     backend,
     draft_backend,
-    speculative_states: tuple[SpeculativeState, ...],
+    indexer_runtime: QSAIndexerRuntime | None,
+    draft_indexer_runtime: QSAIndexerRuntime | None,
     uses_paged_state_verify: bool,
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
     model_name = "execution"
     actual_bytes = sum(
-        state.preallocate_verify_workspace(
+        runtime.preallocate_verify_workspace(
             config.max_bs, int(server_args.speculative_num_draft_tokens or 1)
         )
-        for state in speculative_states
+        for runtime in (indexer_runtime, draft_indexer_runtime)
+        if runtime is not None
     )
     if uses_paged_state_verify and expected_bytes:
         model_name = "paged-state"
@@ -976,7 +977,7 @@ def _prepare_verify_workspace(
         actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
-    elif not speculative_states:
+    elif indexer_runtime is None and draft_indexer_runtime is None:
         return
     if actual_bytes != expected_bytes:
         raise RuntimeError(
@@ -1202,11 +1203,8 @@ def create_attn_components(
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
-        speculative_states=tuple(
-            runtime
-            for runtime in (indexer_runtime, draft_indexer_runtime)
-            if runtime is not None
-        ),
+        indexer_runtime=indexer_runtime,
+        draft_indexer_runtime=draft_indexer_runtime,
         uses_paged_state_verify=cache_family in ("qwen4_exp", "qwen_gdn", "kimi_k3"),
         is_inkling=cache_family == "inkling",
         expected_bytes=fixed_workspace_bytes,

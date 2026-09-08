@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Verification participants run after execution, outside the backend tree."""
+"""The target context's QSA runtime commits after eager forward or graph replay."""
 
 from types import SimpleNamespace
 
@@ -29,13 +29,25 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 
 
-def _runner(*, use_graph: bool, has_drafter: bool, fail_forward: bool):
+def _runner(
+    *, use_graph: bool, has_drafter: bool, has_indexer_runtime: bool, fail_forward: bool
+):
     events = []
     commits = []
     wrapper = object.__new__(ForwardStepRunner)
     wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8)
     wrapper.device = "cpu"
-    wrapper.drafter = object() if has_drafter else None
+    wrapper.drafter = (
+        SimpleNamespace(
+            indexer_runtime=SimpleNamespace(
+                commit_after_verify=lambda *args, **kwargs: events.append(
+                    "draft_commit"
+                )
+            )
+        )
+        if has_drafter
+        else None
+    )
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
@@ -75,12 +87,15 @@ def _runner(*, use_graph: bool, has_drafter: bool, fail_forward: bool):
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
     wrapper.output_buffers = {4: result}
-    wrapper.speculative_states = (SimpleNamespace(commit_after_verify=commit),)
+    wrapper.indexer_runtime = (
+        SimpleNamespace(commit_after_verify=commit) if has_indexer_runtime else None
+    )
     return wrapper, events, commits
 
 
 def _run(wrapper, mode):
     ctx = SimpleNamespace(
+        indexer_runtime=wrapper.indexer_runtime,
         bs=2,
         num_extends=1 if mode.is_mixed() else (2 if mode.is_extend() else 0),
         forward_mode=mode,
@@ -107,24 +122,32 @@ def _run(wrapper, mode):
 
 
 @pytest.mark.parametrize(
-    "mode,use_graph,has_drafter,expected",
+    "mode,use_graph,has_drafter,has_indexer_runtime,expected",
     [
-        (ForwardMode.DECODE, False, True, [([3, 1], 0)]),
-        (ForwardMode.DECODE, True, True, [([3, 1], 0)]),
-        (ForwardMode.MIXED, False, True, [([3, 1], 1)]),
-        (ForwardMode.EXTEND, False, True, []),
-        (ForwardMode.DECODE, False, False, []),
+        (ForwardMode.DECODE, False, True, True, [([3, 1], 0)]),
+        (ForwardMode.DECODE, True, True, True, [([3, 1], 0)]),
+        (ForwardMode.MIXED, False, True, True, [([3, 1], 1)]),
+        (ForwardMode.EXTEND, False, True, True, []),
+        (ForwardMode.DECODE, False, False, True, []),
+        (ForwardMode.DECODE, False, True, False, []),
+        (ForwardMode.DECODE, True, True, False, []),
+        (ForwardMode.MIXED, False, True, False, []),
     ],
 )
 def test_runner_commits_live_acceptance_once_after_execution(
-    mode, use_graph, has_drafter, expected
+    mode, use_graph, has_drafter, has_indexer_runtime, expected
 ):
     wrapper, events, commits = _runner(
-        use_graph=use_graph, has_drafter=has_drafter, fail_forward=False
+        use_graph=use_graph,
+        has_drafter=has_drafter,
+        has_indexer_runtime=has_indexer_runtime,
+        fail_forward=False,
     )
     _run(wrapper, mode)
     assert commits == expected
     assert events[:2] == ["metadata", "execute"]
+    assert "draft_commit" not in events
+    assert events.count("recurrent") == int(has_drafter and mode.is_decode())
     if expected:
         assert events[-1] == "commit"
         assert events.count("commit") == 1
@@ -133,7 +156,10 @@ def test_runner_commits_live_acceptance_once_after_execution(
 @pytest.mark.parametrize("use_graph", [False, True])
 def test_failed_execution_does_not_commit_stale_staging(use_graph):
     wrapper, events, commits = _runner(
-        use_graph=use_graph, has_drafter=True, fail_forward=True
+        use_graph=use_graph,
+        has_drafter=True,
+        has_indexer_runtime=True,
+        fail_forward=True,
     )
     with pytest.raises(RuntimeError, match="forward failed"):
         _run(wrapper, ForwardMode.DECODE)

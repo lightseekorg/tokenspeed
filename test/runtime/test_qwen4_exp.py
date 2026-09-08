@@ -605,8 +605,8 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         logit_cap=0.0,
         v_head_dim=8,
         sliding_window_size=-1,
-        group_id=FULL_ATTENTION,
     )
+    layer.bind_cache_group(FULL_ATTENTION)
     pool = SimpleNamespace()
     ctx = SimpleNamespace(
         attn_backend=backend,

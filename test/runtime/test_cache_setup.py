@@ -398,7 +398,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         num_kv_heads=1,
         head_dim=2,
         attn_tp_size=1,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
     )
     width = 3 if speculative else 0
     attn_config = AttnConfig(
@@ -409,7 +409,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     draft_config = (
         replace(
             attn_config,
-            components=(replace(target_spec, layer_types=(FULL_ATTENTION,)),),
+            components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
         )
         if speculative
         else None
