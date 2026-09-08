@@ -101,12 +101,13 @@ def test_iris_state_uses_protocol_capacities(monkeypatch):
     assert len(created) == 1
 
 
+@pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_producer_direct_admission_supported_world_sizes(
     monkeypatch,
+    world_size,
     dtype,
 ):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     monkeypatch.setattr(
@@ -114,14 +115,13 @@ def test_producer_direct_admission_supported_world_sizes(
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
-    for world_size in config.supported_world_sizes:
-        state = SimpleNamespace(world_size=world_size, max_bytes=64)
-        assert triton_ops.symm_outputs_can_run(
-            state,
-            ((3, 5), (1, 1)),
-            dtype,
-        )
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(
+        state,
+        ((3, 5), (1, 1)),
+        dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -133,7 +133,6 @@ def test_producer_direct_admission_supported_world_sizes(
     ],
 )
 def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     monkeypatch.setattr(
@@ -141,69 +140,43 @@ def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    world_size = (
-        iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct.supported_world_sizes[-1]
-    )
-    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+    state = SimpleNamespace(world_size=8, max_bytes=64)
 
     assert triton_ops.symm_outputs_can_run(state, shapes, dtype)
 
 
 @pytest.mark.parametrize(
-    ("shapes", "dtype", "op"),
+    ("world_size", "shapes", "dtype", "op"),
     [
-        (((3,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (((3,),), torch.float32, dist.ReduceOp.SUM),
-        (((36,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (((18,),), torch.float32, dist.ReduceOp.SUM),
-        (((4,),), torch.float64, dist.ReduceOp.SUM),
-        (((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
+        (1, ((4,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((36,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((18,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.float64, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
     ],
 )
 def test_producer_direct_admission_rejects_unsupported_requests(
     monkeypatch,
+    world_size,
     shapes,
     dtype,
     op,
 ):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     monkeypatch.setattr(
         triton_ops,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
-    )
-    world_size = (
-        iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct.supported_world_sizes[-1]
     )
     state = SimpleNamespace(world_size=world_size, max_bytes=64)
 
     assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
 
 
-def test_producer_direct_admission_rejects_unsupported_world_size(monkeypatch):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-    config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
-    world_size = max(config.supported_world_sizes) + 1
-    state = SimpleNamespace(world_size=world_size, max_bytes=64)
-
-    assert not triton_ops.symm_outputs_can_run(
-        state,
-        ((4,),),
-        torch.bfloat16,
-    )
-
-
 def test_producer_direct_admission_is_cdna4_only(monkeypatch):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     monkeypatch.setattr(
@@ -211,10 +184,7 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=False),
     )
-    world_size = (
-        iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct.supported_world_sizes[-1]
-    )
-    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+    state = SimpleNamespace(world_size=8, max_bytes=64)
 
     assert not triton_ops.symm_outputs_can_run(
         state,
@@ -223,8 +193,16 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_producer_direct_two_stage_threshold(dtype):
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "min_bytes"),
+    [
+        (4, torch.bfloat16, 160 << 10),
+        (4, torch.float32, 160 << 10),
+        (8, torch.bfloat16, 96 << 10),
+        (8, torch.float32, 96 << 10),
+    ],
+)
+def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     try:
         from tokenspeed_kernel.ops.communication.iris import (
             IRIS_ALL_REDUCE_KERNEL_CONFIG,
@@ -233,27 +211,12 @@ def test_producer_direct_two_stage_threshold(dtype):
         pytest.skip("iris is not installed")
 
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
-    for world_size, min_bytes in config.two_stage_min_bytes:
-        alignment = world_size * (config.packed_word_bytes // dtype.itemsize)
-        min_numel = min_bytes // dtype.itemsize
-        assert config.use_two_stage(world_size, min_numel, dtype)
-        assert not config.use_two_stage(
-            world_size,
-            min_numel - alignment,
-            dtype,
-        )
-        assert not config.use_two_stage(world_size, min_numel + 1, dtype)
-
-    one_stage_world_size = next(
-        world_size
-        for world_size in config.supported_world_sizes
-        if config.two_stage_threshold(world_size) is None
-    )
-    assert not config.use_two_stage(
-        one_stage_world_size,
-        config.two_stage_min_bytes[0][1] // dtype.itemsize,
-        dtype,
-    )
+    alignment = world_size * (config.packed_word_bytes // dtype.itemsize)
+    min_numel = min_bytes // dtype.itemsize
+    assert config.use_two_stage(world_size, min_numel, dtype)
+    assert not config.use_two_stage(world_size, min_numel - alignment, dtype)
+    assert not config.use_two_stage(world_size, min_numel + 1, dtype)
+    assert not config.use_two_stage(2, min_numel, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -592,14 +555,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
     )
 
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
-    max_tokens = 16
-    num_token_cases = []
-    num_tokens = 1
-    while num_tokens <= max_tokens:
-        num_token_cases.append(num_tokens)
-        num_tokens *= 2
-
-    for num_tokens in num_token_cases:
+    for num_tokens in (1, 2, 4, 8, 16):
         torch.manual_seed(101 + num_tokens)
         hidden = config.hidden_size
         blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
@@ -640,7 +596,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             scratch,
             rank=rank,
             group=state.group,
-            local_world_size=state.world_size,
+            local_world_size=8,
         )
         for _ in range(4):
             actual_hidden, actual_residual = allreduce_residual_attnres_combine(
@@ -651,7 +607,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 scratch,
                 rank=rank,
                 group=state.group,
-                local_world_size=state.world_size,
+                local_world_size=8,
                 eps=1e-6,
             )
             torch.testing.assert_close(
@@ -671,7 +627,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 scratch,
                 rank=rank,
                 group=state.group,
-                local_world_size=state.world_size,
+                local_world_size=8,
                 eps=1e-6,
             )
         graph.replay()
