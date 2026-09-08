@@ -32,6 +32,7 @@ from tokenspeed.runtime.execution.model_executor import (
     ModelExecutorConfig,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.speculative_state import SpeculativeState
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -148,6 +149,7 @@ def create_model_executor(
     model_runner: ModelRunner,
     attn_backend: AttentionBackend,
     token_to_kv_pool: CachePool,
+    speculative_states: tuple[SpeculativeState, ...],
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: CachePool | None = None,
@@ -178,6 +180,7 @@ def create_model_executor(
         model_runner=model_runner,
         attn_backend=attn_backend,
         token_to_kv_pool=token_to_kv_pool,
+        speculative_states=speculative_states,
         sampling_backend=sampling_backend,
         draft_model_runner=draft_model_runner,
         draft_attn_backend=draft_attn_backend,

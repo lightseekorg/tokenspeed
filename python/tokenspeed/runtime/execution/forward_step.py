@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.execution.speculative_state import SpeculativeState
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
@@ -187,6 +188,7 @@ class ForwardStepRunner:
         token_to_kv_pool: CachePool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
+        speculative_states: tuple[SpeculativeState, ...],
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
         drafter: BaseDrafter | None = None,
@@ -201,6 +203,7 @@ class ForwardStepRunner:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.token_to_kv_pool = token_to_kv_pool
+        self.speculative_states = speculative_states
         self.drafter = drafter
         self.sampling_backend = sampling_backend
         self.input_buffers = input_buffers
@@ -1016,9 +1019,7 @@ class ForwardStepRunner:
         if self.drafter is not None and (
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):
-            self.attn_backend.commit_speculative_state_after_verify(
-                result[1],
-                num_extends=ctx.num_extends,
-            )
+            for state in self.speculative_states:
+                state.commit_after_verify(result[1], num_extends=ctx.num_extends)
 
         return result

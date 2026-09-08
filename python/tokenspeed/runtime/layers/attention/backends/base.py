@@ -366,19 +366,6 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
-    ) -> None:
-        """Publish acceptance to runner-facing children.
-
-        Paged compute leaves carry no post-verify lifecycle.
-        """
-        for child in self.child_backends():
-            if isinstance(child, AttentionBackend):
-                child.commit_speculative_state_after_verify(
-                    accepted_lengths, num_extends=num_extends
-                )
-
     @contextmanager
     def record_pd_cache_step(
         self,

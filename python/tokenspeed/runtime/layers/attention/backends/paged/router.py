@@ -35,10 +35,10 @@ scheduler bridge and the kernels that expands raw group tables:
 * it dispatches a layer's forward to the leaf of ``layer.group_id`` with
   that group's write locations.
 
-Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. An optional
-backend runtime receives resolved ``group_view`` results for cross-group
-indexing and owns its transient verify state. A single-group model is a
-router with one leaf; there is no single-table special case anywhere.
+Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. Indexers consume
+resolved ``group_view`` results for cross-group indexing. Their verification
+state belongs to the execution side, outside the router. A single-group
+model is a router with one leaf; there is no single-table special case.
 """
 
 from __future__ import annotations
@@ -54,7 +54,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
-    PagedAttentionRuntime,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
@@ -143,7 +142,6 @@ class CacheGroupRouter(AttentionBackend):
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
         self.cache_pool: CachePool | None = None
-        self.runtime: PagedAttentionRuntime | None = None
         self._stacks: GroupTableStacks | None = None
         # Published write locations: the decode slot (graph-recorded views,
         # refreshed in place) and the extend slot (fresh per round).
@@ -207,21 +205,6 @@ class CacheGroupRouter(AttentionBackend):
     def configure_runtime(self, **kwargs) -> None:
         for leaf in self.leaves.values():
             leaf.configure_runtime(**kwargs)
-
-    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
-        """Allocate the family's shared verify workspace and return its bytes."""
-        if self.runtime is None:
-            return 0
-        return self.runtime.preallocate_verify_workspace(max_bs, draft_token_num)
-
-    def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
-    ) -> None:
-        """Publish acceptance to this router's shared runtime."""
-        if self.runtime is not None:
-            self.runtime.commit_after_mtp_verify(
-                accepted_lengths, num_extends=num_extends
-            )
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():

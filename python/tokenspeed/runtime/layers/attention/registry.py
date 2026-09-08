@@ -69,7 +69,9 @@ _ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.execution.speculative_state import SpeculativeState
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -461,14 +463,12 @@ def create_paged_router(
         leaf_spec = dataclasses.replace(spec, backend_name=name)
         return leaf_cls(config, leaf_spec, kernel_page_size=kernel_page_size)
 
-    router = CacheGroupRouter(
+    return CacheGroupRouter(
         leaf_factory,
         is_draft=bool(config.is_draft),
         spec_num_tokens=config.speculative_num_draft_tokens or 1,
         device=config.device,
     )
-    router.runtime = leaf_cls.create_runtime(config, router)
-    return router
 
 
 def _validate_lcm_page_size(
@@ -953,38 +953,52 @@ def _prepare_verify_workspace(
     config,
     backend,
     draft_backend,
+    speculative_states: tuple[SpeculativeState, ...],
     uses_paged_state_verify: bool,
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
+    model_name = "execution"
+    actual_bytes = sum(
+        state.preallocate_verify_workspace(
+            config.max_bs, int(server_args.speculative_num_draft_tokens or 1)
+        )
+        for state in speculative_states
+    )
     if uses_paged_state_verify and expected_bytes:
         model_name = "paged-state"
-        actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
+        actual_bytes += backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs,
             int(server_args.speculative_num_draft_tokens),
         )
-        full_preallocate = getattr(
-            getattr(backend, "full_attn_backend", None),
-            "preallocate_verify_workspace",
-            None,
-        )
-        if full_preallocate is not None:
-            actual_bytes += full_preallocate(
-                config.max_bs,
-                int(server_args.speculative_num_draft_tokens),
-            )
     elif is_inkling:
         model_name = "Inkling"
-        actual_bytes = backend.fixed_workspace_bytes()
+        actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
-    else:
+    elif not speculative_states:
         return
     if actual_bytes != expected_bytes:
         raise RuntimeError(
             f"planned {model_name} verify workspace does not match allocated tensors: "
             f"{expected_bytes} planned, {actual_bytes} allocated"
         )
+
+
+def _create_indexer_runtime(
+    config: AttnConfig | None, pool: CachePool | None
+) -> QSAIndexerRuntime | None:
+    """Build QSA execution state only for a side whose fields use its cache."""
+    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    )
+    from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
+
+    if config is None or pool is None:
+        return None
+    if QWEN4_EXP_QSA_RECENT_CACHE_GROUP not in pool.paged_group_ids:
+        return None
+    return QSAIndexerRuntime(config, pool)
 
 
 # ---------- public API ----------
@@ -1021,6 +1035,8 @@ def create_attn_components(
     CachePool,
     AttentionBackend | None,
     CachePool | None,
+    QSAIndexerRuntime | None,
+    QSAIndexerRuntime | None,
     dict | None,
 ]:
     target = _resolve_attn_side(model_config, server_args.attention_backend)
@@ -1179,11 +1195,18 @@ def create_attn_components(
             continue
         side_backend.set_cache_pool(side_pool)
 
+    indexer_runtime = _create_indexer_runtime(config, pool)
+    draft_indexer_runtime = _create_indexer_runtime(draft_attn_config, draft_pool)
     _prepare_verify_workspace(
         server_args=server_args,
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
+        speculative_states=tuple(
+            runtime
+            for runtime in (indexer_runtime, draft_indexer_runtime)
+            if runtime is not None
+        ),
         uses_paged_state_verify=cache_family in ("qwen4_exp", "qwen_gdn", "kimi_k3"),
         is_inkling=cache_family == "inkling",
         expected_bytes=fixed_workspace_bytes,
@@ -1200,5 +1223,7 @@ def create_attn_components(
         pool,
         draft_attn_backend,
         draft_pool,
+        indexer_runtime,
+        draft_indexer_runtime,
         cache_storage,
     )

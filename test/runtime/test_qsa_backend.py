@@ -28,9 +28,6 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-    HybridLinearAttnBackend,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -43,14 +40,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.layers.attention.qsa.runtime import (
-    QSARuntime,
-    require_qsa_runtime,
+from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
+from tokenspeed.runtime.layers.attention.qsa.runtime import QSAIndexerRuntime
+from tokenspeed.runtime.layers.attention.registry import (
+    _create_indexer_runtime,
+    _prepare_verify_workspace,
+    create_paged_router,
 )
-from tokenspeed.runtime.layers.attention.registry import create_paged_router
 
 
-def _make_qsa_backend(*, max_bs: int, is_draft: bool, device: str) -> CacheGroupRouter:
+def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
     spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=1,
@@ -77,7 +76,15 @@ def _make_qsa_backend(*, max_bs: int, is_draft: bool, device: str) -> CacheGroup
         draft_block_decode=False,
         components=(spec,),
     )
-    return create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
+    return config
+
+
+def _make_qsa_backend(*, max_bs: int, is_draft: bool, device: str) -> CacheGroupRouter:
+    return create_paged_router(
+        _qsa_config(max_bs=max_bs, is_draft=is_draft, device=device),
+        AttentionArch.MHA,
+        backend_name="qsa",
+    )
 
 
 def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
@@ -128,11 +135,22 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
 
 
 @pytest.fixture
-def router() -> CacheGroupRouter:
-    router = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
-    router.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
-    router.preallocate_verify_workspace(8, 4)
-    return router
+def runtime() -> QSAIndexerRuntime:
+    runtime = _create_indexer_runtime(
+        _qsa_config(max_bs=8, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    _prepare_verify_workspace(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=4),
+        config=SimpleNamespace(max_bs=8),
+        backend=None,
+        draft_backend=None,
+        speculative_states=(runtime,),
+        uses_paged_state_verify=False,
+        is_inkling=False,
+        expected_bytes=2 * 8 * 4 * 8 * 2 + 8 * 4 * 36 + 2 * 2 * 8,
+    )
+    return runtime
 
 
 @pytest.fixture
@@ -148,33 +166,28 @@ def commit_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[tuple, dict]]:
     return calls
 
 
-def test_qsa_registry_preallocates_from_the_cache_plan(router) -> None:
-    assert type(router) is CacheGroupRouter
-    assert isinstance(router.runtime, QSARuntime)
-    assert len(router.leaves) == 3
+def test_qsa_registry_preallocates_from_the_cache_plan(runtime) -> None:
+    router = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
+    router.set_cache_pool(runtime.cache_pool)
+    assert not hasattr(router, "runtime")
+    assert not hasattr(router, "commit_speculative_state_after_verify")
     assert all(isinstance(leaf, QSAAttnBackend) for leaf in router.leaves.values())
-    workspace = router.runtime._verify_workspace
+    workspace = runtime._verify_workspace
     assert workspace.token_k.shape == (2, 8, 4, 1, 8)
     assert workspace.position_values.shape == (8, 4, 3)
     assert workspace.logical_positions.shape == workspace.recent_locs.shape == (8, 4)
     expected_bytes = 2 * 8 * 4 * 8 * 2 + 8 * 4 * 36 + 2 * 2 * 8
-    assert router.preallocate_verify_workspace(8, 4) == expected_bytes
-    assert router.runtime._verify_workspace is workspace
+    assert runtime.preallocate_verify_workspace(8, 4) == expected_bytes
+    assert runtime._verify_workspace is workspace
 
 
-@pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("layer_offset", [0, 5])
-def test_qsa_commit_uses_only_owned_layers_once(
-    commit_calls, hybrid, layer_offset
-) -> None:
-    router = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
+def test_qsa_commit_uses_only_owned_layers_once(commit_calls, layer_offset) -> None:
     pool = _qsa_pool(device="cpu", layer_offset=layer_offset)
-    router.set_cache_pool(pool)
-    router.preallocate_verify_workspace(8, 4)
-    backend = (
-        HybridLinearAttnBackend(router, SimpleNamespace(), [1, 3]) if hybrid else router
+    runtime = QSAIndexerRuntime(
+        _qsa_config(max_bs=8, is_draft=False, device="cpu"), pool
     )
-    runtime = require_qsa_runtime(backend)
+    runtime.preallocate_verify_workspace(8, 4)
     workspace = runtime._verify_workspace
     # Both eager batches and graph buckets use the same capacity-sized tensors.
     for bs in (8, 2):
@@ -183,7 +196,7 @@ def test_qsa_commit_uses_only_owned_layers_once(
         assert views[1][0].data_ptr() == workspace.token_k[1].data_ptr()
         assert views[0][1].data_ptr() == views[1][1].data_ptr()
         assert views[0][0].shape == (bs, 4, 1, 8)
-        backend.commit_speculative_state_after_verify(
+        runtime.commit_after_verify(
             torch.tensor([9] + [3] * bs, dtype=torch.int32), num_extends=1
         )
     assert len(commit_calls) == 2
@@ -205,45 +218,50 @@ def test_qsa_commit_uses_only_owned_layers_once(
 
 
 @pytest.mark.parametrize("bs", [0, 9])
-def test_qsa_staging_rejects_invalid_capacity(router, bs) -> None:
+def test_qsa_staging_rejects_invalid_capacity(runtime, bs) -> None:
     with pytest.raises(RuntimeError, match="preallocated shape"):
-        router.runtime.verify_staging_buffers(1, bs)
+        runtime.verify_staging_buffers(1, bs)
 
 
-def test_qsa_staging_rejects_changed_verify_width(router) -> None:
-    router.spec_num_tokens = 3
+def test_qsa_staging_rejects_changed_verify_width(runtime) -> None:
+    runtime.spec_num_tokens = 3
     with pytest.raises(RuntimeError, match="preallocated shape"):
-        router.runtime.verify_staging_buffers(1, 2)
+        runtime.verify_staging_buffers(1, 2)
 
 
 def test_qsa_staging_requires_preallocation() -> None:
-    router = _make_qsa_backend(max_bs=2, is_draft=False, device="cpu")
+    runtime = QSAIndexerRuntime(
+        _qsa_config(max_bs=2, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
     with pytest.raises(RuntimeError, match="must be preallocated"):
-        router.runtime.verify_staging_buffers(1, 2)
+        runtime.verify_staging_buffers(1, 2)
 
 
 @pytest.mark.parametrize("layer_id, error", [(0, KeyError), (4, ValueError)])
-def test_qsa_staging_rejects_layers_outside_its_fields(router, layer_id, error) -> None:
+def test_qsa_staging_rejects_layers_outside_its_fields(
+    runtime, layer_id, error
+) -> None:
     with pytest.raises(error):
-        router.runtime.verify_staging_buffers(layer_id, 2)
+        runtime.verify_staging_buffers(layer_id, 2)
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_qsa_commit_without_target_staging_is_silent(commit_calls, is_draft) -> None:
-    router = _make_qsa_backend(max_bs=2, is_draft=is_draft, device="cpu")
-    router.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
-    nbytes = router.preallocate_verify_workspace(2, 4)
-    assert (nbytes == 0) == is_draft
-    router.commit_speculative_state_after_verify(
-        torch.tensor([2], dtype=torch.int32), num_extends=0
+    runtime = QSAIndexerRuntime(
+        _qsa_config(max_bs=2, is_draft=is_draft, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
     )
+    nbytes = runtime.preallocate_verify_workspace(2, 4)
+    assert (nbytes == 0) == is_draft
+    runtime.commit_after_verify(torch.tensor([2], dtype=torch.int32), num_extends=0)
     assert commit_calls == []
 
 
 @pytest.mark.parametrize("num_extends", [-1, 3])
-def test_qsa_commit_rejects_invalid_extend_prefix(router, num_extends) -> None:
+def test_qsa_commit_rejects_invalid_extend_prefix(runtime, num_extends) -> None:
     with pytest.raises(ValueError, match="invalid extend prefix"):
-        router.commit_speculative_state_after_verify(
+        runtime.commit_after_verify(
             torch.tensor([1, 2], dtype=torch.int32), num_extends=num_extends
         )
 
@@ -256,9 +274,11 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
     router = _make_qsa_backend(max_bs=4, is_draft=False, device="cuda")
     pool = _qsa_pool(device="cuda", layer_offset=0)
     router.set_cache_pool(pool)
-    router.preallocate_verify_workspace(4, 4)
+    runtime = QSAIndexerRuntime(
+        _qsa_config(max_bs=4, is_draft=False, device="cuda"), pool
+    )
+    runtime.preallocate_verify_workspace(4, 4)
     router.init_cuda_graph_state(4)
-    runtime = router.runtime
     raws = [pool.arena.field(qsa_raw_key_field(layer)) for layer in (1, 3)]
     positions = [pool.arena.field(qsa_rope_position_field(layer)) for layer in (1, 3)]
     workspace = runtime._verify_workspace
@@ -272,7 +292,7 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
         gid: torch.tensor([[1], [2]], dtype=torch.int32, device="cuda")
         for gid in router.group_ids
     }
-    ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE)
+    ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE, attn_backend=router)
 
     def refresh(actual_bs: int) -> None:
         router.refresh_decode_metadata(
@@ -287,7 +307,7 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
         )
 
     def stage() -> None:
-        layout = runtime.qsa_forward_layout(
+        layout = qsa_forward_layout(
             ctx,
             8,
             compressed_token_page_size=256,
@@ -324,7 +344,7 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
             stage()
         else:
             graph.replay()
-        router.commit_speculative_state_after_verify(
+        runtime.commit_after_verify(
             torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
         )
         assert runtime._verify_workspace is workspace
@@ -346,3 +366,74 @@ def test_qsa_runtime_refreshes_layout_and_commits_live_verify_rows(
             )
     assert torch.count_nonzero(pool.arena.field(qsa_raw_key_field(4))) == 0
     assert torch.count_nonzero(pool.arena.field(qsa_rope_position_field(4))) == 0
+
+
+def test_qsa_runtime_is_shared_only_with_its_models_indexers(runtime) -> None:
+    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+
+    def model() -> torch.nn.ModuleList:
+        indexers = []
+        for layer_id in (1, 3):
+            indexer = QSAIndexer.__new__(QSAIndexer)
+            torch.nn.Module.__init__(indexer)
+            indexer.layer_id = layer_id
+            indexer.runtime = None
+            indexers.append(indexer)
+        return torch.nn.ModuleList([*indexers, torch.nn.Identity()])
+
+    target, draft = model(), model()
+    draft_runtime = QSAIndexerRuntime(
+        _qsa_config(max_bs=8, is_draft=True, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=5),
+    )
+    workspace = runtime._verify_workspace
+    runtime.bind_indexers(target)
+    draft_runtime.bind_indexers(draft)
+    assert all(indexer.runtime is runtime for indexer in target[:2])
+    assert all(indexer.runtime is draft_runtime for indexer in draft[:2])
+    assert runtime._verify_workspace is workspace
+    assert draft_runtime.preallocate_verify_workspace(8, 4) == 0
+    assert target.state_dict() == draft.state_dict() == {}
+
+
+def test_qsa_without_speculation_needs_no_verify_workspace() -> None:
+    import dataclasses
+
+    config = dataclasses.replace(
+        _qsa_config(max_bs=8, is_draft=False, device="cpu"),
+        speculative_num_draft_tokens=1,
+    )
+    runtime = _create_indexer_runtime(config, _qsa_pool(device="cpu", layer_offset=0))
+    _prepare_verify_workspace(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=None),
+        config=config,
+        backend=None,
+        draft_backend=None,
+        speculative_states=(runtime,),
+        uses_paged_state_verify=False,
+        is_inkling=False,
+        expected_bytes=0,
+    )
+    assert runtime._verify_workspace is None
+
+
+def test_qsa_runtime_requires_fields_in_the_side_view() -> None:
+    config = _qsa_config(max_bs=8, is_draft=False, device="cpu")
+    pool = _qsa_pool(device="cpu", layer_offset=0)
+    pool.paged_group_ids = (FULL_ATTENTION,)
+    assert _create_indexer_runtime(config, pool) is None
+    assert _create_indexer_runtime(None, None) is None
+
+
+def test_qsa_workspace_budget_mismatch_fails_before_forward(runtime) -> None:
+    with pytest.raises(RuntimeError, match="planned execution verify workspace"):
+        _prepare_verify_workspace(
+            server_args=SimpleNamespace(speculative_num_draft_tokens=4),
+            config=SimpleNamespace(max_bs=8),
+            backend=None,
+            draft_backend=None,
+            speculative_states=(runtime,),
+            uses_paged_state_verify=False,
+            is_inkling=False,
+            expected_bytes=runtime._verify_workspace.nbytes - 1,
+        )

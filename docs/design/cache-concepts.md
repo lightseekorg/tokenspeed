@@ -459,7 +459,7 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
-## Sparse indexers: model-owned weights, backend-owned dispatch
+## Sparse indexers: model weights, backend dispatch, execution-owned verification
 
 Sparse-attention families split one mechanism across the model and the
 backend. The invariant is the division, not where any helper happens to sit:
@@ -468,36 +468,40 @@ backend. The invariant is the division, not where any helper happens to sit:
   `nn.Module` (weight loading addresses it by module path), and its forward
   ends by handing `topk_indices` to the normal attention call
   (`PagedAttention.forward` → the backend), never to a side channel.
-* The **backend** owns everything the dispatch needs: the metadata slot, the
-  per-group page tables and consumer page sizes, the derived layout, and any
-  speculative side-state (QSA's verify staging + batched commit). A backend
-  whose attention is sparse is a *registered* backend (`register_backend`),
-  not a lazily bolted-on coordinator — that is what puts its workspace on
-  the `workspace_bytes` ledger and lets the registry size it before
-  CUDA-graph capture.
+* The **backend** owns attention dispatch and cache addressing: the metadata
+  slots, per-group page tables and consumer page sizes. Sparse attention is
+  a registered compute backend (`register_backend`) using the same router
+  and leaf lifecycle as dense attention.
+* The **indexer runtime** owns speculative verification workspace and its
+  accepted-state commit. QSA's `QSAIndexerRuntime` is constructed at startup
+  for each applicable target/draft cache view, separately from the backend
+  tree. The recipe budgets staging and address tables in `workspace_bytes`;
+  attention-component assembly preallocates them from the bound plan. The
+  device builder shares the runtime with the side's indexers and hands the
+  target's verification participant to the executor. Indexers take local
+  layer views; the execution runner commits acceptance after the complete
+  eager forward or graph replay, once for all owned layers.
 
 Two consequences worth remembering when touching this boundary:
 
 * **Whoever produces the metadata owns the group route.** `set_cache_pool`
   binds the ordinary `CacheGroupRouter`, whose `init_forward_metadata*`
-  owns table expansion, per-group write locations, and capture buffers. QSA
-  is a registered paged leaf using MHA metadata. Its family runtime is
-  constructed once with the router and derives the indexer's layout from
-  resolved `group_view` results, including the full-history table used by
-  top-k selection. A wrapper inserted above it must forward `set_cache_pool`;
+  owns table expansion, per-group write locations, and capture buffers.
+  QSA's compute leaf uses MHA metadata. The indexer's `qsa/metadata.py`
+  derives its layout from resolved `group_view` results and the live full-KV
+  metadata slot. A wrapper above the router forwards `set_cache_pool`;
   there is no parallel group geometry on the model side.
 * **Sparse addressing belongs to the consumer of the group.** DSA's index
-  rows ride the history group's table and write locations, so its dense
-  child stays a pure calculator. QSA's compressed/recent groups are
-  scheduler-owned cache groups with heterogeneous page sizes. Their resolved
-  views go to the backend-owned QSA runtime; the compute leaf receives the
-  selected physical slots and its own KV write locations. Persisted QSA
-  fields stay in the cache recipe and LCM arena; the runtime owns only
-  derived layout and transient verification staging. Staging and commit
-  address tables are included in `workspace_bytes` and preallocated from the
-  bound cache plan before graph capture. Model indexers only request their
-  staging views by local layer id; they do not bind or populate cache addresses. Duplicating group conversion in the
-  runtime, model or hybrid wrapper would fork the single source of truth.
+  rows ride the history group's table and write locations. QSA's compressed
+  and recent groups remain scheduler-owned groups with heterogeneous page
+  sizes. The indexer consumes their resolved views; the compute leaf
+  receives selected physical slots and its own KV write locations. Persisted
+  QSA fields stay in the cache recipe and LCM arena. The indexer runtime
+  derives owned layers and commit addresses from the bound plan's layer
+  window, including under PP and target/draft sharing. Model binding never
+  populates cache addresses. Moving verification out of the backend does not
+  move persistent cache allocation, prefix matching, transfer or retention
+  into model modules.
 
 ## Code placement
 

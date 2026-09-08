@@ -35,17 +35,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.qsa.runtime import (
-    QSARuntime,
-    decode_query_lengths,
-)
+from tokenspeed.runtime.layers.attention.qsa.metadata import decode_query_lengths
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
-    from tokenspeed.runtime.layers.attention.backends.paged.router import (
-        CacheGroupRouter,
-    )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -56,7 +50,7 @@ class QSAAttnBackend(MHAAttnBackend):
     """Sparse MHA leaf over the ordinary router's resolved pages and slots.
 
     MHA supplies the unified metadata path. Cross-group indexing and verify
-    commits belong to the one registry-created runtime, outside this leaf.
+    commits belong to the execution-owned indexer runtime, outside this leaf.
     """
 
     def __init__(
@@ -68,11 +62,6 @@ class QSAAttnBackend(MHAAttnBackend):
             kernel_page_size=kernel_page_size,
         )
         self._metadata_capacity_rows = config.max_bs * self.spec_num_tokens
-
-    @classmethod
-    def create_runtime(cls, config: AttnConfig, router: CacheGroupRouter) -> QSARuntime:
-        """Create one QSA runtime for all groups owned by the router."""
-        return QSARuntime(config, router)
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
