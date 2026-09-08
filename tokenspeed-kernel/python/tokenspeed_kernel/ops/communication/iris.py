@@ -416,9 +416,9 @@ class IrisAllReduce(object):
             buf_bytes = max_numel * dtype.itemsize
             # _input_buf, _attnres_input_buf (2), _producer_direct_scratch_buf,
             # the staged path's rotating slots (_STAGED_SLOTS), the two-stage
-            # path's own slots (_STAGED_SLOTS), and its scratch partition --
+            # path's single staging buffer, and its scratch partition --
             # counted as a whole buffer since world_size is not known yet.
-            heap_size = max(1 << 28, (5 + 2 * _STAGED_SLOTS) * buf_bytes + (16 << 20))
+            heap_size = max(1 << 28, (6 + _STAGED_SLOTS) * buf_bytes + (16 << 20))
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -454,22 +454,18 @@ class IrisAllReduce(object):
         # reads peers' inputs out of symmetric memory, so the payload has to be
         # staged before launch. That staging cannot share _staged_input_buf --
         # its slot is chosen by one-shot's kernel from a counter we cannot see --
-        # nor _input_buf, which acquire_outputs hands to producer-direct. Hence
-        # dedicated buffers; at the configured max_numel they cost about 1 MiB.
+        # nor _input_buf, which acquire_outputs hands to producer-direct.
         #
-        # Two slots, for the reason spelled out on the one-shot kernel: writing
-        # E+1 lands on the other slot, and reaching E+2 means every peer passed
-        # the entry barrier at E+1, which they publish only after finishing
-        # their reads at E.
-        self._two_stage_input_buf = self._ctx.zeros(
-            (_STAGED_SLOTS, max_numel), dtype=dtype
-        )
+        # A single buffer, deliberately: rotating slots from the host does not
+        # survive graph capture, which records the staging copy's address and
+        # replays it unchanged. The kernel's exit barrier is what makes one
+        # buffer safe -- see EXIT_BARRIER.
+        self._two_stage_input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
         # Each rank reduces only its own partition and peers read it at the same
         # offset, so scratch holds one partition rather than the whole payload.
         self._two_stage_scratch_buf = self._ctx.zeros(
             (max_numel // self.world_size,), dtype=dtype
         )
-        self._two_stage_slot = 0
         self._producer_direct_block_size = 512
         # Use one program per tile for small payloads, capped to limit contention.
         self._producer_direct_max_programs = 84
@@ -597,7 +593,7 @@ class IrisAllReduce(object):
         return offset % self._elements_per_word == 0 and offset <= self.max_numel
 
     def _all_reduce_two_stage(
-        self, tensor: torch.Tensor, numel: int, safe: bool = True
+        self, tensor: torch.Tensor, numel: int, safe: bool
     ) -> torch.Tensor:
         """Reduce ``tensor`` in place via reduce-scatter then all-gather.
 
@@ -611,9 +607,7 @@ class IrisAllReduce(object):
         Returns:
             The reduction across the group; a clone of ``tensor`` when ``safe``.
         """
-        slot = self._two_stage_slot
-        self._two_stage_slot = (slot + 1) % _STAGED_SLOTS
-        staged = self._two_stage_input_buf[slot]
+        staged = self._two_stage_input_buf
         staged[:numel].copy_(tensor.view(-1))
 
         partition_numel = numel // self.world_size
@@ -638,6 +632,7 @@ class IrisAllReduce(object):
             NUM_WARPS=8,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
             ELEMENTS_PER_WORD=self._elements_per_word,
+            EXIT_BARRIER=True,
             num_warps=8,
         )
         tensor.view(-1).copy_(output)
@@ -683,6 +678,7 @@ class IrisAllReduce(object):
                 NUM_WARPS=8,
                 ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
                 ELEMENTS_PER_WORD=self._elements_per_word,
+                EXIT_BARRIER=False,
                 num_warps=8,
             )
         else:
@@ -1163,6 +1159,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    EXIT_BARRIER: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions."""
     block_id = gl.program_id(0)
@@ -1316,6 +1313,34 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             mask=gl.expand_dims(mask, 0),
         )
         tile_id += NUM_PROGRAMS
+
+    if EXIT_BARRIER:
+        # Callers that stage into the symmetric input before launching cannot
+        # rotate buffers safely: under graph capture the staging copy records a
+        # fixed address and replays it, so a rank one invocation ahead would
+        # overwrite an input its slower peers are still reducing. Holding the
+        # kernel until every peer has finished reading makes a single staging
+        # buffer correct by construction, at the price of one more rendezvous.
+        # Producer-direct callers own their input and pass False.
+        reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+        _iris_sync_rank_epoch(
+            ready_flags,
+            block_id,
+            reads_done,
+            local_heap,
+            heap_base_0,
+            heap_base_1,
+            heap_base_2,
+            heap_base_3,
+            heap_base_4,
+            heap_base_5,
+            heap_base_6,
+            heap_base_7,
+            RANK,
+            WORLD_SIZE,
+            NUM_WARPS,
+            PUBLISH=True,
+        )
 
 
 @gluon.jit
