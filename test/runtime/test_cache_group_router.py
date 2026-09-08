@@ -548,7 +548,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
-        router, _ = self._router(spec=1)
+        router, leaves = self._router(spec=1)
         # Request 0 extends (prefix 4, 5 new tokens), request 1 decodes at
         # seq 4.
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
@@ -573,6 +573,138 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
         )
+        router.forward(
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+            _layer(FULL),
+            None,
+            ForwardMode.DECODE,
+            1,
+        )
+        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
+
+    def test_draft_step_zero_local_decode_writes_the_full_extend_span(self):
+        router, leaves = self._router(is_draft=True, spec=1)
+        seq_lens = torch.tensor([9], dtype=torch.int32)
+        extend_seq_lens = torch.tensor([5], dtype=torch.int32)
+        extend_prefix_lens = torch.tensor([4], dtype=torch.int32)
+        router.init_forward_metadata(
+            1,
+            1,
+            torch.arange(1, dtype=torch.int32),
+            seq_lens,
+            ForwardMode.EXTEND,
+            block_tables=self._tables(1),
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens.clone(),
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_with_prefix=True,
+        )
+        router.refresh_decode_metadata(
+            1,
+            1,
+            torch.arange(1, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(1),
+            num_extends=1,
+        )
+        router.forward(
+            torch.zeros(1),
+            torch.zeros(5),
+            torch.zeros(5),
+            _layer(FULL),
+            None,
+            ForwardMode.DECODE,
+            1,
+        )
+        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0])
+
+    def test_draft_step_zero_one_token_extend_ignores_q_k_shape_equality(self):
+        router, leaves = self._router(is_draft=True, spec=1)
+        seq_lens = torch.tensor([5], dtype=torch.int32)
+        one = torch.ones(1, dtype=torch.int32)
+        prefix = torch.tensor([4], dtype=torch.int32)
+        router.init_forward_metadata(
+            1,
+            1,
+            torch.arange(1, dtype=torch.int32),
+            seq_lens,
+            ForwardMode.EXTEND,
+            block_tables=self._tables(1),
+            extend_seq_lens=one,
+            extend_seq_lens_cpu=one.clone(),
+            extend_prefix_lens=prefix,
+            extend_prefix_lens_cpu=prefix.clone(),
+            extend_with_prefix=True,
+        )
+        router.refresh_decode_metadata(
+            1,
+            1,
+            torch.arange(1, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(1),
+            num_extends=1,
+        )
+        q = torch.zeros(1)
+        router.forward_decode(q, q, q, _layer(FULL), None, 1)
+        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24])
+
+    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+        router, leaves = self._router(is_draft=True, spec=1)
+        seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+        extend_seq_lens = torch.tensor([5], dtype=torch.int32)
+        extend_prefix_lens = torch.tensor([4], dtype=torch.int32)
+        router.init_forward_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            ForwardMode.MIXED,
+            block_tables=self._tables(),
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens.clone(),
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens.clone(),
+            extend_with_prefix=True,
+        )
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+            num_extends=1,
+        )
+        router.forward(
+            torch.zeros(2),
+            torch.zeros(6),
+            torch.zeros(6),
+            _layer(FULL),
+            None,
+            ForwardMode.DECODE,
+            2,
+        )
+        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0, 39])
+
+        later = router.publish_draft_step_locations(
+            cache_start=torch.tensor([4, 0], dtype=torch.int32), num_tokens=1
+        )
+        router.forward(
+            torch.zeros(2),
+            torch.zeros(2),
+            torch.zeros(2),
+            _layer(FULL),
+            None,
+            ForwardMode.DECODE,
+            2,
+        )
+        self.assertEqual(leaves[FULL].calls[-1][2].data_ptr(), later.data_ptr())
+        self.assertEqual(later.tolist(), [24, 36])
 
     def test_capture_seeds_with_idle_rows_then_calls_leaf_capture_hooks(self):
         router, leaves = self._router()

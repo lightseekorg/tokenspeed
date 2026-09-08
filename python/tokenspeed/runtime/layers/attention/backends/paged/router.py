@@ -351,6 +351,22 @@ class CacheGroupRouter(AttentionBackend):
             )
         return self._extend_write_locations[gid]
 
+    def _forward_decode_write_locations(self, layer: PagedAttention) -> torch.Tensor:
+        """Include EXTEND rows when draft step 0 locally dispatches as DECODE."""
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        decode_locations = self.write_locations(layer, ForwardMode.DECODE)
+        if (
+            not self.is_draft
+            or self._decode_request_offset == 0
+            or self._extend_write_locations is None
+        ):
+            return decode_locations
+        extend_locations = self._extend_write_locations[layer.group_id]
+        if decode_locations.numel() == 0:
+            return extend_locations
+        return torch.cat((extend_locations, decode_locations))
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -664,7 +680,11 @@ class CacheGroupRouter(AttentionBackend):
         # Under a prefill-graph replay the frozen forward_mode scalar is
         # always EXTEND, which is also the live mode.
         leaf = self._leaf_for(layer)
-        out_cache_loc = self.write_locations(layer, forward_mode)
+        out_cache_loc = (
+            self._forward_decode_write_locations(layer)
+            if forward_mode.is_decode()
+            else self.write_locations(layer, forward_mode)
+        )
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 return leaf.forward_decode(
@@ -703,10 +723,8 @@ class CacheGroupRouter(AttentionBackend):
         **kwargs,
     ):
         """Composite hosts (hybrid GDN/KDA) dispatch decode directly."""
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
         leaf = self._leaf_for(layer)
-        out_cache_loc = self.write_locations(layer, ForwardMode.DECODE)
+        out_cache_loc = self._forward_decode_write_locations(layer)
         return leaf.forward_decode(
             q,
             k,
