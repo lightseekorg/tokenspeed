@@ -321,6 +321,35 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
 
+    def test_checkpoint_id_fingerprints_local_config_code(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, source in (
+                (first, "class Config: rope_theta = 10000\n"),
+                (second, "class Config: rope_theta = 500000\n"),
+            ):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write(
+                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                    )
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(b"weights")
+                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                    handle.write(source)
+            self.assertNotEqual(
+                self._checkpoint_id(
+                    first,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+                self._checkpoint_id(
+                    second,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                ),
+            )
+
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as handle:

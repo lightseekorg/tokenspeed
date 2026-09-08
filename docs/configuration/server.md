@@ -322,7 +322,8 @@ Mooncake Store (L3)
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
-immutable revision or a local weight-byte fingerprint — never an inherited
+immutable revision or a local fingerprint of selected weights, metadata,
+and top-level `*.py` — never an inherited
 config `_commit_hash` or a 40-hex folder name outside Hugging Face
 `snapshots/<commit>` — plus `--load-format` so a directory that contains
 more than one weight encoding cannot share objects across loaders, and

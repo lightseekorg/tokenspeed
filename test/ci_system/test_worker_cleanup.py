@@ -1,12 +1,18 @@
+import inspect
 import subprocess
 import time
 from pathlib import Path
 
 
-def _run_cleanup_script(script: str, timeout: int = 5) -> subprocess.CompletedProcess:
+def _run_cleanup_script(script: str, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash"], input=script, text=True, capture_output=True, timeout=timeout
     )
+
+
+def test_run_cleanup_script_requires_timeout():
+    param = inspect.signature(_run_cleanup_script).parameters["timeout"]
+    assert param.default is inspect.Parameter.empty
 
 
 def test_stop_worker_pids_forces_process_that_ignores_sigterm():
@@ -22,7 +28,7 @@ if kill -0 "$worker" 2>/dev/null; then
 fi
 """
     started = time.monotonic()
-    result = _run_cleanup_script(script)
+    result = _run_cleanup_script(script, timeout=5)
 
     assert result.returncode == 0, result.stderr
     assert time.monotonic() - started < 4
@@ -71,7 +77,7 @@ fi
 kill "$parent" 2>/dev/null || true
 wait "$parent" 2>/dev/null || true
 """
-    result = _run_cleanup_script(script)
+    result = _run_cleanup_script(script, timeout=5)
     assert result.returncode == 0, result.stderr + result.stdout
 
 
@@ -103,7 +109,7 @@ if kill -0 "$server" 2>/dev/null; then
   exit 1
 fi
 """
-    result = _run_cleanup_script(script)
+    result = _run_cleanup_script(script, timeout=5)
     assert result.returncode == 0, result.stderr + result.stdout
 
 

@@ -196,7 +196,10 @@ def l3_checkpoint_id(
     fine-tuned tree can inherit from its source, and never from a
     40-character hex basename outside that snapshot layout. Local fingerprints also
     hash ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
-    quantization cannot collide under identical weight bytes. Hugging Face
+    quantization cannot collide under identical weight bytes, and top-level
+    ``*.py`` so ``--trust-remote-code`` configuration/modeling modules that
+    derive architecture fields cannot share a namespace with identical
+    JSON/weights. Hugging Face
     hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
     pinned ``--revision``. The returned id always includes the normalized
@@ -330,6 +333,18 @@ def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozens
     return frozenset()
 
 
+def _is_local_checkpoint_code(name: str) -> bool:
+    """Return whether ``name`` is custom HF code loaded with trust_remote_code.
+
+    Configuration and modeling modules at the checkpoint root can derive
+    rope, layout, and other fields that change KV without touching
+    ``config.json`` or the weight tensors. Hugging Face snapshot commits
+    already cover those files; local fingerprints must hash them too.
+    """
+
+    return name.endswith(".py")
+
+
 @functools.cache
 def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     """Hash config/index/quant-config bytes and the selected weight files.
@@ -342,8 +357,11 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     not in the weight tensors. ``consolidated.safetensors.index.json`` is
     hashed so two Mistral dumps with the same ``consolidated*.safetensors``
     candidates but different shard maps cannot share a namespace.
-    ``--load-format`` selects so a directory that contains more than one
-    checkpoint encoding cannot share a namespace across loaders.
+    Top-level ``*.py`` is hashed so two trees with identical JSON/weights
+    but different ``--trust-remote-code`` configuration modules cannot
+    share a namespace. ``--load-format`` selects so a directory that
+    contains more than one checkpoint encoding cannot share a namespace
+    across loaders.
     """
     hasher = hashlib.sha256()
     try:
@@ -355,7 +373,7 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
         path = os.path.join(model_dir, name)
         if not os.path.isfile(path):
             continue
-        if name in _CHECKPOINT_METADATA_FILES:
+        if name in _CHECKPOINT_METADATA_FILES or _is_local_checkpoint_code(name):
             hasher.update(name.encode())
             _update_file_digest(hasher, path)
             continue
