@@ -35,8 +35,12 @@ if not is_cdna4():
 
 import tokenspeed_kernel  # noqa: E402
 from tokenspeed_kernel.selection import kernel_override  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
+    _mxfp4_quantize_tile,
+    _mxfp8_quantize_tile,
     quantize_mxfp8_sorted_routes,
+    scaled_downcast_layout,
 )
 
 _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
@@ -116,6 +120,137 @@ def test_sorted_route_mxfp8_quantization_matches_standard_gfx950() -> None:
         atol=0,
         rtol=0,
     )
+
+
+@gluon.jit
+def _quantize_tile_probe_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    OUTPUT_FP8: gl.constexpr,
+):
+    """Run one quantize tile over a dense BLOCK_M x BLOCK_N tile."""
+
+    layout: gl.constexpr = scaled_downcast_layout(BLOCK_M, BLOCK_N, gl.num_warps())
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
+    cols = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, layout))
+    values = gl.load(x_ptr + rows[:, None] * BLOCK_N + cols[None, :])
+
+    if OUTPUT_FP8:
+        quantized, scale_byte = _mxfp8_quantize_tile(values)
+        OUT_COLS: gl.constexpr = BLOCK_N
+    else:
+        quantized, scale_byte = _mxfp4_quantize_tile(values)
+        OUT_COLS: gl.constexpr = BLOCK_N // 2
+
+    out_layout: gl.constexpr = quantized.type.layout
+    out_rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_layout))
+    out_cols = gl.arange(0, OUT_COLS, gl.SliceLayout(0, out_layout))
+    gl.store(out_ptr + out_rows[:, None] * OUT_COLS + out_cols[None, :], quantized)
+
+    scale_layout: gl.constexpr = scale_byte.type.layout
+    scale_rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, scale_layout))
+    scale_cols = gl.arange(0, BLOCK_N // 32, gl.SliceLayout(0, scale_layout))
+    gl.store(
+        scale_ptr + scale_rows[:, None] * (BLOCK_N // 32) + scale_cols[None, :],
+        scale_byte,
+    )
+
+
+def _quantize_tile_probe(
+    hidden_states: torch.Tensor,
+    *,
+    output_fp8: bool,
+):
+    """Return the quantized tile, its scales, and the compiled kernel."""
+
+    block_m, block_n = hidden_states.shape
+    out_cols = block_n if output_fp8 else block_n // 2
+    out_dtype = torch.float8_e4m3fn if output_fp8 else torch.uint8
+    out = torch.empty((block_m, out_cols), dtype=out_dtype, device="cuda")
+    scales = torch.empty((block_m, block_n // 32), dtype=torch.uint8, device="cuda")
+    compiled = _quantize_tile_probe_kernel[(1,)](
+        hidden_states,
+        out,
+        scales,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        OUTPUT_FP8=output_fp8,
+        num_warps=4,
+    )
+    return out, scales, compiled
+
+
+def _quantize_tile_probe_input() -> torch.Tensor:
+    """A tile spanning normal, tiny, tie-rounded, and all-zero 32-value groups.
+
+    Row 0 is entirely zero, which selects the raw E8M0 payload 0 that the
+    hardware scaled downcast cannot encode as an exponent; ``_hw_scale_payload``
+    keeps that group bit-identical to the software reference. Row 1 exercises a
+    far-from-unity scale that still encodes, and row 2 the E2M1
+    round-half-to-even ties.
+    """
+
+    generator = torch.Generator(device="cuda").manual_seed(20260907)
+    values = torch.randn(
+        (32, 256),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    values[0] = 0.0
+    values[1] = torch.full_like(values[1], 2.0**-100)
+    # Ties between two E2M1 codes must round half-to-even the same way.
+    values[2] = torch.tensor(
+        [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 32,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    return values
+
+
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_quantize_tile_matches_reference_quantizer_gfx950(output_fp8: bool) -> None:
+    values = _quantize_tile_probe_input()
+    actual, actual_scales, _ = _quantize_tile_probe(values, output_fp8=output_fp8)
+
+    if output_fp8:
+        expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
+            values,
+            solution="triton",
+        )
+    else:
+        expected, expected_scales = tokenspeed_kernel.quantize_mxfp4(
+            values,
+            scale_layout="linear",
+            solution="triton",
+        )
+
+    torch.testing.assert_close(
+        actual.view(torch.uint8),
+        expected.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        actual_scales,
+        expected_scales.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_quantize_tile_uses_hardware_scaled_downcast_gfx950(output_fp8: bool) -> None:
+    """The tiles must lower to v_cvt_scalef32_*, not the software bit path."""
+
+    values = _quantize_tile_probe_input()
+    _, _, compiled = _quantize_tile_probe(values, output_fp8=output_fp8)
+    amdgcn = compiled.asm["amdgcn"]
+    suffix = "fp8" if output_fp8 else "fp4"
+    assert f"v_cvt_scalef32_pk_{suffix}_f32" in amdgcn
 
 
 def _make_mxfp4_module(
