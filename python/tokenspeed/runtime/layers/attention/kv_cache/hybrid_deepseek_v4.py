@@ -18,6 +18,7 @@ from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.ops.attention.triton.dsv4 import dsv4_compressed_slot_mapping
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
@@ -360,6 +361,19 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         "indexer_kv": "indexer_kv_buffer",
         "indexer_state": "indexer_state_buffer",
     }
+
+    # A V4 layer's fused attention reads several history groups at once (the
+    # SWA window beside its compressed chain and the compressor tails), so no
+    # layer rides one group through ``PagedAttention`` and no router leaf
+    # serves this view: the V4 backend takes every group's table by id.
+    @property
+    @override
+    def paged_group_ids(self) -> tuple[str, ...]:
+        return ()
+
+    @override
+    def history_group_by_layer(self) -> dict[int, str]:
+        return {}
 
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str

@@ -1686,7 +1686,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     softmax = MHAConfig(
         backend_name="fa2",
         num_attention_heads=2,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
         num_kv_heads=1,
         attn_tp_size=1,
         head_dim=32,

@@ -40,6 +40,7 @@ jobs:
       has_tasks: ${{ steps.matrix.outputs.has_tasks }}
       allowed: ${{ steps.gate.outputs.allowed }}
       enabled: ${{ steps.gate.outputs.enabled }}
+      install_tokenspeed_mla_from_source: ${{ steps.changes.outputs.install_tokenspeed_mla_from_source }}
     steps:
       - name: Check trusted source
         id: gate
@@ -141,6 +142,7 @@ jobs:
           RUNNER: ${{ matrix.runner }}
           TASK_TYPE: ${{ matrix.type }}
           PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
         run: |
           set -euo pipefail
           unset HF_TOKEN HUGGING_FACE_HUB_TOKEN

@@ -82,6 +82,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_history_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
@@ -104,6 +107,7 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
     Fp8Config,
@@ -1413,6 +1417,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             mapping=None,
             speculative_algorithm="DSPARK",
             enable_prefix_caching=True,
+            speculative_num_steps=5,
             speculative_num_draft_tokens=6,
             prefix_granularity=256,
             load_format="auto",
@@ -2411,6 +2416,39 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
         )
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
+
+    def test_deepseek_v4_kv_pool_binds_no_paged_attention_layer(self):
+        # Every V4 group stores rows of token history, and a layer's fused
+        # attention reads several of them at once (its SWA window beside its
+        # compressed chain), so the generic per-layer derivation has no single
+        # group to hand PagedAttention -- the view says so instead of raising.
+        config = SimpleNamespace(
+            compress_ratios=[1, 4, 128],
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+        )
+        pool, _ = _make_planned_deepseek_v4_pool(layout, config)
+
+        self.assertEqual(
+            {spec.family for spec in pool.arena.cache_group_specs}, {"history"}
+        )
+        with self.assertRaisesRegex(ValueError, "more than one history"):
+            derive_history_groups_by_layer(
+                pool.arena,
+                first_layer=0,
+                num_layers=len(layout.layer_ratio),
+                kv_planes=pool.layer_plane_bindings,
+            )
+        self.assertEqual(pool.history_group_by_layer(), {})
+        self.assertEqual(pool.paged_group_ids, ())
+        bind_cache_groups(torch.nn.Module(), pool)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
         config = SimpleNamespace(

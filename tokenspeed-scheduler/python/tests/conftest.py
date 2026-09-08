@@ -33,8 +33,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id=group_id,
-            rows_per_page=cfg.prefix_granularity,
-            entry_stride_tokens=1,
+            block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=(

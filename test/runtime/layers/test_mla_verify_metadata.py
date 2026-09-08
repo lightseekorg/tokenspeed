@@ -4,6 +4,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 sys.path.insert(
@@ -26,6 +27,9 @@ def _run_mla_decode(
     page_size: int = 16,
     draft_block_decode: bool = False,
     sliding_window_size: int = -1,
+    query_blocks: bool = False,
+    block_size: int | None = None,
+    num_extends: int = 0,
 ) -> dict[str, torch.Tensor]:
     captured = {}
 
@@ -36,19 +40,29 @@ def _run_mla_decode(
     monkeypatch.setattr(
         mla_backend, "mla_decode_with_kvcache", fake_mla_decode_with_kvcache
     )
+    monkeypatch.setattr(
+        mla_backend,
+        "supports_mla_decode_query_blocks",
+        lambda **kwargs: query_blocks,
+    )
     backend = object.__new__(mla_backend.MLAAttnBackend)
-    metadata_rows = bs * q_len_per_req if draft_block_decode else bs
+    spec = block_size or q_len_per_req
+    metadata_rows = bs * spec if draft_block_decode else bs
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    block_seq_lens = seq_lens
     if draft_block_decode:
-        seq_lens = seq_lens.repeat_interleave(q_len_per_req)
+        seq_lens = seq_lens.repeat_interleave(spec)
     backend.forward_decode_metadata = SimpleNamespace(
-        num_extends=0,
+        num_extends=num_extends,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
         seq_lens=seq_lens,
+        # Built once per forward alongside the expanded rows above.
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=block_seq_lens,
     )
     backend.is_draft = is_draft
     backend.draft_block_decode = draft_block_decode
-    backend.spec_num_tokens = q_len_per_req if draft_block_decode else 1
+    backend.spec_num_tokens = spec if draft_block_decode else 1
     backend.max_context_len = 256
     backend.kernel_page_size = page_size
     backend.kv_lora_rank = 2
@@ -57,6 +71,7 @@ def _run_mla_decode(
     backend.kv_cache_dim = 4
     backend.data_type = data_type
     backend.kernel_solution = None
+    backend._query_block_decode = {}
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
@@ -124,3 +139,258 @@ def test_dflash2_block_decode_passes_exact_sliding_window(monkeypatch):
     assert captured["window_left"] == 4095
     assert captured["noncausal_block_size"] == 8
     assert captured["q"].shape[0] == 16
+
+
+@pytest.mark.parametrize("window", [4095, -1])
+def test_a_block_folds_onto_the_query_axis_when_a_kernel_takes_it(monkeypatch, window):
+    """One row per request instead of one per block position, same mask.
+
+    The flattened metadata repeats each request's page table and block-end
+    length once per block position, so the un-expanded rows are the request.
+    The layout follows the kernel and not the mask: a draft mixes windowed and
+    full-attention layers over one metadata buffer, so both fold whenever a
+    kernel says it reads the query-axis form.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        sliding_window_size=window,
+        query_blocks=True,
+    )
+
+    assert captured["q"].shape[:2] == (2, 8)
+    assert captured["page_table"].shape[0] == 2
+    assert captured["cache_seqlens"].tolist() == [64, 128]
+    assert captured["noncausal_block_size"] == 8
+    assert captured["window_left"] == window
+
+
+def test_a_block_layer_keeps_the_flattened_rows_when_no_kernel_reads_the_fold(
+    monkeypatch,
+):
+    """Declining leaves the contract every other configuration has always sent."""
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        sliding_window_size=4095,
+        query_blocks=False,
+    )
+
+    assert captured["q"].shape[:2] == (16, 1)
+    assert captured["page_table"].shape[0] == 16
+
+
+def test_a_flattened_block_never_skips_metadata_rows_for_extends(monkeypatch):
+    """A block round has no extend split to apply.
+
+    ``refresh_decode_metadata`` expands rows ``[0, bs)`` into
+    ``[0, bs * block)`` and the drafter's query covers those same requests, so
+    skipping metadata rows while keeping every query row runs the kernel off
+    the end of both, and a drafter that is not ``kimi_mla`` reports
+    ``num_extends == bs`` -- enough to empty the slice outright.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=8,
+        draft_block_decode=True,
+        query_blocks=False,
+        num_extends=2,
+    )
+
+    assert captured["q"].shape[0] == 16
+    assert captured["page_table"].shape[0] == 16
+    assert captured["cache_seqlens"].shape[0] == 16
+
+
+def test_a_narrower_draft_forward_than_its_block_keeps_the_flattened_rows(monkeypatch):
+    """Un-expanding is only valid on the stride the metadata was built with.
+
+    ``resolve_speculative_num_tokens`` reconciles the draft's forward width
+    with its block for every drafter in tree, so this is the arithmetic's
+    guard rather than a live configuration: a forward narrower than its block
+    would stride into the next request's rows.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=True,
+        bs=2,
+        q_len_per_req=7,
+        draft_block_decode=True,
+        sliding_window_size=-1,
+        query_blocks=True,
+        block_size=8,
+    )
+    assert captured["q"].shape[:2] == (14, 1)
+    assert captured["noncausal_block_size"] == 8
+
+
+def test_the_metadata_fold_rows_are_every_spec_th_expanded_row() -> None:
+    """The fold reads the rows the block was expanded from.
+
+    The block entries are the per-request rows repeated ``spec`` times, so the
+    rows the fold reads have to equal every ``spec``-th expanded entry.
+    """
+    bs, spec, pages = 2, 4, 3
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.spec_num_tokens = spec
+    backend.max_context_len = 256
+    backend.max_num_pages = pages
+    backend.draft_block_decode = True  # block_decode_active/_expansion derive
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
+
+    page_table = torch.arange(bs * pages, dtype=torch.int32).view(bs, pages)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
+    backend.fill_block_decode_seq_lens(bs, seq_lens)
+    metadata = backend.forward_decode_metadata
+
+    torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
+    torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens[0::spec])
+
+
+def _run_cutedsl_decode(
+    monkeypatch,
+    *,
+    bs: int = 2,
+    q_len_per_req: int = 8,
+    draft_block_decode: bool = True,
+    block_size: int = 8,
+    sliding_window_size: int = -1,
+    num_extends: int = 0,
+) -> dict:
+    """The CuteDSL leaf's decode call, with the kernel replaced by a probe."""
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    captured = {}
+
+    def fake_tokenspeed_mla_decode(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(*kwargs["query"].shape[:-1], 4)
+
+    monkeypatch.setattr(
+        cutedsl_backend, "tokenspeed_mla_decode", fake_tokenspeed_mla_decode
+    )
+    backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    spec = block_size if draft_block_decode else 1
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
+    backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(
+        num_extends=num_extends,
+        page_table=torch.zeros(bs * spec, 1, dtype=torch.int32),
+        max_seq_len_k=256,
+        seq_lens_k=seq_lens.repeat_interleave(spec),
+        block_page_table=torch.zeros(bs, 1, dtype=torch.int32),
+        block_seq_lens=seq_lens,
+    )
+    backend.draft_block_decode = draft_block_decode
+    backend.spec_num_tokens = spec
+    backend.is_draft = draft_block_decode
+    backend.data_type = torch.float32
+    backend.kv_lora_rank = 2
+    backend.qk_rope_head_dim = 2
+    backend.kv_cache_dim = 4
+    backend.kernel_page_size = 32
+    backend._cutedsl_workspace = lambda q_len: torch.empty(0, dtype=torch.int8)
+    backend._logged_block_layouts = set()
+
+    layer = SimpleNamespace(
+        tp_q_head_num=1,
+        head_dim=4,
+        v_head_dim=4,
+        scaling=1.0,
+        k_scale_float=None,
+        layer_id=0,
+        sliding_window_size=sliding_window_size,
+    )
+    backend.forward_decode(
+        q=torch.zeros(bs * q_len_per_req, 4),
+        k=None,
+        v=None,
+        layer=layer,
+        out_cache_loc=torch.empty(0, dtype=torch.int32),
+        token_to_kv_pool=SimpleNamespace(
+            get_key_buffer=lambda layer_id: torch.zeros(32, 4)
+        ),
+        bs=bs,
+        save_kv_cache=False,
+    )
+    return captured
+
+
+@pytest.mark.parametrize("window", [4095, -1])
+def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(
+    monkeypatch, window
+):
+    """The same fold on the CuteDSL leaf, under either mask."""
+    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=window)
+
+    assert captured["query"].shape[:2] == (2, 8)
+    assert captured["block_tables"].shape[0] == 2
+    assert captured["seq_lens"].tolist() == [64, 128]
+    assert captured["window_left"] == window
+    assert captured["causal_mask"] is False
+
+
+def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeypatch):
+    captured = _run_cutedsl_decode(
+        monkeypatch, q_len_per_req=2, draft_block_decode=False
+    )
+
+    assert captured["query"].shape[:2] == (2, 2)
+    assert captured["seq_lens"].tolist() == [64, 128]
+    assert captured["window_left"] == -1
+    assert captured["causal_mask"] is True
+
+
+def test_a_narrower_cutedsl_draft_forward_refuses_to_drop_the_window(monkeypatch):
+    with pytest.raises(ValueError, match="query axis"):
+        _run_cutedsl_decode(monkeypatch, q_len_per_req=7, sliding_window_size=4095)
+
+
+def test_a_flattened_cutedsl_block_never_skips_metadata_rows_for_extends(monkeypatch):
+    captured = _run_cutedsl_decode(
+        monkeypatch, q_len_per_req=7, sliding_window_size=-1, num_extends=2
+    )
+
+    assert captured["query"].shape[0] == 14
+    assert captured["block_tables"].shape[0] == 16
+    assert captured["seq_lens"].shape[0] == 16
+
+
+def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None:
+    """Same invariant as the shared leaf: the fold rows are every spec-th entry."""
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        tokenspeed_mla as cutedsl_backend,
+    )
+
+    bs, spec, pages = 2, 4, 3
+    backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend.spec_num_tokens = spec
+    backend.max_context_len = 256
+    backend.draft_block_decode = True
+    backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
+    backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
+    backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
+
+    page_table = torch.arange(bs * pages, dtype=torch.int32).view(bs, pages)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    backend.refresh_decode_metadata(bs, bs, seq_lens, page_table)
+    metadata = backend.forward_decode_metadata
+
+    torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
+    torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens_k[0::spec])

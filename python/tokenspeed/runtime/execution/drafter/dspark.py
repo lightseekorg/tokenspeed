@@ -36,6 +36,7 @@ class DSpark(DFlash):
     """DFlash block drafter + a Markov head (semi-autoregressive proposal)."""
 
     sample_from_anchor = True
+    spec_algorithm = "DSPARK"
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

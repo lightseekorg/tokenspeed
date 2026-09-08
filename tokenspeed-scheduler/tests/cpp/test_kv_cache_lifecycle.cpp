@@ -45,8 +45,7 @@ protected:
 
         CacheGroupConfig full_grp;
         full_grp.group_id = "full";
-        full_grp.rows_per_page = cfg.prefix_granularity;
-        full_grp.entry_stride_tokens = 1;
+        full_grp.block_granularity = cfg.prefix_granularity;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.cache_blocks_per_lcm_block = 2;
         full_grp.retention = CacheGroupConfig::Retention::FullHistory;
@@ -54,12 +53,11 @@ protected:
 
         CacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
-        swa_grp.rows_per_page = cfg.prefix_granularity;
-        swa_grp.entry_stride_tokens = 1;
+        swa_grp.block_granularity = cfg.prefix_granularity;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
         swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
         swa_grp.sliding_window_tokens = 4;
-        swa_grp.family = CacheGroupFamily::State;
+        swa_grp.family = CacheGroupFamily::History;
 
         cfg.cache_groups = {full_grp, swa_grp};
         return cfg;
