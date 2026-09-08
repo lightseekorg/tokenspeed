@@ -44,20 +44,18 @@ def _make_config() -> ts.SchedulerConfig:
 
     full = ts.CacheGroupConfig(
         group_id="full",
-        rows_per_page=cfg.prefix_granularity,
-        entry_stride_tokens=1,
+        block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
         retention=ts.CacheRetention.FullHistory,
         family=ts.CacheGroupFamily.History,
     )
     swa = ts.CacheGroupConfig(
         group_id="swa",
-        rows_per_page=cfg.prefix_granularity,
-        entry_stride_tokens=1,
+        block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
         retention=ts.CacheRetention.SlidingWindow,
         sliding_window_tokens=4,
-        family=ts.CacheGroupFamily.State,
+        family=ts.CacheGroupFamily.History,
     )
     cfg.cache_groups = [full, swa]
     return cfg
@@ -188,7 +186,7 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
     cfg.max_scheduled_tokens = 8_192
     cfg.max_batch_size = 1
     for group in cfg.cache_groups:
-        group.rows_per_page = cfg.prefix_granularity
+        group.block_granularity = cfg.prefix_granularity
         group.cache_blocks_per_lcm_block = (
             12 if group.group_id == K3_GROUP_IDS[0] else 1
         )

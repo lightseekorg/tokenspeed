@@ -35,8 +35,39 @@ if not is_cdna4():
 
 import tokenspeed_kernel  # noqa: E402
 from tokenspeed_kernel.selection import kernel_override  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (  # noqa: E402
+    _compact_mxfp4_scale_tile,
+)
 
 _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+
+
+@pytest.mark.parametrize(
+    "per_lane, scales_per_lane, group",
+    [(64, 2, 32), (32, 1, 32), (16, 1, 16), (8, 1, 8)],
+    ids=["two_blocks", "one_block", "half_block", "quarter_block"],
+)
+def test_compact_scale_tile_holds_one_scale_per_upcast_group(
+    per_lane: int, scales_per_lane: int, group: int
+) -> None:
+    # A lane spanning a whole 32-value MXFP4 block keeps that block's single
+    # scale; a lane spanning less keeps one scale and re-reads the block byte.
+    expanded = gl.BlockedLayout([2, per_lane], [1, 64], [4, 1], [1, 0])
+    layout, elements_per_scale = _compact_mxfp4_scale_tile(expanded, 1)
+    assert elements_per_scale == group
+    assert layout.size_per_thread == [2, scales_per_lane]
+    assert layout.threads_per_warp == expanded.threads_per_warp
+    assert layout.warps_per_cta == expanded.warps_per_cta
+    assert layout.order == expanded.order
+
+
+def test_compact_scale_tile_rejects_partial_upcast_groups() -> None:
+    # Under eight values per lane a v_cvt_scalef32_pk_bf16_fp4 group would span
+    # two scales, so the K tile may not shrink that far.
+    expanded = gl.BlockedLayout([2, 4], [1, 64], [4, 1], [1, 0])
+    with pytest.raises(ValueError, match="whole 8-element groups"):
+        _compact_mxfp4_scale_tile(expanded, 1)
 
 
 def _a8w4_ep_plan(intermediate_size: int) -> dict:

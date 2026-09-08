@@ -1667,7 +1667,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     softmax = MHAConfig(
         backend_name="fa2",
         num_attention_heads=2,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
         num_kv_heads=1,
         attn_tp_size=1,
         head_dim=32,
@@ -1935,6 +1935,47 @@ def test_ple_batch_indices_uniform_matches_general_path() -> None:
     assert torch.equal(fast[0], general[0][: fast[5]])
     assert torch.equal(fast[1], general[1][: fast[5]])
     assert torch.equal(fast[3], general[3][: len(lengths)])
+
+
+@_requires_cuda
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_ple_eager_indices_after_shared_pool_graph_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.qwen4_exp_ple._UNIFORM_INDEX_CACHE", {}
+    )
+    device = torch.device("cuda")
+    pool = torch.cuda.graph_pool_handle()
+    overwrite = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(overwrite, pool=pool):
+        scratch = torch.full((4096,), 37, dtype=torch.long, device=device)
+    del scratch
+
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture, pool=pool):
+        captured = Qwen4ExpPLELayer._batch_indices([1] * batch_size, device)
+        captured_output = tuple(value.clone() for value in captured[:4])
+
+    # An earlier graph can reuse these addresses for its transient tensors.
+    # Eager prefill must derive its indices without replaying the later graph.
+    overwrite.replay()
+    torch.cuda.synchronize()
+    eager = Qwen4ExpPLELayer._batch_indices([1] * batch_size, device)
+    expected = (
+        torch.arange(batch_size, dtype=torch.long),
+        torch.zeros(batch_size, dtype=torch.long),
+        torch.ones(batch_size, dtype=torch.long),
+        torch.arange(batch_size, dtype=torch.long),
+    )
+    for actual, reference in zip(eager[:4], expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+
+    capture.replay()
+    torch.cuda.synchronize()
+    for actual, reference in zip(captured_output, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)

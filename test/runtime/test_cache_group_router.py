@@ -329,6 +329,17 @@ class CacheGroupRouterTest(unittest.TestCase):
             "linear_attention_0": torch.ones((bs, 2), dtype=torch.int32),
         }
 
+    def test_window_support_is_forwarded_from_the_leaves(self):
+        router, leaves = self._router()
+        self.assertFalse(router.supports_layer_sliding_window)
+
+        for leaf in leaves.values():
+            leaf.supports_layer_sliding_window = True
+        self.assertTrue(router.supports_layer_sliding_window)
+
+        leaves[SWA].supports_layer_sliding_window = False
+        self.assertFalse(router.supports_layer_sliding_window)
+
     def test_rejects_non_history_groups(self):
         router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
         with self.assertRaisesRegex(ValueError, "family 'state'"):

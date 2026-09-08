@@ -69,12 +69,14 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
-    validate_cache_group_ids,
+    bind_cache_groups,
+    check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -391,7 +393,6 @@ class ModelExecutor:
         )
 
         attn_backend.configure_runtime(
-            sliding_window_size=model_runner.sliding_window_size,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 token_to_kv_pool, "cache_group_page_counts", None
@@ -399,7 +400,6 @@ class ModelExecutor:
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
-                sliding_window_size=model_runner.sliding_window_size,
                 cache_group_specs=tuple(
                     _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
                 ),
@@ -408,15 +408,15 @@ class ModelExecutor:
                 ),
             )
 
-        validate_cache_group_ids(
-            model_runner.model,
-            token_to_kv_pool.arena.cache_group_specs,
-        )
+        # Storage is the plan's decision: stamp each attention layer's cache
+        # group from the pool and check the group retains what the layer's
+        # mask can see. A block drafter additionally borrows the target's
+        # full-history group -- it writes at the target's cache locations.
+        bind_cache_groups(model_runner.model, token_to_kv_pool)
         if draft_model_runner is not None and draft_token_to_kv_pool is not None:
-            validate_cache_group_ids(
-                draft_model_runner.model,
-                draft_token_to_kv_pool.arena.cache_group_specs,
-            )
+            bind_cache_groups(draft_model_runner.model, draft_token_to_kv_pool)
+            if is_block_drafter(config.spec_algo, is_draft=True):
+                check_block_drafter_storage(draft_model_runner.model, token_to_kv_pool)
 
         # Backend-declared CUDA-graph support, AND-composed over the target
         # and draft trees (the decode graph records the whole step, drafter
@@ -1079,6 +1079,15 @@ class ModelExecutor:
                     positions=empty,
                     spec_step_idx=step_idx,
                 )
+
+    def order_cache_operations(self) -> None:
+        """Order caller-stream cache work after previously submitted forwards.
+
+        Called on the forward thread before D2H or page reuse. This inserts
+        a GPU dependency, not a host synchronization; the forward prologue's
+        wait is too late to protect cache operations submitted before it.
+        """
+        self.device_module.current_stream().wait_stream(self.execution_stream)
 
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""

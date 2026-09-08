@@ -44,6 +44,7 @@ on:
           - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
@@ -120,6 +121,9 @@ jobs:
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          # A dispatched pull request may carry unmerged tokenspeed-mla changes,
+          # and the Slurm coordinator has no gh to narrow that to its diff.
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.pr && '1' || '0' }}
           CONTAINER_IMAGE: ${{ inputs.container_image }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}

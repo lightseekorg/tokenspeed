@@ -108,29 +108,22 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def(
             "__init__",
-            [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
-               std::int32_t entry_stride_tokens, std::int32_t total_pages,
-               tokenspeed::CacheGroupConfig::Retention retention, std::optional<std::int32_t> sliding_window_tokens,
-               tokenspeed::CacheGroupFamily family, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy) {
-                new (self) tokenspeed::CacheGroupConfig{std::move(group_id),
-                                                        rows_per_page,
-                                                        entry_stride_tokens,
-                                                        total_pages,
-                                                        cache_blocks_per_lcm_block,
-                                                        retention,
-                                                        sliding_window_tokens,
-                                                        family,
-                                                        transfer_policy};
+            [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
+               std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
+               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
+               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy) {
+                new (self) tokenspeed::CacheGroupConfig{
+                    std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
+                    retention,           sliding_window_tokens, family,      transfer_policy,
+                };
             },
-            nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
+            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
-        .def_rw("rows_per_page", &tokenspeed::CacheGroupConfig::rows_per_page)
-        .def_rw("entry_stride_tokens", &tokenspeed::CacheGroupConfig::entry_stride_tokens)
+        .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)

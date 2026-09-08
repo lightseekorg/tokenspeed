@@ -41,7 +41,10 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.utils import get_layer_id
@@ -174,13 +177,23 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # Visibility only; the cache plan decides storage (bound at startup).
+        sliding_window_size = -1
+        if config.layer_types[layer_id] == "sliding_attention":
+            if config.sliding_window is None:
+                raise ValueError(
+                    "Qwen3 sliding_attention layers require config.sliding_window."
+                )
+            sliding_window_size = hf_sliding_window_to_window_left(
+                config.sliding_window
+            )
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=config.layer_types[layer_id],
+            sliding_window_size=sliding_window_size,
         )
 
     def _apply_qk_norm(

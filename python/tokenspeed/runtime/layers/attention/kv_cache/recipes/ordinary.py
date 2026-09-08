@@ -88,12 +88,14 @@ class OrdinaryRecipe(CacheRecipe):
         hf_config's ``layer_types`` (one draft layer against 61 target
         labels).
         """
-        target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
+        target = tuple(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
         if len(target) != self.num_target_layers:
             target = (FULL_ATTENTION,) * self.num_target_layers
         if self.draft_attn_config is None:
             return target
-        draft = tuple(self.draft_attn_config.component(SoftmaxAttnConfig).layer_types)
+        draft = tuple(
+            self.draft_attn_config.component(SoftmaxAttnConfig).cache_layer_types
+        )
         if len(draft) != self.num_draft_layers:
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
@@ -163,7 +165,7 @@ class OrdinaryRecipe(CacheRecipe):
 def _storage_layers(config, num_layers: int) -> int:
     spec = config.component(SoftmaxAttnConfig)
     group_size = hybrid_slab_group_size(
-        spec.layer_types,
+        spec.cache_layer_types,
         sliding_window_tokens=spec.sliding_window_tokens,
     )
     return group_size if group_size is not None else num_layers
@@ -176,7 +178,7 @@ def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
 
     spec = config.component(SoftmaxAttnConfig)
     if isinstance(spec, MHAConfig | MSAConfig):
-        layer_types = tuple(spec.layer_types)
+        layer_types = tuple(spec.cache_layer_types)
         if layer_types:
             ids = tuple(
                 layer_group_ids(

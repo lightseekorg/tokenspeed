@@ -384,13 +384,11 @@ TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
     config.prefix_granularity = 16;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full";
-    full_grp.rows_per_page = 16;
-    full_grp.entry_stride_tokens = 1;
+    full_grp.block_granularity = 16;
     full_grp.retention = CacheGroupConfig::Retention::FullHistory;
     CacheGroupConfig swa_grp;
     swa_grp.group_id = "swa";
-    swa_grp.rows_per_page = 16;
-    swa_grp.entry_stride_tokens = 1;
+    swa_grp.block_granularity = 16;
     swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
     swa_grp.sliding_window_tokens = 128;
     config.cache_groups = {full_grp, swa_grp};
@@ -410,13 +408,11 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     config.prefix_granularity = 4;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
-    full_grp.rows_per_page = 4;
-    full_grp.entry_stride_tokens = 1;
+    full_grp.block_granularity = 4;
     full_grp.retention = CacheGroupConfig::Retention::FullHistory;
     CacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
-    state_grp.rows_per_page = 4;
-    state_grp.entry_stride_tokens = 1;
+    state_grp.block_granularity = 4;
     state_grp.family = CacheGroupFamily::State;
     config.cache_groups = {full_grp, state_grp};
 
@@ -433,13 +429,11 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     config.prefix_granularity = 128;
     CacheGroupConfig full;
     full.group_id = "full";
-    full.rows_per_page = 128;
-    full.entry_stride_tokens = 1;
+    full.block_granularity = 128;
     full.cache_blocks_per_lcm_block = 16;
     CacheGroupConfig state0;
     state0.group_id = "state0";
-    state0.rows_per_page = 128;
-    state0.entry_stride_tokens = 1;
+    state0.block_granularity = 128;
     state0.family = CacheGroupFamily::State;
     CacheGroupConfig state1 = state0;
     state1.group_id = "state1";
@@ -461,13 +455,11 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     config.prefix_granularity = 256;
     CacheGroupConfig history;
     history.group_id = "history";
-    history.rows_per_page = 64;
-    history.entry_stride_tokens = 4;
+    history.block_granularity = 256;
     CacheGroupConfig state;
     state.group_id = "compressor_state";
     state.family = CacheGroupFamily::State;
-    state.rows_per_page = 4;
-    state.entry_stride_tokens = 1;
+    state.block_granularity = 4;
     config.cache_groups = {history, state};
 
     const std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
@@ -487,8 +479,7 @@ SchedulerConfig MakeValidConfig() {
     config.max_batch_size = 8;
     CacheGroupConfig group;
     group.group_id = "full";
-    group.rows_per_page = 128;
-    group.entry_stride_tokens = 1;
+    group.block_granularity = 128;
     group.total_pages = config.device_allocator.total_pages;
     config.cache_groups = {group};
     return config;
@@ -524,9 +515,17 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositivePerGroupPacking) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, RejectsNonPositiveBlockGranularity) {
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t block_granularity : {0, -1}) {
+        config.cache_groups[0].block_granularity = block_granularity;
+        ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
+    }
+}
+
 TEST(SchedulerConfigValidateTest, RejectsBlockGranularityThatDoesNotDivideP) {
     SchedulerConfig config = MakeValidConfig();
-    config.cache_groups[0].rows_per_page = 48;
+    config.cache_groups[0].block_granularity = 48;
     ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
 }
 
@@ -545,6 +544,21 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
         config.cache_groups[0].sliding_window_tokens = window;
         ExpectRejectedNamingGroup(config, "nonpositive_window");
     }
+}
+
+TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
+    // A State group holds checkpoints, never a token window that could slide
+    // out; the same window declared as History is an ordinary SWA group.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "sliding_state";
+    group.retention = CacheGroupConfig::Retention::SlidingWindow;
+    group.sliding_window_tokens = 256;
+    group.family = CacheGroupFamily::State;
+    ExpectRejectedNamingGroup(config, "sliding_state");
+
+    group.family = CacheGroupFamily::History;
+    EXPECT_NO_THROW(config.Validate());
 }
 
 TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
@@ -583,8 +597,7 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
     CacheGroupConfig group;
     group.group_id = "full";
-    group.rows_per_page = 1;
-    group.entry_stride_tokens = 1;
+    group.block_granularity = 1;
     group.total_pages = 2;
 
     group.cache_blocks_per_lcm_block = 0;
