@@ -184,16 +184,9 @@ def _quantize_tile_probe(
 
 
 def _quantize_tile_probe_input() -> torch.Tensor:
-    """A tile spanning normal, tiny, tie-rounded, and all-zero 32-value groups.
+    """A tile spanning normal, tiny, tie-rounded, and all-zero groups."""
 
-    Row 0 is entirely zero, which selects the raw E8M0 payload 0 that the
-    hardware scaled downcast cannot encode as an exponent; ``_hw_scale_payload``
-    keeps that group bit-identical to the software reference. Row 1 exercises a
-    far-from-unity scale that still encodes, and row 2 the E2M1
-    round-half-to-even ties.
-    """
-
-    generator = torch.Generator(device="cuda").manual_seed(20260907)
+    generator = torch.Generator(device="cuda").manual_seed(271828)
     values = torch.randn(
         (32, 256),
         dtype=torch.bfloat16,
@@ -201,9 +194,10 @@ def _quantize_tile_probe_input() -> torch.Tensor:
         generator=generator,
     )
     values[0] = 0.0
-    values[1] = torch.full_like(values[1], 2.0**-100)
+    for row, exponent in enumerate((-100, -120, -125, -126, -127, -130, -133), 1):
+        values[row] = torch.full_like(values[row], 2.0**exponent)
     # Ties between two E2M1 codes must round half-to-even the same way.
-    values[2] = torch.tensor(
+    values[8] = torch.tensor(
         [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 32,
         dtype=torch.bfloat16,
         device="cuda",
@@ -219,12 +213,18 @@ def test_quantize_tile_matches_reference_quantizer_gfx950(output_fp8: bool) -> N
     if output_fp8:
         expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
             values,
+            enable_pdl=False,
+            override=None,
             solution="triton",
         )
     else:
         expected, expected_scales = tokenspeed_kernel.quantize_mxfp4(
             values,
+            global_scale=None,
+            scale_size=32,
             scale_layout="linear",
+            enable_pdl=False,
+            override=None,
             solution="triton",
         )
 

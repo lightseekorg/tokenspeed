@@ -34,27 +34,10 @@ accumulation because each rank owns only a sparse subset of the routed experts.
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
-| `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. Both tiles convert through CDNA4's hardware scaled downcast; see below. |
+| `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |
 | `preprocess.py` / `weight_preprocess.py` | Offline weight interleave, scale swizzle, gdot128 preshuffle, package-prefill aliases. |
-
-## Tile quantization
-
-`quantize_gluon.py` picks each 32-value group's E8M0 scale in software and then
-converts through `gl.amd.cdna4.scaled_downcast`, so `v_cvt_scalef32_pk_fp4_f32`
-/ `v_cvt_scalef32_pk_fp8_f32` performs the `* 2**-scale_exp` rescale, the
-rounding, and (for E2M1) the nibble packing in one instruction per value pair.
-Two constraints come with that:
-
-* The instruction needs 8 consecutive values along the scaled axis in one
-  lane's consecutive registers, which an MFMA accumulator layout does not
-  provide. `scaled_downcast_layout()` names a layout that does; the tiles
-  convert into it, and a caller that owns its own tile layout should load
-  through the same helper so the conversion folds away.
-* The scale reaches the instruction as an F32 whose exponent field is the E8M0
-  payload, so payload 0 would encode 0.0 and divide to NaN. `_hw_scale_payload`
-  substitutes 1 for the instruction only, leaving the stored scale byte alone.
 
 ## `fused/` subpackage
 

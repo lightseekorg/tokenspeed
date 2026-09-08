@@ -20,10 +20,17 @@
 
 """Gluon MXFP4/MXFP8 quantization helpers for staged MXFP4-weight MoE.
 
-Both tiles pick the E8M0 block scale in software and then hand the scale
-payload straight to CDNA4's ``v_cvt_scalef32_pk_{fp4,fp8}_f32`` through
-``gl.amd.cdna4.scaled_downcast``, which folds the ``* 2**-scale_exp`` rescale
-and the FP4/FP8 rounding into one instruction per value pair.
+Both tiles pick each 32-value group's E8M0 scale in software and then
+converts through `gl.amd.cdna4.scaled_downcast`, so `v_cvt_scalef32_pk_fp4_f32`
+/ `v_cvt_scalef32_pk_fp8_f32` performs the `* 2**-scale_exp` rescale, the
+rounding, and (for E2M1) the nibble packing in one instruction per value pair.
+Some constraints come with that:
+
+* The instruction needs 8 consecutive values along the scaled axis in one
+  lane's consecutive registers, which an MFMA accumulator layout does not
+  provide. `scaled_downcast_layout()` names a layout that does; the tiles
+  convert into it, and a caller that owns its own tile layout should load
+  through the same helper so the conversion folds away.
 """
 
 from __future__ import annotations
@@ -56,28 +63,6 @@ def scaled_downcast_layout(block_m: int, block_n: int, num_warps: int) -> gl.con
 
 
 @gluon.jit
-def _hw_scale_payload(scale_byte):
-    """Raise an E8M0 payload of 0 to 1 for the hardware scaled downcast.
-
-    ``v_cvt_scalef32_*`` takes the scale as an F32 built by shifting the E8M0
-    payload into the exponent field, so payload 0 -- nominally 2**-127 --
-    encodes 0.0 and the divide returns NaN where the software path returned 0.
-    Only the payload handed to the instruction is raised; the byte written to
-    memory keeps the reference quantizer's encoding.
-
-    A payload reaches 0 only for a group whose amax is 0 or subnormal-small
-    (at or below 2**-125 for E2M1, 448 * 2**-127 for E4M3). An all-zero group
-    quantizes to 0 under either scale, so the common case stays bit-identical
-    to the software path. A subnormal-small group instead quantizes one binade
-    low -- it dequantizes to half the reference's value, which is still zero to
-    every consumer at that magnitude, and is the only encoding available given
-    the hardware cannot take 2**-127 as a scale.
-    """
-    one = gl.full(scale_byte.shape, 1, gl.uint8, layout=scale_byte.type.layout)
-    return gl.maximum(scale_byte, one)
-
-
-@gluon.jit
 def _mxfp4_quantize_tile(out):
     """Quantize each contiguous 32-value group to packed E2M1 + UE8M0.
 
@@ -105,9 +90,7 @@ def _mxfp4_quantize_tile(out):
     scale_i = gl.minimum(gl.maximum(exp_biased - 2, 0), 254)
     scale_byte = scale_i.to(gl.uint8)
 
-    packed = gl.amd.cdna4.scaled_downcast(
-        vals, _hw_scale_payload(scale_byte), "e2m1", axis=1
-    )
+    packed = gl.amd.cdna4.scaled_downcast(vals, scale_byte, "e2m1", axis=1)
     return packed, scale_byte
 
 
@@ -132,9 +115,7 @@ def _mxfp8_quantize_tile(out):
     scale_exp = gl.where(amax > 0.0, scale_exp, -127.0)
     scale_byte = (scale_exp + 127.0).to(gl.uint8)
 
-    quantized = gl.amd.cdna4.scaled_downcast(
-        vals, _hw_scale_payload(scale_byte), "e4m3", axis=1
-    )
+    quantized = gl.amd.cdna4.scaled_downcast(vals, scale_byte, "e4m3", axis=1)
     return quantized, scale_byte
 
 
