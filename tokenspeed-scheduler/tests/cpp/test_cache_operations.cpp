@@ -868,6 +868,38 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     coordinator.Free(tables);
 }
 
+TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kSlidingWindow,
+        .sliding_window = 3,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(pinned);
+
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey key_h2{.group_id = 0, .content_hash = "h2"};
+    coordinator.RegisterStorageKeys(std::array{key_h1, key_h2});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"});
+    ASSERT_EQ(probe.host.num_common_tokens, 6);
+    ASSERT_EQ(probe.host.per_group.size(), 1u);
+    ASSERT_EQ(probe.host.per_group[0].hits, (std::vector<std::uint8_t>{0, 1, 1}));
+
+    auto match = MatchPrefixForTest(coordinator, std::array<std::string, 3>{"h0", "h1", "h2"});
+    EXPECT_EQ(match.host.num_common_tokens, 0)
+        << "truncating [0, 1, 1] to [0, 1] would restore a window whose first live page is a hole";
+    ASSERT_EQ(match.host.per_group.size(), 1u);
+    EXPECT_TRUE(match.host.per_group[0].blocks.empty());
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
+}
+
 TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     BlockPool device_pool{8};
     BlockPool host_pool{2};

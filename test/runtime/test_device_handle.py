@@ -704,6 +704,7 @@ def test_the_handle_stays_a_closed_list_of_named_operations():
         "execute",
         "role",
         "poll_cache_results",
+        "consume_l3_backup_poll_failure",
         "query_l3_storage",
         "plan_has_l3_prefetch",
         "prefetch_l3_load_backs",

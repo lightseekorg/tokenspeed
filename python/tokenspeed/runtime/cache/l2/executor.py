@@ -296,6 +296,7 @@ class L2CacheExecutor:
         self._ready_load_acks: list[tuple[int, bool]] = []
         self._l3_prefetch_ok: dict[StoragePage, bool] = {}
         self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
+        self._backup_poll_failed = False
         self._l3_workers: ThreadPoolExecutor | None = None
 
     def attach_l3_storage(
@@ -876,6 +877,18 @@ class L2CacheExecutor:
         self._collect_finished_backups(results)
         return results
 
+    def consume_backup_poll_failure(self) -> bool:
+        """Return whether an L3 backup future failed since the last consume.
+
+        ``poll_results`` must not raise that failure: ``L2CacheHooks`` has
+        not entered its replica collectives yet, and a rank-local raise
+        hangs peers waiting in ``all_reduce`` / ``all_gather_object``.
+        """
+
+        failed = bool(getattr(self, "_backup_poll_failed", False))
+        self._backup_poll_failed = False
+        return failed
+
     def _complete_or_queue_write(self, ack: _Ack, results: list) -> None:
         if not ack.backup_pages or getattr(self, "l3_store", None) is None:
             results.extend(self._write_done(op_id) for op_id in ack.op_ids)
@@ -895,13 +908,18 @@ class L2CacheExecutor:
             inflight = list(getattr(self, "_backup_futures", ()))
             self._backup_futures = []
         still: list[tuple[Future, list[int], list[StoragePage]]] = []
-        error = None
         for future, op_ids, pages in inflight:
-            if error is not None or not future.done():
+            if not future.done():
                 still.append((future, op_ids, pages))
                 continue
             failed = future.exception()
             if failed is not None:
+                logger.error(
+                    "L3 backup failed; retrying and reporting a rank-local "
+                    "failure so replica cache-poll collectives can converge",
+                    exc_info=failed,
+                )
+                self._backup_poll_failed = True
                 workers = getattr(self, "_l3_workers", None)
                 if workers is not None:
                     still.append(
@@ -909,14 +927,11 @@ class L2CacheExecutor:
                     )
                 else:
                     still.append((future, op_ids, pages))
-                error = failed
                 continue
             future.result()
             results.extend(self._write_done(op_id) for op_id in op_ids)
         with self._ack_lock:
             self._backup_futures.extend(still)
-        if error is not None:
-            raise error
 
     def _backup_to_storage(self, pages: Sequence[StoragePage]) -> None:
         l3_store = getattr(self, "l3_store", None)

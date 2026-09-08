@@ -58,10 +58,16 @@ class _Device:
 
     def __init__(self) -> None:
         self.results: list = []
+        self.backup_failed = False
 
     def poll_cache_results(self) -> list:
         results, self.results = self.results, []
         return results
+
+    def consume_l3_backup_poll_failure(self) -> bool:
+        failed = self.backup_failed
+        self.backup_failed = False
+        return failed
 
 
 def _hooks(
@@ -403,6 +409,46 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
 
     assert hooks.poll_ready_events() == []
     assert reduce_groups == [cp_group]
+
+
+def test_replica_backup_failure_raises_after_poll_all_reduce(
+    fake_cache_ops, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = _Device()
+    device.backup_failed = True
+    cp_group = object()
+    hooks = _hooks(
+        device,
+        speculative_algorithm=None,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        attn_cp_size=2,
+        attn_cp_cpu_group=cp_group,
+        pp_size=1,
+        pp_cpu_group=None,
+    )
+    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+
+    reduce_groups: list = []
+    gather_groups: list = []
+
+    def _all_reduce(tensor, op=None, group=None) -> None:
+        del op
+        reduce_groups.append(group)
+        tensor[1] = max(int(tensor[1].item()), 1)
+
+    def _all_gather_object(output, obj, group=None) -> None:
+        gather_groups.append(group)
+        del output, obj
+
+    _install_collectives(
+        monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
+    )
+
+    with pytest.raises(RuntimeError, match="L3 backup failed on a replica rank"):
+        hooks.poll_ready_events()
+    assert reduce_groups == [cp_group]
+    assert gather_groups == []
 
 
 if __name__ == "__main__":

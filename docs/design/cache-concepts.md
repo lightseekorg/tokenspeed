@@ -411,7 +411,9 @@ Its responsibilities:
   finished local backup must not `CacheHostBlock` on one mirrored
   scheduler while a CP/PP peer still has the op pending. A truncated
   `batch_is_exist` reply is a failed put, not an implicit success:
-  `WriteBackDone` follows only a completed backup. Every rank
+  `WriteBackDone` follows only a completed backup. A backup future that
+  fails is MAX-reduced with the replica idle/work flag before the
+  completion gather so every rank raises together. Every rank
   stays in every replica-group gather even when an earlier intersection
   is empty, so a peer that is ready on CP/PP is not left unmatched. A later Host
   miss that is known to exist in L3 allocates

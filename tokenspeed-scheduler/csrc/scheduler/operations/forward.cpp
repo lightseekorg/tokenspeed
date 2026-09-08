@@ -382,8 +382,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     // L3 Host prefetch can allocate fewer pages than ProbePrefix reported.
     // Retry admission from that shortened boundary so the first-chunk window
-    // and table coverage stay aligned. Clamping the probe is required:
-    // re-probing would see the same L3 keys and shorten again.
+    // and table coverage stay aligned. Clamping num_common_tokens is
+    // required so acquireHostWithKeys re-matches window/Mamba groups at the
+    // shortened bound: a full re-probe would see the same L3 keys again,
+    // and truncating a non-closed hits mask can leave required lookback
+    // pages as holes.
     for (int attempt = 0;; ++attempt) {
         _assert(attempt < 64, "L3 host prefix clamp did not converge");
         if (match.probe.host.num_common_tokens > host_prefix_cap) {

@@ -436,6 +436,22 @@ class DeviceHandle:
         )
         return l2.poll_results()
 
+    def consume_l3_backup_poll_failure(self) -> bool:
+        """Whether an L3 backup future failed since the last consume.
+
+        ``poll_cache_results`` must not raise that failure:
+        ``L2CacheHooks.poll_ready_events`` still has to enter replica
+        collectives. A rank-local raise hangs peers in those waits.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        consume = getattr(l2, "consume_backup_poll_failure", None)
+        if consume is None:
+            return False
+        return bool(consume())
+
     def query_l3_storage(self, pages) -> list[bool] | None:
         """Probe immutable L3 objects without exposing the Host-cache tier."""
 

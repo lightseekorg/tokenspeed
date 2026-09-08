@@ -32,7 +32,10 @@ asynchronously, so a rank-local ``WriteBackDone`` would ``CacheHostBlock``
 on one mirrored scheduler while a CP/PP peer still has the op pending.
 Every rank enters every replica-group gather, including with an empty
 intermediate intersection; skipping a later CP/PP ``all_gather_object``
-hangs ranks whose first group already agreed.
+hangs ranks whose first group already agreed. An L3 backup future that
+fails is converted into a rank-local flag and MAX-reduced on that same
+first replica all_reduce so every rank raises together instead of one
+rank raising out of ``poll_results`` while peers wait in the gather.
 ``poll_ready_events`` returns events for the event loop to apply —
 feedback into the scheduler stays an explicit ``advance_scheduler`` call
 in the loop body.
@@ -134,12 +137,27 @@ class L2CacheHooks:
         # Completions are async (CUDA copies, L3 backups) and not lock-step
         # across TP/CP/PP, so local state (_num_inflight / _pending_payloads)
         # diverges transiently. A rank-local skip would let some ranks gather
-        # while others return, deadlocking the group. Agree on the skip via a
-        # cheap single-int MAX all_reduce on each replica group.
+        # while others return, deadlocking the group. Agree on work and on
+        # backup failure via a two-int MAX all_reduce on each replica group.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
+        local_backup_failed = self._device.consume_l3_backup_poll_failure()
         if self._replica_groups:
-            if not self._group_has_work(local_has_work):
+            has_work, backup_failed = self._converge_poll_state(
+                local_has_work, local_backup_failed
+            )
+            if backup_failed:
+                raise RuntimeError(
+                    "L3 backup failed on a replica rank; every cache-owning "
+                    "rank raises after the poll all_reduce so peers are not "
+                    "left in all_gather_object"
+                )
+            if not has_work:
                 return []
+        elif local_backup_failed:
+            raise RuntimeError(
+                "L3 backup failed; refusing WriteBackDone until replica "
+                "ranks can converge on the failure"
+            )
         elif not local_has_work:
             return []
 
@@ -161,26 +179,33 @@ class L2CacheHooks:
             events.append(e)
         return events
 
-    def _group_has_work(self, local_has_work: bool) -> bool:
-        """Whether ANY cache-owning rank in this replica has cache work.
+    def _converge_poll_state(
+        self, local_has_work: bool, local_backup_failed: bool
+    ) -> tuple[bool, bool]:
+        """Replica MAX of in-flight work and L3 backup failure.
 
-        Single-int MAX all_reduce on attention TP, then CP, then PP (same
-        order as L3 exists / flush). Deciding from rank-local state alone
-        deadlocks the group when a peer still has in-flight backups; see
+        Single two-int MAX all_reduce on attention TP, then CP, then PP
+        (same order as L3 exists / flush). Deciding from rank-local state
+        alone deadlocks the group when a peer still has in-flight backups
+        or when one rank raised out of ``poll_results``; see
         poll_ready_events.
 
         Args:
             local_has_work: This rank's view of whether any cache op is in
                 flight or any polled payload awaits commit.
+            local_backup_failed: Whether this rank's L3 backup future failed
+                since the last poll.
 
         Returns:
-            ``True`` if any replica rank has work (all must gather);
-            ``False`` only when every rank is idle.
+            ``(has_work, backup_failed)`` after MAX-reducing both flags.
         """
-        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
+        flag = torch.tensor(
+            [1 if local_has_work else 0, 1 if local_backup_failed else 0],
+            dtype=torch.int32,
+        )
         for _size, group in self._replica_groups:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-        return bool(flag.item())
+        return bool(flag[0].item()), bool(flag[1].item())
 
     def _pop_ready_payloads(self) -> list[dict]:
         """Intersect pending completions across every replica group.

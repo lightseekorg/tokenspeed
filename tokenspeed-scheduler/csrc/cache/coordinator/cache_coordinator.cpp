@@ -322,61 +322,88 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
 CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                                        std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                                        std::uint64_t access_epoch) {
-    CoordinatorMatch out;
-    out.num_common_tokens = probe.num_common_tokens;
-    out.per_group.resize(groups_.size());
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
-        const GroupPrefixProbe& group_probe = probe.per_group[i];
-        PrefixMatch& match = out.per_group[i];
-        const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
-        const std::size_t covered_pages = static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
-        match.blocks.resize(std::min(group_probe.hits.size(), covered_pages));
-        PrefixCacheIndex& index = groups_[i].Index();
-        for (std::size_t hit_index = 0; hit_index < match.blocks.size(); ++hit_index) {
-            if (group_probe.hits[hit_index] == 0) {
-                continue;
+    PrefixProbe::Tier working = std::move(probe);
+    for (int attempt = 0;; ++attempt) {
+        _assert(attempt < 64, "L3 host prefix clamp did not converge");
+        // Re-run SweepThenConverge at the current bound. Truncating a window
+        // or Mamba hits mask (for example [0, 1, 1] -> [0, 1]) can leave the
+        // first live lookback page as a hole; the matcher must rebuild the
+        // trailing run for the shortened resume point. A caller-clamped
+        // num_common_tokens keeps the original L3 keys out of a longer match.
+        const std::int32_t bound_tokens = std::max(working.num_common_tokens, floor_tokens);
+        working = probeTierWithKeys<CacheTier::kHost>(group_keys, match_order_, bound_tokens / prefix_granularity_,
+                                                      floor_tokens);
+
+        CoordinatorMatch out;
+        out.num_common_tokens = working.num_common_tokens;
+        out.per_group.resize(groups_.size());
+        std::int32_t shortage_tokens = -1;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
+            const GroupPrefixProbe& group_probe = working.per_group[i];
+            PrefixMatch& match = out.per_group[i];
+            const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+            const std::size_t covered_pages =
+                static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+            match.blocks.resize(std::min(group_probe.hits.size(), covered_pages));
+            PrefixCacheIndex& index = groups_[i].Index();
+            for (std::size_t hit_index = 0; hit_index < match.blocks.size(); ++hit_index) {
+                if (group_probe.hits[hit_index] == 0) {
+                    continue;
+                }
+                const CacheKey& key = group_keys[i][static_cast<std::size_t>(floor_pages) + hit_index];
+                CacheBlockRef host_block_ref = index.Find(*host_pool_, key);
+                if (host_block_ref) {
+                    PrefixMatch acquired = index.AcquireMatched(*host_pool_, group_keys[i],
+                                                                floor_pages + static_cast<std::int32_t>(hit_index),
+                                                                GroupPrefixProbe{.hits = {1}}, access_epoch);
+                    match.blocks[hit_index] = std::move(acquired.blocks.front());
+                    continue;
+                }
+                _assert(storage_keys_.contains(key), "Host probe hit without a Host or L3 entry");
+                host_block_ref = AcquireHostBlock(groups_[i].Id());
+                if (!host_block_ref) {
+                    // Host pool is pinned. Drop this attempt's pins and re-match
+                    // non-closed groups at the shortened bound instead of
+                    // treating truncated holes as computed tokens.
+                    const std::int32_t failed_at =
+                        floor_tokens + static_cast<std::int32_t>(hit_index) * geometry_[i].BlockGranularity();
+                    shortage_tokens = shortage_tokens < 0 ? failed_at : std::min(shortage_tokens, failed_at);
+                    break;
+                }
+                match.blocks[hit_index] = std::move(host_block_ref);
             }
-            const CacheKey& key = group_keys[i][static_cast<std::size_t>(floor_pages) + hit_index];
-            CacheBlockRef host_block_ref = index.Find(*host_pool_, key);
-            if (host_block_ref) {
-                PrefixMatch acquired =
-                    index.AcquireMatched(*host_pool_, group_keys[i], floor_pages + static_cast<std::int32_t>(hit_index),
-                                         GroupPrefixProbe{.hits = {1}}, access_epoch);
-                match.blocks[hit_index] = std::move(acquired.blocks.front());
-                continue;
-            }
-            _assert(storage_keys_.contains(key), "Host probe hit without a Host or L3 entry");
-            host_block_ref = AcquireHostBlock(groups_[i].Id());
-            if (!host_block_ref) {
-                // Host pool is pinned; drop this and later hits so admission can
-                // recompute instead of FatalCheck-ing on a missing prefetch page.
-                match.blocks.resize(hit_index);
-                out.num_common_tokens =
-                    std::min(out.num_common_tokens,
-                             floor_tokens + static_cast<std::int32_t>(hit_index) * geometry_[i].BlockGranularity());
-                break;
-            }
-            match.blocks[hit_index] = std::move(host_block_ref);
         }
-    }
-    // Shortage is counted in the failing group's block_granularity, which may
-    // be finer than prefix identity. Round down so every group keeps a
-    // reusable prefix boundary; otherwise a 64-token group is trimmed to
-    // empty while hit_tokens stays at 48.
-    out.num_common_tokens -= out.num_common_tokens % prefix_granularity_;
-    // A later group can lower the shared boundary after earlier groups have
-    // already pinned pages. Trim every group to the final boundary so those
-    // excess pins are released and no stale KV is admitted past the common
-    // prefix.
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
-        const std::size_t covered_pages = static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
-        if (out.per_group[i].blocks.size() > covered_pages) {
-            out.per_group[i].blocks.resize(covered_pages);
+        if (shortage_tokens < 0) {
+            // Shortage is counted in the failing group's block_granularity,
+            // which may be finer than prefix identity. Round down so every
+            // group keeps a reusable prefix boundary; otherwise a 64-token
+            // group is trimmed to empty while hit_tokens stays at 48.
+            out.num_common_tokens -= out.num_common_tokens % prefix_granularity_;
+            // A later group can lower the shared boundary after earlier groups
+            // have already pinned pages. Trim every group to the final
+            // boundary so those excess pins are released and no stale KV is
+            // admitted past the common prefix.
+            for (std::size_t i = 0; i < groups_.size(); ++i) {
+                const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+                const std::size_t covered_pages =
+                    static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+                if (out.per_group[i].blocks.size() > covered_pages) {
+                    out.per_group[i].blocks.resize(covered_pages);
+                }
+            }
+            return out;
         }
+        shortage_tokens -= shortage_tokens % prefix_granularity_;
+        if (shortage_tokens >= working.num_common_tokens) {
+            shortage_tokens = working.num_common_tokens - prefix_granularity_;
+        }
+        if (shortage_tokens < floor_tokens) {
+            shortage_tokens = floor_tokens;
+        }
+        shortage_tokens -= shortage_tokens % prefix_granularity_;
+        working.num_common_tokens = shortage_tokens;
     }
-    return out;
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {

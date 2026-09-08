@@ -1071,6 +1071,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_write_op_ids = []
         executor._ready_load_acks = []
         executor._backup_futures = []
+        executor._backup_poll_failed = False
         executor._l3_workers = None
         executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
@@ -1087,29 +1088,23 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             )
         ]
 
-        raised = None
+        first = None
+        failed = False
         try:
-            try:
-                first = executor.poll_results()
-            except RuntimeError as exc:
-                raised = exc
-                first = None
-            if raised is None:
-                self.assertEqual(first, [])
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    try:
-                        executor.poll_results()
-                    except RuntimeError as exc:
-                        raised = exc
-                        break
+            first = executor.poll_results()
+            self.assertEqual(first, [])
+            failed = executor.consume_backup_poll_failure()
+            deadline = time.monotonic() + 2
+            while not failed and time.monotonic() < deadline:
+                self.assertEqual(executor.poll_results(), [])
+                failed = executor.consume_backup_poll_failure()
+                if not failed:
                     time.sleep(0.01)
         finally:
             workers = executor._l3_workers
             if workers is not None:
                 workers.shutdown(wait=True)
-        self.assertIsNotNone(raised)
-        self.assertRegex(str(raised), "L3 backup failed")
+        self.assertTrue(failed)
 
     def test_prefetch_failure_returns_false(self):
         try:
