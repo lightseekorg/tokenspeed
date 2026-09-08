@@ -28,6 +28,7 @@ the Mooncake package is not installed, unless ``MOONCAKE_REQUIRE_MASTER=1``.
 from __future__ import annotations
 
 import ctypes
+import inspect
 import json
 import os
 import shutil
@@ -93,7 +94,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_tcp(host: str, port: int, timeout_s: float = 20.0) -> None:
+def _wait_tcp(host: str, port: int, *, timeout_s: float) -> None:
     deadline = time.time() + timeout_s
     last_error = None
     while time.time() < deadline:
@@ -140,6 +141,12 @@ class _Host:
         return (int(block_id) - 1) * self._page, self._page
 
 
+class WaitTcpTimeoutTest(unittest.TestCase):
+    def test_wait_tcp_requires_timeout(self) -> None:
+        param = inspect.signature(_wait_tcp).parameters["timeout_s"]
+        self.assertIs(param.default, inspect.Parameter.empty)
+
+
 class MooncakeMasterLiveTest(unittest.TestCase):
     master_proc: subprocess.Popen[bytes] | None = None
     master_log = None
@@ -159,7 +166,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         existing = os.environ.get("MOONCAKE_MASTER", "").strip()
         if existing:
             host, _, port_text = existing.rpartition(":")
-            _wait_tcp(host or "127.0.0.1", int(port_text))
+            _wait_tcp(host or "127.0.0.1", int(port_text), timeout_s=20.0)
             cls.master_addr = existing
             cls.started_master = False
             return
@@ -202,7 +209,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         cls.started_master = True
         cls.master_addr = f"127.0.0.1:{port}"
         try:
-            _wait_tcp("127.0.0.1", port)
+            _wait_tcp("127.0.0.1", port, timeout_s=20.0)
         except TimeoutError:
             cls._stop_master()
             output = b""
