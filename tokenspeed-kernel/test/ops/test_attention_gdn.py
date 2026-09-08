@@ -905,3 +905,162 @@ def test_gdn_decode_mtp_disable_state_update_false_writes_back(
         rtol=2e-2,
         atol=3e-2,
     )
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize(
+    ("state_mode", "strided_pool"),
+    [
+        ("readonly", False),
+        ("readonly", True),
+        ("writeback", False),
+        ("writeback", True),
+        # Upstream scatter indexes a flat 3D pool, as used by verify scratch;
+        # its native 4D strided-pool path supports the other state modes.
+        ("scatter", False),
+        ("cache", False),
+        ("cache", True),
+    ],
+)
+def test_flashinfer_mtp_uninitialized_buffers(
+    device: str, batch: int, strided_pool: bool, state_mode: str, require
+) -> None:
+    """Live output/cache rows overwrite poison; skipped rows and slab gaps survive."""
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as reference_mtp
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn import gated_delta_rule_mtp
+
+    steps, heads, dim = 3, 32, 128
+    pool_size = 1 + batch * (steps + 1)
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=batch,
+        num_q_heads=heads // 2,
+        num_v_heads=heads,
+        head_dim=dim,
+        pool_size=pool_size,
+        state_dtype=torch.float32,
+        parameter_dtype=torch.float32,
+        parameter_requires_grad=False,
+    )
+    # B*HV selects both FlashInfer's inline and warp-specialized kernels.
+    read_rows = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
+    if batch > 1:
+        read_rows[-1] = -1
+    output_rows = None
+    if state_mode == "scatter":
+        output_rows = torch.arange(
+            batch + 1, pool_size, dtype=torch.int32, device=device
+        ).view(batch, steps)
+        if batch > 1:
+            output_rows[-1].fill_(-1)
+    backing = torch.full(
+        (pool_size * (2 if strided_pool else 1), heads, dim, dim),
+        123.0,
+        dtype=pool.dtype,
+        device=device,
+    )
+    actual_pool = backing[::2] if strided_pool else backing
+    actual_pool.copy_(pool)
+    expected_pool = pool.clone()
+    output = torch.full_like(v, float("nan"))
+    expected_output = output.clone()
+    cache = None
+    expected_cache = None
+    if state_mode == "cache":
+        cache = torch.full(
+            (batch, steps, heads, dim, dim),
+            float("nan"),
+            device=device,
+            dtype=torch.float32,
+        )
+        expected_cache = cache.clone()
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        initial_state_indices=read_rows,
+        A_log=A_log,
+        a=a.to(q.dtype),
+        dt_bias=dt_bias,
+        b=b.to(q.dtype),
+        scale=dim**-0.5,
+        ssm_state_indices=output_rows,
+        disable_state_update=state_mode in ("readonly", "cache"),
+        use_qk_l2norm=True,
+    )
+    reference_mtp(
+        **kwargs,
+        initial_state=expected_pool,
+        output=expected_output,
+        intermediate_states_buffer=expected_cache,
+        output_state_indices=None,
+    )
+    gated_delta_rule_mtp(
+        **kwargs,
+        initial_state=actual_pool,
+        output=output,
+        intermediate_states_buffer=cache,
+    )
+
+    live_rows = batch - 1 if batch > 1 else batch
+    assert torch.isfinite(output[:live_rows]).all()
+    torch.testing.assert_close(output, expected_output, equal_nan=True)
+    torch.testing.assert_close(actual_pool, expected_pool)
+    if cache is not None:
+        assert torch.isfinite(cache[:live_rows]).all()
+        torch.testing.assert_close(cache, expected_cache, equal_nan=True)
+    if strided_pool:
+        assert (backing[1::2] == 123.0).all()
+
+
+def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> None:
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.float16, "q")
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as reference_mtp
+
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.float16,
+        T=3,
+        batch=1,
+        num_q_heads=4,
+        num_v_heads=8,
+        head_dim=128,
+        pool_size=4,
+        state_dtype=torch.float32,
+        parameter_dtype=torch.bfloat16,
+        parameter_requires_grad=True,
+    )
+    read_rows = torch.tensor([1], dtype=torch.int32, device=device)
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=pool,
+        initial_state_indices=read_rows,
+        a=a.to(q.dtype),
+        b=b.to(q.dtype),
+        scale=None,
+        disable_state_update=True,
+        use_qk_l2norm=True,
+        intermediate_states_buffer=None,
+        output_state_indices=None,
+    )
+    actual = gdn_decode_mtp(
+        **kwargs,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        override=None,
+        solution="flashinfer",
+    )
+    expected, _ = reference_mtp(
+        **kwargs,
+        A_log=A_log.detach().float(),
+        dt_bias=dt_bias.detach().float(),
+        output=None,
+        ssm_state_indices=None,
+    )
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, expected)

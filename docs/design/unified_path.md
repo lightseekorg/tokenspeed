@@ -89,6 +89,24 @@ on replay. PLE's uniform index bundles are reused during capture only; eager
 prefill and decode construct their indices through the same builder outside
 the capture pool.
 
+GDN verify reuses the memoized scratch seed rows for both conv and recurrent
+initial-state reads: request `i` starts at `i * (T + 1)`. Each layer takes the
+first `bs` entries of the layer-major seed table instead of subtracting one
+from the per-token output grid on device. The same indices serve eager and
+captured forwards.
+
+FlashInfer FP32 GDN MTP runs through the `tokenspeed-kernel/thirdparty/`
+adapter into `run_mtp_decode`. The registered op supplies an empty BF16 output;
+the disabled intermediate cache receives an unused typed view. Neither needs
+a per-forward zero fill. Every non-negative read row writes its complete
+output; negative padding rows leave output untouched, matching the portable
+Triton contract that padded outputs are undefined and must be ignored. Verify
+scratch rows are non-negative even for padded requests, whose seed state is
+zero. Pool reads/writes still obey the negative-index skip contract on direct
+state-pool calls such as ReplaySSM. Supplying a real intermediate cache enables
+its writes; a dummy must never be passed as an enabled cache just to avoid
+FlashInfer's placeholder allocation.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base

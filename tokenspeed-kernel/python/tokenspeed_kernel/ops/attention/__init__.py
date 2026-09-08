@@ -4618,6 +4618,8 @@ def gdn_decode_mtp(
 
     Returns:
         Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+        Outputs for negative initial-state indices are undefined and must be
+        ignored, including on the FlashInfer FP32 path.
     """
     if output_state_indices is not None:
         if output_state_indices.shape != q.shape[:2]:

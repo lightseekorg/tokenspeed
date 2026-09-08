@@ -1632,7 +1632,10 @@ class MambaAttnBackend(AttentionBackend):
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             conv_states = conv_scratch
-            conv_read = output_indices[:batch_size, 0] - 1
+            # The first layer's seed rows are the shared per-request read ids.
+            conv_read = self._verify_seed_dst_rows(batch_size, draft_token_num)[
+                :batch_size
+            ]
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
@@ -1899,7 +1902,9 @@ class MambaAttnBackend(AttentionBackend):
             output_state_indices = None
         else:
             initial_state = ssm_scratch
-            initial_indices = output_indices[:batch_size, 0] - 1
+            initial_indices = self._verify_seed_dst_rows(batch_size, draft_token_num)[
+                :batch_size
+            ]
             output_state_indices = output_indices
         (
             mtp_initial_indices,

@@ -79,7 +79,9 @@ if platform.is_hopper_plus:
         from flashinfer.gdn_decode import (
             gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
         )
-        from flashinfer.gdn_decode import gated_delta_rule_mtp as _fi_mtp
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            gated_delta_rule_mtp as _fi_mtp,
+        )
 
         _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
         _gated_delta_rule_mtp = _fi_mtp
@@ -423,7 +425,8 @@ if is_decode_available():
 
         Padding behavior depends on the state dtype. The standalone FP32 MTP
         kernel skips a batch row when ``initial_state_indices`` is negative;
-        its per-token state indices may remain negative for that skipped row.
+        its output is undefined and its per-token state indices may remain
+        negative for that skipped row, matching the portable Triton contract.
         The BF16 fast path redirects negative read indices to row 0 and does
         not mask negative per-token scatter indices, so callers must provide
         non-negative destinations (typically by clamping padding to a reserved
@@ -475,12 +478,21 @@ if is_decode_available():
                 scale=scale,
             )
             return out
-        out, _ = _gated_delta_rule_mtp(
+        # The kernel overwrites every live output. Its disabled intermediate
+        # cache needs only a typed pointer, so bypass the public wrapper's two
+        # zero fills through the third-party adapter.
+        out = torch.empty(
+            (*q.shape[:2], v.shape[2], V_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        _gated_delta_rule_mtp(
             q=q,
             k=k,
             v=v,
             initial_state=initial_state,
             initial_state_indices=initial_state_indices,
+            output=out,
             A_log=A_log,
             a=a.to(q.dtype),
             dt_bias=dt_bias,
@@ -491,4 +503,4 @@ if is_decode_available():
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         )
-        return out
+        return out.to(q.dtype)
