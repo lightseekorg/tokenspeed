@@ -242,6 +242,24 @@ def test_plain_two_stage_admits_partitionable_shapes(dtype):
     assert not _use_two_stage_plain(2, aligned, dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
+def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
+    """Dtypes the packing kernel cannot express must stay on one-shot.
+
+    The kernel maps the element type through _PRODUCER_DIRECT_GL_DTYPES, so
+    admitting anything outside it would raise instead of reducing. Types wider
+    than a 64-bit word are the sharper case: they make elements-per-word zero,
+    which would divide by zero in the alignment check itself.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    for numel in (8, 64, 7168, 32 * 7168):
+        assert not _use_two_stage_plain(8, numel, dtype)
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------

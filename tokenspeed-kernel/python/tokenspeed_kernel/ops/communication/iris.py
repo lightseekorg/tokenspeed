@@ -132,6 +132,11 @@ def _use_two_stage_plain(
     """
     if world_size not in (4, 8):
         return False
+    # The kernel packs elements into 64-bit words through
+    # _PRODUCER_DIRECT_GL_DTYPES; anything outside it (or wider than a word,
+    # which would make elements_per_word zero) stays on one-shot.
+    if dtype not in _PRODUCER_DIRECT_GL_DTYPES:
+        return False
     elements_per_word = 8 // dtype.itemsize
     return numel % (world_size * elements_per_word) == 0
 
@@ -410,8 +415,10 @@ class IrisAllReduce(object):
         if heap_size is None:
             buf_bytes = max_numel * dtype.itemsize
             # _input_buf, _attnres_input_buf (2), _producer_direct_scratch_buf,
-            # and the staged path's rotating slots (_STAGED_SLOTS).
-            heap_size = max(1 << 28, (4 + _STAGED_SLOTS) * buf_bytes + (16 << 20))
+            # the staged path's rotating slots (_STAGED_SLOTS), the two-stage
+            # path's own slots (_STAGED_SLOTS), and its scratch partition --
+            # counted as a whole buffer since world_size is not known yet.
+            heap_size = max(1 << 28, (5 + 2 * _STAGED_SLOTS) * buf_bytes + (16 << 20))
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -529,7 +536,7 @@ class IrisAllReduce(object):
         if _platform.is_cdna4 and _use_two_stage_plain(
             self.world_size, numel, self.dtype
         ):
-            return self._all_reduce_two_stage(tensor, numel)
+            return self._all_reduce_two_stage(tensor, numel, safe=safe)
         iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, self._block_size),)](
             tensor.view(-1),
             self._staged_input_buf.view(-1),
@@ -589,15 +596,20 @@ class IrisAllReduce(object):
             offset += tensor.numel()
         return offset % self._elements_per_word == 0 and offset <= self.max_numel
 
-    def _all_reduce_two_stage(self, tensor: torch.Tensor, numel: int) -> torch.Tensor:
+    def _all_reduce_two_stage(
+        self, tensor: torch.Tensor, numel: int, safe: bool = True
+    ) -> torch.Tensor:
         """Reduce ``tensor`` in place via reduce-scatter then all-gather.
 
         Args:
             tensor: Contiguous local contribution; overwritten with the sum.
             numel: ``tensor.numel()``, already checked against the heap capacity.
+            safe: Return a copy rather than the caller's tensor, matching the
+                one-shot path -- the reduction lands in place either way, so
+                without this the result aliases the input.
 
         Returns:
-            ``tensor``, holding the reduction across the group.
+            The reduction across the group; a clone of ``tensor`` when ``safe``.
         """
         slot = self._two_stage_slot
         self._two_stage_slot = (slot + 1) % _STAGED_SLOTS
@@ -629,7 +641,7 @@ class IrisAllReduce(object):
             num_warps=8,
         )
         tensor.view(-1).copy_(output)
-        return tensor
+        return tensor.clone() if safe else tensor
 
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
