@@ -321,6 +321,8 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         config=config,
         backend=backend,
         draft_backend=None,
+        indexer_runtime=None,
+        draft_indexer_runtime=None,
         uses_paged_state_verify=True,
         is_inkling=False,
         expected_bytes=planned_bytes,
@@ -335,6 +337,8 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
             config=config,
             backend=backend,
             draft_backend=None,
+            indexer_runtime=None,
+            draft_indexer_runtime=None,
             uses_paged_state_verify=True,
             is_inkling=False,
             expected_bytes=planned_bytes + 1,
@@ -344,10 +348,16 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 def test_descriptor_binding_rejects_nonuniform_conv_width():
     harness = _Harness(eager_replay=True)
     last = harness.layer_ids[-1]
-    harness.params[last]["conv_weights"] = harness.params[last]["conv_weights"][:, :3]
     harness.prepare_metadata([0], {group: [2] for group in _STATE_GROUPS}, [8 + T])
+    harness.forward(harness.inputs(1, 701), 1)
+    # Verify kernels reject invalid conv widths before descriptor binding.
+    # Rebind directly to exercise the batched descriptor's geometry check.
+    weights = harness.backend._replay_weights[last]
+    weights = (weights[0][:, :3], *weights[1:])
+    harness.backend._replay_weights[last] = weights
+    harness.backend._replay_descriptor_bound.remove(last)
     with pytest.raises(RuntimeError, match="uniform geometry"):
-        harness.forward(harness.inputs(1, 701), 1)
+        harness.backend._bind_replay_descriptor(last, weights)
 
 
 def test_equal_geometry_pool_replacement_rebinds_batched_replay():

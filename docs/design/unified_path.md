@@ -341,11 +341,10 @@ view. Every `ForwardContext.indexer_runtime` borrows the matching runtime
 (`None` without QSA); Tensor workspace stays on the runtime. Indexers read
 this reference directly, with no model binding.
 
-`SpeculativeState` participants are fixed at startup. `ForwardStepRunner`
-commits each target participant once after eager forward or graph replay,
-excluding leading extend requests in mixed batches. Draft runtimes do not
-participate in target commits; the attention backend tree does not dispatch
-these lifecycle calls.
+`ForwardStepRunner` commits `ctx.indexer_runtime` once after eager verify
+or graph replay, excluding leading extend requests in mixed batches. Only
+the target runtime is committed here; the backend tree does not dispatch
+indexer lifecycle calls.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes

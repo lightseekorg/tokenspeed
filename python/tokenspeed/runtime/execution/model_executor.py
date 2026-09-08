@@ -456,9 +456,6 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            speculative_states=(
-                (indexer_runtime,) if indexer_runtime is not None else ()
-            ),
             indexer_runtime=indexer_runtime,
             drafter=self.drafter,
             draft_attn_backend=draft_attn_backend,
