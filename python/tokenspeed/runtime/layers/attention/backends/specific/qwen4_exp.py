@@ -26,12 +26,16 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import (
+    copy_state_rows,
+    state_verify_commit_rows,
+)
 
 from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
-    _row_stride_i32,
 )
+from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     qwen4_exp_ple_conv_field,
@@ -178,7 +182,7 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
 
         conv_shape = tuple(conv_fields[0].shape[1:])
         conv_dtype = conv_fields[0].dtype
-        conv_dst_stride = _row_stride_i32(conv_fields[0])
+        conv_dst_stride = row_stride_i32(conv_fields[0])
         for layer, field in zip(self._ple_layers, conv_fields, strict=True):
             if tuple(field.shape[1:]) != conv_shape or field.dtype != conv_dtype:
                 raise RuntimeError(
@@ -186,10 +190,10 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
                     f"{tuple(field.shape[1:])}/{field.dtype} differs from layer "
                     f"{first_layer.layer_id} {conv_shape}/{conv_dtype}"
                 )
-            if _row_stride_i32(field) != conv_dst_stride:
+            if row_stride_i32(field) != conv_dst_stride:
                 raise RuntimeError(
                     f"PLE layer {layer.layer_id} convolution page stride "
-                    f"{_row_stride_i32(field)} must match layer "
+                    f"{row_stride_i32(field)} must match layer "
                     f"{first_layer.layer_id} {conv_dst_stride}"
                 )
         for layer, scratch in zip(self._ple_layers, conv_scratches, strict=True):
@@ -211,8 +215,8 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         tables = {
             "context_src": self._u64([context_scratch.data_ptr()], device),
             "context_dst": self._u64([context_field.data_ptr()], device),
-            "context_src_stride": self._i64([_row_stride_i32(context_scratch)], device),
-            "context_dst_stride": self._i64([_row_stride_i32(context_field)], device),
+            "context_src_stride": self._i64([row_stride_i32(context_scratch)], device),
+            "context_dst_stride": self._i64([row_stride_i32(context_field)], device),
             "context_row_bytes": context_field[0].numel()
             * context_field.element_size(),
             "conv_src": self._u64(
@@ -220,7 +224,7 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
             ),
             "conv_dst": self._u64([field.data_ptr() for field in conv_fields], device),
             "conv_src_stride": self._i64(
-                [_row_stride_i32(scratch) for scratch in conv_scratches], device
+                [row_stride_i32(scratch) for scratch in conv_scratches], device
             ),
             "conv_dst_stride": self._i64([conv_dst_stride] * len(conv_fields), device),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
@@ -259,11 +263,6 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         if rows is None or rows.shape[1] < row_count:
             raise RuntimeError("PLE commit rows exceed the preallocated capacity")
         src_rows, dst_rows = rows[0, :row_count], rows[1, :row_count]
-        from tokenspeed_kernel.ops.kvcache.triton import (
-            copy_state_rows,
-            state_verify_commit_rows,
-        )
-
         state_verify_commit_rows(
             accepted_length,
             pages,

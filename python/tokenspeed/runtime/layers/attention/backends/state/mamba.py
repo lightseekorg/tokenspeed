@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     verify_state_blocks,
 )
+from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -53,6 +54,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
@@ -309,17 +311,6 @@ class _GDNReplayWorkspace:
     initialized_layers: set[int]
     geometry: tuple[int, int, int, int]
     state_dtype: torch.dtype
-
-
-def _row_stride_i32(tensor: torch.Tensor) -> int:
-    """Return one state row's stride in int32 words for pointer-table copies."""
-
-    if tensor[0].numel() and not tensor[0].is_contiguous():
-        raise RuntimeError("batched verify state copy requires contiguous row payloads")
-    stride_bytes = tensor.stride(0) * tensor.element_size()
-    if stride_bytes % 4:
-        raise RuntimeError("state row stride must be 4-byte aligned")
-    return stride_bytes // 4
 
 
 class MambaAttnBackend(AttentionBackend):
@@ -612,14 +603,14 @@ class MambaAttnBackend(AttentionBackend):
                 raise RuntimeError("verify state rows must be uniform per kind")
             conv_src.append(conv.data_ptr())
             conv_dst.append(conv_scratch.data_ptr())
-            conv_src_st.append(_row_stride_i32(conv))
-            conv_dst_st.append(_row_stride_i32(conv_scratch))
+            conv_src_st.append(row_stride_i32(conv))
+            conv_dst_st.append(row_stride_i32(conv_scratch))
             ssm_src.append(ssm.data_ptr())
-            ssm_src_st.append(_row_stride_i32(ssm))
+            ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
-                ssm_dst_st.append(_row_stride_i32(ssm_scratch))
+                ssm_dst_st.append(row_stride_i32(ssm_scratch))
             group_sel.append(group_index[self._state_group_for(layer_id)])
 
         def _u64(values: list[int]) -> torch.Tensor:
@@ -666,8 +657,6 @@ class MambaAttnBackend(AttentionBackend):
 
     def _seed_verify_scratch_batched(self, bs: int, draft_token_num: int) -> None:
         """Seed verify scratch from each layer's committed state page."""
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
-
         tables = self._verify_copy_tables_get()
         state_in_by_group = self.forward_metadata.state_in_blocks_by_group
         sin_stack = torch.stack(
@@ -748,8 +737,6 @@ class MambaAttnBackend(AttentionBackend):
             [pages_by_group[group_id] for group_id in self._state_groups()]
         )
         dst_rows = pages_stack.index_select(0, copy_tables["group_sel"]).reshape(-1)
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
-
         src_tiled = src_rows.repeat(copy_tables["num_layers"])
         copy_state_rows(
             copy_tables["conv_scratch"],

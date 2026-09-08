@@ -325,6 +325,12 @@ wrapper). A new leaf goes under `paged/`, a new recurrent family under
 router, paged leaves and execution-owned indexer state cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
+Shared state-copy geometry belongs in `backends/state/utils.py`:
+`row_stride_i32` validates each row's contiguous payload and converts its
+physical stride, including inter-row padding, to the int32 units required
+by `copy_state_rows`. Both Mamba/GDN and PLE import it directly instead of
+depending on a backend-private helper.
+
 QSA follows the ordinary router + leaf path. Its registered paged leaf
 inherits MHA's metadata refresh and capture. `attention/qsa/metadata.py`
 derives the indexer's layer-shared layout from `router.group_view(gid, bs)`
