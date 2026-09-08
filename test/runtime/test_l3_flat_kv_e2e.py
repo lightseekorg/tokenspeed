@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -116,6 +118,23 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             cp_rank=0,
             prefix_for_weight_version=lambda version: f"e2e-{version}",
         )
+        self.addCleanup(executor.shutdown)
+
+        # A CUDA fence cannot complete a CPU storage future. Hold PUT until
+        # the test observes the pending ACK, then let normal polling finish it.
+        put_started = threading.Event()
+        release_put = threading.Event()
+        self.addCleanup(release_put.set)
+        backend = executor.l3_store.backend
+        original_put = backend.batch_put_from
+
+        def gated_put(keys, host_buffer, offsets, sizes):
+            put_started.set()
+            if not release_put.wait(timeout=10):
+                raise TimeoutError("test did not release the L3 backup")
+            return original_put(keys, host_buffer, offsets, sizes)
+
+        self.enterContext(patch.object(backend, "batch_put_from", gated_put))
 
         first[16:20].fill_(0x11)
         second[28:34].fill_(0x12)
@@ -136,6 +155,14 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         )
         torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
+        self.assertEqual(write_results, [])
+        self.assertTrue(put_started.wait(timeout=10), "L3 backup did not start")
+        release_put.set()
+        deadline = time.monotonic() + 10
+        while not write_results and time.monotonic() < deadline:
+            write_results = executor.poll_results()
+            if not write_results:
+                time.sleep(0.001)
         self.assertEqual([int(event.op_id) for event in write_results], [7])
         self.assertEqual(executor.l3_store.exists(backup_pages), [True, True, True])
 
@@ -179,7 +206,6 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
         )
-        executor.shutdown()
 
 
 if __name__ == "__main__":

@@ -66,6 +66,13 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
+  The architecture test pins the exact public operation names, not a numeric
+  size limit. L3 adds named Host-tier operations for existence/readability
+  probes, prefetch planning/results, failed-read invalidation, namespace and
+  weight-version changes, and cache shutdown. These keep the executor and
+  Host buffer hidden; they do not introduce another generic work slot.
+  Changing this surface requires updating both this contract and the explicit
+  operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of

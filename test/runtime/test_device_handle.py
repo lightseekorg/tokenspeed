@@ -680,13 +680,33 @@ def test_the_event_loop_stores_only_the_running_handle():
 def test_the_handle_stays_a_closed_list_of_named_operations():
     """A god object forms one convenience method at a time.
 
-    The bound is not sacred, but pushing past it should be a deliberate
-    change — and every entry should be a named operation, not a "run this
-    closure" slot. Exactly one such slot is registered (EPD admission's
-    device half is a state machine; see run_multimodal_work).
+    Pin the operation names so even a same-size substitution needs review.
+    L3 control operations keep the Host tier behind the handle, as documented
+    in docs/design/event-loop.md. Exactly one generic work slot is registered
+    (EPD admission's device half; see run_multimodal_work).
     """
     public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    assert len(public) <= 10, sorted(public)
+    assert public == {
+        "execute",
+        "role",
+        "poll_cache_results",
+        "query_l3_storage",
+        "plan_has_l3_prefetch",
+        "prefetch_l3_load_backs",
+        "invalidate_l3_prefetch",
+        "l3_prefetch_storage_keys",
+        "mark_l3_keys_unread",
+        "l3_key_is_unread",
+        "forget_l3_unread_keys",
+        "delete_l3_namespace",
+        "set_l3_weight_version",
+        "shutdown_cache",
+        "run_idle_forward",
+        "run_multimodal_work",
+        "run_kv_repair",
+        "run_remote_prefill_landing",
+        "update_weights",
+    }
     assert {name for name in public if name.endswith("_work")} == {
         "run_multimodal_work"
     }
