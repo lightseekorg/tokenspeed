@@ -1804,110 +1804,44 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
-    stride_qkvz,
-    stride_ba,
+    stride_qkvz: tl.constexpr,
+    stride_ba: tl.constexpr,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_BA: tl.constexpr,
 ):
-    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-
-    V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-
-    # ── Input dimensions ──
-    TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
-    TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
+    row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-
-    # ── Output dimensions ──
-    QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
-
-    # ── Read from input (supports non-contiguous stride) ──
-    # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * stride_qkvz + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    # k for head group i_qk: in the all_k region
-    blk_k_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
+    QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
+    # QKVZ is already ordered: copy consecutive features and split only the
+    # destination pointer. This also handles non-power-of-two head ratios.
+    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(
+        mixed_qkvz + row * stride_qkvz + offsets,
+        offsets < QKVZ_DIM,
+        other=0,
     )
-    # ── Write to output (identical layout to the interleaved kernel) ──
-    blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    output = tl.where(
+        offsets < QKV_DIM,
+        mixed_qkv + row * QKV_DIM + offsets,
+        z + row * TOTAL_V + offsets - QKV_DIM,
     )
+    tl.store(output, values, offsets < QKVZ_DIM)
 
-    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
-    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-
-    # Compile-time branch keeps the fast
-    # vectorized path for pow2 ratios and loops per head otherwise
-    IS_POW2: tl.constexpr = (V_PER_GROUP & (V_PER_GROUP - 1)) == 0
-
-    if IS_POW2:
-        blk_v_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
+    # One tile owns each row's gates; adjacent lanes copy adjacent heads.
+    if tile == 0:
+        heads = tl.arange(0, BLOCK_BA)
+        mask = heads < NUM_HEADS_V
+        b_values = tl.load(mixed_ba + row * stride_ba + heads, mask, other=0)
+        a_values = tl.load(
+            mixed_ba + row * stride_ba + NUM_HEADS_V + heads, mask, other=0
         )
-        blk_z_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + TOTAL_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_v_st_ptr = (
-            mixed_qkv
-            + i_bs * QKV_DIM_T
-            + NUM_HEADS_QK * HEAD_QK * 2
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_z_st_ptr = (
-            z
-            + i_bs * NUM_HEADS_V * HEAD_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    else:
-        for i in tl.static_range(V_PER_GROUP):
-            head_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
-            blk_v_ptr = mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + head_off
-            blk_z_ptr = (
-                mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + TOTAL_V + head_off
-            )
-            blk_v_st_ptr = (
-                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + head_off
-            )
-            blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + head_off
-            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-
-    # ── b and a ──
-    for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * stride_ba + i_qk * V_PER_GROUP + i
-        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
-
-    for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * stride_ba + NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+        tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
+        tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(
@@ -1918,7 +1852,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     head_qk,
     head_v,
 ):
-    """Fused split/reshape/cat for Qwen3.5. Supports non-contiguous inputs.
+    """Repack Qwen3.5 projections into contiguous, independently owned outputs.
+
+    Inputs have unit inner strides; row strides and storage offsets may vary.
+    The leading dimension counts tokens, including flattened MTP tokens.
+    QKV and Z retain the QKVZ dtype; B and A retain the BA dtype.
 
     Input layout (per row):
         mixed_qkvz: [all_q | all_k | all_v | all_z]
@@ -1948,7 +1886,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
-    grid = (batch * seq_len, num_heads_qk)
+    grid = (batch * seq_len, triton.cdiv(qkv_dim_t + num_heads_v * head_v, 2048))
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -1962,8 +1900,10 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
-        num_stages=3,
+        BLOCK=2048,
+        BLOCK_BA=triton.next_power_of_2(num_heads_v),
+        num_warps=4,
+        num_stages=1,
     )
     return mixed_qkv, z, b, a
 

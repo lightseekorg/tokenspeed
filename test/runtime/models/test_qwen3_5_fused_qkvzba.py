@@ -1,14 +1,28 @@
-"""Correctness + perf guard for fused_qkvzba_split_reshape_cat_contiguous.
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-The kernel's v/z access was reworked from one V_PER_GROUP * HEAD_V arange
-into a per-head static_range loop so any integer head ratio works (Triton
-arange requires a power-of-2 span; ratio 3 * 128 = 384 is not one).
+"""Exact repack, storage and graph contracts for Qwen3.5 QKVZBA projections.
 
-- correctness: bit-exact vs a plain torch split reference for ratios
-  1/2/3/4, plus 16-byte alignment of every output (flashinfer's CuteDSL
-  gdn_decode_mtp requirement).
-- perf: the looped kernel must not regress vs the previous wide-arange
-  implementation on the power-of-2 ratios it used to handle (1/2/4).
+Cover integer head ratios, feature-tile tails, packed projection row strides,
+unaligned inputs and independent, contiguous, 16-byte-aligned outputs. Keep
+the original power-of-two kernel as a prefill performance regression guard.
 """
 
 import os
@@ -186,6 +200,111 @@ class FusedQkvzbaTest(unittest.TestCase):
 
         return fused_qkvzba_split_reshape_cat_contiguous
 
+    def _assert_repack(self, qkvz, ba, outputs, nk, nv, dq, dv):
+        q, k, v, z = qkvz.split([nk * dq, nk * dq, nv * dv, nv * dv], dim=-1)
+        b, a = ba.split([nv, nv], dim=-1)
+        expected = (
+            torch.cat((q, k, v), dim=-1),
+            z.reshape(qkvz.shape[0], nv, dv),
+            b,
+            a,
+        )
+        for actual, reference in zip(outputs, expected):
+            self.assertEqual(actual.shape, reference.shape)
+            self.assertEqual(actual.dtype, reference.dtype)
+            self.assertTrue(actual.is_contiguous())
+            self.assertEqual(actual.data_ptr() % 16, 0)
+            # Compare bytes to preserve NaN payloads and the sign of zero.
+            self.assertTrue(
+                torch.equal(
+                    actual.view(torch.uint8), reference.contiguous().view(torch.uint8)
+                )
+            )
+        if qkvz.numel():
+            input_storage = {
+                tensor.untyped_storage().data_ptr() for tensor in (qkvz, ba)
+            }
+            output_storage = {tensor.untyped_storage().data_ptr() for tensor in outputs}
+            self.assertTrue(input_storage.isdisjoint(output_storage))
+            ranges = sorted(
+                (tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes)
+                for tensor in outputs
+            )
+            for (_, end), (start, _) in zip(ranges, ranges[1:]):
+                self.assertLessEqual(end, start)
+
+    def test_projection_layouts_dtypes_and_tile_tails(self):
+        fused = self._fused()
+        torch.manual_seed(4)
+        cases = [
+            (0, 4, 12, 128, 128, torch.bfloat16, torch.bfloat16, "packed"),
+            (1, 4, 12, 128, 128, torch.bfloat16, torch.bfloat16, "packed"),
+            (3, 1, 3, 128, 128, torch.bfloat16, torch.bfloat16, "packed"),
+            (24, 4, 12, 128, 128, torch.bfloat16, torch.bfloat16, "packed"),
+            (65, 8, 24, 128, 128, torch.bfloat16, torch.bfloat16, "packed"),
+            (257, 4, 12, 64, 128, torch.float16, torch.float16, "packed"),
+            (3, 2, 6, 128, 128, torch.bfloat16, torch.float32, "unaligned"),
+            (65, 4, 16, 128, 128, torch.bfloat16, torch.bfloat16, "unaligned"),
+            (32, 4, 4, 128, 64, torch.float32, torch.float32, "unaligned"),
+        ]
+        for rows, nk, nv, dq, dv, dtype, gate_dtype, layout in cases:
+            with self.subTest(
+                rows=rows, nk=nk, nv=nv, dq=dq, dv=dv, dtype=dtype, layout=layout
+            ):
+                width = 2 * nk * dq + 2 * nv * dv
+                if layout == "packed":
+                    # Match _forward_input_proj's split of one merged GEMM output.
+                    packed = torch.randn(
+                        rows, width + 2 * nv, dtype=dtype, device="cuda"
+                    )
+                    qkvz, ba = packed.split([width, 2 * nv], dim=-1)
+                else:
+                    qkvz = torch.randn(rows, width + 3, dtype=dtype, device="cuda")[
+                        :, 1 : width + 1
+                    ]
+                    ba = torch.randn(rows, 2 * nv + 5, dtype=gate_dtype, device="cuda")[
+                        :, 1 : 2 * nv + 1
+                    ]
+                    self.assertNotEqual(qkvz.data_ptr() % 16, 0)
+                    self.assertNotEqual(ba.data_ptr() % 16, 0)
+                if rows:
+                    for tensor in (qkvz, ba):
+                        specials = torch.tensor(
+                            [0.0, -0.0, float("inf"), -float("inf"), float("nan")],
+                            dtype=tensor.dtype,
+                            device="cuda",
+                        )
+                        tensor[0, :5] = specials
+                    qkv_dim = 2 * nk * dq + nv * dv
+                    qkvz[0, qkv_dim : qkv_dim + 5] = qkvz[0, :5]
+                before = (qkvz.clone(), ba.clone())
+                outputs = fused(qkvz, ba, nk, nv, dq, dv)
+                self._assert_repack(qkvz, ba, outputs, nk, nv, dq, dv)
+                for actual, reference in zip((qkvz, ba), before):
+                    self.assertTrue(
+                        torch.equal(
+                            actual.contiguous().view(torch.uint8),
+                            reference.view(torch.uint8),
+                        )
+                    )
+
+    def test_graph_replay_reads_updated_projection(self):
+        fused = self._fused()
+        rows, nk, nv = 24, 4, 12
+        width = 2 * nk * HEAD_QK + 2 * nv * HEAD_V
+        packed = torch.randn(rows, width + 2 * nv, dtype=torch.bfloat16, device="cuda")
+        qkvz, ba = packed.split([width, 2 * nv], dim=-1)
+        fused(qkvz, ba, nk, nv, HEAD_QK, HEAD_V)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = fused(qkvz, ba, nk, nv, HEAD_QK, HEAD_V)
+        for _ in range(2):
+            packed.normal_()
+            graph.replay()
+            torch.cuda.synchronize()
+            self._assert_repack(qkvz, ba, outputs, nk, nv, HEAD_QK, HEAD_V)
+
     def test_matches_split_reference_for_all_integer_ratios(self):
         fused = self._fused()
         torch.manual_seed(0)
@@ -253,8 +372,7 @@ class FusedQkvzbaTest(unittest.TestCase):
             results[nv // nk] = (t_old, t_new)
 
         for ratio, (t_old, t_new) in results.items():
-            # pow2 ratios compile to the same wide-arange path as before;
-            # allow 20% noise margin on a memory-bound microkernel
+            # Compare with the original per-head kernel, allowing 20% noise.
             self.assertLessEqual(
                 t_new,
                 t_old * 1.20,
