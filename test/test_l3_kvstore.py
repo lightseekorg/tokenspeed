@@ -400,6 +400,42 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
 
+    def test_checkpoint_id_fingerprints_imported_custom_code_subdirectories(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory, helper in (
+                (first, "def rotary_dim():\n    return 64\n"),
+                (second, "def rotary_dim():\n    return 128\n"),
+            ):
+                helpers = os.path.join(directory, "model_helpers")
+                os.makedirs(helpers)
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write(
+                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                    )
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(b"weights")
+                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                    handle.write("from model_helpers.attention import rotary_dim\n")
+                with open(os.path.join(helpers, "__init__.py"), "w") as handle:
+                    handle.write("")
+                with open(os.path.join(helpers, "attention.py"), "w") as handle:
+                    handle.write(helper)
+            first_id = self._checkpoint_id(
+                first,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            second_id = self._checkpoint_id(
+                second,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertTrue(first_id.startswith("local-"))
+            self.assertTrue(second_id.startswith("local-"))
+            self.assertNotEqual(first_id, second_id)
+
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as handle:

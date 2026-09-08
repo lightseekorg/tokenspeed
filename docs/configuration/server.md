@@ -323,7 +323,7 @@ Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
 immutable revision or a local fingerprint of selected weights, metadata,
-and top-level `*.py` — never an inherited
+and local `*.py` including imported package subdirectories — never an inherited
 config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
 `(models|datasets|spaces)--*/snapshots/<commit>` cache path with a sibling
 `refs` directory (a directory merely named `snapshots` is fingerprinted)

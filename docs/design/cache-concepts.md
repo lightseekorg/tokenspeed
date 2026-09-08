@@ -441,9 +441,11 @@ Its responsibilities:
   bytes. Local
   fingerprints include `hf_quant_config.json` (ModelOpt
   mixed-precision maps and KV quantization live there, not in the
-  weight tensors), top-level `*.py` (`--trust-remote-code` configuration
-  and modeling modules can derive architecture fields that change KV
-  without touching JSON or weights), plus only the weight files `--load-format` selects
+  weight tensors), local `*.py` including imported package
+  subdirectories (`--trust-remote-code` configuration, modeling modules,
+  and helpers such as `model_helpers/attention.py` can derive
+  architecture fields that change KV without touching JSON or weights),
+  plus only the weight files `--load-format` selects
   (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
   `sharded_state` hashes `model-rank-*-part-*.safetensors`). Mistral
   fingerprints include `consolidated.safetensors.index.json` so two dumps

@@ -198,10 +198,11 @@ def l3_checkpoint_id(
     inherit from its source, and never from a 40-character hex basename
     or a folder merely named ``snapshots``. Local fingerprints also hash
     ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
-    quantization cannot collide under identical weight bytes, and
-    top-level ``*.py`` so ``--trust-remote-code`` configuration/modeling
-    modules that derive architecture fields cannot share a namespace
-    with identical JSON/weights. Hugging Face hub ids still prefer the
+    quantization cannot collide under identical weight bytes, and local
+    ``*.py`` (top-level modules and imported package subdirectories) so
+    ``--trust-remote-code`` configuration/modeling helpers that derive
+    architecture fields cannot share a namespace with identical
+    JSON/weights. Hugging Face hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
     pinned ``--revision``. The returned id always includes the
     normalized load format so two deployments that share a directory
@@ -345,13 +346,47 @@ def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozens
 def _is_local_checkpoint_code(name: str) -> bool:
     """Return whether ``name`` is custom HF code loaded with trust_remote_code.
 
-    Configuration and modeling modules at the checkpoint root can derive
-    rope, layout, and other fields that change KV without touching
-    ``config.json`` or the weight tensors. Hugging Face snapshot commits
-    already cover those files; local fingerprints must hash them too.
+    Configuration and modeling modules, including helpers imported from
+    package subdirectories, can derive rope, layout, and other fields
+    that change KV without touching ``config.json`` or the weight
+    tensors. Hugging Face snapshot commits already cover those files;
+    local fingerprints must hash them too.
     """
 
     return name.endswith(".py")
+
+
+def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
+    """Return ``(relative posix path, absolute path)`` for local custom code.
+
+    Walks package subdirectories so an imported helper such as
+    ``model_helpers/attention.py`` cannot keep the L3 checkpoint id after
+    changing KV computation. ``__pycache__`` and hidden directories are
+    skipped; bytecode and VCS metadata are not part of the loaded model.
+    """
+
+    found: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(
+        model_dir, topdown=True, onerror=None, followlinks=False
+    ):
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name != "__pycache__" and not name.startswith(".")
+        )
+        rel_dir = os.path.relpath(dirpath, model_dir)
+        for name in sorted(filenames):
+            if not _is_local_checkpoint_code(name):
+                continue
+            path = os.path.join(dirpath, name)
+            if not os.path.isfile(path):
+                continue
+            if rel_dir == os.curdir:
+                rel = name
+            else:
+                rel = "/".join((*rel_dir.split(os.sep), name))
+            found.append((rel, path))
+    return tuple(found)
 
 
 @functools.cache
@@ -366,11 +401,12 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     not in the weight tensors. ``consolidated.safetensors.index.json`` is
     hashed so two Mistral dumps with the same ``consolidated*.safetensors``
     candidates but different shard maps cannot share a namespace.
-    Top-level ``*.py`` is hashed so two trees with identical JSON/weights
-    but different ``--trust-remote-code`` configuration modules cannot
-    share a namespace. ``--load-format`` selects so a directory that
-    contains more than one checkpoint encoding cannot share a namespace
-    across loaders.
+    Local ``*.py`` is hashed, including files imported from package
+    subdirectories, so two trees with identical JSON/weights but
+    different ``--trust-remote-code`` configuration modules cannot share
+    a namespace. ``--load-format`` selects so a directory that contains
+    more than one checkpoint encoding cannot share a namespace across
+    loaders.
     """
     hasher = hashlib.sha256()
     try:
@@ -378,11 +414,14 @@ def _local_checkpoint_fingerprint(model_dir: str, load_format: str) -> str:
     except OSError:
         return hasher.hexdigest()
     selected_weights = _selected_weight_names(names, load_format=load_format)
+    for rel, path in _local_checkpoint_code_files(model_dir):
+        hasher.update(rel.encode())
+        _update_file_digest(hasher, path)
     for name in names:
         path = os.path.join(model_dir, name)
         if not os.path.isfile(path):
             continue
-        if name in _CHECKPOINT_METADATA_FILES or _is_local_checkpoint_code(name):
+        if name in _CHECKPOINT_METADATA_FILES:
             hasher.update(name.encode())
             _update_file_digest(hasher, path)
             continue
