@@ -158,6 +158,65 @@ esac
     )
 
 
+def run_deepswe_resolve_script(tmp_path: Path, *, pr: str, pr_files: str) -> str:
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/b300-deepswe.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["source"]["steps"]
+        if step.get("name") == "Resolve trusted source"
+    )
+    script = step["run"].replace("${{ github.repository }}", "lightseekorg/tokenspeed")
+    for placeholder in ("task_count", "sample_seed", "concurrency"):
+        script = script.replace("${{ inputs.%s }}" % placeholder, "1")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "${2:-}" in
+  repos/lightseekorg/tokenspeed/commits/main)
+    printf '%s\\n' "$GH_MAIN_SHA"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*/files)
+    printf '%s\\n' "$GH_PR_FILES"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*)
+    printf '{"head":{"sha":"%s","repo":{"full_name":"%s"}},"html_url":"%s"}\\n' \
+      "$GH_PR_SHA" lightseekorg/tokenspeed "https://example.invalid/pull/7"
+    ;;
+  *)
+    echo "Unexpected gh call: $*" >&2
+    exit 1
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GH_MAIN_SHA": "1" * 40,
+            "GH_PR_SHA": "2" * 40,
+            "GH_PR_FILES": pr_files,
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "step-summary"),
+            "PR": pr,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return output.read_text(encoding="utf-8")
+
+
 def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
     paths = set()
     for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
@@ -824,6 +883,54 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
         " && 10 || inputs.timeout_minutes }}"
     )
+
+
+def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["submit"]["steps"]
+        if step.get("name") == "Submit and wait for GB300 Slurm task"
+    )
+
+    assert workflow["jobs"]["scan"]["outputs"][
+        "install_tokenspeed_mla_from_source"
+    ] == ("${{ steps.changes.outputs.install_tokenspeed_mla_from_source }}")
+    assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}"
+    )
+
+
+def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Submit and wait for Slurm tasks"
+    )
+
+    assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ inputs.pr && '1' || '0' }}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr", "pr_files", "expected"),
+    [
+        ("", "", "install_mla=0"),
+        ("7", "README.md", "install_mla=0"),
+        ("7", "tokenspeed-mla/python/tokenspeed_mla/mla_decode.py", "install_mla=1"),
+    ],
+)
+def test_b300_deepswe_resolves_the_tokenspeed_mla_source(
+    tmp_path, pr, pr_files, expected
+):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/b300-deepswe.yml")
+    assert workflow["jobs"]["run"]["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ needs.source.outputs.install_mla }}"
+    )
+
+    assert expected in run_deepswe_resolve_script(tmp_path, pr=pr, pr_files=pr_files)
 
 
 def test_mi450_sim_runs_on_the_cpu_only_pool():

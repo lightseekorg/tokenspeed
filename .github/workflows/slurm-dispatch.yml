@@ -121,6 +121,9 @@ jobs:
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          # A dispatched pull request may carry unmerged tokenspeed-mla changes,
+          # and the Slurm coordinator has no gh to narrow that to its diff.
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.pr && '1' || '0' }}
           CONTAINER_IMAGE: ${{ inputs.container_image }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
