@@ -490,8 +490,13 @@ Its responsibilities:
   `global_segment_size` is divided by attention TP × CP × PP; passing
   `server_args.attn_tp_size` when `ENABLE_CP` inferred `cp_size` would
   over-mount the store. Host eviction does
-  **not** drop the L3 key. A cluster-wide `clear_cache` deletes objects under
-  that stable prefix rather than minting a process-local generation.
+  **not** drop the L3 key. A `clear_cache` in this process group deletes
+  objects under that stable prefix rather than minting a process-local
+  generation, so a restarted rank still probes the same keys. Independent
+  TokenSpeed jobs that share a tenant are not in the TP/CP/PP/DP MIN: a
+  fleet-wide wipe is an operator flush of every instance. A later
+  `batch_exists` miss is not a lease; vanished-L3 prefetch recovers if
+  another client republishes or this delete races a peer PUT.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
   MIN-reduces existence across every cache-owning rank in the DP replica
   (attention TP, then CP, then PP; not across DP) and

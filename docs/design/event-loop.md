@@ -315,7 +315,8 @@ For orientation, one iteration of `event_loop`:
   then PP) and then across attention DP — DP replicas share Mooncake
   objects — then MIN-reduce an error-returning L3 `remove_by_prefix`,
   before any rank mutates Device/Host. The frontend ANDs every DP
-  worker's reply. Queued Submitted/Retracted
+  worker's reply. Independent TokenSpeed jobs that share a tenant are
+  not in those groups. Queued Submitted/Retracted
   hashes of requests that can take a batch slot and Device pages this
   round are re-probed immediately before `next_execution_plan` so a hit
   registered at submit cannot be admitted after the object is gone. A

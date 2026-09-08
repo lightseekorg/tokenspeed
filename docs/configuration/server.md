@@ -343,7 +343,7 @@ ranks (attention TP, then CP, then PP) and then across attention DP
 before any rank clears. Exists, prefetch, and `WriteBackDone` stay
 TP/CP/PP because DP ranks hold different sequences; flush includes DP
 because object keys omit DP rank. Remote L3 deletion is the next
-cluster-wide phase: it
+replica-then-DP phase: it
 returns success/failure instead of raising, is MIN-reduced, and only
 then does `ClearCache` destroy Device/Host. A rank whose writebacks have
 drained cannot rotate L3 or drop local indexes while a peer still

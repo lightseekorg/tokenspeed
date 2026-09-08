@@ -73,10 +73,14 @@ class L3HostStore:
     def rotate_namespace(self) -> bool:
         """Delete objects under this stable namespace.
 
-        Cache flush / weight update is cluster-wide: every instance that
-        shares the store must clear together. The prefix itself does not
-        change, so a restarted peer still probes the same namespace and
-        observes the deletion through ``batch_exists``.
+        The prefix does not change, so a restarted rank in *this* job still
+        probes the same keys and observes the deletion through
+        ``batch_exists``. TP/CP/PP/DP MIN-reduce clearability and the
+        delete result inside one TokenSpeed process group. Independent
+        deployments that share a tenant are not in those groups: a
+        fleet-wide wipe is an operator flush of every instance. A peer
+        PUT after this delete is a later ``batch_exists`` hit, not a
+        lease; vanished-L3 prefetch recovers a miss.
 
         Returns True when the store reports the prefix is gone. A False
         must not be followed by Device/Host ``ClearCache``.
