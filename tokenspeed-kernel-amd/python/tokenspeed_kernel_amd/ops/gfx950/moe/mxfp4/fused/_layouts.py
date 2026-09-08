@@ -100,6 +100,12 @@ def _swiglu_split_layout(
     block_m: int, block_n_full: int, num_warps: int
 ) -> gl.constexpr:
     THREADS_PER_WARP = 64  # CDNA4 wavefront size.
+    # TODO: widening `size_per_thread` to `[1, 16]` would leave each half of
+    # the `gl.split` below with the 8 contiguous per-lane values that
+    # `quantize_gluon.scaled_downcast_layout()` requires, so the quantize
+    # tiles could drop their `convert_layout`.
+    # The same applies to the inline split layout in
+    # `prefill_stage1._apply_interleaved_gate_activation`.
     return gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[4, THREADS_PER_WARP // 4],
