@@ -339,8 +339,10 @@ device arena offsets), the
 cache-quantization config (including `quantization_param_path` scale-file
 bytes and `--speculative-draft-model-quantization` when a draft pool is
 present), the pipeline stage, the context-parallel
-width (`cp_size`), and any
-speculative draft checkpoint. Live weight updates flush Device/Host
+width (`cp_size`), any
+speculative draft checkpoint, and `L3_RUNTIME_COMPAT` (bumped when
+built-in model code, RoPE, or a cache-producing kernel changes KV for
+the same checkpoint and layout). Live weight updates flush Device/Host
 before the GPU load, then rebuild that prefix. A requested `flush_cache`
 must succeed first: in-flight Host writebacks cause `ClearCache` to
 reject. Weight-update `flush_cache` and standalone `/flush_cache`

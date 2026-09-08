@@ -436,8 +436,14 @@ Its responsibilities:
   to the HF text config (rope_theta, rope_scaling, and other architecture
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), the resolved attention-TP width
-  (`attn.tp_size`), and the speculative
-  draft checkpoint when a separate draft pool is present. An unpinned
+  (`attn.tp_size`), the speculative
+  draft checkpoint when a separate draft pool is present, and
+  `L3_RUNTIME_COMPAT` (a required namespace epoch bumped when built-in
+  model code, positional encoding, or a cache-producing kernel changes
+  KV without touching checkpoint, layout, or listed options). A git SHA
+  or package version is not used: those would split L3 on unrelated
+  rolling upgrades while remaining `0.1.0` across cache-affecting edits.
+  An unpinned
   Hugging Face branch or local path is identified from a Hugging Face
   hub cache snapshot
   (`hub/.../(models|datasets|spaces)--<repo>/snapshots/<commit>` with a

@@ -597,6 +597,15 @@ def _file_digest(path: str) -> str:
     return hasher.hexdigest()
 
 
+# Bump when a runtime change alters produced KV for the same checkpoint,
+# packed Host layout, and listed options (built-in model code, RoPE,
+# cache-producing kernels). Unrelated rolling upgrades must keep this
+# value so they still share L3. This is not a git SHA or package version:
+# those would split the store on every non-cache commit while staying
+# 0.1.0 across cache-affecting edits.
+L3_RUNTIME_COMPAT = "1"
+
+
 def storage_key_prefix(
     model_name: str,
     *,
@@ -611,27 +620,30 @@ def storage_key_prefix(
     draft_revision: str,
     draft_weight_version: str,
     cache_quantization: str,
+    runtime_compat: str,
 ) -> str:
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, attention-TP width,
     context-parallel width, draft pool, cache-quantization config (target
-    and draft), or runtime HF overrides and silently collide with an
-    incompatible deployment.
+    and draft), runtime HF overrides, or the KV-producer compat epoch and
+    silently collide with an incompatible deployment.
     ``revision`` is the resolved immutable checkpoint (Hugging Face commit
     or local fingerprint), not a moving branch name. ``model_overrides``
     is the ``--hf-overrides`` dict applied to the HF text config
     (rope_theta, rope_scaling, and the rest of the effective architecture).
-    Empty strings and an empty override dict are valid and mean "unset"
-    (no draft pool, no extra cache scales, no HF overrides). ``cp_size``
-    belongs here rather than only in the per-object ``c{cp_rank}`` shard
-    id: zigzag CP assigns different token blocks to the same rank under
-    different widths. ``attn_tp_size`` belongs here rather than only in
-    the per-object ``r{tp_rank}`` shard id: GQA with TP above the KV-head
-    count keeps one local KV head per rank, so packed Host geometry is
-    unchanged, while ``tp_rank // num_kv_head_replicas`` assigns different
-    heads to the same rank.
+    ``runtime_compat`` is ``L3_RUNTIME_COMPAT``: the epoch of the runtime
+    that produced the KV, not a build SHA. Empty strings and an empty
+    override dict are valid and mean "unset" (no draft pool, no extra
+    cache scales, no HF overrides). ``cp_size`` belongs here rather than
+    only in the per-object ``c{cp_rank}`` shard id: zigzag CP assigns
+    different token blocks to the same rank under different widths.
+    ``attn_tp_size`` belongs here rather than only in the per-object
+    ``r{tp_rank}`` shard id: GQA with TP above the KV-head count keeps one
+    local KV head per rank, so packed Host geometry is unchanged, while
+    ``tp_rank // num_kv_head_replicas`` assigns different heads to the
+    same rank.
     """
 
     if not isinstance(model_overrides, dict):
@@ -650,6 +662,7 @@ def storage_key_prefix(
             "draft_revision": str(draft_revision),
             "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
+            "runtime_compat": str(runtime_compat),
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -906,6 +906,7 @@ def build_device_side(
         )
         if server_args.kvstore_storage_backend is not None:
             from tokenspeed.runtime.cache.l3.backend import (
+                L3_RUNTIME_COMPAT,
                 cache_layout_signature,
                 l3_cache_quantization_id,
                 l3_checkpoint_id,
@@ -1000,6 +1001,7 @@ def build_device_side(
                     draft_revision=draft_revision,
                     draft_weight_version=weight_version if draft_model else "",
                     cache_quantization=cache_quantization,
+                    runtime_compat=L3_RUNTIME_COMPAT,
                 )
 
             l2_cache_executor.attach_l3_storage(

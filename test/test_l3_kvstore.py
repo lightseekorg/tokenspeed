@@ -31,6 +31,7 @@ from unittest import mock
 
 from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    L3_RUNTIME_COMPAT,
     L3UnreadKeySet,
     MemoryKvStore,
     cache_layout_signature,
@@ -100,6 +101,7 @@ class StorageKeyTest(unittest.TestCase):
                 "draft_revision": "",
                 "draft_weight_version": "",
                 "cache_quantization": "",
+                "runtime_compat": L3_RUNTIME_COMPAT,
             }
             values.update(overrides)
             return storage_key_prefix(**values)
@@ -127,6 +129,8 @@ class StorageKeyTest(unittest.TestCase):
             prefix(model_overrides={"b": 2, "a": 1}),
             prefix(model_overrides={"a": 1, "b": 2}),
         )
+        self.assertNotEqual(base, prefix(runtime_compat="2"))
+        self.assertEqual(prefix(runtime_compat="1"), prefix(runtime_compat="1"))
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
         with self.assertRaises(TypeError):
@@ -141,6 +145,9 @@ class StorageKeyTest(unittest.TestCase):
         )
         self.assertIs(
             signature.parameters["attn_tp_size"].default, inspect.Parameter.empty
+        )
+        self.assertIs(
+            signature.parameters["runtime_compat"].default, inspect.Parameter.empty
         )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
