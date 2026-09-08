@@ -410,11 +410,16 @@ class IrisAllReduce(object):
             all_reduce_distribution=1,
         )
 
-        # Whether this state can ever dispatch a two-stage reduction. Both the
-        # kernel's CDNA4 intrinsics and its partitioning are fixed properties of
-        # the state, so deciding once here keeps the buffers, the heap estimate
-        # and the dispatch from disagreeing.
-        self._two_stage_supported = _platform.is_cdna4 and group.size() in (4, 8)
+        # Whether this state can ever dispatch a two-stage reduction. Platform,
+        # group size and element type are all fixed for the life of the state,
+        # so deciding once here keeps the buffers, the heap estimate and the
+        # dispatch from disagreeing. Only the payload size is per-call, and it
+        # stays in _use_two_stage_plain.
+        self._two_stage_supported = (
+            _platform.is_cdna4
+            and group.size() in (4, 8)
+            and dtype in _PRODUCER_DIRECT_GL_DTYPES
+        )
 
         # Leave generous heap headroom for the symmetric input and Iris
         # bookkeeping such as ring/spinlock flags.

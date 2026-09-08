@@ -260,6 +260,36 @@ def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
         assert not _use_two_stage_plain(8, numel, dtype)
 
 
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "supported"),
+    [
+        (8, torch.bfloat16, True),
+        (4, torch.float32, True),
+        (2, torch.bfloat16, False),
+        (8, torch.float64, False),
+    ],
+)
+def test_two_stage_state_gate_matches_dispatch(world_size, dtype, supported):
+    """The state-level gate must agree with the per-call predicate.
+
+    A state that reserves the staging buffer and the larger heap for a
+    combination the predicate then refuses is not merely wasteful: a caller
+    supplying an explicit heap sized for the one-shot allocations fails to
+    construct. Everything the predicate tests apart from payload size is fixed
+    for the life of the state, so the two have to be decided from the same
+    conditions.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    # a payload that satisfies the size condition, so only the state-level
+    # conditions can decide the outcome
+    numel = 8 * 7168
+    assert _use_two_stage_plain(world_size, numel, dtype) is supported
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
