@@ -449,7 +449,9 @@ Its responsibilities:
   architecture fields that change KV without touching JSON or weights),
   plus only the weight files `--load-format` selects
   (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
-  `sharded_state` hashes `model-rank-*-part-*.safetensors`). Mistral
+  `sharded_state` hashes `model-rank-*-part-*.safetensors`; each rank
+  fingerprints the files it can read and the replica all-gathers those
+  digests so a rank-local shard change still rotates the namespace). Mistral
   fingerprints include `consolidated.safetensors.index.json` so two dumps
   with the same `consolidated*.safetensors` candidates but different shard
   maps cannot share a namespace. The

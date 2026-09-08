@@ -927,35 +927,32 @@ def build_device_side(
                 else 1
             )
             rank = dist.get_rank() if world_size > 1 else 0
-            if rank == 0:
-                checkpoint_id = l3_checkpoint_id(
-                    model_config.model_path,
-                    hf_config=model_config.hf_config,
-                    revision=str(model_config.revision or ""),
+            checkpoint_id = l3_checkpoint_id(
+                model_config.model_path,
+                hf_config=model_config.hf_config,
+                revision=str(model_config.revision or ""),
+                load_format=str(server_args.load_format),
+            )
+            if draft_model_config is not None:
+                draft_revision = l3_checkpoint_id(
+                    draft_model_config.model_path,
+                    hf_config=draft_model_config.hf_config,
+                    revision=str(draft_model_config.revision or ""),
                     load_format=str(server_args.load_format),
                 )
-                if draft_model_config is not None:
-                    draft_revision = l3_checkpoint_id(
-                        draft_model_config.model_path,
-                        hf_config=draft_model_config.hf_config,
-                        revision=str(draft_model_config.revision or ""),
-                        load_format=str(server_args.load_format),
-                    )
-                else:
-                    draft_revision = ""
             else:
-                checkpoint_id = ""
                 draft_revision = ""
 
-            def broadcast_checkpoint_ids(payload: list) -> list:
-                dist.broadcast_object_list(payload, src=0)
-                return payload
+            def gather_checkpoint_ids(payload: list) -> list:
+                gathered = [None] * world_size
+                dist.all_gather_object(gathered, payload)
+                return gathered
 
             checkpoint_id, draft_revision = share_l3_checkpoint_ids(
                 [checkpoint_id, draft_revision],
                 rank=rank,
                 world_size=world_size,
-                broadcast=broadcast_checkpoint_ids,
+                gather=gather_checkpoint_ids,
             )
             pipeline_rank = (
                 server_args.mapping.pp_rank if server_args.mapping.has_pp else 0

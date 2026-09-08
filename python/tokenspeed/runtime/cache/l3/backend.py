@@ -244,20 +244,48 @@ def share_l3_checkpoint_ids(
     *,
     rank: int,
     world_size: int,
-    broadcast: Callable[[list], list],
+    gather: Callable[[list], list],
 ) -> list[str]:
-    """Return ``ids`` from rank 0 so every worker hashes local weights once.
+    """Return one replica-wide identity from every rank's local checkpoint ids.
 
-    ``broadcast`` must implement a replica-wide object broadcast that
-    returns the source payload on every rank. When ``world_size`` is 1
-    the ids are returned unchanged and ``broadcast`` is not called.
+    Each rank fingerprints the files it can read. Rank-local
+    ``--load-format sharded_state`` directories hold only
+    ``model-rank-{rank}-part-*``, so replacing every rank with rank 0's
+    id would keep a Mooncake namespace after another shard changed.
+    ``gather`` must implement a replica-wide object all-gather that
+    returns one payload list per rank, in rank order. When
+    ``world_size`` is 1 the ids are returned unchanged and ``gather`` is
+    not called. When every rank reports the same ids, those ids are used
+    unchanged (a shared snapshot, or a directory that contains every
+    shard).
     """
 
     if world_size <= 1:
         return list(ids)
-    payload = list(ids) if rank == 0 else [None] * len(ids)
-    shared = broadcast(payload)
-    return [str(item) for item in shared]
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    gathered = gather(list(ids))
+    if not isinstance(gathered, list) or len(gathered) != world_size:
+        raise ValueError("L3 checkpoint gather must return one payload per rank")
+    slot_count = len(ids)
+    combined: list[str] = []
+    for slot in range(slot_count):
+        column: list[str] = []
+        for row in gathered:
+            if not isinstance(row, list) or len(row) != slot_count:
+                raise ValueError(
+                    "L3 checkpoint gather payload must match the local id list"
+                )
+            column.append(str(row[slot]))
+        combined.append(_combined_checkpoint_id(column))
+    return combined
+
+
+def _combined_checkpoint_id(column: list[str]) -> str:
+    if all(item == column[0] for item in column):
+        return column[0]
+    payload = json.dumps(column, separators=(",", ":"))
+    return "local-" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _snapshot_commit_hash(snapshot_path: str) -> str | None:
@@ -320,8 +348,9 @@ def _selected_weight_names(names: Sequence[str], *, load_format: str) -> frozens
     Pattern groups match ``DefaultModelLoader._prepare_weights``: the first
     group that matches any file wins, so ``auto`` hashes ``*.safetensors``
     when those exist and does not mix in leftover ``*.bin`` / ``*.pt``.
-    ``sharded_state`` hashes ``model-rank-*-part-*.safetensors`` (all ranks,
-    because rank 0 broadcasts the id) and falls back to ``*.safetensors``.
+    ``sharded_state`` hashes ``model-rank-*-part-*.safetensors`` (every
+    rank's local files; replica gather combines those digests) and falls
+    back to ``*.safetensors``.
     Unknown loaders raise rather than hashing metadata alone.
     """
 

@@ -638,44 +638,71 @@ class StorageKeyTest(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(digest.call_count, 2)
 
-    def test_share_l3_checkpoint_ids_broadcasts_from_rank_zero(self):
+    def test_share_l3_checkpoint_ids_combines_rank_local_digests(self):
         seen = []
 
-        def broadcast(payload):
-            seen.append(list(payload))
-            return ["shared-target", "shared-draft"]
+        def gather_from(rows):
+            def gather(payload):
+                seen.append(list(payload))
+                return rows
 
+            return gather
+
+        shared = ["local-aaa:sharded_state", ""]
         self.assertEqual(
             share_l3_checkpoint_ids(
-                ["local-a", "local-b"],
+                shared,
                 rank=0,
                 world_size=1,
-                broadcast=broadcast,
+                gather=gather_from([shared]),
             ),
-            ["local-a", "local-b"],
+            shared,
         )
         self.assertEqual(seen, [])
         self.assertEqual(
             share_l3_checkpoint_ids(
-                ["local-a", "local-b"],
-                rank=0,
-                world_size=8,
-                broadcast=broadcast,
+                shared,
+                rank=1,
+                world_size=2,
+                gather=gather_from([shared, shared]),
             ),
-            ["shared-target", "shared-draft"],
+            shared,
         )
-        self.assertEqual(seen, [["local-a", "local-b"]])
-        seen.clear()
-        self.assertEqual(
+        signature = inspect.signature(share_l3_checkpoint_ids)
+        self.assertIs(signature.parameters["gather"].default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
             share_l3_checkpoint_ids(
-                ["ignored", "ignored"],
-                rank=3,
-                world_size=8,
-                broadcast=broadcast,
-            ),
-            ["shared-target", "shared-draft"],
+                shared,
+                rank=0,
+                world_size=2,
+            )
+        rank0 = ["local-rank0:sharded_state", ""]
+        rank1_a = ["local-rank1a:sharded_state", ""]
+        rank1_b = ["local-rank1b:sharded_state", ""]
+        combined_a = share_l3_checkpoint_ids(
+            rank0,
+            rank=0,
+            world_size=2,
+            gather=gather_from([rank0, rank1_a]),
         )
-        self.assertEqual(seen, [[None, None]])
+        combined_b = share_l3_checkpoint_ids(
+            rank0,
+            rank=0,
+            world_size=2,
+            gather=gather_from([rank0, rank1_b]),
+        )
+        self.assertTrue(combined_a[0].startswith("local-"))
+        self.assertNotEqual(combined_a[0], rank0[0])
+        self.assertNotEqual(combined_a, combined_b)
+        self.assertEqual(combined_a[1], "")
+        self.assertEqual(combined_b[1], "")
+        with self.assertRaises(ValueError):
+            share_l3_checkpoint_ids(
+                rank0,
+                rank=0,
+                world_size=2,
+                gather=gather_from([rank0]),
+            )
 
     def test_checkpoint_id_rejects_unpinned_remote_without_commit(self) -> None:
         with self.assertRaises(ValueError):

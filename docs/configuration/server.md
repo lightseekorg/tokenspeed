@@ -328,7 +328,9 @@ config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
 `(models|datasets|spaces)--*/snapshots/<commit>` cache path with a sibling
 `refs` directory (a directory merely named `snapshots` is fingerprinted)
 — plus `--load-format` so a directory that contains
-more than one weight encoding cannot share objects across loaders, and
+more than one weight encoding cannot share objects across loaders
+(`sharded_state` combines every rank's local `model-rank-*-part-*`
+digest, not only rank 0's), and
 `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity
