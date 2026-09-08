@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # Prepare dataset
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
 pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
@@ -35,7 +38,6 @@ CONFIGS=(
     attn_tp4_moe_ep4
 )
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_PID=
 SERVER_LOG=
 
@@ -83,8 +85,8 @@ stop_server() {
 }
 
 wait_for_port_free() {
-    local port=${1:-8000}
-    local timeout=${2:-90}
+    local port=$1
+    local timeout=$2
     local start=$SECONDS
     while ! python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', $port)); s.close()" 2>/dev/null; do
         if (( SECONDS - start > timeout )); then
@@ -98,7 +100,7 @@ wait_for_port_free() {
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
 # Preflight: bail out if port 8000 is already in use
-wait_for_port_free 8000
+wait_for_port_free 8000 90
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
 SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
@@ -144,5 +146,5 @@ for CONFIG in "${CONFIGS[@]}"; do
         --no-timestamp
 
     stop_server
-    wait_for_port_free 8000
+    wait_for_port_free 8000 90
 done
