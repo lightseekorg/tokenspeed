@@ -28,9 +28,7 @@ Some constraints come with that:
 
 * The instruction needs 8 consecutive values along the scaled axis in one
   lane's consecutive registers, which an MFMA accumulator layout does not
-  provide. `scaled_downcast_layout()` names a layout that does; the tiles
-  convert into it, and a caller that owns its own tile layout should load
-  through the same helper so the conversion folds away.
+  provide. `scaled_downcast_layout()` names a layout that does.
 """
 
 from __future__ import annotations
@@ -46,9 +44,9 @@ def scaled_downcast_layout(block_m: int, block_n: int, num_warps: int) -> gl.con
     ``amdgpu.scaled_downcast_fp{4,8}`` requires every group of 8 consecutive
     values along the scaled axis to sit in one lane's consecutive registers and
     to share one E8M0 scale, so the tile must carry at least 8 -- here 16 --
-    values per lane along that axis. Callers that own their tile layout should
-    load through this so the conversion in :func:`_mxfp4_quantize_tile` and
-    :func:`_mxfp8_quantize_tile` folds away.
+    values per lane along that axis. Callers that own their tile layout can use
+    this layout with :func:`_mxfp4_quantize_tile_in_layout` to avoid a register
+    redistribution.
     """
     per_thread = min(16, block_n)
     lanes_n = max(1, min(8, block_n // per_thread))
@@ -63,22 +61,12 @@ def scaled_downcast_layout(block_m: int, block_n: int, num_warps: int) -> gl.con
 
 
 @gluon.jit
-def _mxfp4_quantize_tile(out):
-    """Quantize each contiguous 32-value group to packed E2M1 + UE8M0.
-
-    Returns the packed FP4 bytes (two values per byte along the last axis, so
-    half the input width) and one raw E8M0 scale byte per 32-value group.
-    """
-
-    BLOCK_M: gl.constexpr = out.shape[0]
-    OUT_BLOCK_N: gl.constexpr = out.shape[1]
+def _mxfp4_quantize_tile_impl(vals):
+    BLOCK_M: gl.constexpr = vals.shape[0]
+    OUT_BLOCK_N: gl.constexpr = vals.shape[1]
     Q_GROUPS: gl.constexpr = OUT_BLOCK_N // 32
     gl.static_assert(OUT_BLOCK_N % 32 == 0)
 
-    DOWNCAST_LAYOUT: gl.constexpr = scaled_downcast_layout(
-        BLOCK_M, OUT_BLOCK_N, gl.num_warps()
-    )
-    vals = gl.convert_layout(out.to(gl.bfloat16).to(gl.float32), DOWNCAST_LAYOUT)
     grouped = vals.reshape((BLOCK_M, Q_GROUPS, 32))
     amax = gl.max(gl.abs(grouped), axis=2, keep_dims=False)
     # Round amax up to a power of two, then back off two exponents so the
@@ -92,6 +80,25 @@ def _mxfp4_quantize_tile(out):
 
     packed = gl.amd.cdna4.scaled_downcast(vals, scale_byte, "e2m1", axis=1)
     return packed, scale_byte
+
+
+@gluon.jit
+def _mxfp4_quantize_tile_in_layout(out):
+    """Quantize an MXFP4 tile already satisfying the downcast layout contract."""
+
+    vals = out.to(gl.bfloat16).to(gl.float32)
+    return _mxfp4_quantize_tile_impl(vals)
+
+
+@gluon.jit
+def _mxfp4_quantize_tile(out):
+    """Relayout and quantize each contiguous 32-value group to MXFP4."""
+
+    DOWNCAST_LAYOUT: gl.constexpr = scaled_downcast_layout(
+        out.shape[0], out.shape[1], gl.num_warps()
+    )
+    vals = gl.convert_layout(out.to(gl.bfloat16).to(gl.float32), DOWNCAST_LAYOUT)
+    return _mxfp4_quantize_tile_impl(vals)
 
 
 @gluon.jit

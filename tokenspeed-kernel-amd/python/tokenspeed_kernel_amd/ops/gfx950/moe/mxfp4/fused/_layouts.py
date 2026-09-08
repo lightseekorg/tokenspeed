@@ -100,18 +100,52 @@ def _swiglu_split_layout(
     block_m: int, block_n_full: int, num_warps: int
 ) -> gl.constexpr:
     THREADS_PER_WARP = 64  # CDNA4 wavefront size.
-    # TODO: widening `size_per_thread` to `[1, 16]` would leave each half of
-    # the `gl.split` below with the 8 contiguous per-lane values that
-    # `quantize_gluon.scaled_downcast_layout()` requires, so the quantize
-    # tiles could drop their `convert_layout`.
-    # The same applies to the inline split layout in
-    # `prefill_stage1._apply_interleaved_gate_activation`.
     return gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[4, THREADS_PER_WARP // 4],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
+
+
+@gluon.constexpr_function
+def _mxfp4_swiglu_split_layout(
+    block_m: int, block_n_full: int, num_warps: int
+) -> gl.constexpr:
+    # Match the post-split tile to scaled_downcast_layout(). The interleaved
+    # accumulator holds two adjacent values for each output, so its contiguous
+    # register extent is twice the downcast extent.
+    out_block_n = block_n_full // 2
+    out_per_thread = min(16, out_block_n)
+    lanes_n = max(1, min(8, out_block_n // out_per_thread))
+    lanes_m = 64 // lanes_n
+    warps_m = max(1, min(num_warps, block_m // lanes_m))
+    return gl.BlockedLayout(
+        size_per_thread=[1, 2 * out_per_thread],
+        threads_per_warp=[lanes_m, lanes_n],
+        warps_per_cta=[warps_m, num_warps // warps_m],
+        order=[1, 0],
+    )
+
+
+@gluon.jit
+def _swiglu_reduce_with_layout(
+    acc,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
+    beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+    SPLIT_LAYOUT: gl.constexpr,
+):
+    BLOCK_M: gl.constexpr = acc.shape[0]
+    acc = gl.convert_layout(acc, SPLIT_LAYOUT)
+    reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
+    gate, linear = gl.split(reshaped)
+    if limit > 0.0:
+        gate = gl.minimum(gate, limit)
+        linear = gl.clamp(linear, -limit, limit)
+    s = gate / (1.0 + gl.exp(-alpha * gate))
+    return s * (linear + beta)
 
 
 @gluon.jit
@@ -121,21 +155,29 @@ def _swiglu_reduce(
     limit: gl.constexpr,
     beta: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
-    MMA: gl.constexpr,
 ):
-    BLOCK_M: gl.constexpr = acc.shape[0]
-    BLOCK_N_FULL: gl.constexpr = acc.shape[1]
     SPLIT_LAYOUT: gl.constexpr = _swiglu_split_layout(
-        BLOCK_M, BLOCK_N_FULL, gl.num_warps()
+        acc.shape[0], acc.shape[1], gl.num_warps()
     )
-    acc = gl.convert_layout(acc, SPLIT_LAYOUT)
-    reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
-    gate, linear = gl.split(reshaped)
-    if limit > 0.0:
-        gate = gl.minimum(gate, limit)
-        linear = gl.clamp(linear, -limit, limit)
-    s = gate / (1.0 + gl.exp(-alpha * gate))
-    return s * (linear + beta)
+    return _swiglu_reduce_with_layout(
+        acc, alpha, limit, beta, OUT_BLOCK_N, SPLIT_LAYOUT
+    )
+
+
+@gluon.jit
+def _mxfp4_swiglu_reduce(
+    acc,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
+    beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    SPLIT_LAYOUT: gl.constexpr = _mxfp4_swiglu_split_layout(
+        acc.shape[0], acc.shape[1], gl.num_warps()
+    )
+    return _swiglu_reduce_with_layout(
+        acc, alpha, limit, beta, OUT_BLOCK_N, SPLIT_LAYOUT
+    )
 
 
 @gluon.jit

@@ -32,8 +32,14 @@ if not is_cdna4():
 
 import tokenspeed_kernel  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (  # noqa: E402
+    _mxfp4_swiglu_reduce,
+    _swiglu_reduce,
+    get_mfma_layout,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
     _mxfp4_quantize_tile,
+    _mxfp4_quantize_tile_in_layout,
     _mxfp8_quantize_tile,
     quantize_mxfp8_sorted_routes,
     scaled_downcast_layout,
@@ -231,3 +237,119 @@ def test_quantize_tile_uses_hardware_scaled_downcast_gfx950(output_fp8: bool) ->
     amdgcn = compiled.asm["amdgcn"]
     suffix = "fp8" if output_fp8 else "fp4"
     assert f"v_cvt_scalef32_pk_{suffix}_f32" in amdgcn
+
+
+@gluon.jit
+def _swiglu_quantize_layout_probe_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N_FULL: gl.constexpr,
+    OPTIMIZED: gl.constexpr,
+):
+    """Quantize a SwiGLU tile through the reference or optimized layout path."""
+
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N_FULL // 2
+    acc_layout: gl.constexpr = get_mfma_layout(
+        gl.num_warps(),
+        True,
+        scale_preshuffle=False,
+        block_m=BLOCK_M,
+        w_via_vgpr=False,
+    )
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, acc_layout))
+    cols = gl.arange(0, BLOCK_N_FULL, layout=gl.SliceLayout(0, acc_layout))
+    acc = gl.load(x_ptr + rows[:, None] * BLOCK_N_FULL + cols[None, :]).to(gl.float32)
+    if OPTIMIZED:
+        activated = _mxfp4_swiglu_reduce(
+            acc,
+            1.0,
+            0.0,
+            0.0,
+            OUT_BLOCK_N,
+        )
+        quantized, scale_byte = _mxfp4_quantize_tile_in_layout(activated)
+    else:
+        activated = _swiglu_reduce(
+            acc,
+            1.0,
+            0.0,
+            0.0,
+            OUT_BLOCK_N,
+        )
+        quantized, scale_byte = _mxfp4_quantize_tile(activated)
+    quantized = quantized.reshape((BLOCK_M, OUT_BLOCK_N // 2))
+
+    out_layout: gl.constexpr = quantized.type.layout
+    out_rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_layout))
+    out_cols = gl.arange(0, OUT_BLOCK_N // 2, gl.SliceLayout(0, out_layout))
+    gl.store(
+        out_ptr + out_rows[:, None] * (OUT_BLOCK_N // 2) + out_cols[None, :],
+        quantized,
+    )
+
+    scale_layout: gl.constexpr = scale_byte.type.layout
+    scale_rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, scale_layout))
+    scale_cols = gl.arange(0, OUT_BLOCK_N // 32, gl.SliceLayout(0, scale_layout))
+    gl.store(
+        scale_ptr + scale_rows[:, None] * (OUT_BLOCK_N // 32) + scale_cols[None, :],
+        scale_byte,
+    )
+
+
+def _swiglu_quantize_layout_probe(
+    values: torch.Tensor,
+    *,
+    optimized: bool,
+    num_warps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    block_m, block_n_full = values.shape
+    out_block_n = block_n_full // 2
+    out = torch.empty(
+        (block_m, out_block_n // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    scales = torch.empty(
+        (block_m, out_block_n // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    _swiglu_quantize_layout_probe_kernel[(1,)](
+        values,
+        out,
+        scales,
+        BLOCK_M=block_m,
+        BLOCK_N_FULL=block_n_full,
+        OPTIMIZED=optimized,
+        num_warps=num_warps,
+    )
+    return out, scales
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_swiglu_quantize_layout_specialization_is_bit_exact_gfx950(
+    num_warps: int,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(161803)
+    values = torch.randn(
+        (64, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+
+    expected, expected_scales = _swiglu_quantize_layout_probe(
+        values,
+        optimized=False,
+        num_warps=num_warps,
+    )
+    actual, actual_scales = _swiglu_quantize_layout_probe(
+        values,
+        optimized=True,
+        num_warps=num_warps,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=0)
