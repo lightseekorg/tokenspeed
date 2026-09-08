@@ -321,10 +321,8 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(op_ids, [7])
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
-    def test_writeback_reuses_static_geometry_on_the_caller_stream(self):
-        executor_module = self._executor_module()
+    def _make_write_executor(self, executor_module):
         L2CacheExecutor = executor_module.L2CacheExecutor
-
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
@@ -334,24 +332,34 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.transfer_backend = "auto"
         executor._write_acks = []
-        executor._write_workspace = Mock()
-        executor._write_metadata_done = None
-        executor._write_workspace.load_block_transfers.return_value = (1, (0, 1))
-        executor._write_workspace.prepare_backend.return_value = SimpleNamespace(
-            uses_device_tables=True,
-        )
+        executor.write_stream = Mock(name="write_stream")
+        for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
+            lane = SimpleNamespace(workspace=Mock(), metadata_done=None)
+            lane.workspace.load_block_transfers.return_value = (1, (0, 1))
+            lane.workspace.prepare_backend.return_value = SimpleNamespace(
+                uses_device_tables=True,
+            )
+            setattr(executor, lane_name, lane)
         executor._transfer_geometry = SimpleNamespace(
             device_rows=object(),
             layer_slices=((0, 2), (2, 1)),
             num_field_rows=3,
         )
-        stream = object()
+        return executor, device
+
+    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
+        executor_module = self._executor_module()
+        executor, device = self._make_write_executor(executor_module)
+        lane = executor._pinned_write_lane
+        caller_stream = object()
         finish = Mock()
         metadata_done = Mock()
 
         with (
             patch.object(
-                executor_module.device_module, "current_stream", return_value=stream
+                executor_module.device_module,
+                "current_stream",
+                return_value=caller_stream,
             ),
             patch.object(
                 executor_module.device_module,
@@ -360,15 +368,18 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
-            executor._start_writing([7], [(0, 5, 9)])
+            fence = executor._start_writing([7], [(0, 5, 9)], lane=lane)
 
-        # On the CALLER's current stream: the copy must read the source pages
-        # before anything later in the plan (zeroing, the granted request's
-        # writes) can touch them, and the single-stream FIFO is that fence.
-        executor._write_workspace.load_block_transfers.assert_called_once_with(
+        # On the write stream, ordered after the caller's stream (which the
+        # caller ordered behind the forwards that wrote the pages). The
+        # completion event is handed back so a stream-ordered submission can
+        # fence the caller on it; a pinned one simply drops it.
+        self.assertIs(fence, finish)
+        executor.write_stream.wait_stream.assert_called_once_with(caller_stream)
+        lane.workspace.load_block_transfers.assert_called_once_with(
             [(0, 5, 9)], geometry=executor._transfer_geometry
         )
-        executor._write_workspace.commit_block_transfers.assert_called_once_with(
+        lane.workspace.commit_block_transfers.assert_called_once_with(
             1, device, non_blocking=True
         )
         transfer.assert_called_once_with(
@@ -376,8 +387,8 @@ class GroupAwareWireTest(unittest.TestCase):
             executor.layout.buffers,
             executor.host_storage.host_buffer,
             executor._transfer_geometry,
-            executor._write_workspace,
-            stream,
+            lane.workspace,
+            executor.write_stream,
             num_blocks=1,
             geometry_offset=0,
             num_geometry_rows=3,
@@ -385,9 +396,10 @@ class GroupAwareWireTest(unittest.TestCase):
             grid_cap=None,
             layer_ready_flags=None,
         )
-        finish.record.assert_called_once_with(stream)
-        metadata_done.record.assert_called_once_with(stream)
+        finish.record.assert_called_once_with(executor.write_stream)
+        metadata_done.record.assert_called_once_with(executor.write_stream)
         metadata_done.synchronize.assert_not_called()
+        self.assertIsNone(executor._ordered_write_lane.metadata_done)
 
         # Refill must wait for metadata, but must never wait for payload ACK.
         for ready in (False, True):
@@ -396,18 +408,14 @@ class GroupAwareWireTest(unittest.TestCase):
                 metadata_done.query.return_value = ready
                 order = Mock()
                 order.attach_mock(metadata_done.synchronize, "retire")
-                order.attach_mock(
-                    executor._write_workspace.load_block_transfers, "refill"
-                )
-                order.attach_mock(
-                    executor._write_workspace.commit_block_transfers, "upload"
-                )
+                order.attach_mock(lane.workspace.load_block_transfers, "refill")
+                order.attach_mock(lane.workspace.commit_block_transfers, "upload")
                 order.attach_mock(metadata_done.record, "record")
                 with (
                     patch.object(
                         executor_module.device_module,
                         "current_stream",
-                        return_value=stream,
+                        return_value=caller_stream,
                     ),
                     patch.object(
                         executor_module.device_module, "Event", return_value=finish
@@ -415,7 +423,7 @@ class GroupAwareWireTest(unittest.TestCase):
                     patch.object(executor_module, "transfer_cache_blocks") as transfer,
                 ):
                     order.attach_mock(transfer, "payload")
-                    executor._start_writing([8], [(0, 6, 10)])
+                    executor._start_writing([8], [(0, 6, 10)], lane=lane)
                 names = [call[0] for call in order.mock_calls]
                 self.assertEqual(
                     names,
@@ -423,6 +431,116 @@ class GroupAwareWireTest(unittest.TestCase):
                     + ["refill", "upload", "record", "payload"],
                 )
                 finish.synchronize.assert_not_called()
+
+    def test_submit_write_backs_fences_only_stream_ordered_ops(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+        caller_stream = Mock(name="caller_stream")
+        ordered_finish = Mock(name="ordered_finish")
+        pinned_finish = Mock(name="pinned_finish")
+        events = iter(
+            [
+                Mock(name="ordered_meta"),
+                ordered_finish,
+                Mock(name="pinned_meta"),
+                pinned_finish,
+            ]
+        )
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12, 13]
+                self.group_ids = [[0], [0], [0]]
+                self.src_pages = [[1], [2], [3]]
+                self.dst_pages = [[5], [6], [7]]
+                self.source_pinned = [True, False, True]
+
+        with (
+            patch.object(
+                executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+            ),
+            patch.object(
+                executor_module.device_module,
+                "current_stream",
+                return_value=caller_stream,
+            ),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                side_effect=lambda: next(events),
+            ),
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
+        ):
+            executor.submit_write_backs(SimpleNamespace(cache=[WriteBackOp()]))
+
+        # The stream-ordered op (12) launches first and the caller's stream
+        # waits on ITS completion only; the pinned ops (11, 13) follow on the
+        # write stream and fence nothing -- the scheduler holds their sources.
+        ordered_lane = executor._ordered_write_lane
+        pinned_lane = executor._pinned_write_lane
+        ordered_lane.workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 6)], geometry=executor._transfer_geometry
+        )
+        pinned_lane.workspace.load_block_transfers.assert_called_once_with(
+            [(0, 1, 5), (0, 3, 7)], geometry=executor._transfer_geometry
+        )
+        self.assertEqual(
+            [call.args[4] for call in transfer.call_args_list],
+            [ordered_lane.workspace, pinned_lane.workspace],
+        )
+        caller_stream.wait_event.assert_called_once_with(ordered_finish)
+        self.assertEqual(
+            [(ack.finish_event, ack.op_ids) for ack in executor._write_acks],
+            [(ordered_finish, [12]), (pinned_finish, [11, 13])],
+        )
+
+    def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+        caller_stream = Mock(name="caller_stream")
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11]
+                self.group_ids = [[0]]
+                self.src_pages = [[1]]
+                self.dst_pages = [[5]]
+                self.source_pinned = [True]
+
+        with (
+            patch.object(
+                executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+            ),
+            patch.object(
+                executor_module.device_module,
+                "current_stream",
+                return_value=caller_stream,
+            ),
+            patch.object(executor_module.device_module, "Event", side_effect=Mock),
+            patch.object(executor_module, "transfer_cache_blocks"),
+        ):
+            executor.submit_write_backs(SimpleNamespace(cache=[WriteBackOp()]))
+
+        caller_stream.wait_event.assert_not_called()
+        executor._ordered_write_lane.workspace.load_block_transfers.assert_not_called()
+
+    def test_submit_write_backs_rejects_ragged_guard_vector(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12]
+                self.group_ids = [[0], [0]]
+                self.src_pages = [[1], [2]]
+                self.dst_pages = [[5], [6]]
+                self.source_pinned = [True]
+
+        with patch.object(
+            executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+        ):
+            with self.assertRaises(ValueError):
+                executor.submit_write_backs(SimpleNamespace(cache=[WriteBackOp()]))
 
     def test_loadback_logs_non_empty_batch(self):
         executor_module, executor, _, geometry, workspace = self._make_load_executor(
@@ -1010,8 +1128,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
+            lane=executor._pinned_write_lane,  # pylint: disable=protected-access
         )
-        torch.cuda.current_stream().synchronize()
+        executor.write_stream.synchronize()
         write_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in write_results], [7])
 
@@ -1052,10 +1171,17 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         executor, pool, _ = self._make_executor(layout, io_backend="kernel")
         for generation in range(3):
             # Reuse one Device source, but preserve each batch in its own Host
-            # block. No caller synchronization between write submissions.
+            # block. No caller synchronization between write submissions; the
+            # write stream inherits the caller's order, so each copy reads the
+            # fill that preceded it.
             for block in range(1, 4):
                 device[16:20].fill_(generation * 16 + block)
-                executor._start_writing([block], [(0, 1, block)])
+                executor._start_writing(
+                    [block], [(0, 1, block)], lane=executor._pinned_write_lane
+                )
+            # The load below has no scheduler ACK to wait for, so order it
+            # behind the copies the way a stream-ordered submission would.
+            torch.cuda.current_stream().wait_stream(executor.write_stream)
             device.fill_(0xEE)
             load_index = executor._start_loading(
                 [9], [(0, block, block) for block in range(1, 4)]
@@ -1090,7 +1216,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         device[16:20].fill_(0x11)
         device[56:60].fill_(0x12)
         torch.cuda.synchronize()
-        executor._start_writing([7], [(0, 1, 1)])  # pylint: disable=protected-access
+        executor._start_writing(  # pylint: disable=protected-access
+            [7], [(0, 1, 1)], lane=executor._pinned_write_lane
+        )
         torch.cuda.synchronize()
         self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
 

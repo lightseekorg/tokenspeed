@@ -447,7 +447,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
-        if (auto store = tier_transfers_.StartPendingStores()) {
+        // Boundary publications of live requests: their owners hold the pages,
+        // and the ticket pins them until the ACK, so the copy stays off the
+        // forward's critical path.
+        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

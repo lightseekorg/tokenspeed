@@ -266,7 +266,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages)
+        .def_ro("source_pinned", &tokenspeed::WriteBackBatch::source_pinned);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
