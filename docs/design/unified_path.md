@@ -344,60 +344,24 @@ wrapper). A new leaf goes under `paged/`, a new recurrent family under
 router, paged leaves and execution-owned indexer state cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
-Shared state-copy geometry belongs in `backends/state/utils.py`:
-`row_stride_i32` validates each row's contiguous payload and converts its
-physical stride, including inter-row padding, to the int32 units required
-by `copy_state_rows`. Both Mamba/GDN and PLE import it directly instead of
-depending on a backend-private helper.
+QSA uses the ordinary router and an MHA-derived leaf. Its indexer layout
+comes from `router.group_view` and full-KV metadata, and stays in
+`SparseTopKShare` with the existing forward and MTP reuse boundaries.
 
-QSA follows the ordinary router + leaf path. Its registered paged leaf
-inherits MHA's metadata refresh and capture. `attention/qsa/metadata.py`
-derives the indexer's layer-shared layout from `router.group_view(gid, bs)`
-and the full-KV leaf's live metadata. It never builds another block-table
-route. The per-forward layout stays in `SparseTopKShare`, retaining the
-router/drafter invalidation and MTP reuse boundaries.
-The leaf requires explicit `ctx` and `topk_indices` arguments; only an
-explicit `topk_indices=None` selects its dense MHA path. The router currently
-creates leaves for the indexer-only compressed/recent groups too: their
-geometry supplies the shared table stacks, even though no `PagedAttention`
-layer dispatches to them. Removing their unused attention graph buffers
-requires separating table specifications from compute-leaf construction.
+Execution owns a separate `QSAIndexerRuntime` for each target/draft cache
+view. Every `ForwardContext.indexer_runtime` borrows the matching runtime
+(`None` without QSA); Tensor workspace stays on the runtime. Indexers read
+this reference directly, with no model binding.
 
-`attention/qsa/runtime.py::QSAIndexerRuntime` owns target-verify staging and
-batched commit. Attention-component assembly creates one independent runtime
-per applicable target/draft cache view, binds its cache plan and budgets and
-preallocates its workspace before capture. The device builder passes both
-runtimes to execution. Every `ForwardContext` explicitly carries the runtime
-for its cache view (`None` for a side without QSA), including eager, idle,
-warmup, decode capture, prefill capture and draft forwards. Indexers obtain
-it from `ctx.indexer_runtime`; model construction needs no runtime binding
-or module traversal. Owned layers, field shapes and commit addresses come
-exclusively from the bound cache plan. Every forward takes views of one
-capacity-sized workspace, without allocating a second staging buffer.
+`SpeculativeState` participants are fixed at startup. `ForwardStepRunner`
+commits each target participant once after eager forward or graph replay,
+excluding leading extend requests in mixed batches. Draft runtimes do not
+participate in target commits; the attention backend tree does not dispatch
+these lifecycle calls.
 
-Like `attn_backend` and `token_to_kv_pool`, `indexer_runtime` is a borrowed
-reference to a long-lived subsystem. `ForwardContext` does not own its
-workspace or carry per-forward Tensor payloads: QSA row layouts and top-k
-remain in the backend's `SparseTopKShare`, and verify staging stays in the
-preallocated runtime. The target context references the same runtime that
-the executor commits; draft contexts reference their own side's runtime.
-
-Verification state follows `execution/speculative_state.py::SpeculativeState`,
-independently of the attention backend tree. The executor assembles a fixed
-tuple of target verification participants at construction and passes it to
-`ForwardStepRunner`. After eager execution or graph replay produces the live
-acceptance lengths, the runner commits each participant once, passing the
-leading extend count for mixed batches. Draft runtimes are separate and are
-not target-acceptance participants. No callback registration happens during
-forward. Paged leaves and the router neither construct nor hold an indexer
-runtime, allocate its workspace, or forward verification results.
-
-PLE's batched state commit preallocates source/destination row ids for
-`max_decode_bs * num_ple_layers` entries alongside its verify scratch. Each
-batch uses a contiguous prefix of those flat buffers, with no per-batch
-allocation or retained storage buckets. The cache recipe reserves these
-row-id bytes before sizing the arena, and workspace setup checks that the
-allocation matches the reservation.
+QSA verify staging and PLE commit-row buffers are preallocated for full
+decode capacity and sliced per batch. Cache recipes reserve their bytes
+before sizing the arena.
 
 ## One block-table route: router + leaves
 
