@@ -187,34 +187,18 @@ class KimiK3AttnResKernelConfig:
     """Kimi-K3 fused attention-TP all-reduce and AttnRes contract."""
 
     hidden_size: int
-    max_profitable_tokens_by_world_size: tuple[tuple[int, int], ...]
     num_subgroups: int
     elements_per_thread: int
     input_slots: int
 
     def __post_init__(self) -> None:
-        world_sizes = tuple(
-            world_size for world_size, _ in self.max_profitable_tokens_by_world_size
-        )
         if (
             self.hidden_size <= 0
-            or not world_sizes
-            or len(set(world_sizes)) != len(world_sizes)
-            or any(
-                world_size <= 1 or max_tokens <= 0
-                for world_size, max_tokens in self.max_profitable_tokens_by_world_size
-            )
             or self.num_subgroups <= 0
             or self.elements_per_thread <= 0
             or self.input_slots < 2
         ):
             raise ValueError("invalid Kimi-K3 AttnRes Iris kernel configuration")
-
-    def max_profitable_num_tokens(self, world_size: int) -> int:
-        return dict(self.max_profitable_tokens_by_world_size).get(world_size, 0)
-
-    def supports_world_size(self, world_size: int) -> bool:
-        return self.max_profitable_num_tokens(world_size) > 0
 
 
 @dataclass(frozen=True)
@@ -258,7 +242,6 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
     ),
     kimi_k3_attnres=KimiK3AttnResKernelConfig(
         hidden_size=7168,
-        max_profitable_tokens_by_world_size=((8, 16),),
         num_subgroups=4,
         elements_per_thread=1,
         input_slots=2,
@@ -1024,7 +1007,7 @@ class IrisAllReduce(object):
             op = dist.ReduceOp.SUM
         assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
         kernel_config = self._kernel_config.kimi_k3_attnres
-        assert _platform.is_cdna4 and kernel_config.supports_world_size(self.world_size)
+        assert _platform.is_cdna4 and self.world_size == 8
         num_tokens = partial.shape[0]
         assert 0 < num_tokens <= self.attnres_max_rows
         expected_shape = (num_tokens, kernel_config.hidden_size)

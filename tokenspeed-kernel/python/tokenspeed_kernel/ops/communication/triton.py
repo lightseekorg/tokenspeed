@@ -2101,9 +2101,9 @@ def _all_reduce_residual_attnres_can_run(
     kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
     num_tokens = partial.shape[0] if partial.ndim == 2 else 0
     return (
-        kernel_config.supports_world_size(state.world_size)
+        state.world_size == 8
         and op == torch.distributed.ReduceOp.SUM
-        and 0 < num_tokens <= kernel_config.max_profitable_num_tokens(state.world_size)
+        and 0 < num_tokens <= 16
         and num_tokens <= state.max_token_num
         and partial.shape == residual.shape == (num_tokens, kernel_config.hidden_size)
         and score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)

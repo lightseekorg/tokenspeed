@@ -22,7 +22,6 @@
 import socket
 import sys
 import traceback
-from dataclasses import replace
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -100,57 +99,6 @@ def test_iris_state_uses_protocol_capacities(monkeypatch):
     assert iris_state.attnres_max_rows == 5
     assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
     assert len(created) == 1
-
-
-def test_attnres_admission_uses_kernel_config(monkeypatch):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    attnres_config = iris_ops.KimiK3AttnResKernelConfig(
-        hidden_size=11,
-        max_profitable_tokens_by_world_size=((2, 3),),
-        num_subgroups=1,
-        elements_per_thread=1,
-        input_slots=2,
-    )
-    kernel_config = replace(
-        iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG,
-        kimi_k3_attnres=attnres_config,
-    )
-    monkeypatch.setattr(
-        iris_ops,
-        "IRIS_ALL_REDUCE_KERNEL_CONFIG",
-        kernel_config,
-    )
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-
-    partial = torch.empty((3, 11), dtype=torch.bfloat16)
-    residual = torch.empty_like(partial)
-    weight = torch.empty((11,), dtype=torch.bfloat16)
-    scratch = (
-        torch.empty((3,), dtype=torch.float32),
-        torch.empty((3,), dtype=torch.float32),
-        torch.empty((3, 11), dtype=torch.float32),
-    )
-    state = SimpleNamespace(
-        world_size=2,
-        device=partial.device,
-        attnres_max_numel=partial.numel(),
-        max_token_num=3,
-    )
-
-    assert triton_ops._all_reduce_residual_attnres_can_run(
-        state,
-        partial,
-        residual,
-        weight,
-        weight,
-        scratch,
-    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -446,7 +394,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
             for shapes in output_shape_cases
         )
-        attnres_max_rows = attnres_config.max_profitable_num_tokens(world_size)
+        attnres_max_rows = 16 if world_size == 8 else 0
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
@@ -540,7 +488,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 ((16, 7168), (16, 3584)),
                 device,
             )
-        if attnres_config.supports_world_size(world_size):
+        if world_size == 8:
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
         dist.destroy_process_group()
@@ -644,7 +592,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
     )
 
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
-    max_tokens = config.max_profitable_num_tokens(state.world_size)
+    max_tokens = 16
     num_token_cases = []
     num_tokens = 1
     while num_tokens <= max_tokens:
