@@ -105,6 +105,7 @@ class RequestState:
         self.cached_tokens: int = 0
         self.prefix_len: int = 0
         self.spec_verify_ct: int = 0
+        self.spec_accepted_tokens: int = 0
         self.accept_draft_tokens: float | None = None
 
         # request stats (host-side); tracker attached only with --enable-log-request-stats
@@ -592,8 +593,6 @@ class OutputProcesser:
     ) -> None:
         if not self.metrics.enabled:
             return
-        if forward_op.num_extends() > 0:
-            return
         if self.spec_algorithm is None or self.spec_num_tokens is None:
             return
         if model_execution_results.output_lengths is None:
@@ -776,6 +775,9 @@ class OutputProcesser:
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
+                # Same accounting as MetricsCollector.record_spec_decode_step:
+                # one bonus token per verify step, the rest are accepted drafts.
+                request_state.spec_accepted_tokens += max(0, int(output_length) - 1)
                 self._check_physical_extent(rid, request_state, output_length)
 
             # With the capturable grammar pipeline the matcher is
@@ -1021,6 +1023,7 @@ class OutputProcesser:
         completion_tokens: list[int] = []
         cached_tokens: list[int] = []
         spec_verify_ct: list[int] = []
+        spec_accepted_tokens: list[int] = []
         batch_accept_draft_tokens: list[float] = []
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
@@ -1086,6 +1089,7 @@ class OutputProcesser:
 
             if self.spec_algorithm is not None:
                 spec_verify_ct.append(rs.spec_verify_ct)
+                spec_accepted_tokens.append(rs.spec_accepted_tokens)
                 batch_accept_draft_tokens.append(rs.accept_draft_tokens)
 
             output_extra_infos.append({"decode_prefix_len": rs.prefix_len})
@@ -1123,6 +1127,7 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
+            spec_accepted_tokens=spec_accepted_tokens,
             input_token_logprobs_val=[],
             input_token_logprobs_idx=[],
             output_token_logprobs_val=output_token_logprobs_val,

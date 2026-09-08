@@ -303,7 +303,13 @@ class OutputProcessor:
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.engine.server_args.speculative_algorithm:
-                    meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                    verify_ct = recv_obj.spec_verify_ct[i]
+                    meta_info["spec_verify_ct"] = verify_ct
+                    accepted = getattr(recv_obj, "spec_accepted_tokens", None)
+                    if accepted and i < len(accepted):
+                        width = self.engine.server_args.speculative_num_draft_tokens
+                        meta_info["spec_accepted_tokens"] = accepted[i]
+                        meta_info["spec_draft_tokens"] = verify_ct * width
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
