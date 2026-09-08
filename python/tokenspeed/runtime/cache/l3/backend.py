@@ -34,6 +34,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+_HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
 _CHECKPOINT_METADATA_FILES = (
     "config.json",
     "hf_quant_config.json",
@@ -189,23 +190,23 @@ def l3_checkpoint_id(
 
     ``--revision`` may be a moving branch or omitted. Two instances that
     resolve different commits (or local trees) must not share Mooncake
-    keys.     A local directory is identified from a Hugging Face
-    ``snapshots/<commit>`` path or a fingerprint of the weight files
-    ``--load-format`` actually
-    selects — never from ``hf_config._commit_hash``, which a copied or
-    fine-tuned tree can inherit from its source, and never from a
-    40-character hex basename outside that snapshot layout. Local fingerprints also
-    hash ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
-    quantization cannot collide under identical weight bytes, and top-level
-    ``*.py`` so ``--trust-remote-code`` configuration/modeling modules that
-    derive architecture fields cannot share a namespace with identical
-    JSON/weights. Hugging Face
-    hub ids still prefer the
+    keys. A local directory is identified from a Hugging Face hub cache
+    snapshot (``.../(models|datasets|spaces)--<repo>/snapshots/<commit>``
+    with a sibling ``refs`` directory) or a fingerprint of the weight
+    files ``--load-format`` actually selects — never from
+    ``hf_config._commit_hash``, which a copied or fine-tuned tree can
+    inherit from its source, and never from a 40-character hex basename
+    or a folder merely named ``snapshots``. Local fingerprints also hash
+    ``hf_quant_config.json`` so ModelOpt mixed-precision maps and KV
+    quantization cannot collide under identical weight bytes, and
+    top-level ``*.py`` so ``--trust-remote-code`` configuration/modeling
+    modules that derive architecture fields cannot share a namespace
+    with identical JSON/weights. Hugging Face hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
-    pinned ``--revision``. The returned id always includes the normalized
-    load format so two deployments that share a directory (or commit)
-    but select different ``.safetensors`` / ``.bin`` / ``.pt`` sets
-    cannot restore each other's KV.
+    pinned ``--revision``. The returned id always includes the
+    normalized load format so two deployments that share a directory
+    (or commit) but select different ``.safetensors`` / ``.bin`` /
+    ``.pt`` sets cannot restore each other's KV.
     """
 
     fmt = _normalize_load_format(load_format)
@@ -259,18 +260,26 @@ def share_l3_checkpoint_ids(
 
 
 def _snapshot_commit_hash(snapshot_path: str) -> str | None:
-    """Return the commit only for a Hugging Face ``snapshots/<hash>`` path.
+    """Return the commit only for a Hugging Face hub cache snapshot path.
 
-    A 40-character hex basename is not enough: a copied or fine-tuned
-    local tree can keep that folder name while holding different bytes.
+    The layout is ``.../(models|datasets|spaces)--<repo>/snapshots/<40-hex>``
+    with a sibling ``refs`` directory. A 40-character hex basename is not
+    enough, and neither is a folder merely named ``snapshots``: a copied
+    or fine-tuned tree such as ``/models/snapshots/<hash>`` can keep
+    those names while holding different bytes.
     """
 
     normalized = os.path.normpath(snapshot_path)
     candidate = os.path.basename(normalized)
     if not _HF_COMMIT_HASH_RE.fullmatch(candidate):
         return None
-    parent = os.path.basename(os.path.dirname(normalized))
-    if parent != "snapshots":
+    snapshot_dir = os.path.dirname(normalized)
+    if os.path.basename(snapshot_dir) != "snapshots":
+        return None
+    repo_dir = os.path.dirname(snapshot_dir)
+    if not _HF_HUB_REPO_DIR_RE.fullmatch(os.path.basename(repo_dir)):
+        return None
+    if not os.path.isdir(os.path.join(repo_dir, "refs")):
         return None
     return candidate
 

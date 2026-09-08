@@ -189,7 +189,9 @@ class StorageKeyTest(unittest.TestCase):
     def test_checkpoint_id_uses_snapshot_directory_commit(self):
         commit = "c" * 40
         with tempfile.TemporaryDirectory() as root:
-            snapshot = os.path.join(root, "snapshots", commit)
+            repo = os.path.join(root, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
             with open(os.path.join(snapshot, "config.json"), "w") as handle:
                 handle.write("{}")
@@ -202,6 +204,54 @@ class StorageKeyTest(unittest.TestCase):
                 ),
                 f"{commit}:safetensors",
             )
+
+    def test_checkpoint_id_does_not_trust_hub_snapshots_without_refs(self):
+        commit = "f" * 40
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write('{"model_type":"x"}')
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"aaa")
+            checkpoint_id = self._checkpoint_id(
+                snapshot,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertTrue(checkpoint_id.startswith("local-"))
+            self.assertNotEqual(checkpoint_id, f"{commit}:auto")
+
+    def test_checkpoint_id_does_not_trust_snapshots_dir_outside_hf_hub_cache(self):
+        commit = "e" * 40
+        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+            first = os.path.join(first_root, "models", "snapshots", commit)
+            second = os.path.join(second_root, "models", "snapshots", commit)
+            os.makedirs(first)
+            os.makedirs(second)
+            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(payload)
+            first_id = self._checkpoint_id(
+                first,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            second_id = self._checkpoint_id(
+                second,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            self.assertTrue(first_id.startswith("local-"))
+            self.assertTrue(second_id.startswith("local-"))
+            self.assertNotEqual(first_id, second_id)
+            self.assertNotEqual(first_id, f"{commit}:auto")
 
     def test_checkpoint_id_fingerprints_local_weight_bytes(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:

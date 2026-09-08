@@ -430,10 +430,15 @@ Its responsibilities:
   (`attn.tp_size`), and the speculative
   draft checkpoint when a separate draft pool is present. An unpinned
   Hugging Face branch or local path is identified from a Hugging Face
-  `snapshots/<commit>` directory or fingerprinted from the contents of
-  the local checkpoint actually loaded. A copied config's inherited
-  `_commit_hash` is not trusted, and a 40-character hex folder name
-  outside that snapshot layout is not treated as a commit. Local
+  hub cache snapshot
+  (`hub/.../(models|datasets|spaces)--<repo>/snapshots/<commit>` with a
+  sibling `refs` directory) or fingerprinted from the contents of the
+  local checkpoint actually loaded. A copied config's inherited
+  `_commit_hash` is not trusted. A 40-character hex folder whose parent
+  is named `snapshots` is not treated as a commit unless that hub layout
+  is present, so two hosts cannot share an L3 namespace from
+  `/models/snapshots/<same-hash>` while serving different fine-tuned
+  bytes. Local
   fingerprints include `hf_quant_config.json` (ModelOpt
   mixed-precision maps and KV quantization live there, not in the
   weight tensors), top-level `*.py` (`--trust-remote-code` configuration
