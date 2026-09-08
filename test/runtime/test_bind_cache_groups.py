@@ -34,7 +34,7 @@ FULL = "full_attention"
 SWA = "sliding_attention"
 
 
-def _spec(group_id, retention, sliding_window_tokens=None):
+def _spec(group_id, retention, sliding_window_tokens):
     return SimpleNamespace(
         group_id=group_id,
         retention=retention,
@@ -50,7 +50,7 @@ def _pool(group_by_layer, specs):
     )
 
 
-def _layer(layer_id, sliding_window_size=-1):
+def _layer(layer_id, sliding_window_size):
     return PagedAttention(
         num_heads=1,
         head_dim=4,
@@ -69,44 +69,65 @@ class _Model(nn.Module):
 
 class PagedAttentionStorageStateTest(unittest.TestCase):
     def test_group_id_is_unbound_until_bound(self):
-        layer = _layer(0)
+        layer = _layer(0, sliding_window_size=-1)
         with self.assertRaisesRegex(RuntimeError, "no cache group bound"):
             layer.group_id
         layer.bind_cache_group(FULL)
         self.assertEqual(layer.group_id, FULL)
 
     def test_rebinding_to_another_group_is_a_bug(self):
-        layer = _layer(0)
+        layer = _layer(0, sliding_window_size=-1)
         layer.bind_cache_group(FULL)
         layer.bind_cache_group(FULL)  # idempotent
         with self.assertRaisesRegex(ValueError, "cannot rebind"):
             layer.bind_cache_group(SWA)
         with self.assertRaisesRegex(ValueError, "nonempty"):
-            _layer(1).bind_cache_group("")
+            _layer(1, sliding_window_size=-1).bind_cache_group("")
 
     def test_hf_window_counts_the_current_token(self):
         self.assertEqual(hf_sliding_window_to_window_left(1024), 1023)
 
+    def test_zero_window_left_is_a_window_not_full_attention(self):
+        # HF sliding_window=1 sees the current token only; the layer must keep
+        # that 0 rather than fold it into -1 by truthiness.
+        layer = _layer(0, sliding_window_size=hf_sliding_window_to_window_left(1))
+        self.assertEqual(layer.sliding_window_size, 0)
+        bind_cache_groups(
+            _Model(layer), _pool({0: SWA}, (_spec(SWA, "sliding_window", 1),))
+        )
+        self.assertEqual(layer.group_id, SWA)
+
+    def test_window_left_must_be_an_int_at_or_above_minus_one(self):
+        for bad in (None, -2):
+            with self.assertRaisesRegex(ValueError, "sliding_window_size"):
+                _layer(0, sliding_window_size=bad)
+
 
 class BindCacheGroupsTest(unittest.TestCase):
     def test_binds_each_layer_from_the_plan(self):
-        model = _Model(_layer(0), _layer(1, sliding_window_size=127))
+        model = _Model(
+            _layer(0, sliding_window_size=-1), _layer(1, sliding_window_size=127)
+        )
         bind_cache_groups(
             model,
             _pool(
                 {0: FULL, 1: SWA},
-                (_spec(FULL, "full_history"), _spec(SWA, "sliding_window", 128)),
+                (_spec(FULL, "full_history", None), _spec(SWA, "sliding_window", 128)),
             ),
         )
         self.assertEqual([m.group_id for m in model.attns], [FULL, SWA])
 
     def test_layer_missing_from_the_plan_raises(self):
-        model = _Model(_layer(0), _layer(3))
+        model = _Model(
+            _layer(0, sliding_window_size=-1), _layer(3, sliding_window_size=-1)
+        )
         with self.assertRaisesRegex(ValueError, r"layer_id=3.*no history-family"):
-            bind_cache_groups(model, _pool({0: FULL}, (_spec(FULL, "full_history"),)))
+            bind_cache_groups(
+                model, _pool({0: FULL}, (_spec(FULL, "full_history", None),))
+            )
 
     def test_full_visibility_cannot_ride_a_sliding_group(self):
-        model = _Model(_layer(0))
+        model = _Model(_layer(0, sliding_window_size=-1))
         with self.assertRaisesRegex(ValueError, "sees the full history"):
             bind_cache_groups(
                 model, _pool({0: SWA}, (_spec(SWA, "sliding_window", 128),))
@@ -123,7 +144,7 @@ class BindCacheGroupsTest(unittest.TestCase):
     def test_sliding_mask_on_a_full_group_is_fine(self):
         # A block drafter: sliding compute mask, full-history storage.
         model = _Model(_layer(0, sliding_window_size=1023))
-        bind_cache_groups(model, _pool({0: FULL}, (_spec(FULL, "full_history"),)))
+        bind_cache_groups(model, _pool({0: FULL}, (_spec(FULL, "full_history", None),)))
         self.assertEqual(model.attns[0].group_id, FULL)
 
 
@@ -136,7 +157,7 @@ class BlockDrafterStorageTest(unittest.TestCase):
     def test_shares_the_targets_full_history_group(self):
         target = _pool(
             {0: FULL, 1: SWA},
-            (_spec(FULL, "full_history"), _spec(SWA, "sliding_window", 128)),
+            (_spec(FULL, "full_history", None), _spec(SWA, "sliding_window", 128)),
         )
         check_block_drafter_storage(self._bound_draft(FULL), target)
 
@@ -145,7 +166,7 @@ class BlockDrafterStorageTest(unittest.TestCase):
         # target layer lives there, so there is nothing to borrow.
         target = _pool(
             {0: SWA},
-            (_spec(SWA, "sliding_window", 128), _spec(FULL, "full_history")),
+            (_spec(SWA, "sliding_window", 128), _spec(FULL, "full_history", None)),
         )
         with self.assertRaisesRegex(ValueError, "must share a full-history group"):
             check_block_drafter_storage(self._bound_draft(FULL), target)
@@ -159,7 +180,7 @@ class BlockDrafterStorageTest(unittest.TestCase):
 class HistoryGroupByLayerOverRealPlanTest(unittest.TestCase):
     """The pool reads layer -> group back from the planned KV fields."""
 
-    def _pool(self, *, layer_types, sliding_window_tokens, num_draft_layers=0):
+    def _pool(self, *, layer_types, sliding_window_tokens, num_draft_layers):
         from cache_pool_test_utils import (
             make_layer_group_ids,
             make_mha_memory_plan,
@@ -218,7 +239,11 @@ class HistoryGroupByLayerOverRealPlanTest(unittest.TestCase):
         return target, draft
 
     def test_hybrid_target_maps_each_layer_to_its_label_group(self):
-        target, _ = self._pool(layer_types=(FULL, SWA, FULL), sliding_window_tokens=32)
+        target, _ = self._pool(
+            layer_types=(FULL, SWA, FULL),
+            sliding_window_tokens=32,
+            num_draft_layers=0,
+        )
         self.assertEqual(target.history_group_by_layer(), {0: FULL, 1: SWA, 2: FULL})
 
     def test_draft_view_maps_local_ids_onto_continuation_layers(self):
@@ -236,7 +261,9 @@ class HistoryGroupByLayerOverRealPlanTest(unittest.TestCase):
             sliding_window_tokens=32,
             num_draft_layers=1,
         )
-        target_model = _Model(_layer(0), _layer(1, sliding_window_size=31))
+        target_model = _Model(
+            _layer(0, sliding_window_size=-1), _layer(1, sliding_window_size=31)
+        )
         bind_cache_groups(target_model, target)
         self.assertEqual([m.group_id for m in target_model.attns], [FULL, SWA])
         # The block drafter masks to its own window but rides the target's

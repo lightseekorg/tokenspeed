@@ -398,7 +398,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
-        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        window_left = layer.sliding_window_size
         noncausal_block_size = self.spec_num_tokens if self.block_decode_active else 1
         if value_weight is not None:
             # Fuse projection and gate into decode to avoid materializing latent output.

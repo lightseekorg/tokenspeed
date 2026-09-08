@@ -69,7 +69,14 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         # Visibility: window_left of the compute mask, -1 for full attention.
-        self.sliding_window_size = sliding_window_size or -1
+        # 0 is a real window (the current token only), not "unset".
+        if sliding_window_size is None or sliding_window_size < -1:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_size is a "
+                f"window_left >= 0 or -1 for full attention, got "
+                f"{sliding_window_size!r}"
+            )
+        self.sliding_window_size = int(sliding_window_size)
         # Storage: the cache group this layer's KV rides. Owned by the cache
         # plan and bound at startup (bind_cache_groups); the model never
         # names it.
