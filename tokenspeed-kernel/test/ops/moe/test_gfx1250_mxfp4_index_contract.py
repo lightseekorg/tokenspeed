@@ -26,8 +26,16 @@ import ast
 from pathlib import Path
 
 import pytest
-from tokenspeed_kernel_amd._triton import gl, gluon_ir, ir
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common
+from utils import is_amd
+
+if not is_amd():
+    pytest.skip(
+        "tokenspeed-kernel-amd is installed on AMD CI only",
+        allow_module_level=True,
+    )
+
+from tokenspeed_kernel_amd._triton import gl, gluon_ir, ir  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common  # noqa: E402
 
 # Read sources from the tree the import resolved to, not the repo layout.
 MXFP4_ROOT = Path(_common.__file__).parent
