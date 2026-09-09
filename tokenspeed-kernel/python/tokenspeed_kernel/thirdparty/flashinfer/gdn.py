@@ -18,16 +18,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer FP32-state MTP adapter without per-call buffer initialization."""
+"""FlashInfer GDN adapters with optional PDL and uninitialized MTP buffers."""
 
 from __future__ import annotations
+
+import functools
 
 import torch
 from flashinfer.gdn_kernels.gdn_decode_mtp import (
     get_tile_v_mtp,
     get_vec_size_mtp,
-    run_mtp_decode,
 )
+
+# Keep the original optional-backend detection even though these adapters are
+# defined independently of the upstream entry points they wrap.
+try:
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
+except ImportError:
+    _original_prefill = None
+try:
+    from flashinfer.gdn_decode import (
+        gated_delta_rule_decode_pretranspose as _original_decode,
+    )
+except ImportError:
+    _original_decode = None
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule_mtp as _original_bf16_mtp,
+    )
+except ImportError:
+    _original_bf16_mtp = None
+
+HAS_PREFILL = _original_prefill is not None
+HAS_DECODE = _original_decode is not None
+HAS_BF16_MTP = _original_bf16_mtp is not None
 
 
 def gated_delta_rule_mtp(
@@ -47,6 +71,7 @@ def gated_delta_rule_mtp(
     ssm_state_indices: torch.Tensor | None,
     disable_state_update: bool,
     use_qk_l2norm: bool,
+    enable_pdl: bool,
 ) -> None:
     """Run FlashInfer MTP into a caller-owned output without zero fills.
 
@@ -74,6 +99,8 @@ def gated_delta_rule_mtp(
         disable_state_update: Suppress pool writes. Otherwise the final state
             overwrites the read row unless per-token destinations are supplied.
         use_qk_l2norm: Normalize q/k inside the kernel.
+        enable_pdl: Enable dependent launch and input synchronization; selected
+            before capture and retained by CUDA Graph replay.
 
     Returns:
         None. The output and enabled state destinations are written in place.
@@ -125,7 +152,7 @@ def gated_delta_rule_mtp(
         assert ssm_state_indices.dtype == torch.int32
         assert ssm_state_indices.device == q.device
 
-    run_mtp_decode(
+    _mtp_runner(enable_pdl)(
         h0_source=state_source,
         intermediate_states=intermediate_states,
         A_log=A_log,
@@ -155,3 +182,152 @@ def gated_delta_rule_mtp(
         output_state_indices=None,
         use_pool_indexing=use_pool_indexing,
     )
+
+
+@functools.cache
+def _mtp_runner(enable_pdl: bool):
+    from flashinfer.gdn_kernels import gdn_decode_mtp
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+
+    if not enable_pdl:
+        return gdn_decode_mtp.run_mtp_decode
+    return _adapt_module(
+        gdn_decode_mtp,
+        kernels=("gdn_verify_kernel_mtp", "gdn_verify_kernel_mtp_inline"),
+        launchers=("run_gdn_verify_kernel_mtp", "run_gdn_verify_kernel_mtp_inline"),
+        entrypoints=("run_mtp_decode",),
+        caches=("_get_compiled_mtp_kernel", "_get_compiled_mtp_kernel_inline"),
+        overrides={},
+    )["run_mtp_decode"]
+
+
+@functools.cache
+def _bf16_runners(enable_pdl: bool):
+    from flashinfer.gdn_kernels import gdn_decode_bf16_state
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+
+    if not enable_pdl:
+        return vars(gdn_decode_bf16_state)
+    return _adapt_module(
+        gdn_decode_bf16_state,
+        kernels=(
+            "gdn_decode_bf16state_mtp_ilp4_kernel",
+            "gdn_wide_vec_kernel",
+            "gdn_wide_vec_kernel_t1",
+        ),
+        launchers=(
+            "run_gdn_decode_bf16state_mtp_ilp4",
+            "_run_wide_vec",
+            "_run_wide_vec_t1",
+        ),
+        entrypoints=(
+            "gated_delta_rule",
+            "gated_delta_rule_mtp",
+            "gated_delta_rule_mtp_wide_vec",
+            "gated_delta_rule_t1_wide_vec",
+        ),
+        caches=("_compiled_kernels_mtp", "_compiled_kernels_wide_vec"),
+        overrides={},
+    )
+
+
+@functools.cache
+def _decode_runner(enable_pdl: bool):
+    from flashinfer import gdn_decode
+    from flashinfer.gdn_kernels import gdn_decode_pretranspose
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+
+    if not enable_pdl:
+        return _original_decode
+    pretranspose = _adapt_module(
+        gdn_decode_pretranspose,
+        kernels=(
+            "gdn_decode_kernel_small_batch_pretranspose",
+            "gdn_decode_kernel_big_batch_pretranspose",
+        ),
+        launchers=(
+            "run_gdn_decode_kernel_small_batch_pretranspose",
+            "run_gdn_decode_kernel_big_batch_pretranspose",
+        ),
+        entrypoints=("run_pretranspose_decode",),
+        caches=("_get_compiled_decode_kernel",),
+        overrides={},
+    )
+    overrides = {"run_pretranspose_decode": pretranspose["run_pretranspose_decode"]}
+    if gdn_decode._GDN_DECODE_BF16_STATE_AVAILABLE:
+        bf16 = _bf16_runners(enable_pdl)
+        overrides.update(
+            _gated_delta_rule_bf16_state=bf16["gated_delta_rule"],
+            _gated_delta_rule_bf16_state_mtp=bf16["gated_delta_rule_mtp"],
+        )
+    return _adapt_module(
+        gdn_decode,
+        kernels=(),
+        launchers=(),
+        entrypoints=("gated_delta_rule_decode_pretranspose",),
+        caches=(),
+        overrides=overrides,
+    )["gated_delta_rule_decode_pretranspose"]
+
+
+@functools.cache
+def _prefill_runner(enable_pdl: bool):
+    from flashinfer import gdn_prefill
+    from flashinfer.gdn_kernels.blackwell import gdn_prefill as sm100
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module, _PdlKernel
+
+    if not enable_pdl:
+        return _original_prefill
+
+    class PdlGatedDeltaNetChunkedKernel(sm100.GatedDeltaNetChunkedKernel):
+        kernel = _PdlKernel(sm100.GatedDeltaNetChunkedKernel.kernel)
+
+    adapted = _adapt_module(
+        sm100,
+        kernels=(),
+        launchers=(),
+        entrypoints=("chunk_gated_delta_rule_sm100",),
+        caches=("_get_compiled_cache",),
+        overrides={"GatedDeltaNetChunkedKernel": PdlGatedDeltaNetChunkedKernel},
+    )
+    return _adapt_module(
+        gdn_prefill,
+        kernels=(),
+        launchers=(),
+        entrypoints=("chunk_gated_delta_rule",),
+        caches=(),
+        overrides={
+            "chunk_gated_delta_rule_sm100": adapted["chunk_gated_delta_rule_sm100"]
+        },
+    )["chunk_gated_delta_rule"]
+
+
+def gated_delta_rule_decode_pretranspose(*, enable_pdl: bool, **kwargs):
+    """Run T=1 decode with FlashInfer's keyword arguments.
+
+    ``enable_pdl`` selects dependent launch and synchronization. ``kwargs``
+    contains the upstream decode inputs, state pool/indices and output options.
+    Returns the upstream ``(output, state)`` pair with K-last state layout.
+    """
+    return _decode_runner(enable_pdl)(**kwargs)
+
+
+def gated_delta_rule_bf16_mtp(*, enable_pdl: bool, **kwargs):
+    """Run BF16-state MTP with FlashInfer's keyword arguments.
+
+    ``enable_pdl`` selects an isolated PDL compilation/buffer cache; ``kwargs``
+    contains the upstream MTP inputs and state destinations. Returns its
+    ``[B, T, HV, V]`` output, updating enabled state destinations in place.
+    """
+    return _bf16_runners(enable_pdl)["gated_delta_rule_mtp"](**kwargs)
+
+
+def chunk_gated_delta_rule(*args, enable_pdl: bool, **kwargs):
+    """Run SM100 prefill with FlashInfer's positional and keyword arguments.
+
+    ``args`` contains Q/K/V; ``kwargs`` contains upstream gates, state,
+    sequence lengths and output options. The caller selects ``use_cp=False``.
+    ``enable_pdl`` controls the persistent kernel. Returns the upstream output
+    and optional final state.
+    """
+    return _prefill_runner(enable_pdl)(*args, **kwargs)

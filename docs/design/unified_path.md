@@ -107,6 +107,11 @@ state-pool calls such as ReplaySSM. Supplying a real intermediate cache enables
 its writes; a dummy must never be passed as an enabled cache just to avoid
 FlashInfer's placeholder allocation.
 
+GDN kernel scheduling follows the global `pdl_enabled()` switch across prefill,
+decode and verify. Eager and capture use the same launchers; a captured graph
+retains its capture-time PDL dependency edges and must be recaptured to change
+that choice. See [GDN PDL](gdn-pdl.md) for synchronization and backend coverage.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base

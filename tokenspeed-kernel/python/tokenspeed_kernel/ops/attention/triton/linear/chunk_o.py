@@ -29,6 +29,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.linear.index import prepare_chunk_indices
 from tokenspeed_kernel.ops.attention.triton.linear.op import exp, safe_exp
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.heuristics(
@@ -58,7 +59,10 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
@@ -134,6 +138,8 @@ def chunk_fwd_kernel_o(
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def chunk_fwd_o(
@@ -146,6 +152,7 @@ def chunk_fwd_o(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
 ) -> torch.Tensor:
+    enable_pdl = pdl_enabled()
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
@@ -181,5 +188,7 @@ def chunk_fwd_o(
         BV=64,
         num_warps=4,
         num_stages=2,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return o

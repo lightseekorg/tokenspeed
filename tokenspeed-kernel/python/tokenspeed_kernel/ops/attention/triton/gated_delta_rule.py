@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.attention import (
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.triton.linear.chunk import chunk_gated_delta_rule
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -150,12 +150,18 @@ def _fused_gdn_decode_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
+    Q_STRIDES: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    A_STRIDES: tl.constexpr,
+    B_STRIDES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Dense-batch (no varlen) sigmoid-gating delta-rule decode/MTP update.
 
     q, k: [B, T, H, K]; v: [B, T, HV, V]; a, b: [B, T, HV]; o: [B, T, HV, V]
-    (all contiguous -- enforced by the Python launcher, so strides below
-    derive directly from the constexpr dims). h0_source is the K-last
+    (input strides are explicit so decode can consume packed QKV views
+    without intermediate copies). h0_source is the K-last
     ``[pool_size, HV, V, K]`` SSM state pool (matches gdn_chunk_prefill's
     contract); h0_indices ([B]) selects each batch entry's read row, ``-1``
     skipped (state contribution treated as zero -- mirrors flashinfer's
@@ -175,6 +181,8 @@ def _fused_gdn_decode_update_kernel(
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -182,14 +190,14 @@ def _fused_gdn_decode_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (i_n * T) * H * K + i_h * K + o_k
-    p_k = k + (i_n * T) * H * K + i_h * K + o_k
-    p_v = v + (i_n * T) * HV * V + i_hv * V + o_v
-    p_b = b + (i_n * T) * HV + i_hv
+    p_q = q + i_n * Q_STRIDES[0] + i_h * Q_STRIDES[2] + o_k * Q_STRIDES[3]
+    p_k = k + i_n * K_STRIDES[0] + i_h * K_STRIDES[2] + o_k * K_STRIDES[3]
+    p_v = v + i_n * V_STRIDES[0] + i_hv * V_STRIDES[2] + o_v * V_STRIDES[3]
+    p_b = b + i_n * B_STRIDES[0] + i_hv * B_STRIDES[2]
     p_o = o + (i_n * T * HV + i_hv) * V + o_v
 
     p_A_log = A_log + i_hv
-    p_a = a + (i_n * T) * HV + i_hv
+    p_a = a + i_n * A_STRIDES[0] + i_hv * A_STRIDES[2]
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -272,12 +280,12 @@ def _fused_gdn_decode_update_kernel(
                     mask=mask_h,
                 )
 
-        p_q += H * K
-        p_k += H * K
-        p_v += HV * V
-        p_b += HV
+        p_q += Q_STRIDES[1]
+        p_k += K_STRIDES[1]
+        p_v += V_STRIDES[1]
+        p_b += B_STRIDES[1]
         p_o += HV * V
-        p_a += HV
+        p_a += A_STRIDES[1]
 
     if HAS_OUTPUT_STATE_INDICES:
         out_idx = tl.load(output_state_indices + i_n).to(tl.int64)
@@ -300,6 +308,8 @@ def _fused_gdn_decode_update_kernel(
                 + o_k[:, None]
             )
             tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _launch_fused_gdn_decode_update(
@@ -325,12 +335,7 @@ def _launch_fused_gdn_decode_update(
     [B, T, HV]; initial_state is the K-last [pool_size, HV, V, K] SSM state
     pool (the shared runtime contract -- see module docstring).
     """
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    a = a.contiguous()
-    b = b.contiguous()
-
+    enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -373,8 +378,15 @@ def _launch_fused_gdn_decode_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
+        Q_STRIDES=q.stride(),
+        K_STRIDES=k.stride(),
+        V_STRIDES=v.stride(),
+        A_STRIDES=a.stride(),
+        B_STRIDES=b.stride(),
         num_warps=1,
         num_stages=3,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return o
 
@@ -507,8 +519,11 @@ def _gdn_replay_commit_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     STATE_DTYPE_CODE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Recompute accepted GDN states with one Triton program per state tile."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_k, i_v, i_lnh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_hv = i_lnh % HV
     i_ln = i_lnh // HV
@@ -590,6 +605,8 @@ def _gdn_replay_commit_kernel(
             + o_k[:, None]
         )
         tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -646,6 +663,7 @@ def triton_gdn_replay_commit(
         ``None``. Every layer's accepted state is written through its pool
         address in one kernel launch.
     """
+    enable_pdl = pdl_enabled()
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     state_dtype_codes = {
@@ -681,4 +699,6 @@ def triton_gdn_replay_commit(
         STATE_DTYPE_CODE=state_dtype_codes[state_dtype],
         num_warps=1,
         num_stages=3,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )

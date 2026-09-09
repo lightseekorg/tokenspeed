@@ -81,13 +81,13 @@ def test_matches_fla(
         v=v,
         g=g,
         beta=beta,
-        initial_state=h0.clone(),
+        initial_state=h0.transpose(-1, -2).contiguous(),
         output_final_state=True,
         cu_seqlens=cu.long(),
         head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
-    o_fi, st_fi = gdn.gdn_chunk_prefill(
+    result = gdn.gdn_chunk_prefill(
         l2norm_fwd(q),
         l2norm_fwd(k),
         v,
@@ -96,7 +96,12 @@ def test_matches_fla(
         scale=D**-0.5,
         initial_state=h0.clone(),
         cu_seqlens=cu,
+        qk_l2norm=False,
+        output_final_state=True,
+        output_h=False,
     )
+    o_fi, st_fi = result.out, result.final_state
+    st_ref = st_ref.transpose(-1, -2)
 
     assert o_fi.shape == o_ref.shape
     assert o_fi.dtype == o_ref.dtype

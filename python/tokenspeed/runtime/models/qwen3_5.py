@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -1812,7 +1813,10 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     HEAD_V: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_BA: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
     QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
@@ -1842,6 +1846,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         )
         tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
         tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(
@@ -1868,6 +1874,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         b: [num_v_heads]
         a: [num_v_heads]
     """
+    enable_pdl = pdl_enabled()
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = torch.empty(
@@ -1904,6 +1911,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         BLOCK_BA=triton.next_power_of_2(num_heads_v),
         num_warps=4,
         num_stages=1,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return mixed_qkv, z, b, a
 

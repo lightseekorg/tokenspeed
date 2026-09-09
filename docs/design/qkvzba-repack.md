@@ -40,7 +40,9 @@ The former implementation launched one single-warp CTA per token/QK head and
 issued scalar gate copies for every V head. For 4 QK heads, 12 V heads and
 128-dimensional heads, the new layout halves the CTA count and replaces six
 single-lane gate loads/stores per old CTA with two lane-parallel copies per
-token. No shared memory, synchronization or arithmetic on the values is needed.
+token. No shared memory, CTA barriers or arithmetic on the values is needed.
+The global `pdl_enabled()` switch controls grid dependency synchronization and
+PDL launch attributes; see [GDN PDL](gdn-pdl.md).
 
 ## Validation and measurements
 
@@ -51,7 +53,9 @@ the project runtime initialization. The command backend captured
 events, dividing each sample by 200. The graph allocator reused released
 output storage. Timing excludes Python allocation/dispatch and does not inject
 cache flushes. Release uses the median of ten samples per workload. These are
-kernel microbenchmarks, not end-to-end model speedups.
+kernel microbenchmarks, not end-to-end model speedups. These repack-only
+measurements predate PDL integration; the [GDN PDL document](gdn-pdl.md) records
+chain measurements with the global switch off and on.
 
 The contiguous-tile candidate passed L2, reducing the equally weighted mean
 from 16.913 to 9.879 microseconds (41.6%). All ten comparison workloads improved.

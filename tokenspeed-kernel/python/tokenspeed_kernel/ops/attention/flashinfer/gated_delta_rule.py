@@ -52,6 +52,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -63,9 +64,15 @@ _chunk_gated_delta_rule = error_fn
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            HAS_PREFILL,
+        )
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            chunk_gated_delta_rule as _fi_chunk,
+        )
 
-        _chunk_gated_delta_rule = _fi_chunk
+        if HAS_PREFILL:
+            _chunk_gated_delta_rule = _fi_chunk
     except ImportError:
         pass
 
@@ -76,7 +83,10 @@ _has_gdn_decode = False
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gdn_decode import (
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            HAS_DECODE,
+        )
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
             gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
         )
         from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
@@ -85,7 +95,7 @@ if platform.is_hopper_plus:
 
         _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
         _gated_delta_rule_mtp = _fi_mtp
-        _has_gdn_decode = True
+        _has_gdn_decode = HAS_DECODE
     except ImportError:
         pass
 
@@ -96,11 +106,15 @@ _gated_delta_rule_bf16_mtp = None
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-            gated_delta_rule_mtp as _fi_bf16_mtp,
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            HAS_BF16_MTP,
+        )
+        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
+            gated_delta_rule_bf16_mtp as _fi_bf16_mtp,
         )
 
-        _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
+        if HAS_BF16_MTP:
+            _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
     except ImportError:
         pass
 
@@ -281,6 +295,7 @@ if is_available():
             # upstream. Disabling CP can slow long-context GDN prefill but
             # does not change correctness.
             use_cp=False,
+            enable_pdl=pdl_enabled(),
         )
 
         out = out.to(q.dtype)
@@ -363,6 +378,7 @@ if is_decode_available():
         A_log = A_log.detach().float()
         dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
+            enable_pdl=pdl_enabled(),
             q=q,
             k=k,
             v=v,
@@ -462,6 +478,7 @@ if is_decode_available():
         )
         if use_bf16_state:
             out = _gated_delta_rule_bf16_mtp(
+                enable_pdl=pdl_enabled(),
                 A_log=A_log,
                 a=a.to(q.dtype),
                 dt_bias=dt_bias,
@@ -487,6 +504,7 @@ if is_decode_available():
             device=q.device,
         )
         _gated_delta_rule_mtp(
+            enable_pdl=pdl_enabled(),
             q=q,
             k=k,
             v=v,

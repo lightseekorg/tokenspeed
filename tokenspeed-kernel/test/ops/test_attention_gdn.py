@@ -922,8 +922,14 @@ def test_gdn_decode_mtp_disable_state_update_false_writes_back(
         ("cache", True),
     ],
 )
+@pytest.mark.parametrize("enable_pdl", [False, True])
 def test_flashinfer_mtp_uninitialized_buffers(
-    device: str, batch: int, strided_pool: bool, state_mode: str, require
+    device: str,
+    batch: int,
+    strided_pool: bool,
+    state_mode: str,
+    enable_pdl: bool,
+    require,
 ) -> None:
     """Live output/cache rows overwrite poison; skipped rows and slab gaps survive."""
     require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
@@ -1000,6 +1006,7 @@ def test_flashinfer_mtp_uninitialized_buffers(
     )
     gated_delta_rule_mtp(
         **kwargs,
+        enable_pdl=enable_pdl,
         initial_state=actual_pool,
         output=output,
         intermediate_states_buffer=cache,
@@ -1064,3 +1071,65 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
     )
     assert actual.dtype == torch.float16
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_triton_gdn_packed_decode_inputs(
+    device: str, steps: int, state_dtype: torch.dtype, require
+):
+    """Packed QKV and strided scalar gates must match the independent oracle."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    batch, heads, value_heads, dim = 4, 4, 12, 128
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=batch,
+        num_q_heads=heads,
+        num_v_heads=value_heads,
+        head_dim=dim,
+        pool_size=batch + 1,
+        state_dtype=state_dtype,
+        parameter_dtype=torch.float32,
+        parameter_requires_grad=False,
+    )
+    reads = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    expected, states = _torch_gdn_decode_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[reads],
+        dim**-0.5,
+    )
+    packed = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1)
+    q, k, v = packed.split([heads * dim, heads * dim, value_heads * dim], dim=-1)
+    gates = torch.stack((a, b), dim=-1)
+    actual = gdn_decode_mtp(
+        q=q.view(batch, steps, heads, dim),
+        k=k.view(batch, steps, heads, dim),
+        v=v.view(batch, steps, value_heads, dim),
+        a=gates[..., 0],
+        b=gates[..., 1],
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        initial_state_indices=reads,
+        scale=dim**-0.5,
+        use_qk_l2norm=True,
+        disable_state_update=False,
+        intermediate_states_buffer=None,
+        output_state_indices=None,
+        solution="triton",
+        override=None,
+    )
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        pool[reads].float(), states[-1].to(state_dtype).float(), rtol=2e-2, atol=3e-2
+    )
