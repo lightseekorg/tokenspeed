@@ -69,6 +69,7 @@ def request_body(model, messages, max_tokens, rid):
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
+            "temperature": 0.0,
             "ignore_eos": True,
             "rid": rid,
         }

@@ -94,11 +94,11 @@ request reached a rank other than the one holding its KV).
 
 - Input anchor 50K (first turns); D output 2000 (decode >= 95% of measured
   wall clock at observed TPOT).
-- Sampling: NOT pinned, matching the agentic bench convention. Speculative
-  acceptance drifts between runs, and a rung's output throughput is output
-  divided by the wall time set by its slowest request, so D-sim differences
-  below the measured noise band need repeated runs; TPOT p50 is the steadier
-  column.
+- Sampling: greedy (`temperature 0`), matching evalscope's default in the
+  agentic bench, so acceptance lengths are comparable across the two. A
+  rung's output throughput is output divided by the wall time set by its
+  slowest request, so D-sim differences below the measured noise band need
+  repeated runs; TPOT p50 is the steadier column.
 - Config: `--max-num-seqs 128` (8 slots per rank), chunked prefill 8192 with
   `--gpu-memory-utilization 0.8` — the trtllm MoE workspace scales with the
   tokens gathered from all 16 ranks per step, and 16 x 8192 needs the headroom
