@@ -162,7 +162,20 @@ def prepare_all_reduce_buffers(
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
-    """Allocate persistent all-reduce buffers before cache planning."""
+    """Ask the active backend to allocate all-reduce buffers before cache planning.
+
+    Args:
+        group: Global ranks participating in the reductions.
+        staged_max_numel: Maximum ordinary all-reduce payload in elements.
+        producer_direct_max_numel: Maximum producer-direct payload in elements.
+        attnres_max_numel: Maximum fused AttnRes payload in elements.
+        attnres_max_rows: Maximum fused AttnRes payload in rows.
+        dtype: Element type shared by the prepared paths.
+        backend: Backend to prepare, or ``None`` to use the global backend.
+
+    Returns:
+        Whether the active backend prepared the requested buffers.
+    """
 
     if backend is None:
         backend = get_global_backend()

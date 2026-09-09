@@ -93,6 +93,20 @@ class TritonAllReduceBackend(CommBackend):
         attnres_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
+        """Allocate or reuse an Iris state with the requested capacities.
+
+        Args:
+            group: Global ranks participating in the reductions.
+            staged_max_numel: Maximum ordinary all-reduce payload in elements.
+            producer_direct_max_numel: Maximum producer-direct payload in elements.
+            attnres_max_numel: Maximum fused AttnRes payload in elements.
+            attnres_max_rows: Maximum fused AttnRes payload in rows.
+            dtype: Element type shared by the prepared paths.
+
+        Returns:
+            Whether Iris prepared the requested buffers on this platform.
+        """
+
         if len(group) <= 1 or not current_platform().is_amd:
             return False
         if dtype != torch.bfloat16:

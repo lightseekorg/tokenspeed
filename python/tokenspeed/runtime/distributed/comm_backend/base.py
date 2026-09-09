@@ -66,19 +66,7 @@ class CommBackend(ABC):
         attnres_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
-        """Allocate persistent all-reduce buffers before cache planning.
-
-        Args:
-            group: Global ranks participating in the reductions.
-            staged_max_numel: Maximum ordinary all-reduce payload in elements.
-            producer_direct_max_numel: Maximum producer-direct payload in elements.
-            attnres_max_numel: Maximum fused AttnRes payload in elements.
-            attnres_max_rows: Maximum fused AttnRes payload in rows.
-            dtype: Element type shared by the prepared paths.
-
-        Returns:
-            Whether the backend prepared the requested buffers.
-        """
+        """Return false when the backend has no persistent buffers to prepare."""
 
         return False
 
