@@ -3,7 +3,8 @@
 # pd_client run as job steps (attention-DP 16 spans 4 nodes of 4 GPUs).
 #
 #   sbatch -N 4 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
-#       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> p_bench.slurm
+#       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
+#       --wrap "bash test/agentic_benchmark/kimi_k3/tokenspeed_disagg/p_bench.slurm"
 #
 #   SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> bash p_bench.slurm
 
@@ -13,9 +14,9 @@ CONFIGS=(
     attn_dp16_moe_ep16
 )
 
-# Under sbatch this file runs from the spool directory; SLURM_SUBMIT_DIR is
-# where sbatch was invoked (this directory, per the usage above).
-SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Passing this file to sbatch directly runs a spool copy and loses this
+# directory; the usage above wraps it so the real path is used in both modes.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MODEL=nvidia/Kimi-K3-NVFP4
 DATASET="${SCRIPT_DIR}/agentic_dataset_x32.json"
 SERVER_PID=

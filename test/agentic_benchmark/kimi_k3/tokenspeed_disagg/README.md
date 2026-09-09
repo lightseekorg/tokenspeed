@@ -67,7 +67,9 @@ Each rung is its own prime-measure loop:
 
 1. **Prime** the rung's conversations (0 .. parallel - 1) with
    `max_tokens 1` at concurrency 16, one cold prefill per DP rank.
-2. **Settle 30s**: async writebacks and allocator churn quiesce.
+2. **Settle 10s**: the host writebacks of the primed contexts are issued
+   within a second of each request finishing, and launching the measure
+   client as a job step adds about 20 s on top.
 3. **Measure**: resend the same first turns, `max_tokens 2000` + `ignore_eos`,
    as one lockstep wave of exactly parallel requests. Sticky placement fixes
    each conversation's rank, so rolling admission could not hold per-rank
