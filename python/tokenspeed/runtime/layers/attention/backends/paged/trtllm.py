@@ -100,6 +100,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
+    # Both kernel call sites forward layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)

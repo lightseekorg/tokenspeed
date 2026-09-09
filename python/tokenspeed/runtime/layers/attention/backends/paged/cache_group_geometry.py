@@ -63,10 +63,10 @@ class CacheGroupGeometry:
         """This group's block granularity; an unknown id is a contract bug.
 
         Every id reaching here must name a learned row-geometry group —
-        layer group ids are validated against the pool's published specs at
-        startup (``validate_cache_group_ids``), and table dicts are keyed by
-        contract ids. No fallback: a miss means the geometry was never
-        learned (pool not bound) or the id belongs to a state group.
+        layer group ids are bound from the pool's plan at startup
+        (``bind_cache_groups``), and table dicts are keyed by contract ids.
+        No fallback: a miss means the geometry was never learned (pool not
+        bound) or the id belongs to a state group.
         """
         try:
             return self.granularities[group_id]

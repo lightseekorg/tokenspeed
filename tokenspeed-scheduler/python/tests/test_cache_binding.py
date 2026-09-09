@@ -46,6 +46,12 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(ts.Scheduler, "get_request_paged_cache_page_ids")
 
 
+def test_write_back_op_carries_the_source_guard():
+    # The runtime branches on how the scheduler guards the Device sources
+    # (pinned until the ACK, or released and stream-ordered), never on why.
+    assert hasattr(Cache.WriteBackOp, "source_pinned")
+
+
 def test_cache_event_fields_are_bound():
     write_back = Cache.WriteBackDoneEvent()
     write_back.op_id = 7

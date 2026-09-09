@@ -27,6 +27,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
     _group_m_swizzle,
     _load_layout,
+    _mxfp4_swiglu_reduce,
     _store_layout,
     _swiglu_reduce,
     _xcd_chiplet_swizzle,
@@ -54,7 +55,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
     _preshuffled_w_read_layout,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
-    _mxfp4_quantize_tile,
+    _mxfp4_quantize_tile_in_layout,
     _mxfp4_store_cdna4_scale,
 )
 
@@ -1157,16 +1158,15 @@ def _pipelined_moe_tile_compute(
         acc = acc + bias[None, :].to(gl.float32)
 
     if DO_SWIGLU:
-        out = _swiglu_reduce(
-            acc,
-            SWIGLU_ALPHA,
-            SWIGLU_LIMIT,
-            SWIGLU_BETA,
-            OUT_BLOCK_N,
-            cfg.acc_layout,
-        )
         if HAS_MXFP4_QUANT_OUT:
-            packed, scale_byte = _mxfp4_quantize_tile(out)
+            out = _mxfp4_swiglu_reduce(
+                acc,
+                SWIGLU_ALPHA,
+                SWIGLU_LIMIT,
+                SWIGLU_BETA,
+                OUT_BLOCK_N,
+            )
+            packed, scale_byte = _mxfp4_quantize_tile_in_layout(out)
             packed = packed.reshape((BLOCK_M, OUT_BLOCK_N // 2))
             PACK_LAYOUT: gl.constexpr = packed.type.layout
             offs_pack_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, PACK_LAYOUT))
@@ -1226,6 +1226,13 @@ def _pipelined_moe_tile_compute(
                 K_SWIZZLE=8,
             )
             return
+        out = _swiglu_reduce(
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+        )
         if HAS_FP8_QUANT_OUT:
             scale = gl.load(out_quant_scale_ptr).to(gl.float32)
             inv_scale = 1.0 / scale

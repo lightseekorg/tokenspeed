@@ -25,7 +25,13 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import kpool_decode_topk, kpool_prefill_topk
+from tokenspeed_kernel.ops.attention.triton.kpool_expand import (
+    expand_kpool_to_flat_kv,
+)
 from tokenspeed_kernel.ops.attention.triton.kpool_score import score_kpool_dense
+from tokenspeed_kernel.ops.attention.triton.kpool_select import (
+    _prepare_kpool_decode_metadata,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -147,11 +153,65 @@ def _assert_selection(
         )
 
 
-def test_dense_scores_match_reference() -> None:
+def _reference_expand_kpool(
+    pool_indices: torch.Tensor,
+    causal_lens: torch.Tensor,
+    req_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    block_size: int,
+    append_tail: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, topk_pools = pool_indices.shape
+    width = topk_pools * pool_size + (pool_size - 1 if append_tail else 0)
+    slots = torch.full(
+        (num_tokens, width), -1, dtype=torch.int32, device=pool_indices.device
+    )
+    lens = torch.zeros(num_tokens, dtype=torch.int32, device=pool_indices.device)
+
+    for token in range(num_tokens):
+        seq_len = max(int(causal_lens[token]), 0)
+        num_pools = seq_len // pool_size
+        history_len = min(num_pools * pool_size, topk_pools * pool_size)
+        selected = (
+            list(range(num_pools))
+            if num_pools <= topk_pools
+            else pool_indices[token].tolist()
+        )
+        raw_slots = []
+        for pool in selected[:topk_pools]:
+            if len(raw_slots) >= history_len:
+                break
+            if 0 <= pool < num_pools:
+                raw_slots.extend(range(pool * pool_size, (pool + 1) * pool_size))
+            else:
+                raw_slots.extend([-1] * pool_size)
+        if append_tail:
+            raw_slots.extend(range(num_pools * pool_size, seq_len))
+
+        count = 0
+        req = int(req_ids[token])
+        for column, raw_slot in enumerate(raw_slots[:width]):
+            if not 0 <= raw_slot < seq_len:
+                continue
+            page_idx = raw_slot // block_size
+            if page_idx >= block_table.shape[1]:
+                continue
+            page = int(block_table[req, page_idx])
+            slots[token, column] = page * block_size + raw_slot % block_size
+            count += 1
+        lens[token] = count
+    return slots, lens
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+def test_dense_scores_match_reference(weight_dtype: torch.dtype) -> None:
     q, cache, pooled_k, weights, seq_lens, index_table, _ = _setup(
         [2051, 4101], seed=47
     )
     req_ids = torch.arange(q.shape[0], dtype=torch.int32, device="cuda")
+    weights = weights.to(weight_dtype)
     pool_lens = seq_lens // _POOL
     max_num_pools = int(pool_lens.max())
     actual = score_kpool_dense(
@@ -180,6 +240,134 @@ def test_dense_scores_match_reference() -> None:
         ).sum(0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=5e-7)
+
+
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 4])
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
+def test_decode_metadata_matches_torch_chain(
+    q_len_per_req: int,
+    seq_dtype: torch.dtype,
+) -> None:
+    seq_lens = torch.tensor([0, 2, 7], dtype=seq_dtype, device="cuda")
+    num_tokens = seq_lens.numel() * q_len_per_req
+    actual_req_ids, actual_causal_lens = _prepare_kpool_decode_metadata(
+        seq_lens,
+        num_tokens,
+        q_len_per_req,
+    )
+
+    token_ids = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    expected_req_ids = token_ids // q_len_per_req
+    expected_causal_lens = (
+        seq_lens.to(torch.int32).index_select(0, expected_req_ids)
+        - (q_len_per_req - 1)
+        + token_ids % q_len_per_req
+    ).clamp_min(0)
+
+    assert torch.equal(actual_req_ids, expected_req_ids)
+    assert torch.equal(actual_causal_lens, expected_causal_lens)
+
+
+@pytest.mark.parametrize("num_reqs", [3, 13])
+def test_decode_metadata_cuda_graph_tracks_tail_batch_lengths(num_reqs: int) -> None:
+    seq_lens = torch.arange(num_reqs, dtype=torch.int32, device="cuda")
+
+    _prepare_kpool_decode_metadata(seq_lens, num_reqs, 1)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        req_ids, causal_lens = _prepare_kpool_decode_metadata(seq_lens, num_reqs, 1)
+
+    seq_lens.add_(17)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        req_ids,
+        torch.arange(num_reqs, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.equal(causal_lens, seq_lens)
+
+
+@pytest.mark.parametrize("table_cols", [1, 2, 5, 9, 16, 31])
+def test_expand_kpool_tracks_runtime_page_table_width(table_cols: int) -> None:
+    pool_indices = torch.tensor(
+        [[0, 1, 2], [0, -1, 5], [0, 2, 4], [0, 16, 32]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    causal_lens = torch.tensor(
+        [0, 3, min(table_cols * _KV_PAGE, 17), table_cols * _KV_PAGE + 3],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    req_ids = torch.arange(4, dtype=torch.int32, device="cuda")
+    table_storage = torch.arange(
+        4 * (table_cols + 3), dtype=torch.int32, device="cuda"
+    ).view(4, table_cols + 3)
+    block_table = table_storage[:, :table_cols]
+    width = pool_indices.shape[1] * _POOL + _POOL - 1
+    out_storage = torch.empty((4, width + 2), dtype=torch.int32, device="cuda")
+    out = out_storage[:, :width]
+    lens_out = torch.empty(4, dtype=torch.int32, device="cuda")
+    assert not block_table.is_contiguous()
+    assert not out.is_contiguous()
+
+    expected = _reference_expand_kpool(
+        pool_indices,
+        causal_lens,
+        req_ids,
+        block_table,
+        pool_size=_POOL,
+        block_size=_KV_PAGE,
+        append_tail=True,
+    )
+    actual = expand_kpool_to_flat_kv(
+        pool_indices,
+        causal_lens,
+        req_ids,
+        block_table,
+        pool_size=_POOL,
+        kv_page_size=_KV_PAGE,
+        append_tail=True,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert actual[0] is out
+    assert actual[1] is lens_out
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
+def test_expand_kpool_empty_input_and_invalid_table_contract() -> None:
+    pool_indices = torch.empty((0, 3), dtype=torch.int32, device="cuda")
+    causal_lens = torch.empty(0, dtype=torch.int32, device="cuda")
+    req_ids = torch.empty(0, dtype=torch.int32, device="cuda")
+    block_table = torch.empty((1, 2), dtype=torch.int32, device="cuda")
+
+    slots, lens = expand_kpool_to_flat_kv(
+        pool_indices,
+        causal_lens,
+        req_ids,
+        block_table,
+        pool_size=_POOL,
+        kv_page_size=_KV_PAGE,
+        append_tail=True,
+    )
+
+    assert slots.shape == (0, 15)
+    assert lens.shape == (0,)
+    with pytest.raises(ValueError, match="at least one page"):
+        expand_kpool_to_flat_kv(
+            pool_indices,
+            causal_lens,
+            req_ids,
+            block_table[:, :0],
+            pool_size=_POOL,
+            kv_page_size=_KV_PAGE,
+            append_tail=True,
+        )
 
 
 @pytest.mark.parametrize(

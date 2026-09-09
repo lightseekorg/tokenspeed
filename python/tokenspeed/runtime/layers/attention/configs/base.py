@@ -40,6 +40,7 @@ from typing import TypeVar
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
@@ -58,6 +59,42 @@ def resolve_speculative_num_tokens(
     if is_draft and server_args.speculative_algorithm == "DSPARK":
         return width - 1
     return width
+
+
+def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
+    """A draft that proposes a whole block in one forward and writes its KV at
+    the target's cache locations (DFLASH / DSPARK)."""
+    return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
+
+
+def resolve_cache_layer_types(
+    hf_config,
+    *,
+    num_layers: int,
+    is_draft: bool,
+    draft_block_decode: bool,
+) -> tuple[str, ...]:
+    """Per-layer cache-group labels of one model side, read once for all
+    softmax families.
+
+    ``cache_layer_types`` wins over ``layer_types``: it can carry labels
+    outside transformers' ``ALLOWED_LAYER_TYPES`` (Inkling's sliding
+    sub-groups). Target-stack labels that do not fit a draft's depth are
+    dropped so the recipe resolves the draft to full history. A block drafter
+    writes at the target's cache locations, so its storage IS the target's
+    full-history group whatever compute mask its layers apply: the label
+    vector says so explicitly instead of losing the labels.
+    """
+    layer_types = tuple(
+        getattr(hf_config, "cache_layer_types", None)
+        or getattr(hf_config, "layer_types", None)
+        or ()
+    )
+    if draft_block_decode:
+        return (FULL_ATTENTION,) * num_layers
+    if is_draft and layer_types and len(layer_types) != num_layers:
+        return ()
+    return layer_types
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
@@ -95,9 +132,11 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     num_kv_heads: int
     head_dim: int
     attn_tp_size: int
-    # Per-layer attention-type labels, forwarded to the KV pool for
-    # cache_group_specs publication (empty -> single full-history group).
-    layer_types: tuple[str, ...] = ()
+    # Per-layer cache-group labels (the storage vocabulary of
+    # recipes/spec.py, NOT the checkpoint's compute labels), consumed only by
+    # the cache recipes; empty -> single full-history group. A layer's
+    # compute mask lives on its PagedAttention (sliding_window_size).
+    cache_layer_types: tuple[str, ...] = ()
     # Retention window; families narrow the type (per-layer tuple on MHA,
     # DeepSeek V4's int on MLA, None on MSA).
     sliding_window_tokens: int | tuple[int | None, ...] | None = None

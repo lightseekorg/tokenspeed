@@ -297,6 +297,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
             context_len=4096,
+            num_attention_layers=2,
             num_attention_heads=16,
             num_key_value_heads=8,
             head_dim=128,

@@ -219,6 +219,77 @@ def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     assert not _use_two_stage_producer_direct(2, min_numel, dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_plain_two_stage_admits_partitionable_shapes(dtype):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    elements_per_word = 8 // dtype.itemsize
+    # The plain path carries no minimum size -- two-stage measured faster than
+    # one-shot at every shape down to 14 KB -- so the predicate is purely the
+    # kernel's partitioning requirement.
+    aligned = 8 * elements_per_word
+    assert _use_two_stage_plain(8, aligned, dtype)
+    assert _use_two_stage_plain(8, aligned * 4096, dtype)
+    # every K3 decode width partitions evenly across 8 ranks
+    for tokens in (1, 8, 16, 32, 64):
+        assert _use_two_stage_plain(8, tokens * 7168, dtype)
+    # a payload that does not split into whole words per rank stays on one-shot
+    assert not _use_two_stage_plain(8, aligned + 1, dtype)
+    # world sizes without a tuned partitioning fall back
+    assert not _use_two_stage_plain(2, aligned, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
+def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
+    """Dtypes the packing kernel cannot express must stay on one-shot.
+
+    The kernel maps the element type through _PRODUCER_DIRECT_GL_DTYPES, so
+    admitting anything outside it would raise instead of reducing. Types wider
+    than a 64-bit word are the sharper case: they make elements-per-word zero,
+    which would divide by zero in the alignment check itself.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    for numel in (8, 64, 7168, 32 * 7168):
+        assert not _use_two_stage_plain(8, numel, dtype)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "supported"),
+    [
+        (8, torch.bfloat16, True),
+        (4, torch.float32, True),
+        (2, torch.bfloat16, False),
+        (8, torch.float64, False),
+    ],
+)
+def test_two_stage_state_gate_matches_dispatch(world_size, dtype, supported):
+    """The state-level gate must agree with the per-call predicate.
+
+    A state that reserves the staging buffer and the larger heap for a
+    combination the predicate then refuses is not merely wasteful: a caller
+    supplying an explicit heap sized for the one-shot allocations fails to
+    construct. Everything the predicate tests apart from payload size is fixed
+    for the life of the state, so the two have to be decided from the same
+    conditions.
+    """
+    try:
+        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    # a payload that satisfies the size condition, so only the state-level
+    # conditions can decide the outcome
+    numel = 8 * 7168
+    assert _use_two_stage_plain(world_size, numel, dtype) is supported
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------

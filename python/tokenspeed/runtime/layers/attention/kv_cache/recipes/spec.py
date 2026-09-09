@@ -35,15 +35,18 @@ SlidingWindowTokens = int | Sequence[int | None] | None
 class CacheGroupSpec:
     """One cache group's scheduler-facing layout.
 
-    A spec declares exactly one geometry shape:
+    A spec declares exactly one geometry shape, and the family names it:
 
-    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — for
-      paged KV-cache consumers, whose CacheBlocks physically hold rows of
-      entries (per-token KV, sliding windows, compressed entries).
-    * **Checkpoint** (``checkpoint_granularity``) — for snapshot-style state
-      groups (recurrent/conv state), whose CacheBlocks each hold one state
-      snapshot taken every ``checkpoint_granularity`` tokens. Such a group
-      has no rows and no pages; only state-family groups may use this shape.
+    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — the
+      ``"history"`` family: paged KV-cache consumers whose CacheBlocks
+      physically hold rows of entries (per-token KV, sliding windows,
+      compressed entries). Retention is full-history or sliding.
+    * **Checkpoint** (``checkpoint_granularity``) — the ``"state"`` family:
+      snapshot-style groups (recurrent/conv state) whose CacheBlocks each
+      hold one state snapshot taken every ``checkpoint_granularity`` tokens.
+      Such a group has no rows and no pages, and a snapshot summarizes
+      everything before it, so nothing in it ever slides out: retention is
+      always full-history.
 
     Family-agnostic consumers address either shape through
     ``block_granularity``; ``page_size`` exists only for row geometry.
@@ -54,8 +57,8 @@ class CacheGroupSpec:
     rows_per_page: int | None = None
     entry_stride_tokens: int | None = None
     sliding_window_tokens: int | None = None
-    # History stores token history; State stores recurrent state. Retention
-    # determines whether either family is full-history or sliding.
+    # History stores token history in rows; State stores recurrent-state
+    # checkpoints. __post_init__ holds the family to its shape.
     family: Family = "history"
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
@@ -82,7 +85,18 @@ class CacheGroupSpec:
                     f"group {self.group_id!r}: checkpoint_granularity must be "
                     f"> 0, got {self.checkpoint_granularity}"
                 )
+            if self.retention != "full_history":
+                raise ValueError(
+                    f"group {self.group_id!r}: a state group keeps checkpoints "
+                    "that never slide out; declare full_history retention"
+                )
             return
+        if self.family == "state":
+            raise ValueError(
+                f"group {self.group_id!r}: a state-family group declares "
+                "checkpoint_granularity; rows of token history -- a sliding "
+                "window included -- are a history-family group"
+            )
         if self.rows_per_page is None or self.entry_stride_tokens is None:
             raise ValueError(
                 f"group {self.group_id!r}: declare either row geometry "
@@ -138,7 +152,8 @@ def _ceil_div(dividend: int, divisor: int) -> int:
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
 
-# Labels whose group is state-family (recurrent state rows, not KV history).
+# Labels whose group is state-family (recurrent-state checkpoints, not rows
+# of KV history).
 STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 
@@ -211,10 +226,9 @@ def compute_cache_group_page_counts(
         protected_pages = max_live_requests * _ceil_div(
             overlap_schedule_depth * decode_input_tokens, block_granularity
         )
-        # Mamba-state kind = family "state" AND retention != sliding_window
-        # (the C++ side keys it the same way); V4's sliding-window state tail
-        # buffers keep the sliding-window formula below.
-        if spec.family == "state" and spec.retention == "full_history":
+        # A state group holds two rolling checkpoints per request (input and
+        # output), whatever the prompt or chunk width.
+        if spec.family == "state":
             total = max_live_requests * 2 + NULL_PAGES
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
@@ -313,8 +327,7 @@ def compute_max_logical_pages_for_capture(
 _LAYER_TYPE_RETENTION: dict[str, Retention] = {
     FULL_ATTENTION: "full_history",
     "sliding_attention": "sliding_window",
-    # State groups ride full_history retention: the C++ side keys the
-    # mamba-state kind on family == State && retention != SlidingWindow.
+    # State groups ride full_history retention: a checkpoint never slides out.
     LINEAR_ATTENTION: "full_history",
     # DSA attends sparsely but retains the full KV history (the indexer
     # selects from it), so its layers publish as full-history groups.
@@ -488,11 +501,10 @@ def layer_group_ids(
     layer_types: Sequence[str],
     sliding_window_tokens: SlidingWindowTokens,
 ) -> list[str]:
-    """Per-layer cache group id — the single derivation the recipes
-    and multi-window models assign ``PagedAttention(group_id=...)`` from
-    (today gpt_oss.py assigns group_id=layer_type, identical in the
-    single-window case), so ``block_tables`` keys line up with the
-    published group specs.
+    """Per-layer cache group id, derived once from the storage labels; the
+    model side never spells these (``bind_cache_groups`` stamps each
+    ``PagedAttention`` from the plan), so ``block_tables`` keys line up with
+    the published group specs by construction.
 
     The id is the bare label unless sliding layers carry more than one
     distinct window (then ``label_<window>``), so single-window models keep
@@ -685,9 +697,8 @@ def apply_pd_transfer_policies(
 ) -> list[CacheGroupSpec]:
     """Stamp PD-disaggregation transfer policies onto group specs.
 
-    Full-history state groups transfer only their trailing snapshot. Sliding
-    state is rolling token history and therefore transfers its complete
-    retained suffix, like an attention-history group.
+    State groups transfer only their trailing checkpoint; history groups --
+    a sliding window included -- transfer their complete retained suffix.
     """
     from dataclasses import replace
 
@@ -695,9 +706,7 @@ def apply_pd_transfer_policies(
         replace(
             spec,
             transfer_policy=(
-                "latest_snapshot"
-                if spec.family == "state" and spec.retention == "full_history"
-                else "full_suffix"
+                "latest_snapshot" if spec.family == "state" else "full_suffix"
             ),
         )
         for spec in specs

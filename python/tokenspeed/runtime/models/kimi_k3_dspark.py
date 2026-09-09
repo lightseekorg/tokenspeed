@@ -39,6 +39,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.embedding import apply_k_rope
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
@@ -51,7 +52,6 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -166,8 +166,13 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
             .reshape(-1, 1, self.qk_rope_head_dim)
             .clone()
         )
-        dummy_q = k_pe.new_empty(k_pe.shape)
-        _, k_pe_rot = self.rotary_emb(positions, dummy_q, k_pe)
+        k_pe_rot = apply_k_rope(
+            positions,
+            k_pe,
+            self.qk_rope_head_dim,
+            self.rotary_emb.cos_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
         latent[..., self.kv_lora_rank :] = k_pe_rot.reshape(
             latent.size(0), self.qk_rope_head_dim
         )
@@ -205,14 +210,6 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("self_attn", prefix),
         )
-        # The draft's MLA layers join the target's full_attention cache
-        # group (K3 publishes 4 groups: full_attention + 3 KDA linear). The
-        # inherited attn_mqa/attn_mha are built without a group_id; tag them so
-        # validate_cache_group_ids binds them to the full_attention table
-        # instead of failing on an empty group_id. Mirrors the target
-        # (kimi_k3.py MLA layer construction).
-        self.self_attn.attn_mqa.group_id = FULL_ATTENTION
-        self.self_attn.attn_mha.group_id = FULL_ATTENTION
         self.layer_id = layer_id
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = DFlashMLP(

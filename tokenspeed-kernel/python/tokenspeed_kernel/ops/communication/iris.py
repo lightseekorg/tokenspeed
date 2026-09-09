@@ -106,6 +106,41 @@ def _use_two_stage_producer_direct(
     )
 
 
+def _use_two_stage_plain(
+    world_size: int,
+    numel: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether a plain all-reduce of ``numel`` should take the two-stage path.
+
+    Args:
+        world_size: Ranks participating in the reduction.
+        numel: Elements in the tensor being reduced.
+        dtype: Element type; sets how many elements pack into a 64-bit word.
+
+    Returns:
+        True when the two-stage reduce-scatter/all-gather can run this shape.
+
+    Unlike the producer-direct threshold this carries no minimum size. Measured
+    on gfx950 at world 8, the two forms are within noise of each other below
+    about 16 tokens of hidden 7168 (one-shot is marginally ahead at some of those
+    shapes), and two-stage pulls away above it: 1.11x at 16 tokens, 1.37x at 32,
+    1.82x at 64. A minimum would buy nothing at the small end and risks sitting
+    in the wrong place as shapes change, so the only condition kept is the
+    kernel's structural one -- the payload has to split evenly into per-rank
+    partitions of whole 64-bit words.
+    """
+    if world_size not in (4, 8):
+        return False
+    # The kernel packs elements into 64-bit words through
+    # _PRODUCER_DIRECT_GL_DTYPES; anything outside it (or wider than a word,
+    # which would make elements_per_word zero) stays on one-shot.
+    if dtype not in _PRODUCER_DIRECT_GL_DTYPES:
+        return False
+    elements_per_word = 8 // dtype.itemsize
+    return numel % (world_size * elements_per_word) == 0
+
+
 # Staging slots the one-shot all-reduce rotates through. Two is enough to keep
 # the reclaim wait off the critical path: a rank may be a whole invocation ahead
 # of its slowest peer before it has to wait for that peer to finish reading.
@@ -375,13 +410,29 @@ class IrisAllReduce(object):
             all_reduce_distribution=1,
         )
 
+        # Whether this state can ever dispatch a two-stage reduction. Platform,
+        # group size and element type are all fixed for the life of the state,
+        # so deciding once here keeps the buffers, the heap estimate and the
+        # dispatch from disagreeing. Only the payload size is per-call, and it
+        # stays in _use_two_stage_plain.
+        self._two_stage_supported = (
+            _platform.is_cdna4
+            and group.size() in (4, 8)
+            and dtype in _PRODUCER_DIRECT_GL_DTYPES
+        )
+
         # Leave generous heap headroom for the symmetric input and Iris
         # bookkeeping such as ring/spinlock flags.
         if heap_size is None:
             buf_bytes = max_numel * dtype.itemsize
             # _input_buf, _attnres_input_buf (2), _producer_direct_scratch_buf,
             # and the staged path's rotating slots (_STAGED_SLOTS).
-            heap_size = max(1 << 28, (4 + _STAGED_SLOTS) * buf_bytes + (16 << 20))
+            buffers = 4 + _STAGED_SLOTS
+            if self._two_stage_supported:
+                # its staging buffer, plus the scratch partition counted as a
+                # whole buffer rather than 1/world_size
+                buffers += 2
+            heap_size = max(1 << 28, buffers * buf_bytes + (16 << 20))
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
@@ -412,6 +463,32 @@ class IrisAllReduce(object):
         self._staged_input_buf = self._ctx.zeros(
             (_STAGED_SLOTS, max_numel), dtype=dtype
         )
+        # Two-stage plain all-reduce. One-shot stages inside its own kernel and
+        # picks a slot from its per-block epoch; the two-stage kernel instead
+        # reads peers' inputs out of symmetric memory, so the payload has to be
+        # staged before launch. That staging cannot share _staged_input_buf --
+        # its slot is chosen by one-shot's kernel from a counter we cannot see --
+        # nor _input_buf, which acquire_outputs hands to producer-direct.
+        #
+        # A single buffer, deliberately: rotating slots from the host does not
+        # survive graph capture, which records the staging copy's address and
+        # replays it unchanged. The kernel's exit barrier is what makes one
+        # buffer safe -- see EXIT_BARRIER.
+        #
+        # Skipped entirely where dispatch could never reach them: a CDNA3 part
+        # or a group of some other size would otherwise reserve a payload
+        # buffer and a scratch partition it can never use, and an explicit
+        # heap_size sized for the previous allocations would fail to fit them.
+        if self._two_stage_supported:
+            self._two_stage_input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
+            # Each rank reduces only its own partition and peers read it at the
+            # same offset, so scratch holds one partition, not the whole payload.
+            self._two_stage_scratch_buf = self._ctx.zeros(
+                (max_numel // self.world_size,), dtype=dtype
+            )
+        else:
+            self._two_stage_input_buf = None
+            self._two_stage_scratch_buf = None
         self._producer_direct_block_size = 512
         # Use one program per tile for small payloads, capped to limit contention.
         self._producer_direct_max_programs = 84
@@ -420,6 +497,17 @@ class IrisAllReduce(object):
         self._producer_direct_ready_flags = self._ctx.zeros(
             (self._producer_direct_max_programs, self.world_size),
             dtype=torch.int32,
+        )
+        # Separate epochs from the producer-direct reduce: in a tensor-parallel
+        # MoE both collectives run inside one layer, and a shared counter would
+        # let one path's epoch satisfy the other's barrier.
+        self._two_stage_ready_flags = (
+            self._ctx.zeros(
+                (self._producer_direct_max_programs, self.world_size),
+                dtype=torch.int32,
+            )
+            if self._two_stage_supported
+            else None
         )
         heap_bases = self._ctx.get_heap_bases()
         self._group_heap_bases = heap_bases[group_ranks].contiguous()
@@ -458,6 +546,20 @@ class IrisAllReduce(object):
             f"tensor numel ({numel}) exceeds iris buffer capacity "
             f"({self.max_numel})"
         )
+        # One-shot has every rank publish the whole payload and read world_size
+        # copies of it, so its cost grows with the payload; the two-stage form
+        # moves 2x however wide the world is. Measured on gfx950 at world 8,
+        # including the staging copy this path pays and one-shot does not:
+        # parity below ~16 tokens of hidden 7168, then 1.11x at 16, 1.37x at 32,
+        # 1.82x at 64. The predicate is the kernel's partitioning requirement,
+        # not a crossover -- see _use_two_stage_plain.
+        # The two-stage kernel stores through a CDNA4 buffer intrinsic, so it is
+        # gated the same way the producer-direct reduce is; older AMD parts keep
+        # the portable one-shot path.
+        if self._two_stage_supported and _use_two_stage_plain(
+            self.world_size, numel, self.dtype
+        ):
+            return self._all_reduce_two_stage(tensor, numel, safe=safe)
         iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, self._block_size),)](
             tensor.view(-1),
             self._staged_input_buf.view(-1),
@@ -517,6 +619,52 @@ class IrisAllReduce(object):
             offset += tensor.numel()
         return offset % self._elements_per_word == 0 and offset <= self.max_numel
 
+    def _all_reduce_two_stage(
+        self, tensor: torch.Tensor, numel: int, safe: bool
+    ) -> torch.Tensor:
+        """Reduce ``tensor`` in place via reduce-scatter then all-gather.
+
+        Args:
+            tensor: Contiguous local contribution; overwritten with the sum.
+            numel: ``tensor.numel()``, already checked against the heap capacity.
+            safe: Return a copy rather than the caller's tensor, matching the
+                one-shot path -- the reduction lands in place either way, so
+                without this the result aliases the input.
+
+        Returns:
+            The reduction across the group; a clone of ``tensor`` when ``safe``.
+        """
+        staged = self._two_stage_input_buf
+        staged[:numel].copy_(tensor.view(-1))
+
+        partition_numel = numel // self.world_size
+        partition_words = partition_numel // self._elements_per_word
+        # 512 threads move 16 bytes each, split evenly across ranks.
+        block_words = 1024 // self.world_size
+        num_tiles = triton.cdiv(partition_words, block_words)
+        num_programs = min(num_tiles, self._producer_direct_max_programs)
+        output = self._producer_direct_output_buf[:numel]
+        iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
+            staged,
+            self._two_stage_scratch_buf,
+            output,
+            self._two_stage_ready_flags,
+            *self._heap_base_addresses,
+            RANK=self._iris_rank,
+            WORLD_SIZE=self.world_size,
+            PARTITION_WORDS=partition_words,
+            BLOCK_WORDS=block_words,
+            NUM_PROGRAMS=num_programs,
+            NUM_TILES=num_tiles,
+            NUM_WARPS=8,
+            ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
+            ELEMENTS_PER_WORD=self._elements_per_word,
+            EXIT_BARRIER=True,
+            num_warps=8,
+        )
+        tensor.view(-1).copy_(output)
+        return tensor.clone() if safe else tensor
+
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
@@ -557,6 +705,7 @@ class IrisAllReduce(object):
                 NUM_WARPS=8,
                 ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
                 ELEMENTS_PER_WORD=self._elements_per_word,
+                EXIT_BARRIER=False,
                 num_warps=8,
             )
         else:
@@ -1037,6 +1186,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    EXIT_BARRIER: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions."""
     block_id = gl.program_id(0)
@@ -1190,6 +1340,34 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             mask=gl.expand_dims(mask, 0),
         )
         tile_id += NUM_PROGRAMS
+
+    if EXIT_BARRIER:
+        # Callers that stage into the symmetric input before launching cannot
+        # rotate buffers safely: under graph capture the staging copy records a
+        # fixed address and replays it, so a rank one invocation ahead would
+        # overwrite an input its slower peers are still reducing. Holding the
+        # kernel until every peer has finished reading makes a single staging
+        # buffer correct by construction, at the price of one more rendezvous.
+        # Producer-direct callers own their input and pass False.
+        reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+        _iris_sync_rank_epoch(
+            ready_flags,
+            block_id,
+            reads_done,
+            local_heap,
+            heap_base_0,
+            heap_base_1,
+            heap_base_2,
+            heap_base_3,
+            heap_base_4,
+            heap_base_5,
+            heap_base_6,
+            heap_base_7,
+            RANK,
+            WORLD_SIZE,
+            NUM_WARPS,
+            PUBLISH=True,
+        )
 
 
 @gluon.jit

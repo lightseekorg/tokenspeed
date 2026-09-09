@@ -23,20 +23,22 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling.triton import dflash2_greedy_path
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 
-def _walk_greedy_path(
+def _greedy_path_torch(
     candidate_ids: torch.Tensor,
     scores: torch.Tensor,
     anchor_token_ids: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Greedily walk a fixed DFlash2 lattice without host-side tensor reads."""
+    """Torch reference for the walk; CUDA batches take the Triton kernel."""
     batch_size, num_steps, top_k = candidate_ids.shape
     out[:, 0].copy_(anchor_token_ids)
     previous = torch.zeros(batch_size, dtype=torch.int64, device=candidate_ids.device)
@@ -52,8 +54,23 @@ def _walk_greedy_path(
     return out
 
 
+def _walk_greedy_path(
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Greedily walk a fixed DFlash2 lattice without host-side tensor reads."""
+    if scores.is_cuda:
+        return dflash2_greedy_path(candidate_ids, scores, anchor_token_ids, out)
+    return _greedy_path_torch(candidate_ids, scores, anchor_token_ids, out)
+
+
 class DFlash2(DFlash):
     """DFlash block runtime with the DFlash2 top-k transition selector."""
+
+    #: Built in wire_target from the wired head's shard geometry.
+    candidate_topk: VocabParallelTopK | None = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -73,6 +90,7 @@ class DFlash2(DFlash):
             nested.get("final_logit_softcapping") or 0.0
         )
         self.candidate_logits_processor: LogitsProcessor | None = None
+        self.candidate_topk: VocabParallelTopK | None = None
 
     def wire_target(self, target_model) -> None:
         super().wire_target(target_model)
@@ -86,12 +104,28 @@ class DFlash2(DFlash):
         self.candidate_logits_processor.final_logit_softcapping = (
             self.final_logit_softcapping if self.final_logit_softcapping > 0 else None
         )
+        processor = self.candidate_logits_processor
+        self.candidate_topk = VocabParallelTopK(
+            self.lm_head,
+            tp_size=processor.tp_size,
+            tp_rank=processor.tp_rank,
+            tp_group=processor.tp_group,
+            vocab_size=self.model.config.vocab_size,
+            top_k=self.selector_top_k,
+            max_rows=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+            logit_scale=processor.logit_scale,
+            softcapping=processor.final_logit_softcapping,
+            skip_all_gather=processor.skip_all_gather,
+            dp_sampling_enabled=processor.dp_sampling_enabled,
+        )
 
     def _compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.candidate_logits_processor is None:
             raise RuntimeError("DFlash2 must be wired to the target before drafting.")
+        if self.candidate_topk.enabled:
+            return self.candidate_topk(hidden_states)
         metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
         logits = self.candidate_logits_processor._get_logits(
             hidden_states, self.lm_head, metadata

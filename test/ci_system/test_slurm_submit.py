@@ -525,6 +525,20 @@ def test_render_script_contains_cluster_requirements():
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
+def test_render_script_carries_the_tokenspeed_mla_override_into_the_container():
+    script = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4, nodes=2),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    container_env = [line for line in script.splitlines() if "--container-env=" in line]
+    assert len(container_env) == 2
+    assert all("INSTALL_TOKENSPEED_MLA_FROM_SOURCE," in line for line in container_env)
+
+
 def test_render_script_mounts_only_allocated_gb300_devices():
     script = render_script(
         Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
