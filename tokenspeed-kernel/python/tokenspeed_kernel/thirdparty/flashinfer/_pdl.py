@@ -61,21 +61,12 @@ def _gdn_pdl_kernel(
 
 
 class _PdlLaunch:
-    def __init__(self, body, args, constant_positions):
-        self.body = body
-        self.dynamic_args = tuple(
-            value for i, value in enumerate(args) if i not in constant_positions
-        )
-        self.constant_args = tuple(args[i] for i in constant_positions)
-        self.constant_positions = constant_positions
+    def __init__(self, launcher):
+        self.launcher = launcher
 
     def launch(self, **kwargs):
-        return _gdn_pdl_kernel(
-            self.body,
-            self.dynamic_args,
-            self.constant_args,
-            self.constant_positions,
-        ).launch(**dict(kwargs, use_pdl=True))
+        kwargs["use_pdl"] = True
+        return self.launcher.launch(**kwargs)
 
 
 class _PdlKernel:
@@ -104,7 +95,16 @@ class _PdlKernel:
         bound.apply_defaults()
         if bound.kwargs:
             raise TypeError("FlashInfer PDL requires a positional device-kernel ABI")
-        return _PdlLaunch(self.body, bound.args, self.constant_positions)
+        args = bound.args
+        dynamic_args = tuple(
+            value for i, value in enumerate(args) if i not in self.constant_positions
+        )
+        constant_args = tuple(args[i] for i in self.constant_positions)
+        return _PdlLaunch(
+            _gdn_pdl_kernel(
+                self.body, dynamic_args, constant_args, self.constant_positions
+            )
+        )
 
 
 def _clone_function(function, namespace):
@@ -139,7 +139,7 @@ def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides)
         namespace[name] = (
             {}
             if isinstance(original, dict)
-            else functools.cache(inspect.unwrap(original))
+            else functools.cache(_clone_function(original, namespace))
         )
     for name in launchers:
         namespace[name] = cute.jit(_clone_function(getattr(module, name), namespace))

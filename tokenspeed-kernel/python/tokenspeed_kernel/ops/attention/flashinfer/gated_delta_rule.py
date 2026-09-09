@@ -61,62 +61,28 @@ platform = current_platform()
 SUPPORTED_HEAD_DIM = 128
 
 _chunk_gated_delta_rule = error_fn
-
-if platform.is_hopper_plus:
-    try:
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            HAS_PREFILL,
-        )
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            chunk_gated_delta_rule as _fi_chunk,
-        )
-
-        if HAS_PREFILL:
-            _chunk_gated_delta_rule = _fi_chunk
-    except ImportError:
-        pass
-
-# Decode / MTP (K-last, SM90+).
 _gated_delta_rule_decode_pretranspose = error_fn
 _gated_delta_rule_mtp = error_fn
+_gated_delta_rule_bf16_mtp = None
 _has_gdn_decode = False
 
 if platform.is_hopper_plus:
     try:
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            HAS_DECODE,
-        )
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
-        )
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            gated_delta_rule_mtp as _fi_mtp,
-        )
-
-        _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
-        _gated_delta_rule_mtp = _fi_mtp
-        _has_gdn_decode = HAS_DECODE
+        from tokenspeed_kernel.thirdparty.flashinfer import gdn as _flashinfer_gdn
     except ImportError:
         pass
-
-# BF16-state MTP kernel: a separate, optional entry point. Needed so
-# gdn_decode_mtp can forward the intermediate-state and per-token state-pool
-# scatter arguments that are not exposed by gated_delta_rule_decode_pretranspose.
-_gated_delta_rule_bf16_mtp = None
-
-if platform.is_hopper_plus:
-    try:
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            HAS_BF16_MTP,
+    else:
+        if _flashinfer_gdn.HAS_PREFILL:
+            _chunk_gated_delta_rule = _flashinfer_gdn.chunk_gated_delta_rule
+        _has_gdn_decode = _flashinfer_gdn.HAS_DECODE
+        _gated_delta_rule_decode_pretranspose = (
+            _flashinfer_gdn.gated_delta_rule_decode_pretranspose
         )
-        from tokenspeed_kernel.thirdparty.flashinfer.gdn import (
-            gated_delta_rule_bf16_mtp as _fi_bf16_mtp,
-        )
-
-        if HAS_BF16_MTP:
-            _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
-    except ImportError:
-        pass
+        _gated_delta_rule_mtp = _flashinfer_gdn.gated_delta_rule_mtp
+        # BF16 MTP exposes intermediate-state/scatter arguments absent from
+        # the single-token entry point, and remains independently optional.
+        if _flashinfer_gdn.HAS_BF16_MTP:
+            _gated_delta_rule_bf16_mtp = _flashinfer_gdn.gated_delta_rule_bf16_mtp
 
 
 def is_available() -> bool:

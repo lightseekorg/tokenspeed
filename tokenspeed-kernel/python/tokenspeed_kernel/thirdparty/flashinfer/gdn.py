@@ -30,8 +30,7 @@ from flashinfer.gdn_kernels.gdn_decode_mtp import (
     get_vec_size_mtp,
 )
 
-# Keep the original optional-backend detection even though these adapters are
-# defined independently of the upstream entry points they wrap.
+# Preserve independent availability checks for optional FlashInfer entry points.
 try:
     from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
 except ImportError:
@@ -187,10 +186,12 @@ def gated_delta_rule_mtp(
 @functools.cache
 def _mtp_runner(enable_pdl: bool):
     from flashinfer.gdn_kernels import gdn_decode_mtp
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
 
     if not enable_pdl:
         return gdn_decode_mtp.run_mtp_decode
+
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+
     return _adapt_module(
         gdn_decode_mtp,
         kernels=("gdn_verify_kernel_mtp", "gdn_verify_kernel_mtp_inline"),
@@ -204,10 +205,12 @@ def _mtp_runner(enable_pdl: bool):
 @functools.cache
 def _bf16_runners(enable_pdl: bool):
     from flashinfer.gdn_kernels import gdn_decode_bf16_state
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
 
     if not enable_pdl:
         return vars(gdn_decode_bf16_state)
+
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
+
     return _adapt_module(
         gdn_decode_bf16_state,
         kernels=(
@@ -233,12 +236,16 @@ def _bf16_runners(enable_pdl: bool):
 
 @functools.cache
 def _decode_runner(enable_pdl: bool):
-    from flashinfer import gdn_decode
-    from flashinfer.gdn_kernels import gdn_decode_pretranspose
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module
-
     if not enable_pdl:
         return _original_decode
+
+    from flashinfer import gdn_decode
+    from flashinfer.gdn_kernels import gdn_decode_pretranspose
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import (
+        _adapt_module,
+        _clone_function,
+    )
+
     pretranspose = _adapt_module(
         gdn_decode_pretranspose,
         kernels=(
@@ -260,24 +267,21 @@ def _decode_runner(enable_pdl: bool):
             _gated_delta_rule_bf16_state=bf16["gated_delta_rule"],
             _gated_delta_rule_bf16_state_mtp=bf16["gated_delta_rule_mtp"],
         )
-    return _adapt_module(
-        gdn_decode,
-        kernels=(),
-        launchers=(),
-        entrypoints=("gated_delta_rule_decode_pretranspose",),
-        caches=(),
-        overrides=overrides,
-    )["gated_delta_rule_decode_pretranspose"]
+    return _clone_function(_original_decode, {**vars(gdn_decode), **overrides})
 
 
 @functools.cache
 def _prefill_runner(enable_pdl: bool):
-    from flashinfer import gdn_prefill
-    from flashinfer.gdn_kernels.blackwell import gdn_prefill as sm100
-    from tokenspeed_kernel.thirdparty.flashinfer._pdl import _adapt_module, _PdlKernel
-
     if not enable_pdl:
         return _original_prefill
+
+    from flashinfer import gdn_prefill
+    from flashinfer.gdn_kernels.blackwell import gdn_prefill as sm100
+    from tokenspeed_kernel.thirdparty.flashinfer._pdl import (
+        _adapt_module,
+        _clone_function,
+        _PdlKernel,
+    )
 
     class PdlGatedDeltaNetChunkedKernel(sm100.GatedDeltaNetChunkedKernel):
         kernel = _PdlKernel(sm100.GatedDeltaNetChunkedKernel.kernel)
@@ -290,16 +294,13 @@ def _prefill_runner(enable_pdl: bool):
         caches=("_get_compiled_cache",),
         overrides={"GatedDeltaNetChunkedKernel": PdlGatedDeltaNetChunkedKernel},
     )
-    return _adapt_module(
-        gdn_prefill,
-        kernels=(),
-        launchers=(),
-        entrypoints=("chunk_gated_delta_rule",),
-        caches=(),
-        overrides={
-            "chunk_gated_delta_rule_sm100": adapted["chunk_gated_delta_rule_sm100"]
+    return _clone_function(
+        _original_prefill,
+        {
+            **vars(gdn_prefill),
+            "chunk_gated_delta_rule_sm100": adapted["chunk_gated_delta_rule_sm100"],
         },
-    )["chunk_gated_delta_rule"]
+    )
 
 
 def gated_delta_rule_decode_pretranspose(*, enable_pdl: bool, **kwargs):

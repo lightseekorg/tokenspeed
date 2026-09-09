@@ -126,7 +126,7 @@ def restore_pdl():
 
 
 @pytest.mark.parametrize("batch", [1, 8])
-@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("steps", [1, 3, 4])
 @pytest.mark.parametrize(
     "solution,state_dtype",
     [
@@ -140,7 +140,8 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
     torch.manual_seed(31)
-    heads, value_heads, dim = 4, 8, 128
+    # TP4 Qwen3.8 uses 4 QK / 12 V heads; MTP with 3 draft steps verifies T=4.
+    heads, value_heads, dim = 4, 12, 128
     rows = batch * steps
     qkv_width = (2 * heads + value_heads) * dim
     qkvz_width = qkv_width + value_heads * dim

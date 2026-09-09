@@ -110,7 +110,9 @@ FlashInfer's placeholder allocation.
 GDN kernel scheduling follows the global `pdl_enabled()` switch across prefill,
 decode and verify. Eager and capture use the same launchers; a captured graph
 retains its capture-time PDL dependency edges and must be recaptured to change
-that choice. See [GDN PDL](gdn-pdl.md) for synchronization and backend coverage.
+that choice. Participating kernels wait before reading inputs and signal at
+the end of computation. FlashInfer adapters retain the original CuTe device
+body and launch geometry, with separate PDL compilation caches.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
