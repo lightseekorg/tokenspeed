@@ -234,7 +234,10 @@ and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources may be re-granted in the
 same plan, so it is launched first and the caller's stream waits on its
 completion event before the plan's page zeroing is enqueued — the zeroing,
-load-backs, forwards and RDMA triggers behind it inherit the fence. The two
+load-backs, forwards and RDMA triggers behind it inherit the fence (the
+forward by waiting on the default stream in its prologue; that wait is
+one-way, the zeroing's and the writeback's own waits are what order the
+default and write streams behind the forwards). The two
 kinds use separate staging lanes: each lane uploads block metadata
 asynchronously and records an event after both metadata copies to protect its
 pinned CPU staging tables — before refilling them, the next submission on

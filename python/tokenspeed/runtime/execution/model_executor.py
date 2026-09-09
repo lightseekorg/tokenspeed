@@ -497,9 +497,11 @@ class ModelExecutor:
         self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
         # own: everything the data plane enqueues outside an explicit stream
-        # context -- page zeroing, the cache ops' fences and start events,
-        # the forward prologue's handshake -- lands here. `execution_stream`
-        # carries the model launches and the runtime-state writes.
+        # context -- page zeroing, the cache ops' fences and start events --
+        # lands here. `execution_stream` carries the model launches and the
+        # runtime-state writes. Dependencies between them are placed by the
+        # consumer: each forward waits on the default stream in its prologue;
+        # zeroing and write-back wait on the execution stream themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
@@ -1236,10 +1238,10 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            # Wait for previous iteration's runtime state updates
-            # (future_input_map, valid_cache_lengths) on execution_stream to
-            # complete before reading them.
-            self.default_stream.wait_stream(self.execution_stream)
+            # Behind the default-stream work the plan enqueued ahead of this
+            # forward: the page zeroing, the retraction write-back's fence,
+            # the multimodal features. The runtime-state reads below need no
+            # cross-stream wait -- their writers ran on execution_stream too.
             self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
