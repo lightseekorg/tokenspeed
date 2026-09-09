@@ -110,13 +110,10 @@ class _StagedAllReduceKernelConfig:
 @dataclass(frozen=True)
 class _ProducerDirectAllReduceKernelConfig:
     supported_world_sizes: tuple[int, ...]
-    packed_word_bytes: int
-    block_size: int
-    max_programs: int
+    one_stage_block_size: int
+    one_stage_max_programs: int
     one_stage_num_subgroups: int
     one_stage_words_per_lane: int
-    two_stage_num_subgroups: int
-    two_stage_words_per_lane: int
     two_stage_min_bytes: tuple[tuple[int, int], ...]
     publish_ready: bool
 
@@ -125,22 +122,17 @@ class _ProducerDirectAllReduceKernelConfig:
             not self.supported_world_sizes
             or len(set(self.supported_world_sizes)) != len(self.supported_world_sizes)
             or any(world_size <= 1 for world_size in self.supported_world_sizes)
-            or self.packed_word_bytes <= 0
-            or self.block_size <= 0
-            or self.max_programs <= 0
+            or self.one_stage_block_size <= 0
+            or self.one_stage_max_programs <= 0
             or self.one_stage_num_subgroups <= 0
             or self.one_stage_words_per_lane <= 0
-            or self.two_stage_num_subgroups <= 0
-            or self.two_stage_words_per_lane <= 0
         ):
             raise ValueError("invalid producer-direct Iris kernel configuration")
         threshold_world_sizes = tuple(
             world_size for world_size, _ in self.two_stage_min_bytes
         )
         if len(set(threshold_world_sizes)) != len(threshold_world_sizes) or any(
-            world_size not in self.supported_world_sizes
-            or min_bytes <= 0
-            or self.two_stage_num_subgroups % world_size != 0
+            world_size not in self.supported_world_sizes or min_bytes <= 0
             for world_size, min_bytes in self.two_stage_min_bytes
         ):
             raise ValueError("invalid producer-direct Iris two-stage thresholds")
@@ -151,35 +143,50 @@ class _ProducerDirectAllReduceKernelConfig:
     def two_stage_threshold(self, world_size: int) -> int | None:
         return dict(self.two_stage_min_bytes).get(world_size)
 
-    def scratch_numel(self, max_numel: int, world_size: int) -> int:
-        if max_numel == 0 or self.two_stage_threshold(world_size) is None:
-            return 0
-        return triton.cdiv(max_numel, world_size)
 
-    def use_two_stage(
+@dataclass(frozen=True)
+class _TwoStageAllReduceKernelConfig:
+    supported_world_sizes: tuple[int, ...]
+    max_programs: int
+    num_subgroups: int
+    words_per_lane: int
+
+    def __post_init__(self) -> None:
+        if (
+            not self.supported_world_sizes
+            or len(set(self.supported_world_sizes)) != len(self.supported_world_sizes)
+            or self.num_subgroups <= 0
+            or any(
+                world_size <= 1 or self.num_subgroups % world_size != 0
+                for world_size in self.supported_world_sizes
+            )
+            or self.max_programs <= 0
+            or self.words_per_lane <= 0
+        ):
+            raise ValueError("invalid two-stage Iris kernel configuration")
+
+    def supports_world_size(self, world_size: int) -> bool:
+        return world_size in self.supported_world_sizes
+
+    def can_partition(
         self,
         world_size: int,
         total_numel: int,
-        dtype: torch.dtype,
+        elements_per_word: int,
     ) -> bool:
-        min_bytes = self.two_stage_threshold(world_size)
-        if min_bytes is None or self.packed_word_bytes % dtype.itemsize != 0:
-            return False
-        elements_per_word = self.packed_word_bytes // dtype.itemsize
         return (
-            total_numel * dtype.itemsize >= min_bytes
+            self.supports_world_size(world_size)
             and total_numel % (world_size * elements_per_word) == 0
         )
 
-    def two_stage_block_words(self, world_size: int, subgroup_size: int) -> int:
-        assert self.two_stage_threshold(world_size) is not None
-        assert self.two_stage_num_subgroups % world_size == 0
-        return (
-            self.two_stage_num_subgroups
-            * subgroup_size
-            * self.two_stage_words_per_lane
-            // world_size
-        )
+    def scratch_numel(self, max_numel: int, world_size: int) -> int:
+        if max_numel == 0 or not self.supports_world_size(world_size):
+            return 0
+        return triton.cdiv(max_numel, world_size)
+
+    def block_words(self, world_size: int, subgroup_size: int) -> int:
+        assert self.supports_world_size(world_size)
+        return self.num_subgroups * subgroup_size * self.words_per_lane // world_size
 
 
 @dataclass(frozen=True)
@@ -219,24 +226,41 @@ class IrisAllReduceKernelConfig:
 
     Attributes:
         subgroup_size: Hardware subgroup width used by the Gluon kernels.
+        packed_word_bytes: Packed element width used by the symmetric kernels.
         staged: Launch and workspace parameters for staged all-reduce.
-        producer_direct: Launch, workspace, and eligibility parameters for
-            producer-direct all-reduce.
+        producer_direct: Launch and eligibility parameters for producer-direct
+            all-reduce.
+        two_stage: Launch and workspace parameters shared by ordinary staged and
+            producer-direct two-stage all-reduce.
         kimi_k3_attnres: Launch and shape parameters for Kimi-K3 AttnRes.
     """
 
     subgroup_size: int
+    packed_word_bytes: int
     staged: _StagedAllReduceKernelConfig
     producer_direct: _ProducerDirectAllReduceKernelConfig
+    two_stage: _TwoStageAllReduceKernelConfig
     kimi_k3_attnres: KimiK3AttnResKernelConfig
 
     def __post_init__(self) -> None:
-        if self.subgroup_size <= 0 or self.subgroup_size & (self.subgroup_size - 1):
-            raise ValueError("Iris subgroup size must be a positive power of two")
+        if (
+            self.subgroup_size <= 0
+            or self.subgroup_size & (self.subgroup_size - 1)
+            or self.packed_word_bytes <= 0
+        ):
+            raise ValueError("invalid Iris all-reduce kernel configuration")
+        if any(
+            not self.two_stage.supports_world_size(world_size)
+            for world_size, _ in self.producer_direct.two_stage_min_bytes
+        ):
+            raise ValueError(
+                "producer-direct two-stage thresholds require kernel support"
+            )
 
 
 IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
     subgroup_size=64,
+    packed_word_bytes=8,
     staged=_StagedAllReduceKernelConfig(
         block_size=2048,
         num_subgroups=4,
@@ -244,15 +268,18 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
     ),
     producer_direct=_ProducerDirectAllReduceKernelConfig(
         supported_world_sizes=(2, 4, 8),
-        packed_word_bytes=8,
-        block_size=512,
-        max_programs=84,
+        one_stage_block_size=512,
+        one_stage_max_programs=84,
         one_stage_num_subgroups=1,
         one_stage_words_per_lane=2,
-        two_stage_num_subgroups=8,
-        two_stage_words_per_lane=2,
         two_stage_min_bytes=((4, 160 << 10), (8, 96 << 10)),
         publish_ready=False,
+    ),
+    two_stage=_TwoStageAllReduceKernelConfig(
+        supported_world_sizes=(4, 8),
+        max_programs=84,
+        num_subgroups=8,
+        words_per_lane=2,
     ),
     kimi_k3_attnres=KimiK3AttnResKernelConfig(
         world_size=8,
@@ -281,15 +308,35 @@ def producer_direct_all_reduce_can_run(
         Whether the group size and element type are supported and the payload is
         positive, packed-word aligned, and within the input-buffer capacity.
     """
-    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
+    kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
+    config = kernel_config.producer_direct
     element_bytes = dtype.itemsize
     return (
         config.supports_world_size(world_size)
         and total_numel > 0
         and dtype in _PRODUCER_DIRECT_GL_DTYPES
-        and config.packed_word_bytes % element_bytes == 0
-        and total_numel % (config.packed_word_bytes // element_bytes) == 0
+        and kernel_config.packed_word_bytes % element_bytes == 0
+        and total_numel % (kernel_config.packed_word_bytes // element_bytes) == 0
         and total_numel * element_bytes <= max_bytes
+    )
+
+
+def _use_two_stage_producer_direct(
+    world_size: int,
+    total_numel: int,
+    dtype: torch.dtype,
+) -> bool:
+    kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
+    min_bytes = kernel_config.producer_direct.two_stage_threshold(world_size)
+    if min_bytes is None or dtype not in _PRODUCER_DIRECT_GL_DTYPES:
+        return False
+    elements_per_word = kernel_config.packed_word_bytes // dtype.itemsize
+    return total_numel * dtype.itemsize >= min_bytes and (
+        kernel_config.two_stage.can_partition(
+            world_size=world_size,
+            total_numel=total_numel,
+            elements_per_word=elements_per_word,
+        )
     )
 
 
@@ -317,16 +364,18 @@ def _use_two_stage_plain(
     kernel's structural one -- the payload has to split evenly into per-rank
     partitions of whole 64-bit words.
     """
-    kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
-    if kernel_config.two_stage_threshold(world_size) is None:
-        return False
     # The kernel packs elements into 64-bit words through
     # _PRODUCER_DIRECT_GL_DTYPES; anything outside it (or wider than a word,
     # which would make elements_per_word zero) stays on one-shot.
     if dtype not in _PRODUCER_DIRECT_GL_DTYPES:
         return False
+    kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
     elements_per_word = kernel_config.packed_word_bytes // dtype.itemsize
-    return numel % (world_size * elements_per_word) == 0
+    return kernel_config.two_stage.can_partition(
+        world_size=world_size,
+        total_numel=numel,
+        elements_per_word=elements_per_word,
+    )
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
@@ -605,10 +654,30 @@ class IrisAllReduce(object):
         self._kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
         producer_config = self._kernel_config.producer_direct
         staged_config = self._kernel_config.staged
-        self._elements_per_word = producer_config.packed_word_bytes // dtype.itemsize
-        self._producer_direct_scratch_numel = producer_config.scratch_numel(
-            max_numel=producer_direct_max_numel,
-            world_size=self.world_size,
+        two_stage_config = self._kernel_config.two_stage
+        self._elements_per_word = (
+            self._kernel_config.packed_word_bytes // dtype.itemsize
+        )
+        self._producer_direct_two_stage_workspace_required = (
+            producer_direct_max_numel > 0
+            and producer_config.two_stage_threshold(self.world_size) is not None
+            and two_stage_config.supports_world_size(self.world_size)
+        )
+        self._producer_direct_scratch_numel = (
+            two_stage_config.scratch_numel(
+                max_numel=producer_direct_max_numel,
+                world_size=self.world_size,
+            )
+            if self._producer_direct_two_stage_workspace_required
+            else 0
+        )
+        self._producer_direct_max_programs = max(
+            producer_config.one_stage_max_programs,
+            (
+                two_stage_config.max_programs
+                if self._producer_direct_two_stage_workspace_required
+                else 0
+            ),
         )
         self._staged_max_programs = staged_config.max_programs(
             max_numel=staged_max_numel
@@ -619,15 +688,18 @@ class IrisAllReduce(object):
         # so deciding once here keeps the buffers, the heap estimate and the
         # dispatch from disagreeing. Only the payload size is per-call, and it
         # stays in _use_two_stage_plain.
-        self._two_stage_supported = (
+        self._staged_two_stage_supported = (
             _platform.is_cdna4
             and staged_max_numel > 0
-            and producer_config.two_stage_threshold(self.world_size) is not None
+            and two_stage_config.supports_world_size(self.world_size)
             and dtype in _PRODUCER_DIRECT_GL_DTYPES
         )
         self._staged_two_stage_scratch_numel = (
-            triton.cdiv(staged_max_numel, self.world_size)
-            if self._two_stage_supported
+            two_stage_config.scratch_numel(
+                max_numel=staged_max_numel,
+                world_size=self.world_size,
+            )
+            if self._staged_two_stage_supported
             else 0
         )
 
@@ -637,14 +709,22 @@ class IrisAllReduce(object):
                 + self._producer_direct_scratch_numel
                 + staged_config.input_slots * staged_max_numel
                 + 2 * attnres_max_numel
-                + (staged_max_numel if self._two_stage_supported else 0)
+                + (staged_max_numel if self._staged_two_stage_supported else 0)
                 + self._staged_two_stage_scratch_numel
             )
             flag_numel = self.world_size * (
                 self._staged_max_programs
                 + 2 * attnres_max_rows
-                + (producer_config.max_programs if producer_direct_max_numel else 0)
-                + (producer_config.max_programs if self._two_stage_supported else 0)
+                + (
+                    self._producer_direct_max_programs
+                    if producer_direct_max_numel
+                    else 0
+                )
+                + (
+                    two_stage_config.max_programs
+                    if self._staged_two_stage_supported
+                    else 0
+                )
             )
             heap_size = max(
                 1 << 28,
@@ -685,7 +765,7 @@ class IrisAllReduce(object):
         )
         output_max_numel = max(
             producer_direct_max_numel,
-            staged_max_numel if self._two_stage_supported else 0,
+            staged_max_numel if self._staged_two_stage_supported else 0,
         )
         self._reduced_output_buf = (
             torch.empty(output_max_numel, dtype=dtype, device=self.device)
@@ -723,22 +803,22 @@ class IrisAllReduce(object):
         # or a group of some other size would otherwise reserve a payload
         # buffer and a scratch partition it can never use, and an explicit
         # heap_size sized for the previous allocations would fail to fit them.
-        if self._two_stage_supported:
-            self._two_stage_input_buf = self._ctx.zeros(
+        if self._staged_two_stage_supported:
+            self._staged_two_stage_input_buf = self._ctx.zeros(
                 (staged_max_numel,), dtype=dtype
             )
             # Each rank reduces only its own partition and peers read it at the
             # same offset, so scratch holds one partition, not the whole payload.
-            self._two_stage_scratch_buf = self._ctx.zeros(
+            self._staged_two_stage_scratch_buf = self._ctx.zeros(
                 (self._staged_two_stage_scratch_numel,), dtype=dtype
             )
         else:
-            self._two_stage_input_buf = None
-            self._two_stage_scratch_buf = None
+            self._staged_two_stage_input_buf = None
+            self._staged_two_stage_scratch_buf = None
         self._producer_direct_ready_flags = (
             self._ctx.zeros(
                 (
-                    producer_config.max_programs,
+                    self._producer_direct_max_programs,
                     self.world_size,
                 ),
                 dtype=torch.int32,
@@ -749,12 +829,12 @@ class IrisAllReduce(object):
         # Separate epochs from the producer-direct reduce: in a tensor-parallel
         # MoE both collectives run inside one layer, and a shared counter would
         # let one path's epoch satisfy the other's barrier.
-        self._two_stage_ready_flags = (
+        self._staged_two_stage_ready_flags = (
             self._ctx.zeros(
-                (producer_config.max_programs, self.world_size),
+                (two_stage_config.max_programs, self.world_size),
                 dtype=torch.int32,
             )
-            if self._two_stage_supported
+            if self._staged_two_stage_supported
             else None
         )
         heap_bases = self._ctx.get_heap_bases()
@@ -804,7 +884,7 @@ class IrisAllReduce(object):
         # The two-stage kernel stores through a CDNA4 buffer intrinsic, so it is
         # gated the same way the producer-direct reduce is; older AMD parts keep
         # the portable one-shot path.
-        if self._two_stage_supported and _use_two_stage_plain(
+        if self._staged_two_stage_supported and _use_two_stage_plain(
             self.world_size, numel, self.dtype
         ):
             return self._all_reduce_two_stage(tensor, numel, safe=safe)
@@ -890,13 +970,13 @@ class IrisAllReduce(object):
         Returns:
             The reduction across the group; a clone of ``tensor`` when ``safe``.
         """
-        staged = self._two_stage_input_buf
+        staged = self._staged_two_stage_input_buf
         staged[:numel].copy_(tensor.view(-1))
 
         partition_numel = numel // self.world_size
         partition_words = partition_numel // self._elements_per_word
-        kernel_config = self._kernel_config.producer_direct
-        block_words = kernel_config.two_stage_block_words(
+        kernel_config = self._kernel_config.two_stage
+        block_words = kernel_config.block_words(
             world_size=self.world_size,
             subgroup_size=self._kernel_config.subgroup_size,
         )
@@ -906,9 +986,9 @@ class IrisAllReduce(object):
         output = self._reduced_output_buf[:numel]
         iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
             staged,
-            self._two_stage_scratch_buf,
+            self._staged_two_stage_scratch_buf,
             output,
-            self._two_stage_ready_flags,
+            self._staged_two_stage_ready_flags,
             *self._heap_base_addresses,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
@@ -916,13 +996,13 @@ class IrisAllReduce(object):
             BLOCK_WORDS=block_words,
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
-            NUM_WARPS=kernel_config.two_stage_num_subgroups,
+            NUM_WARPS=kernel_config.num_subgroups,
             SUBGROUP_SIZE=self._kernel_config.subgroup_size,
-            WORDS_PER_LANE=kernel_config.two_stage_words_per_lane,
+            WORDS_PER_LANE=kernel_config.words_per_lane,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
             ELEMENTS_PER_WORD=self._elements_per_word,
             EXIT_BARRIER=True,
-            num_warps=kernel_config.two_stage_num_subgroups,
+            num_warps=kernel_config.num_subgroups,
         )
         tensor.view(-1).copy_(output)
         return tensor.clone() if safe else tensor
@@ -951,21 +1031,22 @@ class IrisAllReduce(object):
             self._reduced_output_buf,
             tuple(tuple(tensor.shape) for tensor in tensors),
         )
-        use_two_stage = kernel_config.use_two_stage(
+        use_two_stage = _use_two_stage_producer_direct(
             world_size=self.world_size,
             total_numel=total_numel,
             dtype=self.dtype,
         )
         if use_two_stage:
+            two_stage_config = self._kernel_config.two_stage
             assert self._producer_direct_scratch_buf is not None
             partition_numel = total_numel // self.world_size
             partition_words = partition_numel // self._elements_per_word
-            block_words = kernel_config.two_stage_block_words(
+            block_words = two_stage_config.block_words(
                 world_size=self.world_size,
                 subgroup_size=self._kernel_config.subgroup_size,
             )
             num_tiles = triton.cdiv(partition_words, block_words)
-            num_programs = min(num_tiles, kernel_config.max_programs)
+            num_programs = min(num_tiles, two_stage_config.max_programs)
             iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
                 self._input_buf,
                 self._producer_direct_scratch_buf,
@@ -978,18 +1059,18 @@ class IrisAllReduce(object):
                 BLOCK_WORDS=block_words,
                 NUM_PROGRAMS=num_programs,
                 NUM_TILES=num_tiles,
-                NUM_WARPS=kernel_config.two_stage_num_subgroups,
+                NUM_WARPS=two_stage_config.num_subgroups,
                 SUBGROUP_SIZE=self._kernel_config.subgroup_size,
-                WORDS_PER_LANE=kernel_config.two_stage_words_per_lane,
+                WORDS_PER_LANE=two_stage_config.words_per_lane,
                 ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
                 ELEMENTS_PER_WORD=self._elements_per_word,
                 EXIT_BARRIER=False,
-                num_warps=kernel_config.two_stage_num_subgroups,
+                num_warps=two_stage_config.num_subgroups,
             )
         else:
-            block_size = kernel_config.block_size
+            block_size = kernel_config.one_stage_block_size
             num_tiles = triton.cdiv(total_numel, block_size)
-            num_programs = min(num_tiles, kernel_config.max_programs)
+            num_programs = min(num_tiles, kernel_config.one_stage_max_programs)
             iris_reduce_symmetric_gluon_kernel[(num_programs,)](
                 self._input_buf,
                 self._reduced_output_buf,

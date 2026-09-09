@@ -22,6 +22,7 @@
 import socket
 import sys
 import traceback
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -206,17 +207,18 @@ def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     try:
         from tokenspeed_kernel.ops.communication.iris import (
             IRIS_ALL_REDUCE_KERNEL_CONFIG,
+            _use_two_stage_producer_direct,
         )
     except ImportError:
         pytest.skip("iris is not installed")
 
-    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
+    config = IRIS_ALL_REDUCE_KERNEL_CONFIG
     alignment = world_size * (config.packed_word_bytes // dtype.itemsize)
     min_numel = min_bytes // dtype.itemsize
-    assert config.use_two_stage(world_size, min_numel, dtype)
-    assert not config.use_two_stage(world_size, min_numel - alignment, dtype)
-    assert not config.use_two_stage(world_size, min_numel + 1, dtype)
-    assert not config.use_two_stage(2, min_numel, dtype)
+    assert _use_two_stage_producer_direct(world_size, min_numel, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel - alignment, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel + 1, dtype)
+    assert not _use_two_stage_producer_direct(2, min_numel, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -240,6 +242,28 @@ def test_plain_two_stage_admits_partitionable_shapes(dtype):
     assert not _use_two_stage_plain(8, aligned + 1, dtype)
     # world sizes without a tuned partitioning fall back
     assert not _use_two_stage_plain(2, aligned, dtype)
+
+
+def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
+    try:
+        from tokenspeed_kernel.ops.communication import iris as iris_ops
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG
+    monkeypatch.setattr(
+        iris_ops,
+        "IRIS_ALL_REDUCE_KERNEL_CONFIG",
+        replace(
+            config,
+            producer_direct=replace(
+                config.producer_direct,
+                two_stage_min_bytes=(),
+            ),
+        ),
+    )
+    assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
+    assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
@@ -372,30 +396,53 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             device=device,
         )
         assert state._input_buf.numel() == producer_direct_max_numel
-        scratch_numel = kernel_config.producer_direct.scratch_numel(
-            max_numel=producer_direct_max_numel,
-            world_size=world_size,
+        producer_direct_two_stage = kernel_config.producer_direct.two_stage_threshold(
+            world_size
+        ) is not None and kernel_config.two_stage.supports_world_size(world_size)
+        scratch_numel = (
+            kernel_config.two_stage.scratch_numel(
+                max_numel=producer_direct_max_numel,
+                world_size=world_size,
+            )
+            if producer_direct_two_stage
+            else 0
         )
         if scratch_numel:
             assert state._producer_direct_scratch_buf.numel() == scratch_numel
         else:
             assert state._producer_direct_scratch_buf is None
+        assert state._producer_direct_ready_flags.shape == (
+            max(
+                kernel_config.producer_direct.one_stage_max_programs,
+                (
+                    kernel_config.two_stage.max_programs
+                    if producer_direct_two_stage
+                    else 0
+                ),
+            ),
+            world_size,
+        )
         assert state._staged_input_buf.shape == (
             kernel_config.staged.input_slots,
             staged_max_numel,
         )
-        if state._two_stage_supported:
-            assert state._two_stage_input_buf.numel() == staged_max_numel
+        if state._staged_two_stage_supported:
+            assert state._staged_two_stage_input_buf.numel() == staged_max_numel
             assert (
-                state._two_stage_scratch_buf.numel()
+                state._staged_two_stage_scratch_buf.numel()
                 == (staged_max_numel + world_size - 1) // world_size
             )
+            assert state._staged_two_stage_ready_flags.shape == (
+                kernel_config.two_stage.max_programs,
+                world_size,
+            )
         else:
-            assert state._two_stage_input_buf is None
-            assert state._two_stage_scratch_buf is None
+            assert state._staged_two_stage_input_buf is None
+            assert state._staged_two_stage_scratch_buf is None
+            assert state._staged_two_stage_ready_flags is None
         output_max_numel = max(
             producer_direct_max_numel,
-            staged_max_numel if state._two_stage_supported else 0,
+            staged_max_numel if state._staged_two_stage_supported else 0,
         )
         assert state._reduced_output_buf.numel() == output_max_numel
         if attnres_max_numel:
