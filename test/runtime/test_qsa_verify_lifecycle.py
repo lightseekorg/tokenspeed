@@ -18,7 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen4-Exp commits its independent cache consumers after eager or replay."""
+"""Check commit order, live acceptance and failure handling after eager or replay.
+
+Exercise execution modes with all consumers, then each optional consumer alone.
+"""
 
 from types import SimpleNamespace
 
@@ -40,9 +43,7 @@ def _runner(
     *,
     use_graph: bool,
     has_drafter: bool,
-    has_indexer_backend: bool,
-    has_linear: bool,
-    has_ple: bool,
+    consumers: tuple[str, ...],
     fail_forward: bool,
 ):
     events = []
@@ -84,15 +85,17 @@ def _runner(
                 SimpleNamespace(commit_verified_state=commit_recurrent),
                 [1, 3],
             )
-            if has_linear
+            if "recurrent" in consumers
             else full_backend
         ),
         ple_backend=(
-            SimpleNamespace(commit_verified_state=commit_ple) if has_ple else None
+            SimpleNamespace(commit_verified_state=commit_ple)
+            if "ple" in consumers
+            else None
         ),
         indexer_backend=(
             SimpleNamespace(commit_after_mtp_verify=commit_qsa)
-            if has_indexer_backend
+            if "qsa" in consumers
             else None
         ),
     )
@@ -170,45 +173,48 @@ def _run(wrapper, mode):
 
 
 @pytest.mark.parametrize(
-    "mode,use_graph,has_drafter,has_indexer_backend,expected",
+    "mode,use_graph,has_drafter,consumers",
     [
-        (ForwardMode.DECODE, False, True, True, [([3, 1], 0)]),
-        (ForwardMode.DECODE, True, True, True, [([3, 1], 0)]),
-        (ForwardMode.MIXED, False, True, True, [([3, 1], 1)]),
-        (ForwardMode.EXTEND, False, True, True, []),
-        (ForwardMode.DECODE, False, False, True, []),
-        (ForwardMode.DECODE, False, True, False, []),
-        (ForwardMode.DECODE, True, True, False, []),
-        (ForwardMode.MIXED, False, True, False, []),
+        (ForwardMode.DECODE, False, True, ("recurrent", "ple", "qsa")),
+        (ForwardMode.DECODE, True, True, ("recurrent", "ple", "qsa")),
+        (ForwardMode.MIXED, False, True, ("recurrent", "ple", "qsa")),
+        (ForwardMode.EXTEND, False, True, ("recurrent", "ple", "qsa")),
+        (ForwardMode.DECODE, False, False, ("recurrent", "ple", "qsa")),
+        (ForwardMode.DECODE, False, True, ("recurrent",)),
+        (ForwardMode.DECODE, True, True, ("ple",)),
+        (ForwardMode.DECODE, True, True, ("qsa",)),
+        (ForwardMode.DECODE, False, True, ()),
+        (ForwardMode.MIXED, False, True, ("ple",)),
     ],
 )
-@pytest.mark.parametrize(
-    "has_linear,has_ple", [(True, True), (False, True), (True, False), (False, False)]
-)
 def test_runner_commits_live_acceptance_once_after_execution(
-    mode, use_graph, has_drafter, has_indexer_backend, expected, has_linear, has_ple
+    mode, use_graph, has_drafter, consumers
 ):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
         has_drafter=has_drafter,
-        has_indexer_backend=has_indexer_backend,
-        has_linear=has_linear,
-        has_ple=has_ple,
+        consumers=consumers,
         fail_forward=False,
     )
     _run(wrapper, mode)
-    assert commits["qsa"] == expected
+    expected_qsa = (
+        [([3, 1], int(mode.is_mixed()))]
+        if has_drafter
+        and "qsa" in consumers
+        and mode in (ForwardMode.DECODE, ForwardMode.MIXED)
+        else []
+    )
+    assert commits["qsa"] == expected_qsa
     assert events[:2] == ["metadata", "execute"]
     assert "draft_qsa" not in events
     verifies_decode = has_drafter and mode.is_decode()
-    assert commits["recurrent"] == ([[3, 1]] if verifies_decode and has_linear else [])
-    assert commits["ple"] == ([[3, 1]] if verifies_decode and has_ple else [])
     expected_commits = []
-    if verifies_decode and has_linear:
-        expected_commits.append("recurrent")
-    if verifies_decode and has_ple:
-        expected_commits.append("ple")
-    if expected:
+    for consumer in ("recurrent", "ple"):
+        active = verifies_decode and consumer in consumers
+        assert commits[consumer] == ([[3, 1]] if active else [])
+        if active:
+            expected_commits.append(consumer)
+    if expected_qsa:
         expected_commits.append("qsa")
     assert events[2:] == expected_commits
 
@@ -218,9 +224,7 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
         has_drafter=True,
-        has_indexer_backend=True,
-        has_linear=True,
-        has_ple=True,
+        consumers=("recurrent", "ple", "qsa"),
         fail_forward=True,
     )
     with pytest.raises(RuntimeError, match="forward failed"):

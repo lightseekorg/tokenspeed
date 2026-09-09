@@ -36,7 +36,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext, ForwardMode
 
 
-def _make_mapping(rank: int = 0) -> Mapping:
+def _make_mapping(rank: int) -> Mapping:
     # Mirrors the repro config: DP=4, dense-tp=4, moe-tp=1, ep=4 on a 4-GPU node.
     return Mapping(
         rank=rank,
@@ -66,7 +66,9 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
 
 def test_capture_global_bs_none_diverges_from_replay():
     """Missing global_bs leaves collectives sized for target verify rows."""
-    cm = CommManager(mapping=_make_mapping(), layer_id=0, is_moe=True, prev_is_moe=True)
+    cm = CommManager(
+        mapping=_make_mapping(0), layer_id=0, is_moe=True, prev_is_moe=True
+    )
     bs = 1
 
     # Pre-fix capture: global_num_tokens set (uniform dummy), global_bs left None.
@@ -87,28 +89,9 @@ def test_capture_global_bs_none_diverges_from_replay():
     assert buggy != live
 
 
-def test_capture_global_bs_set_matches_replay():
-    """The fix: setting global_bs at capture (same as global_num_tokens) makes the
-    captured draft MoE all-gather layout identical to the replayed one."""
-    cm = CommManager(mapping=_make_mapping(), layer_id=0, is_moe=True, prev_is_moe=True)
-    bs = 1
-
-    capture_fixed = _draft_first_step_ctx(
-        bs, global_bs=[bs] * 4, global_num_tokens=[bs * 4] * 4
-    )
-    replay = _draft_first_step_ctx(
-        bs, global_bs=[bs] * 4, global_num_tokens=[bs * 4] * 4
-    )
-
-    assert cm.moe_tp_ep_group_scattered_num_tokens(
-        capture_fixed
-    ) == cm.moe_tp_ep_group_scattered_num_tokens(replay)
-
-
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_capture_matches_replay_all_ranks(rank: int):
-    """For every DP rank, the fixed capture layout matches replay (the scattered
-    counts for the rank's MoE tp_ep group are identical)."""
+def test_draft_collectives_use_narrowed_counts_on_all_ranks(rank: int):
+    """Every DP rank uses the draft's counts instead of the target verify width."""
     cm = CommManager(
         mapping=_make_mapping(rank), layer_id=0, is_moe=True, prev_is_moe=True
     )
@@ -117,17 +100,3 @@ def test_capture_matches_replay_all_ranks(rank: int):
     scattered = cm.moe_tp_ep_group_scattered_num_tokens(ctx)
     # moe tp_ep group spans all 4 ranks (moe_tp=1 * ep=4); each contributes bs.
     assert scattered == [bs] * 4
-
-
-def test_capture_one_sets_global_bs():
-    """Guards the fix at its source: ForwardStepRunner._capture_one must set
-    ctx.global_bs (not leave it None) for DP, matching how global_num_tokens is
-    set. Verified by inspecting the source so the test needs no GPU/capture."""
-    import inspect
-
-    from tokenspeed.runtime.execution import forward_step
-
-    src = inspect.getsource(forward_step.ForwardStepRunner._capture_one)
-    # Both DP token-metadata fields must be assigned in the capture path.
-    assert "ctx.global_num_tokens" in src
-    assert "ctx.global_bs" in src

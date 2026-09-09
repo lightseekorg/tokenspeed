@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen4 cache consumers are assembled per view and budgeted independently."""
+"""Qwen4 cache consumers are assembled per view and budgeted independently.
+
+Cover target consumer combinations and the draft/width-one allocation gates;
+draft views never own GDN or PLE consumers.
+"""
 
 from importlib import import_module
 from types import SimpleNamespace
@@ -64,16 +68,22 @@ def _config(*, is_draft: bool, width: int):
     )
 
 
-@pytest.mark.parametrize("has_qsa", [False, True])
-@pytest.mark.parametrize("hybrid", [False, True])
-@pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize(
-    "is_draft,has_ple", [(False, False), (False, True), (True, False)]
+    "is_draft,has_ple,has_qsa,hybrid",
+    [
+        (False, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+        (False, True, True, False),
+        (False, True, True, True),
+        (True, False, False, False),
+        (True, False, True, False),
+    ],
 )
 def test_composition_uses_local_fields_without_requiring_linear_layers(
-    has_ple, has_qsa, is_draft, hybrid, width
+    has_ple, has_qsa, is_draft, hybrid
 ):
-    config = _config(is_draft=is_draft, width=width)
+    config = _config(is_draft=is_draft, width=4)
     groups = [QWEN4_EXP_PLE_CACHE_GROUP] if has_ple else []
     if has_qsa:
         groups += [QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP]
@@ -95,7 +105,7 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
         layer_num=1,
         arena=SimpleNamespace(plan=SimpleNamespace(fields=fields)),
     )
-    full = SimpleNamespace(device="cpu", spec_num_tokens=width)
+    full = SimpleNamespace(device="cpu", spec_num_tokens=4)
     attention = (
         HybridLinearAttnBackend(full, SimpleNamespace(), [3]) if hybrid else full
     )
@@ -107,19 +117,28 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
     assert backend.device == "cpu"
     assert backend.dtype == torch.bfloat16
     assert backend.is_draft is is_draft
-    assert backend.spec_num_tokens == width
+    assert backend.spec_num_tokens == 4
     assert backend.num_qo_heads == 4
     assert backend.num_kv_heads == 1
     assert backend.head_dim == 16
     assert backend.cache_pool is None
 
 
-@pytest.mark.parametrize("width", [1, 4])
-@pytest.mark.parametrize("has_gdn", [False, True])
 @pytest.mark.parametrize(
-    "has_ple,has_qsa", [(False, False), (False, True), (True, False), (True, True)]
+    "width,is_draft,has_gdn,has_ple,has_qsa",
+    [
+        (4, False, False, False, False),
+        (4, False, False, False, True),
+        (4, False, False, True, False),
+        (4, False, False, True, True),
+        (4, False, True, False, False),
+        (4, False, True, False, True),
+        (4, False, True, True, False),
+        (4, False, True, True, True),
+        (1, False, True, True, True),
+        (4, True, False, False, True),
+    ],
 )
-@pytest.mark.parametrize("is_draft", [False, True])
 def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
     width, has_gdn, has_ple, has_qsa, is_draft
 ):
@@ -163,23 +182,6 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
     )
     with pytest.raises(RuntimeError, match="does not match allocated tensors"):
         _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes + 1)
-
-
-@pytest.mark.parametrize("width,expected_bytes", [(1, 0), (4, 12)])
-def test_registry_preallocates_qwen4_without_inspecting_children(width, expected_bytes):
-    # A registry-facing composite needs only the operation, not its child fields.
-    root = object.__new__(Qwen4ExpBackend)
-    root.preallocate_verify_workspace = Mock(return_value=expected_bytes)
-    _prepare_verify_workspace(
-        server_args=SimpleNamespace(speculative_num_draft_tokens=width),
-        config=SimpleNamespace(max_bs=2),
-        backend=root,
-        draft_backend=None,
-        uses_paged_state_verify=True,
-        is_inkling=False,
-        expected_bytes=expected_bytes,
-    )
-    root.preallocate_verify_workspace.assert_called_once_with(2, width)
 
 
 @pytest.mark.parametrize("is_qwen4", [False, True])

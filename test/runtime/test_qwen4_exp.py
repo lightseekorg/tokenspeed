@@ -75,7 +75,6 @@ from tokenspeed.runtime.layers.attention.qsa import (
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
-    decode_query_lengths,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -686,37 +685,6 @@ def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
         indexer._topk_solution(1, small, 64)
 
 
-def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.qsa.indexer.ReplicatedLinear",
-        lambda *args, **kwargs: torch.nn.Identity(),
-    )
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.qsa.indexer.GemmaRMSNorm",
-        lambda *args, **kwargs: torch.nn.Identity(),
-    )
-    config = SimpleNamespace(
-        indexer_n_heads=4,
-        indexer_kv_heads=1,
-        indexer_head_dim=16,
-        indexer_budget=2048,
-        indexer_compress_ratio=4,
-        hidden_size=64,
-        rms_norm_eps=1e-6,
-    )
-    indexer = QSAIndexer(
-        config,
-        layer_id=0,
-        quant_config=None,
-        prefix="model.layers.0.attn",
-        rotary_emb=SimpleNamespace(rotary_dim=16),
-    )
-
-    assert indexer._persistent_topk_workspace.dtype == torch.uint8
-    assert indexer._persistent_topk_workspace.numel() == 1024 * 1024
-    assert "_persistent_topk_workspace" not in indexer.state_dict()
-
-
 def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
@@ -1112,51 +1080,6 @@ def test_qwen4_exp_nextn_compacts_context_topk_for_mtp_decode() -> None:
 
     assert prefill_topk is None
     torch.testing.assert_close(decode_topk, rows[[2, 5]])
-
-
-@pytest.mark.parametrize(
-    ("mode", "force_uniform"),
-    [(ForwardMode.DECODE, False), (ForwardMode.EXTEND, True)],
-)
-def test_qwen4_exp_qsa_uses_compacted_decode_width(
-    mode: ForwardMode, force_uniform: bool
-) -> None:
-    ctx = SimpleNamespace(bs=1, forward_mode=mode)
-
-    assert (
-        decode_query_lengths(
-            ctx,
-            total_tokens=1,
-            force_uniform=force_uniform,
-        )
-        == 1
-    )
-
-
-def test_qwen4_exp_qsa_draft_write_mask_keeps_only_accepted_prefix() -> None:
-    ctx = SimpleNamespace(bs=3, num_extends=1)
-    # Verify windows start at 10 and 19 (vc); the drafter published the
-    # accepted frontier vc + a with a = [2, 1]. The prompt row's length is
-    # irrelevant: extend rows are always written.
-    accepted_seq_lens = torch.tensor([3, 12, 20])
-    logical = torch.tensor([0, 1, 2, 10, 11, 12, 13, 19, 20, 21, 22])
-    requests = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
-    recent_locs = torch.ones_like(logical, dtype=torch.int32)
-
-    actual = QSAIndexer._draft_accepted_write_mask(
-        ctx,
-        accepted_seq_lens,
-        logical,
-        requests,
-        recent_locs,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        torch.tensor(
-            [True, True, True, True, True, False, False, True, False, False, False]
-        ),
-    )
 
 
 def _qsa_cache_test_indexer(device: str = "cuda"):

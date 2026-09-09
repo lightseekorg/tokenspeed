@@ -188,23 +188,6 @@ def test_qsa_indexer_workspace_cannot_be_rebound(state) -> None:
     assert backend._verify_state._verify_workspace is workspace
 
 
-def test_qsa_state_does_not_leak_between_target_and_draft(state, commit_calls) -> None:
-    _, target = _root_with_indexer(
-        _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
-    )
-    draft, draft_indexer = _root_with_indexer(
-        _qsa_config(max_bs=8, is_draft=True, device="cpu"), state.cache_pool
-    )
-    target.preallocate_verify_workspace(8, 4)
-    target.verify_staging_buffers(1, 2)
-    assert target._verify_state is not None
-    assert draft_indexer._verify_state is None
-    draft.commit_speculative_state_after_verify(
-        torch.tensor([3, 1], dtype=torch.int32), num_extends=0
-    )
-    assert commit_calls == []
-
-
 @pytest.mark.parametrize("layer_offset", [0, 5])
 def test_qsa_commit_uses_only_owned_layers_once(commit_calls, layer_offset) -> None:
     pool = _qsa_pool(device="cpu", layer_offset=layer_offset)
@@ -387,18 +370,24 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
 
 
 @pytest.mark.parametrize("is_draft,width", [(False, 1), (True, 4)])
-def test_qsa_only_target_verification_creates_state(is_draft, width) -> None:
+def test_qsa_only_target_verification_creates_state(
+    is_draft, width, commit_calls
+) -> None:
     config = replace(
         _qsa_config(max_bs=8, is_draft=is_draft, device="cpu"),
         speculative_num_draft_tokens=width,
     )
-    _, backend = _root_with_indexer(config, _qsa_pool(device="cpu", layer_offset=0))
+    root, backend = _root_with_indexer(config, _qsa_pool(device="cpu", layer_offset=0))
     assert backend._verify_state is None
     with pytest.raises(ValueError, match="speculative target"):
         QSAVerifyState(config, _qsa_pool(device="cpu", layer_offset=0))
     assert backend.preallocate_verify_workspace(8, width) == 0
     with pytest.raises(RuntimeError, match="speculative target"):
         backend.verify_staging_buffers(1, 2)
+    root.commit_speculative_state_after_verify(
+        torch.tensor([3, 1], dtype=torch.int32), num_extends=0
+    )
+    assert commit_calls == []
 
 
 def test_qsa_raw_tables_refresh_in_place_and_clear_padding() -> None:
