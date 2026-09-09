@@ -39,24 +39,40 @@ class TierTransferManager {
 public:
     explicit TierTransferManager(CacheCoordinator& coordinator) : coordinator_{coordinator} {}
 
-    std::optional<WriteBackOperation> StartPendingStores();
+    // Drains the coordinator's pending store candidates into one write-back
+    // op. `guard` says how the Device sources are protected while the copy is
+    // in flight (see StoreSourceGuard): every candidate drained by this call
+    // gets the same guard, so a retraction's kStreamOrdered drain also covers
+    // ordinary candidates queued earlier in the round -- a superset that is
+    // always safe, only slower.
+    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
+    // Pinned stores hold Device capacity that returns by itself at the ACK;
+    // the scheduler defers retraction while any is in flight rather than
+    // sacrificing a request for capacity that is about to free.
+    bool HasPinnedStoresInFlight() const;
     bool HasAnyInFlight() const { return !write_backs_.empty() || !load_backs_.empty(); }
 
 private:
-    // A store ticket pins only its Host destination. The Device source may
-    // be reused (even freed and re-granted) the moment the store is issued:
-    // the runtime enqueues the D2H copy on the forward thread's stream ahead
-    // of any subsequent write to those pages, so the snapshot reads the old
-    // bytes. The ACK's one job is publishing the Host entry (CacheHostBlock).
+    // A store ticket always pins its Host destination; the ACK's one job is
+    // publishing that entry (CacheHostBlock). Whether it also pins the Device
+    // source is the op's StoreSourceGuard: kPinnedUntilAck keeps the source
+    // cached and unevictable until the ACK, kStreamOrdered leaves it empty
+    // and relies on the runtime ordering the copy ahead of any reuse.
     struct StoreTicket {
         CacheKey key;
+        CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
+    };
+
+    struct InFlightWriteBack {
+        StoreSourceGuard guard;
+        std::vector<StoreTicket> tickets;
     };
 
     std::uint32_t nextOpId() { return next_op_id_++; }
@@ -64,7 +80,7 @@ private:
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
 
     CacheCoordinator& coordinator_;
-    std::unordered_map<std::uint32_t, std::vector<StoreTicket>> write_backs_;
+    std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;
     std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;

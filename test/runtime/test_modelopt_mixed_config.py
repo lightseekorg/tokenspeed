@@ -228,9 +228,19 @@ _FP8_PB_WO_LAYERS = {
 }
 
 
-def test_from_config_accepts_fp8_pb_wo():
-    config = _renamed_config(_FP8_PB_WO_LAYERS)
-    assert config._resolve_quant_algo("model.layers.4.self_attn.o_proj") == "FP8_PB_WO"
+@pytest.mark.parametrize("algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
+def test_from_config_accepts_fp8_pb_wo_aliases(algo: str):
+    config = ModelOptMixedConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "mtp.layers.0.mlp.experts": {"quant_algo": algo},
+            },
+        }
+    )
+    assert config.quantized_layers == {
+        "mtp.layers.0.mlp.experts": "FP8_PB_WO",
+    }
     assert config.has_fp8_pb_wo
     # FP8_PB_WO aliases to FP8_BLOCK_SCALES: DeepSeek-style w8a8 with
     # ModelOpt's fixed 128x128 block shape and non-ue8m0 float32 scales.
@@ -537,12 +547,23 @@ def test_preprocess_passthrough_without_fp8_pb_wo():
     assert list(preprocess_fp8_pb_wo_weights(iter(stream), None)) == stream
 
 
-def test_moe_weight_dtype_rejects_fp8_pb_wo_experts():
+def test_moe_fp8_pb_wo_experts_resolve_block_scale_config():
     config = _renamed_config(
-        {"language_model.model.layers.5.mlp.experts.0.w1": {"quant_algo": "FP8_PB_WO"}}
+        {
+            "language_model.model.layers.5.mlp.experts.0.w1": {
+                "quant_algo": "FP8_BLOCK_SCALES"
+            }
+        }
     )
-    with pytest.raises(ValueError, match="no MoE kernel path"):
-        config.moe_weight_dtype("model.layers.5.mlp.experts")
+
+    moe_config = config.get_moe_quant_config("model.layers.5.mlp.experts")
+
+    assert moe_config is config.fp8_block_scales_config
+    assert moe_config.is_checkpoint_fp8_serialized
+    assert moe_config.activation_scheme == "dynamic"
+    assert moe_config.weight_block_size == [128, 128]
+    assert moe_config.scale_fmt is None
+    assert config.moe_weight_dtype("model.layers.5.mlp.experts") == "fp8"
 
 
 def test_from_config_rejects_missing_quantized_layers():
@@ -589,13 +610,27 @@ def test_ambiguous_child_scan_raises():
         config._resolve_quant_algo("model.layers.3.block_sparse_moe")
 
 
-def test_moe_weight_dtype_prefers_experts_subtree():
+def test_moe_quant_config_prefers_experts_subtree():
     config = _renamed_config()
-    assert config.moe_weight_dtype("model.layers.3.block_sparse_moe.experts") == "nvfp4"
+    assert (
+        config.get_moe_quant_config("model.layers.3.block_sparse_moe.experts")
+        is config.nvfp4_config
+    )
     # A MoE block prefix must not be captured by the MXFP8 shared experts.
+    assert (
+        config.get_moe_quant_config("model.layers.3.block_sparse_moe")
+        is config.nvfp4_config
+    )
     assert config.moe_weight_dtype("model.layers.3.block_sparse_moe") == "nvfp4"
+
+    mxfp8 = ModelOptMixedConfig(
+        quantized_layers={"model.layers.4.mlp.experts": "MXFP8"}
+    )
+    assert mxfp8.get_moe_quant_config("model.layers.4.mlp") is mxfp8.mxfp8_config
+    assert mxfp8.moe_weight_dtype("model.layers.4.mlp") == "fp8"
+
     with pytest.raises(ValueError, match="MoE prefix"):
-        config.moe_weight_dtype("model.layers.99.block_sparse_moe")
+        config.get_moe_quant_config("model.layers.99.block_sparse_moe")
 
 
 def test_minimax_m3_quant_rename_table_matches_module_prefixes():

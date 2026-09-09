@@ -53,9 +53,24 @@ struct CacheTransferHash {
     }
 };
 
+// How a store's Device source is protected while its D2H copy is in flight.
+enum class StoreSourceGuard : std::uint8_t {
+    // The scheduler pins the Device block until the runtime acknowledges the
+    // copy: it stays cached and unevictable, so the runtime may copy it on
+    // any stream, off the forward's critical path. Ordinary publication.
+    kPinnedUntilAck,
+    // The Device block is released -- and may be re-granted -- the moment the
+    // store issues; the runtime must order the copy on the forward thread's
+    // stream ahead of the plan's page reuse. A retraction's snapshot: the
+    // victim's pages are granted away in the same round.
+    kStreamOrdered,
+};
+
 struct WriteBackOperation {
     std::uint32_t op_id{0};
     std::vector<CacheTransfer> transfers;  // DEVICE→HOST.
+    // False is the safe reading: the runtime orders the copy ahead of reuse.
+    bool source_pinned{false};
 };
 
 struct WriteBackBatch {
@@ -63,6 +78,10 @@ struct WriteBackBatch {
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    // Per op: whether the scheduler holds the Device sources until the ACK
+    // (see StoreSourceGuard). The runtime must order an unpinned op's copy
+    // ahead of the plan's page zeroing; a pinned op may ride any stream.
+    std::vector<bool> source_pinned;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
@@ -82,6 +101,7 @@ struct WriteBackBatch {
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            source_pinned.push_back(op.source_pinned);
         }
     }
 };

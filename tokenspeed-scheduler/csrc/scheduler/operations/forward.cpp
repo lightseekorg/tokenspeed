@@ -704,7 +704,10 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
         coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);
-        if (auto write_back = tier_transfers_.StartPendingStores()) {
+        // The victim's pages are granted away in this very round, so the
+        // ticket cannot pin them: the runtime orders the copy on the forward
+        // thread's stream ahead of the plan's page reuse instead.
+        if (auto write_back = tier_transfers_.StartPendingStores(StoreSourceGuard::kStreamOrdered)) {
             write_back_operations.push_back(std::move(*write_back));
         }
     }
@@ -732,7 +735,9 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
 // A readmission's failed admission never reaches here (its phase records no
 // blocker): when the readmission needs a victim, the two simply do not fit
 // together, and swapping them is pure thrash -- it waits for a completion
-// instead.
+// instead. Likewise while an ordinary (pinned) store is in flight: its
+// Device pages come back at the ACK without anyone giving way, so retracting
+// for capacity they hold would be the same thrash.
 //
 // A grant that cannot join its round (a local prefill grant beside an
 // already-built decode batch, where the role's grammar keeps them apart)
@@ -747,7 +752,10 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
     // A load-back mid-flight is writing pages its readmission owns; the
     // victim policy cannot see that write, so no retraction until it lands.
-    if (tier_transfers_.HasLoadBacksInFlight()) {
+    // A pinned store mid-flight holds pages the ACK is about to release; the
+    // blocked admission retries against them next round before anyone is
+    // sacrificed. (Stream-ordered stores hold nothing and gate nothing.)
+    if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight()) {
         return;
     }
 

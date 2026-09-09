@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -13,6 +14,8 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashVisionConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention import kpool as kpool_runtime
+from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -22,6 +25,7 @@ from tokenspeed.runtime.models.glm53_flash import (
     Glm53FlashAttention,
     Glm53FlashForCausalLM,
     Glm53FlashForConditionalGeneration,
+    Glm53FlashIndexerOutput,
     Glm53FlashKDA,
     Glm53FlashMoE,
 )
@@ -116,6 +120,123 @@ def _tiny_config() -> Glm53FlashConfig:
             projection_intermediate_size=32,
         ),
     )
+
+
+def test_kpool_decode_forwards_configured_context_bound(monkeypatch) -> None:
+    captured = {}
+
+    def fake_kpool_decode_topk(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return kwargs["out"], kwargs["lens_out"]
+
+    monkeypatch.setattr(kpool_runtime, "kpool_decode_topk", fake_kpool_decode_topk)
+    index_cache = torch.empty((4, 16, 132), dtype=torch.uint8)
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(max_context_len=131072),
+        token_to_kv_pool=SimpleNamespace(
+            arena=SimpleNamespace(kv_page_size=64),
+            get_kpool_buffers=lambda _layer_id: (index_cache, None, None),
+        ),
+    )
+    query = torch.zeros((5, 2, 128), dtype=torch.bfloat16)
+    weights = torch.zeros((5, 2), dtype=torch.float32)
+    seq_lens = torch.tensor([1024, 2048], dtype=torch.int32)
+    page_table = torch.zeros((2, 4), dtype=torch.int32)
+    out = torch.empty((5, 2051), dtype=torch.int32)
+    lens_out = torch.empty(5, dtype=torch.int32)
+
+    KPoolRuntime(pool_size=4, index_topk=2048).select_decode(
+        query=query,
+        weights=weights,
+        softmax_scale=0.125,
+        ctx=ctx,
+        layer_id=3,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        q_len_per_req=2,
+        decode_start=1,
+        num_decode_tokens=4,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert captured["args"][0].shape == (4, 2, 128)
+    assert captured["kwargs"]["max_seq_len"] == 131072
+    assert captured["kwargs"]["page_size"] == 16
+    assert captured["kwargs"]["kv_page_size"] == 64
+    assert captured["kwargs"]["out"].shape == (4, 2051)
+    assert captured["kwargs"]["lens_out"].shape == (4,)
+
+
+@pytest.mark.parametrize(
+    ("decode_start", "num_decode_tokens", "expected_fill_value", "expected_fill"),
+    [
+        pytest.param(0, 4, None, False, id="full-decode"),
+        pytest.param(1, 2, -1, True, id="mixed-prefill"),
+    ],
+)
+def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
+    decode_start: int,
+    num_decode_tokens: int,
+    expected_fill_value: int | None,
+    expected_fill: bool,
+) -> None:
+    attention = Glm53FlashAttention.__new__(Glm53FlashAttention)
+    attention.index_topk = 12
+    attention.index_kpool = 4
+    attention.indexer = SimpleNamespace(weights_softmax_scale=0.25)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    captured = {}
+    topk_indices = torch.empty((4, 15), dtype=torch.int32)
+    topk_lens = torch.empty(4, dtype=torch.int32)
+
+    def get_indices(_name, _rows, _width, _device, *, fill_value=-1):
+        captured["fill_value"] = fill_value
+        return topk_indices
+
+    def get_lens(_rows, _device, *, fill=True):
+        captured["fill"] = fill
+        return topk_lens
+
+    def select_decode(**kwargs):
+        captured["out"] = kwargs["out"]
+        captured["lens_out"] = kwargs["lens_out"]
+
+    attention._get_decode_topk_workspace = get_indices
+    attention._get_decode_topk_lens_workspace = get_lens
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            require_kpool_runtime=lambda: SimpleNamespace(
+                select_decode=select_decode,
+            )
+        )
+    )
+    indexer_output = Glm53FlashIndexerOutput(
+        query=torch.zeros((4, 1, 128), dtype=torch.bfloat16),
+        key=torch.empty(0),
+        weights=torch.zeros((4, 1), dtype=torch.bfloat16),
+        gate=torch.empty(0),
+    )
+
+    result = attention._compute_decode_topk_indices_portable(
+        indexer_output=indexer_output,
+        ctx=ctx,
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        page_table=torch.zeros((1, 1), dtype=torch.int32),
+        q_len_per_req=1,
+        decode_start=decode_start,
+        num_tokens=4,
+        num_decode_tokens=num_decode_tokens,
+        topk=12,
+    )
+
+    assert captured["fill_value"] == expected_fill_value
+    assert captured["fill"] is expected_fill
+    assert captured["out"] is topk_indices
+    assert captured["lens_out"] is topk_lens
+    assert result.topk_indices is topk_indices
+    assert result.topk_lens is topk_lens
 
 
 def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:

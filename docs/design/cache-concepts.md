@@ -224,14 +224,23 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
-Writeback uploads block metadata asynchronously on the caller stream. An
-event recorded after both metadata copies protects the pinned CPU staging
-tables: before refilling them, the next submission waits only if that event
-is incomplete. This does not wait for the payload transfer or publish a
-writeback ACK. Device metadata reuse stays ordered after the previous payload
-by caller-stream FIFO; the forward-to-cache and cache-to-page-reuse fences
-remain unchanged. Even a partially submitted metadata upload records its
-retirement event before propagating a staging failure.
+Writeback runs on the executor's write stream, ordered after the caller's
+stream (which the caller has already ordered behind the forwards that wrote
+the pages). Each op says how the scheduler guards its Device sources
+(`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
+and unevictable until the ACK, so its copy overlaps whatever the round does
+next and nobody waits on it. An unpinned op's sources may be re-granted in the
+same plan, so it is launched first and the caller's stream waits on its
+completion event before the plan's page zeroing is enqueued — the zeroing,
+load-backs, forwards and RDMA triggers behind it inherit the fence. The two
+kinds use separate staging lanes: each lane uploads block metadata
+asynchronously and records an event after both metadata copies to protect its
+pinned CPU staging tables — before refilling them, the next submission on
+that lane waits only if that event is incomplete. This does not wait for the
+payload transfer or publish a writeback ACK. Device metadata reuse stays
+ordered after the previous payload by write-stream FIFO. Even a partially
+submitted metadata upload records its retirement event before propagating a
+staging failure.
 
 Ready flags are valid only for a full-geometry H2D transfer. Consumers first
 wait for the current generation's flag initialization event, then its layer
@@ -390,7 +399,11 @@ Its responsibilities:
   Host. At finish or retraction, all eligible Device-resident non-state pages
   and only the newest Device-resident checkpoint per state group are queued
   before request ownership is released. Ordinary sliding-window entries
-  always stream when published.
+  always stream when published. The queue is drained by
+  `TierTransferManager::StartPendingStores(guard)`: every store but a
+  retraction's snapshot pins its Device sources until the ACK; the snapshot
+  store is stream-ordered instead, because its sources are re-granted in the
+  same round (`scheduler.md` §2).
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.

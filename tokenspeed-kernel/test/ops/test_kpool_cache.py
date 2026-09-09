@@ -352,6 +352,72 @@ def test_prefill_tail_write_masks_padded_and_invalid_rows() -> None:
     assert torch.equal(tail_gate[0], initial_gate[0])
 
 
+@pytest.mark.parametrize("num_tokens", [1, 7, 179, 206])
+def test_prefill_tail_write_tracks_runtime_source_bound(num_tokens: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(32 + num_tokens)
+    keys = _random((num_tokens, _DIM), generator, 0.3)
+    gates = _random((num_tokens, _DIM), generator, 1.5)
+    tail_k = _random((5, 7, _DIM), generator, 1.0)
+    tail_gate = _random((5, 7, _DIM), generator, 1.0)
+    initial_k = tail_k.clone()
+    initial_gate = tail_gate.clone()
+    source_starts = torch.tensor(
+        [0, num_tokens - 1, num_tokens, max(num_tokens - 2, 0), -1],
+        device="cuda",
+    )
+    destination_slots = torch.arange(5, device="cuda")
+    destination_positions = torch.tensor([0, 6, 3, 4, 2], device="cuda")
+    valid_counts = torch.tensor([4, 4, 4, 3, 2], device="cuda")
+    expected = _reference_tail_write(
+        keys,
+        gates,
+        initial_k,
+        initial_gate,
+        source_starts,
+        destination_slots,
+        destination_positions,
+        valid_counts,
+    )
+
+    kpool_prefill_tail_write(
+        keys,
+        gates,
+        tail_k,
+        tail_gate,
+        source_starts,
+        destination_slots,
+        destination_positions,
+        valid_counts,
+        pool_size=_POOL,
+    )
+
+    assert torch.equal(tail_k, expected[0])
+    assert torch.equal(tail_gate, expected[1])
+
+
+def test_prefill_tail_write_empty_metadata_is_noop() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(33)
+    keys = _random((8, _DIM), generator, 0.3)
+    gates = _random((8, _DIM), generator, 1.5)
+    tail_k = _random((2, 7, _DIM), generator, 1.0)
+    tail_gate = _random((2, 7, _DIM), generator, 1.0)
+    initial_k = tail_k.clone()
+    initial_gate = tail_gate.clone()
+    metadata = [torch.empty(0, dtype=torch.int32, device="cuda") for _ in range(4)]
+
+    kpool_prefill_tail_write(
+        keys,
+        gates,
+        tail_k,
+        tail_gate,
+        *metadata,
+        pool_size=_POOL,
+    )
+
+    assert torch.equal(tail_k, initial_k)
+    assert torch.equal(tail_gate, initial_gate)
+
+
 def test_prefill_tail_write_accepts_distinct_row_strides() -> None:
     generator = torch.Generator(device="cuda").manual_seed(30)
     keys = _random((12, _DIM + 8), generator, 0.3)[:, :_DIM]

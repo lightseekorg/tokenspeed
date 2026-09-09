@@ -63,16 +63,23 @@ from tokenspeed.runtime.layers.quantization.utils import (
 
 logger = logging.getLogger(__name__)
 
-_MOE_WEIGHT_DTYPES = {
-    "NVFP4": "nvfp4",
-    "MXFP8": "fp8",
+_MOE_CONFIG_ATTRS = {
+    "NVFP4": "nvfp4_config",
+    "MXFP8": "mxfp8_config",
+    "FP8_PB_WO": "fp8_block_scales_config",
 }
 
+_QUANT_ALGO_ALIASES = {"FP8_BLOCK_SCALES": "FP8_PB_WO"}
 _FP8_PB_WO_BLOCK_SIZE = [128, 128]
 
 _SUPPORTED_QUANT_ALGOS = frozenset(
     {"NVFP4", "W4A16_NVFP4", "MXFP8", "FP8", "FP8_PB_WO"}
 )
+
+
+def _normalize_quant_algo(algo: str) -> str:
+    return _QUANT_ALGO_ALIASES.get(algo, algo)
+
 
 # FP8_PB_WO runtime routing. A module keeps FP8 weights (w8a8 blockwise,
 # TRT-LLM's FP8_BLOCK_SCALES alias) if its weight either flows through
@@ -136,7 +143,9 @@ class ModelOptMixedConfig(QuantizationConfig):
         group_size: int = 16,
     ) -> None:
         super().__init__(exclude_modules=exclude_modules)
-        self.quantized_layers = quantized_layers
+        self.quantized_layers = {
+            name: _normalize_quant_algo(algo) for name, algo in quantized_layers.items()
+        }
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.group_size = group_size
         self.mxfp8_config = Mxfp8Config(
@@ -169,8 +178,7 @@ class ModelOptMixedConfig(QuantizationConfig):
             weight_block_size=list(_FP8_PB_WO_BLOCK_SIZE),
             scale_fmt=None,
         )
-        self.has_fp8_pb_wo = "FP8_PB_WO" in set(quantized_layers.values())
-        # MoE layers read this when their experts resolve to an fp8 algo.
+        self.has_fp8_pb_wo = "FP8_PB_WO" in set(self.quantized_layers.values())
         self.weight_block_size = self.mxfp8_config.weight_block_size
 
     @classmethod
@@ -215,9 +223,10 @@ class ModelOptMixedConfig(QuantizationConfig):
         group_size: int | None = None
         unknown: set[str] = set()
         for name, info in raw_layers.items():
-            algo = str(info.get("quant_algo", "")).upper()
+            raw_algo = str(info.get("quant_algo", "")).upper()
+            algo = _normalize_quant_algo(raw_algo)
             if algo not in _SUPPORTED_QUANT_ALGOS:
-                unknown.add(algo)
+                unknown.add(raw_algo)
                 continue
             quantized_layers[name] = algo
             if algo in ("NVFP4", "W4A16_NVFP4") and group_size is None:
@@ -361,26 +370,32 @@ class ModelOptMixedConfig(QuantizationConfig):
             return Fp8LinearMethod(self.fp8_block_scales_config)
         raise ValueError(f"Unsupported quant_algo {algo!r} for layer {prefix!r}")
 
-    def moe_weight_dtype(self, prefix: str = "") -> str:
-        # Prefer the experts subtree: a MoE block prefix (e.g. "...mlp") can
-        # also contain differently-quantized shared experts.
+    def _resolve_moe_quant_algo(self, prefix: str) -> str:
         candidates = (
             (prefix,) if prefix.endswith(".experts") else (f"{prefix}.experts", prefix)
         )
         for candidate in candidates:
             algo = self._resolve_quant_algo(candidate)
-            if algo is not None:
-                if algo not in _MOE_WEIGHT_DTYPES:
-                    raise ValueError(
-                        f"MoE experts at {prefix!r} resolve to {algo!r}, which "
-                        "has no MoE kernel path; supported expert algos: "
-                        f"{sorted(_MOE_WEIGHT_DTYPES)}."
-                    )
-                return _MOE_WEIGHT_DTYPES[algo]
+            if algo is None:
+                continue
+            if algo not in _MOE_CONFIG_ATTRS:
+                raise ValueError(
+                    f"MoE experts at {prefix!r} resolve to {algo!r}, which "
+                    "has no MoE kernel path; supported expert algos: "
+                    f"{sorted(_MOE_CONFIG_ATTRS)}."
+                )
+            return algo
         raise ValueError(
             f"No quantized_layers entry resolves the MoE prefix {prefix!r}; "
             "cannot infer the experts' weight dtype."
         )
+
+    def get_moe_quant_config(self, prefix: str) -> QuantizationConfig:
+        algo = self._resolve_moe_quant_algo(prefix)
+        return getattr(self, _MOE_CONFIG_ATTRS[algo])
+
+    def moe_weight_dtype(self, prefix: str = "") -> str:
+        return self.get_moe_quant_config(prefix).moe_weight_dtype(prefix)
 
     def get_scaled_act_names(self) -> list[str]:
         return []

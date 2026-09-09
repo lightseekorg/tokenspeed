@@ -165,21 +165,40 @@ required a cross-round capacity barrier. Two edges of the loop:
   order (§3) tries the blocker before any other claim.
 
 **The victim's pages are released — and grantable — immediately**, even though
-its L2 snapshot has not been copied yet. The runtime enqueues the D2H snapshot
-copy on the **forward thread's stream** ahead of everything else the plan does
-to those pages — the same stream carries the zeroing, fences the forwards, and
-gates a granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
-`event-loop.md`) — so the copy reads the old bytes whatever the scheduler does
-with the pages. Store tickets consequently pin only their Host destinations;
-the ack's one job is publishing the Host entry.
+its L2 snapshot has not been copied yet. The snapshot store is issued with
+`StoreSourceGuard::kStreamOrdered`: its ticket pins only the Host destination,
+and the runtime fences the **forward thread's stream** on the D2H copy's
+completion ahead of everything else the plan does to those pages — that
+stream carries the zeroing, fences the forwards, and gates a granted remote
+prefill's RDMA trigger (see `DeviceHandle.execute` and `event-loop.md`) — so
+the copy reads the old bytes whatever the scheduler does with the pages. This
+is the one store that pays for its ordering on the forward's critical path,
+and it has to: the pages are gone in the same round.
+
+**Every other store pins its Device sources until the ack.** Boundary
+publications of a live request and the finish-time flush are issued with
+`StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
+each source, so the block stays cached and unevictable — the admission planner
+cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does
+not count it — until `CompleteWriteBack` publishes the Host entry and drops the
+pin. Nothing else needs to know the copy is in flight, so the runtime copies
+on its own stream and no forward waits. A cached block is never written again
+by its owner (prefix reuse already depends on that), so the pin alone makes
+the copy race-free. Both guards are one path — `StartPendingStores(guard)` —
+and the op carries `source_pinned` to the runtime, which branches on the guard
+and never on the reason.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns —
 and one whose pages a PD transfer still pins must not be either. Both are
 checked on the chosen victim; if it is not quiescent, retraction waits for it
-rather than sacrificing a worse-ranked request. The one remaining global gate
-is an in-flight load-back: it is writing pages its readmission owns, and the
-victim policy cannot see that write. In-flight *stores* gate nothing anymore.
+rather than sacrificing a worse-ranked request. Two global gates remain. An
+in-flight load-back: it is writing pages its readmission owns, and the victim
+policy cannot see that write. And an in-flight *pinned* store: it holds Device
+capacity the ack returns by itself, so retracting anyone for that capacity
+would be the thrash of §4 — the blocked admission retries against the
+released pins next round instead. Stream-ordered stores hold nothing and gate
+nothing.
 
 The forward-out check is a count on `fsm::ForwardState`, incremented when a
 forward is scheduled and cleared when its result lands. It lives on the base
@@ -372,13 +391,18 @@ no victim and nothing could free that page.
   prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD pin on its pages — and an in-flight load-back defers all retraction;
-  in-flight stores defer nothing.
+  no PD pin on its pages — and an in-flight load-back or an in-flight pinned
+  store defers all retraction; stream-ordered stores defer nothing.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the write-back →
   zero → load → forward order on the forward thread's stream is what makes
   the immediate release safe, and changing `DeviceHandle.execute`'s ordering
   breaks it.
+- A store either pins its Device sources until the ack or is stream-ordered;
+  never neither (2). Only `retractVictim` issues a stream-ordered store — its
+  sources are granted away in the same round — and only such an op may be
+  fenced ahead of the plan's page reuse by the runtime. A new store site
+  chooses its guard explicitly (`StartPendingStores` has no default).
 - Only computed tokens are published as a prefix — `retractVictim` reads the
   window of an incomplete prefill rather than its whole token count.
 - At most one readmission is in progress per role, by phase construction; a

@@ -1315,11 +1315,13 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
 }
 
-TEST_F(PrefillSlideAdmissionSuite, InFlightStoreDoesNotDeferAdmission) {
+TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     // Sink ON over the LongPromptAdmittedOnlyBecausePrefillSlides math: device
     // 13 -> 12 usable, c1+c2 charge 8, c3 needs 6 = free 4 + slide credit 2.
-    // A store ticket pins no device source (the forward thread's stream orders the
-    // copy before any reuse), so c3 admits WHILE op1 is still in flight.
+    // An ordinary store ticket pins its device sources until the ACK, so the
+    // slid SWA pages op1 is copying are not evictable yet: c3 waits one round
+    // for the ACK -- and waits, rather than retracting anyone (least of all
+    // itself) for capacity that the ACK is about to return.
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 13;
     scheduler_ = std::make_unique<Scheduler>(config_);
@@ -1339,19 +1341,28 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStoreDoesNotDeferAdmission) {
     const auto op1 = std::get<WriteBackBatch>(wb1.front());
     ASSERT_EQ(op1.op_ids.size(), 1u);
     EXPECT_EQ(op1.src_pages.at(0).size(), 4u) << "the first completed Full+SWA pages stream together";
+    EXPECT_EQ(op1.source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), 4);
 
-    ExecutionPlan c3 = PlanOnce();  // slide credit 2: admitted with op1 in flight; emits op2
+    ExecutionPlan stalled = PlanOnce();  // slide credit 2 is pinned by op1: c3 cannot admit yet
+    const ForwardBatch* stalled_forward = FindForwardBatch(stalled);
+    ASSERT_TRUE(stalled_forward == nullptr || stalled_forward->request_ids.empty())
+        << "an in-flight pinned store holds the slid pages until the ACK";
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(stalled).empty())
+        << "a retraction would have emitted a snapshot store; the pinned store defers retraction instead";
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u) << "the prefill keeps its place; nothing was retracted";
+    EXPECT_EQ(scheduler_->PrefillSize(), 1u);
+
+    SendWriteBackDone(op1.op_ids.at(0));
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+
+    ExecutionPlan c3 = PlanOnce();  // the ACK released the pins: slide credit 2 -> admitted; emits op2
     ASSERT_NE(FindForwardBatch(c3), nullptr);
-    ASSERT_EQ(FindForwardBatch(c3)->request_ids.size(), 1u)
-        << "an in-flight store must not defer admission: its sources are not pinned";
+    ASSERT_EQ(FindForwardBatch(c3)->request_ids.size(), 1u) << "the ACK returns the slid pages; c3 admits";
     auto wb2 = ExtractCacheOpsOfKind<WriteBackBatch>(c3);
     ASSERT_EQ(wb2.size(), 1u);
     const auto op2 = std::get<WriteBackBatch>(wb2.front());
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
-
-    SendWriteBackDone(op1.op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
 
     SendForwardDone("r1", {99});
     ExecutionPlan decode = PlanOnce();  // last prefill pages stream on PrefillDone
@@ -1361,17 +1372,16 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStoreDoesNotDeferAdmission) {
     auto wb3 = ExtractCacheOpsOfKind<WriteBackBatch>(decode);
     ASSERT_EQ(wb3.size(), 1u);
     const auto op3 = std::get<WriteBackBatch>(wb3.front());
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2)
-        << "the finalize slide's pages return at once: store tickets hold no device pins";
 
     SendForwardDone("r1", {100});
     SendFinish("r1");
-    PlanOnce();  // reap: no device pins, the pool balances immediately
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    PlanOnce();
+    EXPECT_LT(scheduler_->PoolFreeBlocks(), free_at_start)
+        << "op2/op3 still pin their sources: the pool does not balance before their ACKs";
     SendWriteBackDone(op2.op_ids.at(0));
     SendWriteBackDone(op3.op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 12);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACKs return every pinned source";
 }
 
 // Pool 17 -> 16 usable: swa at full prompt length would need 10+10+2 = 22
@@ -3942,7 +3952,9 @@ TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
 // ---------------------------------------------------------------------------
 // M15 streaming L2 sink: pages registered by a planning round batch into ONE
 // D2H write-back; WriteBackDone commits the host index and unpins the source
-// blocks. Byte movement itself is Phase D.
+// blocks (an ordinary store pins its Device sources until the ACK; only a
+// retraction's snapshot store leaves them to the runtime's stream order).
+// Byte movement itself is Phase D.
 // ---------------------------------------------------------------------------
 class StreamingSinkSuite : public SchedulerTestSuite {
 protected:
@@ -4001,19 +4013,20 @@ TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
     ASSERT_EQ(stream_wb->op_ids.size(), 1u);
     EXPECT_EQ(stream_wb->src_pages.at(0).size(), 6u);
     EXPECT_EQ(stream_wb->dst_pages.at(0).size(), 6u);
+    EXPECT_EQ(stream_wb->source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "nothing indexed until WriteBackDone";
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 
     ExecutionPlan finish = FinishAndReap("r1");
     EXPECT_FALSE(FindWriteBack(finish).has_value()) << "already-streamed prefill pages must not rewrite at finish";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
-        << "sources are not pinned: the forward thread's stream orders the copy before any reuse";
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+        << "the six sources stay pinned until the ACK: the finished request's other pages return, these do not";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     PlanOnce();
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACK returns the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
@@ -4044,7 +4057,7 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6) << "r1's six sources stay pinned in flight";
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0) << "r1 holds all 6 host pages in flight";
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
@@ -4053,7 +4066,8 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     ExecutionPlan finish2 = FinishAndReap("r2");
     EXPECT_FALSE(FindWriteBack(finish2).has_value())
         << "finish-created candidates must also skip a fully-consumed host pool";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+        << "dropped candidates pin nothing; only r1's in-flight sources are held";
 
     SendWriteBackDone(stream_wb1->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
@@ -4102,13 +4116,13 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
 
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r2")).has_value()) << "same-round duplicates must be dropped";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
-        << "no source pins: the forward thread's stream orders the copies before any reuse";
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
+        << "one pinned source per emitted key; the dropped duplicates pin nothing";
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "the six cached host pages remain occupied";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "the ACK returns the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
@@ -4142,7 +4156,7 @@ TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
     SendWriteBackDone(stream_wb->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     const std::int32_t free_after_ack = scheduler_->PoolFreeBlocks();
-    EXPECT_EQ(free_after_ack, free_after_reap) << "the ack publishes host entries; no device pins to return";
+    EXPECT_EQ(free_after_ack, free_after_reap + 6) << "the ack publishes host entries and returns the six pins";
 
     // A replayed ack must be a no-op (the ledger already retired the op).
     SendWriteBackDone(stream_wb->op_ids.at(0));
