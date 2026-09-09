@@ -1620,7 +1620,8 @@ def poll_readiness(
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
+            # Restarting servers can reset or stall an accepted HTTP connection.
             pass
         sleep_deadline = min(deadline, time.time() + interval_seconds)
         while time.time() < sleep_deadline:
