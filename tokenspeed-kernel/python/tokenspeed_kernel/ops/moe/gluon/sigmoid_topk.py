@@ -78,9 +78,7 @@ if current_platform().is_amd:
             max_arch_version=ArchVersion(12, 5),
             vendors=frozenset({"amd"}),
         ),
-        signatures=format_signatures(
-            "router_logits", "dense", {torch.float32}
-        ),
+        signatures=format_signatures("router_logits", "dense", {torch.float32}),
         priority=Priority.SPECIALIZED,
         tags={"prefill", "routing", "gfx1250"},
         traits={
