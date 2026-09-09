@@ -25,6 +25,7 @@
 import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
 from tokenspeed_triton import language as tl
+from tokenspeed_triton._C.libtriton import gluon_ir, ir
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
     async_copy as cdna4_async_copy,
@@ -36,6 +37,8 @@ __all__ = [
     "cdna4_async_copy",
     "gl",
     "gluon",
+    "gluon_ir",
+    "ir",
     "tl",
     "triton",
 ]

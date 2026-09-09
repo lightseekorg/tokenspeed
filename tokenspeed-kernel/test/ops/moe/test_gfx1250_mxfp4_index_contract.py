@@ -23,26 +23,14 @@
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
 
 import pytest
-from triton._C.libtriton import gluon_ir, ir
+from tokenspeed_kernel_amd._triton import gl, gluon_ir, ir
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-AMD_PACKAGE_ROOT = REPO_ROOT / "tokenspeed-kernel-amd" / "python"
-MXFP4_ROOT = (
-    AMD_PACKAGE_ROOT / "tokenspeed_kernel_amd" / "ops" / "gfx1250" / "moe" / "mxfp4"
-)
-
-# Checks below read kernel sources from this checkout, so import the package
-# from the same tree rather than from an unrelated installed copy.
-sys.path.insert(0, str(AMD_PACKAGE_ROOT))
-
-from tokenspeed_kernel_amd._triton import gl  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (  # noqa: E402
-    get_tdm_gather_scatter_idx_layout,
-)
+# Read sources from the tree the import resolved to, not the repo layout.
+MXFP4_ROOT = Path(_common.__file__).parent
 
 # ---------------------------------------------------------------------------
 # Index ownership: which warp holds which row
@@ -64,7 +52,7 @@ _BUILDER = gluon_ir.GluonOpBuilder(_CONTEXT)
 
 def index_warp_bases(num_indices: int, num_warps: int, slice_dim: int) -> list[int]:
     """Return the warp bases of the index layout a consumer builds."""
-    base = get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
+    base = _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
     layout = gl.SliceLayout(slice_dim, base)
     linear = _BUILDER.to_linear_layout(layout._to_ir(_BUILDER), [num_indices])
     assert len(linear.shape) == 1
@@ -112,7 +100,7 @@ def test_index_layout_rejects_unpartitionable_warp_counts(
     num_indices: int, num_warps: int
 ) -> None:
     with pytest.raises(AssertionError):
-        get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
+        _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
 
 
 @pytest.mark.parametrize("path", INDEX_LAYOUT_CONSUMERS, ids=lambda p: p.name)
