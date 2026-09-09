@@ -304,10 +304,6 @@ class AttentionBackend(ABC):
             share = self.__dict__["_sparse_topk"] = SparseTopKShare()
         return share
 
-    def update_mamba_state_after_mtp_verify(self, accepted_lengths) -> None:
-        """Commit recurrent-state pages after MTP verification; only nodes
-        with Mamba/GDN state override."""
-
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
@@ -372,7 +368,11 @@ class AttentionBackend(ABC):
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Commit side state after execution; owning composites dispatch it."""
+        """Commit live acceptance after drafted decode/mixed execution or replay.
+
+        ``num_extends == 0`` identifies pure decode; otherwise extend requests
+        lead the mixed batch. Stateless backends inherit this no-op.
+        """
 
     @contextmanager
     def record_pd_cache_step(

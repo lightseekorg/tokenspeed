@@ -379,12 +379,14 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner keeps its two existing post-verify calls after eager execution
-or graph replay, with acceptance sliced to the real batch. The decode-only
-`update_mamba_state_after_mtp_verify` call commits GDN and then PLE; the
-decode/mixed `commit_speculative_state_after_verify` call commits QSA through
-the indexer child, excluding leading extend requests. The root dispatches
-each consumer once, never a second recursive commit over all children.
+The runner calls `commit_speculative_state_after_verify` once on the target
+after drafted decode/mixed execution or graph replay, with live acceptance
+and `num_extends`. Since forward mode is derived from the extend count,
+zero means decode at this entry. Hybrid commits GDN/KDA only then; the
+Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
+decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
+retain PLE's direct state writes. Each consumer commits once; stateless
+backends inherit a no-op.
 Transient verify storage belongs to these consumers; LCM remains the owner
 of the persistent request caches.
 

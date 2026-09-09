@@ -250,5 +250,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
-    def update_mamba_state_after_mtp_verify(self, accepted_lengths):
-        self.linear_attn_backend.commit_verified_state(accepted_lengths)
+    def commit_speculative_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        if num_extends == 0:
+            self.linear_attn_backend.commit_verified_state(accepted_lengths)

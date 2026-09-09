@@ -330,7 +330,7 @@ class MambaAttnBackend(AttentionBackend):
         Verify reads the state at the last COMMITTED position
         (``seq_lens - draft_token_num``); speculative outputs stay out of the
         state slab, and the accepted state is committed back by
-        ``update_mamba_state_after_mtp_verify``. Returns the per-group in
+        ``commit_speculative_state_after_verify``. Returns the per-group in
         pages, the committed lengths, and the per-group group tables (kept
         for the commit's dynamic page resolve).
         """

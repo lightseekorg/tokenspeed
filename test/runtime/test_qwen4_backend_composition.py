@@ -239,7 +239,7 @@ def test_hybrid_factory_binds_gdn_only_for_local_state(
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
         gdn.set_kv_pool.assert_called_once_with(pool)
         accepted = torch.tensor([1, 3], dtype=torch.int32)
-        backend.update_mamba_state_after_mtp_verify(accepted)
+        backend.commit_speculative_state_after_verify(accepted, num_extends=0)
         gdn.commit_verified_state.assert_called_once_with(accepted)
     else:
         factory.assert_not_called()

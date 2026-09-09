@@ -21,6 +21,7 @@
 """Check commit order, live acceptance and failure handling after eager or replay.
 
 Exercise execution modes with all consumers, then each optional consumer alone.
+The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
 """
 
 from types import SimpleNamespace
@@ -173,22 +174,26 @@ def _run(wrapper, mode):
 
 
 @pytest.mark.parametrize(
-    "mode,use_graph,has_drafter,consumers",
+    "mode,use_graph,has_drafter,consumers,qwen4",
     [
-        (ForwardMode.DECODE, False, True, ("recurrent", "ple", "qsa")),
-        (ForwardMode.DECODE, True, True, ("recurrent", "ple", "qsa")),
-        (ForwardMode.MIXED, False, True, ("recurrent", "ple", "qsa")),
-        (ForwardMode.EXTEND, False, True, ("recurrent", "ple", "qsa")),
-        (ForwardMode.DECODE, False, False, ("recurrent", "ple", "qsa")),
-        (ForwardMode.DECODE, False, True, ("recurrent",)),
-        (ForwardMode.DECODE, True, True, ("ple",)),
-        (ForwardMode.DECODE, True, True, ("qsa",)),
-        (ForwardMode.DECODE, False, True, ()),
-        (ForwardMode.MIXED, False, True, ("ple",)),
+        (ForwardMode.DECODE, False, True, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.DECODE, True, True, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.MIXED, False, True, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.EXTEND, False, True, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.DECODE, False, False, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.DECODE, False, True, ("recurrent",), True),
+        (ForwardMode.DECODE, True, True, ("ple",), True),
+        (ForwardMode.DECODE, True, True, ("qsa",), True),
+        (ForwardMode.DECODE, False, True, (), True),
+        (ForwardMode.MIXED, False, True, ("ple",), True),
+        (ForwardMode.DECODE, False, True, ("recurrent",), False),
+        (ForwardMode.DECODE, True, True, ("recurrent",), False),
+        (ForwardMode.MIXED, False, True, ("recurrent",), False),
+        (ForwardMode.DECODE, False, True, (), False),
     ],
 )
 def test_runner_commits_live_acceptance_once_after_execution(
-    mode, use_graph, has_drafter, consumers
+    mode, use_graph, has_drafter, consumers, qwen4
 ):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
@@ -196,6 +201,9 @@ def test_runner_commits_live_acceptance_once_after_execution(
         consumers=consumers,
         fail_forward=False,
     )
+    if not qwen4:
+        wrapper.attn_backend = wrapper.attn_backend.attention_backend
+        wrapper.config.spec_algo = "DSPARK"
     _run(wrapper, mode)
     expected_qsa = (
         [([3, 1], int(mode.is_mixed()))]
