@@ -84,6 +84,7 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
     ReservePrefillDemands(demands, groups,
                           PrefillReserve{.decode_input_tokens = 2,
+                                         .workspace_tokens = 0,
                                          .completes_prefill = false,
                                          .prompt_headroom_tokens = 30,
                                          .reserve_snapshot_state_growth = false});
@@ -98,12 +99,44 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
     ReservePrefillDemands(demands, groups,
                           PrefillReserve{.decode_input_tokens = 2,
+                                         .workspace_tokens = 0,
                                          .completes_prefill = true,
                                          .prompt_headroom_tokens = 0,
                                          .reserve_snapshot_state_growth = true});
     EXPECT_EQ(demands[0].reserve_tokens, 2);
     EXPECT_EQ(demands[1].reserve_tokens, 2);
     EXPECT_EQ(demands[2].reserve_tokens, 4) << "max(block_granularity, decode)";
+}
+
+TEST(ReservePrefillDemandsTest, WorkspaceCoversHistoryWithoutChangingSnapshotStateGrowth) {
+    const std::vector<CacheGroupConfig> groups = {
+        Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History),
+        Group("state", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+    };
+    std::vector<BlockTable> tables(3);
+    for (const bool completes_prefill : {false, true}) {
+        auto demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
+        ReservePrefillDemands(demands, groups,
+                              PrefillReserve{.decode_input_tokens = 0,
+                                             .workspace_tokens = 8,
+                                             .completes_prefill = completes_prefill,
+                                             .prompt_headroom_tokens = 0,
+                                             .reserve_snapshot_state_growth = false});
+        EXPECT_EQ(demands[0].reserve_tokens, 8);
+        EXPECT_EQ(demands[1].reserve_tokens, 8);
+        EXPECT_EQ(demands[2].reserve_tokens, 0);
+    }
+    auto demands = MakeGroupDemands(tables, GroupDemand{.num_tokens = 6});
+    ReservePrefillDemands(demands, groups,
+                          PrefillReserve{.decode_input_tokens = 2,
+                                         .workspace_tokens = 8,
+                                         .completes_prefill = true,
+                                         .prompt_headroom_tokens = 30,
+                                         .reserve_snapshot_state_growth = true});
+    EXPECT_EQ(demands[0].reserve_tokens, 30);
+    EXPECT_EQ(demands[1].reserve_tokens, 8);
+    EXPECT_EQ(demands[2].reserve_tokens, 4);
 }
 
 TEST(MakeSnapshotStatePrefillSparseTest, MaterializesOnlyTheStateGroupsFromTheLastCheckpoint) {

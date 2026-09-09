@@ -302,6 +302,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     const PrefillReserve reserve{
         .decode_input_tokens = decode_input_tokens,
+        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - prefill_tokens + headroom : 0,
         // A remote landing always finishes shaping; the P role needs no
@@ -389,6 +390,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     // The prompt headroom was prepaid at first-chunk admission.
     const PrefillReserve reserve{
         .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
+        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
         .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,

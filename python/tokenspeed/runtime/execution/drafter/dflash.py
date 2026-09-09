@@ -281,9 +281,15 @@ class DFlash(BaseDrafter):
         language_model = getattr(target_model, "language_model", target_model)
         self.target_model = target_model
         self.target_language_model = language_model
+        # Setup may provide a local draft embedding when the target's embedding
+        # lives on another stage. Resource availability determines the binding.
         self.embed_tokens = target_model.get_input_embeddings()
+        if self.embed_tokens is None:
+            self.embed_tokens = self.model.embed_tokens
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
+        if getattr(type(self.model), "configure_target", None) is not None:
+            return  # Model setup already bound its trained capture contract.
         if not hasattr(target_model, "set_dflash_layers_to_capture"):
             raise ValueError(
                 "DFLASH requires the target model to support "
@@ -532,9 +538,12 @@ class DFlash(BaseDrafter):
         accept_lengths: torch.Tensor,
     ) -> None:
         hidden = logits_output.hidden_states
-        if hidden is None:
+        if hidden is None and not base_ctx.target_context_ready:
             raise RuntimeError("DFLASH requires target hidden states.")
-        if hidden.shape[0] != base_ctx.input_num_tokens:
+        if (
+            not base_ctx.target_context_ready
+            and hidden.shape[0] != base_ctx.input_num_tokens
+        ):
             raise RuntimeError(
                 "DFLASH hidden-state/token mismatch: "
                 f"hidden_tokens={hidden.shape[0]}, input_tokens={base_ctx.input_num_tokens}."
@@ -571,7 +580,10 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
+            if not base_ctx.target_context_ready:
+                self._write_native_cache(
+                    hidden, positions, cache_locs, decode_only=True
+                )
             return
 
         if base_ctx.input_num_tokens == 0:
@@ -597,7 +609,10 @@ class DFlash(BaseDrafter):
         self.draft_seq_lens_buf[:bs].copy_(
             torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
         )
-        self._write_native_cache(hidden, positions, cache_locs, decode_only=decode_only)
+        if not base_ctx.target_context_ready:
+            self._write_native_cache(
+                hidden, positions, cache_locs, decode_only=decode_only
+            )
 
     def _write_native_cache(
         self,
@@ -986,7 +1001,8 @@ class DFlash(BaseDrafter):
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         return (
-            ctx.num_extends == 0
+            ctx.target_context_producer is None
+            and ctx.num_extends == 0
             and self._fused_kv_enabled
             and self._kv_aux_stream is not None
             and (capturing or not get_is_cuda_graph_phase())

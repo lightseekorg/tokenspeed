@@ -31,7 +31,7 @@ matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
-once per round (`PrefillReserve`: decode width, prompt headroom,
+once per round (`PrefillReserve`: decode width, workspace, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
 group's page demand by `ReservePrefillDemands` — the only writer of
 `GroupDemand::reserve_tokens`. It picks the rule by the group's retention,
@@ -49,6 +49,16 @@ never by call site:
   waiting on a pool that had room for it.
 - *Snapshot-state* groups reserve at least one growth block on a decoding
   role's completing chunk or remote landing, and nothing on other rounds (§1.2).
+
+`prefill_workspace_tokens` declares transient history writes after each prefill
+chunk. It defaults to zero, independently of `decode_input_tokens`. The runtime
+sets it to the verify width only for K3 DSpark on a pipeline prefill worker,
+whose final stage writes proposal KV after every chunk. Other models and roles
+retain their existing admission policy. History groups take the maximum of this
+workspace and their other reserves; snapshot-state shaping is unchanged. These
+pages use the request's existing cache groups and retire with its other blocks.
+The single-request capacity bound includes the same explicit workspace so a
+maximum-length K3 pipeline prefill prompt remains admissible.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 

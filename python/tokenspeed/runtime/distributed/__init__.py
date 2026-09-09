@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Distributed runtime public exports."""
+"""Lightweight topology exports; communication modules are imported explicitly."""
 
-from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 
-__all__ = ["CommManager", "Mapping"]
+__all__ = ["Mapping"]

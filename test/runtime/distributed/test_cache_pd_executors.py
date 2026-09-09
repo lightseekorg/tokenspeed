@@ -452,6 +452,12 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
         0,
         "mlx5_0",
         pool,
+        draft_model_config=None,
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
+        producer_fields_by_step=tuple(
+            (field.field_id,) for field in layout.plan.fields
+        ),
+        logical_plan=None,
         model_config=SimpleNamespace(
             num_attention_layers=2,
             num_key_value_heads=1,
@@ -1120,6 +1126,9 @@ def test_cache_heterogeneous_gqa_route_rendezvous_idle_prefill_ranks() -> None:
     prefill = PrefillParallelInfo(
         tp_size=4,
         dp_size=1,
+        cache_fields_by_stage=(
+            tuple(field.field_id for field in prefill_layout.plan.fields),
+        ),
         cache_layout=prefill_layout,
     )
 

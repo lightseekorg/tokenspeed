@@ -6871,8 +6871,16 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+        cache_field_placement,
+    )
+
+    _, schedules = cache_field_placement(
+        setup.spec.memory_plan, (CacheLayerOwnership(3, 0, (0, 3)),)
+    )
     schedule = build_cache_fields_by_producer_step(
-        setup.spec.memory_plan, num_target_layers=3
+        setup.spec.memory_plan, producer_fields_by_step=schedules[0]
     )
     assert schedule.step_count == 3
     assert all(schedule.fields_by_step)

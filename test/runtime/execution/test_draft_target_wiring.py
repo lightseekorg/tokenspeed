@@ -408,3 +408,38 @@ def test_dflash_sink_folds_the_taps_and_writes_the_kv_once():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+@pytest.mark.parametrize("num_extends,accept", [(1, 1), (0, 2), (0, 0)])
+def test_prepared_context_updates_lengths_without_rewriting_cache(num_extends, accept):
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = 4
+    drafter.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.tensor([4]),
+        req_pool_indices_buf=torch.tensor([0]),
+        positions_buf=torch.arange(10, 14),
+    )
+    drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([10]))
+    drafter.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+    drafter._write_native_cache = mock.Mock(
+        side_effect=AssertionError("context already written")
+    )
+    ctx = SimpleNamespace(
+        target_context_ready=True,
+        bs=1,
+        num_extends=num_extends,
+        input_num_tokens=4,
+        attn_backend=SimpleNamespace(
+            decode_window_locations=lambda: (
+                torch.arange(4)
+                if not num_extends
+                else torch.empty(0, dtype=torch.int64)
+            ),
+            extend_span_locations=lambda: torch.arange(4),
+        ),
+    )
+    drafter._update_native_cache_from_target(
+        ctx, SimpleNamespace(hidden_states=None), torch.tensor([accept])
+    )
+    assert drafter.draft_seq_lens_buf.item() == (14 if num_extends else 10 + accept)
+    drafter._write_native_cache.assert_not_called()

@@ -51,9 +51,9 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
             SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-        return reserve.DecodeTokens();
+        return std::max(reserve.DecodeTokens(), reserve.workspace_tokens);
     }
-    return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
+    return std::max({reserve.DecodeTokens(), reserve.prompt_headroom_tokens, reserve.workspace_tokens});
 }
 
 }  // namespace
@@ -61,7 +61,7 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
 void ReservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                            const PrefillReserve& reserve) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
+    _assert(reserve.decode_input_tokens >= 0 && reserve.workspace_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
             "prefill reserve inputs must be non-negative");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");

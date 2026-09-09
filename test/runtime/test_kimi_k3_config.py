@@ -721,11 +721,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer = kimi_k3.KimiLinearMLP(
                 hidden_size=7168,
                 intermediate_size=6144,
-                mapping=mapping,
+                tp_rank=mapping.moe.tp_ep_rank,
+                tp_size=mapping.moe.tp_ep_size,
+                tp_group=mapping.moe.tp_ep_group,
                 quant_config=None,
                 prefix="shared_experts",
                 reduce_results=False,
                 is_shared_expert=True,
+                activation_situ_beta=1.0,
+                activation_situ_linear_beta=None,
             )
             actual = layer(
                 torch.empty(2, 7168, dtype=torch.bfloat16),
@@ -1132,6 +1136,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mock.Mock(),
                 num_global_tokens=1,
                 max_num_tokens_per_gpu=1,
+                do_finalize=True,
             ),
             routed_input + 1,
         )

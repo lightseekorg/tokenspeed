@@ -86,9 +86,13 @@ def _wire_draft_to_target_model(
     budget, so weights the draft shares with the target (embed/LM head) are
     released before profiling instead of being double-counted.
     """
-    DrafterImpl = get_drafter_impl(
-        server_args.speculative_algorithm, draft_model_runner.model
-    )
+    draft_model = draft_model_runner.model
+    DrafterImpl = get_drafter_impl(server_args.speculative_algorithm, draft_model)
+    configure_target = getattr(type(draft_model), "configure_target", None)
+    if configure_target is not None:
+        configure_target(
+            draft_model, model_runner.model, model_runner.model_config.hf_text_config
+        )
     if DrafterImpl.shares_target_embed_head:
         embed, head = model_runner.model.get_embed_and_head()
         draft_model = draft_model_runner.model
@@ -129,6 +133,24 @@ def create_model_runner(
 
     draft_model_runner = None
     if draft_model_config is not None:
+        if server_args.mapping.has_pp and server_args.speculative_algorithm is not None:
+            if (
+                server_args.disaggregation_mode != "prefill"
+                or server_args.speculative_algorithm != "DSPARK"
+                or getattr(draft_model_config.hf_config, "model_type", None)
+                != "k3_dspark"
+            ):
+                raise ValueError(
+                    "Pipeline speculation requires Kimi-K3 DSpark on a prefill node"
+                )
+            if (
+                server_args.mapping.attn.cp_size != 1
+                or server_args.mapping.dense.tp_group
+                != server_args.mapping.attn.tp_group
+            ):
+                raise ValueError(
+                    "Pipeline DSpark requires attention CP=1 and matching dense/attention TP groups"
+                )
         draft_model_runner = ModelRunner(
             model_config=draft_model_config,
             gpu_id=gpu_id,

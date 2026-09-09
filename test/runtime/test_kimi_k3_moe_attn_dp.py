@@ -173,7 +173,6 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
 @pytest.mark.parametrize(
     "backend,dp,match",
     [
-        ("deepep", 2, "does not support DeepEP"),
         ("agrs", 1, "requires attention DP"),
         ("flashinfer", 1, "requires attention DP"),
     ],
@@ -285,7 +284,12 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         return expected.reshape(2 * capacity, expected.shape[-1])
 
     def experts(
-        routed, routing, *, num_global_tokens, max_num_tokens_per_gpu, do_finalize
+        routed,
+        routing,
+        *,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        do_finalize,
     ):
         events.append("experts")
         assert num_global_tokens == max_num_tokens_per_gpu == 2 * capacity

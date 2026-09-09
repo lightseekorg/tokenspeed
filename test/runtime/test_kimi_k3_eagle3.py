@@ -70,7 +70,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
             model,
             torch.tensor([0, 1]),
             positions=None,
-            ctx=None,
+            ctx=SimpleNamespace(target_context_producer=None),
         )
 
     # IDs are one-based completed-layer IDs.  IDs 2 and 3 select the

@@ -324,6 +324,15 @@ decode too. (`_cache_contract_bound` is gone: every LCM pool publishes a
 cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
+K3 DSpark pipeline prefill distributes target-tap projection across stages,
+while the final stage owns the proposal network and draft cache. After
+target prefill sampling, that stage runs the ordinary drafter; its completed
+call publishes the final cache producer barrier. PD transfers the sampled
+anchor and real draft candidates with the target and draft caches. Decode
+installs that window before its first ordinary verify round. Stage ownership
+changes where context and proposals are produced; candidate handoff and
+verification follow the same path as other speculative prefills.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
@@ -631,6 +640,40 @@ buffer; `fill_input_buffers` takes no table.
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
 
+## K3 target capture is configured once
+
+`create_model_runner` calls the draft model's optional `configure_target`
+hook after loading. K3's model hook validates and installs its trained tap
+indices, stream and projection contract on every stage. The ordinary DSpark
+drafter binds embeddings and heads without changing that contract. A last
+pipeline stage borrows its local draft embedding when the target embedding
+lives elsewhere; this is resource binding, not a different proposal algorithm.
+
+Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
+produced after L. AttnRes tap L is produced at L+1's entry by that layer's
+mixer, before input-layer normalization or snapshot mutation; the final tap
+belongs to the output mixer. Capture execution and projection-weight placement
+use this same owner on both PP and non-PP. There is no boundary deferral or
+recovery operation. Capture's mixed stream must not be replaced by the fused
+attention input, which already includes input-layer normalization.
+
+Unquantized K3 drafts use `TargetContextProducer` on both topologies: normalize
+each tap if configured, apply its projection columns, sum in FP32, then apply
+context normalization once. The accumulator stays local or travels with the
+chunk's PP state. Only the final owner writes native context KV. Quantized
+non-PP drafts retain their quantization-aware concatenated projection; raw
+per-tap weight slicing is not a quantized linear operation. PP drafts require
+unquantized projection weights.
+
+The producer is stateless across forwards. Each chunk owns its accumulator;
+queued chunks cannot alias it. `ctx.target_context_ready` is published after
+native writes are enqueued on the forward stream. The common block drafter
+still updates accepted-prefix lengths, but does not project/write those rows
+again. Its optional auxiliary-stream writer is disabled for a forward with
+this producer, avoiding a second writer or a missing stream dependency.
+The final PD readiness barrier remains after the whole proposal call, since
+proposal execution can write the same draft fields after context injection.
+
 ## Per-forward drafter work rides on the context
 
 What a drafter wants done *during* the target forward is a property of that
@@ -646,9 +689,9 @@ DFLASH is the one user: its incremental projection attaches
 draft's `fc` projection on the aux stream so the draft KV is written under
 the target's remaining layers. The arming gate is the same
 `_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. Model-side
-capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
-in which tap order — and carries no per-round state.
+round can never be armed on one side and drained on the other. These hooks
+consume the target's capture configuration; they do not change the tap
+selection or output layout.
 
 The reverse direction rides on the context as well: a target that captures
 its taps on a row subset reports it as `ctx.captured_rows`
