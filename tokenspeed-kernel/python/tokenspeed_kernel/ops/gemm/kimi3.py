@@ -953,9 +953,7 @@ def kimi3_shared_situ_projection(
         gate_up = decode_gemv(hidden_states, gate_up_weight)
     else:
         gate_up = (
-            _try_gluon_largem_gfx1250(hidden_states, gate_up_weight)
-            if solution == "auto"
-            else None
+            _try_gluon_largem_gfx1250(hidden_states, gate_up_weight) if routed else None
         )
         if gate_up is None:
             gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
