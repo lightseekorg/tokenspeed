@@ -26,7 +26,6 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa_backend_module
-import tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple as ple_backend_module
 import tokenspeed.runtime.layers.attention.qsa.indexer as qsa_indexer_module
 import tokenspeed.runtime.layers.attention.qsa.metadata as qsa_metadata_module
 from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
@@ -54,9 +53,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
     PLEForwardMetadata,
-    Qwen4ExpPLEBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -79,7 +76,6 @@ from tokenspeed.runtime.layers.attention.qsa import (
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
     decode_query_lengths,
-    qsa_attention_metadata,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -538,9 +534,7 @@ def _qsa_root(
             ),
         ),
     )
-    backend = Qwen4ExpBackend(
-        router, None, [3], None, QSAIndexerBackend(config, router)
-    )
+    backend = Qwen4ExpBackend(router, None, QSAIndexerBackend(config, router))
     backend.set_cache_pool(pool)
     backend.init_cuda_graph_state(max_bs)
     return backend
@@ -565,56 +559,22 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
     )
 
 
-def test_qwen4_exp_qsa_reads_raw_group_tables_from_its_indexer_backend() -> None:
-    backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=1, is_draft=False)
-    raw = torch.tensor([[3, 5], [7, -1]], dtype=torch.int32)
-    _qsa_extend_round(
-        backend, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[300, 9]
-    )
-
-    metadata = backend.indexer_backend.metadata_for(ForwardMode.EXTEND)
-    assert metadata.qsa_block_table.shape == (2, 4)
-    assert metadata.recent_block_table.shape == (2, 16)
-    assert metadata.qsa_block_table[:, :2].tolist() == [[3, 5], [7, 0]]
-    assert metadata.recent_block_table[:, :2].tolist() == [[3, 5], [7, 0]]
-    assert backend.full_attn_backend.group_ids == (FULL_ATTENTION,)
-    assert backend.full_attn_backend.stacks.group_kernel_page_size(FULL_ATTENTION) == 64
-
-
-def test_qwen4_exp_qsa_metadata_follows_its_own_forward_slot() -> None:
-    backend = _qsa_root(kernel_page_size=64, spec=3, max_bs=4, is_draft=False)
-    raw = torch.tensor([[3, 5]], dtype=torch.int32)
-    tables = {gid: raw for gid in _QSA_GROUP_GRANULARITIES}
-    indexer = backend.indexer_backend
-
-    _qsa_extend_round(backend, tables, seq_lens=[300])
-    ctx = SimpleNamespace(attn_backend=backend, forward_mode=ForwardMode.EXTEND)
-    assert qsa_attention_metadata(ctx) is indexer.forward_extend_metadata
-    assert qsa_attention_metadata(ctx).seq_lens.tolist() == [300]
-
-    backend.refresh_decode_metadata(
-        1,
-        1,
-        torch.tensor([1], dtype=torch.int32),
-        torch.tensor([301], dtype=torch.int32),
-        forward_mode=ForwardMode.DECODE,
-        block_tables=tables,
-    )
-    ctx = SimpleNamespace(attn_backend=backend, forward_mode=ForwardMode.DECODE)
-    assert qsa_attention_metadata(ctx) is indexer.forward_decode_metadata
-    assert qsa_attention_metadata(ctx).seq_lens.tolist() == [301]
-
-
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize(
-    ("mode", "query_width"),
-    [(ForwardMode.EXTEND, 1), (ForwardMode.DECODE, 4), (ForwardMode.DECODE, 1)],
+    ("mode", "query_width", "save_kv_cache"),
+    [
+        (ForwardMode.EXTEND, 1, False),
+        (ForwardMode.EXTEND, 1, True),
+        (ForwardMode.DECODE, 4, True),
+        (ForwardMode.DECODE, 1, True),
+    ],
 )
 def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     monkeypatch: pytest.MonkeyPatch,
     hybrid: bool,
     mode: ForwardMode,
     query_width: int,
+    save_kv_cache: bool,
 ) -> None:
     router = _qsa_router(kernel_page_size=64, max_bs=4, spec=4)
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
@@ -635,9 +595,10 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     else:
         _qsa_extend_round(router, tables, seq_lens=lengths)
         kv_width = 1
-    backend = (
+    attention = (
         HybridLinearAttnBackend(router, SimpleNamespace(), [3]) if hybrid else router
     )
+    backend = Qwen4ExpBackend(attention, None, None)
     events = []
     backend.register_step_counter(
         SimpleNamespace(record_cache=lambda: events.append("cache_step"))
@@ -687,14 +648,15 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         keys,
         keys,
         ctx,
-        save_kv_cache=True,
+        save_kv_cache=save_kv_cache,
         record_kv_cache=None,
         topk_indices=topk,
     )
     assert output.shape == queries.shape
-    assert events == (
-        ["attention", "cache_step"] if mode.is_extend() else ["attention"]
-    )
+    expected_events = ["attention"]
+    if mode.is_extend():
+        expected_events.insert(1 if save_kv_cache else 0, "cache_step")
+    assert events == expected_events
 
 
 def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
@@ -764,7 +726,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     indexer.compress_ratio = 4
 
     backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=1, is_draft=False)
-    router = backend.full_attn_backend
+    router = backend.attention_backend
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
     _qsa_extend_round(
         backend, {gid: raw for gid in _QSA_GROUP_GRANULARITIES}, seq_lens=[8, 9]
@@ -917,7 +879,9 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
 
     target_backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=4, is_draft=False)
     if hybrid:
-        target_backend.linear_attn_backend = SimpleNamespace()
+        target_backend.attention_backend = HybridLinearAttnBackend(
+            target_backend.attention_backend, SimpleNamespace(), [3]
+        )
     target_backend.indexer_backend.verify_staging_buffers = staging
     draft_backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=1, is_draft=True)
     ordinary_backend = _qsa_root(kernel_page_size=64, max_bs=4, spec=1, is_draft=False)
@@ -1472,225 +1436,6 @@ def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
     )
 
 
-def _ple_backend_for_fields(
-    cache_fields, *, width: int, max_bs: int, granularity: int
-) -> Qwen4ExpPLEBackend:
-    config = SimpleNamespace(
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        is_draft=False,
-        speculative_num_draft_tokens=width,
-    )
-    spec = SimpleNamespace(
-        num_attention_heads=1,
-        num_kv_heads=1,
-        attn_tp_size=1,
-        head_dim=8,
-    )
-    backend = Qwen4ExpPLEBackend(config, spec)
-    backend.set_cache_pool(
-        SimpleNamespace(
-            field_layer_range=range(3),
-            _field_layer_id=lambda layer_id: layer_id,
-            arena=SimpleNamespace(
-                plan=SimpleNamespace(
-                    fields=tuple(
-                        SimpleNamespace(
-                            group_id=QWEN4_EXP_PLE_CACHE_GROUP, field_id=name
-                        )
-                        for name in cache_fields
-                    )
-                ),
-                field=cache_fields.__getitem__,
-                runtime_contract=SimpleNamespace(
-                    group_specs=(
-                        SimpleNamespace(
-                            group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-                            family="state",
-                            checkpoint_granularity=granularity,
-                        ),
-                    )
-                ),
-            ),
-        )
-    )
-    backend.init_cuda_graph_state(max_bs)
-    return backend
-
-
-def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
-    context_field = qwen4_exp_ple_context_field(0)
-    cache_fields = {
-        context_field: torch.empty((3, 2), dtype=torch.int64),
-        qwen4_exp_ple_conv_field(0): torch.empty((3, 16, 9), dtype=torch.bfloat16),
-        qwen4_exp_ple_conv_field(2): torch.empty((3, 16, 9), dtype=torch.bfloat16),
-    }
-    backend = _ple_backend_for_fields(
-        cache_fields,
-        width=3,
-        max_bs=2,
-        granularity=4,
-    )
-
-    nbytes = backend.preallocate_verify_workspace(max_bs=2, draft_token_num=3)
-    first = backend.ple_verify_scratch(context_field, 0)
-    second = backend.ple_verify_scratch(context_field, 2)
-
-    assert first is not None and second is not None
-    assert first[0] is second[0]
-    assert first[0].shape == (8, 2)
-    assert first[0].dtype == torch.int64
-    assert first[1].shape == (8, 16, 9)
-    assert first[1].dtype == torch.bfloat16
-    assert second[1].shape == (8, 16, 9)
-    rows = backend._ple_commit_rows
-    assert rows.shape == (2, 2 * 2)
-    assert rows.dtype == torch.int64
-    assert nbytes == 8 * (2 * 8 + 2 * 16 * 9 * 2) + 2 * 2 * 2 * 8
-    assert backend.preallocate_verify_workspace(max_bs=1, draft_token_num=3) == nbytes
-    assert backend._ple_commit_rows is rows
-    assert backend.ple_verify_scratch(context_field, 0)[0] is first[0]
-    with pytest.raises(RuntimeError, match="preallocated capacity"):
-        backend.preallocate_verify_workspace(max_bs=3, draft_token_num=3)
-
-
-def test_qwen4_exp_backend_batches_ple_verify_commit(monkeypatch) -> None:
-    context_field_id = qwen4_exp_ple_context_field(0)
-    context = torch.empty((5, 2), dtype=torch.int64)
-    conv = {
-        layer_id: torch.empty((5, 4, 3), dtype=torch.bfloat16) for layer_id in (0, 2)
-    }
-    fields = {context_field_id: context}
-    fields.update(
-        {qwen4_exp_ple_conv_field(layer_id): value for layer_id, value in conv.items()}
-    )
-    backend = _ple_backend_for_fields(fields, width=3, max_bs=4, granularity=4)
-    backend.preallocate_verify_workspace(max_bs=4, draft_token_num=3)
-    accepted = torch.tensor([1, 3, 2, 1], dtype=torch.int32)
-    pages = torch.tensor([4, 3, 2, 1], dtype=torch.int32)
-    row_calls = []
-    copy_calls = []
-    monkeypatch.setattr(
-        ple_backend_module,
-        "state_verify_commit_rows",
-        lambda *args, **kwargs: row_calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        ple_backend_module,
-        "copy_state_rows",
-        lambda *args, **kwargs: copy_calls.append((args, kwargs)),
-    )
-
-    rows = backend._ple_commit_rows
-    for bs in (1, 4, 2, 3, 4):
-        row_calls.clear()
-        copy_calls.clear()
-        backend.refresh_decode_metadata(
-            bs,
-            bs,
-            torch.arange(bs),
-            torch.full((bs,), 4, dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-            block_tables={QWEN4_EXP_PLE_CACHE_GROUP: pages[:bs, None]},
-        )
-        backend.commit_verified_state(accepted[:bs])
-
-        assert len(row_calls) == 1
-        assert row_calls[0][1] == {"verify_width": 3, "num_layers": 2}
-        src_rows, dst_rows = row_calls[0][0][2:]
-        assert src_rows.shape == dst_rows.shape == (2 * bs,)
-        assert src_rows.is_contiguous() and dst_rows.is_contiguous()
-        assert src_rows.data_ptr() == rows[0].data_ptr()
-        assert dst_rows.data_ptr() == rows[1].data_ptr()
-        assert backend._ple_commit_rows is rows
-        assert len(copy_calls) == 2
-        assert copy_calls[0][0][0].numel() == 1
-        assert copy_calls[1][0][0].numel() == 2
-        assert copy_calls[0][0][2].numel() == bs
-        assert copy_calls[1][0][2] is src_rows
-        assert copy_calls[0][1]["row_bytes"] == 16
-        assert copy_calls[1][1]["row_bytes"] == 24
-        backend.commit_verified_state(accepted[:bs])
-        assert len(row_calls) == 1  # Exactly once per prepared verify round.
-
-
-def test_qwen4_exp_composes_ordinary_gdn_with_specific_state_backends(
-    monkeypatch,
-) -> None:
-    softmax = MHAConfig(
-        backend_name="mha",
-        num_attention_heads=2,
-        num_kv_heads=1,
-        attn_tp_size=1,
-        head_dim=8,
-    )
-    linear = LinearAttnConfig(
-        num_k_heads=2,
-        num_v_heads=2,
-        head_k_dim=8,
-        head_v_dim=8,
-        conv_kernel_size=4,
-        layer_ids=(0,),
-        tp_size=1,
-    )
-    config = AttnConfig(
-        device="cpu",
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method="none",
-        prefix_granularity=128,
-        context_len=1024,
-        max_bs=2,
-        is_draft=False,
-        speculative_num_draft_tokens=1,
-        components=(softmax, linear),
-    )
-    text_config = SimpleNamespace(
-        model_type="qwen4_exp_text",
-        full_attention_layer_ids=(1,),
-        mamba2_cache_params=(None, None, None, None, (0,)),
-    )
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            text_config=text_config,
-            architectures=["Qwen4ExpForConditionalGeneration"],
-        ),
-        attention_arch=object(),
-    )
-    state_group = SimpleNamespace(
-        group_id=LINEAR_ATTENTION,
-        family="state",
-        checkpoint_granularity=128,
-    )
-    pool = SimpleNamespace(
-        field_layer_range=range(2),
-        arena=SimpleNamespace(
-            runtime_contract=SimpleNamespace(group_specs=(state_group,)),
-            plan=SimpleNamespace(fields=()),
-        ),
-        state_group_by_layer={0: LINEAR_ATTENTION},
-        get_component=lambda layer_id, name: None,
-    )
-    monkeypatch.setattr(
-        attention_registry,
-        "_create_attn_backend_with_name",
-        lambda *args, **kwargs: SimpleNamespace(device=torch.device("cpu")),
-    )
-
-    backend = attention_registry._create_hybrid_linear_attn_backend(
-        SimpleNamespace(speculative_algorithm=None, kda_backend="auto"),
-        model_config,
-        config,
-        pool=pool,
-    )
-
-    assert isinstance(
-        backend.linear_attn_backend,
-        MambaAttnBackend,
-    )
-    assert isinstance(backend, Qwen4ExpBackend)
-
-
 def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
     """A CPU-only PLE layer with the GEMMs / embedding stubbed out.
 
@@ -1787,24 +1532,6 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
     assert folded["add_terms"][1] is hidden_states
     torch.testing.assert_close(output, folded["add_terms"][0] + hidden_states)
     torch.testing.assert_close(context[2], torch.tensor([7], dtype=torch.int64))
-
-
-def test_qwen4_exp_ple_forward_is_an_eager_break() -> None:
-    # The prefill graph captures every bucket with a single dummy request, so
-    # the PLE layer must stay eager or its per-request indices, page ids and
-    # bs-shaped grids bake in at bs=1.
-    assert hasattr(Qwen4ExpPLELayer.forward, "__wrapped__")
-
-
-def test_qwen4_exp_qsa_entry_points_are_eager_breaks() -> None:
-    # Hybrid targets break at the composite dispatch; bare draft models break
-    # at CacheGroupRouter.forward. Direct child entry points stay plain to avoid nesting.
-    assert hasattr(QSAIndexer.forward, "__wrapped__")
-    assert hasattr(HybridLinearAttnBackend.forward, "__wrapped__")
-    assert hasattr(CacheGroupRouter.forward, "__wrapped__")
-    assert not hasattr(QSAAttnBackend.forward_extend, "__wrapped__")
-    assert not hasattr(QSAAttnBackend.forward_decode, "__wrapped__")
-    assert not hasattr(QSAIndexer, "sparse_attention")
 
 
 @pytest.mark.parametrize(
@@ -2324,55 +2051,6 @@ def test_ple_conv_sequences_matches_reference(lengths) -> None:
     torch.testing.assert_close(conv_output, ref_output)
     torch.testing.assert_close(final_conv, ref_final)
     torch.testing.assert_close(intermediate, ref_intermediate)
-
-
-@pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
-def test_ple_verify_scratch_fill_matches_reference(lengths) -> None:
-    ngram_size = 3
-    conv_kernel_size = 4
-    channels = 4
-    context_len = ngram_size - 1
-    state_len = (conv_kernel_size - 1) * ngram_size
-    bs = len(lengths)
-    total = sum(lengths)
-    width = max(lengths, default=0)
-    torch.manual_seed(2)
-    initial_context = torch.randint(1, 50, (bs, context_len), dtype=torch.long)
-    initial_conv = torch.randn(bs, channels, state_len, dtype=torch.float32)
-    contexts = torch.randint(1, 50, (total, ngram_size), dtype=torch.long)
-    intermediate = torch.randn(total, channels, state_len, dtype=torch.float32)
-    index = Qwen4ExpPLELayer._batch_indices(lengths, initial_context.device)
-    req, col, _, _, _, idx_total, idx_bs = index
-
-    rows = bs * (width + 1)
-    ctx_new = torch.zeros(rows, context_len, dtype=torch.long)
-    conv_new = torch.zeros(rows, channels, state_len, dtype=torch.float32)
-    ctx_ref = torch.zeros_like(ctx_new)
-    conv_ref = torch.zeros_like(conv_new)
-
-    # Vectorized fill (mirrors Qwen4ExpPLELayer.forward verify branch).
-    stride = width + 1
-    init_rows = torch.arange(idx_bs) * stride
-    ctx_new[init_rows] = initial_context
-    conv_new[init_rows] = initial_conv
-    if idx_total:
-        token_rows = req * stride + 1 + col
-        ctx_new[token_rows] = contexts[:, 1:]
-        conv_new[token_rows] = intermediate
-
-    # Reference per-request fill.
-    token_start = 0
-    for request, length in enumerate(lengths):
-        base = request * (width + 1)
-        ctx_ref[base] = initial_context[request]
-        conv_ref[base] = initial_conv[request]
-        token_end = token_start + length
-        ctx_ref[base + 1 : base + length + 1] = contexts[token_start:token_end, 1:]
-        conv_ref[base + 1 : base + length + 1] = intermediate[token_start:token_end]
-        token_start = token_end
-
-    assert torch.equal(ctx_new, ctx_ref)
-    torch.testing.assert_close(conv_new, conv_ref)
 
 
 @_requires_cuda

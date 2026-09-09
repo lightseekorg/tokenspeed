@@ -28,6 +28,9 @@ import torch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
@@ -63,13 +66,15 @@ def _runner(
         commits["qsa"].append((accepted_lengths.tolist(), num_extends))
 
     wrapper.attn_backend = Qwen4ExpBackend(
-        full_attn_backend=full_backend,
-        linear_attn_backend=(
-            SimpleNamespace(commit_verified_state=commit_recurrent)
+        attention_backend=(
+            HybridLinearAttnBackend(
+                full_backend,
+                SimpleNamespace(commit_verified_state=commit_recurrent),
+                [1, 3],
+            )
             if has_linear
-            else None
+            else full_backend
         ),
-        full_attn_layers=[1, 3],
         ple_backend=(
             SimpleNamespace(commit_verified_state=commit_ple) if has_ple else None
         ),
@@ -80,12 +85,8 @@ def _runner(
         ),
     )
     draft_backend = Qwen4ExpBackend(
-        full_attn_backend=full_backend,
-        linear_attn_backend=None,
-        full_attn_layers=[0],
-        ple_backend=SimpleNamespace(
-            commit_verified_state=lambda *args: events.append("draft_ple")
-        ),
+        attention_backend=full_backend,
+        ple_backend=None,
         indexer_backend=SimpleNamespace(
             commit_after_mtp_verify=lambda *args, **kwargs: events.append("draft_qsa")
         ),
@@ -185,7 +186,6 @@ def test_runner_commits_live_acceptance_once_after_execution(
     _run(wrapper, mode)
     assert commits["qsa"] == expected
     assert events[:2] == ["metadata", "execute"]
-    assert "draft_ple" not in events
     assert "draft_qsa" not in events
     verifies_decode = has_drafter and mode.is_decode()
     assert commits["recurrent"] == ([[3, 1]] if verifies_decode and has_linear else [])

@@ -20,12 +20,18 @@
 
 """Qwen4 cache consumers are assembled per view and budgeted independently."""
 
+from importlib import import_module
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.registry as registry
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
@@ -36,15 +42,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import (
     _compose_qwen4_exp_backend,
     _prepare_verify_workspace,
 )
 
 
-@pytest.mark.parametrize("has_ple", [False, True])
 @pytest.mark.parametrize("has_qsa", [False, True])
-@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize(
+    "is_draft,has_ple", [(False, False), (False, True), (True, False)]
+)
 def test_composition_uses_local_fields_without_requiring_linear_layers(
     has_ple, has_qsa, is_draft
 ):
@@ -82,17 +90,17 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
         arena=SimpleNamespace(plan=SimpleNamespace(fields=fields)),
     )
     full = SimpleNamespace(device="cpu", spec_num_tokens=4)
-    backend = _compose_qwen4_exp_backend(config, pool, full, None, [3, 7])
-    assert backend.linear_attn_backend is None
+    backend = _compose_qwen4_exp_backend(config, pool, full)
+    assert backend.attention_backend is full
     assert (backend.ple_backend is not None) == has_ple
     assert (backend.indexer_backend is not None) == has_qsa
-    # NextN layers are local even if the HF config still names target layers.
-    assert backend._backend_for_layer(0) is full
-    assert len(backend.child_backends()) == 1 + has_ple + has_qsa
 
 
 @pytest.mark.parametrize("width", [1, 4])
-def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(width):
+@pytest.mark.parametrize("has_gdn", [False, True])
+def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
+    width, has_gdn
+):
     calls = []
 
     def consumer(name, nbytes):
@@ -102,13 +110,10 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(width
 
         return SimpleNamespace(preallocate_verify_workspace=preallocate)
 
-    root = Qwen4ExpBackend(
-        SimpleNamespace(device="cpu"),
-        consumer("gdn", 3),
-        [0],
-        consumer("ple", 5),
-        consumer("qsa", 7),
-    )
+    attention = SimpleNamespace(device="cpu")
+    if has_gdn:
+        attention = HybridLinearAttnBackend(attention, consumer("gdn", 3), [0])
+    root = Qwen4ExpBackend(attention, consumer("ple", 5), consumer("qsa", 7))
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=width),
         config=SimpleNamespace(max_bs=2, speculative_num_draft_tokens=width),
@@ -117,25 +122,39 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(width
         uses_paged_state_verify=True,
         is_inkling=False,
     )
-    _prepare_verify_workspace(**kwargs, expected_bytes=15 if width > 1 else 0)
+    _prepare_verify_workspace(
+        **kwargs, expected_bytes=(12 + 3 * has_gdn) if width > 1 else 0
+    )
     assert calls == (
-        [("gdn", 2, width), ("ple", 2, width), ("qsa", 2, width)] if width > 1 else []
+        ([("gdn", 2, width)] if has_gdn else [])
+        + [("ple", 2, width), ("qsa", 2, width)]
+        if width > 1
+        else []
     )
     with pytest.raises(RuntimeError, match="does not match allocated tensors"):
         _prepare_verify_workspace(**kwargs, expected_bytes=0 if width > 1 else 1)
 
 
-def test_hybrid_factory_skips_gdn_when_only_other_ranks_own_state(monkeypatch):
+@pytest.mark.parametrize("has_local_state", [False, True])
+def test_hybrid_factory_binds_gdn_only_for_local_state(monkeypatch, has_local_state):
+    # Load the subclass before replacing its base class with a constructor mock.
+    import_module("tokenspeed.runtime.layers.attention.backends.state.kda")
     full = SimpleNamespace(device="cpu", spec_num_tokens=1)
+    gdn = SimpleNamespace(set_kv_pool=Mock(), commit_verified_state=Mock())
+    factory = Mock(return_value=gdn)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.state.mamba.MambaAttnBackend",
+        factory,
+    )
     components = {
         SoftmaxAttnConfig: SimpleNamespace(),
-        LinearAttnConfig: SimpleNamespace(layer_ids=(3,)),
+        LinearAttnConfig: SimpleNamespace(layer_ids=(0 if has_local_state else 3,)),
     }
     config = SimpleNamespace(component=components.get)
     pool = SimpleNamespace(
-        state_group_by_layer={},
-        field_layer_range=range(0, 1),
-        layer_num=1,
+        state_group_by_layer={0: "linear_attention"} if has_local_state else {},
+        field_layer_range=range(2),
+        layer_num=2,
         arena=SimpleNamespace(plan=SimpleNamespace(fields=[])),
     )
     monkeypatch.setattr(registry, "is_qwen4_exp", lambda hf_config: True)
@@ -143,9 +162,9 @@ def test_hybrid_factory_skips_gdn_when_only_other_ranks_own_state(monkeypatch):
         registry, "_create_attn_backend_with_name", lambda name, arch, config: full
     )
     backend = registry._create_hybrid_linear_attn_backend(
-        SimpleNamespace(speculative_algorithm=None),
+        SimpleNamespace(speculative_algorithm=None, kda_backend="auto"),
         SimpleNamespace(
-            hf_config=SimpleNamespace(full_attention_layer_ids=[0]),
+            hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
             attention_arch="mha",
         ),
         config,
@@ -153,6 +172,82 @@ def test_hybrid_factory_skips_gdn_when_only_other_ranks_own_state(monkeypatch):
         full_attn_backend_name=None,
         is_kda=False,
     )
-    assert backend.linear_attn_backend is None
-    assert backend.child_backends() == (full,)
-    assert backend._backend_for_layer(0) is full
+    if has_local_state:
+        factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
+        gdn.set_kv_pool.assert_called_once_with(pool)
+        accepted = torch.tensor([1, 3], dtype=torch.int32)
+        backend.update_mamba_state_after_mtp_verify(accepted)
+        gdn.commit_verified_state.assert_called_once_with(accepted)
+    else:
+        factory.assert_not_called()
+        assert backend.attention_backend is full
+
+
+@pytest.fixture(params=[False, True], ids=["router", "hybrid"])
+def attention_root(request):
+    router = CacheGroupRouter(
+        lambda group, page_size: None,
+        is_draft=False,
+        spec_num_tokens=4,
+        device="cpu",
+        consumed_group_ids=(FULL_ATTENTION,),
+    )
+    attention = (
+        HybridLinearAttnBackend(router, SimpleNamespace(), [0])
+        if request.param
+        else router
+    )
+    return Qwen4ExpBackend(attention, None, None), router
+
+
+def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
+    root, router = attention_root
+    seq_lens = torch.zeros(2, dtype=torch.int32)
+    leaf = SimpleNamespace(
+        advance_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
+        fill_block_decode_seq_lens=lambda bs, out: out[:bs].copy_(seq_lens[:bs]),
+    )
+    router.leaves = {FULL_ATTENTION: leaf}
+    indexer = SimpleNamespace(
+        advance_draft_forward_metadata=Mock(),
+        update_draft_forward_metadata=Mock(),
+        fill_block_decode_seq_lens=Mock(),
+    )
+    root.indexer_backend = indexer
+    advance = torch.tensor([8, 12], dtype=torch.int32)
+    frontier = torch.tensor([5, 9], dtype=torch.int32)
+    root.advance_draft_forward_metadata(advance)
+    torch.testing.assert_close(seq_lens, advance)
+    root.update_draft_forward_metadata(frontier)
+    lengths = torch.full((3,), -1, dtype=torch.int32)
+    root.fill_block_decode_seq_lens(2, lengths)
+    assert lengths.tolist() == [5, 9, -1]
+    assert leaf.advance_draft_forward_metadata.call_count == 2
+    indexer.advance_draft_forward_metadata.assert_called_once_with(advance)
+    indexer.update_draft_forward_metadata.assert_called_once_with(frontier)
+    indexer.fill_block_decode_seq_lens.assert_called_once_with(2, lengths)
+    root.sparse_topk.decode = frontier
+    assert router.sparse_topk.decode is frontier
+    router.sparse_topk.clear()
+    assert root.sparse_topk.decode is None
+
+
+def test_runtime_and_draft_setup_reach_attention_leaves(attention_root):
+    root, router = attention_root
+    leaf = SimpleNamespace(
+        configure_runtime=Mock(),
+        init_prefill_graph_state=Mock(),
+        supports_layer_sliding_window=True,
+    )
+    router.leaves = {FULL_ATTENTION: leaf}
+    pool = object()
+    root.configure_runtime(token_to_kv_pool=pool)
+    root.init_prefill_graph_state(16, 4)
+    leaf.configure_runtime.assert_called_once_with(token_to_kv_pool=pool)
+    leaf.init_prefill_graph_state.assert_called_once_with(16, 4)
+    assert root.supports_layer_sliding_window
+    slots = torch.empty(4, dtype=torch.int32)
+    starts = torch.tensor([8, 12], dtype=torch.int32)
+    router.draft_write_locations_uniform = Mock(return_value=slots)
+    assert root.draft_write_locations_uniform(slots, starts, 2) is slots
+    router.draft_write_locations_uniform.assert_called_once_with(slots, starts, 2)

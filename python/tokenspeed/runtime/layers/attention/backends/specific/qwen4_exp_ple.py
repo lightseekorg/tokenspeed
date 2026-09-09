@@ -378,21 +378,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                     f"{row_stride_i32(field)} must match layer "
                     f"{self._conv_field_ids[0]} {conv_dst_stride}"
                 )
-        for layer, scratch in zip(self._conv_field_ids, conv_scratches, strict=True):
-            if tuple(scratch.shape[1:]) != conv_shape or scratch.dtype != conv_dtype:
-                raise RuntimeError(
-                    f"PLE layer {layer} convolution verify scratch "
-                    f"geometry {tuple(scratch.shape[1:])}/{scratch.dtype} differs "
-                    f"from its cache field {conv_shape}/{conv_dtype}"
-                )
-        if (
-            tuple(context_scratch.shape[1:]) != tuple(context_field.shape[1:])
-            or context_scratch.dtype != context_field.dtype
-        ):
-            raise RuntimeError(
-                "PLE context verify scratch geometry differs from its cache field"
-            )
-
         device = context_field.device
         tables = {
             "context_src": self._u64([context_scratch.data_ptr()], device),
@@ -410,7 +395,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             ),
             "conv_dst_stride": self._i64([conv_dst_stride] * len(conv_fields), device),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
-            "num_layers": len(conv_fields),
         }
         return tables
 

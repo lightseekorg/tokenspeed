@@ -78,10 +78,10 @@ class ForwardContext:
     """Do not contain Tensor.
 
     The context describes a forward (mode, counts, DP layout) and points at
-    the long-lived subsystems it runs against: the attention backend and cache
-    pool. Data travels as forward arguments or through those subsystems.
-    The collaborators a drafter attaches per forward (``draft_narrowing``,
-    ``target_capture_sink``) lend behavior,
+    the two long-lived subsystems it runs against; data travels as forward
+    arguments or through those subsystems (attention metadata, the backend's
+    per-forward scratch, the KV pool). The collaborators a drafter attaches
+    per forward (``draft_narrowing``, ``target_capture_sink``) lend behavior,
     not buffers. ``gather_ids`` is the one tensor left, pending its move to a
     forward argument beside ``positions``.
     """

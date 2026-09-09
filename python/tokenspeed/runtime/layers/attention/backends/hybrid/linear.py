@@ -54,7 +54,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: MambaAttnBackend | None,
+        linear_attn_backend: MambaAttnBackend,
         full_attn_layers: list[int],
     ):
         self.device = full_attn_backend.device
@@ -123,14 +123,13 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def cache_consumer_families(self) -> frozenset[str]:
-        """Cache families consumed by the actual child backends."""
-        return frozenset().union(
-            *(backend.cache_consumer_families for backend in self.child_backends())
+        """Cache families consumed by the two child backends."""
+        return (
+            self.full_attn_backend.cache_consumer_families
+            | self.linear_attn_backend.cache_consumer_families
         )
 
     def child_backends(self):
-        if self.linear_attn_backend is None:
-            return (self.full_attn_backend,)
         return (self.full_attn_backend, self.linear_attn_backend)
 
     def set_cache_pool(self, cache_pool) -> None:
@@ -141,21 +140,19 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend
-        if self.linear_attn_backend is None:
-            raise ValueError(f"layer {layer_id} has no linear attention backend")
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
 
     def init_forward_metadata(self, *args, **kwargs):
-        for backend in self.child_backends():
-            backend.init_forward_metadata(*args, **kwargs)
+        self.full_attn_backend.init_forward_metadata(*args, **kwargs)
+        self.linear_attn_backend.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
         # Both children are runner-facing nodes whose init_cuda_graph_state
         # absorbs the runner extras (cache_group_specs, ...) through **kwargs.
-        for backend in self.child_backends():
-            backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
@@ -166,12 +163,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        for backend in self.child_backends():
-            backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.linear_attn_backend.init_forward_metadata_capture_cuda_graph(
+            *args, **kwargs
+        )
 
     def refresh_decode_metadata(self, *args, **kwargs) -> None:
-        for backend in self.child_backends():
-            backend.refresh_decode_metadata(*args, **kwargs)
+        self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
+        self.linear_attn_backend.refresh_decode_metadata(*args, **kwargs)
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -252,5 +251,4 @@ class HybridLinearAttnBackend(AttentionBackend):
         return ret
 
     def update_mamba_state_after_mtp_verify(self, accepted_lengths):
-        if self.linear_attn_backend is not None:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+        self.linear_attn_backend.commit_verified_state(accepted_lengths)

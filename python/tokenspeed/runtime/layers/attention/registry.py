@@ -697,9 +697,7 @@ def _create_hybrid_linear_attn_backend(
             len(full_attn_layers),
         )
         if is_qwen4_exp(hf_config):
-            return _compose_qwen4_exp_backend(
-                config, pool, full_attn_backend, None, full_attn_layers
-            )
+            return _compose_qwen4_exp_backend(config, pool, full_attn_backend)
         return full_attn_backend
 
     kda_backend = server_args.kda_backend.strip().lower()
@@ -717,15 +715,11 @@ def _create_hybrid_linear_attn_backend(
     # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
-    backend = (
-        _compose_qwen4_exp_backend(
-            config, pool, full_attn_backend, linear_attn_backend, full_attn_layers
-        )
-        if is_qwen4_exp(hf_config)
-        else HybridLinearAttnBackend(
-            full_attn_backend, linear_attn_backend, full_attn_layers
-        )
+    backend = HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, full_attn_layers
     )
+    if is_qwen4_exp(hf_config):
+        backend = _compose_qwen4_exp_backend(config, pool, backend)
     logger.info(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
@@ -735,10 +729,11 @@ def _create_hybrid_linear_attn_backend(
     return backend
 
 
-def _compose_qwen4_exp_backend(
-    config, pool, full_attn_backend, linear_attn_backend, full_attn_layers
-) -> AttentionBackend:
+def _compose_qwen4_exp_backend(config, pool, attention_backend) -> AttentionBackend:
     """Attach each Qwen4 consumer only when this pool view publishes its fields."""
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
         QSAIndexerBackend,
     )
@@ -762,10 +757,6 @@ def _compose_qwen4_exp_backend(
         for field in pool.arena.plan.fields
         if cache_field_layer_id(field.field_id) in pool.field_layer_range
     }
-    if linear_attn_backend is None:
-        # A NextN view can retain the target's HF layer-id lists even though
-        # its own model has only full-attention layers numbered from zero.
-        full_attn_layers = list(range(pool.layer_num))
     ple = (
         Qwen4ExpPLEBackend(config, config.component(SoftmaxAttnConfig))
         if QWEN4_EXP_PLE_CACHE_GROUP in local_groups
@@ -776,14 +767,17 @@ def _compose_qwen4_exp_backend(
         raise ValueError(
             "QSA consumer requires both compressed and recent cache groups"
         )
+    full_attn_backend = (
+        attention_backend.full_attn_backend
+        if isinstance(attention_backend, HybridLinearAttnBackend)
+        else attention_backend
+    )
     indexer = (
         QSAIndexerBackend(config, full_attn_backend)
         if qsa_groups <= local_groups
         else None
     )
-    return Qwen4ExpBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers, ple, indexer
-    )
+    return Qwen4ExpBackend(attention_backend, ple, indexer)
 
 
 def _wrap_inkling_backend(
@@ -1010,6 +1004,9 @@ def _prepare_verify_workspace(
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
     )
@@ -1018,8 +1015,13 @@ def _prepare_verify_workspace(
     if isinstance(backend, Qwen4ExpBackend):
         actual_bytes = 0
         if config.speculative_num_draft_tokens > 1:
+            gdn = (
+                backend.attention_backend.linear_attn_backend
+                if isinstance(backend.attention_backend, HybridLinearAttnBackend)
+                else None
+            )
             for consumer in (
-                backend.linear_attn_backend,
+                gdn,
                 backend.ple_backend,
                 backend.indexer_backend,
             ):

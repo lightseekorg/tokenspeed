@@ -131,8 +131,8 @@ something the idle refresh cannot express:
   query-start-loc, which the idle refresh deliberately zeroes;
 * **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
   capture must seed real lengths);
-* **HybridLinearAttnBackend / MSAHybrid**: pure fan-out to their children so
-  the real captures above are reached.
+* **HybridLinearAttnBackend / Qwen4ExpBackend / MSAHybrid**: pure fan-out to
+  their children so the real captures above are reached.
 
 A new backend implements `refresh_decode_metadata` and inherits both
 `init_cuda_graph_state` (the page-table / cache-seqlens pair, sized by
@@ -333,11 +333,13 @@ family under `state/`. A model-shaped backend earns `specific/` only when the or
 router and ordinary paged or recurrent leaves cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
-`Qwen4ExpBackend` is a `HybridLinearAttnBackend` composite over full attention,
-optional GDN, optional `Qwen4ExpPLEBackend` and optional `QSAIndexerBackend`.
-It broadcasts cache binding and metadata lifecycle calls to the actual
-children; the model retains projection, PLE and indexer computation order.
-PLE and QSA remain available when the model has no linear-attention layers.
+`Qwen4ExpBackend` composes one attention backend, optional
+`Qwen4ExpPLEBackend` and optional `QSAIndexerBackend`. The attention child is
+the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
+when this view owns GDN layers. Forward dispatch and PD step recording stay
+with that child; the root broadcasts cache and metadata lifecycle calls.
+Draft views have no GDN or PLE child. PLE and QSA remain available on targets
+without linear-attention layers; the model retains their computation order.
 
 QSA's full-KV attention uses the ordinary router and an MHA-derived leaf.
 Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
@@ -563,13 +565,9 @@ mapping remains a separate consumer of the shared mapping helpers
   and CUDA graph replay; `test_qsa_verify_lifecycle.py` — the Qwen4-Exp root
   commits GDN/PLE on decode and QSA on decode/mixed, using real acceptance
   rows once after execution, including PLE without GDN and failure cases.
-* `test/ci/ut/ut-qwen4-backends.yaml` — manual Slurm regression task that
-  invokes the QSA/PLE runtime and kernel pytest files explicitly.
-  `ut-qwen4-exp-model-smoke.yaml` separately runs the public Qwen4-Exp
-  checkpoint without speculation, with eager MTP and with graph MTP.
-  Repeated batches exercise sizes one and four; verify counts and profiler
-  graph launches confirm the execution modes. Model smoke checks completion,
-  while the deterministic kernel/cache-state tests establish numerical parity.
+* `test/runtime/test_qwen4_backend_composition.py` — local consumer selection,
+  workspace accounting, draft hooks through the attention composite and one
+  PD cache step per layer.
 * `test/runtime/test_cudagraph_per_group.py`,
   `test_group_write_locations.py` — per-group padding wiring and the
   write-location edge cases (holes, overflow, MTP re-anchor) on the unified

@@ -566,8 +566,10 @@ is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
   fill at expansion ratio one, preserving block ids and clearing padding,
   and borrows the full-KV address view from the router. Its private
   `QSAVerifyState` exists only for a speculative target with local QSA fields.
-* **`Qwen4ExpBackend`** composes the full-attention, optional GDN, PLE and
-  indexer consumers. The runner's existing post-verify calls dispatch once
+* **`Qwen4ExpBackend`** composes an attention backend with optional PLE and
+  indexer consumers. Its attention child uses the ordinary hybrid only for
+  views with GDN layers; draft views have neither GDN nor PLE.
+  The runner's existing post-verify calls dispatch once
   to their respective children; the root neither allocates verify tensors
   nor registers or looks up QSA state. PLE owns its checkpoint metadata
   independently of Mamba and shares only the checkpoint arithmetic. See the

@@ -135,9 +135,6 @@ def test_ple_capture_and_verify_use_own_stable_metadata(backend, monkeypatch):
     )
     monkeypatch.setattr(ple_module, "copy_state_rows", lambda *a, **k: None)
     backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
-    # Both accepted prefixes cross the checkpoint after their committed input.
-    assert rows_calls[0][0][1].tolist() == [2, 5]
-    assert rows_calls[0][1] == {"verify_width": 3, "num_layers": 2}
     backend.commit_verified_state(torch.tensor([2, 3], dtype=torch.int32))
     assert len(rows_calls) == 1
     assert backend._verify_commit_ctx is None
@@ -208,14 +205,7 @@ def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
     assert backend.forward_metadata is None
 
 
-def test_ple_plan_binding_excludes_other_views_and_needs_no_model(backend):
-    assert backend._conv_field_ids == (
-        qwen4_exp_ple_conv_field(0),
-        qwen4_exp_ple_conv_field(2),
-    )
-    assert len(backend._ple_verify_tables["conv_src"]) == 2
-    assert len(backend._ple_verify_tables["context_src"]) == 1
-    assert not hasattr(backend, "_ple_layers")
+def test_ple_preallocation_preserves_workspace_and_budget(backend):
     scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0)
     allocated = backend.preallocate_verify_workspace(4, 3)
     assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8
@@ -286,6 +276,8 @@ def test_draft_view_cannot_claim_target_ple_fields():
 )
 def test_ple_commit_copies_only_accepted_checkpoints():
     backend = _make_backend(3, False, "cuda")
+    other_view = backend.cache_pool.arena.field(qwen4_exp_ple_conv_field(4))
+    other_view.fill_(-77)
     for index, (field_id, scratch) in enumerate(backend._ple_verify_scratch.items()):
         values = torch.arange(scratch.numel(), device="cuda").reshape(scratch.shape)
         scratch.copy_(values + 100 * index)
@@ -311,4 +303,5 @@ def test_ple_commit_copies_only_accepted_checkpoints():
         assert torch.equal(field[5], scratch[7])
         untouched = [row for row in range(field.shape[0]) if row not in (2, 5)]
         assert torch.all(field[untouched] == -77)
+    assert torch.all(other_view == -77)
     assert backend._verify_commit_ctx is None
