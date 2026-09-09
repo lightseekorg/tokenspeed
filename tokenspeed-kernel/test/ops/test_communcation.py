@@ -162,6 +162,12 @@ def check_all_reduce(rank: int, world_size: int, device) -> None:
         max_bytes=0,
         device=device,
     )
+    assert state.max_bytes == 0
+    assert not triton_communication.symm_outputs_can_run(
+        state,
+        ((4,),),
+        torch.bfloat16,
+    )
 
     for numel in [2880, 20160, 23040, 92160, 184320]:
         tensor = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)

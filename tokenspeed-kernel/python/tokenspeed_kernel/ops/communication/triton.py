@@ -1933,7 +1933,7 @@ def create_state(
             world_size=world_size,
             device=device,
             max_numel=max_numel,
-            max_bytes=max_bytes or max_numel * torch.bfloat16.itemsize,
+            max_bytes=max_bytes,
             attnres_max_numel=attnres_max_numel,
             max_token_num=0,
             hidden_dim=0,
