@@ -470,8 +470,7 @@ def test_gfx1250_small_m_route_matches_expert_grouping(tokens: int) -> None:
     experts, topk = 896, 16
     ids = torch.stack(
         [
-            (torch.arange(topk, device="cuda", dtype=torch.int32) + token * 7)
-            % experts
+            (torch.arange(topk, device="cuda", dtype=torch.int32) + token * 7) % experts
             for token in range(tokens)
         ]
     )
@@ -594,9 +593,7 @@ def _assert_gfx1250_large_route(
         num_blocks = int(expected_block_offsets[-1])
         expected_schedule = []
         for expert, count in enumerate(expected_blocks.tolist()):
-            expected_schedule.extend(
-                (block << 16) | expert for block in range(count)
-            )
+            expected_schedule.extend((block << 16) | expert for block in range(count))
         assert metadata.block_schedule(block_size)[:num_blocks].tolist() == (
             expected_schedule
         )
@@ -610,8 +607,9 @@ def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64() -> N
     torch.manual_seed(43)
     tokens, topk, experts = 37, 7, 11
     ids = (
-        torch.arange(tokens * topk, device="cuda", dtype=torch.int32)
-        .reshape(tokens, topk)
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
+            tokens, topk
+        )
         % experts
     )
     ids[:, 1] = 3
@@ -658,10 +656,7 @@ def test_gfx1250_weighted_topk_reduce_masks_invalid_rows() -> None:
         torch.zeros_like(weights),
     )
     expected = (
-        (
-            torch.nan_to_num(flat.float(), nan=0.0)
-            * expected_weights.reshape(-1, 1)
-        )
+        (torch.nan_to_num(flat.float(), nan=0.0) * expected_weights.reshape(-1, 1))
         .view(tokens, topk, width)
         .sum(dim=1)
         .to(torch.bfloat16)
