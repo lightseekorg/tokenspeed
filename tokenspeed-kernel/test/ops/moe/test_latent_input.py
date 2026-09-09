@@ -134,9 +134,7 @@ def test_latent_input_without_up_clamp() -> None:
 def test_gfx1250_latent_input_decode_matches_and_replays() -> None:
     hidden_size = 7168
     widths = (896, 3584, 1536)
-    packed = torch.randn(
-        sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda"
-    )
+    packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
     views = list(packed.split(widths))
     hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device="cuda")
     gate_clamp, up_clamp = 4.0, 25.0

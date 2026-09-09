@@ -42,9 +42,7 @@ def _latent_input_decode_kernel(
         )
         n_layout: gl.constexpr = gl.SliceLayout(1, layout)
         k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-        offs_n = pid * _ROUTER_BLOCK_N + gl.arange(
-            0, _ROUTER_BLOCK_N, layout=n_layout
-        )
+        offs_n = pid * _ROUTER_BLOCK_N + gl.arange(0, _ROUTER_BLOCK_N, layout=n_layout)
         acc = gl.zeros([_ROUTER_BLOCK_N], gl.float32, n_layout)
         for k0 in range(0, _HIDDEN, _BLOCK_K):
             offs_k = k0 + gl.arange(0, _BLOCK_K, layout=k_layout)
@@ -97,9 +95,7 @@ def _latent_input_decode_kernel(
     )
     n_layout: gl.constexpr = gl.SliceLayout(1, layout)
     k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    offs_n = pid_n * _SHARED_BLOCK_N + gl.arange(
-        0, _SHARED_BLOCK_N, layout=n_layout
-    )
+    offs_n = pid_n * _SHARED_BLOCK_N + gl.arange(0, _SHARED_BLOCK_N, layout=n_layout)
     gate_acc = gl.zeros([_SHARED_BLOCK_N], gl.float32, n_layout)
     up_acc = gl.zeros([_SHARED_BLOCK_N], gl.float32, n_layout)
     for k0 in range(0, _HIDDEN, _BLOCK_K):
@@ -110,8 +106,7 @@ def _latent_input_decode_kernel(
         gate_weight = gl.amd.cdna5.buffer_load(
             ptr=shared_weight_ptr,
             offsets=(
-                offs_n[:, None].to(gl.int64) * _HIDDEN
-                + offs_k[None, :].to(gl.int64)
+                offs_n[:, None].to(gl.int64) * _HIDDEN + offs_k[None, :].to(gl.int64)
             ).to(gl.int32),
         )
         up_weight = gl.amd.cdna5.buffer_load(

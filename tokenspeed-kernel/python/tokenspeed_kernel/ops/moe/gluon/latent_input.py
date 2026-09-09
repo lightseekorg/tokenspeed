@@ -15,14 +15,14 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
-    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
-        gluon_latent_input_decode_gfx1250 as _decode_gfx1250_impl,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
         gluon_latent_input_decode_gfx950 as _decode_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
         gluon_latent_input_small_batch_gfx950 as _small_batch_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (
+        gluon_latent_input_decode_gfx1250 as _decode_gfx1250_impl,
     )
 
     _SIGNATURES = frozenset(
