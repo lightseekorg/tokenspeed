@@ -232,13 +232,17 @@ Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources may be re-granted in the
-same plan, so it is launched first and the caller's stream waits on its
-completion event before the plan's page zeroing is enqueued — the zeroing,
-load-backs, forwards and RDMA triggers behind it inherit the fence (the
-forward by waiting on the default stream in its prologue; that wait is
-one-way, the zeroing's and the writeback's own waits are what order the
-default and write streams behind the forwards). The two
-kinds use separate staging lanes: each lane uploads block metadata
+same plan, so it is launched first and the fence stream the caller names --
+the default stream, where the plan's page zeroing runs -- waits on its
+completion event before the zeroing is enqueued — the zeroing, load-backs,
+forwards and RDMA triggers behind it inherit the fence (the forward by
+waiting on the default stream in its prologue; that wait is one-way, the
+zeroing's and the writeback's own waits are what order the default and write
+streams behind the forwards). Load-backs likewise name their producer stream
+-- the default stream that zeroed their destinations -- rather than
+recording their start event on whatever stream is current: every stream the
+L2 executor orders against is an argument, never ambient thread state. The
+two kinds use separate staging lanes: each lane uploads block metadata
 asynchronously and records an event after both metadata copies to protect its
 pinned CPU staging tables — before refilling them, the next submission on
 that lane waits only if that event is incomplete. This does not wait for the
@@ -254,6 +258,14 @@ layer readiness alone does not retire metadata still read by the transfer.
 On submission failure, retirement fences protect reuse without publishing a
 successful load ACK. If neither event publication nor stream synchronization
 can establish retirement, the executor must reject further loads.
+
+An op is acknowledged only by its copy's completion event, so every op on the
+wire carries at least one transfer, and no (group, source, destination)
+repeats within one plan: a store skips keys already in flight, a load targets
+freshly acquired pages. The scheduler asserts both when batching a plan's ops
+and the runtime refuses an op with nothing to copy; neither side dedups or
+invents an acknowledgement, because an op that never completes a copy would
+hold its tickets forever.
 
 ## block vs. page
 

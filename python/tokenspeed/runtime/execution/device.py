@@ -310,13 +310,15 @@ class DeviceHandle:
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
-            # forward thread's stream here, before the zeroing is enqueued.
-            # The copies themselves order behind the execution stream, where
-            # the forwards wrote the pages.
+            # default stream the zeroing runs on, before the zeroing is
+            # enqueued. The copies themselves order behind the execution
+            # stream, where the forwards wrote the pages.
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_write_backs(
-                        execution_plan, producer_stream=executor.execution_stream
+                        execution_plan,
+                        producer_stream=executor.execution_stream,
+                        fence_stream=executor.default_stream,
                     )
                 )
             )
@@ -327,8 +329,14 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # Behind the zeroing: the loads' destinations were zeroed on the
+            # default stream, so that is the producer they order after.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_load_backs(
+                        execution_plan, producer_stream=executor.default_stream
+                    )
+                )
             )
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,

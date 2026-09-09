@@ -27,7 +27,6 @@ from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
 import psutil
-import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     build_host_transfer_geometry,
@@ -88,7 +87,7 @@ class _WriteLane:
     (stream-ordered, then pinned) never wait on each other's staging.
     """
 
-    __slots__ = ("workspace", "metadata_done")
+    __slots__ = ("metadata_done", "workspace")
 
     def __init__(self) -> None:
         self.workspace = HostTransferWorkspace()
@@ -182,12 +181,13 @@ class L2CacheExecutor:
         # stream the caller names per submission -- the one the forwards wrote
         # the pages on. What differs per op is who waits on the copy: a
         # stream-ordered op (a retraction's snapshot, whose sources this very
-        # plan may re-grant) fences the caller's stream on its completion, so
-        # the plan's zeroing, load-backs and forwards stay behind it; a pinned
-        # op (an ordinary publication, whose sources the scheduler holds until
-        # the ACK) fences nothing and never holds up the round. Loads keep
-        # their own stream: their consumers are fenced per layer by the
-        # tracker events.
+        # plan may re-grant) fences the fence stream the caller names on its
+        # completion, so the plan's zeroing, load-backs and forwards stay
+        # behind it; a pinned op (an ordinary publication, whose sources the
+        # scheduler holds until the ACK) fences nothing and never holds up the
+        # round. Loads keep their own stream, ordered after the producer stream
+        # that zeroed their destinations: their consumers are fenced per layer
+        # by the tracker events.
         self.write_stream = _new_cache_stream(None)
         self.load_stream = _new_cache_stream(_load_stream_priority())
         device = self.layout.buffers[0].device
@@ -279,11 +279,9 @@ class L2CacheExecutor:
         self._ack_lock = threading.Lock()
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
-        self._ready_write_op_ids: list[int] = []
-        self._ready_load_op_ids: list[int] = []
         self._load_poisoned = False
 
-    def submit_write_backs(self, plan, *, producer_stream) -> None:
+    def submit_write_backs(self, plan, *, producer_stream, fence_stream) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
         Must run BEFORE the plan's page zeroing. Every copy is ordered behind
@@ -292,15 +290,17 @@ class L2CacheExecutor:
         ``source_pinned``: a pinned op's sources stay cached and unevictable
         until the ACK, so its copy rides the write stream and nobody waits on
         it; an unpinned op's sources may already be granted to another request
-        in this very plan, so it goes first and the caller's stream waits on
-        its completion -- the plan's zeroing, load-backs and forwards are
-        ordered behind that wait.
+        in this very plan, so it goes first and ``fence_stream`` waits on its
+        completion -- the plan's zeroing, load-backs and forwards are ordered
+        behind that wait.
 
         Args:
             plan: The round's ExecutionPlan; its ``Cache.WriteBackOp``
                 entries are read here.
             producer_stream: The stream whose completed work every copy must
                 observe -- the model executor's execution stream.
+            fence_stream: The stream a stream-ordered op's completion fences
+                -- the one the plan's page zeroing runs on next.
         """
         ordered_op_ids: list[int] = []
         ordered_transfers: list[tuple[int, int, int]] = []
@@ -322,7 +322,7 @@ class L2CacheExecutor:
             producer_stream=producer_stream,
         )
         if fence is not None:
-            device_module.current_stream().wait_event(fence)
+            fence_stream.wait_event(fence)
         self._start_writing(
             pinned_op_ids,
             pinned_transfers,
@@ -330,8 +330,15 @@ class L2CacheExecutor:
             producer_stream=producer_stream,
         )
 
-    def submit_load_backs(self, plan) -> None:
-        """Launch the plan's H2D loads; runs after the plan's page zeroing."""
+    def submit_load_backs(self, plan, *, producer_stream) -> None:
+        """Launch the plan's H2D loads; runs after the plan's page zeroing.
+
+        Args:
+            plan: The round's ExecutionPlan; its ``Cache.LoadBackOp``
+                entries are read here.
+            producer_stream: The stream whose completed work every copy must
+                observe -- the one that zeroed the destination pages.
+        """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
         for operation in plan.cache:
@@ -345,7 +352,9 @@ class L2CacheExecutor:
                     transfers=transfers,
                     source_is_device=False,
                 )
-        load_index = self._start_loading(op_ids, transfers)
+        load_index = self._start_loading(
+            op_ids, transfers, producer_stream=producer_stream
+        )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
 
@@ -398,6 +407,11 @@ class L2CacheExecutor:
         ):
             if not (len(groups) == len(sources) == len(destinations)):
                 raise ValueError(f"ragged cache operation {op_id}")
+            # An op is acknowledged by its copy's completion event; one with
+            # nothing to copy could never be acknowledged and the scheduler
+            # would hold its tickets forever.
+            if not groups:
+                raise ValueError(f"cache operation {op_id} carries no transfers")
             collected_op_ids.append(int(op_id))
             for group, source, destination in zip(groups, sources, destinations):
                 device_block_id, host_block_id = (
@@ -415,16 +429,11 @@ class L2CacheExecutor:
     ):
         """Launch one D2H batch on the write stream; return its completion event.
 
-        Returns None when nothing was launched (no ops, or ops with no
-        transfers, which are acknowledged at the next poll).
+        Returns None when the lane has no ops this round.
         """
         if not op_ids:
             return None
         op_ids = _ordered_unique(op_ids)
-        if not transfers:
-            with self._ack_lock:
-                self._ready_write_op_ids.extend(op_ids)
-            return None
         if self.attn_tp_rank == 0:
             logger.info(
                 "[L2] writeback started: operations=%d blocks=%d pinned=%s",
@@ -434,13 +443,11 @@ class L2CacheExecutor:
             )
         # Behind the forwards that wrote the source pages: that is what lets
         # the copy read their final bytes.
-        stream = self.write_stream
-        stream.wait_stream(producer_stream)
+        self.write_stream.wait_stream(producer_stream)
         # CPU writes are not ordered by stream FIFO. Retire the previous
         # metadata upload before refilling its pinned source, not at submit.
-        if lane.metadata_done is not None:
-            if not lane.metadata_done.query():
-                lane.metadata_done.synchronize()
+        if lane.metadata_done is not None and not lane.metadata_done.query():
+            lane.metadata_done.synchronize()
         num_blocks, _ = lane.workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
@@ -448,7 +455,7 @@ class L2CacheExecutor:
         # the write stream itself: the payload kernel below reads those tables
         # from that stream, and a copy issued on the caller's stream would sit
         # behind the wait recorded above with nothing ordering it first.
-        with device_module.stream(stream):
+        with device_module.stream(self.write_stream):
             mode = lane.workspace.prepare_backend(
                 self.layout.buffers,
                 self.host_storage.host_buffer,
@@ -465,14 +472,14 @@ class L2CacheExecutor:
                     # Also protect a partially submitted upload if staging
                     # fails. This event excludes the payload transfer; Device
                     # table reuse remains ordered by the write stream's FIFO.
-                    lane.metadata_done.record(stream)
+                    lane.metadata_done.record(self.write_stream)
         transfer_cache_blocks(
             "d2h",
             self.layout.buffers,
             self.host_storage.host_buffer,
             self._transfer_geometry,
             lane.workspace,
-            stream,
+            self.write_stream,
             num_blocks=num_blocks,
             geometry_offset=0,
             num_geometry_rows=self._transfer_geometry.num_field_rows,
@@ -481,7 +488,7 @@ class L2CacheExecutor:
             layer_ready_flags=None,
         )
         finish = device_module.Event()
-        finish.record(stream)
+        finish.record(self.write_stream)
         with self._ack_lock:
             self._write_acks.append(_Ack(finish, op_ids))
         return finish
@@ -490,6 +497,8 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
+        *,
+        producer_stream,
     ) -> int | None:
         if self._load_poisoned:
             raise RuntimeError(
@@ -500,10 +509,6 @@ class L2CacheExecutor:
         if get_is_capture_mode():
             raise RuntimeError("Host cache load must run outside CUDA Graph capture")
         op_ids = _ordered_unique(op_ids)
-        if not transfers:
-            with self._ack_lock:
-                self._ready_load_op_ids.extend(op_ids)
-            return None
         if self.attn_tp_rank == 0:
             logger.info(
                 "[L2] load started: operations=%d blocks=%d",
@@ -511,10 +516,11 @@ class L2CacheExecutor:
                 len(transfers),
             )
 
-        # EventLoop zeroes freshly allocated Device blocks before submitting the
-        # load. Recording the start event here makes the H2D copy wait for that
-        # zeroing; per-layer ready flags (Triton) or events (DMA) then keep
-        # model consumers from reading partially restored cache state.
+        # EventLoop zeroes freshly allocated Device blocks on the producer
+        # stream before submitting the load. Recording the start event there
+        # makes the H2D copy wait for that zeroing; per-layer ready flags
+        # (Triton) or events (DMA) then keep model consumers from reading
+        # partially restored cache state.
         load_index = None
         finish = None
         flags = None
@@ -531,7 +537,7 @@ class L2CacheExecutor:
                     load_index = current_load_index
                 elif current_load_index != load_index:
                     raise RuntimeError("target and draft Host-load trackers diverged")
-                load_events.start_event.record()
+                load_events.start_event.record(producer_stream)
                 load_events.start_event.wait(self.load_stream)
             if load_index is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
@@ -653,11 +659,8 @@ class L2CacheExecutor:
                         pass
 
     def poll_results(self) -> list:
+        results: list = []
         with self._ack_lock:
-            results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
-            self._ready_write_op_ids.clear()
-            results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
-            self._ready_load_op_ids.clear()
             self._write_acks[:] = self._drain(
                 self._write_acks, self._write_done, results
             )
@@ -687,17 +690,13 @@ class L2CacheExecutor:
         return event
 
     def shutdown(self) -> None:
-        # The caller's stream carries the fences the transfers were ordered
-        # behind; the write and load streams carry the transfers themselves.
-        torch.cuda.current_stream().synchronize()
-        self.write_stream.synchronize()
-        self.load_stream.synchronize()
+        # The fences and start events live on streams the callers named per
+        # submission; the whole device covers them and the transfer streams.
+        device_module.synchronize()
 
     def reset(self) -> None:
         self.shutdown()
         self._write_acks.clear()
         self._load_acks.clear()
-        self._ready_write_op_ids.clear()
-        self._ready_load_op_ids.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()
