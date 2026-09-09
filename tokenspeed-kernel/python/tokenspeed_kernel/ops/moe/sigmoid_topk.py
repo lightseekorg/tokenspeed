@@ -32,7 +32,6 @@ def _gluon_eligible(
         and topk <= experts <= 1024
         and router_logits.stride(1) == 1
         and correction_bias.is_contiguous()
-        and correction_bias.dtype == router_logits.dtype
     )
 
 
