@@ -116,7 +116,7 @@ for CONFIG in "${CONFIGS[@]}"; do
     fi
     echo "Warmup..."
     evalscope perf \
-        --model deepseek-v4-flash \
+        --model deepseek-ai/DeepSeek-V4-Flash-0731 \
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
@@ -131,15 +131,15 @@ for CONFIG in "${CONFIGS[@]}"; do
 
     echo "Benchmark..."
     evalscope perf \
-        --model deepseek-v4-flash \
+        --model deepseek-ai/DeepSeek-V4-Flash-0731 \
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
         --max-tokens 500 \
         --multi-turn \
-        --number 4 8 8 16 \
-        --parallel 1 2 4 8 \
+        --number 4 8 8 16 32 \
+        --parallel 1 2 4 8 16 \
         --extra-args '{"ignore_eos": true, "temperature": 0}' \
         --name $CONFIG \
         --outputs-dir $SWEEP_DIR \

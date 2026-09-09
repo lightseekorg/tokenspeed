@@ -50,7 +50,7 @@ def load_tokenizer(model: str, revision: str):
     def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None,
         **kwargs,
     ):
         thinking = kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
