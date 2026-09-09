@@ -36,6 +36,41 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def test_repack_compiles_for_amd():
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    from tokenspeed.runtime.models.qwen3_5 import (
+        fused_qkvzba_split_reshape_cat_contiguous_kernel as kernel,
+    )
+
+    # Exercise AMD pointer canonicalization even when CI runs on NVIDIA GPUs.
+    triton.compile(
+        ASTSource(
+            kernel,
+            signature={name: "*bf16" for name in kernel.arg_names[:6]},
+            constexprs=dict(
+                stride_qkvz=4120,
+                stride_ba=4120,
+                NUM_HEADS_QK=4,
+                NUM_HEADS_V=12,
+                HEAD_QK=128,
+                HEAD_V=128,
+                BLOCK=2048,
+                BLOCK_BA=16,
+                ENABLE_PDL=False,
+            ),
+            attrs={
+                (i,): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+                for i in range(6)
+            },
+        ),
+        target=GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 4, "num_stages": 1},
+    )
+
+
 @pytest.mark.parametrize(
     "rows,nk,nv,dq,dv,dtype,gate_dtype,layout",
     [

@@ -1815,20 +1815,24 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
     QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
     QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
-    # QKVZ is already ordered: copy consecutive features and split only the
-    # destination pointer. This also handles non-power-of-two head ratios.
+    # QKVZ is already ordered, including non-power-of-two head ratios.
     offsets = tile * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(
         mixed_qkvz + row * stride_qkvz + offsets,
         offsets < QKVZ_DIM,
         other=0,
     )
-    output = tl.where(
-        offsets < QKV_DIM,
+    # Keep output bases separate: pointer selection breaks AMD canonicalization.
+    tl.store(
         mixed_qkv + row * QKV_DIM + offsets,
-        z + row * TOTAL_V + offsets - QKV_DIM,
+        values,
+        offsets < QKV_DIM,
     )
-    tl.store(output, values, offsets < QKVZ_DIM)
+    tl.store(
+        z + row * TOTAL_V + offsets - QKV_DIM,
+        values,
+        (offsets >= QKV_DIM) & (offsets < QKVZ_DIM),
+    )
 
     # One tile owns each row's gates; adjacent lanes copy adjacent heads.
     if tile == 0:
