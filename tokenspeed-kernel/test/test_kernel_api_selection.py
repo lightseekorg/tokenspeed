@@ -67,6 +67,7 @@ import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
+import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -181,6 +182,7 @@ _RELOAD_MODULES = [
     _moe_gluon_dsv4,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
+    _moe_sigmoid_topk,
     _moe_gluon_sigmoid_topk,
     _moe_gluon,
     _moe_triton_bf16,
@@ -2381,6 +2383,58 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert triton_spec.priority == Priority.SPECIALIZED + 1
     assert gluon_spec.priority == Priority.SPECIALIZED
     assert selected.name == "triton_decode_sigmoid_bias_topk"
+
+
+def test_gfx1250_sigmoid_topk_selects_by_token_count(
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx1250")
+    triton_spec = registry.get_by_name("triton_decode_sigmoid_bias_topk")
+    if gluon_spec is None or triton_spec is None:
+        pytest.skip("gfx1250 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        decode = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1, "experts": 896, "topk": 16},
+        )
+        batched = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+        other_shape = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 256, "topk": 8},
+        )
+        reduced_precision = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode.name == "triton_decode_sigmoid_bias_topk"
+    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert other_shape.name == "torch_sigmoid_bias_topk"
+    assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
