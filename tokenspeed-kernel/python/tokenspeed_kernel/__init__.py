@@ -150,8 +150,6 @@ __all__ = [
     "prepare_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
-    # quantization
-    "fp8_quantize_dequantize",
     # hyperconnection
     "gated_residual_combine",
     "gated_residual_mix",
@@ -222,6 +220,7 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
     # quantization
+    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_fp8_with_scale",
     "quantize_mxfp8",

@@ -204,11 +204,6 @@ def _rmsnorm(
     return (weight.float() * normalized).to(original_dtype)
 
 
-# Public name for direct contract tests while preserving the historical private
-# helper imported by the DSpark model implementation.
-dspark_rmsnorm = _rmsnorm
-
-
 def _normalize_query_per_head(
     query: torch.Tensor,
     head_dim: int,
@@ -276,7 +271,7 @@ def dspark_attention_forward_batched(
     )
     block_freqs = freqs_cis[block_positions]
 
-    main_kv = dspark_rmsnorm(_dspark_fp8_linear(main_x, wkv), kv_norm_w, eps)
+    main_kv = _rmsnorm(_dspark_fp8_linear(main_x, wkv), kv_norm_w, eps)
     main_kv = _rope_last_dims_batched(
         main_kv,
         rope_head_dim,
@@ -284,7 +279,7 @@ def dspark_attention_forward_batched(
     )
     main_kv = _quantize_dspark_non_rope(main_kv, rope_head_dim)
 
-    query = dspark_rmsnorm(_dspark_fp8_linear(x, wq_a), q_norm_w, eps)
+    query = _rmsnorm(_dspark_fp8_linear(x, wq_a), q_norm_w, eps)
     query = _dspark_fp8_linear(query, wq_b).unflatten(-1, (n_heads, head_dim))
     query = _normalize_query_per_head(query, head_dim, eps)
     query = _rope_last_dims_batched(
@@ -293,7 +288,7 @@ def dspark_attention_forward_batched(
         block_freqs,
     )
 
-    block_kv = dspark_rmsnorm(_dspark_fp8_linear(x, wkv), kv_norm_w, eps)
+    block_kv = _rmsnorm(_dspark_fp8_linear(x, wkv), kv_norm_w, eps)
     block_kv = _rope_last_dims_batched(
         block_kv,
         rope_head_dim,

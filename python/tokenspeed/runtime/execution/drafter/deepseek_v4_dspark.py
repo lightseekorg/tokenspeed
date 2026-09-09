@@ -34,7 +34,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     sample_dspark_block_greedy,
 )
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
@@ -43,9 +42,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-
-
-logger = get_colorful_logger(__name__)
 
 
 def _dspark_decode_position_plan(

@@ -153,8 +153,8 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     _dspark_output_projection,
     _normalize_query_per_head,
     _quantize_dspark_non_rope,
+    _rmsnorm,
     dspark_fp8_quant_dequant,
-    dspark_rmsnorm,
     get_dspark_topk_idxs_batched,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
@@ -2230,7 +2230,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         values = torch.linspace(-7.0, 7.0, 1024, dtype=torch.bfloat16).reshape(2, 512)
         weight = torch.linspace(-0.5, 0.5, 512, dtype=torch.bfloat16)
 
-        actual = dspark_rmsnorm(values, weight, 1e-6)
+        actual = _rmsnorm(values, weight, 1e-6)
         normalized = values.float()
         normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
         expected = (weight.float() * normalized).to(values.dtype)
@@ -2251,11 +2251,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         values = torch.randn((8, 5, 512), device="cuda", dtype=torch.bfloat16)
         weight = torch.randn((512,), device="cuda", dtype=torch.bfloat16)
 
-        dspark_rmsnorm(values, weight, 1e-6)
+        _rmsnorm(values, weight, 1e-6)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            actual = dspark_rmsnorm(values, weight, 1e-6)
+            actual = _rmsnorm(values, weight, 1e-6)
 
         values.copy_(torch.randn_like(values))
         graph.replay()

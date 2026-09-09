@@ -198,6 +198,8 @@ def mhc_fused_hc(
         rms_eps: Epsilon used by the residual RMS normalization.
         hc_eps: Epsilon added during pre-mix and Sinkhorn normalization.
         sinkhorn_iters: Number of Sinkhorn row/column normalization iterations.
+        norm_weight: Optional RMSNorm weight applied to the current layer input.
+        norm_eps: RMSNorm epsilon. This must be provided with ``norm_weight``.
 
     Returns:
         A tuple of the current BF16 residual streams, BF16 layer input, FP32
