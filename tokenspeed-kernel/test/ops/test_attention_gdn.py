@@ -39,10 +39,17 @@ def _fla_chunk_gated_delta_rule():
     return chunk_gated_delta_rule
 
 
-def _make_inputs(*, device: str, dtype: torch.dtype, seq_len: int = 130):
+def _make_inputs(
+    *,
+    device: str,
+    dtype: torch.dtype,
+    seq_len: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    state_dtype: torch.dtype,
+    nonzero_state: bool,
+):
     torch.manual_seed(0)
-    num_q_heads = 16
-    num_v_heads = 32
     head_dim = 128
     q = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
@@ -51,9 +58,11 @@ def _make_inputs(*, device: str, dtype: torch.dtype, seq_len: int = 130):
     g = F.logsigmoid(
         torch.rand(1, seq_len, num_v_heads, device=device, dtype=torch.float32)
     )
+    state_shape = (1, num_v_heads, head_dim, head_dim)
     initial_state = (
-        torch.randn(1, num_v_heads, head_dim, head_dim, device=device, dtype=dtype)
-        * 0.1
+        torch.randn(state_shape, device=device, dtype=state_dtype) * 0.1
+        if nonzero_state
+        else torch.zeros(state_shape, device=device, dtype=state_dtype)
     )
     cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     return q, k, v, g, beta, initial_state, cu_seqlens
@@ -258,14 +267,48 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
     )
 
 
+def test_flashinfer_prefill_supported_shapes(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule import is_supported
+
+    assert is_supported(128, torch.bfloat16, 16, 16)
+    assert is_supported(128, torch.bfloat16, 16, 32)
+    assert not is_supported(64, torch.bfloat16, 16, 16)
+    assert not is_supported(128, torch.float16, 16, 16)
+    assert not is_supported(128, torch.bfloat16, 32, 16)
+
+
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, require):
+@pytest.mark.parametrize(
+    "num_q_heads,num_v_heads,seq_len,state_dtype,nonzero_state",
+    [
+        (16, 16, 130, torch.bfloat16, False),
+        (16, 32, 130, torch.bfloat16, True),
+        (16, 64, 512, torch.float32, True),
+        (4, 12, 2048, torch.float32, False),
+    ],
+)
+def test_gdn_chunk_prefill_matches_fla_reference(
+    device: str,
+    solution: str,
+    num_q_heads: int,
+    num_v_heads: int,
+    seq_len: int,
+    state_dtype: torch.dtype,
+    nonzero_state: bool,
+    require,
+):
     # Each selectable backend should match the FLA reference output/state contract.
     require("attention", "gdn_chunk_prefill", solution, torch.bfloat16, "q")
 
     q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
         device=device,
         dtype=torch.bfloat16,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        state_dtype=state_dtype,
+        nonzero_state=nonzero_state,
     )
     result = gdn_chunk_prefill(
         q,
@@ -308,6 +351,7 @@ def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, req
     # the stable signal, while max error can be noisy on a few elements.
     assert (result.out.float() - ref_out.float()).abs().mean() < 1e-3
     assert (result.final_state.float() - ref_state.float()).abs().mean() < 1e-3
+    torch.testing.assert_close(result.out, ref_out, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
@@ -318,6 +362,11 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
         device=device,
         dtype=torch.bfloat16,
+        seq_len=130,
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.bfloat16,
+        nonzero_state=True,
     )
     result = gdn_chunk_prefill(
         q,

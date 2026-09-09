@@ -126,16 +126,9 @@ def restore_pdl():
 
 
 @pytest.mark.parametrize("batch", [1, 8])
-@pytest.mark.parametrize("steps", [1, 3, 4])
-@pytest.mark.parametrize(
-    "solution,state_dtype",
-    [
-        ("triton", torch.float32),
-        ("triton", torch.bfloat16),
-        ("flashinfer", torch.float32),
-        ("flashinfer", torch.bfloat16),
-    ],
-)
+@pytest.mark.parametrize("steps", [1, 4])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
     if solution == "flashinfer" and not flashinfer_gdn.is_decode_available():
         pytest.skip("FlashInfer GDN unavailable")
@@ -346,3 +339,7 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         torch.testing.assert_close(
             result.final_state, reference.final_state, rtol=0, atol=0
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

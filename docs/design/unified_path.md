@@ -89,30 +89,17 @@ on replay. PLE's uniform index bundles are reused during capture only; eager
 prefill and decode construct their indices through the same builder outside
 the capture pool.
 
-GDN verify reuses the memoized scratch seed rows for both conv and recurrent
-initial-state reads: request `i` starts at `i * (T + 1)`. Each layer takes the
-first `bs` entries of the layer-major seed table instead of subtracting one
-from the per-token output grid on device. The same indices serve eager and
-captured forwards.
+GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
+and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
+use uninitialized output and a placeholder for a disabled intermediate cache:
+live rows are fully written, while negative padding rows skip state access
+and leave output undefined. Consumers must ignore padded output; enabled
+intermediate caches always require real storage.
 
-FlashInfer FP32 GDN MTP runs through the `tokenspeed-kernel/thirdparty/`
-adapter into `run_mtp_decode`. The registered op supplies an empty BF16 output;
-the disabled intermediate cache receives an unused typed view. Neither needs
-a per-forward zero fill. Every non-negative read row writes its complete
-output; negative padding rows leave output untouched, matching the portable
-Triton contract that padded outputs are undefined and must be ignored. Verify
-scratch rows are non-negative even for padded requests, whose seed state is
-zero. Pool reads/writes still obey the negative-index skip contract on direct
-state-pool calls such as ReplaySSM. Supplying a real intermediate cache enables
-its writes; a dummy must never be passed as an enabled cache just to avoid
-FlashInfer's placeholder allocation.
-
-GDN kernel scheduling follows the global `pdl_enabled()` switch across prefill,
-decode and verify. Eager and capture use the same launchers; a captured graph
-retains its capture-time PDL dependency edges and must be recaptured to change
-that choice. Participating kernels wait before reading inputs and signal at
-the end of computation. FlashInfer adapters retain the original CuTe device
-body and launch geometry, with separate PDL compilation caches.
+GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
+reading inputs and signal after computation; FlashInfer adapters preserve the
+upstream CuTe body and isolate PDL compilation caches. Graphs retain their
+capture-time PDL setting and must be recaptured to change it.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
