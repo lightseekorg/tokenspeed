@@ -523,18 +523,41 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 checkpoint_granularity=0,
             )
 
-    def test_state_family_may_keep_row_geometry(self):
-        # V4-style row-buffer groups are state-family with real rows.
+    def test_state_family_requires_checkpoint_shape(self):
+        # Rows of token history -- V4's compressor tails included -- are a
+        # history group whatever their retention; the state family names the
+        # checkpoint shape and nothing else.
+        with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
+            CacheGroupSpec(
+                group_id="v4.compressor",
+                retention="sliding_window",
+                rows_per_page=16,
+                entry_stride_tokens=4,
+                sliding_window_tokens=256,
+                family="state",
+            )
         spec = CacheGroupSpec(
             group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=256,
-            family="state",
+            family="history",
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
+
+    def test_state_family_rides_full_history(self):
+        # A checkpoint summarizes everything before it, so nothing in a state
+        # group ever slides out.
+        with self.assertRaisesRegex(ValueError, "full_history"):
+            CacheGroupSpec(
+                group_id="state",
+                retention="sliding_window",
+                sliding_window_tokens=256,
+                family="state",
+                checkpoint_granularity=64,
+            )
 
 
 def _fake_pool(specs, *, packing=1) -> SimpleNamespace:
@@ -572,7 +595,6 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         return pool_to_cache_groups
 
     def test_two_group_specs_convert_to_two_scheduler_groups(self):
-        from types import SimpleNamespace
 
         pool_to_cache_groups = self._import_converter()
 
@@ -591,9 +613,9 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         group_ids = {g.group_id for g in groups}
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
 
-    def test_checkpoint_spec_folds_to_row_geometry_at_the_bridge(self):
-        from types import SimpleNamespace
-
+    def test_both_declaration_shapes_cross_the_bridge_as_block_granularity(self):
+        """The scheduler config carries no declaration shape: a checkpoint
+        spec and a row-geometry spec both arrive as a bare slot span."""
         pool_to_cache_groups = self._import_converter()
 
         specs = _specs(
@@ -606,8 +628,12 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
         state = groups["linear_attention"]
-        self.assertEqual(state.rows_per_page, 16)
-        self.assertEqual(state.entry_stride_tokens, 1)
+        self.assertEqual(state.block_granularity, 16)
+        self.assertFalse(hasattr(state, "rows_per_page"))
+        self.assertFalse(hasattr(state, "entry_stride_tokens"))
+        self.assertFalse(hasattr(state, "checkpoint_granularity"))
+        full = groups["full_attention"]
+        self.assertEqual(full.block_granularity, 16)
 
 
 if __name__ == "__main__":

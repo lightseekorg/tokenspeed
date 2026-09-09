@@ -47,11 +47,6 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 
-# Configs
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
-
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
     RMSNorm as RMSNormGated,
@@ -773,7 +768,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
         )
 
         # Dense MLP for non-MoE variant

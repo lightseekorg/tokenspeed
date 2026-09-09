@@ -106,6 +106,58 @@ def derive_state_groups_by_layer(
     return mapping
 
 
+def derive_history_groups_by_layer(
+    arena: CacheArena,
+    *,
+    first_layer: int,
+    num_layers: int,
+    kv_planes: Iterable[str],
+) -> dict[int, str]:
+    """Map each attention layer to the history-family group holding its KV.
+
+    The counterpart of :func:`derive_state_groups_by_layer` for the paged
+    side: read back from the planned fields, restricted to the planes this
+    view's kernels write KV through (``layer_plane_bindings``), so a layer
+    that also owns indexer or state planes in other groups still resolves to
+    the one group its ``PagedAttention`` rides.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+        kv_planes: Plane names of the KV fields (e.g. ``k``/``v`` or
+            ``latent_kv``).
+
+    Returns:
+        View-local layer id -> history-family group id, one entry per layer
+        whose KV planes the plan declares inside this view's window.
+
+    Raises:
+        ValueError: a layer's KV planes span more than one history group.
+    """
+    history = {
+        str(spec.group_id)
+        for spec in arena.cache_group_specs
+        if spec.family == "history"
+    }
+    wanted_planes = set(kv_planes)
+    mapping: dict[int, str] = {}
+    for field in arena.plan.fields:
+        located = _layer_plane(field.field_id, first_layer, num_layers)
+        if located is None:
+            continue
+        layer_id, plane = located
+        if plane not in wanted_planes or str(field.group_id) not in history:
+            continue
+        existing = mapping.setdefault(layer_id, str(field.group_id))
+        if existing != str(field.group_id):
+            raise ValueError(
+                f"layer {layer_id} has KV planes in more than one history "
+                f"cache group: {existing!r} and {field.group_id!r}"
+            )
+    return mapping
+
+
 def derive_paged_group_ids(
     arena: CacheArena, *, first_layer: int, num_layers: int
 ) -> tuple[str, ...]:
@@ -193,6 +245,17 @@ class CachePool(ABC):
             self.arena,
             first_layer=self._field_layer_offset,
             num_layers=self.layer_num,
+        )
+
+    def history_group_by_layer(self) -> dict[int, str]:
+        """View-local layer id -> the history-family group its KV planes
+        ride; what ``bind_cache_groups`` stamps onto the model's
+        ``PagedAttention`` layers."""
+        return derive_history_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            kv_planes=self.layer_plane_bindings,
         )
 
     def _field_layer_id(self, layer_id: int) -> int:

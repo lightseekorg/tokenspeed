@@ -28,7 +28,9 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    is_block_drafter,
     model_wide_kwargs,
+    resolve_cache_layer_types,
     resolve_dtype,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -37,7 +39,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 @dataclass(kw_only=True)
 class MHAConfig(SoftmaxAttnConfig):
     # Mixed full+sliding models are ONE component carrying the inherited
-    # per-layer layer_types/window vectors; the per-layer kv-head counts
+    # per-layer cache_layer_types/window vectors; the per-layer kv-head counts
     # live on the cache-pool spec (``CachePoolSpec.layer_kv_head_counts``).
 
     @classmethod
@@ -45,33 +47,24 @@ class MHAConfig(SoftmaxAttnConfig):
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
     ) -> AttnConfig:
         kv_cache_dtype = server_args.kv_cache_dtype
-        draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
         )
         if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
         hf_config = model_config.hf_config
-        # cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
-        layer_types = tuple(
-            getattr(hf_config, "cache_layer_types", None)
-            or getattr(hf_config, "layer_types", None)
-            or ()
+        cache_layer_types = resolve_cache_layer_types(
+            hf_config,
+            num_layers=model_config.num_attention_layers,
+            is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
         )
-        if (
-            is_draft
-            and layer_types
-            and len(layer_types) != model_config.num_attention_layers
-        ):
-            # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
-            layer_types = ()
-        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
-        if draft_block_decode:
-            # A block drafter writes its KV at the target's cache locations, so
-            # it cannot carry a retention policy of its own; its window is an
-            # attention mask the draft applies in its own layers.
-            layer_types = ()
-            sliding_window_tokens = None
+        # The retention window belongs to the storage labels: a block drafter
+        # has none of its own (its window is a compute mask on its layers).
+        sliding_window_tokens = (
+            None if draft_block_decode else getattr(hf_config, "sliding_window", None)
+        )
         spec = cls(
             backend_name=(
                 server_args.attention_backend
@@ -82,7 +75,7 @@ class MHAConfig(SoftmaxAttnConfig):
             num_kv_heads=model_config.num_key_value_heads,
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
-            layer_types=layer_types,
+            cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
         )
         return AttnConfig(

@@ -377,6 +377,7 @@ def render_script(
         "--container-remap-root",
         "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,"
         "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME,"
+        "INSTALL_TOKENSPEED_MLA_FROM_SOURCE,"
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]

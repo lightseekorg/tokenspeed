@@ -88,6 +88,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
@@ -135,6 +136,24 @@ def test_qwen4_exp_modelopt_exclusions_match_shared_expert_fusion() -> None:
     assert should_exclude_quant_module(
         "model.layers.0.mlp.shared_expert.gate_up_proj", exclusions
     )
+
+
+def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
+    quant_config = ModelOptMixedConfig(
+        quantized_layers={
+            "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",
+        }
+    )
+
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(quant_config) is quant_config
+
+    excluded = ModelOptMixedConfig(
+        quantized_layers={
+            "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",
+        },
+        exclude_modules=["mtp.layers.0"],
+    )
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
 def test_qwen4_exp_gdn_norm_uses_sigmoid_output_gate() -> None:
@@ -632,8 +651,8 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         logit_cap=0.0,
         v_head_dim=8,
         sliding_window_size=-1,
-        group_id=FULL_ATTENTION,
     )
+    layer.bind_cache_group(FULL_ATTENTION)
     pool = SimpleNamespace()
     ctx = SimpleNamespace(
         attn_backend=backend,
@@ -1948,7 +1967,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     softmax = MHAConfig(
         backend_name="fa2",
         num_attention_heads=2,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
         num_kv_heads=1,
         attn_tp_size=1,
         head_dim=32,

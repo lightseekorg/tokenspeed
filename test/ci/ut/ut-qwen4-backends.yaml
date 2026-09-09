@@ -16,6 +16,11 @@ install:
   - bash test/ci_system/install_deps.sh
 ut:
   commands:
+    - >-
+      python3 -c "import torch;
+      assert torch.cuda.is_available(), 'CUDA unavailable';
+      print('CUDA device:', torch.cuda.get_device_name(0),
+      'capability:', torch.cuda.get_device_capability(0))"
     # PLE GPU reference comparisons live in test_qwen4_exp.py.
     - >-
       python3 -m pytest
@@ -29,6 +34,7 @@ ut:
       test/runtime/test_cache_group_router.py
       test/runtime/test_group_aware_mha.py
       test/runtime/test_group_write_locations.py
+      test/runtime/test_device_handle.py
       test/runtime/test_gdn_state_paging.py
       test/runtime/test_kimi_k3_kda.py
       test/runtime/test_kimi_k3_kda_eager_commit.py

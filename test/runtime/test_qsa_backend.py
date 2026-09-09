@@ -66,7 +66,7 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
         num_kv_heads=1,
         head_dim=2,
         attn_tp_size=1,
-        layer_types=(),
+        cache_layer_types=(),
         sliding_window_tokens=None,
     )
     config = AttnConfig(

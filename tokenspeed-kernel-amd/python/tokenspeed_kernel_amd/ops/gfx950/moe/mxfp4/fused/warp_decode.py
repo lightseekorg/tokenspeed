@@ -522,7 +522,6 @@ def _warp_decode_stage1_coop_compute(
             SWIGLU_LIMIT,
             SWIGLU_BETA,
             OUT_BLOCK_N,
-            cfg.acc_layout,
         )
     out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
     out = (out * out_inv_scale).to(Y.dtype.element_ty)

@@ -216,8 +216,6 @@ def _refresh_decode_indexer_schedule_metadata(
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
-    cache_consumer_families = frozenset({"history", "state"})
-
     def __init__(self, config: AttnConfig, spec: MLAConfig) -> None:
         super().__init__(config, spec)
         self.kernel_page_size = (

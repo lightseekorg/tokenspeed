@@ -68,7 +68,7 @@ def _recipe(*, layer_types: tuple[str, ...], speculative: bool) -> Qwen4ExpRecip
         num_kv_heads=1,
         head_dim=2,
         attn_tp_size=1,
-        layer_types=layer_types,
+        cache_layer_types=layer_types,
         sliding_window_tokens=None,
     )
     width = 3 if speculative else 1
@@ -95,7 +95,7 @@ def _recipe(*, layer_types: tuple[str, ...], speculative: bool) -> Qwen4ExpRecip
         replace(
             config,
             is_draft=True,
-            components=(replace(spec, layer_types=(FULL_ATTENTION,)),),
+            components=(replace(spec, cache_layer_types=(FULL_ATTENTION,)),),
         )
         if speculative
         else None
