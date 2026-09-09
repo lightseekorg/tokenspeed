@@ -1666,6 +1666,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
+            SUBGROUP_SIZE,
             PUBLISH=True,
         )
 

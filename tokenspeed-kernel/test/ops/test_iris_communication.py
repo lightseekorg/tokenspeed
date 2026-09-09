@@ -384,6 +384,20 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             kernel_config.staged.input_slots,
             staged_max_numel,
         )
+        if state._two_stage_supported:
+            assert state._two_stage_input_buf.numel() == staged_max_numel
+            assert (
+                state._two_stage_scratch_buf.numel()
+                == (staged_max_numel + world_size - 1) // world_size
+            )
+        else:
+            assert state._two_stage_input_buf is None
+            assert state._two_stage_scratch_buf is None
+        output_max_numel = max(
+            producer_direct_max_numel,
+            staged_max_numel if state._two_stage_supported else 0,
+        )
+        assert state._reduced_output_buf.numel() == output_max_numel
         if attnres_max_numel:
             assert state._attnres_input_buf.shape == (
                 2,
