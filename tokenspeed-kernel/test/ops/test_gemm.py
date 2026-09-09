@@ -530,7 +530,9 @@ def _assert_linear_attnres_matches_composition(
 )
 @pytest.mark.parametrize("output_size", [3648, 6288])
 def test_linear_attnres_partials_gfx1250_matches_composition(output_size: int) -> None:
-    hidden, weight, blocks, scores, scratch = _kimi3_linear_attnres_inputs(1, output_size)
+    hidden, weight, blocks, scores, scratch = _kimi3_linear_attnres_inputs(
+        1, output_size
+    )
     assert linear_attnres_partials_available(
         hidden,
         weight,

@@ -154,9 +154,7 @@ if current_platform().is_amd:
     else:
 
         def gluon_linear_attnres_partials_gfx1250(**kwargs):
-            raise RuntimeError(
-                "gluon_linear_attnres_partials_gfx1250 requires CDNA5"
-            )
+            raise RuntimeError("gluon_linear_attnres_partials_gfx1250 requires CDNA5")
 
     if _linear_attnres_partials_impl is not None:
 
