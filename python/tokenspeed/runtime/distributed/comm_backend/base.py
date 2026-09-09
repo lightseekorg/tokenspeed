@@ -56,6 +56,32 @@ class CommBackend(ABC):
 
         return False
 
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        """Allocate persistent all-reduce buffers before cache planning.
+
+        Args:
+            group: Global ranks participating in the reductions.
+            staged_max_numel: Maximum ordinary all-reduce payload in elements.
+            producer_direct_max_numel: Maximum producer-direct payload in elements.
+            attnres_max_numel: Maximum fused AttnRes payload in elements.
+            attnres_max_rows: Maximum fused AttnRes payload in rows.
+            dtype: Element type shared by the prepared paths.
+
+        Returns:
+            Whether the backend prepared the requested buffers.
+        """
+
+        return False
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

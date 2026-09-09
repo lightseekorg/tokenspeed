@@ -395,6 +395,12 @@ def _get_or_create_iris_context(heap_size: int):
     global _iris_ctx_singleton
     if _iris_ctx_singleton is None:
         _iris_ctx_singleton = iris.iris(heap_size=heap_size)
+    elif heap_size > _iris_ctx_singleton.heap_size:
+        raise RuntimeError(
+            f"Iris has a {_iris_ctx_singleton.heap_size}-byte symmetric heap, "
+            f"but this state requires {heap_size} bytes; prepare the largest "
+            "state first"
+        )
     return _iris_ctx_singleton
 
 

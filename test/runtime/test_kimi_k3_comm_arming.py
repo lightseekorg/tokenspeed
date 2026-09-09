@@ -31,6 +31,9 @@ TAIL_FUSION request crashes the experts layer with
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import torch
 
 from tokenspeed.runtime.models.kimi_k3_comm import _tail_finalize_top_k
 
@@ -49,3 +52,36 @@ def test_arming_requires_fused_moe_ar():
     plan = SimpleNamespace(fused_moe_ar=False, use_trtllm=True)
     assert _tail_finalize_top_k(10, plan, True) is None
     assert _tail_finalize_top_k(10, plan, False) is None
+
+
+def test_iris_preparation_uses_k3_forward_shapes(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm
+
+    group = tuple(range(8))
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_size=8, tp_group=group),
+        moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=group),
+    )
+    prepare = Mock(return_value=True)
+    monkeypatch.setattr(
+        kimi_k3_comm,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+
+    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+        mapping=mapping,
+        hidden_size=7168,
+        routed_hidden_size=3584,
+        max_num_tokens=16384,
+    )
+    prepare.assert_called_once_with(
+        group,
+        staged_max_numel=8192 * 7168,
+        producer_direct_max_numel=8192 * (7168 + 3584),
+        attnres_max_numel=16 * 7168,
+        attnres_max_rows=16,
+        dtype=torch.bfloat16,
+        backend=None,
+    )

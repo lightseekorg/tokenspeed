@@ -173,6 +173,10 @@ disappear from the GPU budget. (Platforms without the replay kernels fall
 back to the dense `max_bs * (draft_tokens + 1)` per-position state
 workspace, reserved the same way.)
 
+Kimi-K3's persistent Iris buffers follow the same ordering rule. They are
+allocated after weight loading and before cache capacity is measured, so the
+KV budget cannot claim memory that serving will need for communication.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

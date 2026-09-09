@@ -152,6 +152,30 @@ def prepare_all_reduce_lane(
     return backend.prepare_all_reduce_lane(group, hidden_dim)
 
 
+def prepare_all_reduce_buffers(
+    group: Group,
+    *,
+    staged_max_numel: int,
+    producer_direct_max_numel: int,
+    attnres_max_numel: int,
+    attnres_max_rows: int,
+    dtype: torch.dtype,
+    backend: CommBackend | None,
+) -> bool:
+    """Allocate persistent all-reduce buffers before cache planning."""
+
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_all_reduce_buffers(
+        group,
+        staged_max_numel=staged_max_numel,
+        producer_direct_max_numel=producer_direct_max_numel,
+        attnres_max_numel=attnres_max_numel,
+        attnres_max_rows=attnres_max_rows,
+        dtype=dtype,
+    )
+
+
 def prepare_all_reduce_fusion(
     group: Group,
     hidden_dim: int,

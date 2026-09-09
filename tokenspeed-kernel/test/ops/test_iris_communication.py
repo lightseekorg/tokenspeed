@@ -102,6 +102,52 @@ def test_iris_state_uses_path_capacities(monkeypatch):
     assert len(created) == 1
 
 
+def test_iris_state_reuses_prepared_capacity(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    group = object()
+    device = torch.device("cpu")
+    prepared = SimpleNamespace(
+        group=group,
+        rank_in_group=0,
+        device=device,
+        dtype=torch.bfloat16,
+        staged_max_numel=64,
+        producer_direct_max_numel=128,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+    )
+    iris_ops = SimpleNamespace(
+        IRIS_AR_STATES={"prepared": prepared},
+        create_iris_state=lambda **_: pytest.fail("must reuse prepared state"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
+    )
+    state = SimpleNamespace(
+        group=group,
+        rank_in_group=0,
+        max_numel=16,
+        max_bytes=64,
+        attnres_max_numel=8,
+        max_token_num=1,
+        device=device,
+    )
+
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is prepared
+
+
+def test_iris_context_rejects_late_heap_growth(monkeypatch):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    context = SimpleNamespace(heap_size=256)
+    monkeypatch.setattr(iris_ops, "_iris_ctx_singleton", context)
+
+    assert iris_ops._get_or_create_iris_context(128) is context
+    with pytest.raises(RuntimeError, match="prepare the largest state first"):
+        iris_ops._get_or_create_iris_context(512)
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_producer_direct_admission_supported_world_sizes(

@@ -186,6 +186,32 @@ class AutoBackend(CommBackend):
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        if (
+            not current_platform().is_amd
+            or self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return False
+        return self._triton_ar.prepare_all_reduce_buffers(
+            group,
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            dtype=dtype,
+        )
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

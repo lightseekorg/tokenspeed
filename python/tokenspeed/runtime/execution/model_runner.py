@@ -171,6 +171,13 @@ class ModelRunner:
             device=warmup_device,
         )
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Allocate model communication buffers before cache planning."""
+        prepare = getattr(self.model, "prepare_communication_runtime", None)
+        if prepare is None:
+            return False
+        return bool(prepare(max_num_tokens))
+
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:
         try:

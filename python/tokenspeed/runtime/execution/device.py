@@ -647,11 +647,11 @@ def build_device_side(
     control face and the encoder-facts callable it consumes at startup, and
     the handle it runs with.
 
-    The chain is linear and the order is load-bearing: the multimodal
-    runtime must be prepared after weights are loaded and before
-    ``create_attn_components`` profiles memory for the KV budget, and the
-    chunked-prefill limit must be aligned to the cache groups before
-    ``ModelExecutorConfig`` sizes the input buffers from it.
+    The chain is linear and the order is load-bearing: the multimodal runtime
+    and persistent communication buffers must be prepared after weights are
+    loaded and before ``create_attn_components`` profiles memory for the KV
+    budget, and the chunked-prefill limit must be aligned to the cache groups
+    before ``ModelExecutorConfig`` sizes the input buffers from it.
 
     Args:
         server_args: Parsed server arguments. ``chunked_prefill_size`` may
@@ -699,6 +699,18 @@ def build_device_side(
     )
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
+    max_forward_tokens = (
+        server_args.chunked_prefill_size
+        if server_args.chunked_prefill_size > 0
+        else server_args.max_prefill_tokens + server_args.max_model_len
+    )
+    max_forward_tokens = max(
+        max_forward_tokens,
+        max_batch_size * decode_input_tokens,
+    )
+    target.prepare_communication_runtime(max_forward_tokens)
+    if draft is not None:
+        draft.prepare_communication_runtime(max_forward_tokens)
 
     (
         attn_backend,
