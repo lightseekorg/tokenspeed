@@ -2558,11 +2558,11 @@ def _weighted_topk_reduce_gfx1250(
         out.shape != output_shape
         or out.dtype != out_dtype
         or out.device != flat.device
-        or not out.is_contiguous()
+        or out.stride(-1) != 1
     ):
         raise ValueError(
-            "gfx1250 weighted top-k output must be contiguous with the requested "
-            "shape, dtype, and device"
+            "gfx1250 weighted top-k output must be a row-contiguous view with the "
+            "requested shape, dtype, and device"
         )
 
     block_n = 256
