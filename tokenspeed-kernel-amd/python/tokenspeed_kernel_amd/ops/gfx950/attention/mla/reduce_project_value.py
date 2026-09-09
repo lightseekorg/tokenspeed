@@ -62,9 +62,7 @@ def _mla_reduce_project_value_kernel(
     for split in range(0, NUM_KV_SPLITS):
         valid = split * pages_per_split < num_pages
         partial = gl.load(
-            logits_ptr
-            + (batch_head * NUM_KV_SPLITS + split) * LATENT
-            + offs_k,
+            logits_ptr + (batch_head * NUM_KV_SPLITS + split) * LATENT + offs_k,
             mask=valid,
             other=0.0,
         ).to(gl.float32)
@@ -97,9 +95,7 @@ def _mla_reduce_project_value_kernel(
     output_offset = batch_head * VALUE + offs_n
     if HAS_GATE:
         gate = gl.load(
-            gate_ptr
-            + batch * GATE_STRIDE_B
-            + (head * VALUE + offs_n) * GATE_STRIDE_N
+            gate_ptr + batch * GATE_STRIDE_B + (head * VALUE + offs_n) * GATE_STRIDE_N
         ).to(gl.float32)
         projected *= 1.0 / (1.0 + gl.exp(-gate))
     gl.store(

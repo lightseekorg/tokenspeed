@@ -83,9 +83,7 @@ def _mla_project_value_kernel(
     projected = projected.to(gl.bfloat16).to(gl.float32)
     if HAS_GATE:
         gate = gl.load(
-            gate_ptr
-            + batch * GATE_STRIDE_B
-            + (head * VALUE + offs_n) * GATE_STRIDE_N
+            gate_ptr + batch * GATE_STRIDE_B + (head * VALUE + offs_n) * GATE_STRIDE_N
         ).to(gl.float32)
         projected *= 1.0 / (1.0 + gl.exp(-gate))
     gl.store(
@@ -128,11 +126,7 @@ def gluon_mla_project_value_gfx950(
             raise ValueError(
                 f"MLA value projection requires BF16 gate {expected_output}"
             )
-        if (
-            not gate.is_cuda
-            or gate.device != attention.device
-            or gate.stride(1) != 1
-        ):
+        if not gate.is_cuda or gate.device != attention.device or gate.stride(1) != 1:
             raise ValueError(
                 "MLA value projection requires a colocated gate with "
                 "contiguous inner dimension"

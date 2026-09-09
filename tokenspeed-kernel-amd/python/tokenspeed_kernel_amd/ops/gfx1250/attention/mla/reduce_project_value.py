@@ -76,15 +76,9 @@ def _mla_reduce_project_value_kernel(
     # Match the standalone decode reducer's split reduction layout and order.
     # This preserves its materialized BF16 latent boundary before projection.
     tpw_k: gl.constexpr = gl.constexpr(min(_LANES, LATENT))
-    wpc_k: gl.constexpr = gl.constexpr(
-        min(NUM_WARPS, LATENT // min(_LANES, LATENT))
-    )
+    wpc_k: gl.constexpr = gl.constexpr(min(NUM_WARPS, LATENT // min(_LANES, LATENT)))
     spt_k: gl.constexpr = gl.constexpr(
-        LATENT
-        // (
-            min(_LANES, LATENT)
-            * min(NUM_WARPS, LATENT // min(_LANES, LATENT))
-        )
+        LATENT // (min(_LANES, LATENT) * min(NUM_WARPS, LATENT // min(_LANES, LATENT)))
     )
     reduce_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[NUM_KV_SPLITS, spt_k],
@@ -121,9 +115,7 @@ def _mla_reduce_project_value_kernel(
     split_scale = gl.exp2(split_max - overall_max)
     overall_expsum = gl.sum(split_expsum * split_scale)
     partial = gl.load(
-        split_output_ptr
-        + split_offset[:, None] * LATENT
-        + reduce_offs_k[None, :],
+        split_output_ptr + split_offset[:, None] * LATENT + reduce_offs_k[None, :],
         mask=split_mask[:, None],
         other=0.0,
     ).to(gl.float32)
@@ -150,9 +142,7 @@ def _mla_reduce_project_value_kernel(
     output_offset = batch_head * VALUE + offs_n
     if HAS_GATE:
         gate = gl.load(
-            gate_ptr
-            + batch * GATE_STRIDE_B
-            + (head * VALUE + offs_n) * GATE_STRIDE_N
+            gate_ptr + batch * GATE_STRIDE_B + (head * VALUE + offs_n) * GATE_STRIDE_N
         ).to(gl.float32)
         projected *= 1.0 / (1.0 + gl.exp(-gate))
     gl.store(

@@ -1065,10 +1065,7 @@ def _attention_mla_decode_projected_value_amd(
     q = torch.empty((batch, 1, heads, 576), dtype=torch.float8_e4m3fn)
     kv_cache = torch.empty((64, 64, 1, 576), dtype=torch.float8_e4m3fn)
     page_table = (
-        torch.arange(64, dtype=torch.int32)
-        .view(1, 64)
-        .expand(batch, -1)
-        .contiguous()
+        torch.arange(64, dtype=torch.int32).view(1, 64).expand(batch, -1).contiguous()
     )
     cache_seqlens = torch.full((batch,), 4096, dtype=torch.int32)
     value_weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
