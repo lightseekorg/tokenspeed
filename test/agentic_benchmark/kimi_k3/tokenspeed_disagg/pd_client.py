@@ -106,36 +106,17 @@ class Runner:
             self.args.url, data=body, headers={"Content-Type": "application/json"}
         )
         t0 = time.monotonic()
-        retried = False
         try:
             with urllib.request.urlopen(req, timeout=self.args.timeout) as r:
                 out = json.load(r)
-        except Exception:
-            # One retry; a request that fails twice is recorded, not fatal —
-            # the rung completes and collect VOIDs it on failures. The retry
-            # deliberately stays inside the t0..t1 window (a hiccup is part of
-            # the request's real latency); 'Retried Requests' in the summary
-            # flags rungs whose percentiles carry retry time.
-            retried = True
-            try:
-                with urllib.request.urlopen(
-                    urllib.request.Request(
-                        self.args.url,
-                        data=body,
-                        headers={"Content-Type": "application/json"},
-                    ),
-                    timeout=self.args.timeout,
-                ) as r:
-                    out = json.load(r)
-            except Exception as e:
-                return {"failed": True, "error": str(e)[:200]}
+        except Exception as e:
+            raise SystemExit(f"request {rid} failed: {str(e)[:200]}") from e
         t1 = time.monotonic()
         usage = out.get("usage") or {}
         details = usage.get("prompt_tokens_details") or {}
         msg = out["choices"][0]["message"]
         return {
             "latency_s": t1 - t0,
-            "retried": retried,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "cached_tokens": details.get("cached_tokens") or 0,
@@ -151,10 +132,10 @@ class Runner:
         # re-rendered assistant turn retokenizes onto the cached token stream
         # instead of diverging at the <think> open tag.
         index, conv = item
+        if len(conv) < 2:
+            raise SystemExit(f"conversation {index} has no second turn")
         t1_msgs = list(first_turn_messages(conv))
         prime = self.request(t1_msgs, 500, conv_rid(index))
-        if prime.get("failed") or len(conv) < 2:
-            return None
         assistant = {"role": "assistant", "content": prime["content"] or ""}
         if prime.get("reasoning_content"):
             assistant["reasoning_content"] = prime["reasoning_content"]
@@ -172,8 +153,15 @@ class Runner:
             self.results.append(res)
         return res
 
-    # NOTE: failed requests carry {'failed': True} and are excluded from the
-    # token/latency aggregates but counted in 'Failed Requests'.
+    def _map(self, fn, items):
+        # A failed request raises; cancel the queued ones so the run stops
+        # after the in-flight requests instead of sending the rest.
+        with cf.ThreadPoolExecutor(max_workers=self.args.parallel) as ex:
+            try:
+                return list(ex.map(fn, items))
+            except BaseException:
+                ex.shutdown(cancel_futures=True)
+                raise
 
     def run(self, convs):
         a = self.args
@@ -188,16 +176,12 @@ class Runner:
         items = list(enumerate(picked, start=a.offset))
         if a.phase == "p-cached":
             # Phase 1 (untimed): prime every conversation's turn-1 prefix.
-            with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-                payloads = [m for m in ex.map(self.prime_item, items) if m]
-            if not payloads:
-                raise SystemExit("no conversation has a second turn")
+            payloads = self._map(self.prime_item, items)
         else:
             payloads = items
         # Phase 2 (timed): only the measured requests count toward wall time.
         t0 = time.monotonic()
-        with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-            list(ex.map(self.one_item, payloads))
+        self._map(self.one_item, payloads)
         wall = time.monotonic() - t0
         return wall
 
@@ -220,8 +204,7 @@ def _nearest_rank(sorted_vals, p):
 
 
 def summarize(args, results, wall_s):
-    failed = [r for r in results if r.get("failed")]
-    ok = [r for r in results if not r.get("failed")]
+    ok = results
     n = len(ok)
     prompt = sum(r["prompt_tokens"] for r in ok)
     cached = sum(r["cached_tokens"] for r in ok)
@@ -233,13 +216,7 @@ def summarize(args, results, wall_s):
     summary = {
         "Phase": args.phase,
         "Concurrency": args.parallel,
-        # Requested vs Requests: a p-cached prime that fails twice silently
-        # drops its conversation from the measured wave, so the two can
-        # diverge with zero Failed Requests. collect VOIDs the mismatch.
-        "Requested": args.number,
         "Requests": n,
-        "Failed Requests": len(failed),
-        "Retried Requests": sum(1 for r in ok if r.get("retried")),
         "Wall (s)": round(wall_s, 3),
         "Prompt Tokens": prompt,
         "Cached Tokens": cached,

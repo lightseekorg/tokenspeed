@@ -112,11 +112,10 @@ request reached a rank other than the one holding its KV).
 ## Implementation notes
 
 - evalscope's swe_smith plugin has no prime/measure phase control, so ALL
-  phases run through pd_client.py (thin stdlib client, fixed concurrency, one
-  retry per request; a twice-failed request is recorded and the rung is VOIDed
-  by collect instead of aborting the sweep). Summaries record Requested next
-  to Requests; collect VOIDs a mismatch (`short`). Retried Requests is
-  informational: retries keep their full latency.
+  phases run through pd_client.py (thin stdlib client, fixed concurrency). Any
+  failed request aborts the sweep with a non-zero exit: a rung measured after
+  a failure carries a cold prefill inside its wall time, and every later rung
+  inherits the gap.
 - Every summary and collect report carries the boundaries statement: no
   KV-transfer cost modeled; prime-as-transfer is the core approximation;
   single deployment; TTFT is approximated by full-request latency at

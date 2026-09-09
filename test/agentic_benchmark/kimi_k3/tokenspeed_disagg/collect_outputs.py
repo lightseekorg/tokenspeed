@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Collect tokenspeed_disagg sweeps into three tables (P-fresh / P-cached / D-sim).
 
-Applies the validity guards from the README: a rung is VOID if its cache-hit
-guard fails or if any request failed. Accepts multiple sweep dirs (e.g. one P
-sweep and one D sweep); the P:D sizing helper needs one of each.
+Applies the validity guard from the README: a rung is VOID if its cache-hit
+guard fails. Accepts multiple sweep dirs (e.g. one P sweep and one D sweep);
+the P:D sizing helper needs one of each.
 """
 
 import argparse
@@ -44,21 +44,12 @@ def collect(sweep_dir: Path):
         config, phase = m.group(1), m.group(2)
         s = json.loads(summary.read_text())
         hit = s.get("KV Cache Hit Rate (%)", -1.0)
-        failed = s.get("Failed Requests", 0)
         metric = s.get(METRIC[phase], 0.0)
         conc = s.get("Concurrency")
 
         problems = []
         if not hit_guard(phase, hit):
             problems.append("hit")
-        if failed:
-            problems.append(f"{failed}failed")
-        # A rung that measured fewer requests than asked (twice-failed
-        # p-cached primes drop their conversation before the measured wave)
-        # is a shrunken sample with zero Failed Requests — VOID it.
-        requested = s.get("Requested")
-        if requested is not None and s.get("Requests") != requested:
-            problems.append("short")
 
         row = {
             "phase": phase,
@@ -66,10 +57,6 @@ def collect(sweep_dir: Path):
             "Conc.": conc,
             f"{METRIC[phase]} /gpu": round(metric / num_gpus(config), 2),
             "Cache Hit (%)": round(hit, 2),
-            # Informational, not a guard: retries keep their full latency
-            # (a hiccup is real), so nonzero here means the percentile
-            # columns carry retry time.
-            "Retried": s.get("Retried Requests", 0),
             "Requests/s": s.get("Requests/s"),
             "Latency p50 (s)": s.get("Latency p50 (s)"),
             "Latency p99 (s)": s.get("Latency p99 (s)"),
