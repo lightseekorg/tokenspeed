@@ -586,13 +586,14 @@ def test_linear_attnres_partials_gfx1250_cuda_graph_replay(output_size: int) -> 
     run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run()
+        run()
     hidden.copy_(torch.randn_like(hidden))
     blocks.copy_(torch.randn_like(blocks))
     graph.replay()
     torch.cuda.synchronize()
-    replay_expected = run()
-    torch.testing.assert_close(captured, replay_expected, atol=2e-2, rtol=2e-2)
+    replayed = out.clone()
+    expected = run()
+    torch.testing.assert_close(replayed, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(

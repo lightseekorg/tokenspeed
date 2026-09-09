@@ -112,44 +112,56 @@ if current_platform().is_amd:
         return output
 
     if current_platform().is_cdna5:
-        from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.linear_attnres_partials_gfx1250 import (
-            gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
-        )
+        try:
+            from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.linear_attnres_partials_gfx1250 import (
+                gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
+            )
+        except ImportError:
+            _linear_attnres_partials_gfx1250_impl = None
+        if _linear_attnres_partials_gfx1250_impl is None:
 
-        @register_kernel(
-            "gemm",
-            "linear_attnres_partials",
-            name="gluon_linear_attnres_partials_gfx1250",
-            solution="gluon",
-            capability=CapabilityRequirement(
-                min_arch_version=ArchVersion(12, 5),
-                max_arch_version=ArchVersion(12, 5),
-                vendors=frozenset({"amd"}),
-            ),
-            signatures=frozenset(
-                {
-                    format_signature(
-                        hidden_states=dense_tensor_format(torch.bfloat16),
-                        weight=dense_tensor_format(torch.bfloat16),
-                        blocks=dense_tensor_format(torch.bfloat16),
-                        score_weight_a=dense_tensor_format(torch.bfloat16),
-                        score_weight_b=dense_tensor_format(torch.bfloat16),
-                        out=dense_tensor_format(torch.bfloat16),
-                    )
-                }
-            ),
-            priority=Priority.SPECIALIZED,
-            traits={
-                "tokens": frozenset({1}),
-                "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
-                "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
-                "num_blocks": frozenset(range(1, 12)),
-                "inputs_contiguous": frozenset({True}),
-                "gfx1250_linear_attnres_enabled": frozenset({True}),
-            },
-        )
-        def gluon_linear_attnres_partials_gfx1250(**kwargs):
-            return _linear_attnres_partials_gfx1250_impl(**kwargs)
+            def gluon_linear_attnres_partials_gfx1250(**kwargs):
+                raise RuntimeError(
+                    "gluon_linear_attnres_partials_gfx1250 requires "
+                    "tokenspeed-kernel-amd with the gfx1250 AttnRes kernel"
+                )
+
+        else:
+
+            @register_kernel(
+                "gemm",
+                "linear_attnres_partials",
+                name="gluon_linear_attnres_partials_gfx1250",
+                solution="gluon",
+                capability=CapabilityRequirement(
+                    min_arch_version=ArchVersion(12, 5),
+                    max_arch_version=ArchVersion(12, 5),
+                    vendors=frozenset({"amd"}),
+                ),
+                signatures=frozenset(
+                    {
+                        format_signature(
+                            hidden_states=dense_tensor_format(torch.bfloat16),
+                            weight=dense_tensor_format(torch.bfloat16),
+                            blocks=dense_tensor_format(torch.bfloat16),
+                            score_weight_a=dense_tensor_format(torch.bfloat16),
+                            score_weight_b=dense_tensor_format(torch.bfloat16),
+                            out=dense_tensor_format(torch.bfloat16),
+                        )
+                    }
+                ),
+                priority=Priority.SPECIALIZED,
+                traits={
+                    "tokens": frozenset({1}),
+                    "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
+                    "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
+                    "num_blocks": frozenset(range(1, 12)),
+                    "inputs_contiguous": frozenset({True}),
+                    "gfx1250_linear_attnres_enabled": frozenset({True}),
+                },
+            )
+            def gluon_linear_attnres_partials_gfx1250(**kwargs):
+                return _linear_attnres_partials_gfx1250_impl(**kwargs)
 
     else:
 
