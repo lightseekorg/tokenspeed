@@ -28,7 +28,6 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 from __future__ import annotations
 
 import gc
-import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
