@@ -432,23 +432,28 @@ class L2CacheExecutor:
         num_blocks, _ = lane.workspace.load_block_transfers(
             transfers, geometry=self._transfer_geometry
         )
-        mode = lane.workspace.prepare_backend(
-            self.layout.buffers,
-            self.host_storage.host_buffer,
-            backend=self.transfer_backend,
-        )
-        if mode.uses_device_tables:
-            if lane.metadata_done is None:
-                lane.metadata_done = device_module.Event()
-            try:
-                lane.workspace.commit_block_transfers(
-                    num_blocks, self.layout.buffers[0].device, non_blocking=True
-                )
-            finally:
-                # Also protect a partially submitted upload if staging fails.
-                # This event excludes the payload transfer; Device table reuse
-                # remains ordered by the write stream's FIFO.
-                lane.metadata_done.record(stream)
+        # Address-table allocation and the metadata H2D must be enqueued on
+        # the write stream itself: the payload kernel below reads those tables
+        # from that stream, and a copy issued on the caller's stream would sit
+        # behind the wait recorded above with nothing ordering it first.
+        with device_module.stream(stream):
+            mode = lane.workspace.prepare_backend(
+                self.layout.buffers,
+                self.host_storage.host_buffer,
+                backend=self.transfer_backend,
+            )
+            if mode.uses_device_tables:
+                if lane.metadata_done is None:
+                    lane.metadata_done = device_module.Event()
+                try:
+                    lane.workspace.commit_block_transfers(
+                        num_blocks, self.layout.buffers[0].device, non_blocking=True
+                    )
+                finally:
+                    # Also protect a partially submitted upload if staging
+                    # fails. This event excludes the payload transfer; Device
+                    # table reuse remains ordered by the write stream's FIFO.
+                    lane.metadata_done.record(stream)
         transfer_cache_blocks(
             "d2h",
             self.layout.buffers,

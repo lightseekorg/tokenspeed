@@ -361,6 +361,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 "current_stream",
                 return_value=caller_stream,
             ),
+            patch.object(executor_module.device_module, "stream") as stream_ctx,
             patch.object(
                 executor_module.device_module,
                 "Event",
@@ -376,6 +377,11 @@ class GroupAwareWireTest(unittest.TestCase):
         # fence the caller on it; a pinned one simply drops it.
         self.assertIs(fence, finish)
         executor.write_stream.wait_stream.assert_called_once_with(caller_stream)
+        # The address tables and the metadata H2D are enqueued on the write
+        # stream too: the payload kernel reads them from that stream, and a
+        # copy left on the caller's stream would land behind the wait above
+        # with nothing ordering it ahead of the kernel.
+        stream_ctx.assert_called_once_with(executor.write_stream)
         lane.workspace.load_block_transfers.assert_called_once_with(
             [(0, 5, 9)], geometry=executor._transfer_geometry
         )
@@ -401,7 +407,9 @@ class GroupAwareWireTest(unittest.TestCase):
         metadata_done.synchronize.assert_not_called()
         self.assertIsNone(executor._ordered_write_lane.metadata_done)
 
-        # Refill must wait for metadata, but must never wait for payload ACK.
+        # Refill must wait for metadata, but must never wait for payload ACK;
+        # the upload and its retirement event sit inside the write-stream
+        # context, the payload launch names the stream explicitly.
         for ready in (False, True):
             with self.subTest(metadata_ready=ready):
                 metadata_done.reset_mock()
@@ -417,18 +425,28 @@ class GroupAwareWireTest(unittest.TestCase):
                         "current_stream",
                         return_value=caller_stream,
                     ),
+                    patch.object(executor_module.device_module, "stream") as stream_ctx,
                     patch.object(
                         executor_module.device_module, "Event", return_value=finish
                     ),
                     patch.object(executor_module, "transfer_cache_blocks") as transfer,
                 ):
+                    order.attach_mock(stream_ctx, "stream")
                     order.attach_mock(transfer, "payload")
                     executor._start_writing([8], [(0, 6, 10)], lane=lane)
                 names = [call[0] for call in order.mock_calls]
                 self.assertEqual(
                     names,
                     ([] if ready else ["retire"])
-                    + ["refill", "upload", "record", "payload"],
+                    + [
+                        "refill",
+                        "stream",
+                        "stream().__enter__",
+                        "upload",
+                        "record",
+                        "stream().__exit__",
+                        "payload",
+                    ],
                 )
                 finish.synchronize.assert_not_called()
 
@@ -463,6 +481,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module,
                 "current_stream",
                 return_value=caller_stream,
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(
                 executor_module.device_module,
@@ -515,6 +536,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.device_module,
                 "current_stream",
                 return_value=caller_stream,
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(executor_module.device_module, "Event", side_effect=Mock),
             patch.object(executor_module, "transfer_cache_blocks"),
