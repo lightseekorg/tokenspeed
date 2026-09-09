@@ -68,7 +68,7 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-def test_iris_state_uses_protocol_capacities(monkeypatch):
+def test_iris_state_uses_path_capacities(monkeypatch):
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     created = []
@@ -357,7 +357,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
             for shapes in output_shape_cases
         )
-        attnres_max_rows = 16 if world_size == 8 else 0
+        attnres_max_rows = 16 if world_size == attnres_config.world_size else 0
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
@@ -368,6 +368,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
             dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
         )
         assert state._input_buf.numel() == producer_direct_max_numel
         scratch_numel = kernel_config.producer_direct.scratch_numel(
@@ -384,7 +386,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         if attnres_max_numel:
             assert state._attnres_input_buf.shape == (
-                attnres_config.input_slots,
+                2,
                 attnres_max_numel,
             )
             assert state._attnres_ready_flags.shape == (
@@ -410,6 +412,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float16,
+            heap_size=None,
+            device=device,
         )
         _check_all_reduce_symmetric_outputs(
             fp16_state,
@@ -435,6 +439,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float32,
+            heap_size=None,
+            device=device,
         )
         _check_all_reduce_symmetric_outputs(
             fp32_state,
@@ -451,7 +457,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 ((16, 7168), (16, 3584)),
                 device,
             )
-        if world_size == 8:
+        if world_size == attnres_config.world_size:
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
         dist.destroy_process_group()
@@ -683,6 +689,8 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
         )
         _check_all_reduce(
             state,

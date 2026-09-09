@@ -61,13 +61,13 @@ class TritonCommState:
     rank_in_group: int
     world_size: int
     device: torch.device
-    max_numel: int = 0
-    max_bytes: int = 0
-    attnres_max_numel: int = 0
-    max_token_num: int = 0
-    hidden_dim: int = 0
-    comm_buff: torch.Tensor | None = None
-    symm_mem_hdl: object | None = None
+    attnres_max_numel: int
+    max_numel: int
+    max_bytes: int
+    max_token_num: int
+    hidden_dim: int
+    comm_buff: torch.Tensor | None
+    symm_mem_hdl: object | None
 
 
 @dataclass
@@ -1042,9 +1042,13 @@ def nvidia_create_rsag_state(
         rank_in_group=rank_in_group,
         world_size=group.size(),
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
+        symm_mem_hdl=None,
     )
 
 
@@ -1506,6 +1510,9 @@ def amd_create_rsag_state(
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
@@ -1715,6 +1722,9 @@ def create_allreduce_residual_rmsnorm_state(
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_token_num,
         hidden_dim=hidden_dim,
         comm_buff=comm_buff,
@@ -1879,13 +1889,29 @@ def allreduce_residual_rmsnorm(
 def create_state(
     group: dist.ProcessGroup,
     rank_in_group: int,
-    max_tokens: int = 0,
-    hidden_size: int = 0,
-    device: torch.device = None,
-    max_numel: int = 0,
-    max_bytes: int = 0,
-    attnres_max_numel: int = 0,
+    max_tokens: int,
+    hidden_size: int,
+    device: torch.device | None,
+    max_numel: int,
+    max_bytes: int,
+    attnres_max_numel: int,
 ) -> TritonCommState:
+    """Create an all-reduce or reduce-scatter/all-gather communication state.
+
+    Args:
+        group: Process group used by the collective.
+        rank_in_group: This process's rank within ``group``.
+        max_tokens: Maximum gathered token count for an RS/AG state.
+        hidden_size: Hidden width for an RS/AG state.
+        device: Device on which communication storage is allocated.
+        max_numel: Maximum staged all-reduce payload in elements.
+        max_bytes: Maximum producer-direct all-reduce payload in bytes.
+        attnres_max_numel: Maximum fused attention/AttnRes payload in elements;
+            pass zero when the state does not use AttnRes.
+
+    Returns:
+        The initialized communication state.
+    """
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
@@ -1909,6 +1935,8 @@ def create_state(
             max_numel=max_numel,
             max_bytes=max_bytes or max_numel * torch.bfloat16.itemsize,
             attnres_max_numel=attnres_max_numel,
+            max_token_num=0,
+            hidden_dim=0,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
         )
@@ -1977,6 +2005,7 @@ def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
             attnres_max_numel=state.attnres_max_numel,
             attnres_max_rows=state.max_token_num,
             dtype=dtype,
+            heap_size=None,
             device=state.device,
         )
         _iris_mod.IRIS_AR_STATES[key] = iris_state
@@ -2101,7 +2130,7 @@ def _all_reduce_residual_attnres_can_run(
     kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
     num_tokens = partial.shape[0] if partial.ndim == 2 else 0
     return (
-        state.world_size == 8
+        state.world_size == kernel_config.world_size
         and op == torch.distributed.ReduceOp.SUM
         and 0 < num_tokens <= 16
         and num_tokens <= state.max_token_num
@@ -2203,7 +2232,12 @@ def _attnres_comm_state(
         world_size=group.size(),
         device=input_tensor.device,
         attnres_max_numel=input_tensor.numel(),
+        max_numel=0,
+        max_bytes=0,
         max_token_num=input_tensor.shape[0],
+        hidden_dim=0,
+        comm_buff=None,
+        symm_mem_hdl=None,
     )
 
 

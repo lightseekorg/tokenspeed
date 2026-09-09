@@ -184,19 +184,26 @@ class _ProducerDirectAllReduceKernelConfig:
 
 @dataclass(frozen=True)
 class KimiK3AttnResKernelConfig:
-    """Kimi-K3 fused attention-TP all-reduce and AttnRes contract."""
+    """Kimi-K3 fused attention-TP all-reduce and AttnRes contract.
 
+    Attributes:
+        world_size: Required attention tensor-parallel group size.
+        hidden_size: Kimi-K3 attention output width.
+        num_subgroups: Number of subgroups in each kernel workgroup.
+        elements_per_thread: Number of hidden elements processed per thread.
+    """
+
+    world_size: int
     hidden_size: int
     num_subgroups: int
     elements_per_thread: int
-    input_slots: int
 
     def __post_init__(self) -> None:
         if (
-            self.hidden_size <= 0
+            self.world_size <= 1
+            or self.hidden_size <= 0
             or self.num_subgroups <= 0
             or self.elements_per_thread <= 0
-            or self.input_slots < 2
         ):
             raise ValueError("invalid Kimi-K3 AttnRes Iris kernel configuration")
 
@@ -205,10 +212,17 @@ class KimiK3AttnResKernelConfig:
 class IrisAllReduceKernelConfig:
     """Launch and workspace contract for TokenSpeed's Iris all-reduces.
 
-    ``staged`` and ``producer_direct`` are generic AMD collective protocols.
+    ``staged`` and ``producer_direct`` are generic AMD all-reduce paths.
     The producer-direct path is used by Kimi-K3 MoE for both TP/TP and TP/EP;
     it is not EP-specific. ``kimi_k3_attnres`` is model-specific and operates
     only on Kimi-K3's attention tensor-parallel group.
+
+    Attributes:
+        subgroup_size: Hardware subgroup width used by the Gluon kernels.
+        staged: Launch and workspace parameters for staged all-reduce.
+        producer_direct: Launch, workspace, and eligibility parameters for
+            producer-direct all-reduce.
+        kimi_k3_attnres: Launch and shape parameters for Kimi-K3 AttnRes.
     """
 
     subgroup_size: int
@@ -241,10 +255,10 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
         publish_ready=False,
     ),
     kimi_k3_attnres=KimiK3AttnResKernelConfig(
+        world_size=8,
         hidden_size=7168,
         num_subgroups=4,
         elements_per_thread=1,
-        input_slots=2,
     ),
 )
 
@@ -255,7 +269,18 @@ def producer_direct_all_reduce_can_run(
     dtype: torch.dtype,
     max_bytes: int,
 ) -> bool:
-    """Return whether the generic AMD producer-direct kernel supports a payload."""
+    """Check the generic AMD producer-direct kernel's payload requirements.
+
+    Args:
+        world_size: Number of ranks participating in the all-reduce.
+        total_numel: Total number of elements in the payload.
+        dtype: Element type of the payload.
+        max_bytes: Byte capacity of the producer-direct symmetric input buffer.
+
+    Returns:
+        Whether the group size and element type are supported and the payload is
+        positive, packed-word aligned, and within the input-buffer capacity.
+    """
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.producer_direct
     element_bytes = dtype.itemsize
     return (
@@ -538,9 +563,9 @@ class IrisAllReduce(object):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
-        dtype: torch.dtype = torch.bfloat16,
-        heap_size: int | None = None,
-        device: torch.device = None,
+        dtype: torch.dtype,
+        heap_size: int | None,
+        device: torch.device | None,
     ) -> None:
         assert (
             type(group) == dist.ProcessGroup
@@ -611,7 +636,7 @@ class IrisAllReduce(object):
                 producer_direct_max_numel
                 + self._producer_direct_scratch_numel
                 + staged_config.input_slots * staged_max_numel
-                + self._kernel_config.kimi_k3_attnres.input_slots * attnres_max_numel
+                + 2 * attnres_max_numel
                 + (staged_max_numel if self._two_stage_supported else 0)
                 + self._staged_two_stage_scratch_numel
             )
@@ -639,13 +664,7 @@ class IrisAllReduce(object):
             else None
         )
         self._attnres_input_buf = (
-            self._ctx.zeros(
-                (
-                    self._kernel_config.kimi_k3_attnres.input_slots,
-                    attnres_max_numel,
-                ),
-                dtype=dtype,
-            )
+            self._ctx.zeros((2, attnres_max_numel), dtype=dtype)
             if attnres_max_numel
             else None
         )
@@ -1007,7 +1026,7 @@ class IrisAllReduce(object):
             op = dist.ReduceOp.SUM
         assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
         kernel_config = self._kernel_config.kimi_k3_attnres
-        assert _platform.is_cdna4 and self.world_size == 8
+        assert _platform.is_cdna4 and self.world_size == kernel_config.world_size
         num_tokens = partial.shape[0]
         assert 0 < num_tokens <= self.attnres_max_rows
         expected_shape = (num_tokens, kernel_config.hidden_size)
@@ -1054,7 +1073,6 @@ class IrisAllReduce(object):
             HIDDEN=kernel_config.hidden_size,
             BLOCK=triton.next_power_of_2(kernel_config.hidden_size),
             INPUT_SLOT_STRIDE=self.attnres_max_numel,
-            NUM_SLOTS=kernel_config.input_slots,
             EPS=eps,
             ELEMENTS_PER_THREAD=kernel_config.elements_per_thread,
             NUM_WARPS=kernel_config.num_subgroups,
@@ -1680,7 +1698,6 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     HIDDEN: gl.constexpr,
     BLOCK: gl.constexpr,
     INPUT_SLOT_STRIDE: gl.constexpr,
-    NUM_SLOTS: gl.constexpr,
     EPS: gl.constexpr,
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -1715,7 +1732,7 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         heap_base_6,
         heap_base_7,
     )
-    reuse_epoch = gl.maximum(epoch - NUM_SLOTS, 0)
+    reuse_epoch = gl.maximum(epoch - 2, 0)
     _iris_sync_rank_epoch(
         consumed_flags,
         row,
@@ -1736,11 +1753,7 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         PUBLISH=False,
     )
 
-    if NUM_SLOTS & (NUM_SLOTS - 1) == 0:
-        input_slot = epoch & (NUM_SLOTS - 1)
-    else:
-        input_slot = epoch % NUM_SLOTS
-    input_slot_ptr = input_sym_ptr + input_slot * INPUT_SLOT_STRIDE
+    input_slot_ptr = input_sym_ptr + (epoch & 1) * INPUT_SLOT_STRIDE
     gl.amd.cdna4.buffer_store(
         local.to(input_slot_ptr.dtype.element_ty),
         input_slot_ptr,
@@ -2158,11 +2171,11 @@ def create_iris_state(
     producer_direct_max_numel: int,
     attnres_max_numel: int,
     attnres_max_rows: int,
-    dtype: torch.dtype = torch.bfloat16,
-    heap_size: int | None = None,
-    device: torch.device = None,
+    dtype: torch.dtype,
+    heap_size: int | None,
+    device: torch.device | None,
 ) -> "IrisAllReduce":
-    """Create an Iris all-reduce state with protocol-specific capacities.
+    """Create an Iris all-reduce state with separate capacities for each path.
 
     Args:
         group: Process group used by the collectives.

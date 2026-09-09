@@ -390,8 +390,12 @@ class LogitsProcessor(nn.Module):
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
+                attnres_max_numel=0,
                 max_tokens=self._LOGITS_AG_MAX_TOKENS,
                 hidden_size=vocab_padded,
+                device=None,
+                max_numel=0,
+                max_bytes=0,
             )
         return self._LOGITS_AG_STATES[key]
 
