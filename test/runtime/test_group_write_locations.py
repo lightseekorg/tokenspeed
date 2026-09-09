@@ -140,7 +140,13 @@ class MtpReanchorTest(unittest.TestCase):
             FULL: _StubLeaf(4, is_draft=True),
             SWA: _StubLeaf(2, is_draft=True),
         }
-        router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         geometry = CacheGroupGeometry(
             granularities={FULL: 4, SWA: 4},
             families={FULL: "history", SWA: "history"},

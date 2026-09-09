@@ -44,7 +44,7 @@ from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -63,19 +63,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
-
-
-class SpeculativeStateBackend(Protocol):
-    """Side state that consumes the target's speculative verification results."""
-
-    def commit_after_mtp_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
-    ) -> None: ...
-
-
-_SpeculativeStateBackendT = TypeVar(
-    "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
-)
 
 
 @dataclass
@@ -379,42 +366,10 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def register_speculative_state_backend(
-        self, backend: SpeculativeStateBackend
-    ) -> None:
-        """Bind a side-state consumer to the root at startup, before capture.
-
-        Registration and commit are root-local, never a child-tree traversal.
-        Re-registering the same object is harmless; replacing its type would
-        invalidate the workspace addresses recorded by CUDA graphs.
-        """
-        backends = self.__dict__.setdefault("_speculative_state_backends", [])
-        for previous in backends:
-            if previous is backend:
-                return
-            if type(previous) is type(backend):
-                raise RuntimeError("speculative side state cannot be rebound")
-        backends.append(backend)
-
-    def find_speculative_state_backend(
-        self, backend_type: type[_SpeculativeStateBackendT]
-    ) -> _SpeculativeStateBackendT | None:
-        """Return this root's registered consumer of the requested type."""
-        return next(
-            (
-                backend
-                for backend in getattr(self, "_speculative_state_backends", ())
-                if isinstance(backend, backend_type)
-            ),
-            None,
-        )
-
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Commit each root-owned side state once after eager execution or replay."""
-        for backend in getattr(self, "_speculative_state_backends", ()):
-            backend.commit_after_mtp_verify(accepted_lengths, num_extends=num_extends)
+        """Commit side state after execution; owning composites dispatch it."""
 
     @contextmanager
     def record_pd_cache_step(

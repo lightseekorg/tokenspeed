@@ -121,7 +121,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E501
+            from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (  # noqa: E501
                 compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
@@ -136,6 +136,8 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
             page_size,
             torch.tensor(before, dtype=torch.int32),
             torch.tensor(after, dtype=torch.int32),
+            validate=True,
+            group_id="linear_attention",
         )
 
     def test_across_boundary(self):
@@ -182,7 +184,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
 
     def test_index_plan_preserves_int32_inputs(self):
         torch = self.torch
-        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
             _compute_state_block_index_plan,
         )
 
@@ -241,6 +243,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
             torch.tensor([0], dtype=torch.int32),
             torch.tensor([1], dtype=torch.int32),
             validate=False,
+            group_id="linear_attention",
         )
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [0])

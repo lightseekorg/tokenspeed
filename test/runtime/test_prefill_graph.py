@@ -283,7 +283,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         even with the prefill graph disabled."""
         import torch
 
-        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
             compute_state_block_indices,
         )
 
@@ -317,6 +317,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             torch.zeros(3, dtype=torch.int32),
             torch.full((3,), 1024, dtype=torch.int32),
             validate=True,
+            group_id="linear_attention",
         )
 
     def test_expanded_row_reaches_the_kernels_full_width(self):

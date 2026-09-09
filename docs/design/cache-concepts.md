@@ -493,14 +493,19 @@ is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
 * The **model** owns indexer weights and top-k selection, passing
   `topk_indices` through `PagedAttention.forward` to the backend.
-* The **backend** owns attention dispatch and cache addressing. The
-  `CacheGroupRouter` expands scheduler tables once; indexers consume its
-  resolved `group_view` results and the compute leaf's live metadata.
-* The **root backend's registered QSA verify state** owns transient
-  verification workspace and accepted-state commits. Registry construction
-  creates and preallocates it only for a speculative target with local QSA
-  fields. The runner triggers its commit through the root's side-state hook;
-  child backends and draft backends do not borrow or dispatch this state. See the
+* The **full-attention backend** owns attention dispatch and full-KV cache
+  addressing. `CacheGroupRouter` expands only the groups served by attention
+  leaves; QSA's compressed/recent history groups are separate consumers.
+* **`QSAIndexerBackend`** owns those two groups' raw block tables, query
+  lengths and transient verification workspace. It uses the shared table
+  fill at expansion ratio one, preserving block ids and clearing padding,
+  and borrows the full-KV address view from the router. Its private
+  `QSAVerifyState` exists only for a speculative target with local QSA fields.
+* **`Qwen4ExpBackend`** composes the full-attention, optional GDN, PLE and
+  indexer consumers. The runner's existing post-verify calls dispatch once
+  to their respective children; the root neither allocates verify tensors
+  nor registers or looks up QSA state. PLE owns its checkpoint metadata
+  independently of Mamba and shares only the checkpoint arithmetic. See the
   [execution lifecycle](unified_path.md#backend-package-layout).
 
 LCM owns persistent allocation, prefix matching, transfer and retention,
@@ -508,6 +513,12 @@ including QSA's full-KV, compressed and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+
+Qwen4-Exp selects its cache recipe by model family, including targets with
+only full-attention layers. PLE and QSA fields and their verify budget do
+not require a GDN component. Recurrent shapes and replay settings are read
+only when that component exists; a recurrent layer label without matching
+linear-attention geometry still fails during recipe construction.
 
 ## Code placement
 
@@ -641,10 +652,13 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   family-gated (`CacheGroupSpec.__post_init__`).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
-  groups it serves — the router builds one leaf per paged (history-family)
-  group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
-  group ids. `cache_consumer_families` remains the boot-time coverage
+  groups it serves. The router builds a leaf for each claimed attention
+  group and fails a live batch missing any of them. QSA's indexer claims
+  its compressed/recent history groups separately; it does not instantiate
+  attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv,
+  V4) index the dict by their own group ids. Mamba's group set comes from
+  its recurrent fields, so a PLE checkpoint group cannot arm its verify
+  state. `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -660,6 +674,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   kernel pages out, one expand launch per group. Models and the runner never
   compute locations — `write_locations(layer, mode)` is the single accessor
   (`unified_path.md`, "Write locations have one owner").
+  QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
+  each group's `block_granularity`. This ratio-one fill copies stable raw
+  table views and clears holes/padding; it does not add another subdivision
+  convention or derive its addresses through a dummy attention leaf.
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math

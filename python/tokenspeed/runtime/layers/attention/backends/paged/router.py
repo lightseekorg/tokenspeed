@@ -124,6 +124,7 @@ class CacheGroupRouter(AttentionBackend):
         is_draft: bool,
         spec_num_tokens: int,
         device,
+        consumed_group_ids: tuple[str, ...] | None,
     ) -> None:
         """Args:
         leaf_factory: ``(group_id, block_granularity) -> leaf``; called once
@@ -135,8 +136,11 @@ class CacheGroupRouter(AttentionBackend):
             target's decode write window and the location stack's
             per-request capacity.
         device: Buffer device.
+        consumed_group_ids: Groups served by attention leaves, or None to
+            serve every local paged group. Other groups go to peer consumers.
         """
         self._leaf_factory = leaf_factory
+        self._consumed_group_ids = consumed_group_ids
         self.leaves: dict[str, PagedAttentionBackend] = {}
         self._geometry: CacheGroupGeometry | None = None
         self.is_draft = bool(is_draft)
@@ -189,20 +193,19 @@ class CacheGroupRouter(AttentionBackend):
         return tuple(self.leaves.values())
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
-        """Bind the pool: learn the group geometry from its published specs
-        and build one leaf per paged group of this view (``paged_group_ids``)."""
+        """Bind the pool and build leaves only for this consumer's groups."""
         self.cache_pool = cache_pool
         geometry = learn_cache_group_geometry(cache_pool.arena.cache_group_specs)
-        # Include indexer-only history groups (QSA compressed/recent keys).
-        # They receive no PagedAttention forwards, but _table_specs still uses
-        # their leaves to size the shared tables exposed through group_view.
-        # Omitting these leaves, and their unused attention graph buffers,
-        # requires separating table geometry from compute-leaf construction.
+        group_ids = cache_pool.paged_group_ids
+        if self._consumed_group_ids is not None:
+            group_ids = tuple(
+                gid for gid in group_ids if gid in self._consumed_group_ids
+            )
         self.bind(
             geometry,
             {
                 gid: self._leaf_factory(gid, geometry.granularity_of(gid))
-                for gid in cache_pool.paged_group_ids
+                for gid in group_ids
             },
         )
         for leaf in self.leaves.values():

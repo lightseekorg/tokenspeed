@@ -38,6 +38,9 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+    qwen4_exp_backend,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
@@ -48,7 +51,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
-from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -393,7 +395,7 @@ class QSAIndexer(nn.Module):
 
         Everything here is per-request: the logical layout comes from the live
         query lengths, the compressed / recent writes address this forward's
-        rows of the router's page tables, and the compress / top-k grids are
+        rows of the indexer backend's block tables, and the compress / top-k grids are
         sized by the batch. A prefill capture sees one dummy request, so
         graphing this would bake that request's layout and one-row table views
         into every replay. Running it as a break keeps it all live; direct call
@@ -413,15 +415,17 @@ class QSAIndexer(nn.Module):
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
         _, compressed, _ = self._fields(pool)
-        router = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
+        backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
+        if backend is None:
+            raise RuntimeError("QSA requires an indexer backend")
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
             (ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed())
             and verify_bs > 0
-            and router.spec_num_tokens > 1
-            and not router.is_draft
+            and backend.spec_num_tokens > 1
+            and not backend.is_draft
         )
-        is_draft = router.is_draft
+        is_draft = backend.is_draft
         is_draft_first_step = is_draft and ctx.draft_narrowing is not None
         is_draft_decode_step = (
             is_draft and ctx.draft_narrowing is None and ctx.forward_mode.is_decode()
@@ -475,15 +479,10 @@ class QSAIndexer(nn.Module):
                 )
         verify_scratch = None
         if is_target_verify:
-            verify_tokens = verify_bs * router.spec_num_tokens
+            verify_tokens = verify_bs * backend.spec_num_tokens
             if verify_tokens > token_k.shape[0]:
                 raise RuntimeError("QSA verify rows exceed the current input")
-            state = ctx.attn_backend.find_speculative_state_backend(QSAVerifyState)
-            if state is None:
-                raise RuntimeError(
-                    "QSA target verify requires a registered verify state"
-                )
-            verify_scratch = state.verify_staging_buffers(self.layer_id, verify_bs)
+            verify_scratch = backend.verify_staging_buffers(self.layer_id, verify_bs)
         q = self._write_and_compress(
             token_k,
             positions,

@@ -55,10 +55,10 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state import kda, mamba
-from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
 )
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )

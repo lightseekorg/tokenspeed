@@ -220,7 +220,13 @@ class _Harness:
             gid: MHAAttnBackend(config, spec, kernel_page_size=PAGE_SIZE)
             for gid in self.attn_groups
         }
-        inner = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device=device)
+        inner = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device=device,
+            consumed_group_ids=None,
+        )
         inner.bind(
             CacheGroupGeometry(
                 granularities={gid: PAGE_SIZE for gid in self.attn_groups},

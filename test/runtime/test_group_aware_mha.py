@@ -80,7 +80,13 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
 
         page_sizes = {FULL: 4, SWA: 2}
         leaves = {gid: self._leaf(page_sizes[gid]) for gid in group_ids}
-        router = CacheGroupRouter(None, is_draft=False, spec_num_tokens=1, device="cpu")
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
         router.bind(
             CacheGroupGeometry(
                 granularities={gid: 4 for gid in group_ids},

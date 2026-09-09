@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""QSA indexing layout over the ordinary router's resolved cache views."""
+"""QSA indexing layout over its own raw tables and full-KV address views."""
 
 from __future__ import annotations
 
@@ -30,17 +30,15 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_prepare_metadata,
 )
 
-from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
-    QWEN4_EXP_QSA_CACHE_GROUP,
-    QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+    qwen4_exp_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
-    from tokenspeed.runtime.layers.attention.backends.paged.mha import (
-        MHADecodeMetadata,
-        MHAExtendMetadata,
+    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+        QSAIndexerMetadata,
     )
 
 
@@ -87,20 +85,12 @@ class QSALayout:
 
 def qsa_attention_metadata(
     ctx: ForwardContext,
-) -> MHAExtendMetadata | MHADecodeMetadata:
-    """Read the full-KV leaf metadata selected by this forward context."""
-    router = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
-    leaf = router.leaves[FULL_ATTENTION]
-    metadata = (
-        leaf.forward_extend_metadata
-        if ctx.forward_mode.is_extend_or_mixed()
-        else leaf.forward_decode_metadata
-    )
-    if metadata is None:
-        raise RuntimeError(
-            f"QSA found no {ctx.forward_mode} metadata on the full-attention leaf"
-        )
-    return metadata
+) -> QSAIndexerMetadata:
+    """Read the indexer consumer's metadata selected by this forward context."""
+    backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
+    if backend is None:
+        raise RuntimeError("QSA requires an indexer backend")
+    return backend.metadata_for(ctx.forward_mode)
 
 
 def qsa_forward_layout(
@@ -130,7 +120,7 @@ def qsa_forward_layout(
             reset_draft_tags.fill_(torch.iinfo(torch.int64).min)
         return cached
 
-    router = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
+    backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
     metadata = qsa_attention_metadata(ctx)
     query_lengths = decode_query_lengths(
         ctx,
@@ -138,12 +128,12 @@ def qsa_forward_layout(
         force_uniform=False,
     )
     if query_lengths is None:
+        if metadata.extend_seq_lens is None:
+            raise RuntimeError("QSA extend metadata requires query lengths")
         query_lengths = metadata.extend_seq_lens[: ctx.bs]
-    qsa = router.group_view(QWEN4_EXP_QSA_CACHE_GROUP, ctx.bs)
-    recent = router.group_view(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, ctx.bs)
-    full = router.group_view(FULL_ATTENTION, ctx.bs)
-    qsa_page_table, qsa_expansion = qsa.page_table, qsa.pages_per_block
-    recent_page_table, recent_expansion = recent.page_table, recent.pages_per_block
+    full = backend.full_attn_backend.group_view(FULL_ATTENTION, ctx.bs)
+    qsa_page_table = metadata.qsa_block_table
+    recent_page_table = metadata.recent_block_table
     seq_lens = metadata.seq_lens[: ctx.bs]
     logical, requests, qsa_locs, recent_locs, complete_blocks = (
         qwen4_exp_qsa_prepare_metadata(
@@ -151,10 +141,10 @@ def qsa_forward_layout(
             query_lengths,
             total_tokens,
             qsa_page_table,
-            qsa_expansion,
+            1,
             compressed_token_page_size,
             recent_page_table,
-            recent_expansion,
+            1,
             recent_page_size,
             compress_ratio,
             draft_logical_positions=reset_draft_tags,
@@ -168,7 +158,7 @@ def qsa_forward_layout(
         recent_locs=recent_locs,
         complete_blocks=complete_blocks,
         qsa_page_table=qsa_page_table,
-        qsa_page_expansion=qsa_expansion,
+        qsa_page_expansion=1,
         full_page_table=full.page_table,
         full_kernel_page_size=full.kernel_page_size,
         reset_draft_tags=reset_draft_tags,

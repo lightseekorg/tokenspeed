@@ -38,9 +38,6 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    qwen4_exp_linear_backend,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -510,11 +507,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
-        self.ple_layers = tuple(
-            layer.ple
-            for layer in self.layers
-            if getattr(layer, "ple", None) is not None
-        )
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
@@ -551,8 +543,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
-        if self.ple_layers:
-            qwen4_exp_linear_backend(ctx.attn_backend).bind_ple_layers(self.ple_layers)
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )

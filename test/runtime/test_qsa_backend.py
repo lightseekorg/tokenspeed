@@ -29,12 +29,15 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-    HybridLinearAttnBackend,
-)
+from tokenspeed.runtime.execution.graph_ptr_guard import snapshot_graph_metadata
 from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+    QSAIndexerBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+    Qwen4ExpBackend,
+)
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
@@ -44,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    qsa_compressed_field,
     qsa_raw_key_field,
     qsa_rope_position_field,
 )
@@ -51,8 +55,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTEN
 from tokenspeed.runtime.layers.attention.qsa.metadata import qsa_forward_layout
 from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 from tokenspeed.runtime.layers.attention.registry import (
-    _create_qsa_verify_state,
-    _prepare_verify_workspace,
     create_paged_router,
 )
 
@@ -111,12 +113,19 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
         tensors[qsa_rope_position_field(layer_id)] = torch.zeros(
             4, 3, dtype=torch.int64, device=device
         )
+        tensors[qsa_compressed_field(layer_id)] = torch.zeros(
+            4, 64, 1, 8, dtype=torch.bfloat16, device=device
+        )
     pool = SimpleNamespace(
         arena=SimpleNamespace(
             plan=SimpleNamespace(
                 fields=[
                     SimpleNamespace(
-                        group_id=QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+                        group_id=(
+                            QWEN4_EXP_QSA_CACHE_GROUP
+                            if name.endswith(".qsa.compressed_key")
+                            else QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+                        ),
                         field_id=name,
                     )
                     for name in tensors
@@ -144,21 +153,20 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
 
 @pytest.fixture
 def state() -> QSAVerifyState:
-    state = _create_qsa_verify_state(
+    state = QSAVerifyState(
         _qsa_config(max_bs=8, is_draft=False, device="cpu"),
         _qsa_pool(device="cpu", layer_offset=0),
     )
-    _prepare_verify_workspace(
-        server_args=SimpleNamespace(speculative_num_draft_tokens=4),
-        config=SimpleNamespace(max_bs=8),
-        backend=None,
-        draft_backend=None,
-        qsa_verify_state=state,
-        uses_paged_state_verify=False,
-        is_inkling=False,
-        expected_bytes=2 * 8 * 4 * 8 * 2 + 8 * 4 * 36 + 2 * 2 * 8,
-    )
+    state.preallocate_verify_workspace(8, 4)
     return state
+
+
+def _root_with_indexer(config, pool):
+    router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
+    indexer = QSAIndexerBackend(config, router)
+    root = Qwen4ExpBackend(router, None, [1, 3], None, indexer)
+    root.set_cache_pool(pool)
+    return root, indexer
 
 
 @pytest.fixture
@@ -187,26 +195,13 @@ def test_qsa_registry_preallocates_from_the_cache_plan(state) -> None:
     assert state._verify_workspace is workspace
 
 
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_qsa_root_owns_staging_and_commits_once(state, commit_calls, hybrid) -> None:
-    router = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
-    router.set_cache_pool(state.cache_pool)
-    backend = (
-        HybridLinearAttnBackend(router, object.__new__(AttentionBackend), [1, 3])
-        if hybrid
-        else router
+def test_qsa_indexer_owns_staging_and_root_commits_once(state, commit_calls) -> None:
+    backend, indexer = _root_with_indexer(
+        _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
     )
-    backend.register_speculative_state_backend(state)
-    backend.register_speculative_state_backend(state)
-    found = backend.find_speculative_state_backend(QSAVerifyState)
-    assert found is state
-    found.verify_staging_buffers(1, 2)
-    found.verify_staging_buffers(3, 2)
-    # Children cannot borrow their parent's side state. The runner calls the
-    # root exactly once, even when two layers stage into the same workspace.
-    for child in backend.child_backends():
-        if isinstance(child, AttentionBackend):
-            assert child.find_speculative_state_backend(QSAVerifyState) is None
+    indexer.preallocate_verify_workspace(8, 4)
+    indexer.verify_staging_buffers(1, 2)
+    indexer.verify_staging_buffers(3, 2)
     backend.commit_speculative_state_after_verify(
         torch.tensor([9, 3, 1], dtype=torch.int32), num_extends=1
     )
@@ -214,24 +209,29 @@ def test_qsa_root_owns_staging_and_commits_once(state, commit_calls, hybrid) -> 
     assert commit_calls[0][0][6].tolist() == [3, 1]
 
 
-def test_qsa_registered_workspace_cannot_be_rebound(state) -> None:
-    backend = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
-    backend.register_speculative_state_backend(state)
-    replacement = QSAVerifyState(
+def test_qsa_indexer_workspace_cannot_be_rebound(state) -> None:
+    _, backend = _root_with_indexer(
         _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
     )
+    backend.preallocate_verify_workspace(8, 4)
+    workspace = backend._verify_state._verify_workspace
+    backend.set_cache_pool(state.cache_pool)
     with pytest.raises(RuntimeError, match="cannot be rebound"):
-        backend.register_speculative_state_backend(replacement)
-    assert backend.find_speculative_state_backend(QSAVerifyState) is state
+        backend.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
+    assert backend._verify_state._verify_workspace is workspace
 
 
 def test_qsa_state_does_not_leak_between_target_and_draft(state, commit_calls) -> None:
-    target = _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
-    draft = _make_qsa_backend(max_bs=8, is_draft=True, device="cpu")
-    target.register_speculative_state_backend(state)
-    state.verify_staging_buffers(1, 2)
-    assert target.find_speculative_state_backend(QSAVerifyState) is state
-    assert draft.find_speculative_state_backend(QSAVerifyState) is None
+    _, target = _root_with_indexer(
+        _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
+    )
+    draft, draft_indexer = _root_with_indexer(
+        _qsa_config(max_bs=8, is_draft=True, device="cpu"), state.cache_pool
+    )
+    target.preallocate_verify_workspace(8, 4)
+    target.verify_staging_buffers(1, 2)
+    assert target._verify_state is not None
+    assert draft_indexer._verify_state is None
     draft.commit_speculative_state_after_verify(
         torch.tensor([3, 1], dtype=torch.int32), num_extends=0
     )
@@ -327,13 +327,13 @@ def test_qsa_commit_rejects_invalid_extend_prefix(state, num_extends) -> None:
 def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
     use_graph: bool,
 ) -> None:
-    router = _make_qsa_backend(max_bs=4, is_draft=False, device="cuda")
     pool = _qsa_pool(device="cuda", layer_offset=0)
-    router.set_cache_pool(pool)
-    state = QSAVerifyState(_qsa_config(max_bs=4, is_draft=False, device="cuda"), pool)
-    state.preallocate_verify_workspace(4, 4)
-    router.register_speculative_state_backend(state)
-    router.init_cuda_graph_state(4)
+    backend, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cuda"), pool
+    )
+    indexer.preallocate_verify_workspace(4, 4)
+    state = indexer._verify_state
+    backend.init_cuda_graph_state(4)
     raws = [pool.arena.field(qsa_raw_key_field(layer)) for layer in (1, 3)]
     positions = [pool.arena.field(qsa_rope_position_field(layer)) for layer in (1, 3)]
     workspace = state._verify_workspace
@@ -345,12 +345,12 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
     slots = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
     tables = {
         gid: torch.tensor([[1], [2]], dtype=torch.int32, device="cuda")
-        for gid in router.group_ids
+        for gid in pool.paged_group_ids
     }
-    ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE, attn_backend=router)
+    ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE, attn_backend=backend)
 
     def refresh(actual_bs: int) -> None:
-        router.refresh_decode_metadata(
+        backend.refresh_decode_metadata(
             2,
             actual_bs,
             slots,
@@ -372,7 +372,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
         )
         positions = layout.logical_positions[:, None].expand(-1, 3)
         for slot, layer in enumerate((1, 3)):
-            destinations = state.verify_staging_buffers(layer, 2)
+            destinations = indexer.verify_staging_buffers(layer, 2)
             destinations[0].copy_(source[slot].view(2, 4, 1, 8))
             destinations[1].copy_(positions.view(2, 4, 3))
             destinations[2].copy_(layout.logical_positions.view(2, 4))
@@ -399,7 +399,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             stage()
         else:
             graph.replay()
-        router.commit_speculative_state_after_verify(
+        backend.commit_speculative_state_after_verify(
             torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
         )
         assert state._verify_workspace is workspace
@@ -429,28 +429,17 @@ def test_qsa_only_target_verification_creates_state(is_draft, width) -> None:
         _qsa_config(max_bs=8, is_draft=is_draft, device="cpu"),
         speculative_num_draft_tokens=width,
     )
-    state = _create_qsa_verify_state(config, _qsa_pool(device="cpu", layer_offset=0))
-    assert state is None
+    _, backend = _root_with_indexer(config, _qsa_pool(device="cpu", layer_offset=0))
+    assert backend._verify_state is None
     with pytest.raises(ValueError, match="speculative target"):
         QSAVerifyState(config, _qsa_pool(device="cpu", layer_offset=0))
-    _prepare_verify_workspace(
-        server_args=SimpleNamespace(speculative_num_draft_tokens=width),
-        config=config,
-        backend=None,
-        draft_backend=None,
-        qsa_verify_state=state,
-        uses_paged_state_verify=False,
-        is_inkling=False,
-        expected_bytes=0,
-    )
+    assert backend.preallocate_verify_workspace(8, width) == 0
+    with pytest.raises(RuntimeError, match="speculative target"):
+        backend.verify_staging_buffers(1, 2)
 
 
 def test_qsa_state_requires_fields_in_the_side_view() -> None:
     config = _qsa_config(max_bs=8, is_draft=False, device="cpu")
-    pool = _qsa_pool(device="cpu", layer_offset=0)
-    pool.paged_group_ids = (FULL_ATTENTION,)
-    assert _create_qsa_verify_state(config, pool) is None
-    assert _create_qsa_verify_state(None, None) is None
     pool = _qsa_pool(device="cpu", layer_offset=0)
     # A shared arena may have QSA fields only on a different PP rank or on
     # the adjacent draft view. This view must allocate no target workspace.
@@ -459,18 +448,182 @@ def test_qsa_state_requires_fields_in_the_side_view() -> None:
         pool.arena, first_layer=5, num_layers=3
     )
     assert pool.paged_group_ids == ()
-    assert _create_qsa_verify_state(config, pool) is None
+    backend = QSAIndexerBackend(
+        config, _make_qsa_backend(max_bs=8, is_draft=False, device="cpu")
+    )
+    with pytest.raises(RuntimeError, match="compressed and recent fields"):
+        backend.set_cache_pool(pool)
 
 
-def test_qsa_workspace_budget_mismatch_fails_before_forward(state) -> None:
-    with pytest.raises(RuntimeError, match="planned QSA verify workspace"):
-        _prepare_verify_workspace(
-            server_args=SimpleNamespace(speculative_num_draft_tokens=4),
-            config=SimpleNamespace(max_bs=8),
-            backend=None,
-            draft_backend=None,
-            qsa_verify_state=state,
-            uses_paged_state_verify=False,
-            is_inkling=False,
-            expected_bytes=state._verify_workspace.nbytes - 1,
+def test_qsa_raw_tables_refresh_in_place_and_clear_padding() -> None:
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    root.init_cuda_graph_state(4)
+    tables = {
+        gid: torch.tensor([[2, -1, 3], [4, 5, -1]], dtype=torch.int32)
+        for gid in (
+            FULL_ATTENTION,
+            QWEN4_EXP_QSA_CACHE_GROUP,
+            QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
         )
+    }
+    slots = torch.arange(3, dtype=torch.int32)
+    root.refresh_decode_metadata(
+        3,
+        2,
+        slots,
+        torch.tensor([1, 9, 1], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+    )
+    metadata = indexer.forward_decode_metadata
+    assert metadata.seq_lens.tolist() == [4, 9, 4]
+    assert metadata.qsa_block_table.tolist() == [[2, 0, 3, 0], [4, 5, 0, 0], [0] * 4]
+    assert metadata.recent_block_table[:, :3].tolist() == [
+        [2, 0, 3],
+        [4, 5, 0],
+        [0, 0, 0],
+    ]
+    snapshot = snapshot_graph_metadata(indexer)
+    assert any("qsa_block_table" in name for name in snapshot)
+    assert any("recent_block_table" in name for name in snapshot)
+    root.refresh_decode_metadata(
+        3,
+        1,
+        slots,
+        torch.tensor([7, 1, 1], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables={gid: torch.tensor([[6]], dtype=torch.int32) for gid in tables},
+    )
+    assert snapshot_graph_metadata(indexer) == snapshot
+    assert indexer.forward_decode_metadata is metadata
+    assert metadata.qsa_block_table.tolist() == [[6, 0, 0, 0], [0] * 4, [0] * 4]
+    assert torch.count_nonzero(metadata.recent_block_table[:, 1:]) == 0
+    root.refresh_decode_metadata(
+        3,
+        0,
+        slots,
+        torch.ones(3, dtype=torch.int32),
+        forward_mode=ForwardMode.IDLE,
+        block_tables={},
+    )
+    assert torch.count_nonzero(metadata.qsa_block_table) == 0
+    assert torch.count_nonzero(metadata.recent_block_table) == 0
+    assert snapshot_graph_metadata(indexer) == snapshot
+
+
+def test_qsa_indexer_requires_both_live_tables() -> None:
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    root.init_cuda_graph_state(4)
+    with pytest.raises(RuntimeError, match="missing cache groups"):
+        indexer.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0]),
+            torch.tensor([4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                QWEN4_EXP_QSA_CACHE_GROUP: torch.ones((1, 1), dtype=torch.int32)
+            },
+        )
+
+
+def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
+    monkeypatch,
+) -> None:
+    import tokenspeed.runtime.layers.attention.qsa.metadata as metadata_module
+    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=True, device="cpu"),
+        _qsa_pool(device="cpu", layer_offset=0),
+    )
+    root.init_cuda_graph_state(4)
+    tables = {
+        gid: torch.tensor([[1], [2]], dtype=torch.int32)
+        for gid in (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+    }
+    seq_lens = torch.tensor([8, 12], dtype=torch.int32)
+    indexer.init_forward_metadata(
+        2,
+        1,
+        torch.arange(2),
+        seq_lens,
+        ForwardMode.MIXED,
+        block_tables=tables,
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([5], dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        extend_with_prefix=True,
+    )
+    extend = indexer.forward_extend_metadata
+    indexer.refresh_decode_metadata(
+        2,
+        2,
+        torch.arange(2),
+        seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+    )
+    assert indexer.forward_extend_metadata is extend
+    assert extend.extend_seq_lens.tolist() == [3, 4]
+    launches = []
+
+    def prepare(*args, **kwargs):
+        launches.append((args, kwargs))
+        if len(launches) == 1:
+            assert args[0].tolist() == [8, 12]
+            assert args[1].tolist() == [3, 4]
+            logical = torch.tensor([5, 6, 7, 8, 9, 10, 11])
+            requests = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+        else:
+            assert args[0].tolist() == [8, 10]
+            assert args[1] == 1
+            logical = torch.tensor([7, 9])
+            requests = torch.tensor([0, 1])
+        slots = torch.ones(logical.shape, dtype=torch.int32)
+        return logical, requests, slots, slots, slots
+
+    monkeypatch.setattr(metadata_module, "qwen4_exp_qsa_prepare_metadata", prepare)
+    ctx = SimpleNamespace(
+        attn_backend=root, bs=2, num_extends=1, forward_mode=ForwardMode.MIXED
+    )
+    kwargs = dict(
+        compressed_token_page_size=256,
+        recent_page_size=64,
+        compress_ratio=4,
+        reset_draft_tags=None,
+    )
+    layout = qsa_forward_layout(ctx, 7, **kwargs)
+    root.advance_draft_forward_metadata(torch.tensor([8, 10], dtype=torch.int32))
+    assert layout.seq_lens.tolist() == [8, 10]
+    assert layout.logical_positions.tolist() == [5, 6, 7, 8, 9, 10, 11]
+    mask = QSAIndexer._draft_accepted_write_mask(
+        ctx,
+        layout.seq_lens,
+        layout.logical_positions,
+        layout.request_indices,
+        layout.recent_locs,
+    )
+    assert mask.tolist() == [True, True, True, True, True, False, False]
+    assert qsa_forward_layout(ctx, 7, **kwargs) is layout
+    assert len(launches) == 1
+    # Eagle starts each model invocation with fresh row geometry while carrying
+    # forward the selected slots. The narrowed decode has one query per request.
+    topk = torch.tensor([[1], [2]])
+    root.sparse_topk.decode = topk
+    root.sparse_topk.qsa_metadata = None
+    ctx.forward_mode = ForwardMode.DECODE
+    next_layout = qsa_forward_layout(ctx, 2, **kwargs)
+    assert next_layout.logical_positions.tolist() == [7, 9]
+    assert root.sparse_topk.decode is topk
+    root.update_draft_forward_metadata(torch.tensor([9, 11], dtype=torch.int32))
+    assert next_layout.seq_lens.tolist() == [9, 11]
+    root.fill_block_decode_seq_lens(2, torch.tensor([2, 9999], dtype=torch.int32))
+    assert next_layout.seq_lens.tolist() == [4, 1024]

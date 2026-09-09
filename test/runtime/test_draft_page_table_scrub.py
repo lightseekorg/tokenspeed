@@ -55,7 +55,9 @@ class _Leaf:
 
 
 def _draft_router(rows: int = 8) -> CacheGroupRouter:
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},

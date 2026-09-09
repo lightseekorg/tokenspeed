@@ -43,8 +43,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("query_lengths", [4, [3, 4, 5]])
+@pytest.mark.parametrize("qsa_expansion", [1, 2])
 def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
-    device: str, query_lengths: int | list[int]
+    device: str, query_lengths: int | list[int], qsa_expansion: int
 ) -> None:
     seq_lens = torch.tensor([3, 14, 23], device=device, dtype=torch.int32)
     if not isinstance(query_lengths, int):
@@ -56,7 +57,6 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     )
     ratio = 4
     qsa_page_size = 8
-    qsa_expansion = 2
     recent_page_size = 4
     qsa_logical = torch.tensor(
         [[2, 3, 4], [5, 6, 7], [8, 9, 10]], device=device, dtype=torch.int32

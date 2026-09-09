@@ -205,7 +205,9 @@ def test_router_fans_advance_out_to_every_leaf():
 
     leaf = _mha_backend()
     leaf.init_cuda_graph_state(8)
-    router = CacheGroupRouter(None, is_draft=True, spec_num_tokens=4, device="cpu")
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
     router.bind(
         CacheGroupGeometry(
             granularities={"full_attention": 64},

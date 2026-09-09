@@ -321,7 +321,6 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         config=config,
         backend=backend,
         draft_backend=None,
-        qsa_verify_state=None,
         uses_paged_state_verify=True,
         is_inkling=False,
         expected_bytes=planned_bytes,
@@ -329,14 +328,13 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 
     with pytest.raises(
         RuntimeError,
-        match="planned paged-state verify workspace does not match allocated tensors",
+        match="planned verify workspace does not match allocated tensors",
     ):
         _prepare_verify_workspace(
             server_args=server_args,
             config=config,
             backend=backend,
             draft_backend=None,
-            qsa_verify_state=None,
             uses_paged_state_verify=True,
             is_inkling=False,
             expected_bytes=planned_bytes + 1,

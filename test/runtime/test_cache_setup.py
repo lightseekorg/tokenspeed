@@ -9,8 +9,8 @@ from tokenspeed.runtime.cache.transfer.layout import (
     combine_cache_transfer_layouts,
     select_layer_fields,
 )
-from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-    Qwen4ExpMambaAttnBackend,
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+    Qwen4ExpPLEBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
@@ -438,14 +438,13 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         assert setup.fixed_workspace_bytes == 0
         return
 
-    backend = object.__new__(Qwen4ExpMambaAttnBackend)
-    backend.kv_pool = _pool_over_new_arena(
-        setup.spec, attn_config, num_layers=len(setup.spec.layer_types), rank=0
+    backend = Qwen4ExpPLEBackend(attn_config, target_spec)
+    backend.set_cache_pool(
+        _pool_over_new_arena(
+            setup.spec, attn_config, num_layers=len(setup.spec.layer_types), rank=0
+        )
     )
-    backend.device = torch.device("cpu")
-    backend._ple_verify_scratch = {}
-    backend._ple_commit_rows = None
-    ple_bytes = backend._preallocate_aux_verify_workspace(
+    ple_bytes = backend.preallocate_verify_workspace(
         max_bs=attn_config.max_bs, draft_token_num=width
     )
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]

@@ -20,10 +20,10 @@
 
 """Target verification state shared by a model's QSA indexers.
 
-Persistent request caches belong to the LCM arena. The root attention backend
-owns this state's temporary, capacity-sized workspace, bound at startup to
-the target's local cache fields. Its side-state hook commits acceptance after
-eager execution or graph replay; paged leaves do not own or dispatch it.
+Persistent request caches belong to the LCM arena. The QSA indexer backend
+owns this helper's temporary, capacity-sized workspace, bound at startup to
+the target's local cache fields. The root's post-verification hook dispatches
+its commit after eager execution or graph replay.
 """
 
 from __future__ import annotations

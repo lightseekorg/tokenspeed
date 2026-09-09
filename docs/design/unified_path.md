@@ -149,8 +149,9 @@ scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-Current declarations: `DSABackend` and `Qwen4ExpMambaAttnBackend` disable the
-prefill graph (rationale comments live on those classes).
+`DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
+(rationale comments live on those classes). Qwen4-Exp's root composes its
+actual children, so these restrictions also apply when there is no GDN leaf.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
@@ -326,37 +327,49 @@ TRT-LLM MLA, TokenSpeed MLA, DSA, MSA, QSA); `state/` holds the recurrent consum
 (Mamba/GDN and KDA);
 `hybrid/` the layer-routing composite (`linear.py` is
 `HybridLinearAttnBackend`); and `specific/` the bespoke single-model backends
-(DeepSeek V4, Qwen4-Exp's GDN extension, and Inkling's dense + conv-state
-wrapper). A new leaf goes under `paged/`, a new recurrent family under
-`state/`. A model-shaped backend earns `specific/` only when the ordinary
-router, paged leaves and registered side state cannot express it; use by one
+(DeepSeek V4, Qwen4-Exp's composite and side-cache consumers, and Inkling's
+dense + conv-state wrapper). A new leaf goes under `paged/`, a new recurrent
+family under `state/`. A model-shaped backend earns `specific/` only when the ordinary
+router and ordinary paged or recurrent leaves cannot express it; use by one
 model alone is not a reason to introduce a bespoke backend.
 
-QSA uses the ordinary router and an MHA-derived leaf. Its indexer layout
-comes from `router.group_view` and full-KV metadata, and stays in
-`SparseTopKShare` with the existing forward and MTP reuse boundaries.
+`Qwen4ExpBackend` is a `HybridLinearAttnBackend` composite over full attention,
+optional GDN, optional `Qwen4ExpPLEBackend` and optional `QSAIndexerBackend`.
+It broadcasts cache binding and metadata lifecycle calls to the actual
+children; the model retains projection, PLE and indexer computation order.
+PLE and QSA remain available when the model has no linear-attention layers.
 
-The target's root `AttentionBackend` owns a registered `QSAVerifyState`
-when its bound cache view has local QSA fields and its verify width exceeds
-one. Registry construction binds this state from the cache plan and
-preallocates its workspace before model forward or graph capture. Draft
-and non-speculative backends have no QSA verify state. This is transient
-staging, not a second owner of the persistent request cache.
+QSA's full-KV attention uses the ordinary router and an MHA-derived leaf.
+Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
+to extra attention leaves. The indexer backend refreshes stable raw group
+tables with the shared `GroupTableStacks` fill at expansion ratio one:
+block ids remain unchanged, holes become zero, and padded requests and
+column tails are cleared. It owns its query/sequence metadata and borrows
+only the full-KV address table from `router.group_view`. Layer-shared layout
+and top-k still use `SparseTopKShare` with the existing forward and MTP reuse
+boundaries.
 
-Indexers read the target/draft role and token width from their full-attention
-router. Only target verify looks up `QSAVerifyState` through the existing
-`ctx.attn_backend` reference; missing startup registration is an error, never
-a reason to bind a model or allocate workspace lazily during forward.
+`QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
+target. Registry construction binds the cache plan and preallocates its
+workspace before model forward or graph capture. Draft and non-speculative
+indexer backends keep metadata but allocate no target verify workspace.
+Indexers use the root's `indexer_backend`; execution carries no separate
+indexer object and the root has no QSA state registry or type lookup.
 
-`ForwardStepRunner` calls `commit_speculative_state_after_verify` on the
-target root once after eager verify or graph replay, with acceptance sliced
-to the real batch. QSA excludes leading extend requests in mixed batches.
-Registration, lookup and commit stay local to this one root, whether it is
-a hybrid composite or a standalone router; they never walk child backends.
-Registered state cannot be replaced with a different instance of the same
-type, preserving workspace addresses captured by graphs. Mamba/GDN and PLE
-retain their existing decode-only commit lifecycle independently of this
-side-state hook.
+`Qwen4ExpPLEBackend` resolves its own input/output checkpoints and query
+lengths from the PLE cache group. It shares the checkpoint arithmetic with
+recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
+verify context or auxiliary-state hooks. GDN claims only the recurrent
+groups that back its own state fields.
+
+The runner keeps its two existing post-verify calls after eager execution
+or graph replay, with acceptance sliced to the real batch. The decode-only
+`update_mamba_state_after_mtp_verify` call commits GDN and then PLE; the
+decode/mixed `commit_speculative_state_after_verify` call commits QSA through
+the indexer child, excluding leading extend requests. The root dispatches
+each consumer once, never a second recursive commit over all children.
+Transient verify storage belongs to these consumers; LCM remains the owner
+of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
@@ -371,9 +384,9 @@ vocabulary is fixed, with exactly one conversion point:
 |---|---|---|
 | C++ scheduler | per-group `BlockTable`s: rows in `block_granularity` logical index, entries are `CacheBlock` ids | kernel pages, backends |
 | bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
-| **`CacheGroupRouter`** | group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, ALL write-location slot math | kernel calls |
-| QSA indexer metadata | resolved group views and full-KV leaf metadata | raw scheduler table expansion |
-| root-backend-owned QSA verify state | bound cache fields and transient verification workspace | allocation of persistent request caches, scheduler table expansion |
+| **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding and KV write-location slot math | kernel calls |
+| `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view and private verify workspace | MHA leaf metadata, persistent cache allocation |
+| `Qwen4ExpPLEBackend` | its PLE checkpoint table, input/output checkpoints and verify workspace | Mamba metadata and verify context, persistent cache allocation |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
@@ -395,8 +408,9 @@ table expanded to its leaf's `kernel_page_size` and padded to the leaf's
 `max_num_pages`; the stack's column count is the widest group's) and the
 `[G, max_bs * N]` decode write-location stack. Both are allocated once and
 refilled in place: leaves copy their view out, while the decode write-slot
-views, the block drafters' `draft_history_view` and the QSA indexer's group
-tables read the stack storage inside captured graphs. The fill is one expand
+views and the block drafters' `draft_history_view` read the stack storage
+inside captured graphs. QSA's indexer owns separate stacks for its two raw
+groups using the same fill at ratio one. The fill is one expand
 launch per group with plain scalar arguments (scheduler block count, source
 stride, live requests) — no device-side metadata tensor, because the
 per-step pinned staging + H2D it would need lands on the bs=1 latency path;
@@ -514,10 +528,10 @@ in which tap order — and carries no per-round state.
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
-The write-location kernels stay pure functions (`paged/write_locations.py`);
-unifying that math with V4's bespoke slot mapping remains the final
-mapping-owner milestone (`cache-concepts.md` Principle 5 — owners are now
-down to the router and V4).
+The write-location kernels stay pure functions (`paged/write_locations.py`).
+QSA reuses the shared table fill without expansion; V4's token-shaped slot
+mapping remains a separate consumer of the shared mapping helpers
+(`cache-concepts.md` Principle 5).
 
 ## Regression gates
 
@@ -544,6 +558,11 @@ down to the router and V4).
 * `test/runtime/test_cache_group_router.py` — router slot math, expansion,
   padding, placeholder delivery, per-group dispatch, draft window
   publication and address stability.
+* `test/runtime/test_qsa_backend.py` — independent QSA raw-group metadata,
+  target-only verify workspace, and live cache writes across eager execution
+  and CUDA graph replay; `test_qsa_verify_lifecycle.py` — the Qwen4-Exp root
+  commits GDN/PLE on decode and QSA on decode/mixed, using real acceptance
+  rows once after execution, including PLE without GDN and failure cases.
 * `test/runtime/test_cudagraph_per_group.py`,
   `test_group_write_locations.py` — per-group padding wiring and the
   write-location edge cases (holes, overflow, MTP re-anchor) on the unified

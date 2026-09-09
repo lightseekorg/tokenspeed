@@ -1,0 +1,50 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-qwen4-backends
+type: ut
+workflow_stage: unit-test
+triggers:
+  - manual
+  - slurm
+runner:
+  labels:
+    - b200-1gpu
+    - gb200-1gpu
+env:
+  CI: "true"
+  PYTHONPATH: "test/runtime:test:python:tokenspeed-kernel/python"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    # PLE GPU reference comparisons live in test_qwen4_exp.py.
+    - >-
+      python3 -m pytest
+      test/runtime/test_qsa_backend.py
+      test/runtime/test_qsa_verify_lifecycle.py
+      test/runtime/test_qwen4_backend_composition.py
+      test/runtime/test_qwen4_exp.py
+      test/runtime/test_qwen4_exp_cache_without_gdn.py
+      test/runtime/test_qwen4_exp_ple_backend.py
+      test/runtime/test_cache_setup.py
+      test/runtime/test_cache_group_router.py
+      test/runtime/test_group_aware_mha.py
+      test/runtime/test_group_write_locations.py
+      test/runtime/test_gdn_state_paging.py
+      test/runtime/test_kimi_k3_kda.py
+      test/runtime/test_kimi_k3_kda_eager_commit.py
+      test/runtime/test_inkling_activation_parity.py
+      test/runtime/test_draft_advance_seqlens.py
+      test/runtime/test_draft_page_table_scrub.py
+      test/runtime/test_drafter_accept_indexing.py
+      test/runtime/execution/test_draft_target_wiring.py
+      test/runtime/test_cudagraph_support_resolution.py
+      test/runtime/test_unified_decode_path.py
+      test/runtime/test_prefill_graph.py
+      -v -ra
+    - >-
+      python3 -m pytest
+      tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py
+      tokenspeed-kernel/test/ops/test_qsa_sparse_attention.py
+      -v -ra
+report:
+  github_step_summary: true
