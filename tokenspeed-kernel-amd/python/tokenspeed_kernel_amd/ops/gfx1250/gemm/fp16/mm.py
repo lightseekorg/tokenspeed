@@ -118,12 +118,8 @@ def _wmma_tdm_dense_m16_kernel(
     )
 
     for tile in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.cdna5.tdm.async_load(
-            a_desc, [0, tile * BLOCK_K], a_smem.index(tile)
-        )
-        gl.amd.cdna5.tdm.async_load(
-            b_desc, [0, tile * BLOCK_K], b_smem.index(tile)
-        )
+        gl.amd.cdna5.tdm.async_load(a_desc, [0, tile * BLOCK_K], a_smem.index(tile))
+        gl.amd.cdna5.tdm.async_load(b_desc, [0, tile * BLOCK_K], b_smem.index(tile))
 
     acc = gl.zeros((M, BLOCK_N), gl.float32, wmma_layout)
     num_k_tiles: gl.constexpr = K // BLOCK_K
@@ -156,9 +152,9 @@ def _wmma_tdm_dense_m16_kernel(
     offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
     offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
     tile_n = pid_n * BLOCK_N + offs_n
-    output_offsets = (
-        offs_m[:, None] * stride_om + tile_n[None, :] * stride_on
-    ).to(gl.int32)
+    output_offsets = (offs_m[:, None] * stride_om + tile_n[None, :] * stride_on).to(
+        gl.int32
+    )
     gl.amd.cdna5.buffer_store(
         acc.to(gl.bfloat16),
         out_ptr,
@@ -266,8 +262,7 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         or out.device != A.device
     ):
         raise ValueError(
-            f"out must be contiguous GPU BF16 ({A.shape[0]}, 6288) "
-            "colocated with A"
+            f"out must be contiguous GPU BF16 ({A.shape[0]}, 6288) " "colocated with A"
         )
     _launch_wmma_tdm_dense_tiles(
         A,
@@ -356,12 +351,8 @@ def _wmma_tdm_add3_m16_kernel(
 
     # Two tiles are prefetched before the steady-state issue/wait/WMMA loop.
     for tile in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.cdna5.tdm.async_load(
-            a_desc, [0, tile * BLOCK_K], a_smem.index(tile)
-        )
-        gl.amd.cdna5.tdm.async_load(
-            b_desc, [0, tile * BLOCK_K], b_smem.index(tile)
-        )
+        gl.amd.cdna5.tdm.async_load(a_desc, [0, tile * BLOCK_K], a_smem.index(tile))
+        gl.amd.cdna5.tdm.async_load(b_desc, [0, tile * BLOCK_K], b_smem.index(tile))
 
     acc = gl.zeros((M, BLOCK_N), gl.float32, wmma_layout)
     num_k_tiles: gl.constexpr = K // BLOCK_K
@@ -396,25 +387,19 @@ def _wmma_tdm_add3_m16_kernel(
     offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
     tile_n = pid_n * BLOCK_N + offs_n
     addend_a_offsets = (
-        offs_m[:, None] * stride_addend_am
-        + tile_n[None, :] * stride_addend_an
+        offs_m[:, None] * stride_addend_am + tile_n[None, :] * stride_addend_an
     ).to(gl.int32)
     addend_b_offsets = (
-        offs_m[:, None] * stride_addend_bm
-        + tile_n[None, :] * stride_addend_bn
+        offs_m[:, None] * stride_addend_bm + tile_n[None, :] * stride_addend_bn
     ).to(gl.int32)
-    output_offsets = (
-        offs_m[:, None] * stride_om + tile_n[None, :] * stride_on
-    ).to(gl.int32)
+    output_offsets = (offs_m[:, None] * stride_om + tile_n[None, :] * stride_on).to(
+        gl.int32
+    )
 
     # Preserve the materialized BF16 projection boundary used by torch.mm.
     projected = acc.to(gl.bfloat16)
-    addend_a = gl.amd.cdna5.buffer_load(
-        addend_a_ptr, addend_a_offsets
-    )
-    addend_b = gl.amd.cdna5.buffer_load(
-        addend_b_ptr, addend_b_offsets
-    )
+    addend_a = gl.amd.cdna5.buffer_load(addend_a_ptr, addend_a_offsets)
+    addend_b = gl.amd.cdna5.buffer_load(addend_b_ptr, addend_b_offsets)
     gl.amd.cdna5.buffer_store(
         (projected + addend_a + addend_b).to(gl.bfloat16),
         out_ptr,
@@ -729,28 +714,20 @@ def _wmma_tdm_dense_largem_kernel(
         )
         gl.amd.cdna5.tdm.async_wait(2)
         a = a_smem.index(i % NUM_BUFFERS).load(layout=dot_layout_a)
-        b = (
-            b_smem.index(i % NUM_BUFFERS)
-            .permute([1, 0])
-            .load(layout=dot_layout_b)
-        )
+        b = b_smem.index(i % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
         acc = gl.amd.cdna5.wmma(a, b, acc)
 
     gl.amd.cdna5.tdm.async_wait(0)
     last_idx = num_k_tiles - 1
     a = a_smem.index(last_idx % NUM_BUFFERS).load(layout=dot_layout_a)
-    b = (
-        b_smem.index(last_idx % NUM_BUFFERS)
-        .permute([1, 0])
-        .load(layout=dot_layout_b)
-    )
+    b = b_smem.index(last_idx % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
     acc = gl.amd.cdna5.wmma(a, b, acc)
 
     offs_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
     offs_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
-    output_offsets = (
-        offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    ).to(gl.int32)
+    output_offsets = (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on).to(
+        gl.int32
+    )
     gl.amd.cdna5.buffer_store(
         acc.to(gl.bfloat16),
         out_ptr,

@@ -70,23 +70,19 @@ def _use_gluon_largem(m: int, k: int, n: int) -> bool:
 
 
 def _use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
-    return (
-        m >= 512
-        and (k, n)
-        in {
-            (512, 3072),
-            (768, KIMI3_HIDDEN_SIZE),
-            (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, KIMI3_HIDDEN_SIZE),
-            (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, 2304),
-            (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE),
-            (4224, KIMI3_HIDDEN_SIZE),
-            (KIMI3_HIDDEN_SIZE, 1536),
-            (KIMI3_HIDDEN_SIZE, 2112),
-            (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE),
-            (KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE),
-            (KIMI3_HIDDEN_SIZE, 8448),
-        }
-    )
+    return m >= 512 and (k, n) in {
+        (512, 3072),
+        (768, KIMI3_HIDDEN_SIZE),
+        (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, KIMI3_HIDDEN_SIZE),
+        (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, 2304),
+        (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE),
+        (4224, KIMI3_HIDDEN_SIZE),
+        (KIMI3_HIDDEN_SIZE, 1536),
+        (KIMI3_HIDDEN_SIZE, 2112),
+        (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE),
+        (KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE),
+        (KIMI3_HIDDEN_SIZE, 8448),
+    }
 
 
 def _try_gluon_largem_gfx1250(
