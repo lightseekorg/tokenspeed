@@ -563,6 +563,13 @@ mapping remains a separate consumer of the shared mapping helpers
   and CUDA graph replay; `test_qsa_verify_lifecycle.py` — the Qwen4-Exp root
   commits GDN/PLE on decode and QSA on decode/mixed, using real acceptance
   rows once after execution, including PLE without GDN and failure cases.
+* `test/ci/ut/ut-qwen4-backends.yaml` — manual Slurm regression task that
+  invokes the QSA/PLE runtime and kernel pytest files explicitly.
+  `ut-qwen4-exp-model-smoke.yaml` separately runs the public Qwen4-Exp
+  checkpoint without speculation, with eager MTP and with graph MTP.
+  Repeated batches exercise sizes one and four; verify counts and profiler
+  graph launches confirm the execution modes. Model smoke checks completion,
+  while the deterministic kernel/cache-state tests establish numerical parity.
 * `test/runtime/test_cudagraph_per_group.py`,
   `test_group_write_locations.py` — per-group padding wiring and the
   write-location edge cases (holes, overflow, MTP re-anchor) on the unified
