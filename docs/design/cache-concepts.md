@@ -224,10 +224,12 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
-Writeback runs on the executor's write stream, ordered after the producer
-stream the caller names -- the model executor's execution stream, where the
-forwards wrote the pages. (Page zeroing likewise orders itself behind that
-stream inside `zero_cache_pages`; there is no caller-side fence to remember.)
+Every L2 copy is ordered after the prerequisite stream the caller names per
+submission: the stream whose completed work the copy must observe. Writeback
+runs on the executor's write stream, ordered after the model executor's
+execution stream, where the forwards wrote the source pages. (Page zeroing
+likewise orders itself behind that stream inside `zero_cache_pages`; there is
+no caller-side fence to remember.)
 Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
@@ -238,10 +240,10 @@ completion event before the zeroing is enqueued — the zeroing, load-backs,
 forwards and RDMA triggers behind it inherit the fence (the forward by
 waiting on the default stream in its prologue; that wait is one-way, the
 zeroing's and the writeback's own waits are what order the default and write
-streams behind the forwards). Load-backs likewise name their producer stream
--- the default stream that zeroed their destinations -- rather than
-recording their start event on whatever stream is current: every stream the
-L2 executor orders against is an argument, never ambient thread state. The
+streams behind the forwards). A load-back's prerequisite stream is the
+default stream that zeroed its destinations; its start event is recorded
+there rather than on whatever stream is current. Every stream the L2
+executor orders against is an argument, never ambient thread state. The
 two kinds use separate staging lanes: each lane uploads block metadata
 asynchronously and records an event after both metadata copies to protect its
 pinned CPU staging tables — before refilling them, the next submission on

@@ -177,17 +177,17 @@ class L2CacheExecutor:
             tracker = LayerwiseLoadTracker(len(layout.consumers))
             pool.register_layerwise_load_tracker(tracker)
             self._load_trackers.append((tracker, len(layout.consumers)))
-        # Write-backs run on their own stream, ordered after the producer
-        # stream the caller names per submission -- the one the forwards wrote
-        # the pages on. What differs per op is who waits on the copy: a
-        # stream-ordered op (a retraction's snapshot, whose sources this very
-        # plan may re-grant) fences the fence stream the caller names on its
-        # completion, so the plan's zeroing, load-backs and forwards stay
-        # behind it; a pinned op (an ordinary publication, whose sources the
-        # scheduler holds until the ACK) fences nothing and never holds up the
-        # round. Loads keep their own stream, ordered after the producer stream
-        # that zeroed their destinations: their consumers are fenced per layer
-        # by the tracker events.
+        # Every copy runs on its own stream, ordered after the prerequisite
+        # stream the caller names per submission: for a write-back the one
+        # the forwards wrote the source pages on, for a load the one that
+        # zeroed the destination pages. What differs per write-back op is who
+        # waits on the copy: a stream-ordered op (a retraction's snapshot,
+        # whose sources this very plan may re-grant) fences the fence stream
+        # the caller names on its completion, so the plan's zeroing,
+        # load-backs and forwards stay behind it; a pinned op (an ordinary
+        # publication, whose sources the scheduler holds until the ACK) fences
+        # nothing and never holds up the round. A load's consumers are fenced
+        # per layer by the tracker events.
         self.write_stream = _new_cache_stream(None)
         self.load_stream = _new_cache_stream(_load_stream_priority())
         device = self.layout.buffers[0].device
@@ -281,24 +281,25 @@ class L2CacheExecutor:
         self._load_acks: list[_Ack] = []
         self._load_poisoned = False
 
-    def submit_write_backs(self, plan, *, producer_stream, fence_stream) -> None:
+    def submit_write_backs(self, plan, *, prerequisite_stream, fence_stream) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
         Must run BEFORE the plan's page zeroing. Every copy is ordered behind
-        ``producer_stream`` -- the stream the forwards wrote the source pages
-        on -- so it reads their final bytes. The scheduler marks each op
-        ``source_pinned``: a pinned op's sources stay cached and unevictable
-        until the ACK, so its copy rides the write stream and nobody waits on
-        it; an unpinned op's sources may already be granted to another request
-        in this very plan, so it goes first and ``fence_stream`` waits on its
-        completion -- the plan's zeroing, load-backs and forwards are ordered
-        behind that wait.
+        ``prerequisite_stream`` -- here the stream the forwards wrote the
+        source pages on -- so it reads their final bytes. The scheduler marks
+        each op ``source_pinned``: a pinned op's sources stay cached and
+        unevictable until the ACK, so its copy rides the write stream and
+        nobody waits on it; an unpinned op's sources may already be granted to
+        another request in this very plan, so it goes first and
+        ``fence_stream`` waits on its completion -- the plan's zeroing,
+        load-backs and forwards are ordered behind that wait.
 
         Args:
             plan: The round's ExecutionPlan; its ``Cache.WriteBackOp``
                 entries are read here.
-            producer_stream: The stream whose completed work every copy must
-                observe -- the model executor's execution stream.
+            prerequisite_stream: The stream whose completed work every copy
+                must observe -- the model executor's execution stream, where
+                the forwards wrote the source pages.
             fence_stream: The stream a stream-ordered op's completion fences
                 -- the one the plan's page zeroing runs on next.
         """
@@ -319,7 +320,7 @@ class L2CacheExecutor:
             ordered_op_ids,
             ordered_transfers,
             lane=self._ordered_write_lane,
-            producer_stream=producer_stream,
+            prerequisite_stream=prerequisite_stream,
         )
         if fence is not None:
             fence_stream.wait_event(fence)
@@ -327,17 +328,18 @@ class L2CacheExecutor:
             pinned_op_ids,
             pinned_transfers,
             lane=self._pinned_write_lane,
-            producer_stream=producer_stream,
+            prerequisite_stream=prerequisite_stream,
         )
 
-    def submit_load_backs(self, plan, *, producer_stream) -> None:
+    def submit_load_backs(self, plan, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
 
         Args:
             plan: The round's ExecutionPlan; its ``Cache.LoadBackOp``
                 entries are read here.
-            producer_stream: The stream whose completed work every copy must
-                observe -- the one that zeroed the destination pages.
+            prerequisite_stream: The stream whose completed work every copy
+                must observe -- the one the plan's page zeroing ran on, so the
+                loads land on zeroed destination pages.
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
@@ -353,7 +355,7 @@ class L2CacheExecutor:
                     source_is_device=False,
                 )
         load_index = self._start_loading(
-            op_ids, transfers, producer_stream=producer_stream
+            op_ids, transfers, prerequisite_stream=prerequisite_stream
         )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
@@ -425,7 +427,7 @@ class L2CacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         *,
         lane: _WriteLane,
-        producer_stream,
+        prerequisite_stream,
     ):
         """Launch one D2H batch on the write stream; return its completion event.
 
@@ -443,7 +445,7 @@ class L2CacheExecutor:
             )
         # Behind the forwards that wrote the source pages: that is what lets
         # the copy read their final bytes.
-        self.write_stream.wait_stream(producer_stream)
+        self.write_stream.wait_stream(prerequisite_stream)
         # CPU writes are not ordered by stream FIFO. Retire the previous
         # metadata upload before refilling its pinned source, not at submit.
         if lane.metadata_done is not None and not lane.metadata_done.query():
@@ -498,7 +500,7 @@ class L2CacheExecutor:
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
         *,
-        producer_stream,
+        prerequisite_stream,
     ) -> int | None:
         if self._load_poisoned:
             raise RuntimeError(
@@ -516,7 +518,7 @@ class L2CacheExecutor:
                 len(transfers),
             )
 
-        # EventLoop zeroes freshly allocated Device blocks on the producer
+        # EventLoop zeroes freshly allocated Device blocks on the prerequisite
         # stream before submitting the load. Recording the start event there
         # makes the H2D copy wait for that zeroing; per-layer ready flags
         # (Triton) or events (DMA) then keep model consumers from reading
@@ -537,7 +539,7 @@ class L2CacheExecutor:
                     load_index = current_load_index
                 elif current_load_index != load_index:
                     raise RuntimeError("target and draft Host-load trackers diverged")
-                load_events.start_event.record(producer_stream)
+                load_events.start_event.record(prerequisite_stream)
                 load_events.start_event.wait(self.load_stream)
             if load_index is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")

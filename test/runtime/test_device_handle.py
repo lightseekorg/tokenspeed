@@ -253,11 +253,13 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     handle = _handle(
         trace,
         l2_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda p, *, producer_stream, fence_stream: (
-                trace.append(("write_backs", p.cache, producer_stream, fence_stream))
+            submit_write_backs=lambda p, *, prerequisite_stream, fence_stream: (
+                trace.append(
+                    ("write_backs", p.cache, prerequisite_stream, fence_stream)
+                )
             ),
-            submit_load_backs=lambda p, *, producer_stream: trace.append(
-                ("load_backs", p.cache, producer_stream)
+            submit_load_backs=lambda p, *, prerequisite_stream: trace.append(
+                ("load_backs", p.cache, prerequisite_stream)
             ),
             poll_results=lambda: ["done"],
         ),
@@ -295,14 +297,14 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     would leave its ops counted in flight forever."""
     trace: list = []
 
-    def exploding(plan, *, producer_stream, fence_stream):
+    def exploding(plan, *, prerequisite_stream, fence_stream):
         raise ValueError("bad cache op")
 
     handle = _handle(
         trace,
         l2_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
-            submit_load_backs=lambda p, *, producer_stream: None,
+            submit_load_backs=lambda p, *, prerequisite_stream: None,
             poll_results=lambda: [],
         ),
     )

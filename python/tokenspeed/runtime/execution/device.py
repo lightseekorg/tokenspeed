@@ -317,7 +317,7 @@ class DeviceHandle:
                 self._thread.submit(
                     lambda: l2.submit_write_backs(
                         execution_plan,
-                        producer_stream=executor.execution_stream,
+                        prerequisite_stream=executor.execution_stream,
                         fence_stream=executor.default_stream,
                     )
                 )
@@ -330,11 +330,11 @@ class DeviceHandle:
         )
         if l2 is not None:
             # Behind the zeroing: the loads' destinations were zeroed on the
-            # default stream, so that is the producer they order after.
+            # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_load_backs(
-                        execution_plan, producer_stream=executor.default_stream
+                        execution_plan, prerequisite_stream=executor.default_stream
                     )
                 )
             )
