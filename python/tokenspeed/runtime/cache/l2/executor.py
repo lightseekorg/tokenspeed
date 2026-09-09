@@ -178,10 +178,9 @@ class L2CacheExecutor:
             tracker = LayerwiseLoadTracker(len(layout.consumers))
             pool.register_layerwise_load_tracker(tracker)
             self._load_trackers.append((tracker, len(layout.consumers)))
-        # Write-backs run on their own stream, ordered after the caller's
-        # current stream -- the forward thread's default stream, which the
-        # caller has already ordered behind the forwards that wrote the
-        # pages. What differs per op is who waits on the copy: a
+        # Write-backs run on their own stream, ordered after the producer
+        # stream the caller names per submission -- the one the forwards wrote
+        # the pages on. What differs per op is who waits on the copy: a
         # stream-ordered op (a retraction's snapshot, whose sources this very
         # plan may re-grant) fences the caller's stream on its completion, so
         # the plan's zeroing, load-backs and forwards stay behind it; a pinned
@@ -284,17 +283,24 @@ class L2CacheExecutor:
         self._ready_load_op_ids: list[int] = []
         self._load_poisoned = False
 
-    def submit_write_backs(self, plan) -> None:
+    def submit_write_backs(self, plan, *, producer_stream) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
-        Must run BEFORE the plan's page zeroing, on the caller's stream
-        already ordered behind the forwards that wrote the pages. The
-        scheduler marks each op ``source_pinned``: a pinned op's sources stay
-        cached and unevictable until the ACK, so its copy rides the write
-        stream and nobody waits on it; an unpinned op's sources may already
-        be granted to another request in this very plan, so it goes first and
-        the caller's stream waits on its completion -- the plan's zeroing,
-        load-backs and forwards are ordered behind that wait.
+        Must run BEFORE the plan's page zeroing. Every copy is ordered behind
+        ``producer_stream`` -- the stream the forwards wrote the source pages
+        on -- so it reads their final bytes. The scheduler marks each op
+        ``source_pinned``: a pinned op's sources stay cached and unevictable
+        until the ACK, so its copy rides the write stream and nobody waits on
+        it; an unpinned op's sources may already be granted to another request
+        in this very plan, so it goes first and the caller's stream waits on
+        its completion -- the plan's zeroing, load-backs and forwards are
+        ordered behind that wait.
+
+        Args:
+            plan: The round's ExecutionPlan; its ``Cache.WriteBackOp``
+                entries are read here.
+            producer_stream: The stream whose completed work every copy must
+                observe -- the model executor's execution stream.
         """
         ordered_op_ids: list[int] = []
         ordered_transfers: list[tuple[int, int, int]] = []
@@ -310,12 +316,18 @@ class L2CacheExecutor:
                     pinned_transfers=pinned_transfers,
                 )
         fence = self._start_writing(
-            ordered_op_ids, ordered_transfers, lane=self._ordered_write_lane
+            ordered_op_ids,
+            ordered_transfers,
+            lane=self._ordered_write_lane,
+            producer_stream=producer_stream,
         )
         if fence is not None:
             device_module.current_stream().wait_event(fence)
         self._start_writing(
-            pinned_op_ids, pinned_transfers, lane=self._pinned_write_lane
+            pinned_op_ids,
+            pinned_transfers,
+            lane=self._pinned_write_lane,
+            producer_stream=producer_stream,
         )
 
     def submit_load_backs(self, plan) -> None:
@@ -399,6 +411,7 @@ class L2CacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         *,
         lane: _WriteLane,
+        producer_stream,
     ):
         """Launch one D2H batch on the write stream; return its completion event.
 
@@ -419,11 +432,10 @@ class L2CacheExecutor:
                 len(transfers),
                 lane is self._pinned_write_lane,
             )
-        # The caller's stream is already ordered behind the forwards that
-        # wrote the source pages; inheriting it here is what lets the copy
-        # read the final bytes.
+        # Behind the forwards that wrote the source pages: that is what lets
+        # the copy read their final bytes.
         stream = self.write_stream
-        stream.wait_stream(device_module.current_stream())
+        stream.wait_stream(producer_stream)
         # CPU writes are not ordered by stream FIFO. Retire the previous
         # metadata upload before refilling its pinned source, not at submit.
         if lane.metadata_done is not None:

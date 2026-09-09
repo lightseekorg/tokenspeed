@@ -224,9 +224,11 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
-Writeback runs on the executor's write stream, ordered after the caller's
-stream (which the caller has already ordered behind the forwards that wrote
-the pages). Each op says how the scheduler guards its Device sources
+Writeback runs on the executor's write stream, ordered after the producer
+stream the caller names -- the model executor's execution stream, where the
+forwards wrote the pages. (Page zeroing likewise orders itself behind that
+stream inside `zero_cache_pages`; there is no caller-side fence to remember.)
+Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources may be re-granted in the

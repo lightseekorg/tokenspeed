@@ -310,20 +310,22 @@ class DeviceHandle:
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
-            # caller's stream here, before the zeroing is enqueued.
-            def _write_backs():
-                executor.order_cache_operations()
-                l2.submit_write_backs(execution_plan)
-
-            self._l2_submissions.append(self._thread.submit(_write_backs))
+            # forward thread's stream here, before the zeroing is enqueued.
+            # The copies themselves order behind the execution stream, where
+            # the forwards wrote the pages.
+            self._l2_submissions.append(
+                self._thread.submit(
+                    lambda: l2.submit_write_backs(
+                        execution_plan, producer_stream=executor.execution_stream
+                    )
+                )
+            )
         pages = execution_plan.pages_to_zero
-
-        def _zero_pages():
-            if l2 is None:
-                executor.order_cache_operations()
-            return executor.zero_cache_pages(pages)
-
-        zero_future = self._thread.submit(_zero_pages) if pages else None
+        zero_future = (
+            self._thread.submit(lambda: executor.zero_cache_pages(pages))
+            if pages
+            else None
+        )
         if l2 is not None:
             self._l2_submissions.append(
                 self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
