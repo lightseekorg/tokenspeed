@@ -45,6 +45,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
+    --work-dir .ci-artifacts/evalscope-results
     --model nvidia/Kimi-K2.5-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN

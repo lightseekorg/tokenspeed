@@ -1032,22 +1032,27 @@ class L2CacheExecutor:
         l3_store = getattr(self, "l3_store", None)
         if not pages or l3_store is None:
             return
-        existed: list[bool]
-        try:
-            existed = list(l3_store.exists(pages))
-        except Exception:
-            logger.exception(
-                "L3 existence probe before backup failed; leaving unread keys "
-                "in place so an unreadable object cannot be re-admitted"
-            )
-            existed = [True] * len(pages)
+        # The backend already handles create-only PUTs. A separate existence
+        # probe is needed only to decide whether a failed GET can be forgotten.
+        # Keys marked unread after this snapshot stay unread conservatively.
+        unread_pages = self._l3_unread.unread_pages(pages)
+        existed: list[bool] = []
+        if unread_pages:
+            try:
+                existed = list(l3_store.exists(unread_pages))
+            except Exception:
+                logger.exception(
+                    "L3 existence probe before backup failed; leaving unread keys "
+                    "in place so an unreadable object cannot be re-admitted"
+                )
+                existed = [True] * len(unread_pages)
         results = l3_store.backup(pages)
         if len(results) != len(pages) or not all(results):
             ok = sum(1 for flag in results if flag)
             raise RuntimeError(
                 f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
             )
-        self._l3_unread.forget_pages(l3_pages_newly_published(pages, existed))
+        self._l3_unread.forget_pages(l3_pages_newly_published(unread_pages, existed))
 
     @staticmethod
     def _split_ready(queue):

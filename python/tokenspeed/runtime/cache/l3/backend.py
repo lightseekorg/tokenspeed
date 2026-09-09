@@ -780,6 +780,18 @@ class L3UnreadKeySet:
                     None,
                 )
 
+    def unread_pages(self, pages: Sequence[tuple]) -> list[tuple]:
+        """Snapshot only backed-up pages whose failed GET needs revalidation."""
+
+        with self._lock:
+            if not self._keys:
+                return []
+            return [
+                page
+                for page in pages
+                if (int(page[0]), str(page[2]), int(page[3])) in self._keys
+            ]
+
     def forget_pages(self, pages: Sequence[tuple]) -> None:
         groups = []
         hashes = []

@@ -1,6 +1,8 @@
+import json
 import re
 import subprocess
 import textwrap
+from contextlib import nullcontext
 from pathlib import Path
 
 import pipeline
@@ -88,6 +90,48 @@ def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
             log_path=log,
         )
     assert "fatal startup error" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "probe_error", [ConnectionResetError, TimeoutError, pipeline.URLError]
+)
+def test_poll_readiness_retries_transport_errors(monkeypatch, probe_error):
+    response = type("Response", (), {"status": 200})()
+    calls = []
+
+    def probe(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise probe_error("not ready")
+        return nullcontext(response)
+
+    monkeypatch.setattr(pipeline, "urlopen", probe)
+    poll_readiness(
+        {"url": "http://127.0.0.1:8000/readiness", "interval": 0},
+        False,
+        process=None,
+        log_path=None,
+    )
+    assert len(calls) == 2
+
+
+def test_poll_readiness_connection_reset_still_times_out(monkeypatch):
+    now = [0.0]
+
+    def probe(*args, **kwargs):
+        now[0] += 1.0
+        raise ConnectionResetError("not ready")
+
+    monkeypatch.setattr(pipeline.time, "time", lambda: now[0])
+    monkeypatch.setattr(pipeline, "urlopen", probe)
+    with pytest.raises(RuntimeError, match="readiness probe timed out"):
+        poll_readiness(
+            {"url": "http://127.0.0.1:8000/readiness", "timeout": 2, "interval": 0},
+            False,
+            process=None,
+            log_path=None,
+        )
+    assert now[0] == 2.0
 
 
 def test_server_log_wrapper_preserves_server_exit_code(tmp_path):
@@ -1127,7 +1171,25 @@ def test_validate_task_rejects_negative_retries(tmp_path):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
-def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "first_score, second_start_error, first_spawn_error, copy_error",
+    [
+        (None, False, False, False),
+        (0.8, False, False, False),
+        (0.8, True, False, False),
+        (None, False, True, False),
+        (0.8, False, False, True),
+    ],
+)
+def test_execute_task_preserves_attempts(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    first_score,
+    second_start_error,
+    first_spawn_error,
+    copy_error,
+):
     task = {
         "name": "eval-retry",
         "type": "eval",
@@ -1151,27 +1213,51 @@ def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
         lambda runner, env, cwd, dry_run, reuse_state, setup_mode: (env, None),
     )
     monkeypatch.setattr(pipeline, "cleanup_runner", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pipeline, "poll_readiness", lambda *args, **kwargs: None)
+
+    def fake_readiness(*args, **kwargs):
+        if second_start_error and server_starts["n"] == 2:
+            raise RuntimeError("server exited before readiness with exit code 7")
+
+    monkeypatch.setattr(pipeline, "poll_readiness", fake_readiness)
     monkeypatch.setattr(pipeline, "kill_ready_port_listener", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "summarize_command_output", lambda *a, **k: {})
     monkeypatch.setattr(pipeline, "summarize_eval_accept_rate", lambda *a, **k: None)
-    monkeypatch.setattr(pipeline, "check_eval_score_threshold", lambda *a, **k: None)
+
+    def fake_score(*args, **kwargs):
+        if first_score is None:
+            return None
+        score = first_score if eval_calls["n"] == 1 else 1.0
+        return {"score": score, "passed": score >= 0.9, "threshold": ">= 0.9"}
+
+    monkeypatch.setattr(pipeline, "check_eval_score_threshold", fake_score)
     monkeypatch.setattr(pipeline, "stop_server", lambda *a, **k: None)
 
     def fake_start_server(*args, **kwargs):
         server_starts["n"] += 1
+        if first_spawn_error and server_starts["n"] == 1:
+            (tmp_path / ".ci-artifacts" / "server.log").unlink()
+            raise OSError("server spawn failed")
+        (tmp_path / ".ci-artifacts" / "server.log").write_text(
+            f"server attempt {server_starts['n']}"
+        )
         return object()
 
     def fake_shell_run(command, **kwargs):
         if command == "run eval":
             eval_calls["n"] += 1
-            if eval_calls["n"] == 1:
+            if eval_calls["n"] == 1 and first_score is None and not first_spawn_error:
                 raise RuntimeError("command failed with exit code 1: run eval")
             return {"command": command, "returncode": 0, "output": "ok"}
         return {"command": command, "returncode": 0, "output": ""}
 
     monkeypatch.setattr(pipeline, "start_server", fake_start_server)
     monkeypatch.setattr(pipeline, "shell_run", fake_shell_run)
+    if copy_error:
+
+        def fail_copy(source, destination):
+            raise OSError("log archive storage unavailable")
+
+        monkeypatch.setattr(pipeline.shutil, "copyfile", fail_copy)
 
     return_code = pipeline.execute_task(
         config="task.yaml",
@@ -1182,10 +1268,34 @@ def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
         result_json=str(result_json),
     )
 
-    assert return_code == 0
-    assert eval_calls["n"] == 2
+    assert return_code == int(second_start_error)
+    assert eval_calls["n"] == (1 if second_start_error or first_spawn_error else 2)
     assert server_starts["n"] == 2
-    assert result_json.exists()
+    result = json.loads(result_json.read_text())
+    assert len(result["attempts"]) == 2
+    assert result["attempts"][0]["ok"] is False
+    if first_spawn_error:
+        assert result["attempts"][0]["error"] == "server spawn failed"
+    elif first_score is None:
+        assert "command failed" in result["attempts"][0]["error"]
+    else:
+        assert result["attempts"][0]["eval_score_check"]["score"] == first_score
+    assert result["attempts"][1]["ok"] is not second_start_error
+    if second_start_error:
+        assert result["executed_stages"] == ["server"]
+        assert "exit code 7" in result["error"]
+        assert result["attempts"][1]["eval_score_check"] is None
+    else:
+        assert result["attempts"][1]["error"] is None
+    for attempt in (1, 2):
+        attempt_result = result["attempts"][attempt - 1]
+        if copy_error or (first_spawn_error and attempt == 1):
+            assert "server_log" not in attempt_result
+        else:
+            log_path = attempt_result["server_log"]
+            assert (tmp_path / log_path).read_text() == f"server attempt {attempt}"
+    if copy_error:
+        assert "could not preserve server log" in capsys.readouterr().err
 
 
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):

@@ -581,7 +581,11 @@ Its responsibilities:
   (exists and not unread) so one rank cannot re-register a key while a
   peer still blacklists it. A later Host backup forgets an unread entry
   only when the object was absent and this put created it; a create-only
-  skip of an unreadable object keeps the blacklist. The unread set is
+  skip of an unreadable object keeps the blacklist. That pre-PUT existence
+  probe covers only a snapshot of unread keys in the backup batch; ordinary
+  backups use the backend's create-only PUT without a duplicate existence
+  RPC. Keys marked unread after the snapshot remain unread conservatively.
+  The unread set is
   also bounded to Host CacheBlock capacity (LCM parents times each
   group's `cache_blocks_per_lcm_block`). Clients are not failed; mixed
   prefill/decode partners in the same forward retract together so ranks

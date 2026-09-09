@@ -1620,7 +1620,7 @@ def poll_readiness(
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
             pass
         sleep_deadline = min(deadline, time.time() + interval_seconds)
         while time.time() < sleep_deadline:
@@ -1866,6 +1866,7 @@ def execute_task(
     error: str | None = None
     error_reported = False
     max_attempts = 1 + int(task.get("retries") or 0)
+    attempt_results: List[Dict[str, Any]] = []
 
     def _stop_managed_server() -> None:
         nonlocal server_process
@@ -2013,6 +2014,33 @@ def execute_task(
                 )
             finally:
                 _stop_managed_server()
+                if max_attempts > 1:
+                    attempt_result = {
+                        "attempt": attempt,
+                        "ok": error is None,
+                        "executed_stages": stages_run,
+                        "command_results": command_results,
+                        "eval_score_check": eval_score_check,
+                        "eval_accept_rate": eval_accept_rate,
+                        "error": error,
+                    }
+                    if not dry_run and server_log_path is not None:
+                        attempt_log = server_log_path.with_name(
+                            f"server-attempt-{attempt}.log"
+                        )
+                        try:
+                            if server_log_path.exists():
+                                shutil.copyfile(server_log_path, attempt_log)
+                                attempt_result["server_log"] = str(
+                                    attempt_log.relative_to(repo_root)
+                                )
+                        except OSError as exc:
+                            print(
+                                f"warning: could not preserve server log for "
+                                f"attempt {attempt}: {exc}",
+                                file=sys.stderr,
+                            )
+                    attempt_results.append(attempt_result)
     finally:
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
@@ -2048,6 +2076,8 @@ def execute_task(
         "targets": targets,
         "command_results": command_results,
     }
+    if attempt_results:
+        result["attempts"] = attempt_results
     if error is not None:
         result["error"] = error
     if eval_score_check is not None:

@@ -556,6 +556,106 @@ class GroupAwareWireTest(unittest.TestCase):
             "both launches order behind the producer stream the caller named",
         )
 
+    def test_mixed_write_lanes_ack_only_their_completed_l3_put(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+        executor._load_acks = []
+        executor._ready_load_acks = []
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
+        executor.l3_store = Mock()
+        executor.l3_store.exists.return_value = [False]
+        executor._write_done = lambda op_id: op_id
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        ordered_pages = [(0, 6, "ordered", 0)]
+        pinned_pages = [(0, 5, "pinned", 0)]
+
+        def backup(pages):
+            index = 0 if pages == ordered_pages else 1
+            self.assertEqual(pages, [ordered_pages, pinned_pages][index])
+            started[index].set()
+            if not release[index].wait(timeout=10):
+                raise TimeoutError("mixed-lane PUT gate was not released")
+            return [True]
+
+        executor.l3_store.backup.side_effect = backup
+        ordered_finish = Mock()
+        pinned_finish = Mock()
+        ordered_finish.query.return_value = False
+        pinned_finish.query.return_value = False
+        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12]
+                self.group_ids = [[0], [0]]
+                self.src_pages = [[1], [2]]
+                self.dst_pages = [[5], [6]]
+                self.source_pinned = [True, False]
+                self.content_hashes = [["pinned"], ["ordered"]]
+                self.page_offsets = [[0], [0]]
+
+        def poll_until_ready():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                ready = executor.poll_results()
+                if ready:
+                    return ready
+                time.sleep(0.001)
+            self.fail("completed L3 PUT did not produce its ACK")
+
+        try:
+            with (
+                patch.object(executor_module.Cache, "WriteBackOp", WriteBackOp),
+                patch.object(executor_module.device_module, "current_stream"),
+                patch.object(
+                    executor_module.device_module,
+                    "stream",
+                    return_value=nullcontext(),
+                ),
+                patch.object(
+                    executor_module.device_module,
+                    "Event",
+                    side_effect=lambda: next(events),
+                ),
+                patch.object(executor_module, "transfer_cache_blocks"),
+            ):
+                executor.submit_write_backs(
+                    SimpleNamespace(cache=[WriteBackOp()]), producer_stream=object()
+                )
+
+            self.assertEqual(executor.poll_results(), [])
+            executor.l3_store.backup.assert_not_called()
+            ordered_finish.query.return_value = True
+            pinned_finish.query.return_value = True
+            self.assertEqual(executor.poll_results(), [])
+            self.assertTrue(started[0].wait(timeout=10))
+            self.assertFalse(started[1].is_set())
+            self.assertEqual(executor.poll_results(), [])
+
+            release[0].set()
+            self.assertTrue(started[1].wait(timeout=10))
+            self.assertEqual(poll_until_ready(), [12])
+            self.assertEqual(executor.poll_results(), [])
+            self.assertEqual(
+                [op_ids for _, op_ids, _ in executor._backup_futures], [[11]]
+            )
+
+            release[1].set()
+            self.assertEqual(poll_until_ready(), [11])
+            self.assertEqual(executor.poll_results(), [])
+            self.assertEqual(executor._backup_futures, [])
+            executor.l3_store.backup.assert_has_calls(
+                [call(ordered_pages), call(pinned_pages)]
+            )
+        finally:
+            for gate in release:
+                gate.set()
+            if executor._l3_workers is not None:
+                executor._l3_workers.shutdown(wait=True)
+
     def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
@@ -1238,6 +1338,70 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             workers = executor._l3_workers
             if workers is not None:
                 workers.shutdown(wait=True)
+
+    def test_backup_probes_only_unread_pages(self):
+        executor_module = _load_executor_module_without_triton(force_isolated=False)
+        executor = executor_module.L2CacheExecutor.__new__(
+            executor_module.L2CacheExecutor
+        )
+        executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
+        executor.l3_store = Mock()
+        pages = [(0, 1, "new", 0), (0, 2, "missing", 0), (0, 3, "stale", 0)]
+        executor.l3_store.backup.return_value = [True, True, True]
+
+        executor._backup_to_storage(pages)
+        executor.l3_store.exists.assert_not_called()
+        executor.l3_store.backup.assert_called_once_with(pages)
+
+        executor._l3_unread.mark(
+            groups=[0, 0], hashes=["missing", "stale"], offsets=[0, 0]
+        )
+        executor.l3_store.exists.return_value = [False, True]
+        executor._backup_to_storage(pages)
+        executor.l3_store.exists.assert_called_once_with(pages[1:])
+        self.assertFalse(executor._l3_unread.contains(0, "missing", 0))
+        self.assertTrue(executor._l3_unread.contains(0, "stale", 0))
+
+    def test_backup_keeps_unread_keys_on_failed_probe_or_put(self):
+        executor_module = _load_executor_module_without_triton(force_isolated=False)
+        for existed, put_ok in [
+            (RuntimeError("probe failed"), True),
+            ([], True),
+            ([False], False),
+        ]:
+            with self.subTest(existed=existed, put_ok=put_ok):
+                executor = executor_module.L2CacheExecutor.__new__(
+                    executor_module.L2CacheExecutor
+                )
+                executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
+                executor._l3_unread.mark(groups=[0], hashes=["h"], offsets=[0])
+                executor.l3_store = Mock()
+                if isinstance(existed, Exception):
+                    executor.l3_store.exists.side_effect = existed
+                else:
+                    executor.l3_store.exists.return_value = existed
+                executor.l3_store.backup.return_value = [put_ok]
+                context = nullcontext() if put_ok else self.assertRaises(RuntimeError)
+                with context:
+                    executor._backup_to_storage([(0, 1, "h", 0)])
+                self.assertTrue(executor._l3_unread.contains(0, "h", 0))
+
+    def test_backup_keeps_keys_marked_unread_after_snapshot(self):
+        executor_module = _load_executor_module_without_triton(force_isolated=False)
+        executor = executor_module.L2CacheExecutor.__new__(
+            executor_module.L2CacheExecutor
+        )
+        executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
+        executor.l3_store = Mock()
+
+        def backup(pages):
+            executor._l3_unread.mark(groups=[0], hashes=["h"], offsets=[0])
+            return [True] * len(pages)
+
+        executor.l3_store.backup.side_effect = backup
+        executor._backup_to_storage([(0, 1, "h", 0)])
+        executor.l3_store.exists.assert_not_called()
+        self.assertTrue(executor._l3_unread.contains(0, "h", 0))
 
     def test_backup_failure_does_not_ack_writeback(self):
         try:

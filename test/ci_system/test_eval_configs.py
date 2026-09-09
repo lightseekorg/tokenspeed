@@ -231,3 +231,15 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert flag_value(command, "--max-tokens") == max_tokens
         assert "--thinking" in command
         assert flag_value(command, "--thinking-effort") == "max"
+
+
+def test_kimi_accuracy_gates_keep_per_question_artifacts():
+    for filename, threshold in (
+        ("kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml", 0.93),
+        ("kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml", 0.90),
+    ):
+        task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text())
+        command = shlex.split(task["eval"]["command"])
+        assert flag_value(command, "--work-dir") == ".ci-artifacts/evalscope-results"
+        assert "--no-timestamp" not in command
+        assert task["score_threshold"] == threshold
