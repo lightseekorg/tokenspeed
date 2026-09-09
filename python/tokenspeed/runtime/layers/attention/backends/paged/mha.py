@@ -115,6 +115,9 @@ class MHADecodeMetadata:
 class MHAAttnBackend(PagedAttentionBackend):
     """Standard MHA leaf routed through tokenspeed_kernel attention APIs."""
 
+    # Every kernel call site forwards layer.sliding_window_size.
+    supports_layer_sliding_window: bool = True
+
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.

@@ -43,6 +43,7 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.device_module = torch.cuda
+    executor.default_stream = object()
     executor.execution_stream = _ExecutionStream()
     executor.runtime_states = _RuntimeStates()
 
@@ -59,7 +60,6 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
         return torch_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
     executor._reset_valid_cache_length(forward_op)
@@ -76,6 +76,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.device_module = torch.cuda
+    executor.default_stream = object()
     executor.execution_stream = _ExecutionStream()
     executor.runtime_states = _RuntimeStates()
 
@@ -93,7 +94,6 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
         return torch_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
     executor.reset_remote_prefill_cache_lengths(forward_op)

@@ -495,6 +495,14 @@ class ModelExecutor:
         )
 
         self.device_module = torch.get_device_module(self.device)
+        # Two streams, named once. `default_stream` is the forward thread's
+        # own: everything the data plane enqueues outside an explicit stream
+        # context -- page zeroing, the cache ops' fences and start events --
+        # lands here. `execution_stream` carries the model launches and the
+        # runtime-state writes. Dependencies between them are placed by the
+        # consumer: each forward waits on the default stream in its prologue;
+        # zeroing and write-back wait on the execution stream themselves.
+        self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
@@ -1080,19 +1088,19 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def order_cache_operations(self) -> None:
-        """Order caller-stream cache work after previously submitted forwards.
-
-        Called on the forward thread before D2H or page reuse. This inserts
-        a GPU dependency, not a host synchronization; the forward prologue's
-        wait is too late to protect cache operations submitted before it.
-        """
-        self.device_module.current_stream().wait_stream(self.execution_stream)
-
     def zero_cache_pages(self, pages):
-        """Clear newly owned pages and return a CUDA completion event when needed."""
+        """Clear newly owned pages and return a CUDA completion event when needed.
+
+        Runs on ``default_stream``, ordered behind the forwards in flight on
+        ``execution_stream``: the pages' previous owner may still be writing
+        them. The plan's later work on the default stream (the load-backs'
+        start event, the remote prefill's fence) inherits the order; the next
+        forward's prologue waits on the default stream and so runs after the
+        zeroing.
+        """
         if not pages:
             return None
+        self.default_stream.wait_stream(self.execution_stream)
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
@@ -1149,7 +1157,7 @@ class ModelExecutor:
         if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
         done = self.device_module.Event()
-        done.record(self.device_module.current_stream(self.device))
+        done.record(self.default_stream)
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
@@ -1188,7 +1196,7 @@ class ModelExecutor:
 
     def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
-        self.execution_stream.wait_stream(self.device_module.current_stream())
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
                 pool_indices,
@@ -1230,11 +1238,11 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            # Wait for previous iteration's runtime state updates
-            # (future_input_map, valid_cache_lengths) on execution_stream to
-            # complete before reading them.
-            self.device_module.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(self.device_module.current_stream())
+            # Behind the default-stream work the plan enqueued ahead of this
+            # forward: the page zeroing, the retraction write-back's fence,
+            # the multimodal features. The runtime-state reads below need no
+            # cross-stream wait -- their writers ran on execution_stream too.
+            self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.

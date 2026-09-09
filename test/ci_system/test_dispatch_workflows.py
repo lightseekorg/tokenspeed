@@ -158,6 +158,65 @@ esac
     )
 
 
+def run_deepswe_resolve_script(tmp_path: Path, *, pr: str, pr_files: str) -> str:
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/b300-deepswe.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["source"]["steps"]
+        if step.get("name") == "Resolve trusted source"
+    )
+    script = step["run"].replace("${{ github.repository }}", "lightseekorg/tokenspeed")
+    for placeholder in ("task_count", "sample_seed", "concurrency"):
+        script = script.replace("${{ inputs.%s }}" % placeholder, "1")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "${2:-}" in
+  repos/lightseekorg/tokenspeed/commits/main)
+    printf '%s\\n' "$GH_MAIN_SHA"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*/files)
+    printf '%s\\n' "$GH_PR_FILES"
+    ;;
+  repos/lightseekorg/tokenspeed/pulls/*)
+    printf '{"head":{"sha":"%s","repo":{"full_name":"%s"}},"html_url":"%s"}\\n' \
+      "$GH_PR_SHA" lightseekorg/tokenspeed "https://example.invalid/pull/7"
+    ;;
+  *)
+    echo "Unexpected gh call: $*" >&2
+    exit 1
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GH_MAIN_SHA": "1" * 40,
+            "GH_PR_SHA": "2" * 40,
+            "GH_PR_FILES": pr_files,
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "step-summary"),
+            "PR": pr,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return output.read_text(encoding="utf-8")
+
+
 def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
     paths = set()
     for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
@@ -523,6 +582,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
         "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
     ]
@@ -560,6 +620,21 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
     assert target_path in dspark["server"]["command"]
     assert draft_path in dspark["server"]["command"]
     assert dspark["env"]["TOKENSPEED_DFLASH_AUX_STREAM"] == "attn_res"
+
+
+def test_kimi_k3_dflash2_gb300_uses_a_window_aware_drafter_backend():
+    task = load_yaml(
+        REPO_ROOT / "test/ci/eval/"
+        "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+    )
+    command = task["server"]["command"]
+
+    assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
+    assert "/models/nvidia--Kimi-K3-NVFP4/" in command
+    assert "--speculative-draft-model-path lightseekorg/kimi-k3-dflash2" in command
+    assert "--speculative-algorithm DFLASH" in command
+    # The draft's sliding_attention layers need a backend that masks with them.
+    assert "--drafter-attention-backend mla" in command
 
 
 def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
@@ -631,7 +706,7 @@ def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
     assert checkout["with"]["persist-credentials"] is False
 
 
-def test_gb300_slurm_nightly_matrix_selects_kimi_k3_vision_tasks(monkeypatch):
+def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -653,6 +728,11 @@ def test_gb300_slurm_nightly_matrix_selects_kimi_k3_vision_tasks(monkeypatch):
         (
             "test/ci/eval/"
             "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
+            "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
             "slurm-gb300-4gpu",
         ),
     }
@@ -803,6 +883,54 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
         " && 10 || inputs.timeout_minutes }}"
     )
+
+
+def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["submit"]["steps"]
+        if step.get("name") == "Submit and wait for GB300 Slurm task"
+    )
+
+    assert workflow["jobs"]["scan"]["outputs"][
+        "install_tokenspeed_mla_from_source"
+    ] == ("${{ steps.changes.outputs.install_tokenspeed_mla_from_source }}")
+    assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}"
+    )
+
+
+def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Submit and wait for Slurm tasks"
+    )
+
+    assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ inputs.pr && '1' || '0' }}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr", "pr_files", "expected"),
+    [
+        ("", "", "install_mla=0"),
+        ("7", "README.md", "install_mla=0"),
+        ("7", "tokenspeed-mla/python/tokenspeed_mla/mla_decode.py", "install_mla=1"),
+    ],
+)
+def test_b300_deepswe_resolves_the_tokenspeed_mla_source(
+    tmp_path, pr, pr_files, expected
+):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/b300-deepswe.yml")
+    assert workflow["jobs"]["run"]["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
+        "${{ needs.source.outputs.install_mla }}"
+    )
+
+    assert expected in run_deepswe_resolve_script(tmp_path, pr=pr, pr_files=pr_files)
 
 
 def test_mi450_sim_runs_on_the_cpu_only_pool():

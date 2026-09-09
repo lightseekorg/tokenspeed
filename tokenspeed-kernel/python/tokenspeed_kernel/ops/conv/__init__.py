@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Short causal convolution (sconv) kernel entry points.
+"""Convolution kernel entry points.
+
+:func:`dflash2_grouped_conv` is independent of everything below it: a
+block-local grouped depthwise convolution for DFlash2's draft layers, with no
+cache, no ring and no cross-request state.
 
 Depthwise causal FIR convolution with a short window ``W`` (typically 4) and
 an optional residual connection, ``y = x + conv(window)``, as used by TML
@@ -47,6 +51,7 @@ from tokenspeed_kernel._triton import triton as _triton
 from tokenspeed_kernel.ops.conv.triton import (
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
+    dflash2_grouped_conv,
     select_prefill_config,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -55,6 +60,7 @@ PAD_SLOT_ID = -1
 
 __all__ = [
     "PAD_SLOT_ID",
+    "dflash2_grouped_conv",
     "inkling_ring_sconv",
     "seq_idx_from_cu_seqlens",
 ]

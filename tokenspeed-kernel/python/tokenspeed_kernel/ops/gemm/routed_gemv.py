@@ -93,8 +93,8 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (32, 768, 1536): "tgv",
         # dspark gate_up  N=1792 K=7168
         (2, 1792, 7168): "skinny",
-        (3, 1792, 7168): "skinny",
-        (4, 1792, 7168): "skinny",
+        (3, 1792, 7168): "ll_bf16",
+        (4, 1792, 7168): "ll_bf16",
         # dspark fused_qkv_a (2112x7168): handled by dsv3_fused_a_gemm upstream.
         # eagle3 fused_qkv_a  N=2112 K=14336
         (1, 2112, 14336): "skinny",
@@ -163,10 +163,11 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         # These waive the 4% margin: cuBLAS needs a split-K reduce, tgv does not.
         (7, 1536, 7168): "tgv",
         (8, 1536, 7168): "tgv",
-        (5, 3584, 7168): "tgv",
-        (6, 3584, 7168): "tgv",
-        (7, 3584, 7168): "tgv",
-        (8, 3584, 7168): "tgv",
+        # 3584x7168 clears the margin outright.
+        (5, 3584, 7168): "ll_bf16",
+        (6, 3584, 7168): "ll_bf16",
+        (7, 3584, 7168): "ll_bf16",
+        (8, 3584, 7168): "ll_bf16",
         (1, 7168, 768): "tgv",
         (2, 7168, 768): "tgv",
         (4, 7168, 768): "tgv",
@@ -175,7 +176,7 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (1, 3648, 7168): "skinny",  # MLA fused qkv_a + gate, 24 calls/step
         # (1, 2304, 1536) mla_q_b stays on rowcta: 2.48 vs skinny 2.53.
         # M > 1 (small batches, speculative verify) vs the cublas incumbent.
-        (2, 3584, 7168): "skinny",  # 9.20 vs 11.67 (1.27x)
+        (2, 3584, 7168): "ll_bf16",
         # TP8 DSpark drafter, shapes observed at the launch point on GB300.
         # eagle3 drafter TP8 widths; nothing past M=4 clears the margin.
         (2, 4608, 7168): "tgv",  # 1.10x
@@ -184,10 +185,10 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (2, 1536, 1536): "skinny",  # 2.18x
         (3, 1536, 1536): "skinny",  # 1.95x
         (4, 1536, 1536): "skinny",  # 1.83x
-        (5, 1536, 1536): "skinny",  # 1.68x
-        (6, 1536, 1536): "skinny",  # 1.63x
-        (7, 1536, 1536): "skinny",  # 1.55x
-        (8, 1536, 1536): "tgv",  # 1.54x
+        (5, 1536, 1536): "ll_bf16",
+        (6, 1536, 1536): "ll_bf16",
+        (7, 1536, 1536): "ll_bf16",
+        (8, 1536, 1536): "splitk",
         (1, 7168, 1024): "tgv",  # 1.24x
         (2, 7168, 1024): "tgv",  # 1.16x
         (3, 7168, 1024): "tgv",  # 1.15x
@@ -198,7 +199,7 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (8, 7168, 1024): "tgv",  # 1.15x
         (1, 7168, 1792): "tgv",  # 1.13x
         (2, 7168, 1792): "tgv",  # 1.10x
-        (4, 3584, 7168): "skinny",  # 10.38 vs 11.21 (1.08x)
+        (4, 3584, 7168): "ll_bf16",
         (2, 6288, 7168): "tgv",  # 15.29 vs 17.07 (1.12x)
         (4, 6288, 7168): "tgv",  # 15.25 vs 17.26 (1.13x)
         (8, 6288, 7168): "tgv",  # 15.38 vs 16.75 (1.09x)
@@ -229,7 +230,7 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (31, 1152, 1536): "tgv",
         (32, 1152, 1536): "tgv",
         # decode_gemv here. Same >= 4% margin, same cold-L2 tuner.
-        (3, 3584, 7168): "skinny",  # 9.54 vs 11.23 (1.18x)
+        (3, 3584, 7168): "ll_bf16",
         (1, 2880, 7168): "skinny",  # 7.13 vs rowcta 8.61 (1.21x)
         (2, 2880, 7168): "skinny",  # 7.95 vs 9.80 (1.23x)
         (3, 2880, 7168): "skinny",  # 8.24 vs 9.77 (1.19x)
@@ -564,6 +565,54 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         # Unstable exact keys stay on the incumbent: (2,512,2560),
         # (4,640,2560), (17/21/23,2560,320), (1,6656,2560), and
         # (3/4,12800,2560). For 12800x2560, M=5..32 also stay on cuBLAS.
+        # TP8 Kimi-K3 DFlash2 block drafter; M = batch * block width, so the
+        # served M runs well past the M<=8 the other drafters stop at.
+        # (2112x7168) stays out: it is the target's replicated latent
+        # projection too, and already runs a dedicated fused kernel.
+        # 20480x7168 (the head) and 7168x35840 (the context fc) measured
+        # non-monotonic across M, so they keep the incumbent.
+        (5, 1792, 7168): "ll_bf16",
+        (6, 1792, 7168): "ll_bf16",
+        (7, 1792, 7168): "ll_bf16",
+        (8, 1792, 7168): "splitk",
+        (16, 1792, 7168): "splitk",
+        (24, 1792, 7168): "ll_bf16",
+        (32, 1792, 7168): "splitk",
+        (2, 256, 7168): "ll_bf16",
+        (3, 256, 7168): "ll_bf16",
+        (4, 256, 7168): "ll_bf16",
+        (5, 256, 7168): "ll_bf16",
+        (6, 256, 7168): "ll_bf16",
+        (7, 256, 7168): "ll_bf16",
+        (8, 256, 7168): "ll_bf16",
+        # The selector runs M = batch * (block width - 1), so its served M is
+        # 7/14/28/56 -- not the batch * 8 the rest of the draft keys on.
+        (14, 256, 7168): "ll_bf16",
+        (28, 256, 7168): "ll_bf16",
+        (16, 256, 7168): "ll_bf16",
+        (24, 256, 7168): "ll_bf16",
+        (32, 256, 7168): "ll_bf16",
+        (3, 7168, 1792): "tgv",
+        (4, 7168, 1792): "tgv",
+        (5, 7168, 1792): "tgv",
+        (6, 7168, 1792): "tgv",
+        (7, 7168, 1792): "tgv",
+        (8, 7168, 1792): "splitk",
+        (16, 3584, 7168): "ll_bf16",
+        (24, 3584, 7168): "ll_bf16",
+        (32, 3584, 7168): "ll_bf16",
+        (24, 1536, 1536): "tgv",
+        # DFlash2 draft at TP8 on the measured split-K tactic; the tactics
+        # themselves are in SPLITK_TACTIC_ROUTE.
+        (56, 256, 7168): "splitk",
+        (64, 1792, 7168): "splitk",
+        (64, 3584, 7168): "splitk",
+        (16, 1536, 1536): "splitk",
+        (32, 1536, 1536): "splitk",
+        (16, 7168, 1024): "splitk",
+        (32, 7168, 1024): "splitk",
+        (16, 7168, 1792): "splitk",
+        (32, 7168, 1792): "splitk",
     }
 )
 
@@ -622,6 +671,38 @@ SKINNY_CONFIG_ROUTE: MappingProxyType[
         (2, 320, 2560): (160, 2, 1, 16),
         (5, 1536, 7168): (224, 2, 1, 16),
         (6, 1536, 7168): (64, 2, 1, 16),
+    }
+)
+
+
+# Measured (m, n, k) -> (mma_m, mma_n, split_k, ab_stages) for the split-K
+# BF16 kernel. FlashInfer picks these from a generic occupancy heuristic and
+# stops at M == 32; a block drafter's projections are cold-weight and
+# grid-starved, and its M is batch times block width. Same rule as
+# MEASURED_ROUTE: an entry exists only where it beat what serving could
+# already reach by 4%. ``test/gemm_tuning/tune_splitk_tactic.py`` reproduces it.
+SPLITK_TACTIC_ROUTE: MappingProxyType[
+    tuple[int, int, int], tuple[int, int, int, int]
+] = MappingProxyType(
+    {
+        # DFlash2 draft at TP8, M = batch * 8. Left out on purpose:
+        # 2112x7168 is also the K3 target's replicated latent projection and
+        # already runs a dedicated fused kernel, and 20480x7168 is the head,
+        # whose call site is a bare matmul the router never sees.
+        (8, 1536, 1536): (64, 8, 4, 12),
+        (16, 1536, 1536): (64, 16, 3, 10),
+        (32, 1536, 1536): (64, 16, 2, 11),
+        (56, 256, 7168): (64, 16, 4, 10),
+        (8, 1792, 7168): (64, 8, 4, 12),
+        (16, 1792, 7168): (64, 16, 4, 10),
+        (32, 1792, 7168): (64, 32, 4, 8),
+        (64, 1792, 7168): (64, 32, 2, 9),
+        (64, 3584, 7168): (64, 32, 1, 9),
+        (16, 7168, 1024): (128, 16, 1, 6),
+        (32, 7168, 1024): (64, 32, 1, 9),
+        (8, 7168, 1792): (64, 16, 1, 11),
+        (16, 7168, 1792): (64, 16, 1, 11),
+        (32, 7168, 1792): (64, 32, 1, 9),
     }
 )
 
@@ -741,6 +822,40 @@ def tgv_gemv(
         out=out,
     )
     _mark_warmed("tgv", dev, m, n, k)
+    return result
+
+
+def splitk_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` via the split-K BF16 GEMM on its measured tactic.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous bf16 weight.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl import flashinfer_splitk
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    tactic = SPLITK_TACTIC_ROUTE.get((m, n, k))
+    if (
+        tactic is None
+        or x.dtype != torch.bfloat16
+        or not flashinfer_splitk.is_available()
+        or not _usable_in_capture("splitk", dev, m, n, k)
+        or not flashinfer_splitk.supports(m, n, k, tactic)
+    ):
+        return _torch_decode_gemv(x, weight, out)
+    result = flashinfer_splitk.splitk_mm(
+        x, weight, tactic, out, enable_pdl=pdl_enabled()
+    )
+    _mark_warmed("splitk", dev, m, n, k)
     return result
 
 
@@ -914,13 +1029,18 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv, "ll_bf16": ll_bf16_gemv}
+    impls = {
+        "skinny": skinny_gemv,
+        "tgv": tgv_gemv,
+        "ll_bf16": ll_bf16_gemv,
+        "splitk": splitk_gemv,
+    }
     for (m, n, k), backend in MEASURED_ROUTE.items():
         register_kernel(
             "gemm",
             "decode_gemv",
             name=f"{backend}_gemv_m{m}_n{n}_k{k}",
-            solution="flashinfer" if backend == "tgv" else "cute_dsl",
+            solution="flashinfer" if backend in ("tgv", "splitk") else "cute_dsl",
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
             traits={

@@ -485,6 +485,8 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     ASSERT_EQ(write_back_ops.size(), 1u);
     const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
     ASSERT_EQ(write_back.op_ids.size(), 1u);
+    EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
+        << "the victim's pages are granted away this round; the runtime must order the copy ahead of reuse";
 
     // The retraction round grants the freed capacity to the blocked request
     // in the same plan: its remote admission rides plan.remote_prefill.

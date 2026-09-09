@@ -93,7 +93,6 @@ def _handle(trace, kv_transfer=None):
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
             execute_forward_op=execute_forward_op,
-            order_cache_operations=lambda: trace.append("cache-fence"),
             prepare_remote_cache_slots=lambda rows: trace.append(("slots", rows)),
             reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
         ),
@@ -162,7 +161,6 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     # data plane, with the zeroing barrier before the manifest is published.
     assert pending is None
     assert trace == [
-        "cache-fence",
         ("slots", [3]),
         "seed-lengths",
         "zero-sync",
@@ -192,7 +190,7 @@ def test_vanished_l3_recovery_does_not_submit_remote_prefill():
     assert pending is None
     assert "rdma" not in trace
     assert "seed-lengths" not in trace
-    assert trace == ["submit", "cache-fence", ("zero", (7,))]
+    assert trace == ["submit", ("zero", (7,))]
 
 
 def test_decode_node_masks_local_batches_with_the_batch_grammar():

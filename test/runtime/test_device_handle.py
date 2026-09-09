@@ -130,8 +130,8 @@ def _handle(trace, **kwargs):
     return DeviceHandle(
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
-            order_cache_operations=lambda: trace.append("cache_fence"),
             execute_forward_op=lambda *a, **k: trace.append("forward"),
+            execution_stream="execution-stream",
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
             ),
@@ -233,21 +233,26 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 
 
 # ----------------------------------------------------------------------
-# L2 cache plans: write-backs launch AHEAD of the zeroing (they must read
-# the reused pages' old bytes), load-backs behind it.
+# L2 cache plans: write-backs launch AHEAD of the zeroing (a stream-ordered
+# one must read the reused pages' old bytes, and fences the caller's stream
+# before the zeroing is enqueued), load-backs behind it.
 # ----------------------------------------------------------------------
 
 
 def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     """The FIFO carries the correctness order for same-round page reuse: the
-    retraction snapshot copies read the reused pages before the new owner's
-    zeroing wipes them, and the load-backs target zeroed pages."""
+    write-backs are submitted ahead of the new owner's zeroing (a
+    stream-ordered snapshot copy lands its fence there), and the load-backs
+    target zeroed pages. The copies are told which stream wrote the pages;
+    the zeroing orders itself behind that stream."""
     trace: list = []
     plan = _plan(pages_to_zero=[3, 4], cache=["op"])
     handle = _handle(
         trace,
         l2_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda p: trace.append(("write_backs", p.cache)),
+            submit_write_backs=lambda p, *, producer_stream: trace.append(
+                ("write_backs", p.cache, producer_stream)
+            ),
             submit_load_backs=lambda p: trace.append(("load_backs", p.cache)),
             poll_results=lambda: ["done"],
         ),
@@ -260,8 +265,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
 
     assert trace == [
         "submit",
-        "cache_fence",
-        ("write_backs", ["op"]),
+        ("write_backs", ["op"], "execution-stream"),
         "submit",
         ("zero", (3, 4)),
         "submit",
@@ -272,7 +276,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     assert trace[-1] != "submit"
 
 
-def test_page_zeroing_without_l2_orders_after_previous_forward():
+def test_page_zeroing_without_l2_submits_only_zeroing():
     trace: list = []
     handle = _handle(trace)
     handle._executor.zero_cache_pages = lambda pages: trace.append(
@@ -281,7 +285,7 @@ def test_page_zeroing_without_l2_orders_after_previous_forward():
 
     handle.execute(_plan(pages_to_zero=[3, 4]), None, submit_remote_prefill=True)
 
-    assert trace == ["submit", "cache_fence", ("zero", (3, 4))]
+    assert trace == ["submit", ("zero", (3, 4))]
 
 
 def test_a_plan_with_no_device_work_submits_nothing():
@@ -298,7 +302,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     would leave its ops counted in flight forever."""
     trace: list = []
 
-    def exploding(plan):
+    def exploding(plan, *, producer_stream):
         raise ValueError("bad cache op")
 
     handle = _handle(

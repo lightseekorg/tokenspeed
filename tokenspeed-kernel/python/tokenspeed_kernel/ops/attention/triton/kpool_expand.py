@@ -26,7 +26,10 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["block_table_stride", "block_table_cols"],
+    do_not_specialize_on_alignment=["block_table_stride", "block_table_cols"],
+)
 def _kpool_expand_slots_kernel(
     out,
     out_stride,
@@ -37,7 +40,7 @@ def _kpool_expand_slots_kernel(
     req_ids,
     block_table,
     block_table_stride,
-    block_table_cols: tl.constexpr,
+    block_table_cols,
     block_size: tl.constexpr,
     pool_size: tl.constexpr,
     group_topk: tl.constexpr,
@@ -156,6 +159,9 @@ def expand_kpool_to_flat_kv(
         raise ValueError(
             f"lens_out must be int32 {(num_tokens,)} on {pool_indices.device}"
         )
+
+    if num_tokens == 0:
+        return out, lens_out
 
     _kpool_expand_slots_kernel[(num_tokens,)](
         out,

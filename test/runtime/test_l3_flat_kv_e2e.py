@@ -152,8 +152,10 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
             backup_pages,
+            lane=executor._pinned_write_lane,
+            producer_stream=torch.cuda.current_stream(),
         )
-        torch.cuda.current_stream().synchronize()
+        executor.write_stream.synchronize()
         write_results = executor.poll_results()
         self.assertEqual(write_results, [])
         self.assertTrue(put_started.wait(timeout=10), "L3 backup did not start")

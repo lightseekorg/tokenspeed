@@ -53,6 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      install_mla: ${{ steps.resolve.outputs.install_mla }}
     steps:
       - name: Resolve trusted source
         id: resolve
@@ -64,6 +65,7 @@ jobs:
           if [ -z "$PR" ]; then
             sha=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
             link="https://github.com/${{ github.repository }}/commit/$sha"
+            install_mla=0
           else
             number=${PR##*/}
             [[ "$number" =~ ^[0-9]+$ ]] || {
@@ -78,8 +80,16 @@ jobs:
             }
             sha=$(jq -r .head.sha <<< "$data")
             link=$(jq -r .html_url <<< "$data")
+            files=$(gh api "repos/${{ github.repository }}/pulls/$number/files" \
+              --paginate --jq '.[].filename')
+            if grep -q '^tokenspeed-mla/' <<< "$files"; then
+              install_mla=1
+            else
+              install_mla=0
+            fi
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "install_mla=$install_mla" >> "$GITHUB_OUTPUT"
           {
             echo "### B300 DeepSWE source"
             echo
@@ -95,6 +105,7 @@ jobs:
     timeout-minutes: 1440
     env:
       PIP_BREAK_SYSTEM_PACKAGES: "1"
+      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.source.outputs.install_mla }}
       DEEPSWE_TASK_COUNT: ${{ inputs.task_count }}
       DEEPSWE_CONCURRENCY: ${{ inputs.concurrency }}
       DEEPSWE_SAMPLE_SEED: ${{ inputs.sample_seed }}

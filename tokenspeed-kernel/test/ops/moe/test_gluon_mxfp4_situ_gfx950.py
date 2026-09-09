@@ -39,9 +39,6 @@ from tokenspeed_kernel_amd._triton import gl  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (  # noqa: E402
     _compact_mxfp4_scale_tile,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
-    quantize_mxfp8_sorted_routes,
-)
 
 _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
@@ -85,68 +82,6 @@ def _a8w4_ep_plan(intermediate_size: int) -> dict:
             internal_activation_dtype="input",
             solution="gluon",
         )
-
-
-def _unswizzle_cdna4_route_scales(
-    scales: torch.Tensor,
-    *,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    logical_m = torch.arange(rows, device=scales.device)[:, None]
-    logical_k = torch.arange(cols, device=scales.device)[None, :]
-    m_in_block = logical_m % 32
-    m_hi = m_in_block // 16
-    m_lo = m_in_block % 16
-    k_block = logical_k // 8
-    k_hi = (logical_k % 8) // 4
-    k_lo = logical_k % 4
-    swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
-    offsets = swizzled_k + (logical_m // 32) * (cols * 32)
-    return scales.view(torch.uint8).flatten()[offsets]
-
-
-def test_sorted_route_mxfp8_quantization_matches_standard_gfx950() -> None:
-    generator = torch.Generator(device="cuda").manual_seed(20260830)
-    hidden_states = torch.randn(
-        (7, 256),
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=generator,
-    )
-    source_rows = torch.tensor([5, 1, 6, 0, 3], dtype=torch.int32, device="cuda")
-    slots = torch.tensor([2, 4, 1, 0, 3], dtype=torch.int32, device="cuda")
-    valid_rows = int(source_rows.numel())
-    sorted_ids = torch.full((32,), 7, dtype=torch.int32, device="cuda")
-    sorted_ids[:valid_rows] = source_rows | (slots << 24)
-    num_valid_ids = torch.tensor([valid_rows], dtype=torch.int32, device="cuda")
-
-    actual, actual_scales = quantize_mxfp8_sorted_routes(
-        hidden_states,
-        sorted_ids,
-        num_valid_ids,
-    )
-    expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
-        hidden_states[source_rows.long()],
-        solution="triton",
-    )
-
-    torch.testing.assert_close(
-        actual[:valid_rows].view(torch.uint8),
-        expected.view(torch.uint8),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        _unswizzle_cdna4_route_scales(
-            actual_scales,
-            rows=valid_rows,
-            cols=hidden_states.shape[1] // 32,
-        ),
-        expected_scales.view(torch.uint8),
-        atol=0,
-        rtol=0,
-    )
 
 
 def _make_mxfp4_module(

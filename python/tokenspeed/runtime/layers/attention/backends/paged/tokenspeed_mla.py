@@ -89,6 +89,10 @@ class CuteDSLMLADecodeMetadata:
     seq_lens_k: torch.Tensor | None = None
     # Verify window width baked into the graph views (1 outside target verify).
     q_len_per_req: int = 1
+    # Block decode only: the same rows before expansion, one per request. The
+    # query-axis fold reads these instead of re-deriving them once per layer.
+    block_page_table: torch.Tensor | None = None
+    block_seq_lens: torch.Tensor | None = None
 
 
 class CuteDSLMLABackend(PagedAttentionBackend):
@@ -96,9 +100,17 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
+
+    A block drafter's proposal rides the query axis with one page table row and
+    one cache length per request, non-causal and bounded by the layer's window.
+    There is no dispatcher here, so a shape the kernel does not serve is an
+    error rather than a fallback.
     """
 
     default_kernel_page_size = TOKENSPEED_MLA_DEFAULT_PAGE_SIZE
+    # Decode forwards layer.sliding_window_size as window_left; prefill takes
+    # no window, and a draft model only ever runs decode.
+    supports_layer_sliding_window: bool = True
 
     _logged_decode = False
     _logged_prefill = False
@@ -166,6 +178,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.forward_decode_metadata: CuteDSLMLADecodeMetadata | None = None
         self.forward_prefill_metadata: CuteDSLMLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
+        self._block_page_table_buf: torch.Tensor | None = None
+        self._block_seq_lens_buf: torch.Tensor | None = None
+        self._logged_block_layouts: set[tuple[int, int, bool]] = set()
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""
@@ -303,6 +318,63 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     # ---- CUDA Graph ----
 
+    def _ensure_block_row_buffers(self) -> None:
+        """Resident per-request rows behind the block entries, sized once.
+
+        Allocated against the graph buffers' capacity so a captured graph
+        records a block that outlives it.
+        """
+        if self._block_page_table_buf is not None:
+            return
+        max_bs = self.page_table_buf.shape[0] // max(self.block_decode_expansion, 1)
+        self._block_page_table_buf = torch.zeros(
+            (max_bs, self.page_table_buf.shape[1]),
+            dtype=self.page_table_buf.dtype,
+            device=self.page_table_buf.device,
+        )
+        self._block_seq_lens_buf = torch.zeros(
+            max_bs, dtype=self.seq_lens_buf.dtype, device=self.seq_lens_buf.device
+        )
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Broadcast, keeping the per-request row the query-axis fold reads.
+
+        The drafter calls this inside the captured graph, so the row has to be
+        written there too rather than derived from the expanded view per layer.
+        """
+        self._ensure_block_row_buffers()
+        rows = self._block_seq_lens_buf[:bs]
+        torch.clamp(
+            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
+        )
+        expansion = self.block_decode_expansion
+        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
+            rows.unsqueeze(1)
+        )
+
+    def _log_block_layout(
+        self, num_q_heads: int, q_len: int, sliding_window: bool
+    ) -> None:
+        """Say which block layout this leaf sends, once per combination.
+
+        The shared leaf logs the same line from ``_takes_query_blocks``; this
+        one has no probe to log from, so it reports what the shapes decided.
+        """
+        key = (num_q_heads, q_len, sliding_window)
+        if key in self._logged_block_layouts:
+            return
+        self._logged_block_layouts.add(key)
+        logger.info(
+            "CuteDSL MLA block decode uses the %s layout "
+            "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
+            "query-axis" if q_len == self.spec_num_tokens else "flattened",
+            num_q_heads,
+            q_len,
+            self.kernel_page_size,
+            self.data_type,
+            sliding_window,
+        )
+
     def _decode_views(self, bs: int) -> CuteDSLMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -314,12 +386,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return metadata
         if self.block_decode_active:
             expanded_bs = bs * self.block_decode_expansion
+            self._ensure_block_row_buffers()
             metadata = CuteDSLMLADecodeMetadata(
                 page_table=self.page_table_buf[:expanded_bs],
                 max_seq_len_k=self.max_context_len,
                 seq_lens_k=self.seq_lens_buf[:expanded_bs],
                 num_extends=0,
                 q_len_per_req=1,
+                # The rows the block entries were expanded from. Re-deriving
+                # them from the expanded view costs a strided copy per layer
+                # instead of one write per forward.
+                block_page_table=self._block_page_table_buf[:bs],
+                block_seq_lens=self._block_seq_lens_buf[:bs],
             )
         else:
             metadata = CuteDSLMLADecodeMetadata(
@@ -355,11 +433,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             # the capture seeding needs the same safe baseline).
             spec = self.spec_num_tokens
             max_num_pages = self.page_table_buf.shape[1]
-            replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
+            self._ensure_block_row_buffers()
+            rows = self._block_page_table_buf[:bs]
             num_pages = min(page_table.shape[1], max_num_pages)
-            replicated[:, :, :num_pages].copy_(page_table[:bs, None, :num_pages])
+            rows[:, :num_pages].copy_(page_table[:bs, :num_pages])
             if num_pages < max_num_pages:
-                replicated[:, :, num_pages:].zero_()
+                rows[:, num_pages:].zero_()
+            replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
+            replicated.copy_(rows[:, None, :])
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = metadata
@@ -400,12 +481,39 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
+        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        causal_mask = True
         if self.block_decode_active:
-            # Keeping the block on the query axis would re-impose causal order.
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
+            q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+            # The block is non-causal, so the kernel takes it on the query axis
+            # with one page table row and one cache length per request. The
+            # metadata was expanded from rows [0, bs), which is what this query
+            # covers, so no extend offset applies on either layout.
+            self._log_block_layout(layer.tp_q_head_num, q_len_per_req, window_left >= 0)
+            if q_len_per_req == self.spec_num_tokens:
+                causal_mask = False
+                query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+                page_table = metadata.block_page_table
+                cache_seqlens = metadata.block_seq_lens
+            else:
+                # Guards the arithmetic rather than any shipping configuration:
+                # resolve_speculative_num_tokens reconciles the two widths for
+                # every drafter this backend serves.
+                if window_left >= 0:
+                    raise ValueError(
+                        f"a {q_len_per_req}-wide draft forward over a "
+                        f"{self.spec_num_tokens}-wide block cannot carry the "
+                        "block on the query axis, and the flattened rows do "
+                        "not spell this layer's sliding window"
+                    )
+                query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
+                page_table = metadata.page_table
+                cache_seqlens = metadata.seq_lens_k
         else:
             q_len_per_req = q.shape[0] // bs
             query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+            page_table = metadata.page_table[num_extends:]
+            cache_seqlens = metadata.seq_lens_k[num_extends:]
 
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:
@@ -439,10 +547,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             workspace_buffer=self.cutedsl_workspace,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.page_table[num_extends:],
-            seq_lens=metadata.seq_lens_k[num_extends:],
+            block_tables=page_table,
+            seq_lens=cache_seqlens,
             max_seq_len=metadata.max_seq_len_k,
             softmax_scale=softmax_scale,
+            causal_mask=causal_mask,
+            window_left=window_left,
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
