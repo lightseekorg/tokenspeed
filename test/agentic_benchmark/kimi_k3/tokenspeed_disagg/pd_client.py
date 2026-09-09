@@ -3,16 +3,19 @@
 
 evalscope's swe_smith plugin has no prime/measure phase control, so the
 prime waves, the P-cached turn replay, and the measured waves all run
-through this thin client. It replays the frozen agentic dataset, drives a
-fixed concurrency with rolling admission, and emits a benchmark_summary.json
-consumed by pd_sim's own collect_outputs.py (NOT column-compatible with the
-parent bench's collect — pd_sim has its own).
+through this thin client. It replays the duplicated agentic dataset,
+drives a fixed concurrency with rolling admission, and emits a
+benchmark_summary.json consumed by collect_outputs.py in this directory.
 
 Phases (--phase):
   p-fresh   unique first turns, max_tokens 1        -> prefill tok/s
   p-cached  turn-1 prime (500) then turn-2 measure  -> computed tok/s
   d-prime   first turns, max_tokens 1, low parallel  (no summary emitted)
   d-measure resend first turns, max_tokens N        -> output tok/s
+
+Every request carries rid=pdsim-conv-<index> (index into the deduplicated
+conversation list), so a gateway running sticky sessions keeps a
+conversation on the DP rank that primed it across phases.
 """
 
 import argparse
@@ -29,7 +32,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True, help="chat/completions endpoint")
     p.add_argument("--model", required=True, help="served model name")
-    p.add_argument("--dataset", required=True, help="frozen agentic_dataset.json")
+    p.add_argument("--dataset", required=True, help="agentic_dataset_x32.json")
     p.add_argument(
         "--phase",
         required=True,
@@ -56,13 +59,30 @@ def first_turn_messages(conv):
     return conv[0]["messages"]
 
 
+def conv_rid(index):
+    return f"pdsim-conv-{index}"
+
+
+def request_body(model, messages, max_tokens, rid):
+    return json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "ignore_eos": True,
+            "rid": rid,
+        }
+    ).encode()
+
+
 def unique_first_turn_conversations(convs):
     """Drop conversations whose first turn duplicates an earlier one.
 
-    The frozen artifact contains exact duplicate first-turn pairs (7 in the
-    current file, 64 unique of 71). P-fresh's <=5% hit guard assumes every
-    ladder rung prefills content never seen before, so --offset/--number
-    index into this deduplicated, order-preserving list for ALL phases.
+    The 71-conversation build contains exact duplicate first-turn pairs (7
+    pairs, 64 unique); the cache-bust replicas are distinct by construction.
+    P-fresh's <=5% hit guard assumes every ladder rung prefills content never
+    seen before, so --offset/--number index into this deduplicated,
+    order-preserving list for ALL phases.
     """
     seen = set()
     out = []
@@ -80,15 +100,8 @@ class Runner:
         self.lock = threading.Lock()
         self.results = []
 
-    def request(self, messages, max_tokens):
-        body = json.dumps(
-            {
-                "model": self.args.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "ignore_eos": True,
-            }
-        ).encode()
+    def request(self, messages, max_tokens, rid):
+        body = request_body(self.args.model, messages, max_tokens, rid)
         req = urllib.request.Request(
             self.args.url, data=body, headers={"Content-Type": "application/json"}
         )
@@ -130,29 +143,31 @@ class Runner:
             "reasoning_content": msg.get("reasoning_content"),
         }
 
-    def prime_item(self, conv):
+    def prime_item(self, item):
         # P-cached prime: turn 1 with up to 500 generated tokens builds a
         # realistic prefix (50K prompt + completion). Excluded from timing.
         # BOTH reasoning_content and content are passed back verbatim: K3's
         # chat template renders them into the think/response channels, so the
         # re-rendered assistant turn retokenizes onto the cached token stream
         # instead of diverging at the <think> open tag.
+        index, conv = item
         t1_msgs = list(first_turn_messages(conv))
-        prime = self.request(t1_msgs, 500)
+        prime = self.request(t1_msgs, 500, conv_rid(index))
         if prime.get("failed") or len(conv) < 2:
             return None
         assistant = {"role": "assistant", "content": prime["content"] or ""}
         if prime.get("reasoning_content"):
             assistant["reasoning_content"] = prime["reasoning_content"]
-        return t1_msgs + [assistant] + list(conv[1]["messages"])
+        return index, t1_msgs + [assistant] + list(conv[1]["messages"])
 
-    def one_item(self, payload):
+    def one_item(self, item):
         a = self.args
+        index, payload = item
         if a.phase == "p-cached":
             msgs = payload  # pre-assembled turn-2 message list
         else:
             msgs = list(first_turn_messages(payload))
-        res = self.request(msgs, a.max_tokens)
+        res = self.request(msgs, a.max_tokens, conv_rid(index))
         with self.lock:
             self.results.append(res)
         return res
@@ -168,14 +183,17 @@ class Runner:
                 f"dataset has only {len(picked)} conversations at offset "
                 f"{a.offset}; need {a.number}"
             )
+        # Items carry the conversation's absolute index so every phase sends
+        # the same rid for the same conversation.
+        items = list(enumerate(picked, start=a.offset))
         if a.phase == "p-cached":
             # Phase 1 (untimed): prime every conversation's turn-1 prefix.
             with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-                payloads = [m for m in ex.map(self.prime_item, picked) if m]
+                payloads = [m for m in ex.map(self.prime_item, items) if m]
             if not payloads:
                 raise SystemExit("no conversation has a second turn")
         else:
-            payloads = picked
+            payloads = items
         # Phase 2 (timed): only the measured requests count toward wall time.
         t0 = time.monotonic()
         with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
