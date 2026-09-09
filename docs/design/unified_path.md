@@ -338,6 +338,11 @@ model alone is not a reason to introduce a bespoke backend.
 the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
 when this view owns GDN layers. Forward dispatch and PD step recording stay
 with that child; the root broadcasts cache and metadata lifecycle calls.
+Registry construction selects the attention child first, then composes the
+Qwen4-Exp consumers once, regardless of whether this view has GDN layers.
+The root initializes the common `AttentionBackend` attributes from its own
+`AttnConfig`, including draft status, verify width, dtype and head geometry;
+these attributes do not depend on an attention child's wrapper shape.
 Draft views have no GDN or PLE child. PLE and QSA remain available on targets
 without linear-attention layers; the model retains their computation order.
 
@@ -346,10 +351,16 @@ Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
 to extra attention leaves. The indexer backend refreshes stable raw group
 tables with the shared `GroupTableStacks` fill at expansion ratio one:
 block ids remain unchanged, holes become zero, and padded requests and
-column tails are cleared. It owns its query/sequence metadata and borrows
-only the full-KV address table from `router.group_view`. Layer-shared layout
-and top-k still use `SparseTopKShare` with the existing forward and MTP reuse
-boundaries.
+column tails are cleared. QSA kernel calls explicitly use ratio one; the
+layout carries no expansion factor. The indexer owns its query/sequence
+metadata and borrows the full-KV table and kernel page size from
+`router.group_view`. Layer-shared layout and top-k still use `SparseTopKShare`
+with the existing forward and MTP reuse boundaries.
+
+Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
+dense attention. Draft step zero still preserves the dense decode-context
+and KV-recording override, while QSA keeps its original context and narrows
+the selected top-k rows with the queries.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
@@ -357,6 +368,10 @@ workspace before model forward or graph capture. Draft and non-speculative
 indexer backends keep metadata but allocate no target verify workspace.
 Indexers use the root's `indexer_backend`; execution carries no separate
 indexer object and the root has no QSA state registry or type lookup.
+The staging flag records whether forward or capture has ever used staging,
+not whether one round is pending. Commit must not clear it: graph replay
+updates staging tensors without re-running the Python assignment. Staged
+keys retain the model dtype; commit converts them to the fixed BF16 raw cache.
 
 `Qwen4ExpPLEBackend` resolves its own input/output checkpoints and query
 lengths from the PLE cache group. It shares the checkpoint arithmetic with
@@ -375,7 +390,13 @@ of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
-before sizing the arena.
+before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`
+selects its GDN/PLE/QSA consumers, allocates each once and returns their total
+bytes; registry only invokes this operation and checks the recipe budget.
+Draft roots allocate no target verify workspace. Qwen4-Exp reserves no
+verify workspace when the target width is one, even with a draft model
+attached; this includes the inherited GDN/PLE staging budget and PLE commit
+rows.
 
 ## One block-table route: router + leaves
 

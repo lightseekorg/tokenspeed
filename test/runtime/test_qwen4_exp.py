@@ -534,7 +534,7 @@ def _qsa_root(
             ),
         ),
     )
-    backend = Qwen4ExpBackend(router, None, QSAIndexerBackend(config, router))
+    backend = Qwen4ExpBackend(config, router, None, QSAIndexerBackend(config, router))
     backend.set_cache_pool(pool)
     backend.init_cuda_graph_state(max_bs)
     return backend
@@ -598,7 +598,9 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     attention = (
         HybridLinearAttnBackend(router, SimpleNamespace(), [3]) if hybrid else router
     )
-    backend = Qwen4ExpBackend(attention, None, None)
+    backend = Qwen4ExpBackend(
+        _qsa_config(kernel_page_size=64, max_bs=4, spec=4), attention, None, None
+    )
     events = []
     backend.register_step_counter(
         SimpleNamespace(record_cache=lambda: events.append("cache_step"))
@@ -666,22 +668,22 @@ def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
 
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", raising=False)
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", raising=False)
-    assert indexer._topk_solution(1, small, 1, 64) == "logits"
-    assert indexer._topk_solution(1, large, 1, 64) == "logits"
+    assert indexer._topk_solution(1, small, 64) == "logits"
+    assert indexer._topk_solution(1, large, 64) == "logits"
 
     # A tighter budget flips only the oversized batch onto the stream path.
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", "1")
-    assert indexer._topk_solution(1, small, 1, 64) == "logits"
-    assert indexer._topk_solution(1, large, 1, 64) == "stream"
+    assert indexer._topk_solution(1, small, 64) == "logits"
+    assert indexer._topk_solution(1, large, 64) == "stream"
 
     # Explicit backends pin the routing regardless of shape or budget.
     for pinned in ("stream", "logits"):
         monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", pinned)
-        assert indexer._topk_solution(1, large, 1, 64) == pinned
+        assert indexer._topk_solution(1, large, 64) == pinned
 
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", "bogus")
     with pytest.raises(ValueError, match="TOPK_PATH"):
-        indexer._topk_solution(1, small, 1, 64)
+        indexer._topk_solution(1, small, 64)
 
 
 def test_qwen4_exp_qsa_owns_nonpersistent_radix_workspace(monkeypatch) -> None:
@@ -766,7 +768,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         recent_locs=cache_locs,
         complete_blocks=torch.ones(2, dtype=torch.int32),
         qsa_page_table=qsa_table,
-        qsa_page_expansion=1,
         full_page_table=stacks.table(FULL_ATTENTION, 2),
         full_kernel_page_size=64,
         reset_draft_tags=None,
@@ -811,7 +812,6 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     assert recent_table[:, :1].tolist() == [[3], [5]]
     assert selections[0][0][3] is qsa_table
     assert torch.equal(selections[0][0][4], stacks.table(FULL_ATTENTION, 2))
-    assert selections[0][1]["qsa_page_expansion"] == 1
     assert prepare_calls[0][1] == {
         "compressed_token_page_size": 256,
         "recent_page_size": 64,
@@ -864,7 +864,6 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         complete_blocks=torch.ones(8, dtype=torch.int32),
         qsa_page_table=torch.ones((2, 1), dtype=torch.int32),
         full_page_table=torch.ones((2, 1), dtype=torch.int32),
-        qsa_page_expansion=1,
         full_kernel_page_size=64,
     )
     monkeypatch.setattr(
@@ -978,7 +977,6 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
 
     assert second is first
     assert backend.sparse_topk.qsa_metadata is first
-    assert first.qsa_page_expansion == 1
     assert launches[0][0][4] == launches[0][0][7] == 1
     assert len(launches) == 1
     assert torch.all(first_tags == torch.iinfo(torch.int64).min)
@@ -1033,6 +1031,72 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
     )
 
     assert len(compression_calls) == 1
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("narrow", [False, True])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.DECODE]
+)
+def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
+    sparse, narrow, mode
+) -> None:
+    layer = object.__new__(qwen4_exp_nextn.Qwen4ExpDraftAttentionDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    q = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    k, v = q + 100, q + 200
+    topk = torch.arange(12, dtype=torch.int32).reshape(6, 2)
+    events = []
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=2 if mode.is_extend() else (1 if mode.is_mixed() else 0),
+        input_num_tokens=6,
+        forward_mode=mode,
+        capture_hidden_mode=None,
+        decode_input_ids=None,
+        global_num_tokens=None,
+        global_bs=None,
+        all_decode_or_idle=mode.is_decode(),
+        all_extend=mode.is_extend(),
+        collective_num_tokens=None,
+        collective_global_num_tokens=None,
+        gather_ids=torch.tensor([1, 4]),
+        draft_narrowing=(
+            SimpleNamespace(publish_accepted_prefix=lambda: events.append("publish"))
+            if narrow
+            else None
+        ),
+        target_capture_sink=None,
+    )
+    layer._project_qkv_rope = lambda positions, hidden: (q, k, v, None)
+    layer.indexer = (lambda hidden, positions, context: topk) if sparse else None
+    layer.o_proj = lambda hidden: (hidden, None)
+
+    def attention(query, keys, values, context, **kwargs):
+        events.append("attention")
+        # Narrowing discards only queries: the whole catch-up KV window is written.
+        assert keys is k and values is v
+        assert context.forward_mode == (
+            ForwardMode.DECODE if narrow and not sparse else mode
+        )
+        if narrow and not sparse:
+            assert kwargs == {"record_kv_cache": not mode.is_decode_or_idle()}
+        else:
+            assert context is ctx
+            indices = kwargs["topk_indices"]
+            if sparse:
+                torch.testing.assert_close(indices, topk[[1, 4]] if narrow else topk)
+            else:
+                assert indices is None
+        return query
+
+    layer.attn = attention
+    output = layer.self_attention(torch.arange(6), q, ctx)
+    torch.testing.assert_close(output, q[[1, 4]] if narrow else q)
+    assert ctx.forward_mode == mode
+    assert events == (["publish", "attention"] if narrow else ["attention"])
 
 
 def test_qwen4_exp_nextn_compacts_context_topk_for_mtp_decode() -> None:
@@ -1227,7 +1291,6 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
     scratch = indexer._draft_scratch_buffers(
         committed_keys[:1],
         indexer._position_values(seed_position),
-        seed_position,
         1,
     )
 

@@ -47,7 +47,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 
-def _recipe(*, layer_types: tuple[str, ...], speculative: bool) -> Qwen4ExpRecipe:
+def _recipe(
+    *, layer_types: tuple[str, ...], speculative: bool, width: int
+) -> Qwen4ExpRecipe:
     text_config = SimpleNamespace(
         ple_layer_ids=(1, 2),
         short_conv_layer_ids=(0, 1),
@@ -71,7 +73,6 @@ def _recipe(*, layer_types: tuple[str, ...], speculative: bool) -> Qwen4ExpRecip
         cache_layer_types=layer_types,
         sliding_window_tokens=None,
     )
-    width = 3 if speculative else 1
     config = AttnConfig(
         # Planning allocates no device tensors. CUDA plus enabled replay makes
         # this exercise the missing-GDN gate before any kernel capability probe.
@@ -121,10 +122,12 @@ def _recipe(*, layer_types: tuple[str, ...], speculative: bool) -> Qwen4ExpRecip
     )
 
 
-@pytest.mark.parametrize("speculative", [False, True])
-def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative) -> None:
+@pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
+def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative, width) -> None:
     recipe = _recipe(
-        layer_types=(FULL_ATTENTION, FULL_ATTENTION), speculative=speculative
+        layer_types=(FULL_ATTENTION, FULL_ATTENTION),
+        speculative=speculative,
+        width=width,
     )
     assert not recipe.replay_ssm
     setup = recipe.setup()
@@ -147,6 +150,7 @@ def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative) -> None
     assert not any(field.endswith(".ssm") for field in fields)
     if speculative:
         assert qsa_raw_key_field(2) in fields
+    if speculative and width > 1:
         # PLE: eight 64-byte rows plus 64 bytes of commit indices. QSA:
         # two layers' 192-byte keys, 216 shared bytes and 32 address bytes.
         assert setup.fixed_workspace_bytes == 576 + 440
@@ -156,4 +160,6 @@ def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative) -> None
 
 def test_qwen4_state_layer_still_requires_linear_geometry() -> None:
     with pytest.raises(ValueError, match="linear-attention component"):
-        _recipe(layer_types=(LINEAR_ATTENTION, FULL_ATTENTION), speculative=False)
+        _recipe(
+            layer_types=(LINEAR_ATTENTION, FULL_ATTENTION), speculative=False, width=1
+        )

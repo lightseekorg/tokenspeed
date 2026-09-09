@@ -151,7 +151,7 @@ def state() -> QSAVerifyState:
 def _root_with_indexer(config, pool):
     router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
     indexer = QSAIndexerBackend(config, router)
-    root = Qwen4ExpBackend(router, None, indexer)
+    root = Qwen4ExpBackend(config, router, None, indexer)
     root.set_cache_pool(pool)
     return root, indexer
 
@@ -359,6 +359,8 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
         if graph is None:
             stage()
         else:
+            # Replay fills staging on-device; its Python accessor is not called.
+            # Both rounds must commit even without another host-side staging call.
             graph.replay()
         backend.commit_speculative_state_after_verify(
             torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0

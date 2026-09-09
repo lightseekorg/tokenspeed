@@ -1291,8 +1291,9 @@ def test_qwen4_exp_qsa_recent_write_reads_strided_token_k(device: str) -> None:
 
 @pytest.mark.parametrize("ratio, width", [(1, 4), (4, 3), (4, 4), (4, 5), (4, 9)])
 @pytest.mark.parametrize("null_pages", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_qwen4_exp_qsa_commit_verify_layers_matches_torch(
-    device: str, ratio: int, width: int, null_pages: bool
+    device: str, ratio: int, width: int, null_pages: bool, dtype: torch.dtype
 ) -> None:
     head_dim, recent_page_size, num_layers = 8, 64, 3
     counts = [-1, 0, 1, width - 1, width, width + 1]
@@ -1306,7 +1307,7 @@ def test_qwen4_exp_qsa_commit_verify_layers_matches_torch(
     positions = torch.randint(1, 64, (rows, 3), device=device, dtype=torch.int64)
     # A spare request per layer exercises the layer stride above the live batch.
     staged = torch.randn(
-        num_layers, bs + 1, width, 1, head_dim, device=device, dtype=torch.bfloat16
+        num_layers, bs + 1, width, 1, head_dim, device=device, dtype=dtype
     )
     raws = [
         torch.full(

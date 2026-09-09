@@ -1017,7 +1017,8 @@ class ForwardStepRunner:
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):
             self.attn_backend.commit_speculative_state_after_verify(
-                result[1], num_extends=ctx.num_extends
+                result[1],
+                num_extends=ctx.num_extends,
             )
 
         return result

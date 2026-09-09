@@ -95,6 +95,9 @@ class QSAVerifyState:
         )
         self._slots: dict[int, int] = {}
         self._verify_workspace: _QSAVerifyWorkspace | None = None
+        # Records whether a forward has ever used staging, including capture.
+        # Keep it set after commit: graph replay updates the buffers without
+        # running verify_staging_buffers() and its Python assignment again.
         self._verify_staged = False
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:

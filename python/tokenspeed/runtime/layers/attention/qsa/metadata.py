@@ -37,9 +37,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTEN
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
-    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
-        QSAIndexerMetadata,
-    )
 
 
 def decode_query_lengths(
@@ -77,20 +74,9 @@ class QSALayout:
     recent_locs: torch.Tensor
     complete_blocks: torch.Tensor
     qsa_page_table: torch.Tensor
-    qsa_page_expansion: int
     full_page_table: torch.Tensor
     full_kernel_page_size: int
     reset_draft_tags: torch.Tensor | None
-
-
-def qsa_attention_metadata(
-    ctx: ForwardContext,
-) -> QSAIndexerMetadata:
-    """Read the indexer consumer's metadata selected by this forward context."""
-    backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
-    if backend is None:
-        raise RuntimeError("QSA requires an indexer backend")
-    return backend.metadata_for(ctx.forward_mode)
 
 
 def qsa_forward_layout(
@@ -121,7 +107,9 @@ def qsa_forward_layout(
         return cached
 
     backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
-    metadata = qsa_attention_metadata(ctx)
+    if backend is None:
+        raise RuntimeError("QSA requires an indexer backend")
+    metadata = backend.metadata_for(ctx.forward_mode)
     query_lengths = decode_query_lengths(
         ctx,
         total_tokens,
@@ -158,7 +146,6 @@ def qsa_forward_layout(
         recent_locs=recent_locs,
         complete_blocks=complete_blocks,
         qsa_page_table=qsa_page_table,
-        qsa_page_expansion=1,
         full_page_table=full.page_table,
         full_kernel_page_size=full.kernel_page_size,
         reset_draft_tags=reset_draft_tags,

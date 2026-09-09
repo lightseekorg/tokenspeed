@@ -446,18 +446,12 @@ class Qwen4ExpAttentionDecoderLayer(
         ctx: ForwardContext,
     ) -> torch.Tensor:
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        if self.indexer is not None:
-            selected_slots = self.indexer(hidden_states, positions, ctx)
-            attention_output = self._attn(
-                q,
-                k,
-                v,
-                gate,
-                ctx,
-                topk_indices=selected_slots,
-            )
-        else:
-            attention_output = self._attn(q, k, v, gate, ctx)
+        selected_slots = (
+            self.indexer(hidden_states, positions, ctx)
+            if self.indexer is not None
+            else None
+        )
+        attention_output = self._attn(q, k, v, gate, ctx, topk_indices=selected_slots)
         output, _ = self.o_proj(attention_output)
         return output
 

@@ -696,36 +696,34 @@ def _create_hybrid_linear_attn_backend(
             "attn layers in this cache view (skipping linear backend)",
             len(full_attn_layers),
         )
-        if is_qwen4_exp(hf_config):
-            return _compose_qwen4_exp_backend(config, pool, full_attn_backend)
-        return full_attn_backend
-
-    kda_backend = server_args.kda_backend.strip().lower()
-    if is_kda:
-        kda_backend = _resolve_kda_backend(kda_backend)
-        linear_attn_backend = KdaAttnBackend(
-            config, config.component(SoftmaxAttnConfig), kda_backend=kda_backend
-        )
+        backend = full_attn_backend
     else:
-        linear_attn_backend = MambaAttnBackend(
-            config, config.component(SoftmaxAttnConfig)
+        kda_backend = server_args.kda_backend.strip().lower()
+        if is_kda:
+            kda_backend = _resolve_kda_backend(kda_backend)
+            linear_attn_backend = KdaAttnBackend(
+                config, config.component(SoftmaxAttnConfig), kda_backend=kda_backend
+            )
+        else:
+            linear_attn_backend = MambaAttnBackend(
+                config, config.component(SoftmaxAttnConfig)
+            )
+
+        # Recurrent state lives in the LCM arena and is addressed by the
+        # per-group block tables, so no separate request-indexed Mamba pool exists.
+        linear_attn_backend.set_kv_pool(pool)
+
+        backend = HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
         )
-
-    # Recurrent state lives in the LCM arena and is addressed by the
-    # per-group block tables, so no separate request-indexed Mamba pool exists.
-    linear_attn_backend.set_kv_pool(pool)
-
-    backend = HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )
+        logger.info(
+            "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
+            len(full_attn_layers),
+            len(linear_attn.layer_ids),
+            "LCM state fields",
+        )
     if is_qwen4_exp(hf_config):
         backend = _compose_qwen4_exp_backend(config, pool, backend)
-    logger.info(
-        "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
-        len(full_attn_layers),
-        len(linear_attn.layer_ids),
-        "LCM state fields",
-    )
     return backend
 
 
@@ -777,7 +775,7 @@ def _compose_qwen4_exp_backend(config, pool, attention_backend) -> AttentionBack
         if qsa_groups <= local_groups
         else None
     )
-    return Qwen4ExpBackend(attention_backend, ple, indexer)
+    return Qwen4ExpBackend(config, attention_backend, ple, indexer)
 
 
 def _wrap_inkling_backend(
@@ -1004,31 +1002,13 @@ def _prepare_verify_workspace(
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
-    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-        HybridLinearAttnBackend,
-    )
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
     if isinstance(backend, Qwen4ExpBackend):
-        actual_bytes = 0
-        if config.speculative_num_draft_tokens > 1:
-            gdn = (
-                backend.attention_backend.linear_attn_backend
-                if isinstance(backend.attention_backend, HybridLinearAttnBackend)
-                else None
-            )
-            for consumer in (
-                gdn,
-                backend.ple_backend,
-                backend.indexer_backend,
-            ):
-                if consumer is not None:
-                    actual_bytes += consumer.preallocate_verify_workspace(
-                        config.max_bs, width
-                    )
+        actual_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
     elif uses_paged_state_verify and expected_bytes:
         actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs, width

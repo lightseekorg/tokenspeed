@@ -30,6 +30,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
         Qwen4ExpPLEBackend,
     )
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -57,11 +59,12 @@ class Qwen4ExpBackend(AttentionBackend):
 
     def __init__(
         self,
+        config: AttnConfig,
         attention_backend: AttentionBackend,
         ple_backend: Qwen4ExpPLEBackend | None,
         indexer_backend: QSAIndexerBackend | None,
     ) -> None:
-        self.device = attention_backend.device
+        super().__init__(config, config.component(SoftmaxAttnConfig))
         self.attention_backend = attention_backend
         self.ple_backend = ple_backend
         self.indexer_backend = indexer_backend
@@ -83,6 +86,21 @@ class Qwen4ExpBackend(AttentionBackend):
         self.cache_pool = cache_pool
         for backend in self.child_backends():
             backend.set_cache_pool(cache_pool)
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Preallocate target verify consumers and return their total byte count."""
+        if self.is_draft or self.spec_num_tokens <= 1:
+            return 0
+        gdn = (
+            self.attention_backend.linear_attn_backend
+            if isinstance(self.attention_backend, HybridLinearAttnBackend)
+            else None
+        )
+        return sum(
+            consumer.preallocate_verify_workspace(max_bs, draft_token_num)
+            for consumer in (gdn, self.ple_backend, self.indexer_backend)
+            if consumer is not None
+        )
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
         for backend in self.child_backends():

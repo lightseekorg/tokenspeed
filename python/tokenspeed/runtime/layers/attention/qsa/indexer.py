@@ -173,7 +173,6 @@ class QSAIndexer(nn.Module):
         self,
         token_k: torch.Tensor,
         position_values: torch.Tensor,
-        logical_positions: torch.Tensor | None,
         bs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the request-local raw-key ring for one draft MTP round."""
@@ -308,7 +307,6 @@ class QSAIndexer(nn.Module):
         self,
         rows: int,
         page_table: torch.Tensor,
-        page_expansion: int,
         page_size: int,
     ) -> str:
         """Route block top-k between the streaming and materialized paths.
@@ -327,8 +325,7 @@ class QSAIndexer(nn.Module):
             )
         if path != "auto":
             return path
-        num_blocks = (page_table.shape[1] + page_expansion - 1) // page_expansion
-        num_blocks *= page_size
+        num_blocks = page_table.shape[1] * page_size
         budget_mb = envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get()
         # The materialized DSA-selection path measured 2-24x faster than the
         # fused streaming path across decode/prefill shapes, so auto prefers
@@ -347,7 +344,6 @@ class QSAIndexer(nn.Module):
         *,
         full_page_size: int,
         complete_blocks: torch.Tensor,
-        qsa_page_expansion: int = 1,
     ) -> torch.Tensor:
         """Select logical QSA blocks and emit physical full-cache slots."""
 
@@ -366,10 +362,8 @@ class QSAIndexer(nn.Module):
             complete_blocks,
             page_size=page_size,
             block_topk=self.block_topk,
-            page_expansion=qsa_page_expansion,
-            solution=self._topk_solution(
-                q.shape[0], qsa_page_table, qsa_page_expansion, page_size
-            ),
+            page_expansion=1,
+            solution=self._topk_solution(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=pdl_enabled(),
         )
@@ -437,7 +431,6 @@ class QSAIndexer(nn.Module):
             draft_scratch = self._draft_scratch_buffers(
                 token_k,
                 self._position_values(positions),
-                None,
                 ctx.bs,
             )
         layout = qsa_forward_layout(
@@ -512,7 +505,6 @@ class QSAIndexer(nn.Module):
             layout.full_page_table,
             compressed,
             full_page_size=layout.full_kernel_page_size,
-            qsa_page_expansion=layout.qsa_page_expansion,
             complete_blocks=complete_blocks,
         )
         if self.share_topk_for_mtp_iteration:

@@ -212,13 +212,16 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     @override
     def workspace_bytes(self) -> int:
         """GDN/PLE verify staging and commit rows, plus QSA verify staging."""
-        ple_commit_bytes = 0
-        if self.num_draft_layers:
-            num_ple_layers = sum(
-                field.field_id.endswith(".conv") for field in self._ple_fields()
-            )
-            # Source and destination int64 row ids, shared by every batch size.
-            ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
+        if (
+            not self.num_draft_layers
+            or self.attn_config.speculative_num_draft_tokens <= 1
+        ):
+            return 0
+        num_ple_layers = sum(
+            field.field_id.endswith(".conv") for field in self._ple_fields()
+        )
+        # Source and destination int64 row ids, shared by every batch size.
+        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
         return super().workspace_bytes() + ple_commit_bytes + self._qsa_staging_bytes()
 
     def _qsa_staging_bytes(self) -> int:

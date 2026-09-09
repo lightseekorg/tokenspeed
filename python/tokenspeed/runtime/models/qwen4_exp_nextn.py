@@ -95,16 +95,10 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        **kwargs,
+        *,
+        topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        topk_indices = kwargs.pop("topk_indices", None)
-        if kwargs:
-            raise TypeError(
-                f"unexpected Qwen4-Exp draft attention args: {sorted(kwargs)}"
-            )
         if ctx.draft_narrowing is None:
-            if topk_indices is None:
-                return super()._attn(q, k, v, gate, ctx)
             return super()._attn(
                 q,
                 k,

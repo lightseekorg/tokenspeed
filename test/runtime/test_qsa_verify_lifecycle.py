@@ -65,7 +65,19 @@ def _runner(
         events.append("qsa")
         commits["qsa"].append((accepted_lengths.tolist(), num_extends))
 
+    def config(is_draft):
+        return SimpleNamespace(
+            device="cpu",
+            dtype=torch.bfloat16,
+            is_draft=is_draft,
+            speculative_num_draft_tokens=4,
+            component=lambda component_type: SimpleNamespace(
+                num_attention_heads=1, num_kv_heads=1, attn_tp_size=1, head_dim=8
+            ),
+        )
+
     wrapper.attn_backend = Qwen4ExpBackend(
+        config=config(False),
         attention_backend=(
             HybridLinearAttnBackend(
                 full_backend,
@@ -85,6 +97,7 @@ def _runner(
         ),
     )
     draft_backend = Qwen4ExpBackend(
+        config=config(True),
         attention_backend=full_backend,
         ple_backend=None,
         indexer_backend=SimpleNamespace(

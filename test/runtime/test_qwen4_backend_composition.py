@@ -49,25 +49,31 @@ from tokenspeed.runtime.layers.attention.registry import (
 )
 
 
-@pytest.mark.parametrize("has_qsa", [False, True])
-@pytest.mark.parametrize(
-    "is_draft,has_ple", [(False, False), (False, True), (True, False)]
-)
-def test_composition_uses_local_fields_without_requiring_linear_layers(
-    has_ple, has_qsa, is_draft
-):
+def _config(*, is_draft: bool, width: int):
     spec = SimpleNamespace(
-        num_attention_heads=8, num_kv_heads=8, attn_tp_size=1, head_dim=16
+        num_attention_heads=8, num_kv_heads=1, attn_tp_size=2, head_dim=16
     )
-    config = SimpleNamespace(
+    return SimpleNamespace(
         component=lambda component_type: spec,
         device="cpu",
         dtype=torch.bfloat16,
         is_draft=is_draft,
-        speculative_num_draft_tokens=4,
+        speculative_num_draft_tokens=width,
         context_len=512,
         max_bs=4,
     )
+
+
+@pytest.mark.parametrize("has_qsa", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize(
+    "is_draft,has_ple", [(False, False), (False, True), (True, False)]
+)
+def test_composition_uses_local_fields_without_requiring_linear_layers(
+    has_ple, has_qsa, is_draft, hybrid, width
+):
+    config = _config(is_draft=is_draft, width=width)
     groups = [QWEN4_EXP_PLE_CACHE_GROUP] if has_ple else []
     if has_qsa:
         groups += [QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP]
@@ -89,17 +95,33 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
         layer_num=1,
         arena=SimpleNamespace(plan=SimpleNamespace(fields=fields)),
     )
-    full = SimpleNamespace(device="cpu", spec_num_tokens=4)
-    backend = _compose_qwen4_exp_backend(config, pool, full)
-    assert backend.attention_backend is full
+    full = SimpleNamespace(device="cpu", spec_num_tokens=width)
+    attention = (
+        HybridLinearAttnBackend(full, SimpleNamespace(), [3]) if hybrid else full
+    )
+    backend = _compose_qwen4_exp_backend(config, pool, attention)
+    assert backend.attention_backend is attention
     assert (backend.ple_backend is not None) == has_ple
     assert (backend.indexer_backend is not None) == has_qsa
+    # The public contract is available even when the child has no head/dtype fields.
+    assert backend.device == "cpu"
+    assert backend.dtype == torch.bfloat16
+    assert backend.is_draft is is_draft
+    assert backend.spec_num_tokens == width
+    assert backend.num_qo_heads == 4
+    assert backend.num_kv_heads == 1
+    assert backend.head_dim == 16
+    assert backend.cache_pool is None
 
 
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("has_gdn", [False, True])
+@pytest.mark.parametrize(
+    "has_ple,has_qsa", [(False, False), (False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("is_draft", [False, True])
 def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
-    width, has_gdn
+    width, has_gdn, has_ple, has_qsa, is_draft
 ):
     calls = []
 
@@ -113,30 +135,60 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
     attention = SimpleNamespace(device="cpu")
     if has_gdn:
         attention = HybridLinearAttnBackend(attention, consumer("gdn", 3), [0])
-    root = Qwen4ExpBackend(attention, consumer("ple", 5), consumer("qsa", 7))
+    config = _config(is_draft=is_draft, width=width)
+    config.max_bs = 2
+    root = Qwen4ExpBackend(
+        config,
+        attention,
+        consumer("ple", 5) if has_ple else None,
+        consumer("qsa", 7) if has_qsa else None,
+    )
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=width),
-        config=SimpleNamespace(max_bs=2, speculative_num_draft_tokens=width),
+        config=config,
         backend=root,
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
     )
-    _prepare_verify_workspace(
-        **kwargs, expected_bytes=(12 + 3 * has_gdn) if width > 1 else 0
-    )
+    target_verify = width > 1 and not is_draft
+    expected_bytes = (3 * has_gdn + 5 * has_ple + 7 * has_qsa) if target_verify else 0
+    _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes)
     assert calls == (
         ([("gdn", 2, width)] if has_gdn else [])
-        + [("ple", 2, width), ("qsa", 2, width)]
-        if width > 1
+        + ([("ple", 2, width)] if has_ple else [])
+        + ([("qsa", 2, width)] if has_qsa else [])
+        if target_verify
         else []
     )
     with pytest.raises(RuntimeError, match="does not match allocated tensors"):
-        _prepare_verify_workspace(**kwargs, expected_bytes=0 if width > 1 else 1)
+        _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes + 1)
 
 
-@pytest.mark.parametrize("has_local_state", [False, True])
-def test_hybrid_factory_binds_gdn_only_for_local_state(monkeypatch, has_local_state):
+@pytest.mark.parametrize("width,expected_bytes", [(1, 0), (4, 12)])
+def test_registry_preallocates_qwen4_without_inspecting_children(width, expected_bytes):
+    # A registry-facing composite needs only the operation, not its child fields.
+    root = object.__new__(Qwen4ExpBackend)
+    root.preallocate_verify_workspace = Mock(return_value=expected_bytes)
+    _prepare_verify_workspace(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=width),
+        config=SimpleNamespace(max_bs=2),
+        backend=root,
+        draft_backend=None,
+        uses_paged_state_verify=True,
+        is_inkling=False,
+        expected_bytes=expected_bytes,
+    )
+    root.preallocate_verify_workspace.assert_called_once_with(2, width)
+
+
+@pytest.mark.parametrize("is_qwen4", [False, True])
+@pytest.mark.parametrize(
+    "has_linear_config,has_local_state", [(False, False), (True, False), (True, True)]
+)
+def test_hybrid_factory_binds_gdn_only_for_local_state(
+    monkeypatch, is_qwen4, has_linear_config, has_local_state
+):
     # Load the subclass before replacing its base class with a constructor mock.
     import_module("tokenspeed.runtime.layers.attention.backends.state.kda")
     full = SimpleNamespace(device="cpu", spec_num_tokens=1)
@@ -146,18 +198,23 @@ def test_hybrid_factory_binds_gdn_only_for_local_state(monkeypatch, has_local_st
         "tokenspeed.runtime.layers.attention.backends.state.mamba.MambaAttnBackend",
         factory,
     )
+    config = _config(is_draft=False, width=1)
     components = {
-        SoftmaxAttnConfig: SimpleNamespace(),
-        LinearAttnConfig: SimpleNamespace(layer_ids=(0 if has_local_state else 3,)),
+        SoftmaxAttnConfig: config.component(SoftmaxAttnConfig),
+        LinearAttnConfig: (
+            SimpleNamespace(layer_ids=(0 if has_local_state else 3,))
+            if has_linear_config
+            else None
+        ),
     }
-    config = SimpleNamespace(component=components.get)
+    config.component = components.get
     pool = SimpleNamespace(
         state_group_by_layer={0: "linear_attention"} if has_local_state else {},
         field_layer_range=range(2),
         layer_num=2,
         arena=SimpleNamespace(plan=SimpleNamespace(fields=[])),
     )
-    monkeypatch.setattr(registry, "is_qwen4_exp", lambda hf_config: True)
+    monkeypatch.setattr(registry, "is_qwen4_exp", lambda hf_config: is_qwen4)
     monkeypatch.setattr(
         registry, "_create_attn_backend_with_name", lambda name, arch, config: full
     )
@@ -172,7 +229,11 @@ def test_hybrid_factory_binds_gdn_only_for_local_state(monkeypatch, has_local_st
         full_attn_backend_name=None,
         is_kda=False,
     )
+    assert isinstance(backend, Qwen4ExpBackend) == is_qwen4
+    attention = backend.attention_backend if is_qwen4 else backend
     if has_local_state:
+        assert isinstance(attention, HybridLinearAttnBackend)
+        assert attention.full_attn_backend is full
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
         gdn.set_kv_pool.assert_called_once_with(pool)
         accepted = torch.tensor([1, 3], dtype=torch.int32)
@@ -180,7 +241,7 @@ def test_hybrid_factory_binds_gdn_only_for_local_state(monkeypatch, has_local_st
         gdn.commit_verified_state.assert_called_once_with(accepted)
     else:
         factory.assert_not_called()
-        assert backend.attention_backend is full
+        assert attention is full
 
 
 @pytest.fixture(params=[False, True], ids=["router", "hybrid"])
@@ -197,7 +258,10 @@ def attention_root(request):
         if request.param
         else router
     )
-    return Qwen4ExpBackend(attention, None, None), router
+    return (
+        Qwen4ExpBackend(_config(is_draft=False, width=4), attention, None, None),
+        router,
+    )
 
 
 def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):

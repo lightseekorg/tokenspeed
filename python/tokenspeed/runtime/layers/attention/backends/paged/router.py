@@ -105,13 +105,11 @@ class RouterDecodeWriteLocations:
 class PagedGroupView:
     """Resolved pages for a backend runtime consuming one cache group.
 
-    The table aliases the router's persistent stack. ``pages_per_block`` is
-    the router-owned expansion factor; consumers never expand raw tables.
+    The table aliases the router's persistent stack, with its kernel page size.
     """
 
     page_table: torch.Tensor
     kernel_page_size: int
-    pages_per_block: int
 
 
 class CacheGroupRouter(AttentionBackend):
@@ -301,14 +299,13 @@ class CacheGroupRouter(AttentionBackend):
             bs: Number of batch rows, including graph padding.
 
         Returns:
-            A view over the router's table with its kernel page size and
-            block expansion. The router remains the only geometry owner.
+            A view over the router's table with its kernel page size.
+            The router remains the only geometry owner.
         """
         page_size = self.stacks.group_kernel_page_size(group_id)
         return PagedGroupView(
             page_table=self.stacks.table(group_id, bs),
             kernel_page_size=page_size,
-            pages_per_block=self.stacks.group_page_expansion(group_id),
         )
 
     # ------------------------------------------------------------------

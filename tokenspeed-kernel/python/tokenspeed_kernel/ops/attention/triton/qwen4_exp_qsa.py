@@ -1263,7 +1263,9 @@ def qwen4_exp_qsa_commit_verify_layers(
     Args:
         raw_addresses: CUDA uint64 base address for each raw-key cache field.
         position_addresses: CUDA uint64 base address for each position field.
-        staged_k: Keys shaped ``[layers, capacity, width, 1, head_dim]``.
+        staged_k: Keys shaped ``[layers, capacity, width, 1, head_dim]`` in
+            the model's floating-point dtype. Loads use that dtype and stores
+            convert to the raw-key cache's fixed bfloat16 format.
         logical_positions: Consecutive logical positions within each request,
             in request-major order.
         recent_locs: Recent-cache locations for live rows.
