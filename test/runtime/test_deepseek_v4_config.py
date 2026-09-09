@@ -113,10 +113,6 @@ from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     Mxfp4Config,
 )
-from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
@@ -151,7 +147,6 @@ from tokenspeed.runtime.models.deepseek_v4_dspark import (
     DeepseekV4ForCausalLMDSpark,
     _apply_dspark_hc_head,
     _is_zero_initialized_expert_bias,
-    _replicate_dspark_vocab_weight,
     count_dspark_stages,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
@@ -162,10 +157,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     dspark_rmsnorm,
     get_dspark_topk_idxs_batched,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
-    DSparkVanillaMarkov,
-    _local_vocab_argmax,
-)
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
 from tokenspeed.runtime.models.deepseek_v4_next import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -2075,12 +2067,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values,
                 gathered_ids,
-                None,
-                None,
-                None,
-                False,
-                None,
-                None,
             )
 
         self.assertEqual(gather.call_count, 2)
@@ -2093,15 +2079,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 gathered_values[:, :1],
                 gathered_ids[:, :1],
-                None,
-                None,
-                None,
-                False,
-                None,
-                None,
             )
 
-    def test_dspark_replicated_argmax_bypasses_collective_workspaces(self):
+    def test_dspark_single_rank_argmax_bypasses_collective_workspaces(self):
         local_logits = torch.tensor([[1.0, 7.0, 3.0, 4.0]])
         lm_head = SimpleNamespace(
             tp_size=1,
@@ -2123,140 +2103,12 @@ class TestDeepseekV4Config(unittest.TestCase):
                 object(),
                 torch.empty(0),
                 torch.empty(0, dtype=torch.int64),
-                None,
-                None,
-                None,
-                False,
-                None,
-                None,
             )
 
         gather.assert_not_called()
         self.assertTrue(torch.equal(token_ids, torch.tensor([1], dtype=torch.int32)))
 
-    def test_dspark_replicated_markov_embedding_preserves_local_projection(self):
-        full_embedding = torch.arange(192, dtype=torch.float32).reshape(64, 3)
-        full_projection = torch.arange(192, 384, dtype=torch.float32).reshape(64, 3)
-        embedding = VocabParallelEmbedding(
-            64,
-            3,
-            params_dtype=torch.float32,
-        )
-        projection = ParallelLMHead(
-            64,
-            3,
-            params_dtype=torch.float32,
-            tp_rank=1,
-            tp_size=2,
-            tp_group=(0, 1),
-        )
-        with torch.no_grad():
-            embedding.weight.copy_(full_embedding)
-            projection.weight.copy_(full_projection[32:])
-        markov = DSparkVanillaMarkov(embedding, projection)
-
-        with patch(
-            "tokenspeed.runtime.layers.vocab_parallel_embedding.all_reduce"
-        ) as reduce:
-            actual = markov.local_bias(torch.tensor([1, 46], dtype=torch.int32))
-
-        reduce.assert_not_called()
-        expected = full_embedding[[1, 46]] @ full_projection[32:].T
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertEqual(embedding.tp_size, 1)
-        self.assertEqual(projection.tp_size, 2)
-
-    def test_dspark_vocab_replication_reconstructs_tp_rank_order(self):
-        local_weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-        module = SimpleNamespace(
-            tp_size=1,
-            num_added_embeddings=0,
-            org_vocab_size=8,
-            org_vocab_size_padded=8,
-            num_embeddings_padded=8,
-        )
-        mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_size=2, tp_group=(0, 1)),
-        )
-
-        def fake_all_gather(weight, group, dim):
-            self.assertTrue(weight.is_contiguous())
-            self.assertEqual(group, (0, 1))
-            self.assertEqual(dim, 0)
-            return torch.cat((weight, weight + 100), dim=0)
-
-        with patch(
-            "tokenspeed.runtime.models.deepseek_v4_dspark.all_gather",
-            side_effect=fake_all_gather,
-        ) as gather:
-            full_weight = _replicate_dspark_vocab_weight(
-                local_weight,
-                module,
-                mapping,
-                label="LM head",
-            )
-
-        gather.assert_called_once()
-        self.assertTrue(
-            torch.equal(
-                full_weight,
-                torch.cat((local_weight, local_weight + 100), dim=0),
-            )
-        )
-
-    def test_dspark_vocab_replication_rejects_padded_layout(self):
-        module = SimpleNamespace(
-            tp_size=1,
-            num_added_embeddings=0,
-            org_vocab_size=7,
-            org_vocab_size_padded=8,
-            num_embeddings_padded=8,
-        )
-        mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_size=2, tp_group=(0, 1)),
-        )
-        with self.assertRaisesRegex(ValueError, "unpadded base-only"):
-            _replicate_dspark_vocab_weight(
-                torch.ones(4, 3),
-                module,
-                mapping,
-                label="embedding",
-            )
-
-    def test_dspark_replicated_weight_refresh_preserves_graph_buffers(self):
-        old_embed = torch.zeros(8, 3)
-        old_head = torch.zeros(8, 3)
-        new_embed = torch.full((8, 3), 2.0)
-        new_head = torch.full((8, 3), 3.0)
-        model = SimpleNamespace(
-            replicate_vocab_heads=True,
-            embed_tokens=SimpleNamespace(weight=old_embed),
-            refresh_local_base_logits_head=Mock(),
-        )
-        draft = object.__new__(DeepseekV4ForCausalLMDSpark)
-        draft.model = model
-        draft.lm_head = SimpleNamespace(weight=old_head)
-        draft.mapping = SimpleNamespace()
-        embed_ptr = old_embed.data_ptr()
-        head_ptr = old_head.data_ptr()
-
-        with patch(
-            "tokenspeed.runtime.models.deepseek_v4_dspark._replicate_dspark_vocab_weight",
-            side_effect=(new_embed, new_head),
-        ) as replicate:
-            draft.refresh_replicated_embed_and_head(object(), object())
-
-        self.assertEqual(replicate.call_count, 2)
-        self.assertEqual(old_embed.data_ptr(), embed_ptr)
-        self.assertEqual(old_head.data_ptr(), head_ptr)
-        self.assertTrue(torch.equal(old_embed, new_embed))
-        self.assertTrue(torch.equal(old_head, new_head))
-        model.refresh_local_base_logits_head.assert_called_once_with(
-            old_head,
-            force=True,
-        )
-
-    def test_dspark_wire_target_keeps_reconstructed_draft_head(self):
+    def test_dspark_wire_target_uses_draft_head(self):
         draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)
         target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
         drafter = object.__new__(DeepseekV4DSpark)
@@ -6669,7 +6521,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
-            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6706,7 +6557,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
-            hash_table_values_validated=False,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6716,66 +6566,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(topk_ids, expected_ids))
         self.assertTrue(torch.allclose(topk_weights, expected_weights))
-
-    def test_deepseek_v4_hash_gate_validates_complete_loaded_table(self):
-        config = SimpleNamespace(
-            n_routed_experts=4,
-            hidden_size=8,
-            num_hash_layers=1,
-            vocab_size=3,
-            num_experts_per_tok=2,
-            topk_method=None,
-        )
-        gate = DeepseekV4MoEGate(config, layer_index=0)
-        with torch.no_grad():
-            gate.tid2eid.copy_(
-                torch.tensor([[0, 1], [2, 3], [1, 2]], dtype=torch.int32)
-            )
-        gate.validate_hash_indices_table(config.n_routed_experts)
-
-        for invalid in (-1, config.n_routed_experts):
-            with torch.no_grad():
-                gate.tid2eid[1, 0] = invalid
-            with self.assertRaisesRegex(ValueError, r"entries must be in \[0, 4\)"):
-                gate.validate_hash_indices_table(config.n_routed_experts)
-
-    def test_deepseek_v4_hash_router_forwards_validated_table_contract(self):
-        logits = torch.tensor([[0.5, 1.0, -0.5, 0.1]], dtype=torch.float32)
-        input_ids = torch.tensor([1], dtype=torch.long)
-        table = torch.tensor([[0, 1], [3, 2]], dtype=torch.int32)
-        observed = []
-
-        def fake_kernel(*args, **kwargs):
-            observed.append(kwargs["hash_table_values_validated"])
-            selected = args[4][args[5].reshape(-1).long()]
-            weights = torch.ones(selected.shape, dtype=torch.float32)
-            return weights, selected, args[0]
-
-        original = deepseek_v4_model._kernel_dsv4_select_experts
-        deepseek_v4_model._kernel_dsv4_select_experts = fake_kernel
-        try:
-            default = dsv4_select_experts(
-                logits,
-                top_k=2,
-                renormalize=True,
-                hash_indices_table=table,
-                input_ids=input_ids,
-                hash_table_values_validated=False,
-            )
-            trusted = dsv4_select_experts(
-                logits,
-                top_k=2,
-                renormalize=True,
-                hash_indices_table=table,
-                input_ids=input_ids,
-                hash_table_values_validated=True,
-            )
-        finally:
-            deepseek_v4_model._kernel_dsv4_select_experts = original
-
-        self.assertEqual(observed, [False, True])
-        for default_tensor, trusted_tensor in zip(default, trusted, strict=True):
-            self.assertTrue(torch.equal(default_tensor, trusted_tensor))
 
     def test_deepseek_v4_gate_cpu_returns_fp32_logits(self):
         config = SimpleNamespace(
@@ -6858,7 +6648,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
-            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()

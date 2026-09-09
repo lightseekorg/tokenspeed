@@ -3103,7 +3103,6 @@ def _dsv4_select_experts_bias() -> object:
         True,
         correction_bias=correction_bias,
         need_scores=False,
-        hash_table_values_validated=False,
     )
 
 
@@ -3117,7 +3116,6 @@ def _dsv4_select_experts_hash() -> object:
         True,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
-        hash_table_values_validated=False,
     )
 
 

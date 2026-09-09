@@ -38,40 +38,4 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
-            hash_table_values_validated=False,
-        )
-
-
-def test_trusted_hash_table_still_checks_runtime_input_ids() -> None:
-    logits = torch.zeros((1, 4), dtype=torch.float32)
-    table = torch.tensor([[0, 1]], dtype=torch.int32)
-    input_ids = torch.ones((1,), dtype=torch.int64)
-
-    with pytest.raises(ValueError, match=r"input_ids entries must be in \[0, 1\)"):
-        dsv4_select_experts(
-            logits,
-            top_k=2,
-            renormalize=True,
-            hash_indices_table=table,
-            input_ids=input_ids,
-            hash_table_values_validated=True,
-        )
-
-
-def test_hash_table_validation_contract_rejects_invalid_option_use() -> None:
-    logits = torch.zeros((1, 4), dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="requires hash_indices_table"):
-        dsv4_select_experts(
-            logits,
-            top_k=2,
-            renormalize=True,
-            hash_table_values_validated=True,
-        )
-    with pytest.raises(TypeError, match="must be a bool"):
-        dsv4_select_experts(
-            logits,
-            top_k=2,
-            renormalize=True,
-            hash_table_values_validated=1,
         )

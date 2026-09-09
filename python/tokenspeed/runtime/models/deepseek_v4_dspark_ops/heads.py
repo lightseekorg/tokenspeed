@@ -7,13 +7,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    DistArgmaxState,
-)
-from tokenspeed_kernel.ops.sampling.cute_dsl import _invoke_kernel as _cute_local_argmax
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    distributed_argmax,
-)
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
@@ -25,12 +18,6 @@ def _local_vocab_argmax(
     tp_group,
     gathered_values: torch.Tensor,
     gathered_ids: torch.Tensor,
-    dist_argmax_state: DistArgmaxState | None,
-    dist_argmax_max: torch.Tensor | None,
-    dist_argmax_ids: torch.Tensor | None,
-    local_cute_argmax: bool,
-    local_argmax_max: torch.Tensor | None,
-    local_argmax_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     """Return global argmax IDs for vocab-sharded logits."""
     shard = lm_head.shard_indices
@@ -41,58 +28,7 @@ def _local_vocab_argmax(
     added_vocab_start = int(shard.added_vocab_start_index)
     rows = local_logits.shape[0]
 
-    if dist_argmax_state is not None:
-        if (
-            num_added != 0
-            or num_org_padded != num_org
-            or local_logits.shape[1] != num_org
-        ):
-            raise ValueError(
-                "DSpark distributed argmax requires an unpadded base-only "
-                "local vocabulary shard."
-            )
-        if dist_argmax_max is None or dist_argmax_ids is None:
-            raise ValueError(
-                "DSpark distributed argmax requires preallocated max/id scratch."
-            )
-        max_out = dist_argmax_max[:rows]
-        ids_out = dist_argmax_ids[:rows]
-        _, global_ids = distributed_argmax(
-            dist_argmax_state,
-            local_logits.contiguous(),
-            out_max=max_out,
-            out_idx=ids_out,
-        )
-        return global_ids.to(torch.int32)
-
-    if local_cute_argmax:
-        if dist_argmax_state is not None:
-            raise ValueError(
-                "DSpark local and distributed CuTe argmax paths are mutually exclusive."
-            )
-        if (
-            num_added != 0
-            or num_org_padded != num_org
-            or local_logits.shape[1] != num_org
-        ):
-            raise ValueError(
-                "DSpark local CuTe argmax requires an unpadded base-only local "
-                "vocabulary shard."
-            )
-        if local_argmax_max is None or local_argmax_ids is None:
-            raise ValueError(
-                "DSpark local CuTe argmax requires preallocated max/id scratch."
-            )
-        if local_argmax_max.dtype != torch.float32:
-            raise ValueError("DSpark local CuTe argmax max scratch must be float32.")
-        if local_argmax_ids.dtype != torch.int64:
-            raise ValueError("DSpark local CuTe argmax ID scratch must be int64.")
-        if not local_logits.is_contiguous():
-            raise ValueError("DSpark local CuTe argmax logits must be contiguous.")
-        local_max = local_argmax_max[:rows]
-        local_arg = local_argmax_ids[:rows]
-        _cute_local_argmax(local_logits, local_max, local_arg)
-    elif num_org > 0:
+    if num_org > 0:
         local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
     else:
         local_max = torch.full(
@@ -217,12 +153,6 @@ def sample_dspark_block_greedy(
     gathered_values: torch.Tensor,
     gathered_ids: torch.Tensor,
     output: torch.Tensor,
-    dist_argmax_state: DistArgmaxState | None,
-    dist_argmax_max: torch.Tensor | None,
-    dist_argmax_ids: torch.Tensor | None,
-    local_cute_argmax: bool,
-    local_argmax_max: torch.Tensor | None,
-    local_argmax_ids: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the trained Markov correction and greedily sample a fixed block."""
 
@@ -235,12 +165,6 @@ def sample_dspark_block_greedy(
             tp_group,
             gathered_values,
             gathered_ids,
-            dist_argmax_state,
-            dist_argmax_max,
-            dist_argmax_ids,
-            local_cute_argmax,
-            None if local_argmax_max is None else local_argmax_max[step],
-            None if local_argmax_ids is None else local_argmax_ids[step],
         )
         output[:, step] = previous
     return output
