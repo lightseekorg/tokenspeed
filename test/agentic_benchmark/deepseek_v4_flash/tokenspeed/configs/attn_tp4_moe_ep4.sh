@@ -7,8 +7,6 @@ exec ts serve \
     --model deepseek-ai/DeepSeek-V4-Flash-0731 \
     --trust-remote-code \
     --world-size 4 \
-    --nprocs-per-node 4 \
-    --nnodes 1 \
     --attn-tp-size 4 \
     --dense-tp-size 4 \
     --moe-tp-size 1 \
