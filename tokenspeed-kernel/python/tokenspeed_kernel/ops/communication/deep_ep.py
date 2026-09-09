@@ -795,6 +795,16 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
+    def prepare(self) -> None:
+        """Allocate persistent communication buffers before cache profiling.
+
+        Construction alone installs dispatch implementations but allocates no
+        wire storage. Model weight preprocessing calls this collective on all
+        EP ranks so available-memory profiling includes the eventual buffer.
+        No tokens are dispatched and no decode metadata is required.
+        """
+        self._get_impl(self.deepep_mode.enable_low_latency())._get_buffer()
+
     def dispatch(self, *args, **kwargs) -> tuple:
         self.dispatch_a(*args, **kwargs)
         return self.dispatch_b()

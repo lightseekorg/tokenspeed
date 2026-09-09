@@ -1132,6 +1132,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mock.Mock(),
                 num_global_tokens=1,
                 max_num_tokens_per_gpu=1,
+                do_finalize=True,
+                low_latency=None,
+                overlap_fn=None,
             ),
             routed_input + 1,
         )
@@ -1146,6 +1149,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             side_effect=AssertionError("zero tokens must bypass the fused pipeline")
         )
         layer = SimpleNamespace(
+            _use_deepep=False,
             _gather_dp_tokens_for_moe=False,
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,

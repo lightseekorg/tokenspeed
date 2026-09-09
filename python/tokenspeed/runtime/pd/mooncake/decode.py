@@ -46,6 +46,8 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
+    # The legacy bootstrap wire key is "num_target_layers".
+    num_target_cache_layers: int
     cache_layout: CacheTransferContract | None = None
     # Prefill chunk-pipeline stage count; each stage sends only its own
     # layers' KV, so Decode plans per stage and unions the routes.

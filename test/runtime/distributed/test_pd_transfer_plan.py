@@ -275,6 +275,7 @@ def test_pp_receiver_calc_merges_stage_routes():
     info = PrefillParallelInfo(
         tp_size=2,  # registered world = pp(2) x tp(1)
         dp_size=1,
+        num_target_cache_layers=2,
         cache_layout=layout,
         pp_size=2,
     )
@@ -319,6 +320,7 @@ def test_pp_receiver_calc_honors_layer_partition():
         info = PrefillParallelInfo(
             tp_size=2,
             dp_size=1,
+            num_target_cache_layers=3,
             cache_layout=layout,
             pp_size=2,
             pp_layer_partition=partition,

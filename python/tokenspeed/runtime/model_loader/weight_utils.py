@@ -633,17 +633,21 @@ def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
 
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
+    *,
+    process_group: torch.distributed.ProcessGroup | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files using the
     InstantTensor library.
 
     InstantTensor accelerates loading safetensors weights on NVIDIA GPUs
     through distributed loading, pipelined prefetching, and direct I/O. When
-    the job spans multiple ranks, the world process group is passed to
-    InstantTensor so reads are sharded across ranks.
+    a process group is supplied, reads are sharded across those ranks. All
+    participants must consume the same checkpoint files and tensor iterator.
 
     Args:
         hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
+        process_group: Ranks consuming the same weights, or None for local
+            loading. Pipeline context models use their stage's TP group.
 
     Yields:
         ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
@@ -667,16 +671,14 @@ def instanttensor_weights_iterator(
             "Use --load-format auto instead."
         )
 
-    return _instanttensor_tensors(instanttensor, hf_weights_files)
+    return _instanttensor_tensors(instanttensor, hf_weights_files, process_group)
 
 
 def _instanttensor_tensors(
-    instanttensor, hf_weights_files: list[str]
+    instanttensor,
+    hf_weights_files: list[str],
+    process_group: torch.distributed.ProcessGroup | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    process_group = None
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        process_group = torch.distributed.group.WORLD
-
     device = torch.cuda.current_device()
 
     enable_tqdm = (

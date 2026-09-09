@@ -21,6 +21,9 @@
 import dataclasses
 import struct
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    CacheLayerOwnership,
+)
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
     CachePDLayerwiseBlockSelection,
@@ -57,10 +60,8 @@ class KVArgs:
     ib_device: str
     gpu_id: int
     cache_layout: CacheTransferContract
+    layer_ownership: CacheLayerOwnership
     cache_producer_schedule: CacheProducerSchedule | None = None
-    # Prefill chunk-pipeline: this rank's [start, end) global layer window.
-    # None when PP is off (the rank owns every layer).
-    pp_layer_window: tuple[int, int] | None = None
     # Full-model logical contract for the PD wire when the local arena/plan
     # is narrowed to a stage window; None means cache_layout is already it.
     wire_cache_layout: CacheTransferContract | None = None

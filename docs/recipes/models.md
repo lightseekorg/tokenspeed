@@ -226,6 +226,10 @@ target's whatever the drafter proposed.
 
 ## Kimi K3
 
+For Hopper MXFP4 serving with pipeline prefill, attention-DP decode, DeepEP,
+DSpark and decode CUDA graphs, see the
+[K3 Hopper PD configuration and validation guide](../guides/kimi-k3-hopper-pd.md).
+
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a
 DeepSeek-V3-style latent MoE. The KDA layers currently use
@@ -242,15 +246,16 @@ Notes:
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
-- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
-  (fp8 KV required). AMD uses the `mla` backend.
+- The NVIDIA default selects `tokenspeed_mla` (FP8 KV), whose current kernels
+  support Blackwell. On Hopper explicitly select `--attention-backend flashmla`
+  or `mla` with `--kv-cache-dtype bfloat16`. AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
   a flattened local checkpoint and separately staged remote-code cache are no
   longer required.
-- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses its
-  required FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
+- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
+  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
   BF16 so context injection and draft attention match the reference precision.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution

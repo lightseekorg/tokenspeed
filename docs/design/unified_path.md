@@ -240,6 +240,15 @@ decode too. (`_cache_contract_bound` is gone: every LCM pool publishes a
 cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
+K3 DSpark pipeline prefill distributes target-tap projection across stages,
+while the final stage owns the proposal network and draft cache. After
+target prefill sampling, that stage runs the ordinary drafter; its completed
+call publishes the final cache producer barrier. PD transfers the sampled
+anchor and real draft candidates with the target and draft caches. Decode
+installs that window before its first ordinary verify round. Stage ownership
+changes where context and proposals are produced; candidate handoff and
+verification follow the same path as other speculative prefills.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
@@ -458,6 +467,25 @@ buffer; `fill_input_buffers` takes no table.
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
 
+## K3 target capture is configured once
+
+`create_model_runner` calls `_wire_draft_to_target_model` after both models
+load. For K3 DSpark, that function invokes `K3DSpark.configure_target` once
+to configure the target's capture layers, stream and output layout. This
+also runs on PP stages that have no executing drafter. Later,
+`K3DSpark.wire_target` binds model references, embeddings and output heads
+without reconfiguring capture. This setup contract is specific to K3;
+other drafter families retain their existing wiring.
+
+A *tap* is a selected intermediate target hidden state for each token. Its
+count controls the features supplied to the draft, independently of the
+draft's computation depth, cache-layer count and number of PP stages. K3
+uses zero-based completed-layer IDs in checkpoint order: a `prefix` tap
+reads that layer's resulting prefix stream; an `attn_res` tap applies the
+next consumer layer's attention mixing (or the final output mixing at the
+last layer). A boundary `attn_res` tap therefore belongs to the stage with
+that consumer's weights.
+
 ## Per-forward drafter work rides on the context
 
 What a drafter wants done *during* the target forward is a property of that
@@ -473,9 +501,9 @@ DFLASH is the one user: its incremental projection attaches
 draft's `fc` projection on the aux stream so the draft KV is written under
 the target's remaining layers. The arming gate is the same
 `_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. Model-side
-capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
-in which tap order — and carries no per-round state.
+round can never be armed on one side and drained on the other. These hooks
+consume the target's capture configuration; they do not change the tap
+selection or output layout.
 
 ## Non-goals
 

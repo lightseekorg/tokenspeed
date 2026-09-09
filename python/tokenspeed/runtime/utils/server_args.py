@@ -303,7 +303,9 @@ class ServerArgs:
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
     disable_sampling_tp_sync: bool = False
-    low_latency_max_num_tokens_per_gpu: int = 256
+    # Resolved with the model before loading: token-sliced K3 uses its actual
+    # decode capacity; other DeepEP plans retain the legacy 256-row allocation.
+    low_latency_max_num_tokens_per_gpu: int | None = None
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
@@ -807,10 +809,11 @@ class ServerArgs:
                     "--pipeline-parallel-size > 1 with attention DP is not "
                     "supported yet"
                 )
-            if self.speculative_algorithm is not None:
+            if self.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError(
-                    "--pipeline-parallel-size > 1 does not support "
-                    "speculative decoding"
+                    "--pipeline-parallel-size > 1 supports only DSPARK "
+                    "context production on a prefill server; other "
+                    "speculative algorithms are not supported"
                 )
             if (
                 self.pp_layer_partition is not None
@@ -914,6 +917,11 @@ class ServerArgs:
             )
 
     def validate(self):
+        if (
+            self.low_latency_max_num_tokens_per_gpu is not None
+            and self.low_latency_max_num_tokens_per_gpu <= 0
+        ):
+            raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2076,7 +2084,10 @@ class ServerArgs:
             "--low-latency-max-num-tokens-per-gpu",
             type=int,
             default=ServerArgs.low_latency_max_num_tokens_per_gpu,
-            help="Low latency max num tokens per gpu",
+            help="DeepEP low-latency send capacity per rank. When omitted, K3 "
+            "token dispatch derives it from the maximum per-DP verify batch "
+            "after TP slicing (plus recovery chunks when low latency is "
+            "pinned); other plans use 256.",
         )
 
         parser.add_argument(

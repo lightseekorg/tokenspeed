@@ -109,6 +109,7 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
         reduce_project_routed=lambda x: x,
     )
     return SimpleNamespace(
+        _use_deepep=False,
         _gather_dp_tokens_for_moe=False,
         native_latent_moe=None,
         stream_fork=fork,

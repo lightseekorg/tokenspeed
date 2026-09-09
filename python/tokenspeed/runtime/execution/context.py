@@ -32,6 +32,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.context_producer import (
+        PrefillTargetContextProducer,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -122,6 +125,9 @@ class ForwardContext:
     # by the drafter (prepare_target_forward) for the rounds it overlaps with
     # the target; None means the taps are only collected in aux_hidden_states.
     target_capture_sink: TargetCaptureSink | None = None
+    # Prefill pipeline context production carries behavior, while its chunk's
+    # tensor accumulator is part of PPStageState and never stored on ctx.
+    target_context_producer: PrefillTargetContextProducer | None = None
 
 
 @contextmanager

@@ -56,7 +56,7 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -126,7 +126,12 @@ from tokenspeed.runtime.layers.moe.latent import (
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+    use_deepep_low_latency,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
@@ -231,7 +236,13 @@ class KimiLinearMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        if is_shared_expert:
+        if is_shared_expert and get_all2all_backend().is_deepep():
+            # Each attention-DP batch has its own shared expert computation.
+            # DeepEP only owns the routed experts, never these TP partials.
+            tp_rank = mapping.attn.tp_rank
+            tp_size = mapping.attn.tp_size
+            tp_group = mapping.attn.tp_group
+        elif is_shared_expert:
             tp_rank = mapping.moe.tp_ep_rank
             tp_size = mapping.moe.tp_ep_size
             tp_group = mapping.moe.tp_ep_group
@@ -1460,7 +1471,21 @@ class KimiLinearMoE(nn.Module):
         # Attention DP partitions the batch when its TP group is smaller than
         # the MoE TP×EP group. Gather those DP shards so every rank enters the
         # K3 MoE with the same complete token batch.
-        self._gather_dp_tokens_for_moe = mapping.attn.tp_size != mapping.moe.tp_ep_size
+        self._use_deepep = get_all2all_backend().is_deepep()
+        if self._use_deepep and (
+            not plan.use_marlin
+            or mapping.attn.cp_size != 1
+            or mapping.moe.tp_size != 1
+            or mapping.moe.dp_size != 1
+            or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
+        ):
+            raise ValueError(
+                "Kimi-K3 DeepEP requires Marlin, attention CP=1, MoE TP=1/DP=1, "
+                "and expert EP == attention TP*DP inside each pipeline stage."
+            )
+        self._gather_dp_tokens_for_moe = (
+            not self._use_deepep and mapping.attn.tp_size != mapping.moe.tp_ep_size
+        )
         if self._gather_dp_tokens_for_moe:
             if (
                 mapping.attn.cp_size != 1
@@ -1544,9 +1569,12 @@ class KimiLinearMoE(nn.Module):
             ),
         )
 
-        # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
-        self._shard_latent_projections = _shard_k3_latent_projection(
-            mapping, config.hidden_size
+        # The multicast/column down producer requires identical token rows
+        # across its group. DeepEP sources are disjoint token slices, so they
+        # keep complete local down weights; only their up projection shards.
+        self._shard_latent_projections = (
+            not self._use_deepep
+            and _shard_k3_latent_projection(mapping, config.hidden_size)
         )
         # Every captured decode width takes the column shard when the fabric has one.
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -1582,33 +1610,45 @@ class KimiLinearMoE(nn.Module):
             prefix=add_prefix("routed_expert_down_proj", prefix),
             multicast_down=multicast_down,
             column_group=(mapping.moe.tp_ep_group if column_down else None),
-            shard_rank=mapping.moe.tp_ep_rank,
-            shard_size=mapping.moe.tp_ep_size,
+            shard_rank=0 if self._use_deepep else mapping.moe.tp_ep_rank,
+            shard_size=1 if self._use_deepep else mapping.moe.tp_ep_size,
         )
+        self._shard_up_projection = self._shard_latent_projections
+        up_group = (
+            mapping.attn.tp_group if self._use_deepep else mapping.moe.tp_ep_group
+        )
+        up_rank = mapping.attn.tp_rank if self._use_deepep else mapping.moe.tp_ep_rank
+        up_size = mapping.attn.tp_size if self._use_deepep else mapping.moe.tp_ep_size
+        if self._use_deepep:
+            self._shard_up_projection = (
+                up_size > 1 and config.hidden_size % up_size == 0
+            )
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
-            shard_group=(
-                mapping.moe.tp_ep_group if self._shard_latent_projections else None
-            ),
-            shard_rank=mapping.moe.tp_ep_rank,
-            shard_size=mapping.moe.tp_ep_size,
+            shard_group=(up_group if self._shard_up_projection else None),
+            shard_rank=up_rank,
+            shard_size=up_size,
         )
         self.routed_expert_norm = (
             RMSNorm(self.routed_hidden, eps=config.rms_norm_eps)
             if config.latent_moe_use_norm
             else None
         )
-        self.execution_plan = self.execution_plan.prepare_latent_fusion(
-            mapping,
-            lane_width=self.routed_hidden + config.hidden_size,
-            has_latent_norm=self.routed_expert_norm is not None,
-            max_token_num=max(
-                int(global_server_args_dict["comm_fusion_max_num_tokens"]),
-                1,
-            ),
-            shard_up_projection=self._shard_latent_projections,
+        self.execution_plan = (
+            self.execution_plan
+            if self._use_deepep
+            else self.execution_plan.prepare_latent_fusion(
+                mapping,
+                lane_width=self.routed_hidden + config.hidden_size,
+                has_latent_norm=self.routed_expert_norm is not None,
+                max_token_num=max(
+                    int(global_server_args_dict["comm_fusion_max_num_tokens"]),
+                    1,
+                ),
+                shard_up_projection=self._shard_up_projection,
+            )
         )
 
         self._topk_ready = (
@@ -1698,6 +1738,7 @@ class KimiLinearMoE(nn.Module):
             experts_supports_deferred_finalize=(
                 self.experts.supports_deferred_finalize
             ),
+            routed_is_combined=self._use_deepep,
         )
 
     def pack_input_projection_weights(self) -> None:
@@ -1770,7 +1811,9 @@ class KimiLinearMoE(nn.Module):
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-        do_finalize: bool = True,
+        do_finalize: bool,
+        low_latency: bool | None,
+        overlap_fn: Callable[[], None] | None,
     ) -> torch.Tensor:
         """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
         plan = self.execution_plan
@@ -1785,9 +1828,11 @@ class KimiLinearMoE(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             do_finalize=do_finalize,
+            low_latency=low_latency,
+            overlap_fn=overlap_fn,
         )
-        # The kernel returns this rank's pre-reduce partial; the selected
-        # tail tier owns the combining reduction.
+        # The selected tail contract distinguishes replicated-token partials
+        # from already-combined outputs for a unique token slice.
         return out
 
     def _routing_output_format(self, ctx: ForwardContext | None) -> TopKOutputFormat:
@@ -1921,6 +1966,8 @@ class KimiLinearMoE(nn.Module):
         Returns the new prefix (``prefix_sum + routed + shared``); the tail
         tiers fuse the accumulate in-kernel.
         """
+        if self._use_deepep and ctx is None:
+            raise RuntimeError("Kimi-K3 DeepEP requires a ForwardContext")
         local_num_tokens = hidden_states.shape[0]
         local_offset = 0
         if self._gather_dp_tokens_for_moe:
@@ -1944,8 +1991,22 @@ class KimiLinearMoE(nn.Module):
             return output[local_offset : local_offset + local_num_tokens]
 
         num_tokens, hidden_size = hidden_states.shape
-        if num_tokens == 0:
+        if num_tokens == 0 and not self._use_deepep:
             return prefix_sum
+
+        # Attention TP replicas share the batch. Routed experts consume each
+        # row once when the communication kernel owns dispatch/combine; shared
+        # experts continue to consume the full local attention-DP batch.
+        routed_hidden_states = hidden_states
+        routed_start = 0
+        if self._use_deepep:
+            tp = self.mapping.attn
+            counts = CommManager._scatter_count(num_tokens, tp.tp_size)
+            routed_start = sum(counts[: tp.tp_rank])
+            routed_hidden_states = hidden_states.narrow(
+                0, routed_start, counts[tp.tp_rank]
+            )
+        routed_num_tokens = routed_hidden_states.shape[0]
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
@@ -1978,8 +2039,12 @@ class KimiLinearMoE(nn.Module):
         # and reduce over the same width, so one GEMM replaces three. Returns
         # None when the packed weight is unavailable or the shapes are outside
         # the fused kernel, which leaves the separate projections below.
-        fused_inputs = self._latent_input_projections(
-            hidden_states, shared_out=shared_out_buf
+        fused_inputs = (
+            None
+            if self._use_deepep
+            else self._latent_input_projections(
+                hidden_states, shared_out=shared_out_buf
+            )
         )
         if fused_inputs is not None:
             router_logits, routed_in, shared_partial = fused_inputs
@@ -1988,8 +2053,16 @@ class KimiLinearMoE(nn.Module):
             # under concurrent GEMMs). When the selected experts need
             # precomputed TopK runs on the fork branch beside down_proj;
             # routing bypasses it.
-            router_logits = self.gate(hidden_states)
+            router_logits = (
+                self.gate(routed_hidden_states)
+                if routed_num_tokens
+                else hidden_states.new_empty((0, self.num_experts), dtype=torch.float32)
+            )
             routed_in = shared_partial = None
+
+        def compute_shared() -> None:
+            nonlocal shared_partial
+            shared_partial = self.shared_experts(hidden_states, down_out=shared_out_buf)
 
         prepared_shared_shard = None
         # Enable the fork for the whole graph phase, but only overlap during
@@ -2004,28 +2077,48 @@ class KimiLinearMoE(nn.Module):
         # This matches the contract _capture_one documents and the pattern the
         # other fork-using models already follow.
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase() and not self._use_deepep,
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
-                topk_output = self.topk(
-                    hidden_states,
-                    router_logits,
-                    output_format=routing_output_format,
+                topk_output = (
+                    self.topk(
+                        routed_hidden_states,
+                        router_logits,
+                        output_format=routing_output_format,
+                    )
+                    if routed_num_tokens
+                    else self.topk.empty_topk_output(
+                        hidden_states.device,
+                        hidden_states=routed_hidden_states,
+                        router_logits=router_logits,
+                    )
                 )
+                if (
+                    self._use_deepep
+                    and routed_num_tokens
+                    and ctx.forward_mode.is_decode_or_idle()
+                ):
+                    # The GPU window is refreshed for eager and graph decode;
+                    # null slots identify padding without frozen host counts.
+                    locations = ctx.attn_backend.decode_window_locations()
+                    live = locations.narrow(0, routed_start, routed_num_tokens) > 0
+                    topk_output.topk_ids.masked_fill_(~live[:, None], -1)
+                    topk_output.topk_weights.masked_fill_(~live[:, None], 0)
                 if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
-                if shared_partial is None:
-                    shared_partial = self.shared_experts(
-                        hidden_states,
-                        down_out=shared_out_buf,
-                    )
+                if shared_partial is None and not self._use_deepep:
+                    compute_shared()
                 if plan.split_shared_rs and fork._active:
                     prepared_shared_shard = self.comm.reduce_scatter_shared(
                         shared_partial
                     )
             if routed_in is None:
-                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+                routed_in = (
+                    self.routed_expert_down_proj(routed_hidden_states)[0]
+                    if routed_num_tokens
+                    else hidden_states.new_empty((0, self.routed_hidden))
+                )
             if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
@@ -2034,7 +2127,15 @@ class KimiLinearMoE(nn.Module):
                 num_global_tokens,
                 max_num_tokens_per_gpu,
                 do_finalize=not plan.defer_finalize,
+                low_latency=(
+                    use_deepep_low_latency(ctx, self.mapping.attn.dp_size)
+                    if self._use_deepep
+                    else None
+                ),
+                overlap_fn=compute_shared if self._use_deepep else None,
             )
+            if shared_partial is None:
+                raise RuntimeError("MoE did not execute its shared-expert callback")
             if plan.routed_in_fork:
                 # No fused collective to hide behind: reduce and project here
                 # so the work overlaps the shared branch inside the fork.
@@ -2677,6 +2778,7 @@ class KimiLinearModel(nn.Module):
         # Each capture layer's positional tap index (the draft concatenates
         # taps in this order).
         self._dflash_capture_idx_map: dict[int, int] = {}
+        self.pp_context_hidden_size: int | None = None
 
     def _refresh_dflash_capture_fallback(self) -> None:
         """Mark AttnRes consumers that need split execution."""
@@ -2718,10 +2820,19 @@ class KimiLinearModel(nn.Module):
                 break
         if dtype is None:
             dtype = torch.bfloat16
-        return [
+        spec = [
             ("hidden_states", (num_tokens, hidden), dtype),
             ("block_residual", (valid_blocks, num_tokens, hidden), dtype),
         ]
+        if self.pp_context_hidden_size is not None:
+            spec.append(
+                (
+                    "projected_context",
+                    (num_tokens, self.pp_context_hidden_size),
+                    torch.float32,
+                )
+            )
+        return spec
 
     def _dspark_capture_stream(
         self,
@@ -2785,25 +2896,65 @@ class KimiLinearModel(nn.Module):
         capture_layers = self.layers_to_capture
         capture_dflash = bool(capture_layers)
         capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        context_producer = ctx.target_context_producer
         aux_hidden_states: list[torch.Tensor] | None = (
-            [] if capture_dflash or capture_eagle3 else None
+            []
+            if (capture_dflash and context_producer is None) or capture_eagle3
+            else None
         )
+        projected_context = None
+        if context_producer is not None:
+            projected_context = context_producer.begin_stage(
+                hidden_states,
+                pp_inbound.projected_context if pp_inbound is not None else None,
+            )
 
         prefix_sum = hidden_states
+        # An AttnRes tap uses the following layer's mixing parameters. If
+        # that consumer starts this stage, produce the tap from the inbound
+        # state before executing the layer; no remote full-hidden tap is sent.
+        preceding_layer = self.pp_start_layer - 1
+        if (
+            context_producer is not None
+            and self.dflash_aux_stream == "attn_res"
+            and preceding_layer in capture_layers
+        ):
+            captured = self._dspark_capture_stream(
+                preceding_layer, prefix_sum, block_residual
+            )
+            context_producer.add_capture(
+                projected_context,
+                self._dflash_capture_idx_map[preceding_layer],
+                captured,
+            )
         for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
             layer = self.layers[layer_idx]
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, block_residual
             )
             if capture_dflash and layer_idx in capture_layers:
-                captured = self._dspark_capture_stream(
-                    layer_idx, prefix_sum, block_residual
+                defer_boundary_tap = (
+                    context_producer is not None
+                    and self.dflash_aux_stream == "attn_res"
+                    and layer_idx + 1 == self.pp_end_layer
+                    and not self.mapping.is_last_pp_rank
                 )
-                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, captured)
-                assert aux_hidden_states is not None
-                aux_hidden_states.append(captured)
+                if not defer_boundary_tap:
+                    captured = self._dspark_capture_stream(
+                        layer_idx, prefix_sum, block_residual
+                    )
+                    capture_idx = self._dflash_capture_idx_map[layer_idx]
+                    if context_producer is not None:
+                        context_producer.add_capture(
+                            projected_context, capture_idx, captured
+                        )
+                    else:
+                        if ctx.target_capture_sink is not None:
+                            ctx.target_capture_sink.on_target_capture(
+                                capture_idx, captured
+                            )
+                        assert aux_hidden_states is not None
+                        aux_hidden_states.append(captured)
             # Clone: the copy must survive the next layer's in-place residual writes.
             elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
                 assert aux_hidden_states is not None
@@ -2819,8 +2970,20 @@ class KimiLinearModel(nn.Module):
                 PPStageState(
                     hidden_states=prefix_sum,
                     block_residual=block_residual[:valid_blocks],
+                    projected_context=projected_context,
                 ),
                 None,
+            )
+
+        if context_producer is not None:
+            if ctx.num_extends != ctx.bs:
+                raise ValueError(
+                    "Pipeline context production requires a prefill-only batch"
+                )
+            context_producer.write_context(
+                projected_context,
+                positions,
+                ctx.attn_backend.extend_span_locations()[: ctx.input_num_tokens],
             )
 
         hidden_states = _apply_attn_res(
@@ -2893,6 +3056,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
             layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
         }
         self.model._refresh_dflash_capture_fallback()
+
+    def set_prefill_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Configure projected PP taps without retaining concatenated hidden rows."""
+        self.set_dflash_layers_to_capture(layer_ids)
+        self.set_dflash_aux_hidden_stream(stream)
+        self.capture_aux_hidden_states = False
+        self.model.pp_context_hidden_size = hidden_size
 
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
         """Select which K3 residual stream the DFLASH/DSpark taps read."""
@@ -3315,6 +3487,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode cannot capture target hidden states."
             )
         self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def set_prefill_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Forward the pipeline context capture contract to the language model."""
+        if self.language_model is None:
+            raise AttributeError("Encoder-only Kimi-K3 cannot produce draft context")
+        self.language_model.set_prefill_context_capture(layer_ids, stream, hidden_size)
 
     def set_dflash_aux_hidden_stream(self, stream: str) -> None:
         if self.language_model is None:

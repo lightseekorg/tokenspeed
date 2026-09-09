@@ -33,6 +33,9 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    CacheLayerOwnership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheGroupLayout,
@@ -254,63 +257,40 @@ class CacheProducerSchedule:
 def build_cache_fields_by_producer_step(
     plan: CacheMemoryPlan,
     *,
-    num_target_layers: int,
-    pp_layer_window: tuple[int, int] | None = None,
+    ownership: CacheLayerOwnership,
 ) -> CacheProducerSchedule:
-    """Group cache fields by the Prefill barrier that makes them transferable.
+    """Assign resident cache fields to their stage-local readiness barriers.
 
-    With prefill chunk-pipeline parallelism, ``pp_layer_window`` narrows the
-    schedule to this stage's [start, end) global layers: the attention backend
-    records one producer step per layer IT executes, so the step axis must be
-    stage-local while the field IDs keep their global layer numbering.
+    Args:
+        plan: Physical stage plan, or the complete logical plan.
+        ownership: Target cache-layer window and final-stage draft cache ownership.
+
+    Returns:
+        One step per target cache layer and one final step for owned draft fields.
     """
-
     fields_by_layer: dict[int, list[str]] = {}
     for field in plan.fields:
         layer_id = cache_field_layer_id(field.field_id)
+        if (
+            layer_id
+            >= ownership.num_target_cache_layers + ownership.num_draft_cache_layers
+        ):
+            raise ValueError(
+                "PD cache field exceeds the declared target and draft layers"
+            )
         fields_by_layer.setdefault(layer_id, []).append(field.field_id)
-
     if not fields_by_layer:
         raise ValueError("layerwise PD requires at least one cache field")
-    merged_layers = max(fields_by_layer) + 1
-    if (
-        isinstance(num_target_layers, bool)
-        or not isinstance(num_target_layers, int)
-        or num_target_layers < 1
-        or (pp_layer_window is None and num_target_layers > merged_layers)
-    ):
-        raise ValueError("PD target layer count is outside the cache plan")
-
-    if pp_layer_window is not None:
-        start, end = pp_layer_window
-        if not 0 <= start < end <= num_target_layers:
-            raise ValueError("PP layer window is outside the target layer range")
-        # The plan may already be narrowed to the stage window (v2 physical
-        # narrowing), in which case merged_layers reflects the window's last
-        # layer + 1 rather than the full model — that's expected here.
-        return CacheProducerSchedule(
-            fields_by_step=tuple(
-                tuple(fields_by_layer.get(layer_id, ()))
-                for layer_id in range(start, end)
-            )
-        )
-
-    fields_by_step = [
-        tuple(fields_by_layer.get(layer_id, ()))
-        for layer_id in range(num_target_layers)
-    ]
-    if merged_layers > num_target_layers:
-        # A speculative drafter may execute its physical layers repeatedly;
-        # all draft cache fields become transferable at one final barrier.
-        fields_by_step.append(
+    return CacheProducerSchedule(
+        fields_by_step=tuple(
             tuple(
                 field_id
-                for layer_id in range(num_target_layers, merged_layers)
-                for field_id in fields_by_layer.get(layer_id, ())
+                for layer in layers
+                for field_id in fields_by_layer.get(layer, ())
             )
+            for layers in ownership.producer_cache_layers
         )
-
-    return CacheProducerSchedule(tuple(fields_by_step))
+    )
 
 
 @dataclass(frozen=True, slots=True)

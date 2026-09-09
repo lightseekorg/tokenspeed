@@ -150,6 +150,41 @@ def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSp
     return spec
 
 
+def resolve_prefill_workspace_tokens(
+    *,
+    disaggregation_mode: str,
+    pp_size: int,
+    speculative_algorithm: str | None,
+    draft_model_type: str | None,
+    decode_input_tokens: int,
+) -> int:
+    """Return K3 pipeline prefill's proposal-write capacity, otherwise zero.
+
+    Args:
+        disaggregation_mode: Engine role from the server configuration.
+        pp_size: Number of pipeline stages.
+        speculative_algorithm: Configured speculation algorithm, if any.
+        draft_model_type: Resolved draft checkpoint's model type, if any.
+        decode_input_tokens: Target verify width, bounding K3 draft query rows.
+
+    Returns:
+        The history-token reserve after each K3 DSpark pipeline prefill chunk.
+        Other models and execution roles retain their existing admission policy.
+    """
+    if (
+        disaggregation_mode != "prefill"
+        or pp_size <= 1
+        or speculative_algorithm != "DSPARK"
+        or draft_model_type != "k3_dspark"
+    ):
+        return 0
+    if not 1 < decode_input_tokens <= (1 << 31) - 1:
+        raise ValueError(
+            "K3 DSpark prefill workspace requires a verify width >= 2 fitting int32"
+        )
+    return decode_input_tokens
+
+
 def make_config(
     num_device_pages: int,
     max_scheduled_tokens: int,

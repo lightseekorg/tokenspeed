@@ -322,14 +322,17 @@ class DefaultModelLoader(BaseModelLoader):
     def _get_weights_iterator(
         self,
         source: "Source",
-        weight_name_filter: Callable[[str], bool] | None = None,
+        weight_name_filter: Callable[[str], bool] | None,
+        checkpoint_load_group: tuple[int, ...] | None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format.
 
         When ``weight_name_filter`` is given, safetensors shards whose index
         entries contain no accepted weight name are skipped entirely (not
         read or prefetched). The predicate sees names as yielded to the
-        consumer, i.e. with ``source.prefix`` applied.
+        consumer, i.e. with ``source.prefix`` applied. Distributed loaders
+        only synchronize ranks in ``checkpoint_load_group`` when one is
+        declared: pipeline stages can consume different checkpoint subsets.
         """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
@@ -357,7 +360,23 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
-            weights_iterator = instanttensor_weights_iterator(hf_weights_files)
+            process_group = None
+            if checkpoint_load_group is not None:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager as pg_manager,
+                )
+
+                process_group = pg_manager.get_process_group(
+                    "nccl", checkpoint_load_group
+                )
+            elif (
+                torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            ):
+                process_group = torch.distributed.group.WORLD
+            weights_iterator = instanttensor_weights_iterator(
+                hf_weights_files, process_group=process_group
+            )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
@@ -379,6 +398,7 @@ class DefaultModelLoader(BaseModelLoader):
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
         weight_name_filter = getattr(model, "checkpoint_weight_name_filter", None)
+        checkpoint_load_group = getattr(model, "checkpoint_load_group", None)
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,
@@ -386,13 +406,17 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(primary_weights, weight_name_filter)
+        yield from self._get_weights_iterator(
+            primary_weights, weight_name_filter, checkpoint_load_group
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, weight_name_filter)
+            yield from self._get_weights_iterator(
+                source, weight_name_filter, checkpoint_load_group
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

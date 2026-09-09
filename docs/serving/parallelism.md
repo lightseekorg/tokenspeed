@@ -89,8 +89,13 @@ under MoE TP4 is padded from 160 to 192 values per rank.
 
 `--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
 dispatch/combine. It requires a MoE backend whose kernels own those legs:
-`--moe-backend deep_gemm` (block-scale FP8) or `--moe-backend flashinfer_cutedsl`
-(nvfp4, decode-shaped batches only).
+`--moe-backend deep_gemm` (block-scale FP8), `--moe-backend flashinfer_cutedsl`
+(nvfp4, decode-shaped batches only), or `--moe-backend marlin` (MXFP4 W4A16
+with BF16 activations, normal and low-latency legs). K3 on Hopper uses the
+Marlin bridge with disjoint TP token slices; its shared experts and restored
+output stay within each attention-TP group. See the
+[K3 Hopper PD guide](../guides/kimi-k3-hopper-pd.md) for PP4/TP8/EP8 prefill
+and DP4/TP8/EP32 decode.
 
 DeepEP has two sets of legs, and `--deepep-mode` picks between them:
 
@@ -110,7 +115,7 @@ prefill, must fit `--low-latency-max-num-tokens-per-gpu`.
 
 A batch above the low-latency capacity is rejected rather than truncated, so
 raise `--low-latency-max-num-tokens-per-gpu` if decode plus speculative draft
-tokens exceed it. Both current DeepEP MoE backends require BF16 activations;
+tokens exceed it. All current DeepEP MoE backends require BF16 activations;
 `--dtype float16` is not supported.
 
 The mode is chosen per forward from a value every rank agrees on, because the two

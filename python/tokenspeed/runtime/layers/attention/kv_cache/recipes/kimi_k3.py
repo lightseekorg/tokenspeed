@@ -320,7 +320,13 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if self.server_args.speculative_algorithm is None:
+        if self.server_args.speculative_algorithm is None or (
+            getattr(self.server_args, "disaggregation_mode", "null") == "prefill"
+            and self.server_args.mapping.has_pp
+        ):
+            # PP context writers only produce committed prompt state and
+            # skip the decode prewarm. Non-PP P nodes retain verify scratch
+            # because their ordinary eager prewarm still executes decode.
             return 0
         if self.replay_kda:
             conv_shape, recurrent_shape = self._kda_shapes

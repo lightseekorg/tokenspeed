@@ -731,7 +731,13 @@ def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
         ),
     )
 
-    schedule = build_cache_fields_by_producer_step(layout.plan, num_target_layers=2)
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+    )
+
+    schedule = build_cache_fields_by_producer_step(
+        layout.plan, ownership=CacheLayerOwnership(2, 2, (0, 2))
+    )
 
     assert schedule.fields_by_step == (
         ("layer.0.kv",),

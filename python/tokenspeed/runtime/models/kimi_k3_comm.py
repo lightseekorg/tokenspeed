@@ -61,12 +61,14 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
     all_reduce,
     can_acquire_all_reduce_outputs,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
+    token_all_gather,
 )
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -93,6 +95,8 @@ class K3MoETailTier(IntEnum):
     MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
     FUSED_LANE_AR = 2  # join tier: lane one-shot / cat+one-shot / grouped NCCL
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
+    # An explicit input contract, not a candidate of the partial-reduce selector.
+    COMBINED_LATENT = 4  # all-to-all already combined this rank's token slice
 
 
 # Above plain decode-graph buckets: at decode sizes the two staged reduces
@@ -591,7 +595,17 @@ class K3MoeTailComm:
         up_proj,
         execution_plan,
         experts_supports_deferred_finalize: bool,
+        routed_is_combined: bool,
     ) -> None:
+        self.routed_is_combined = routed_is_combined
+        self.mapping = mapping
+        self.routed_norm = routed_norm
+        self.up_proj = up_proj
+        self._shard_up_projection = up_proj.shard_group is not None
+        if routed_is_combined:
+            # Routed outputs belong to distinct token homes. Replicated-token
+            # EP all-reduce capabilities do not apply to this contract.
+            return
         self.state = K3MoeTailCommState.get(
             mapping=mapping,
             hidden_size=hidden_size,
@@ -655,6 +669,44 @@ class K3MoeTailComm:
                 self.latent_tail.supports_split_collective,
             )
 
+    def _tail_combined_latent(
+        self,
+        routed: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Restore TP tokens after EP combine, then join shared/up TP outputs.
+
+        The routed input is a unique token slice whose expert contributions
+        were already combined. Only the attention TP group exchanges its
+        latent rows; no full-width token batch crosses attention DP groups.
+        """
+        if num_tokens == 0:
+            # EP dispatch/combine has already completed, even on this idle DP
+            # group. Its TP peers all own the same empty attention batch.
+            return prefix_sum
+        tp = self.mapping.attn
+        if tp.tp_size > 1:
+            routed = token_all_gather(
+                routed,
+                group=tp.tp_group,
+                scattered_num_tokens=CommManager._scatter_count(num_tokens, tp.tp_size),
+            )
+        if self.routed_norm is not None:
+            routed = self.routed_norm(routed)
+        if self._shard_up_projection:
+            projected = self.up_proj.project_shard(routed)
+            column, width = self.up_proj.shard_slice
+            shared_partial[:, column : column + width].add_(projected)
+        else:
+            projected, _ = self.up_proj(routed)
+            if tp.tp_rank == 0:
+                shared_partial.add_(projected)
+        if tp.tp_size > 1:
+            shared_partial = all_reduce(shared_partial, tp.tp_group)
+        return prefix_sum + shared_partial
+
     # ------------------------------------------------------------------
     # Routing
     # ------------------------------------------------------------------
@@ -670,6 +722,15 @@ class K3MoeTailComm:
         Every input must be rank-uniform (token count, graph phase and the
         negotiated capabilities) so all ranks take identical branches.
         """
+        if self.routed_is_combined:
+            return TailPlan(
+                tier=K3MoETailTier.COMBINED_LATENT,
+                defer_finalize=False,
+                lane=None,
+                symm_outputs=None,
+                routed_in_fork=False,
+                split_shared_rs=False,
+            )
         # Graph warmup, capture, and replay must select the same tier.
         tier = select_k3_moe_tail_tier(
             num_tokens=num_tokens,
@@ -791,6 +852,10 @@ class K3MoeTailComm:
         ``routed_out`` is the experts kernel's deferred-finalize triple.
         """
         tier = plan.tier
+        if tier is K3MoETailTier.COMBINED_LATENT:
+            return self._tail_combined_latent(
+                routed_out, shared_partial, prefix_sum, num_tokens
+            )
         if tier is K3MoETailTier.TAIL_FUSION:
             if plan.defer_finalize:
                 gemm2_out, expert_weights, expanded_idx = routed_out

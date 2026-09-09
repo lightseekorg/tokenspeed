@@ -30,7 +30,16 @@ import torch
 from tokenspeed.runtime.engine import batch_log as batch_log_module
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 
-STATS = {"num_active_pages": 40, "num_cached_pages": 15, "num_queue_reqs": 7}
+STATS = {
+    "num_active_pages": 40,
+    "num_cached_pages": 15,
+    "num_bootstrapping_reqs": 3,
+    "num_queue_reqs": 7,
+    "num_prefilling_reqs": 5,
+    "num_remote_prefilling_reqs": 4,
+    "num_decoding_reqs": 2,
+    "num_pd_transfer_reqs": 4,
+}
 
 
 def _logger(**overrides) -> BatchLogger:
@@ -40,6 +49,8 @@ def _logger(**overrides) -> BatchLogger:
         num_total_pages=100,
         spec_num_steps=0,
         spec_num_tokens=0,
+        dp_rank=2,
+        pp_rank=3,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -73,8 +84,29 @@ def test_extend_round_counts_cached_tokens_once_per_request():
         # cached-token news a second time.
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args_list[0].args[1:] == ("Prefill", 2, 30, 10, 2, 7)
-    assert log.call_args_list[1].args[1:] == ("Prefill", 2, 30, 0, 2, 7)
+    state_counts = (3, 5, 4, 2, 4)
+    assert log.call_args_list[0].args[1:] == (
+        "Prefill",
+        2,
+        3,
+        2,
+        30,
+        10,
+        2,
+        7,
+        *state_counts,
+    )
+    assert log.call_args_list[1].args[1:] == (
+        "Prefill",
+        2,
+        3,
+        2,
+        30,
+        0,
+        2,
+        7,
+        *state_counts,
+    )
 
 
 def test_mixed_round_is_labelled_mix():
@@ -100,9 +132,16 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
     # Rounds 1 and 2 are throttled; round 3 prints the window.
     log.assert_called_once()
     args = log.call_args.args
-    assert args[1:5] == (2, 40, 15, 100)  # running-req, pages active/cached/total
-    assert args[5] == 0.4  # page ratio
-    assert args[6] > 0  # gen throughput over the window
+    assert args[1:7] == (
+        2,
+        3,
+        2,
+        40,
+        15,
+        100,
+    )  # dp/pp rank, running-req, pages active/cached/total
+    assert args[7] == 0.4  # page ratio
+    assert args[8] > 0  # gen throughput over the window
 
 
 def test_state_group_pages_ride_the_decode_line_at_debug():
@@ -125,7 +164,7 @@ def test_state_group_pages_ride_the_decode_line_at_debug():
             logger.log_dispatch(_decode_op(2), STATS)
 
     assert queried == ["state_a", "state_b"]
-    assert debug.call_args.args[1] == (
+    assert debug.call_args.args[3] == (
         "state_a: used=6/10, available=4; state_b: used=0/8, available=8"
     )
 
@@ -167,7 +206,10 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
         logger.record_decode(result, bs=3)
 
     log.assert_called_once_with(
-        "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
+        "Spec verify step. #dp-rank: %s, #pp-rank: %s, "
+        "accept_lengths=%s, accepted_draft_tokens=%s",
+        2,
+        3,
         [1, 3, 8],
         [0, 2, 7],
     )
@@ -188,7 +230,10 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
         logger.record_decode(result, bs=1)
 
     assert log.call_args_list[1] == mock.call(
-        "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
+        "Spec token compare. #dp-rank: %s, #pp-rank: %s, "
+        "anchor=%s, draft=%s, target=%s, match=%s",
+        2,
+        3,
         [10],
         [[11, 12, 13]],
         [[11, 12, 99]],

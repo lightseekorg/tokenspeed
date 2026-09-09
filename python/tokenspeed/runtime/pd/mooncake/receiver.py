@@ -28,9 +28,6 @@ from dataclasses import dataclass
 import requests
 import zmq
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    cache_field_layer_id,
-)
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -39,8 +36,8 @@ from tokenspeed.runtime.pd.cache_protocol import (
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
-    CacheTransferPlanner,
     RankTransferPlan,
+    build_pipeline_transfer_plan,
 )
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
@@ -74,6 +71,7 @@ def _get_prefill_parallel_info_from_server(
             return PrefillParallelInfo(
                 tp_size=int(prefill_parallel_info["prefill_tp_size"]),
                 dp_size=int(prefill_parallel_info["prefill_dp_size"]),
+                num_target_cache_layers=int(prefill_parallel_info["num_target_layers"]),
                 cache_layout=cache_layout,
                 pp_size=int(prefill_parallel_info.get("prefill_pp_size", 1)),
                 pp_layer_partition=(
@@ -130,80 +128,24 @@ class ReceiverRoutePlan:
 
 
 def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePlan:
-    prefill_tp_size_per_dp_rank = prefill_parallel_info.prefill_tp_size_per_dp_rank
-    local_tp_size_per_dp_rank = kv_mgr.topology.tp_size
-    local_cache_layout = kv_mgr.kv_args.cache_layout
     prefill_cache_layout = prefill_parallel_info.cache_layout
-
     if prefill_cache_layout is None:
         raise RuntimeError(
             "Cache-transfer decode connected to a non-cache-transfer prefill"
         )
-    decode_tp_rank = kv_mgr.topology.tp_rank
-
-    pp_size = prefill_parallel_info.pp_size
-    if pp_size <= 1:
-        planner = CacheTransferPlanner(
-            prefill_tp_size=prefill_tp_size_per_dp_rank,
-            decode_tp_size=local_tp_size_per_dp_rank,
-            prefill_layout=prefill_cache_layout,
-            decode_layout=local_cache_layout,
-        )
-        transfer_plan = planner.plan_for_decode_rank(decode_tp_rank)
-        dummy_tp_ranks = ()
-        if decode_tp_rank == 0:
-            dummy_tp_ranks = tuple(
-                rank
-                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
-                if not decode_ranks
-            )
-        return ReceiverRoutePlan(
-            transfer_plan=transfer_plan,
-            dummy_tp_ranks=dummy_tp_ranks,
-        )
-
-    # Prefill chunk pipeline: stage s (layers window w_s) sends only its own
-    # layers' fields, from its own tp group. Plan each stage over its window
-    # and union the routes; a stage rank's identity in the union is the dense
-    # stage-major rank pp_rank * tp_size + tp_rank (matching both the
-    # bootstrap port table and the Prefill status messages).
-    from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
-
-    num_layers = (
-        max(
-            cache_field_layer_id(field.field_id)
-            for field in prefill_cache_layout.plan.fields
-        )
-        + 1
+    transfer_plan, dummy_ranks = build_pipeline_transfer_plan(
+        prefill_tp_size=prefill_parallel_info.prefill_tp_size_per_dp_rank,
+        decode_tp_size=kv_mgr.topology.tp_size,
+        decode_tp_rank=kv_mgr.topology.tp_rank,
+        prefill_layout=prefill_cache_layout,
+        decode_layout=kv_mgr.kv_args.cache_layout,
+        num_target_cache_layers=prefill_parallel_info.num_target_cache_layers,
+        pp_size=prefill_parallel_info.pp_size,
+        pp_layer_partition=prefill_parallel_info.pp_layer_partition,
     )
-    windows = pp_stage_windows(
-        num_layers,
-        pp_size,
-        getattr(prefill_parallel_info, "pp_layer_partition", None),
-    )
-    merged_fragments: dict[int, tuple] = {}
-    dummy_ranks: list[int] = []
-    for stage, window in enumerate(windows):
-        planner = CacheTransferPlanner(
-            prefill_tp_size=prefill_tp_size_per_dp_rank,
-            decode_tp_size=local_tp_size_per_dp_rank,
-            prefill_layout=prefill_cache_layout,
-            decode_layout=local_cache_layout,
-            prefill_layer_window=window,
-        )
-        stage_plan = planner.plan_for_decode_rank(decode_tp_rank)
-        base = stage * prefill_tp_size_per_dp_rank
-        for tp_rank, fragments in stage_plan.fragments_by_prefill_rank.items():
-            merged_fragments[base + tp_rank] = fragments
-        if decode_tp_rank == 0:
-            dummy_ranks.extend(
-                base + rank
-                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
-                if not decode_ranks
-            )
     return ReceiverRoutePlan(
-        transfer_plan=RankTransferPlan(fragments_by_prefill_rank=merged_fragments),
-        dummy_tp_ranks=tuple(sorted(dummy_ranks)),
+        transfer_plan=transfer_plan,
+        dummy_tp_ranks=dummy_ranks,
     )
 
 

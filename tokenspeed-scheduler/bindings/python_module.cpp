@@ -137,6 +137,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
+        .def_rw("prefill_workspace_tokens", &tokenspeed::SchedulerConfig::prefill_workspace_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         .def_prop_rw(
@@ -326,9 +327,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
-        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
-        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
-        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
+             "Count requests waiting for their PD bootstrap handshake.")
+        .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
+             "Count Submitted and Retracted requests awaiting admission or readmission.")
+        .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
+             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+        .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
+             "Count RemotePrefilling requests; these are also included in prefilling_size().")
+        .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
+             "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
