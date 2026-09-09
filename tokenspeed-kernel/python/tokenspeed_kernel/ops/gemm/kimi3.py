@@ -103,9 +103,19 @@ def _try_gluon_largem_gfx1250(
         or weight.ndim != 2
         or activation.dtype != torch.bfloat16
         or weight.dtype != torch.bfloat16
+        or not activation.is_cuda
+        or not weight.is_cuda
+        or weight.device != activation.device
         or not activation.is_contiguous()
         or not weight.is_contiguous()
-        or (out is not None and not out.is_contiguous())
+        or (
+            out is not None
+            and (
+                not out.is_cuda
+                or out.device != activation.device
+                or not out.is_contiguous()
+            )
+        )
         or not _use_gluon_largem_gfx1250(
             int(activation.shape[0]),
             int(activation.shape[1]),
@@ -497,6 +507,8 @@ def kimi3_mla_qkv_gate_projection(
     if solution == "auto":
         gfx1250_tdm = (
             Platform.get().is_cdna5
+            and hidden_states.is_cuda
+            and weight.is_cuda
             and m in {2, 4, 8, 16, 32}
             and input_width == KIMI3_HIDDEN_SIZE
             and qkv_width == 2112
@@ -508,6 +520,8 @@ def kimi3_mla_qkv_gate_projection(
         )
         gfx1250_largem = (
             Platform.get().is_cdna5
+            and hidden_states.is_cuda
+            and weight.is_cuda
             and hidden_states.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
@@ -938,7 +952,11 @@ def kimi3_shared_situ_projection(
 
         gate_up = decode_gemv(hidden_states, gate_up_weight)
     else:
-        gate_up = _try_gluon_largem_gfx1250(hidden_states, gate_up_weight)
+        gate_up = (
+            _try_gluon_largem_gfx1250(hidden_states, gate_up_weight)
+            if solution == "auto"
+            else None
+        )
         if gate_up is None:
             gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
     if gate_up.is_cuda:
@@ -1162,6 +1180,8 @@ def kimi3_qkvfab_projection(
     if solution == "auto":
         if (
             Platform.get().is_cdna5
+            and hidden_states.is_cuda
+            and weight.is_cuda
             and m in {2, 4, 8, 16, 32}
             and input_width == KIMI3_HIDDEN_SIZE
             and output_width == KIMI3_QKVFAB_SIZE
@@ -1174,6 +1194,8 @@ def kimi3_qkvfab_projection(
             solution = "gluon_wmma_gfx1250"
         elif (
             Platform.get().is_cdna5
+            and hidden_states.is_cuda
+            and weight.is_cuda
             and _use_gluon_largem_gfx1250(m, input_width, output_width)
             and hidden_states.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
