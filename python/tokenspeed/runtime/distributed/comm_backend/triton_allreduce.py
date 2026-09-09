@@ -93,12 +93,12 @@ class TritonAllReduceBackend(CommBackend):
         attnres_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
-        """Allocate or reuse an Iris state with the requested capacities.
+        """Allocate or reuse an Iris state within the active dispatch limits.
 
         Args:
             group: Global ranks participating in the reductions.
-            staged_max_numel: Maximum ordinary all-reduce payload in elements.
-            producer_direct_max_numel: Maximum producer-direct payload in elements.
+            staged_max_numel: Requested ordinary all-reduce payload in elements.
+            producer_direct_max_numel: Requested producer-direct payload in elements.
             attnres_max_numel: Maximum fused AttnRes payload in elements.
             attnres_max_rows: Maximum fused AttnRes payload in rows.
             dtype: Element type shared by the prepared paths.
@@ -111,6 +111,11 @@ class TritonAllReduceBackend(CommBackend):
             return False
         if dtype != torch.bfloat16:
             return False
+        staged_max_numel = min(staged_max_numel, self._max_numel)
+        producer_direct_max_numel = min(
+            producer_direct_max_numel,
+            self._producer_direct_max_bytes // dtype.itemsize,
+        )
         requested = (
             staged_max_numel,
             producer_direct_max_numel * dtype.itemsize,

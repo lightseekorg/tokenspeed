@@ -143,12 +143,12 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
-def test_triton_prepares_all_reduce_buffers(monkeypatch):
-    backend = TritonAllReduceBackend(Mock())
+def test_triton_preparation_caps_buffers_at_dispatch_limits(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=256)
     group = (0, 1)
     process_group = object()
     state = SimpleNamespace(
-        max_numel=64,
+        max_numel=128,
         max_bytes=256,
         attnres_max_numel=32,
         max_token_num=4,
@@ -178,8 +178,8 @@ def test_triton_prepares_all_reduce_buffers(monkeypatch):
 
     assert backend.prepare_all_reduce_buffers(
         group,
-        staged_max_numel=64,
-        producer_direct_max_numel=128,
+        staged_max_numel=512,
+        producer_direct_max_numel=512,
         attnres_max_numel=32,
         attnres_max_rows=4,
         dtype=torch.bfloat16,
@@ -190,7 +190,7 @@ def test_triton_prepares_all_reduce_buffers(monkeypatch):
         max_tokens=0,
         hidden_size=0,
         device=torch.device("cuda:0"),
-        max_numel=64,
+        max_numel=128,
         max_bytes=256,
         attnres_max_numel=32,
         attnres_max_rows=4,

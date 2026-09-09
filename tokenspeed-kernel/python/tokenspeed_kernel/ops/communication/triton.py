@@ -2156,8 +2156,20 @@ def all_reduce_symmetric(
     return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
 
 
-def allreduce_residual_attnres_max_tokens() -> int:
-    """Return the largest token count supported by the Kimi-K3 AttnRes kernel."""
+def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
+    """Return the Kimi-K3 AttnRes token limit for a communication group.
+
+    Args:
+        world_size: Number of ranks participating in the all-reduce.
+
+    Returns:
+        The supported token count, or zero when the group size is unsupported.
+    """
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    if world_size != kernel_config.world_size:
+        return 0
     return _ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS
 
 
@@ -2185,7 +2197,7 @@ def _all_reduce_residual_attnres_can_run(
     return (
         state.world_size == kernel_config.world_size
         and op == torch.distributed.ReduceOp.SUM
-        and 0 < num_tokens <= allreduce_residual_attnres_max_tokens()
+        and 0 < num_tokens <= allreduce_residual_attnres_max_tokens(state.world_size)
         and num_tokens <= state.max_token_num
         and partial.shape == residual.shape == (num_tokens, kernel_config.hidden_size)
         and score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)

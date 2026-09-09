@@ -184,12 +184,7 @@ def prepare_k3_all_reduce_buffers(
     max_num_tokens: int,
 ) -> bool:
     """Prepare the node-local AMD all-reduce buffers used by Kimi-K3."""
-    if (
-        not current_platform().is_cdna4
-        or mapping.attn.tp_size <= 1
-        or mapping.moe.tp_ep_size <= 1
-        or mapping.attn.tp_group != mapping.moe.tp_ep_group
-    ):
+    if not current_platform().is_cdna4:
         return False
 
     max_num_tokens = min(max_num_tokens, _IRIS_MAX_TOKENS)
@@ -202,17 +197,39 @@ def prepare_k3_all_reduce_buffers(
 
     attnres_max_rows = min(
         max_num_tokens,
-        allreduce_residual_attnres_max_tokens(),
+        allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
     )
-    return prepare_all_reduce_buffers(
-        mapping.attn.tp_group,
-        staged_max_numel=max_num_tokens * hidden_size,
-        producer_direct_max_numel=max_num_tokens * (hidden_size + routed_hidden_size),
-        attnres_max_numel=attnres_max_rows * hidden_size,
-        attnres_max_rows=attnres_max_rows,
-        dtype=torch.bfloat16,
-        backend=None,
-    )
+    groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    prepared = False
+    if mapping.attn.tp_size > 1:
+        prepared = prepare_all_reduce_buffers(
+            mapping.attn.tp_group,
+            staged_max_numel=max_num_tokens * hidden_size,
+            producer_direct_max_numel=(
+                max_num_tokens * (hidden_size + routed_hidden_size)
+                if groups_are_equal and mapping.moe.tp_ep_size > 1
+                else 0
+            ),
+            attnres_max_numel=attnres_max_rows * hidden_size,
+            attnres_max_rows=attnres_max_rows,
+            dtype=torch.bfloat16,
+            backend=None,
+        )
+    if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
+        prepared = (
+            prepare_all_reduce_buffers(
+                mapping.moe.tp_ep_group,
+                staged_max_numel=max_num_tokens * hidden_size,
+                producer_direct_max_numel=max_num_tokens
+                * (hidden_size + routed_hidden_size),
+                attnres_max_numel=0,
+                attnres_max_rows=0,
+                dtype=torch.bfloat16,
+                backend=None,
+            )
+            or prepared
+        )
+    return prepared
 
 
 class K3AttnCommState:
