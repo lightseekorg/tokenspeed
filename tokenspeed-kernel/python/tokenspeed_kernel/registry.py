@@ -480,11 +480,22 @@ def load_builtin_kernels() -> None:
                 "tokenspeed_kernel.numerics.reference."
             ):
                 del sys.modules[key]
-    import tokenspeed_kernel.ops.attn_res  # noqa: F401
+    import tokenspeed_kernel.ops.attention  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
+    import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kda  # noqa: F401
+    import tokenspeed_kernel.ops.attention.kpool  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mha  # noqa: F401
+    import tokenspeed_kernel.ops.attention.mla  # noqa: F401
+    import tokenspeed_kernel.ops.attention.msa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.qsa  # noqa: F401
+    import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
+    import tokenspeed_kernel.ops.residual  # noqa: F401
     import tokenspeed_kernel.ops.sampling  # noqa: F401
     import tokenspeed_kernel.ops.transform  # noqa: F401
 

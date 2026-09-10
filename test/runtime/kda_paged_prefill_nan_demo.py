@@ -17,7 +17,7 @@ it does not capture or replay a CUDA graph.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention import kda_paged_prefill
+from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
 
 from tokenspeed.runtime.layers.attention.backends.state.kda import (
     _slice_kda_prefill_inputs,

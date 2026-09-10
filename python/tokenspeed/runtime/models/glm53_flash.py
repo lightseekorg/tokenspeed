@@ -1371,6 +1371,8 @@ class Glm53FlashDecoderLayer(nn.Module):
                 self.config.rms_norm_eps,
                 self.config.hc_eps,
                 self.config.hc_sinkhorn_iters,
+                norm_weight=None,
+                norm_eps=None,
             )
             hidden_states = self.input_layernorm(hidden_states)
             if self.is_kda_layer:
@@ -1405,6 +1407,8 @@ class Glm53FlashDecoderLayer(nn.Module):
                 self.config.rms_norm_eps,
                 self.config.hc_eps,
                 self.config.hc_sinkhorn_iters,
+                norm_weight=None,
+                norm_eps=None,
             )
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)

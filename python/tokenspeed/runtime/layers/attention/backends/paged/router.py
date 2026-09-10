@@ -127,15 +127,8 @@ class CacheGroupRouter(AttentionBackend):
         self.is_draft = bool(is_draft)
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
-        self.cache_pool: CachePool | None = None
-        self._speculative_state_backends = []
-        self._stacks: GroupTableStacks | None = None
-        # Published write locations: the decode slot (graph-recorded views,
-        # refreshed in place) and the extend slot (fresh per round).
-        self.decode_write_locations: RouterDecodeWriteLocations | None = None
-        self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
-        self._decode_request_offset = 0
-        self._extend_write_locations: dict[str, torch.Tensor] | None = None
+        self._init_pool_binding()
+        self._forget_bound_pool_state()
 
     def bind(
         self,
@@ -147,21 +140,10 @@ class CacheGroupRouter(AttentionBackend):
         ``set_cache_pool`` is the production caller; unit fixtures bind
         hand-built leaves directly.
         """
-        if not leaves:
-            raise ValueError(
-                f"{type(self).__name__}: the bound pool view has no paged "
-                "(history-family) cache groups to route"
-            )
-        for gid in leaves:
-            if geometry.families.get(gid, "history") != "history":
-                raise ValueError(
-                    f"cache group {gid!r} is family {geometry.families[gid]!r}; "
-                    "the router serves paged history groups only"
-                )
+        self._check_routable(geometry, tuple(leaves))
         self._geometry = geometry
         self.leaves = dict(sorted(leaves.items()))
-        self._stacks = None
-        self._decode_views = {}
+        self._forget_bound_pool_state()
 
     # ------------------------------------------------------------------
     # Structure
@@ -174,20 +156,72 @@ class CacheGroupRouter(AttentionBackend):
     def child_backends(self) -> tuple[PagedAttentionBackend, ...]:
         return tuple(self.leaves.values())
 
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        """Bind the pool: learn the group geometry from its published specs
-        and build one leaf per paged group of this view (``paged_group_ids``)."""
-        self.cache_pool = cache_pool
+    def _forget_bound_pool_state(self) -> None:
+        """The table stacks and write locations built for a bound pool; init rebuilds them."""
+        self._stacks: GroupTableStacks | None = None
+        self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
+        # Published write locations: the decode slot (graph-recorded views,
+        # refreshed in place) and the extend slot (fresh per round).
+        self.decode_write_locations: RouterDecodeWriteLocations | None = None
+        self._extend_write_locations: dict[str, torch.Tensor] | None = None
+        self._decode_request_offset = 0
+
+    def _check_routable(
+        self, geometry: CacheGroupGeometry, group_ids: tuple[str, ...]
+    ) -> None:
+        if not group_ids:
+            raise ValueError(
+                f"{type(self).__name__}: the bound pool view has no paged "
+                "(history-family) cache groups to route"
+            )
+        for gid in group_ids:
+            if geometry.families.get(gid, "history") != "history":
+                raise ValueError(
+                    f"cache group {gid!r} is family {geometry.families[gid]!r}; "
+                    "the router serves paged history groups only"
+                )
+
+    @staticmethod
+    def _derive(cache_pool: CachePool) -> tuple[CacheGroupGeometry, tuple[str, ...]]:
+        """The geometry and paged group ids ``cache_pool`` publishes."""
         geometry = learn_cache_group_geometry(cache_pool.arena.cache_group_specs)
-        self.bind(
-            geometry,
-            {
-                gid: self._leaf_factory(gid, geometry.granularity_of(gid))
-                for gid in cache_pool.paged_group_ids
-            },
-        )
-        for leaf in self.leaves.values():
-            leaf.set_cache_pool(cache_pool)
+        return geometry, tuple(sorted(cache_pool.paged_group_ids))
+
+    def _learn(
+        self, cache_pool: CachePool
+    ) -> tuple[CacheGroupGeometry, tuple[str, ...]]:
+        """The geometry and paged group ids of ``cache_pool``, or raise on a change."""
+        geometry, group_ids = self._derive(cache_pool)
+        self._check_routable(geometry, group_ids)
+        if self._geometry is not None and (
+            geometry != self._geometry or group_ids != tuple(self.leaves)
+        ):
+            raise RuntimeError(
+                "CacheGroupRouter cannot rebind a pool of a different geometry"
+            )
+        return geometry, group_ids
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        self._learn(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """A first bind builds and binds the leaves; every bind drops the tables."""
+        geometry, group_ids = self._derive(cache_pool)
+        if self._geometry is not None:
+            self._geometry = geometry
+            self._forget_bound_pool_state()
+        else:
+            self.bind(
+                geometry,
+                {
+                    gid: self._leaf_factory(gid, geometry.granularity_of(gid))
+                    for gid in group_ids
+                },
+            )
+            for leaf in self.leaves.values():
+                leaf.set_cache_pool(cache_pool)
+        super()._publish_cache_pool(cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
         for leaf in self.leaves.values():
@@ -350,6 +384,22 @@ class CacheGroupRouter(AttentionBackend):
                 "extend write locations requested before init_forward_metadata"
             )
         return self._extend_write_locations[gid]
+
+    def _forward_decode_write_locations(self, layer: PagedAttention) -> torch.Tensor:
+        """Include EXTEND rows when draft step 0 locally dispatches as DECODE."""
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        decode_locations = self.write_locations(layer, ForwardMode.DECODE)
+        if (
+            not self.is_draft
+            or self._decode_request_offset == 0
+            or self._extend_write_locations is None
+        ):
+            return decode_locations
+        extend_locations = self._extend_write_locations[layer.group_id]
+        if decode_locations.numel() == 0:
+            return extend_locations
+        return torch.cat((extend_locations, decode_locations))
 
     # ------------------------------------------------------------------
     # Metadata
@@ -664,7 +714,11 @@ class CacheGroupRouter(AttentionBackend):
         # Under a prefill-graph replay the frozen forward_mode scalar is
         # always EXTEND, which is also the live mode.
         leaf = self._leaf_for(layer)
-        out_cache_loc = self.write_locations(layer, forward_mode)
+        out_cache_loc = (
+            self._forward_decode_write_locations(layer)
+            if forward_mode.is_decode()
+            else self.write_locations(layer, forward_mode)
+        )
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 return leaf.forward_decode(
@@ -703,10 +757,8 @@ class CacheGroupRouter(AttentionBackend):
         **kwargs,
     ):
         """Composite hosts (hybrid GDN/KDA) dispatch decode directly."""
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
         leaf = self._leaf_for(layer)
-        out_cache_loc = self.write_locations(layer, ForwardMode.DECODE)
+        out_cache_loc = self._forward_decode_write_locations(layer)
         return leaf.forward_decode(
             q,
             k,

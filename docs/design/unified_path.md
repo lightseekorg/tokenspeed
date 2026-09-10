@@ -63,6 +63,55 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Rebinding a cache pool
+
+`set_cache_pool` may run more than once on the same backend tree: a memory
+probe binds a small pool, captures into a throwaway graph pool, then binds
+the real pool. The contract is that a rebound backend is indistinguishable
+from one first bound to that pool:
+
+* Every node first answers `validate_cache_pool` for the whole subtree, and
+  only then do the children and the node publish, without a second
+  validation, so a rejected rebind moves nothing (a router's leaves exist
+  only from its first bind on, so the first bind builds and binds them
+  inside its own publish); `set_cache_pool` is that sequence, shared by
+  every node through `CachePoolBinding` and never overridden; a node does
+  its own work in `_publish_cache_pool` (`set_kv_pool` on the state backends
+  is a retained alias). Atomicity covers rejections only: a failure inside a
+  node's own binding work propagates, and the caller rebuilds the tree. A
+  node rejects a pool that changes the geometry it owns: the router its
+  group geometry (granularities, families, retentions and the row layout the
+  leaves' kernels read), the state backends the state group ids, checkpoint
+  grain and the state layers' ids and shapes, DeepSeek V4 the group ids and
+  row geometry, Inkling the ShortConv geometry. Page counts and transfer
+  policy may change. Paged leaves own kernel geometry only; the router
+  validates group geometry for them.
+* Binding drops every pool-derived latch: pointer tables, scratch and views,
+  per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
+  ring and pending remote restores, and side-state verify caches. The state
+  backends keep their pool-independent index buffers, so a same-geometry
+  replacement stays usable without re-initialisation of those buffers (a
+  router in the same tree still needs `init_cuda_graph_state` before any
+  metadata call); the caller still runs `configure_runtime` (with the new
+  pool's specs and page counts), `init_cuda_graph_state`,
+  `init_prefill_graph_state` and `preallocate_verify_workspace` again after
+  a rebind, as after a first bind. A probe pool must still hold `max_bs`
+  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
+  slab. The backend tree covers only itself: the executor's own pool
+  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  pool) and the layer-to-group stamps `bind_cache_groups` writes on the
+  model are the caller's to re-publish.
+* A rebind is an operation inside executor construction, owned by the
+  orchestrator a later change adds; nothing in the backend tree guards
+  against a rebind at another time. That orchestrator releases both graph
+  owners' captures first (the captured graphs record the buffers a publish
+  drops, and eager kernels cache pointers they allocated inside a capture,
+  such as flashinfer's trtllm-gen MoE runner and Qwen4-Exp's uniform index
+  bundles), unfreezes the device-global workspace pool the executor froze
+  before capturing, rebinds the trees, re-runs `bind_cache_groups` and the
+  initialisation sequence above, freezes the workspace again and captures
+  again.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under
@@ -88,6 +137,18 @@ but an earlier graph sharing the same private pool can overwrite its contents
 on replay. PLE's uniform index bundles are reused during capture only; eager
 prefill and decode construct their indices through the same builder outside
 the capture pool.
+
+GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
+and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
+use uninitialized output and a placeholder for a disabled intermediate cache:
+live rows are fully written, while negative padding rows skip state access
+and leave output undefined. Consumers must ignore padded output; enabled
+intermediate caches always require real storage.
+
+GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
+reading inputs and signal after computation; FlashInfer adapters preserve the
+upstream CuTe body and isolate PDL compilation caches. Graphs retain their
+capture-time PDL setting and must be recaptured to change it.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -453,7 +514,10 @@ buffer; `fill_input_buffers` takes no table.
   write. A model path that writes multiple mode windows in one shot (the
   MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
   DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. V4 composes the shared token-shaped resolve
+  graph. The router performs the same composition when a draft step-0
+  forward locally dispatches as DECODE while retaining the round's full K/V
+  rows; target MIXED decode halves and later draft steps keep their ordinary
+  decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.

@@ -39,10 +39,12 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
+    "initialize_all_reduce_state",
     "symm_outputs_can_run",
     "acquire_symm_outputs",
     "all_reduce_symm_can_run",
     "all_reduce_symmetric",
+    "allreduce_residual_attnres_max_tokens",
     "allreduce_residual_attnres_combine_supported",
     "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
@@ -53,6 +55,7 @@ __all__ = [
 
 
 allreduce_residual_rmsnorm_states = {}
+_ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS = 16
 
 
 @dataclass
@@ -61,12 +64,13 @@ class TritonCommState:
     rank_in_group: int
     world_size: int
     device: torch.device
-    max_numel: int = 0
-    max_bytes: int = 0
-    max_token_num: int = 0
-    hidden_dim: int = 0
-    comm_buff: torch.Tensor | None = None
-    symm_mem_hdl: object | None = None
+    attnres_max_numel: int
+    max_numel: int
+    max_bytes: int
+    max_token_num: int
+    hidden_dim: int
+    comm_buff: torch.Tensor | None
+    symm_mem_hdl: object | None
 
 
 @dataclass
@@ -1041,9 +1045,13 @@ def nvidia_create_rsag_state(
         rank_in_group=rank_in_group,
         world_size=group.size(),
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
+        symm_mem_hdl=None,
     )
 
 
@@ -1505,6 +1513,9 @@ def amd_create_rsag_state(
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
@@ -1714,6 +1725,9 @@ def create_allreduce_residual_rmsnorm_state(
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
+        attnres_max_numel=0,
+        max_numel=0,
+        max_bytes=0,
         max_token_num=max_token_num,
         hidden_dim=hidden_dim,
         comm_buff=comm_buff,
@@ -1878,16 +1892,40 @@ def allreduce_residual_rmsnorm(
 def create_state(
     group: dist.ProcessGroup,
     rank_in_group: int,
-    max_tokens: int = 0,
-    hidden_size: int = 0,
-    device: torch.device = None,
-    max_numel: int = 0,
-    max_bytes: int = 0,
+    max_tokens: int,
+    hidden_size: int,
+    device: torch.device | None,
+    max_numel: int,
+    max_bytes: int,
+    attnres_max_numel: int,
+    attnres_max_rows: int,
 ) -> TritonCommState:
+    """Create an all-reduce or reduce-scatter/all-gather communication state.
+
+    Args:
+        group: Process group used by the collective.
+        rank_in_group: This process's rank within ``group``.
+        max_tokens: Maximum gathered token count for an RS/AG state.
+        hidden_size: Hidden width for an RS/AG state.
+        device: Device on which communication storage is allocated.
+        max_numel: Maximum staged all-reduce payload in elements.
+        max_bytes: Maximum producer-direct all-reduce payload in bytes.
+        attnres_max_numel: Maximum fused attention/AttnRes payload in elements;
+            pass zero when the state does not use AttnRes.
+        attnres_max_rows: Maximum fused attention/AttnRes payload in rows; pass
+            zero when the state does not use AttnRes.
+
+    Returns:
+        The initialized communication state.
+    """
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
-    if max_numel:
+    if bool(attnres_max_numel) != bool(attnres_max_rows):
+        raise ValueError(
+            "AttnRes element and row capacities must both be zero or non-zero"
+        )
+    if max_numel or max_bytes or attnres_max_numel:
         device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         world_size = group.size()
         comm_buff = None
@@ -1905,7 +1943,10 @@ def create_state(
             world_size=world_size,
             device=device,
             max_numel=max_numel,
-            max_bytes=max_bytes or max_numel * torch.bfloat16.itemsize,
+            max_bytes=max_bytes,
+            attnres_max_numel=attnres_max_numel,
+            max_token_num=attnres_max_rows,
+            hidden_dim=0,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
         )
@@ -1947,22 +1988,76 @@ def all_reduce_can_run(state: TritonCommState, tensor: torch.Tensor, op=None) ->
     )
 
 
+def _iris_state_key(state: TritonCommState, dtype: torch.dtype) -> tuple:
+    producer_direct_max_numel = state.max_bytes // dtype.itemsize
+    return (
+        id(state.group),
+        state.max_numel,
+        producer_direct_max_numel,
+        state.attnres_max_numel,
+        state.max_token_num,
+        dtype,
+    )
+
+
+def _iris_state_is_compatible(iris_state, state, dtype: torch.dtype) -> bool:
+    return (
+        iris_state.group is state.group
+        and iris_state.rank_in_group == state.rank_in_group
+        and iris_state.device == state.device
+        and iris_state.dtype == dtype
+        and iris_state.staged_max_numel >= state.max_numel
+        and iris_state.producer_direct_max_numel >= state.max_bytes // dtype.itemsize
+        and iris_state.attnres_max_numel >= state.attnres_max_numel
+        and iris_state.attnres_max_rows >= state.max_token_num
+    )
+
+
 def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
     """Return the Iris state sized for this communication backing buffer."""
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-    key = (id(state.group), state.max_bytes, dtype)
+    key = _iris_state_key(state, dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = next(
+            (
+                candidate
+                for candidate in _iris_mod.IRIS_AR_STATES.values()
+                if _iris_state_is_compatible(candidate, state, dtype)
+            ),
+            None,
+        )
     if iris_state is None:
         iris_state = _iris_mod.create_iris_state(
             group=state.group,
             rank_in_group=state.rank_in_group,
-            max_numel=max(state.max_numel, state.max_bytes // dtype.itemsize),
+            staged_max_numel=state.max_numel,
+            producer_direct_max_numel=state.max_bytes // dtype.itemsize,
+            attnres_max_numel=state.attnres_max_numel,
+            attnres_max_rows=state.max_token_num,
             dtype=dtype,
+            heap_size=None,
             device=state.device,
         )
-        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    _iris_mod.IRIS_AR_STATES[key] = iris_state
     return iris_state
+
+
+def initialize_all_reduce_state(
+    state: TritonCommState,
+    dtype: torch.dtype,
+) -> None:
+    """Allocate the backend storage described by an all-reduce state.
+
+    Args:
+        state: Communication state carrying the requested buffer capacities.
+        dtype: Element type used by the all-reduce buffers.
+
+    Returns:
+        None.
+    """
+    _get_or_create_iris_state(state, dtype)
 
 
 def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.Tensor:
@@ -1997,19 +2092,22 @@ def symm_outputs_can_run(
     if op is None:
         op = torch.distributed.ReduceOp.SUM
     numels = tuple(math.prod(shape) for shape in shapes)
-    element_bytes = dtype.itemsize
-    elements_per_word = 8 // element_bytes
     total_numel = sum(numels)
-    return (
-        current_platform().is_cdna4
-        and state.world_size in (2, 4, 8)
-        and dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and op == torch.distributed.ReduceOp.SUM
-        and bool(numels)
-        and all(numel > 0 for numel in numels)
-        and 8 % element_bytes == 0
-        and total_numel % elements_per_word == 0
-        and total_numel * element_bytes <= state.max_bytes
+    if (
+        not current_platform().is_cdna4
+        or op != torch.distributed.ReduceOp.SUM
+        or not numels
+        or any(numel <= 0 for numel in numels)
+    ):
+        return False
+
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    return _iris_mod.producer_direct_all_reduce_can_run(
+        world_size=state.world_size,
+        total_numel=total_numel,
+        dtype=dtype,
+        max_bytes=state.max_bytes,
     )
 
 
@@ -2041,7 +2139,7 @@ def all_reduce_symm_can_run(
         return False
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-    key = (id(state.group), state.max_bytes, tensors[0].dtype)
+    key = _iris_state_key(state, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
     return iris_state is not None and iris_state.owns_outputs(tensors)
 
@@ -2053,9 +2151,26 @@ def all_reduce_symmetric(
     """Reduce consecutive Iris producer outputs in one launch."""
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-    key = (id(state.group), state.max_bytes, tensors[0].dtype)
+    key = _iris_state_key(state, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES[key]
     return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
+
+
+def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
+    """Return the Kimi-K3 AttnRes token limit for a communication group.
+
+    Args:
+        world_size: Number of ranks participating in the all-reduce.
+
+    Returns:
+        The supported token count, or zero when the group size is unsupported.
+    """
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    if world_size != kernel_config.world_size:
+        return 0
+    return _ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS
 
 
 def _all_reduce_residual_attnres_can_run(
@@ -2072,16 +2187,22 @@ def _all_reduce_residual_attnres_can_run(
         op = torch.distributed.ReduceOp.SUM
     m, s_, acc = scratch
     platform = current_platform()
+    if not platform.is_cdna4:
+        return False
+
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
     num_tokens = partial.shape[0] if partial.ndim == 2 else 0
     return (
-        platform.is_cdna4
-        and state.world_size == 8
+        state.world_size == kernel_config.world_size
         and op == torch.distributed.ReduceOp.SUM
-        and 0 < num_tokens <= 16
-        and partial.shape == residual.shape == (num_tokens, 7168)
-        and score_weight.shape == output_weight.shape == (7168,)
+        and 0 < num_tokens <= allreduce_residual_attnres_max_tokens(state.world_size)
+        and num_tokens <= state.max_token_num
+        and partial.shape == residual.shape == (num_tokens, kernel_config.hidden_size)
+        and score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)
         and m.shape == s_.shape == (num_tokens,)
-        and acc.shape == (num_tokens, 7168)
+        and acc.shape == (num_tokens, kernel_config.hidden_size)
         and partial.dtype
         == residual.dtype
         == score_weight.dtype
@@ -2108,7 +2229,7 @@ def _all_reduce_residual_attnres_can_run(
                 acc,
             )
         )
-        and partial.numel() <= state.max_numel
+        and partial.numel() <= state.attnres_max_numel
     )
 
 
@@ -2150,7 +2271,7 @@ def _all_reduce_residual_attnres(
         scratch,
         op=op,
     )
-    from . import iris as _iris_mod
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     iris_state = _get_or_create_iris_state(state, partial.dtype)
     return _iris_mod.iris_all_reduce_residual_attnres(
@@ -2170,14 +2291,18 @@ def _attnres_comm_state(
     rank: int,
     group: dist.ProcessGroup,
 ) -> TritonCommState:
-    max_numel = input_tensor.numel()
     return TritonCommState(
         group=group,
         rank_in_group=rank,
         world_size=group.size(),
         device=input_tensor.device,
-        max_numel=max_numel,
-        max_bytes=max_numel * input_tensor.dtype.itemsize,
+        attnres_max_numel=input_tensor.numel(),
+        max_numel=0,
+        max_bytes=0,
+        max_token_num=input_tensor.shape[0],
+        hidden_dim=0,
+        comm_buff=None,
+        symm_mem_hdl=None,
     )
 
 
@@ -2237,7 +2362,7 @@ def allreduce_residual_attnres_combine(
         output_weight: Output RMSNorm weight shaped ``[7168]``.
         scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` partials.
         rank: Rank within ``group``.
-        group: Eight-rank node-local attention process group.
+        group: Validated node-local Kimi-K3 attention process group.
         local_world_size: Number of processes on each node.
         eps: Positive epsilon for AttnRes scoring and output RMSNorm.
         op: Reduction operation. Only ``SUM`` is supported.

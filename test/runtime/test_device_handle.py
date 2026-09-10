@@ -725,6 +725,32 @@ def test_only_the_builder_constructs_the_device_side():
     assert not offenders, offenders
 
 
+def test_communication_buffers_precede_cache_capacity_planning():
+    import inspect
+    import textwrap
+
+    from tokenspeed.runtime.execution.device import build_device_side
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
+    prepare_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "prepare_communication_runtime"
+    ]
+    cache_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_attn_components"
+    ]
+
+    assert prepare_lines and cache_lines
+    assert max(prepare_lines) < min(cache_lines)
+
+
 def test_collaborators_hold_the_handle_instead_of_walking_to_it():
     """No ``loop.<x>.<y>`` path to the GPU: each hook is handed its own.
 

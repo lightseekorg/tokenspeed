@@ -250,7 +250,18 @@ def get_blocked_layout(shape, dtype, num_warps, ndim=2):
 
 @gluon.constexpr_function
 def get_tdm_gather_scatter_idx_layout(NUM_INDICES, NUM_WARPS):
-    return gl.BlockedLayout([NUM_INDICES, 1], [1, 32], [1, NUM_WARPS], [1, 0])
+    # Partition the rows across warps rather than replicating them. When every
+    # warp holds the whole index list, the warp-id bits are free variables of
+    # the index tensor and the TDM lowering leaves one warp producing for the
+    # whole CTA.
+    assert NUM_WARPS > 0
+    assert NUM_INDICES % NUM_WARPS == 0
+    return gl.BlockedLayout(
+        [1, NUM_INDICES // NUM_WARPS],
+        [32, 1],
+        [1, NUM_WARPS],
+        [0, 1],
+    )
 
 
 @gluon.constexpr_function
@@ -515,12 +526,11 @@ def create_descriptor(
     SCALE_KWIDTH: gl.constexpr = cfg.SCALE_KWIDTH
 
     if cfg.USE_GATHER:
-        # For gather indices, use a layout where all indices are available per thread.
         NUM_INDICES: gl.constexpr = cfg.BLOCK_M
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             NUM_INDICES, cfg.NUM_WARPS
         )
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(0, IDX_BASE_LAYOUT)
 
         GatherIndx_ptr = GatherIndx + start_m
         offs_m_gather = off_m + gl.arange(0, NUM_INDICES, IDX_LAYOUT)

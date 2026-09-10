@@ -137,7 +137,7 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
         lambda dtype, **kwargs: False,
     )
     recipe, _, layout = kimi_tp8_layout(
@@ -164,11 +164,11 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
         lambda dtype, **kwargs: True,
     )
     monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda_batched_replay_uses_raw_gate",
+        "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
         lambda dtype, **kwargs: False,
     )
     recipe, groups, layout = kimi_tp8_layout(

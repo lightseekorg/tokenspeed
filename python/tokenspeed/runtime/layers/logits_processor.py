@@ -390,8 +390,13 @@ class LogitsProcessor(nn.Module):
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
+                attnres_max_numel=0,
+                attnres_max_rows=0,
                 max_tokens=self._LOGITS_AG_MAX_TOKENS,
                 hidden_size=vocab_padded,
+                device=None,
+                max_numel=0,
+                max_bytes=0,
             )
         return self._LOGITS_AG_STATES[key]
 
@@ -409,6 +414,7 @@ class LogitsProcessor(nn.Module):
         *,
         max_M: int,
         skip_ping_pong: bool,
+        dtype: torch.dtype,
     ) -> DistArgmaxState | None:
         """Build this TP group's distributed-argmax state, or None to fall back.
 
@@ -423,17 +429,25 @@ class LogitsProcessor(nn.Module):
             max_M: Largest row count the caller will ever pass.
             skip_ping_pong: Pin the slot band instead of alternating; only
                 when the caller synchronizes across ranks between calls.
+            dtype: Value dtype of the logits selected by the caller.
 
         Returns:
             The state, or None when this group must use the gather path.
         """
-        key = (self.tp_group, lm_head.weight.size(0), max_M, skip_ping_pong)
+        device = lm_head.weight.device
+        key = (
+            self.tp_group,
+            lm_head.weight.size(0),
+            max_M,
+            skip_ping_pong,
+            dtype,
+            device,
+        )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
         if torch.cuda.is_current_stream_capturing():
             return None  # never rendezvous inside capture; warmup probes first
 
-        device = lm_head.weight.device
         group = pg_manager.get_process_group("nccl", self.tp_group)
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
@@ -442,7 +456,7 @@ class LogitsProcessor(nn.Module):
                 group=group,
                 rank_in_group=self.tp_rank,
                 max_M=max_M,
-                dtype=lm_head.weight.dtype,
+                dtype=dtype,
                 device=device,
                 skip_ping_pong=skip_ping_pong,
             )
@@ -473,6 +487,7 @@ class LogitsProcessor(nn.Module):
             lm_head,
             max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
             skip_ping_pong=True,
+            dtype=lm_head.weight.dtype,
         )
 
     def forward(

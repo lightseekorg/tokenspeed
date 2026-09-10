@@ -704,6 +704,16 @@ class LaunchConfig(NamedTuple):
     grid: tuple[int, ...]
 
 
+def _select_llvm_fn_attrs(*, head_dim: int, max_seqlen: int, window_left: int) -> str:
+    """Use max-ILP where it reduces scheduler overhead without regressions.
+
+    It wins for full D=128 attention once fixed scheduling overhead is amortized.
+    D=64, very short sequences, and medium/large sliding windows regress.
+    """
+    use_max_ilp = head_dim == 128 and max_seqlen >= 512 and window_left < 0
+    return "amdgpu-sched-strategy=max-ilp" if use_max_ilp else ""
+
+
 def _select_m_tile(
     *, batch_size: int, n_heads: int, max_seqlen: int
 ) -> tuple[int, int]:
@@ -855,6 +865,11 @@ def gluon_mha_prefill_gfx1250(
         config.num_buffers,
         num_warps=config.num_warps,
         waves_per_eu=config.waves_per_eu,
+        llvm_fn_attrs=_select_llvm_fn_attrs(
+            head_dim=config.head_dim,
+            max_seqlen=config.max_seqlen,
+            window_left=config.window_left,
+        ),
     )
     if return_lse:
         return output, lse

@@ -27,8 +27,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.attention import qsa_sparse_attention
-from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
+from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
@@ -165,6 +165,12 @@ class QSAIndexer(nn.Module):
             torch.empty((_PERSISTENT_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8),
             persistent=False,
         )
+
+    def drop_verify_scratch(self) -> None:
+        """Forget the verify views and their pool; a rebind reissues them."""
+        self._verify_scratch.clear()
+        self._active_verify_width = None
+        self._last_pool = None
 
     @staticmethod
     def _full_backend(ctx: ForwardContext) -> CacheGroupRouter:

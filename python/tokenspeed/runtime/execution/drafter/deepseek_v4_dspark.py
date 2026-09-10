@@ -184,7 +184,7 @@ class DeepseekV4DSpark(BaseDrafter):
 
     def wire_target(self, target_model) -> None:
         self.target_model = target_model
-        self.lm_head = target_model.lm_head
+        self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
         if not hasattr(target_model, "set_dspark_layers_to_capture"):
             raise ValueError(
@@ -200,6 +200,12 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
+
+        if hasattr(self, "lm_head"):
+            self.model.refresh_local_base_logits_head(
+                self.lm_head.weight,
+                force=False,
+            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -243,6 +249,13 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
+
+    def on_target_weights_updated(self) -> None:
+        """Refresh target-derived weights after an in-place target reload."""
+        self.model.refresh_local_base_logits_head(
+            self.lm_head.weight,
+            force=True,
+        )
 
     @staticmethod
     def _bonus_tokens_from_output(
@@ -399,7 +412,7 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head)
+        local_logits = self.model.local_base_logits(draft_hidden, None)
         sample_dspark_block_greedy(
             local_logits,
             bonus,

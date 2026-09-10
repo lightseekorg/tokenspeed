@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single-launch softmax top-k routing for NVIDIA GPUs."""
+"""Single-launch softmax top-k routing for NVIDIA and gfx1250 GPUs."""
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, Platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -120,6 +120,22 @@ def _softmax_topk_kernel(
 @register_kernel(
     "moe",
     "softmax_topk",
+    name="triton_softmax_topk_gfx1250",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    priority=Priority.PERFORMANT,
+    tags={"gfx1250", "routing", "latency"},
+)
+@register_kernel(
+    "moe",
+    "softmax_topk",
     name="triton_softmax_topk",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
@@ -133,11 +149,25 @@ def triton_softmax_topk(
     *,
     router_logits: torch.Tensor,
     topk: int,
+    topk_indices_dtype: torch.dtype,
     renormalize: bool,
     routed_scaling_factor: float,
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused softmax, top-k selection, normalization, and route scaling."""
+    """Fuse softmax, top-k selection, normalization, and route scaling.
+
+    Args:
+        router_logits: Router logits shaped ``[tokens, experts]``.
+        topk: Number of experts selected per token.
+        topk_indices_dtype: Integer dtype for returned expert ids.
+        renormalize: Whether to normalize selected weights to sum to one.
+        routed_scaling_factor: Scale applied to selected route weights.
+        enable_pdl: Whether supported NVIDIA launches may use PDL.
+
+    Returns:
+        FP32 route weights and INT32 or INT64 expert ids, each shaped
+        ``[tokens, topk]``.
+    """
     if (
         router_logits.ndim != 2
         or not router_logits.is_cuda
@@ -155,11 +185,15 @@ def triton_softmax_topk(
         raise ValueError(
             f"Triton softmax-topk supports at most 1024 experts, got {experts}"
         )
+    if topk_indices_dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
 
     weights = torch.empty(
         (tokens, topk), dtype=torch.float32, device=router_logits.device
     )
-    ids = torch.empty((tokens, topk), dtype=torch.int64, device=router_logits.device)
+    ids = torch.empty(
+        (tokens, topk), dtype=topk_indices_dtype, device=router_logits.device
+    )
     if tokens == 0:
         return weights, ids
 

@@ -47,6 +47,7 @@ __all__ = [
     "latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
+    "pack_topk_router_logits",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
     "moe_softmax_topk",
@@ -60,6 +61,7 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
+from tokenspeed_kernel.ops.moe.pack_topk import pack_topk_router_logits  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
 
@@ -375,7 +377,6 @@ def dsv4_select_experts(
             kernels avoid materializing it when false.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-
     Returns:
         FP32 weights, INT32 expert ids, and a tensor shaped [tokens, experts].
         The first two tensors have shape [tokens, top_k]. When need_scores is
