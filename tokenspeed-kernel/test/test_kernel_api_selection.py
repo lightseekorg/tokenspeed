@@ -44,21 +44,32 @@ import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
 import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
+import tokenspeed_kernel.ops.attention.dsa.cuda as _attention_cuda_dsa
+import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
+import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
+import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
+import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
+import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg
 import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
+import tokenspeed_kernel.ops.attention.kpool.deep_gemm as _attention_deep_gemm_kpool
+import tokenspeed_kernel.ops.attention.mha as _attention_mha_pkg
 import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
 import tokenspeed_kernel.ops.attention.mha._triton.prefill as _attention_triton_mha_prefill
 import tokenspeed_kernel.ops.attention.mha.cuda as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
+import tokenspeed_kernel.ops.attention.mla as _attention_mla_pkg
 import tokenspeed_kernel.ops.attention.mla._triton.decode as _attention_triton_mla_decode
 import tokenspeed_kernel.ops.attention.mla._triton.prefill as _attention_triton_mla_prefill
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
+import tokenspeed_kernel.ops.attention.rmha as _attention_rmha_pkg
+import tokenspeed_kernel.ops.attention.rmha.cuda as _attention_cuda_rmha
 import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
@@ -94,13 +105,11 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
-from tokenspeed_kernel.ops.attention import (
-    GdnChunkPrefillResult,
-    KdaPrefillResult,
-)
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
+from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
 from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import (
@@ -143,9 +152,15 @@ if _attention_gluon_kpool is not None:
 
 _RELOAD_MODULES = [
     # Attention registration modules.
+    _attention_cuda_dsa,
     _attention_cuda_dsv4,
+    _attention_flashinfer_dsa,
+    _attention_deep_gemm_dsa,
+    _attention_deep_gemm_dsv4,
+    _attention_deep_gemm_kpool,
     _attention_cuda,
     _attention_flash_attn,
+    _attention_cuda_rmha,
     _attention_flash_mla,
     _attention_flashinfer_gdn,
     _attention_flashinfer,
@@ -160,8 +175,8 @@ _RELOAD_MODULES = [
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
-    # The facade owns public result classes imported by other test modules.
-    # Reloading it would replace those class objects and break isinstance checks.
+    # Variant packages own public result classes imported by other test modules.
+    # Reloading them would replace those class objects and break isinstance checks.
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
@@ -225,9 +240,11 @@ def _kernel_registry(fresh_registry):
         importlib.reload(mod)
 
 
-def test_attention_result_type_identity_is_stable():
-    assert _attention_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
-    assert _attention_pkg.KdaPrefillResult is KdaPrefillResult
+def test_attention_api_ownership_and_result_type_identity_are_stable():
+    assert _attention_pkg.__all__ == ["attn_merge_state"]
+    assert tokenspeed_kernel.attn_merge_state is _attention_pkg.attn_merge_state
+    assert _attention_gdn_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
+    assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
 
 
 def test_residual_family_exports_and_modes():
@@ -304,11 +321,11 @@ def test_dsv4_padded_heads_platform_policy(
     host_platform = Platform.get()
     try:
         Platform.override(mi350_platform)
-        assert tokenspeed_kernel.dsv4_padded_heads(16) == 16
-        assert tokenspeed_kernel.dsv4_padded_heads(32) == 32
+        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 16
+        assert _attention_dsv4_pkg.dsv4_padded_heads(32) == 32
         Platform.override(h100_platform)
-        assert tokenspeed_kernel.dsv4_padded_heads(16) == 64
-        assert tokenspeed_kernel.dsv4_padded_heads(65) == 128
+        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 64
+        assert _attention_dsv4_pkg.dsv4_padded_heads(65) == 128
     finally:
         Platform.override(host_platform)
 
@@ -990,7 +1007,7 @@ def _attention_prefill() -> object:
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
-    return tokenspeed_kernel.mha_prefill(
+    return _attention_mha_pkg.mha_prefill(
         q,
         k,
         v,
@@ -1008,7 +1025,7 @@ def _attention_extend() -> object:
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
-    return tokenspeed_kernel.mha_extend_with_kvcache(
+    return _attention_mha_pkg.mha_extend_with_kvcache(
         q,
         cu_seqlens_q,
         cu_seqlens_kv,
@@ -1027,7 +1044,7 @@ def _attention_decode() -> object:
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
-    return tokenspeed_kernel.mha_decode_with_kvcache(
+    return _attention_mha_pkg.mha_decode_with_kvcache(
         q,
         k_cache,
         v_cache,
@@ -1047,7 +1064,7 @@ def _attention_mla_decode(
     kv_cache = torch.empty((batch_size, 64, 1, 576), dtype=torch.bfloat16)
     page_table = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
     cache_seqlens = torch.full((batch_size,), 64, dtype=torch.int32)
-    return tokenspeed_kernel.mla_decode_with_kvcache(
+    return _attention_mla_pkg.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1066,7 +1083,7 @@ def _attention_mla_decode_fp8_k3() -> object:
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
     page_table = torch.tensor([[0, 1]], dtype=torch.int32)
     cache_seqlens = torch.tensor([128], dtype=torch.int32)
-    return tokenspeed_kernel.mla_decode_with_kvcache(
+    return _attention_mla_pkg.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1084,7 +1101,7 @@ def _attention_mla_decode_fp8q_k3() -> object:
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
     page_table = torch.tensor([[0, 1]], dtype=torch.int32)
     cache_seqlens = torch.tensor([128], dtype=torch.int32)
-    return tokenspeed_kernel.mla_decode_with_kvcache(
+    return _attention_mla_pkg.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1102,7 +1119,7 @@ def _attention_mla_decode_fp8q_unsupported_heads() -> object:
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
     page_table = torch.tensor([[0, 1]], dtype=torch.int32)
     cache_seqlens = torch.tensor([128], dtype=torch.int32)
-    return tokenspeed_kernel.mla_decode_with_kvcache(
+    return _attention_mla_pkg.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1128,7 +1145,7 @@ def _attention_mla_decode_projected_value_amd(
     cache_seqlens = torch.full((batch,), 4096, dtype=torch.int32)
     value_weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
     out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mla_decode_with_kvcache(
+    return _attention_mla_pkg.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
         page_table=page_table,
@@ -1153,7 +1170,7 @@ def _attention_mla_project_value_amd(
     weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
     out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
     gate = torch.empty_like(out) if use_gate else None
-    return tokenspeed_kernel.mla_project_value(
+    return _attention_mla_pkg.mla_project_value(
         attention,
         weight,
         gate=gate,
@@ -1167,7 +1184,7 @@ def _attention_mla_normalize_project_query_gfx1250(heads: int = 12) -> object:
     query_norm_weight = torch.empty((1536,), dtype=torch.bfloat16)
     kv_norm_weight = torch.empty((512,), dtype=torch.bfloat16)
     projection_weight = torch.empty((heads * 192, 1536), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mla_normalize_project_query(
+    return _attention_mla_pkg.mla_normalize_project_query(
         query,
         kv,
         query_norm_weight,
@@ -1186,7 +1203,7 @@ def _attention_rel_prefill() -> object:
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     rel_logits = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_prefill(
+    return _attention_rmha_pkg.rel_mha_prefill(
         q,
         k,
         v,
@@ -1207,7 +1224,7 @@ def _attention_rel_extend() -> object:
     v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_extend_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
@@ -1231,7 +1248,7 @@ def _attention_rel_extend_page256_sliding() -> object:
     v_cache = torch.empty((4, 256, 8, 128), dtype=torch.bfloat16)
     page_table = torch.empty((2, 3), dtype=torch.int32)
     cache_seqlens = torch.tensor([256, 512], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_extend_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_extend_with_kvcache(
         q=q,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
@@ -1255,7 +1272,7 @@ def _attention_rel_decode() -> object:
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_decode_with_kvcache(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1277,7 +1294,7 @@ def _attention_rel_decode_page128_sliding() -> object:
     page_table = torch.empty((2, 2), dtype=torch.int32)
     cache_seqlens = torch.tensor([128, 256], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_decode_with_kvcache(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1302,7 +1319,7 @@ def _attention_rel_decode_multiquery(window_left: int) -> object:
     page_table = torch.empty((batch, 6), dtype=torch.int32)
     cache_seqlens = torch.tensor([300, 641], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, prediction, 2 * prediction], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_decode_with_kvcache(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1333,7 +1350,7 @@ def _attention_rel_decode_page256_sliding() -> object:
     page_table = torch.empty((2, 2), dtype=torch.int32)
     cache_seqlens = torch.tensor([256, 512], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
-    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+    return _attention_rmha_pkg.rel_mha_decode_with_kvcache(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -1353,7 +1370,7 @@ def _attention_dsa_decode() -> object:
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode(
+    return _attention_dsa_pkg.dsa_decode(
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1374,7 +1391,7 @@ def _attention_dsv4_selected(width: int = 640) -> object:
     indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
     lens = torch.tensor([width], dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_prefill(
+    return _attention_dsv4_pkg.dsv4_prefill(
         q,
         kv,
         indices,
@@ -1391,7 +1408,7 @@ def _attention_dsv4_selected_short() -> object:
 def _attention_dsv4_selected_i64() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv = torch.empty((640, 512), dtype=torch.bfloat16)
-    return tokenspeed_kernel.dsv4_prefill(
+    return _attention_dsv4_pkg.dsv4_prefill(
         q,
         kv,
         torch.arange(640, dtype=torch.int32).unsqueeze(0),
@@ -1415,7 +1432,7 @@ def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
             "extra_lens": torch.empty((2,), dtype=torch.int32),
             "extra_page_size": 64,
         }
-    return tokenspeed_kernel.dsv4_decode(
+    return _attention_dsv4_pkg.dsv4_decode(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1441,7 +1458,7 @@ def _attention_dsv4_paged_selected_pro_tp8() -> object:
     extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
     extra_lens = torch.empty((tokens,), dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_decode(
+    return _attention_dsv4_pkg.dsv4_decode(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1458,7 +1475,7 @@ def _attention_dsv4_paged_selected_pro_tp8() -> object:
 
 def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
     tokens = 6
-    return tokenspeed_kernel.dsv4_decode(
+    return _attention_dsv4_pkg.dsv4_decode(
         q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
         swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
         swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
@@ -1481,7 +1498,7 @@ def _attention_dsv4_swa_cache_insert() -> object:
     positions = torch.zeros((1,), dtype=torch.int64)
     cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
     q_out = torch.empty_like(q)
-    return tokenspeed_kernel.dsv4_swa_cache_insert(
+    return _attention_dsv4_pkg.dsv4_swa_cache_insert(
         q,
         kv,
         cache,
@@ -1520,7 +1537,7 @@ def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
     cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
 
     with pytest.raises(ValueError, match="positions entries must index"):
-        tokenspeed_kernel.dsv4_swa_cache_insert(
+        _attention_dsv4_pkg.dsv4_swa_cache_insert(
             q,
             kv,
             cache,
@@ -1531,7 +1548,7 @@ def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
             1,
             validate_positions=True,
         )
-    tokenspeed_kernel.dsv4_swa_cache_insert(
+    _attention_dsv4_pkg.dsv4_swa_cache_insert(
         q,
         kv,
         cache,
@@ -1552,7 +1569,7 @@ def _attention_dsa_decode_fp8_dense_rank128_q4(
     kv_cache = torch.empty((64, 192), dtype=dtype)
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode(
+    return _attention_dsa_pkg.dsa_decode(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1579,7 +1596,7 @@ def _attention_dsa_decode_fp8_dense_rank512(
     kv_cache = torch.empty((64, 576), dtype=dtype)
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode(
+    return _attention_dsa_pkg.dsa_decode(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1606,7 +1623,7 @@ def _attention_dsa_decode_fp8_sparse_rank512(
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode(
+    return _attention_dsa_pkg.dsa_decode(
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1631,7 +1648,7 @@ def _attention_dsa_prefill() -> object:
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1651,7 +1668,7 @@ def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     kv_cache = torch.empty((2051, 512), dtype=torch.bfloat16)
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1673,7 +1690,7 @@ def _attention_dsa_prefill_fp8_dense(
     kv_cache = torch.empty((64, 576), dtype=dtype)
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1697,7 +1714,7 @@ def _attention_dsa_decode_fp8_dense_rank128() -> object:
     kv_cache = torch.empty((64, 192), dtype=torch.float8_e4m3fn)
     topk_slots = torch.empty((2, 2048), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode(
+    return _attention_dsa_pkg.dsa_decode(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1717,7 +1734,7 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     kv_cache = torch.empty((64, 192), dtype=torch.bfloat16)
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1737,7 +1754,7 @@ def _attention_dsa_prefill_fp8_dense_rank128() -> object:
     kv_cache = torch.empty((64, 192), dtype=torch.float8_e4m3fn)
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1757,7 +1774,7 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill(
+    return _attention_dsa_pkg.dsa_prefill(
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1778,7 +1795,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([64, 64], dtype=torch.int32)
     block_table = torch.zeros((2, 1), dtype=torch.int32)
-    return tokenspeed_kernel.dsa_decode_topk(
+    return _attention_dsa_pkg.dsa_decode_topk(
         q,
         weights,
         seq_lens,
@@ -1796,7 +1813,7 @@ def _attention_dsa_decode_topk_bf16_weights() -> object:
 
 def _attention_dsa_decode_topk_logical() -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.dsa_decode_topk(
+    return _attention_dsa_pkg.dsa_decode_topk(
         q,
         torch.empty((2, 2), dtype=torch.float32),
         torch.tensor([64, 64], dtype=torch.int32),
@@ -1823,7 +1840,7 @@ def _attention_dsa_prefill_topk(
     kv_workspace_slots = torch.arange(64, dtype=torch.int64)
     row_starts = torch.tensor([0, 8], dtype=torch.int32)
     row_ends = torch.tensor([8, 16], dtype=torch.int32)
-    return tokenspeed_kernel.dsa_prefill_topk(
+    return _attention_dsa_pkg.dsa_prefill_topk(
         q,
         weights,
         kv_workspace_slots,
@@ -1858,7 +1875,7 @@ def _attention_dsa_decode_topk_standard(
         if index_k_layout == "packed"
         else torch.zeros((2, 64 * 132), dtype=torch.uint8)
     )
-    return tokenspeed_kernel.dsa_decode_topk(
+    return _attention_dsa_pkg.dsa_decode_topk(
         q,
         torch.empty((2, index_heads), dtype=torch.bfloat16),
         torch.tensor([64, 64], dtype=torch.int32),
@@ -1887,7 +1904,7 @@ def _attention_dsa_prefill_topk_standard(
         if index_k_layout == "packed"
         else torch.zeros((2, 64 * 132), dtype=torch.uint8)
     )
-    return tokenspeed_kernel.dsa_prefill_topk(
+    return _attention_dsa_pkg.dsa_prefill_topk(
         q,
         torch.empty((2, index_heads), dtype=torch.float32),
         torch.arange(64, dtype=torch.int64),
@@ -1932,7 +1949,7 @@ def test_dsa_topk_selection_receives_index_heads(
     index_k_cache = torch.empty((64, 132), dtype=torch.uint8)
 
     if mode == "decode":
-        tokenspeed_kernel.dsa_decode_topk(
+        _attention_dsa_pkg.dsa_decode_topk(
             q,
             weights,
             torch.tensor([1], dtype=torch.int32),
@@ -1943,7 +1960,7 @@ def test_dsa_topk_selection_receives_index_heads(
             index_k_cache=index_k_cache,
         )
     else:
-        tokenspeed_kernel.dsa_prefill_topk(
+        _attention_dsa_pkg.dsa_prefill_topk(
             q,
             weights,
             torch.tensor([0], dtype=torch.int64),
@@ -1981,7 +1998,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
     )
     candidate_lens_cpu = torch.tensor([8, 16], dtype=torch.int64)
 
-    tokenspeed_kernel.dsa_prefill_topk(
+    _attention_dsa_pkg.dsa_prefill_topk(
         torch.empty((2, 2, 128), dtype=torch.bfloat16),
         torch.empty((2, 2), dtype=torch.float32),
         torch.arange(16, dtype=torch.int64),
@@ -2073,7 +2090,7 @@ def test_dsa_topk_selection_receives_cache_layout(
     weights = torch.empty((1, 32), dtype=torch.float32)
 
     if mode == "decode":
-        tokenspeed_kernel.dsa_decode_topk(
+        _attention_dsa_pkg.dsa_decode_topk(
             q,
             weights,
             torch.tensor([1], dtype=torch.int32),
@@ -2084,7 +2101,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             index_k_cache=cache,
         )
     else:
-        tokenspeed_kernel.dsa_prefill_topk(
+        _attention_dsa_pkg.dsa_prefill_topk(
             q,
             weights,
             torch.tensor([0], dtype=torch.int64),
@@ -2108,7 +2125,7 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
     inputs.pop("index_k_fp8" if missing == "values" else "index_k_scale")
 
     with pytest.raises(ValueError, match="must be provided together"):
-        tokenspeed_kernel.dsa_prefill_topk(
+        _attention_dsa_pkg.dsa_prefill_topk(
             torch.empty((1, 32, 128), dtype=torch.bfloat16),
             torch.empty((1, 32), dtype=torch.float32),
             torch.tensor([0], dtype=torch.int64),
@@ -2123,7 +2140,7 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
 
 def _attention_dsa_plan() -> object:
     seq_lens_2d = torch.tensor([[64], [64]], dtype=torch.int32)
-    return tokenspeed_kernel.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
+    return _attention_dsa_pkg.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
 
 
 def _attention_merge_state() -> object:
@@ -2131,7 +2148,7 @@ def _attention_merge_state() -> object:
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
-    return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
+    return _attention_pkg.attn_merge_state(out_a, lse_a, out_b, lse_b)
 
 
 def _mhc_pre() -> object:
@@ -2253,7 +2270,7 @@ def _attention_gdn_chunk_prefill() -> object:
     beta = torch.empty((1, 4, 16), dtype=torch.bfloat16)
     initial_state = torch.empty((1, 16, 64, 64), dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
-    return tokenspeed_kernel.gdn_chunk_prefill(
+    return _attention_gdn_pkg.gdn_chunk_prefill(
         q,
         k,
         v,
@@ -4790,6 +4807,7 @@ def test_b300_rel_decode_registration_and_selection(
         Platform.override(b300_platform)
         KernelRegistry.reset()
         importlib.reload(_attention_flash_attn)
+        importlib.reload(_attention_cuda_rmha)
         registry = KernelRegistry.get()
 
         expected_spec = registry.get_by_name(case.expected)

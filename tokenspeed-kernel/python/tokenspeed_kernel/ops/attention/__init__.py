@@ -23,43 +23,12 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.ops.attention.dsa import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.dsa import __all__ as _dsa_all
-from tokenspeed_kernel.ops.attention.dsv4 import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.dsv4 import __all__ as _dsv4_all
-from tokenspeed_kernel.ops.attention.gdn import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.gdn import __all__ as _gdn_all
-from tokenspeed_kernel.ops.attention.kda import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.kda import __all__ as _kda_all
-from tokenspeed_kernel.ops.attention.kpool import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.kpool import __all__ as _kpool_all
-
-# Preserve the long-standing module aliases exposed by this package.
-from tokenspeed_kernel.ops.attention.mha import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.mha import __all__ as _mha_all
-from tokenspeed_kernel.ops.attention.mha import cuda as flash_attn
-from tokenspeed_kernel.ops.attention.mla import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.mla import __all__ as _mla_all
-from tokenspeed_kernel.ops.attention.mla import tokenspeed_mla
-from tokenspeed_kernel.ops.attention.msa import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.msa import __all__ as _msa_all
-from tokenspeed_kernel.ops.attention.msa import cuda as msa_score
-from tokenspeed_kernel.ops.attention.qsa import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.qsa import __all__ as _qsa_all
-from tokenspeed_kernel.ops.attention.rmha import *  # noqa: F403
-from tokenspeed_kernel.ops.attention.rmha import __all__ as _rmha_all
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 LSE_LN = math.log2(math.e)
-
-
-def _attention_format_signature(**roles: torch.Tensor):
-    return format_signature(
-        **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
-    )
 
 
 def attn_merge_state(
@@ -88,7 +57,11 @@ def attn_merge_state(
     This is shared by MHA and MLA because the merge only depends on partial
     attention outputs and LSE values, not on how the K/V states were produced.
     """
-    signature = _attention_format_signature(out_a=out_a, out_b=out_b)
+
+    signature = format_signature(
+        out_a=dense_tensor_format(out_a.dtype),
+        out_b=dense_tensor_format(out_b.dtype),
+    )
     kernel = select_kernel(
         "attention",
         "attn_merge_state",
@@ -128,20 +101,10 @@ def attn_merge_state(
         )
 
 
-# Merge-state implementation registration.
+# Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
 __all__ = [
-    *_mha_all,
-    *_rmha_all,
-    *_mla_all,
-    *_kpool_all,
-    *_dsa_all,
-    *_msa_all,
-    *_dsv4_all,
-    *_gdn_all,
-    *_kda_all,
-    *_qsa_all,
     "attn_merge_state",
 ]

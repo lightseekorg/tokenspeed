@@ -23,51 +23,26 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
-    kernel as _cute_dsl_qsa_sparse_attention,
-)
+
+_PLATFORM = current_platform()
+_IS_NVIDIA_BLACKWELL = _PLATFORM.is_nvidia and _PLATFORM.is_blackwell
+
+if _IS_NVIDIA_BLACKWELL:
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
+        kernel as _cute_dsl_qsa_sparse_attention,
+    )
 
 _HEAD_DIM = 256
 _SELECTED_WIDTH = 2051
 
 
-@register_kernel(
-    "attention",
-    "qsa_sparse_attention",
-    name="cute_dsl_blackwell_qsa_sparse_attention",
-    solution="cute_dsl",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                k_cache=dense_tensor_format(torch.float8_e4m3fn),
-                v_cache=dense_tensor_format(torch.float8_e4m3fn),
-            ),
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                k_cache=dense_tensor_format(torch.bfloat16),
-                v_cache=dense_tensor_format(torch.bfloat16),
-            ),
-        }
-    ),
-    traits={
-        "head_dim": frozenset({_HEAD_DIM}),
-        "value_head_dim": frozenset({_HEAD_DIM}),
-        "num_q_heads": frozenset({6, 12, 24}),
-        "num_kv_heads": frozenset({1, 2, 4}),
-        "selected_width": frozenset({_SELECTED_WIDTH}),
-    },
-    priority=Priority.SPECIALIZED + 2,
-    tags={"latency", "blackwell", "sparse", "cluster"},
-)
 def cute_dsl_blackwell_qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -130,4 +105,41 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     )
 
 
-__all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
+if _IS_NVIDIA_BLACKWELL:
+    register_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        name="cute_dsl_blackwell_qsa_sparse_attention",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.bfloat16),
+                    v_cache=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        traits={
+            "head_dim": frozenset({_HEAD_DIM}),
+            "value_head_dim": frozenset({_HEAD_DIM}),
+            "num_q_heads": frozenset({6, 12, 24}),
+            "num_kv_heads": frozenset({1, 2, 4}),
+            "selected_width": frozenset({_SELECTED_WIDTH}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+        tags={"latency", "blackwell", "sparse", "cluster"},
+    )(cute_dsl_blackwell_qsa_sparse_attention)
+    __all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
+else:
+    __all__ = []

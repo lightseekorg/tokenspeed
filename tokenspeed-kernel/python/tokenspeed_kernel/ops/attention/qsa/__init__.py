@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
@@ -188,16 +187,11 @@ def qsa_sparse_attention(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
 
 # isort: on
 
-try:
-    import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
-except ImportError:
-    pass
-
-if current_platform().is_nvidia:
-    import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
 
 __all__ = [
     "qsa_sparse_attention",

@@ -49,7 +49,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
     rel_mha_extend_with_kvcache,
     rel_mha_plan,

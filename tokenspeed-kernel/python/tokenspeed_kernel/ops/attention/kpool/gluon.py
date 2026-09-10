@@ -36,14 +36,22 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     _kpool_sort_topk_kernel,
     expand_kpool_to_flat_kv,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
-    gluon_dsa_kpool_prefill_logits_gfx950,
-    gluon_dsa_kpool_prefill_plan_logits_gfx950,
-    gluon_dsa_logical_topk_gfx950,
-)
+
+_IS_AMD = current_platform().is_amd
+
+if _IS_AMD:
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        gluon_dsa_kpool_prefill_logits_gfx950,
+        gluon_dsa_kpool_prefill_plan_logits_gfx950,
+        gluon_dsa_logical_topk_gfx950,
+    )
 
 _HEAD_DIM = 128
 _POOL_SIZE = 4
@@ -646,33 +654,36 @@ def _kpool_prefill_topk_impl(
     )
 
 
-@register_kernel(
-    "attention",
-    "kpool_prefill_topk",
-    name="gluon_kpool_prefill_topk_fp8_gfx950",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
-    priority=Priority.SPECIALIZED,
-    traits={
-        "index_heads": frozenset({32}),
-        "head_dim": frozenset({128}),
-        "pool_size": frozenset({4}),
-        "page_size": frozenset({16}),
-        "topk_pools": frozenset({512}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "score_activation": frozenset({"relu"}),
-        "topk_layout": frozenset({"global_slots"}),
-        "prefill_plan": frozenset({False, True}),
-    },
-    tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
-)
 def gluon_kpool_prefill_topk_fp8_gfx950(*args, **kwargs):
     return _kpool_prefill_topk_impl(*args, **kwargs)
 
 
-__all__ = ["gluon_kpool_prefill_topk_fp8_gfx950"]
+if _IS_AMD:
+    register_kernel(
+        "attention",
+        "kpool_prefill_topk",
+        name="gluon_kpool_prefill_topk_fp8_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "index_heads": frozenset({32}),
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16}),
+            "topk_pools": frozenset({512}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "prefill_plan": frozenset({False, True}),
+        },
+        tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
+    )(gluon_kpool_prefill_topk_fp8_gfx950)
+    __all__ = ["gluon_kpool_prefill_topk_fp8_gfx950"]
+else:
+    __all__ = []

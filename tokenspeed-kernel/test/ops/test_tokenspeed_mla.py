@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import tokenspeed_mla as kernel_mla
+from tokenspeed_kernel.ops.attention.mla import tokenspeed_mla as kernel_mla
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     mla_kv_pack_quantize_fp8,
 )

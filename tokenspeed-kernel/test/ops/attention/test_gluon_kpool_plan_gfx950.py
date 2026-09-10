@@ -32,7 +32,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel import kpool_prefill_topk  # isort: skip
+from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_topk  # isort: skip
 from tokenspeed_kernel.ops.attention.kpool import (
     gluon as gluon_kpool_select,  # isort: skip
 )

@@ -20,14 +20,12 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.gdn import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
-)
-from tokenspeed_kernel.ops.attention import (
-    GdnCheckpointLayout,
-    GdnChunkPrefillResult,
 )
 
 

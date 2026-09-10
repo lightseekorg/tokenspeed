@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_padded_heads,
     dsv4_plan,

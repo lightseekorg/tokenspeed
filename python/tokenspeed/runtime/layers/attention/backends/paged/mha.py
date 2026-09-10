@@ -25,7 +25,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,

@@ -34,8 +34,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import rel_mha_extend_with_kvcache, rel_mha_prefill
-from tokenspeed_kernel.ops.attention import flash_attn as fa_mod
+from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod
+from tokenspeed_kernel.ops.attention.rmha import (
+    rel_mha_extend_with_kvcache,
+    rel_mha_prefill,
+)
 
 torch.manual_seed(11)
 

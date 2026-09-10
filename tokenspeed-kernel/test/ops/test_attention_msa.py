@@ -9,7 +9,7 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
@@ -968,7 +968,7 @@ def _prefill_indexer_case(
 def test_fmha_prefill_score_matches_triton(
     qo_lens: list[int], kv_lens: list[int]
 ) -> None:
-    from tokenspeed_kernel.ops.attention import msa_score
+    from tokenspeed_kernel.ops.attention.msa import cuda as msa_score
 
     if not msa_score.ensure_prefill_score_ready(None):
         pytest.skip("fmha OnlyScore JIT compilation failed (nvcc unavailable?)")

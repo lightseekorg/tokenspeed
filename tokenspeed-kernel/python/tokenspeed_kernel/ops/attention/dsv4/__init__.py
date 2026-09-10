@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
@@ -144,7 +144,7 @@ def dsv4_padded_heads(num_local_heads: int) -> int:
 
 def dsv4_reset_attention_state() -> None:
     """Reset backend-owned value-dependent state before a DSV4 forward."""
-    from tokenspeed_kernel.ops.attention.mla.cuda import reset_dsv4_tile_metadata
+    from tokenspeed_kernel.ops.attention.dsv4.cuda import reset_dsv4_tile_metadata
 
     reset_dsv4_tile_metadata()
 
@@ -1061,14 +1061,10 @@ def dsv4_warmup(
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv4.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv4.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv4.deep_gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsv4.gluon  # noqa: E402,F401
 
 # isort: on
-
-if current_platform().is_nvidia:
-    import tokenspeed_kernel.ops.attention.dsv4.deep_gemm  # noqa: E402,F401
-
-if current_platform().is_amd:
-    import tokenspeed_kernel.ops.attention.dsv4.gluon  # noqa: E402,F401
 
 __all__ = [
     "dsv4_indexer_cache_format",

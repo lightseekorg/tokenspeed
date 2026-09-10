@@ -37,6 +37,28 @@ _OPERATOR_VARIANTS = {
 
 def _literal_attention_registrations(path: Path):
     tree = ast.parse(path.read_text(), filename=str(path))
+    helpers = {}
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        parameters = [argument.arg for argument in function.args.args]
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            callee = node.func
+            callee_name = (
+                callee.id
+                if isinstance(callee, ast.Name)
+                else callee.attr if isinstance(callee, ast.Attribute) else None
+            )
+            namespace, operator = node.args[:2]
+            if (
+                callee_name == "register_kernel"
+                and isinstance(namespace, ast.Constant)
+                and namespace.value == "attention"
+                and isinstance(operator, ast.Name)
+                and operator.id in parameters
+            ):
+                helpers[function.name] = parameters.index(operator.id)
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -46,6 +68,15 @@ def _literal_attention_registrations(path: Path):
         elif isinstance(function, ast.Attribute):
             function_name = function.attr
         else:
+            continue
+        if function_name in helpers:
+            operator_index = helpers[function_name]
+            if len(node.args) > operator_index:
+                operator = node.args[operator_index]
+                if isinstance(operator, ast.Constant) and isinstance(
+                    operator.value, str
+                ):
+                    yield operator.value, node.lineno
             continue
         if function_name != "register_kernel" or len(node.args) < 2:
             continue
@@ -110,28 +141,43 @@ def test_attention_implementations_are_grouped_by_variant():
 
     for variant in package_dirs:
         variant_dir = attention_dir / variant
-        assert {
+        implementation_modules = {
             path.stem for path in variant_dir.glob("*.py") if path.name != "__init__.py"
-        } <= implementations
+        }
+        assert implementation_modules <= implementations
         assert all(
             path.name.startswith("_")
             for path in variant_dir.iterdir()
             if path.is_dir() and (path / "__init__.py").is_file()
         )
 
+        tree = ast.parse((variant_dir / "__init__.py").read_text())
+        direct_imports = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert {
+            f"tokenspeed_kernel.ops.attention.{variant}.{implementation}"
+            for implementation in implementation_modules
+        } <= direct_imports
+
     assert not (attention_dir / "dsa" / "_cuda" / "__init__.py").exists()
     assert not (attention_dir / "gdn" / "_triton" / "linear" / "__init__.py").exists()
     assert not (attention_dir / "mla" / "_tokenspeed_mla" / "__init__.py").exists()
 
 
-def test_gluon_attention_registrations_are_owned_by_their_variant():
+def test_attention_registrations_are_owned_by_their_variant():
     attention_dir = (
         Path(__file__).parents[1] / "python" / "tokenspeed_kernel" / "ops" / "attention"
     )
     for variant_dir in attention_dir.iterdir():
         if not variant_dir.is_dir() or not (variant_dir / "__init__.py").is_file():
             continue
-        for path in variant_dir.rglob("gluon.py"):
+        for path in variant_dir.rglob("*.py"):
+            if path.name == "__init__.py":
+                continue
             for operator, lineno in _literal_attention_registrations(path):
                 assert _operator_variant(operator) == variant_dir.name, (
                     f"{path.relative_to(attention_dir)}:{lineno} registers "

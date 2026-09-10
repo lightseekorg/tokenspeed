@@ -143,7 +143,7 @@ def _check(out: torch.Tensor, ref: torch.Tensor):
 @requires_sm100
 def test_decode_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
-    from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
+    from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
 
     seq_lens = [900, 300, 1533]
     cache = _build_paged_cache(seq_lens, seed=7)
@@ -187,7 +187,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
 @requires_sm100
 def test_extend_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
-    from tokenspeed_kernel.ops.attention import mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
 
     seq_lens = [700, 1200]
     extend_lens = [64, 96]

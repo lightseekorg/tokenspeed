@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.attention import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_compress_and_store,

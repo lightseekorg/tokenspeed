@@ -133,7 +133,7 @@ def test_dispatch_native_multiq(page, rel_extent, window_left, kv_lens, k_new) -
     causality fixed 2026-07-14)."""
     _skip_unless_supported()
     import tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_decode_v2 as v2mod
-    from tokenspeed_kernel import rel_mha_decode_with_kvcache
+    from tokenspeed_kernel.ops.attention.rmha import rel_mha_decode_with_kvcache
 
     device = torch.device("cuda")
     B = len(kv_lens)

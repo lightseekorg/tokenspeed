@@ -29,12 +29,12 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.gdn import flashinfer as flashinfer_gdn
+from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
 )
-from tokenspeed_kernel.ops.attention.gdn import flashinfer as flashinfer_gdn
 from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 

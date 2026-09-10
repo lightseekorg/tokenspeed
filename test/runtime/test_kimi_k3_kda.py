@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import kda_recurrent_layout
+from tokenspeed_kernel.ops.attention.kda import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
 # The chunked-prefill KDA path resolves to the flash-linear-attention ("fla")

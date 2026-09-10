@@ -507,8 +507,10 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
             from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
+            from tokenspeed_kernel.ops.attention.gdn import (
+                gdn_replay_commit_supported,
+            )
 
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,

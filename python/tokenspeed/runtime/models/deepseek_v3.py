@@ -31,8 +31,8 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import (
-    attn_merge_state,
+from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
     mla_project_value_prefers_contiguous_weight,
 )

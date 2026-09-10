@@ -21,19 +21,28 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv4.cuda import (
-    has_indexer_mxfp4_paged_gather,
-    has_indexer_topk_prefill,
-    has_persistent_topk,
-    indexer_mxfp4_paged_gather,
-    indexer_topk_prefill,
-    persistent_topk,
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
-from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_prefill_jit
+
+_IS_NVIDIA = current_platform().is_nvidia
+
+if _IS_NVIDIA:
+    from tokenspeed_kernel.ops.attention.dsv4.cuda import (
+        has_indexer_mxfp4_paged_gather,
+        has_indexer_topk_prefill,
+        has_persistent_topk,
+        indexer_mxfp4_paged_gather,
+        indexer_topk_prefill,
+        persistent_topk,
+    )
+    from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
+    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_prefill_jit
 
 _MXFP4_BLOCK_SIZE = 32
 _MXFP4_VALUE_BYTES_PER_BLOCK = _MXFP4_BLOCK_SIZE // 2
@@ -445,24 +454,76 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
     )(_dsv4_decode_topk)
 
 
-_register("fp8_scaled", ArchVersion(9, 0))
-_register("mxfp4", ArchVersion(10, 0))
-
-
-@register_kernel(
-    "attention",
-    "dsv4_warmup",
-    name="deep_gemm_dsv4_warmup",
-    solution="deep_gemm",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset({format_signature()}),
-    traits={},
-    priority=Priority.SPECIALIZED,
-)
 def deep_gemm_dsv4_warmup(**kwargs) -> None:
     if deep_gemm.get_pdl() != pdl_enabled():
         deep_gemm.set_pdl(pdl_enabled())
     warmup_prefill_jit(**kwargs)
+
+
+if _IS_NVIDIA:
+
+    @register_kernel(
+        "attention",
+        "dsv4_plan",
+        name="deep_gemm_dsv4_plan",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={"page_size": frozenset({64})},
+        priority=Priority.PERFORMANT,
+    )
+    def deep_gemm_dsv4_plan(
+        *,
+        page_size: int,
+        seq_lens_2d: torch.Tensor,
+        out: object | None = None,
+    ) -> torch.Tensor:
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
+        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
+            seq_lens_2d,
+            page_size,
+            deep_gemm.get_num_sms(),
+        )
+        if out is None:
+            with torch.inference_mode(False):
+                return refreshed.clone()
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.shape != refreshed.shape
+            or out.device != refreshed.device
+            or out.dtype != refreshed.dtype
+        ):
+            actual = (
+                f"{tuple(out.shape)} {out.dtype} {out.device}"
+                if isinstance(out, torch.Tensor)
+                else type(out).__name__
+            )
+            raise RuntimeError(
+                "DeepSeek V4 decode indexer plan changed shape during CUDA graph "
+                "replay; recapture or use eager for this batch. "
+                f"captured={actual}, refreshed={tuple(refreshed.shape)} "
+                f"{refreshed.dtype} {refreshed.device}"
+            )
+        with torch.inference_mode():
+            out.copy_(refreshed)
+        return out
+
+    _register("fp8_scaled", ArchVersion(9, 0))
+    _register("mxfp4", ArchVersion(10, 0))
+    register_kernel(
+        "attention",
+        "dsv4_warmup",
+        name="deep_gemm_dsv4_warmup",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={},
+        priority=Priority.SPECIALIZED,
+    )(deep_gemm_dsv4_warmup)

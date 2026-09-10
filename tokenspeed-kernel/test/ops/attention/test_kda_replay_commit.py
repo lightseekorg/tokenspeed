@@ -27,7 +27,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.attention import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     kda_replay_commit_supported,
     resolve_kda_batched_replay_commit,
 )
@@ -656,7 +656,7 @@ def test_in_place_commit_full_pool_accounting():
 @requires_registered_replay
 def test_replay_commit_probe_tracks_dtype():
     """The capability probe must use the actual activation dtype."""
-    from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+    from tokenspeed_kernel.ops.attention.kda import kda_replay_commit_supported
 
     assert not kda_replay_commit_supported(torch.float32)
     assert kda_replay_commit_supported(torch.bfloat16)

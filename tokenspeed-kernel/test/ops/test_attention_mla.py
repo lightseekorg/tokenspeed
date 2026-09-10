@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,

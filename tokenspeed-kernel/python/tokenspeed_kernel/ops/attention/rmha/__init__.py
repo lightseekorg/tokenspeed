@@ -507,16 +507,11 @@ def rel_mha_decode_with_kvcache(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.rmha.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.rmha.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.rmha.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.rmha.gluon  # noqa: E402,F401
 
 # isort: on
-
-try:
-    import tokenspeed_kernel.ops.attention.rmha.cute_dsl  # noqa: E402,F401
-except ImportError:
-    pass
-
-if current_platform().is_amd:
-    import tokenspeed_kernel.ops.attention.rmha.gluon  # noqa: E402,F401
 
 __all__ = [
     "rel_mha_plan",

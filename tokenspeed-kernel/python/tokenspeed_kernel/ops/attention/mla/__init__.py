@@ -1216,11 +1216,10 @@ def mla_decode_with_kvcache(
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401
 
 # isort: on
 
-if current_platform().is_amd:
-    import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401
 
 __all__ = [
     "mla_project_value_prefers_contiguous_weight",

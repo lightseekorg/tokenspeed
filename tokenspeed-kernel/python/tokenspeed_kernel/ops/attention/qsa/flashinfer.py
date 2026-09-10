@@ -24,12 +24,21 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
-    get_flashinfer_qsa_sparse_runner,
-)
+
+_IS_NVIDIA = current_platform().is_nvidia
+
+if _IS_NVIDIA:
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_sparse import (
+        get_flashinfer_qsa_sparse_runner,
+    )
 
 _SUPPORTED_HEAD_DIMS = frozenset({64, 128, 256})
 
@@ -130,40 +139,6 @@ _FP8_SIGNATURE = format_signature(
 )
 
 
-@register_kernel(
-    "attention",
-    "qsa_sparse_attention",
-    name="flashinfer_fa2_qsa_sparse_attention",
-    solution="flashinfer",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(8, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset({_BF16_SIGNATURE}),
-    traits={
-        "head_dim": _SUPPORTED_HEAD_DIMS,
-        "value_head_dim": _SUPPORTED_HEAD_DIMS,
-    },
-    priority=Priority.PERFORMANT,
-    tags={"fallback", "fa2", "sparse"},
-)
-@register_kernel(
-    "attention",
-    "qsa_sparse_attention",
-    name="flashinfer_fa2_fp8_qsa_sparse_attention",
-    solution="flashinfer",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset({_FP8_SIGNATURE}),
-    traits={
-        "head_dim": _SUPPORTED_HEAD_DIMS,
-        "value_head_dim": _SUPPORTED_HEAD_DIMS,
-    },
-    priority=Priority.PERFORMANT,
-    tags={"fallback", "fa2", "fp8", "sparse"},
-)
 def flashinfer_fa2_qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -207,4 +182,42 @@ def flashinfer_fa2_qsa_sparse_attention(
     )
 
 
-__all__ = ["flashinfer_fa2_qsa_sparse_attention"]
+if _IS_NVIDIA:
+    # Preserve the original stacked-decorator registration order: FP8, then BF16.
+    register_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        name="flashinfer_fa2_fp8_qsa_sparse_attention",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({_FP8_SIGNATURE}),
+        traits={
+            "head_dim": _SUPPORTED_HEAD_DIMS,
+            "value_head_dim": _SUPPORTED_HEAD_DIMS,
+        },
+        priority=Priority.PERFORMANT,
+        tags={"fallback", "fa2", "fp8", "sparse"},
+    )(flashinfer_fa2_qsa_sparse_attention)
+    register_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        name="flashinfer_fa2_qsa_sparse_attention",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(8, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({_BF16_SIGNATURE}),
+        traits={
+            "head_dim": _SUPPORTED_HEAD_DIMS,
+            "value_head_dim": _SUPPORTED_HEAD_DIMS,
+        },
+        priority=Priority.PERFORMANT,
+        tags={"fallback", "fa2", "sparse"},
+    )(flashinfer_fa2_qsa_sparse_attention)
+    __all__ = ["flashinfer_fa2_qsa_sparse_attention"]
+else:
+    __all__ = []

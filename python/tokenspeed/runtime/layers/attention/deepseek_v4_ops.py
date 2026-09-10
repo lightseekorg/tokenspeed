@@ -23,7 +23,7 @@ runtime requires TokenSpeed's own built DeepSeek V4 attention op.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_csa_indexer_fp8_cache_insert,
     dsv4_swa_cache_insert,
 )

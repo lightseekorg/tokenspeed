@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
@@ -853,11 +853,9 @@ def kda_replay_commit_supported(
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 # isort: on
-
-if current_platform().is_amd:
-    import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 __all__ = [
     "KdaPrefillResult",

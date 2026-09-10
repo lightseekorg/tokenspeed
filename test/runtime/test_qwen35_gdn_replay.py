@@ -47,7 +47,7 @@ from test.runtime.test_gdn_state_paging import (
     _mamba_config_pair,
 )
 
-from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (

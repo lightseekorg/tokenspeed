@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import kpool_decode_topk, kpool_prefill_topk
+from tokenspeed_kernel.ops.attention.kpool import (
+    kpool_decode_topk,
+    kpool_prefill_topk,
+)
 from tokenspeed_kernel.ops.attention.kpool.triton import (
     _prepare_kpool_decode_metadata,
     expand_kpool_to_flat_kv,

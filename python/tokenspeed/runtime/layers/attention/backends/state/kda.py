@@ -28,16 +28,16 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
 )
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
 )
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
     kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
@@ -777,7 +777,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+        from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]

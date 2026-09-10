@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )

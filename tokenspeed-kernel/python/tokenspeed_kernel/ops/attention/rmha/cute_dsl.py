@@ -40,42 +40,50 @@ operator modules, plus a compatibility layer over the installed
 - ``rel_decode``/``rel_decode_v2``/``rel_extend``: operator wrappers the
   ops layer routes through (compile caches, paging glue, warmup hooks).
 
-Importing this package requires ``tokenspeed-fa4`` (and cutlass-dsl);
-``cute_dsl/__init__.py`` guards its re-exports for environments without it.
+The FA4 and CUDA imports are restricted to NVIDIA Blackwell platforms.
 """
 
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl import (  # isort: skip  (FA4 mount precedes the kernels); isort: skip
-    fmha_bias_helper,
-    rel_decode,
-    rel_decode_v2,
-    rel_extend,
-)
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl.cu_blocks_kernels import (
-    CuBlocksToBatchKernel,
-    CuSeqlensToBlocksKernel,
-)
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_combine import (
-    FlashAttentionForwardCombine,
-)
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_sm100_bias import (
-    FlashAttentionForwardSm100,
-)
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_sm100_bias_decode import (
-    FlashAttentionDecodeSm100Bias,
-    create_mxfp8_scale_factor_tensor,
-)
-from tokenspeed_kernel.ops.attention.rmha._cute_dsl.shearing_bias import ShearingBias
+from tokenspeed_kernel.platform import current_platform
 
-__all__ = [
-    "CuBlocksToBatchKernel",
-    "CuSeqlensToBlocksKernel",
-    "FlashAttentionDecodeSm100Bias",
-    "FlashAttentionForwardCombine",
-    "FlashAttentionForwardSm100",
-    "ShearingBias",
-    "create_mxfp8_scale_factor_tensor",
-    "fmha_bias_helper",
-    "rel_decode",
-    "rel_decode_v2",
-    "rel_extend",
-]
+_PLATFORM = current_platform()
+
+if _PLATFORM.is_nvidia and _PLATFORM.is_blackwell:
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl import (  # isort: skip  (FA4 mount precedes the kernels)
+        fmha_bias_helper,
+        rel_decode,
+        rel_decode_v2,
+        rel_extend,
+    )
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl.cu_blocks_kernels import (
+        CuBlocksToBatchKernel,
+        CuSeqlensToBlocksKernel,
+    )
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_combine import (
+        FlashAttentionForwardCombine,
+    )
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_sm100_bias import (
+        FlashAttentionForwardSm100,
+    )
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_sm100_bias_decode import (
+        FlashAttentionDecodeSm100Bias,
+        create_mxfp8_scale_factor_tensor,
+    )
+    from tokenspeed_kernel.ops.attention.rmha._cute_dsl.shearing_bias import (
+        ShearingBias,
+    )
+
+    __all__ = [
+        "CuBlocksToBatchKernel",
+        "CuSeqlensToBlocksKernel",
+        "FlashAttentionDecodeSm100Bias",
+        "FlashAttentionForwardCombine",
+        "FlashAttentionForwardSm100",
+        "ShearingBias",
+        "create_mxfp8_scale_factor_tensor",
+        "fmha_bias_helper",
+        "rel_decode",
+        "rel_decode_v2",
+        "rel_extend",
+    ]
+else:
+    __all__ = []

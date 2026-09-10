@@ -22,13 +22,11 @@
 
 from __future__ import annotations
 
+import functools
+
 import tokenspeed_kernel.ops.attention.kpool._triton.cache  # noqa: F401
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
-    cute_dsl_decode_topk,
-    has_cute_dsl_decode_topk,
-)
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
@@ -54,6 +52,16 @@ _TRAITS = {
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
 }
+
+
+@functools.lru_cache(maxsize=1)
+def _load_cute_dsl_topk():
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
+        cute_dsl_decode_topk,
+        has_cute_dsl_decode_topk,
+    )
+
+    return cute_dsl_decode_topk, has_cute_dsl_decode_topk
 
 
 @triton.jit(
@@ -175,6 +183,7 @@ def _select_pools_dense(
         )
         if use_cute_dsl_topk:
             assert pool_indices is not None
+            cute_dsl_decode_topk, _ = _load_cute_dsl_topk()
             cute_dsl_decode_topk(
                 logits,
                 pool_lens[start:end],
@@ -273,6 +282,7 @@ def triton_dense_kpool_decode_topk(
         num_tokens,
         q_len_per_req,
     )
+    _, has_cute_dsl_decode_topk = _load_cute_dsl_topk()
     use_cute = (
         has_cute_dsl_decode_topk()
         and topk_pools == _CUTE_DSL_TOPK_POOLS
