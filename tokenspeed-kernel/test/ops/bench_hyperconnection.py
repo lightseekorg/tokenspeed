@@ -40,7 +40,7 @@ from tokenspeed_kernel import (
     grouped_gemma_rmsnorm,
     prepare_gated_residual_weight_cache,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 
 HC_COUNT = 4
@@ -53,6 +53,7 @@ BACKENDS = {
     "triton": "triton_hyperconnection_mix",
     "persistent": "triton_persistent_hyperconnection_mix",
     "cute_dsl": "cute_dsl_hyperconnection_mix",
+    "cute_fused": "cute_fused_hyperconnection_mix",
 }
 
 
@@ -124,10 +125,18 @@ def _backend_supported(name: str, rows: int, dtype: torch.dtype) -> bool:
     if name == "cute_dsl":
         return (
             current_platform().is_blackwell
-            and dtype is torch.bfloat16
+            and dtype in (torch.bfloat16, torch.float16)
             and 1 <= rows <= 32
             and KernelRegistry.get().get_by_name("cute_dsl_hyperconnection_mix")
             is not None
+        )
+    if name == "cute_fused":
+        from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
+        return (
+            1 <= rows <= 16
+            and dtype in (torch.bfloat16, torch.float16)
+            and supports_fused_hc(torch.device("cuda"))
         )
     return rows > 0
 
@@ -156,7 +165,7 @@ def _case(
             torch.randn(WIDE, LOWRANK, dtype=dtype, device="cuda", generator=generator)
             * 0.01
         )
-        if backend == "cute_dsl":
+        if backend in ("cute_dsl", "default"):
             prepare_gated_residual_weight_cache(up, LOWRANK)
         weights.append((projection, up))
     override = BACKENDS[backend]
@@ -176,6 +185,7 @@ def _case(
             projection_scale=1.0,
             override=override,
             solution=None,
+            weights_independent=True,
         )
 
     def mix_only() -> torch.Tensor:
@@ -183,9 +193,15 @@ def _case(
         return mixed
 
     def chain() -> torch.Tensor:
-        normalized = grouped_gemma_rmsnorm(residual, norm_weight, HIDDEN_SIZE, 1e-6)
+        nonlocal residual
+        normalized = grouped_gemma_rmsnorm(
+            residual, norm_weight, HIDDEN_SIZE, 1e-6, out=None
+        )
         mixed, inject = mix(normalized)
-        return gated_residual_combine(mixed, residual, inject, HC_COUNT, HIDDEN_SIZE)
+        residual = gated_residual_combine(
+            mixed, residual, inject, HC_COUNT, HIDDEN_SIZE, override=None, solution=None
+        )
+        return residual
 
     return mix_only if operation == "mix" else chain
 
@@ -243,6 +259,12 @@ def main() -> None:
         "--operation", choices=("chain", "mix", "combine_norm"), default="chain"
     )
     parser.add_argument(
+        "--pdl",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="control programmatic dependent launch for the complete chain",
+    )
+    parser.add_argument(
         "--weight-banks",
         type=int,
         default=1,
@@ -253,6 +275,9 @@ def main() -> None:
         parser.error("--weight-banks must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA/ROCm device is required")
+    if args.pdl == "on" and not current_platform().is_hopper_plus:
+        parser.error("PDL requires NVIDIA Hopper or newer")
+    pdl_enabled(None if args.pdl == "auto" else args.pdl == "on")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     rows_values = tuple(int(value) for value in args.rows.split(","))
     results = []
@@ -282,6 +307,7 @@ def main() -> None:
             "iterations": iterations,
             "operation": args.operation,
             "weight_banks": args.weight_banks,
+            "pdl": pdl_enabled(None),
         }
         for name, case in cases.items():
             prefix = f"{name}_" if args.operation == "combine_norm" else ""

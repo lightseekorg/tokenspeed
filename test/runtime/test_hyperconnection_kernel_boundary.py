@@ -53,7 +53,9 @@ def test_kernel_boundary_is_gpu_only() -> None:
     projection = torch.empty(4, 8)
     up = torch.empty(8, 2)
     with pytest.raises(ValueError, match="requires GPU tensors"):
-        gated_residual_mix(normalized, projection, up, 2, 4, 2)
+        gated_residual_mix(
+            normalized, projection, up, 2, 4, 2, weights_independent=False
+        )
     with pytest.raises(ValueError, match="requires GPU tensors"):
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
     with pytest.raises(ValueError, match="requires GPU tensors"):
@@ -260,3 +262,17 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
         -1, (hc_count, hidden_size)
     ) + block_output.unsqueeze(-2) * inject.unsqueeze(-1)
     torch.testing.assert_close(combined, expected_combined.flatten(-2))
+
+
+def test_runtime_declares_loaded_hc_weights_independent(monkeypatch) -> None:
+    mixer = GatedResidualSimple(
+        HyperConnectionConfig(hc_count=4, hidden_size=8, hc_lowrank=3)
+    )
+    value = torch.randn(2, 32)
+    mixed = torch.randn(2, 8)
+    inject = torch.randn(2, 4)
+    monkeypatch.setattr(mixer, "_normalize", lambda x: x)
+    call = mock.Mock(return_value=(mixed, inject))
+    monkeypatch.setattr(hyperconnection_module, "gated_residual_mix", call)
+    mixer.mix(value, block_output=None, inject_logits=None, preload_residual=False)
+    assert call.call_args.kwargs["weights_independent"] is True

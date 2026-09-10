@@ -137,9 +137,13 @@ iteration.
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
 
-The [persistent hyperconnection design](../docs/design/hyperconnection.md)
-documents its stream-private workspace protocol, correctness checks and
-reproducible mix/chain benchmarks, including resident and rotating weights.
+The gated-residual mix requires an explicit `weights_independent` contract.
+Blackwell HC4/H2560/R320 with 1–16 rows can use a single CuTe kernel with a
+shared Down/Up weight TMA warp, K128 stages and fixed-order cluster16
+reduction. Two-GEMM CuTe and persistent Triton cover their supported fallback
+shapes. The [hyperconnection design](../docs/design/hyperconnection.md)
+documents selection, synchronization, weight preparation and reproducible
+mix/chain benchmarks with resident and rotating weights.
 
 ### Plugins
 

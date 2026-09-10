@@ -284,6 +284,7 @@ class GatedResidualSimple(nn.Module):
             self.hidden_size,
             self.hc_lowrank,
             projection_scale=self._projection_scale,
+            weights_independent=True,
         )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (
