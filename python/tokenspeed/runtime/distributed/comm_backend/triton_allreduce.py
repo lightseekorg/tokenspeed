@@ -93,7 +93,7 @@ class TritonAllReduceBackend(CommBackend):
         attnres_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
-        """Allocate or reuse an Iris state within the active dispatch limits.
+        """Allocate or reuse an Iris state with the requested path capacities.
 
         Args:
             group: Global ranks participating in the reductions.
@@ -112,10 +112,6 @@ class TritonAllReduceBackend(CommBackend):
         if dtype != torch.bfloat16:
             return False
         staged_max_numel = min(staged_max_numel, self._max_numel)
-        producer_direct_max_numel = min(
-            producer_direct_max_numel,
-            self._producer_direct_max_bytes // dtype.itemsize,
-        )
         requested = (
             staged_max_numel,
             producer_direct_max_numel * dtype.itemsize,
@@ -230,9 +226,14 @@ class TritonAllReduceBackend(CommBackend):
         if not current_platform().is_cdna4 or not like.is_cuda:
             return False
         total_bytes = sum(math.prod(shape) for shape in shapes) * like.dtype.itemsize
-        if total_bytes > self._producer_direct_max_bytes:
+        state = self._instances.get(group)
+        max_bytes = (
+            state.max_bytes if state is not None else self._producer_direct_max_bytes
+        )
+        if total_bytes > max_bytes:
             return False
-        state = self._get_or_create(group)
+        if state is None:
+            state = self._get_or_create(group)
         return symm_outputs_can_run(state, shapes, like.dtype, op=op)
 
     def can_reduce_outputs(

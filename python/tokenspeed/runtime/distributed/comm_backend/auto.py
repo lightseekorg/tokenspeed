@@ -138,6 +138,12 @@ class AutoBackend(CommBackend):
             use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
                 group
             )
+            if (
+                not use_nccl
+                and current_platform().is_amd
+                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
+            ):
+                return self._triton_ar.all_reduce(tensors, group, op=op)
             # Collections past the one-shot window are headed for NCCL;
             # grouping avoids the copy required to concatenate them first.
             use_nccl = use_nccl or all(
@@ -149,12 +155,6 @@ class AutoBackend(CommBackend):
                 and sum(value.numel() * value.element_size() for value in tensors)
                 > self._triton_ar.producer_direct_max_bytes
             )
-            if (
-                not use_nccl
-                and current_platform().is_amd
-                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
-            ):
-                return self._triton_ar.all_reduce(tensors, group, op=op)
             if use_nccl and len(tensors) == 2:
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)

@@ -123,7 +123,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
         call(
             moe_group,
             staged_max_numel=8192 * 7168,
-            producer_direct_max_numel=8192 * (7168 + 3584),
+            producer_direct_max_numel=48 * (7168 + 3584),
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.bfloat16,
@@ -158,7 +158,40 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     prepare.assert_called_once_with(
         moe_group,
         staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=8192 * (7168 + 3584),
+        producer_direct_max_numel=48 * (7168 + 3584),
+        attnres_max_numel=0,
+        attnres_max_rows=0,
+        dtype=torch.bfloat16,
+        backend=None,
+    )
+
+
+def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm
+
+    group = tuple(range(4))
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_size=4, tp_group=group),
+        moe=SimpleNamespace(tp_ep_size=4, tp_ep_group=group),
+    )
+    prepare = Mock(return_value=True)
+    monkeypatch.setattr(
+        kimi_k3_comm,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+
+    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+        mapping=mapping,
+        hidden_size=7168,
+        routed_hidden_size=3584,
+        max_num_tokens=8192,
+    )
+    prepare.assert_called_once_with(
+        group,
+        staged_max_numel=8192 * 7168,
+        producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
         dtype=torch.bfloat16,

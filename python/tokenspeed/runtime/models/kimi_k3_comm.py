@@ -81,6 +81,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 logger = logging.getLogger(__name__)
 
 _IRIS_MAX_TOKENS = 8192
+_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
 
 class K3MoETailTier(IntEnum):
@@ -200,13 +201,21 @@ def prepare_k3_all_reduce_buffers(
         allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    expand_moe_window = (
+        groups_are_equal and mapping.attn.tp_size == 8 and mapping.moe.tp_ep_size == 8
+    )
+    producer_direct_max_tokens = (
+        max_num_tokens
+        if expand_moe_window
+        else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
+    )
     prepared = False
     if mapping.attn.tp_size > 1:
         prepared = prepare_all_reduce_buffers(
             mapping.attn.tp_group,
             staged_max_numel=max_num_tokens * hidden_size,
             producer_direct_max_numel=(
-                max_num_tokens * (hidden_size + routed_hidden_size)
+                producer_direct_max_tokens * (hidden_size + routed_hidden_size)
                 if groups_are_equal and mapping.moe.tp_ep_size > 1
                 else 0
             ),
@@ -220,7 +229,7 @@ def prepare_k3_all_reduce_buffers(
             prepare_all_reduce_buffers(
                 mapping.moe.tp_ep_group,
                 staged_max_numel=max_num_tokens * hidden_size,
-                producer_direct_max_numel=max_num_tokens
+                producer_direct_max_numel=producer_direct_max_tokens
                 * (hidden_size + routed_hidden_size),
                 attnres_max_numel=0,
                 attnres_max_rows=0,
