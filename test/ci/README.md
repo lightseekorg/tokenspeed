@@ -145,6 +145,63 @@ NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
 the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
 declared in task YAMLs and therefore does not enter default CI matrices.
 
+## Registration-Level Kernel Benchmarks
+
+The `AMD Kernel Benchmarks` workflow compares exact kernel registrations between
+a pull request's merge base and candidate commit. It runs for non-draft,
+same-repository pull requests targeting `main` when the change touches a kernel
+package, the benchmark harness or CI scripts, or either benchmark workflow.
+Fork pull requests are skipped. A manual dispatch accepts explicit base and
+candidate refs and does not require a pull request.
+
+The measurement job uses the `amd-mi355-1gpu-bench` runner and exposes logical
+device 0. The allocation must provide one exclusive `gfx950` GPU, working ROCm
+device permissions, Bash, Git, Python with pip and virtual-environment support,
+and enough temporary space for two source worktrees, environments, and
+compilation caches. It also needs outbound access to GitHub and the configured
+Python and PyTorch package indexes, or equivalent package mirrors. No custom
+secret is required. Outside the official repository, set
+`TOKENSPEED_CI_REPOSITORY` to the exact enabled `owner/repo` and provide
+equivalent hardware.
+
+The workflow prepares a functional ROCm PyTorch installation, then the
+coordinator creates independent base and candidate environments. Each revision
+installs its own ROCm kernel requirements and uses isolated compilation caches.
+The two revisions run serially on the same allocation. A benchmark blocks only
+when it exceeds both its merge-base relative and absolute regression limits;
+noisy runs, successful added or changed cases, and missing cases are reported
+without blocking. A candidate case that fails correctness or execution is
+invalid, as is an environment or infrastructure failure, and fails the job.
+
+The measurement workflow has only repository contents read permission. It
+uploads the result directory as an Actions artifact with 30-day retention and
+writes the comparison to the job summary. A separate
+`AMD Kernel Benchmark PR Comment` workflow runs trusted code from the default
+branch with pull request write permission. It validates the artifact and source
+revision, enforces input and rendered-comment size limits, and then creates or
+replaces one bot-owned comment.
+
+The first pull request introducing these workflows can run only a candidate
+bootstrap because its merge base has no suite. It also cannot trigger its own
+comment publisher: GitHub requires a `workflow_run` receiver to exist on the
+default branch. Once the workflows are on `main`, a manual `main` versus `main`
+dispatch can verify runner setup, and a later qualifying pull request exercises
+the full comparison and comment path. Manual runs produce summaries and
+artifacts but not pull request comments.
+
+The cleanup step follows existing AMD CI practice and terminates GPU-holding
+processes visible to the runner. `CUDA_VISIBLE_DEVICES=0` does not limit that
+process scan, so the runner must have scheduler-enforced GPU or process-namespace
+isolation. Different pull requests are not globally serialized; the runner
+fleet must also prevent two jobs from sharing one physical GPU.
+
+Do not make this workflow an unconditional required check while it uses top-level
+path filters. GitHub does not create the check for unrelated changes, which can
+leave a path-filtered required check pending.
+
+Harness, suite, correctness, timing, and local reproduction details are in the
+[kernel benchmark documentation](../../tokenspeed-kernel/benchmarks/README.md).
+
 ## Slurm with Pyxis/Enroot
 
 `slurm_submit.py` submits an existing task YAML without copying its server,
