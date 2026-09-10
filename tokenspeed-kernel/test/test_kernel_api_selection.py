@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -43,17 +44,22 @@ import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
 import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
+import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
+import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
+import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
 import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
 import tokenspeed_kernel.ops.attention.mha._triton.prefill as _attention_triton_mha_prefill
 import tokenspeed_kernel.ops.attention.mha.cuda as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
-import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon
+import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
 import tokenspeed_kernel.ops.attention.mla._triton.decode as _attention_triton_mla_decode
 import tokenspeed_kernel.ops.attention.mla._triton.prefill as _attention_triton_mla_prefill
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
+import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
+import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
@@ -123,6 +129,18 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+_ATTENTION_GLUON_MODULES = [
+    _attention_gluon_dsa,
+    _attention_gluon_dsv4,
+    _attention_gluon_kda,
+    _attention_gluon_mha,
+    _attention_gluon_mla,
+    _attention_gluon_rmha,
+]
+_attention_gluon_kpool = sys.modules.get("tokenspeed_kernel.ops.attention.kpool.gluon")
+if _attention_gluon_kpool is not None:
+    _ATTENTION_GLUON_MODULES.append(_attention_gluon_kpool)
+
 _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda_dsv4,
@@ -131,7 +149,7 @@ _RELOAD_MODULES = [
     _attention_flash_mla,
     _attention_flashinfer_gdn,
     _attention_flashinfer,
-    _attention_gluon,
+    *_ATTENTION_GLUON_MODULES,
     _attention_triton_mha_prefill,
     _attention_triton_mha_decode,
     _attention_triton_mla_prefill,
@@ -4830,7 +4848,7 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     implementation_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    entrypoint = getattr(_attention_gluon, entrypoint_name, None)
+    entrypoint = getattr(_attention_gluon_dsa, entrypoint_name, None)
     if entrypoint is None:
         pytest.skip(f"{entrypoint_name} is unavailable")
 
@@ -4842,7 +4860,7 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
         forwarded.update(kwargs)
         return expected
 
-    monkeypatch.setattr(_attention_gluon, implementation_name, fake_impl)
+    monkeypatch.setattr(_attention_gluon_dsa, implementation_name, fake_impl)
 
     marker = object()
     result = entrypoint(marker=marker, kv_seq_lens=object())

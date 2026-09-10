@@ -741,6 +741,9 @@ import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
 
 # isort: on
 
+if current_platform().is_amd:
+    import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
+
 __all__ = [
     "dsa_decode",
     "dsa_prefill",

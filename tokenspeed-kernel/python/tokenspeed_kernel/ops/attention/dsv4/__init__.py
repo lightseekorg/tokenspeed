@@ -1067,6 +1067,9 @@ import tokenspeed_kernel.ops.attention.dsv4.triton  # noqa: E402,F401
 if current_platform().is_nvidia:
     import tokenspeed_kernel.ops.attention.dsv4.deep_gemm  # noqa: E402,F401
 
+if current_platform().is_amd:
+    import tokenspeed_kernel.ops.attention.dsv4.gluon  # noqa: E402,F401
+
 __all__ = [
     "dsv4_indexer_cache_format",
     "dsv4_padded_heads",

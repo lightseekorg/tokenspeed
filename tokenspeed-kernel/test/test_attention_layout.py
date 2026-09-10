@@ -18,7 +18,56 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ast
 from pathlib import Path
+
+_OPERATOR_VARIANTS = {
+    "mha_": "mha",
+    "rel_mha_": "rmha",
+    "mla_": "mla",
+    "dsa_": "dsa",
+    "dsv4_": "dsv4",
+    "kda_": "kda",
+    "kpool_": "kpool",
+    "msa_": "msa",
+    "qsa_": "qsa",
+    "gdn_": "gdn",
+}
+
+
+def _literal_attention_registrations(path: Path):
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Name):
+            function_name = function.id
+        elif isinstance(function, ast.Attribute):
+            function_name = function.attr
+        else:
+            continue
+        if function_name != "register_kernel" or len(node.args) < 2:
+            continue
+        namespace, operator = node.args[:2]
+        if (
+            isinstance(namespace, ast.Constant)
+            and namespace.value == "attention"
+            and isinstance(operator, ast.Constant)
+            and isinstance(operator.value, str)
+        ):
+            yield operator.value, node.lineno
+
+
+def _operator_variant(operator: str) -> str | None:
+    return next(
+        (
+            variant
+            for prefix, variant in _OPERATOR_VARIANTS.items()
+            if operator.startswith(prefix)
+        ),
+        None,
+    )
 
 
 def test_attention_implementations_are_grouped_by_variant():
@@ -73,3 +122,18 @@ def test_attention_implementations_are_grouped_by_variant():
     assert not (attention_dir / "dsa" / "_cuda" / "__init__.py").exists()
     assert not (attention_dir / "gdn" / "_triton" / "linear" / "__init__.py").exists()
     assert not (attention_dir / "mla" / "_tokenspeed_mla" / "__init__.py").exists()
+
+
+def test_gluon_attention_registrations_are_owned_by_their_variant():
+    attention_dir = (
+        Path(__file__).parents[1] / "python" / "tokenspeed_kernel" / "ops" / "attention"
+    )
+    for variant_dir in attention_dir.iterdir():
+        if not variant_dir.is_dir() or not (variant_dir / "__init__.py").is_file():
+            continue
+        for path in variant_dir.rglob("gluon.py"):
+            for operator, lineno in _literal_attention_registrations(path):
+                assert _operator_variant(operator) == variant_dir.name, (
+                    f"{path.relative_to(attention_dir)}:{lineno} registers "
+                    f"{operator!r} outside its variant directory"
+                )

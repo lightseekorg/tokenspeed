@@ -856,6 +856,9 @@ import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 
 # isort: on
 
+if current_platform().is_amd:
+    import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
+
 __all__ = [
     "KdaPrefillResult",
     "KdaFusedDecodeResult",

@@ -515,6 +515,9 @@ try:
 except ImportError:
     pass
 
+if current_platform().is_amd:
+    import tokenspeed_kernel.ops.attention.rmha.gluon  # noqa: E402,F401
+
 __all__ = [
     "rel_mha_plan",
     "rel_mha_prefill",
