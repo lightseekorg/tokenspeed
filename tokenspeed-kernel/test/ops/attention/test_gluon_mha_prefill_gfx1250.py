@@ -82,8 +82,11 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
     """
     device, dtype = "cuda", torch.bfloat16
     n_q_heads, n_kv_heads = 4, 1
+    # D=128 full attention crosses the max-ILP scheduler's minimum sequence
+    # length, so this matrix compiles both scheduler policies as well.
+    seqlen = 512 if head_dim == 128 and window_left < 0 else 320
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        [320], n_q_heads, n_kv_heads, head_dim, device, dtype
+        [seqlen], n_q_heads, n_kv_heads, head_dim, device, dtype
     )
 
     original = prefill.get_config
@@ -120,6 +123,28 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
     assert not torch.isnan(out).any()
     expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_select_llvm_fn_attrs():
+    max_ilp = "amdgpu-sched-strategy=max-ilp"
+
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=512, window_left=-1)
+        == max_ilp
+    )
+
+    # Each guard has a measured regression when max-ILP is used.
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=64, max_seqlen=512, window_left=-1) == ""
+    )
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=256, window_left=-1)
+        == ""
+    )
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=4096, window_left=512)
+        == ""
+    )
 
 
 def test_select_m_tile_gates():
