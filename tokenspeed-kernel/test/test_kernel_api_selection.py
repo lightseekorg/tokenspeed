@@ -43,6 +43,7 @@ import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
 import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
+import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
@@ -1489,7 +1490,7 @@ def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
             calls.append(kwargs)
 
     monkeypatch.setattr(
-        _attention_pkg,
+        _attention_dsv4_pkg,
         "select_kernel",
         lambda *args, **kwargs: _SelectedKernel(),
     )
