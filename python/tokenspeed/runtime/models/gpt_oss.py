@@ -589,6 +589,20 @@ class GptOssForCausalLM(BaseCausalLM):
 
         return weight_mapping
 
+    def _cache_routed_expert_weights(self) -> None:
+        if get_all2all_backend().is_petit():
+            # Petit replaces the checkpoint parameters with its native packed
+            # tensors after loading.  Keeping the original ``.data`` objects
+            # here would pin both layouts for the lifetime of the server.
+            # Petit also rejects EPLB, the only consumer of this cache.
+            self.routed_experts_weights_of_layer = {}
+            return
+
+        self.routed_experts_weights_of_layer = {
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(len(self.model.layers))
+        }
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -720,10 +734,7 @@ class GptOssForCausalLM(BaseCausalLM):
             else:
                 logger.info("All parameters loaded successfully.")
 
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(len(self.model.layers))
-        }
+        self._cache_routed_expert_weights()
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
         # Stream experts; buffering them pins most of the checkpoint on the GPU.
