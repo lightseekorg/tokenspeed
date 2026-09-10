@@ -18,9 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.triton.bf16  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.inkling_topk  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.latent_input  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.pack_topk  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.softmax_topk  # noqa: F401
+from __future__ import annotations
+
+import pytest
+import torch
+from tokenspeed_kernel.ops.moe import dsv4_select_experts
+
+
+@pytest.mark.parametrize("invalid", [-1, 4])
+def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
+    logits = torch.zeros((1, 4), dtype=torch.float32)
+    table = torch.tensor([[0, invalid]], dtype=torch.int32)
+    input_ids = torch.zeros((1,), dtype=torch.int64)
+
+    with pytest.raises(ValueError, match=r"entries must be in \[0, 4\)"):
+        dsv4_select_experts(
+            logits,
+            top_k=2,
+            renormalize=True,
+            hash_indices_table=table,
+            input_ids=input_ids,
+        )

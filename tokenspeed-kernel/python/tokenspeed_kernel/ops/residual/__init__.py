@@ -533,6 +533,9 @@ def mhc_pre(
     sinkhorn_iters: int,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    norm_weight: _torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """Compute the mHC pre-mapping for one residual stream.
 
@@ -548,12 +551,18 @@ def mhc_pre(
         sinkhorn_iters: Number of Sinkhorn row/column normalization iterations.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        norm_weight: Optional BF16 RMSNorm weight fused into the selected kernel.
+        norm_eps: Optional RMSNorm epsilon. This must be provided together with
+            ``norm_weight``.
 
     Returns:
         A tuple of the BF16 layer input ``[..., hidden_size]``, FP32 post mix
         ``[..., hc_mult, 1]``, and FP32 combine mix
         ``[..., hc_mult, hc_mult]``.
     """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+
     hc_mult = int(residual.shape[-2])
     hidden_size = int(residual.shape[-1])
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
@@ -595,6 +604,8 @@ def mhc_pre(
             rms_eps,
             hc_eps,
             sinkhorn_iters,
+            norm_weight,
+            norm_eps,
         )
 
 
@@ -666,6 +677,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: _torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """Compose the registered previous post-mapping and current pre-mapping.
 
@@ -684,6 +697,8 @@ def mhc_fused_hc(
         rms_eps: Epsilon used by the residual RMS normalization.
         hc_eps: Epsilon added during pre-mix and Sinkhorn normalization.
         sinkhorn_iters: Number of Sinkhorn row/column normalization iterations.
+        norm_weight: Optional RMSNorm weight applied to the current layer input.
+        norm_eps: RMSNorm epsilon. This must be provided with ``norm_weight``.
 
     Returns:
         A tuple of the current BF16 residual streams, BF16 layer input, FP32
@@ -698,6 +713,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
     return residual_cur, layer_input, post_cur, comb_cur
 

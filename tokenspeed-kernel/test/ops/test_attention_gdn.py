@@ -39,10 +39,17 @@ def _fla_chunk_gated_delta_rule():
     return chunk_gated_delta_rule
 
 
-def _make_inputs(*, device: str, dtype: torch.dtype, seq_len: int = 130):
+def _make_inputs(
+    *,
+    device: str,
+    dtype: torch.dtype,
+    seq_len: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    state_dtype: torch.dtype,
+    nonzero_state: bool,
+):
     torch.manual_seed(0)
-    num_q_heads = 16
-    num_v_heads = 32
     head_dim = 128
     q = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
@@ -51,9 +58,11 @@ def _make_inputs(*, device: str, dtype: torch.dtype, seq_len: int = 130):
     g = F.logsigmoid(
         torch.rand(1, seq_len, num_v_heads, device=device, dtype=torch.float32)
     )
+    state_shape = (1, num_v_heads, head_dim, head_dim)
     initial_state = (
-        torch.randn(1, num_v_heads, head_dim, head_dim, device=device, dtype=dtype)
-        * 0.1
+        torch.randn(state_shape, device=device, dtype=state_dtype) * 0.1
+        if nonzero_state
+        else torch.zeros(state_shape, device=device, dtype=state_dtype)
     )
     cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     return q, k, v, g, beta, initial_state, cu_seqlens
@@ -258,14 +267,48 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
     )
 
 
+def test_flashinfer_prefill_supported_shapes(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule import is_supported
+
+    assert is_supported(128, torch.bfloat16, 16, 16)
+    assert is_supported(128, torch.bfloat16, 16, 32)
+    assert not is_supported(64, torch.bfloat16, 16, 16)
+    assert not is_supported(128, torch.float16, 16, 16)
+    assert not is_supported(128, torch.bfloat16, 32, 16)
+
+
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, require):
+@pytest.mark.parametrize(
+    "num_q_heads,num_v_heads,seq_len,state_dtype,nonzero_state",
+    [
+        (16, 16, 130, torch.bfloat16, False),
+        (16, 32, 130, torch.bfloat16, True),
+        (16, 64, 512, torch.float32, True),
+        (4, 12, 2048, torch.float32, False),
+    ],
+)
+def test_gdn_chunk_prefill_matches_fla_reference(
+    device: str,
+    solution: str,
+    num_q_heads: int,
+    num_v_heads: int,
+    seq_len: int,
+    state_dtype: torch.dtype,
+    nonzero_state: bool,
+    require,
+):
     # Each selectable backend should match the FLA reference output/state contract.
     require("attention", "gdn_chunk_prefill", solution, torch.bfloat16, "q")
 
     q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
         device=device,
         dtype=torch.bfloat16,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        state_dtype=state_dtype,
+        nonzero_state=nonzero_state,
     )
     result = gdn_chunk_prefill(
         q,
@@ -308,6 +351,7 @@ def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, req
     # the stable signal, while max error can be noisy on a few elements.
     assert (result.out.float() - ref_out.float()).abs().mean() < 1e-3
     assert (result.final_state.float() - ref_state.float()).abs().mean() < 1e-3
+    torch.testing.assert_close(result.out, ref_out, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
@@ -318,6 +362,11 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
         device=device,
         dtype=torch.bfloat16,
+        seq_len=130,
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.bfloat16,
+        nonzero_state=True,
     )
     result = gdn_chunk_prefill(
         q,
@@ -904,4 +953,232 @@ def test_gdn_decode_mtp_disable_state_update_false_writes_back(
         ref_states[-1].to(pool.dtype).float(),
         rtol=2e-2,
         atol=3e-2,
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize(
+    ("state_mode", "strided_pool"),
+    [
+        ("readonly", False),
+        ("readonly", True),
+        ("writeback", False),
+        ("writeback", True),
+        # Upstream scatter indexes a flat 3D pool, as used by verify scratch;
+        # its native 4D strided-pool path supports the other state modes.
+        ("scatter", False),
+        ("cache", False),
+        ("cache", True),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_flashinfer_mtp_uninitialized_buffers(
+    device: str,
+    batch: int,
+    strided_pool: bool,
+    state_mode: str,
+    enable_pdl: bool,
+    require,
+) -> None:
+    """Live output/cache rows overwrite poison; skipped rows and slab gaps survive."""
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as reference_mtp
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn import gated_delta_rule_mtp
+
+    steps, heads, dim = 3, 32, 128
+    pool_size = 1 + batch * (steps + 1)
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=batch,
+        num_q_heads=heads // 2,
+        num_v_heads=heads,
+        head_dim=dim,
+        pool_size=pool_size,
+        state_dtype=torch.float32,
+        parameter_dtype=torch.float32,
+        parameter_requires_grad=False,
+    )
+    # B*HV selects both FlashInfer's inline and warp-specialized kernels.
+    read_rows = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
+    if batch > 1:
+        read_rows[-1] = -1
+    output_rows = None
+    if state_mode == "scatter":
+        output_rows = torch.arange(
+            batch + 1, pool_size, dtype=torch.int32, device=device
+        ).view(batch, steps)
+        if batch > 1:
+            output_rows[-1].fill_(-1)
+    backing = torch.full(
+        (pool_size * (2 if strided_pool else 1), heads, dim, dim),
+        123.0,
+        dtype=pool.dtype,
+        device=device,
+    )
+    actual_pool = backing[::2] if strided_pool else backing
+    actual_pool.copy_(pool)
+    expected_pool = pool.clone()
+    output = torch.full_like(v, float("nan"))
+    expected_output = output.clone()
+    cache = None
+    expected_cache = None
+    if state_mode == "cache":
+        cache = torch.full(
+            (batch, steps, heads, dim, dim),
+            float("nan"),
+            device=device,
+            dtype=torch.float32,
+        )
+        expected_cache = cache.clone()
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        initial_state_indices=read_rows,
+        A_log=A_log,
+        a=a.to(q.dtype),
+        dt_bias=dt_bias,
+        b=b.to(q.dtype),
+        scale=dim**-0.5,
+        ssm_state_indices=output_rows,
+        disable_state_update=state_mode in ("readonly", "cache"),
+        use_qk_l2norm=True,
+    )
+    reference_mtp(
+        **kwargs,
+        initial_state=expected_pool,
+        output=expected_output,
+        intermediate_states_buffer=expected_cache,
+        output_state_indices=None,
+    )
+    gated_delta_rule_mtp(
+        **kwargs,
+        enable_pdl=enable_pdl,
+        initial_state=actual_pool,
+        output=output,
+        intermediate_states_buffer=cache,
+    )
+
+    live_rows = batch - 1 if batch > 1 else batch
+    assert torch.isfinite(output[:live_rows]).all()
+    torch.testing.assert_close(output, expected_output, equal_nan=True)
+    torch.testing.assert_close(actual_pool, expected_pool)
+    if cache is not None:
+        assert torch.isfinite(cache[:live_rows]).all()
+        torch.testing.assert_close(cache, expected_cache, equal_nan=True)
+    if strided_pool:
+        assert (backing[1::2] == 123.0).all()
+
+
+def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> None:
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.float16, "q")
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as reference_mtp
+
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.float16,
+        T=3,
+        batch=1,
+        num_q_heads=4,
+        num_v_heads=8,
+        head_dim=128,
+        pool_size=4,
+        state_dtype=torch.float32,
+        parameter_dtype=torch.bfloat16,
+        parameter_requires_grad=True,
+    )
+    read_rows = torch.tensor([1], dtype=torch.int32, device=device)
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=pool,
+        initial_state_indices=read_rows,
+        a=a.to(q.dtype),
+        b=b.to(q.dtype),
+        scale=None,
+        disable_state_update=True,
+        use_qk_l2norm=True,
+        intermediate_states_buffer=None,
+        output_state_indices=None,
+    )
+    actual = gdn_decode_mtp(
+        **kwargs,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        override=None,
+        solution="flashinfer",
+    )
+    expected, _ = reference_mtp(
+        **kwargs,
+        A_log=A_log.detach().float(),
+        dt_bias=dt_bias.detach().float(),
+        output=None,
+        ssm_state_indices=None,
+    )
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_triton_gdn_packed_decode_inputs(
+    device: str, steps: int, state_dtype: torch.dtype, require
+):
+    """Packed QKV and strided scalar gates must match the independent oracle."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    batch, heads, value_heads, dim = 4, 4, 12, 128
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=batch,
+        num_q_heads=heads,
+        num_v_heads=value_heads,
+        head_dim=dim,
+        pool_size=batch + 1,
+        state_dtype=state_dtype,
+        parameter_dtype=torch.float32,
+        parameter_requires_grad=False,
+    )
+    reads = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    expected, states = _torch_gdn_decode_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[reads],
+        dim**-0.5,
+    )
+    packed = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1)
+    q, k, v = packed.split([heads * dim, heads * dim, value_heads * dim], dim=-1)
+    gates = torch.stack((a, b), dim=-1)
+    actual = gdn_decode_mtp(
+        q=q.view(batch, steps, heads, dim),
+        k=k.view(batch, steps, heads, dim),
+        v=v.view(batch, steps, value_heads, dim),
+        a=gates[..., 0],
+        b=gates[..., 1],
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        initial_state_indices=reads,
+        scale=dim**-0.5,
+        use_qk_l2norm=True,
+        disable_state_update=False,
+        intermediate_states_buffer=None,
+        output_state_indices=None,
+        solution="triton",
+        override=None,
+    )
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        pool[reads].float(), states[-1].to(state_dtype).float(), rtol=2e-2, atol=3e-2
     )

@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     prepare_chunk_offsets,
 )
 from tokenspeed_kernel.ops.attention.triton.linear.op import exp, safe_exp
+from tokenspeed_kernel.platform import pdl_enabled
 
 CHUNK_SIZE = 64
 
@@ -72,7 +73,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
@@ -291,6 +295,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
             )
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -304,6 +310,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    enable_pdl = pdl_enabled()
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -353,5 +360,7 @@ def chunk_gated_delta_rule_fwd_h(
         BV=32,
         num_warps=4,
         num_stages=2,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return h, v_new, final_state

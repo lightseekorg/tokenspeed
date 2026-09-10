@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
+from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -132,4 +133,27 @@ def grouped_gemma_rmsnorm(
     return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
 
 
-__all__ = ["grouped_gemma_rmsnorm", "qk_rmsnorm", "rmsnorm"]
+def grouped_rmsnorm(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply weight-free RMSNorm to contiguous groups of the last dimension.
+
+    Args:
+        x: GPU input shaped ``[..., width]``.
+        group_size: Number of contiguous values sharing one RMS statistic.
+        eps: Epsilon added before reciprocal square root.
+        out: Optional contiguous output matching ``x``; may alias ``x``.
+
+    Returns:
+        Normalized tensor matching ``x`` shape and dtype.
+    """
+    if not x.is_cuda:
+        raise ValueError("grouped_rmsnorm requires GPU tensors")
+    return _grouped_rmsnorm(x, int(group_size), eps, out=out)
+
+
+__all__ = ["grouped_gemma_rmsnorm", "grouped_rmsnorm", "qk_rmsnorm", "rmsnorm"]

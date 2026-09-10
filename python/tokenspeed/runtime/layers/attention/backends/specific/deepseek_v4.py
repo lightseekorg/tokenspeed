@@ -18,6 +18,7 @@ from collections.abc import Mapping
 import torch
 from tokenspeed_kernel import (
     dsv4_decode,
+    dsv4_padded_heads,
     dsv4_plan,
     dsv4_prefill,
     dsv4_reset_attention_state,
@@ -27,9 +28,11 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
     dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_dense_compressed_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
     dsv4_indexer_decode_metadata_compute,
+    dsv4_validate_active_cache_pages,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -62,7 +65,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
-from tokenspeed.runtime.layers.attention.page_table import safe_page_ids
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -166,6 +168,8 @@ def _refresh_decode_indexer_schedule_metadata(
     metadata: DeepseekV4ForwardMetadata,
 ) -> None:
     indexer_metadata = metadata.indexer
+    refreshed_keys = indexer_metadata.decode_schedule_metadata_refreshed_keys
+    refreshed_keys.clear()
     if not indexer_metadata.decode_schedule_metadata_cache:
         return
     for (
@@ -211,6 +215,8 @@ def _refresh_decode_indexer_schedule_metadata(
         )
         if refreshed is not None and refreshed is not schedule_metadata:
             indexer_metadata.decode_schedule_metadata_cache[key] = refreshed
+        if refreshed is not None:
+            refreshed_keys.add(key)
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
@@ -261,10 +267,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._expected_cache_group_ids: tuple[str, ...] | None = None
         self._cache_group_raw_tokens_per_page: dict[str, int] = {}
         self._cache_group_max_page_ids: dict[str, int] = {}
+        self._cuda_graph_active_page_validity: torch.Tensor | None = None
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
+        # FlashMLA SM100 decode requires a padded query-head width. Calls using
+        # one backend are stream ordered, so only the valid prefix needs to be
+        # refreshed after the zero-tailed workspace is initialized.
+        self._decode_q_padding_workspace: torch.Tensor | None = None
+        self._decode_q_padding_workspace_layout: (
+            tuple[torch.device, torch.dtype, int, int, int] | None
+        ) = None
         self._swa_window_size = 0
         self._swa_block_size = 0
         self.speculative_num_steps = int(config.speculative_num_steps)
@@ -480,6 +494,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> None:
         """Check only each live row's active page on GPU hot paths."""
         if actual_bs == 0:
+            return
+        if seq_lens.is_cuda and self._cuda_graph_active_page_validity is not None:
+            validity = self._cuda_graph_active_page_validity[: len(tables)]
+            for index, (group_id, table) in enumerate(tables.items()):
+                raw_tokens_per_page = self._cache_group_raw_tokens_per_page.get(
+                    group_id
+                )
+                max_page_id = self._cache_group_max_page_ids.get(group_id)
+                if raw_tokens_per_page is None or max_page_id is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 cache group contract is incomplete for "
+                        f"{group_id!r}"
+                    )
+                dsv4_validate_active_cache_pages(
+                    seq_lens=seq_lens,
+                    block_table=table,
+                    actual_bs=actual_bs,
+                    raw_tokens_per_page=raw_tokens_per_page,
+                    max_page_id=max_page_id,
+                    out=validity[index : index + 1],
+                )
+            torch._assert_async(
+                validity.all(),
+                f"DeepSeek V4 {phase} cache groups contain a negative sequence "
+                "length, a missing active page, or a page ID beyond capacity",
+            )
             return
         live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
         seq_lens_valid = live_seq_lens.ge(0).all()
@@ -945,7 +985,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio <= 1:
             return None, None
         num_tokens = positions.numel()
-        req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         page_table = metadata.cache.compressed_page_table(compress_ratio)
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
@@ -982,35 +1021,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             return cached
 
         width = self._dense_compressed_indices_width(compress_ratio)
-        compressed_lens = torch.div(
-            positions.to(torch.int64) + 1,
-            compress_ratio,
-            rounding_mode="floor",
-        ).clamp(0, width)
-        offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
-        local = offsets[None, :].expand(num_tokens, -1)
-        valid = offsets[None, :] < compressed_lens[:, None]
-        if is_valid_token is not None:
-            valid = valid & is_valid_token.to(torch.bool)[:, None]
-        lens = compressed_lens.to(torch.int32)
-        if is_valid_token is not None:
-            lens = torch.where(
-                is_valid_token.to(torch.bool),
-                lens,
-                torch.zeros_like(lens),
-            )
-
-        safe_local = torch.where(valid, local, torch.zeros_like(local))
-        pages = torch.div(safe_local, block_size, rounding_mode="floor")
-        page_offsets = safe_local % block_size
-        page_ids = safe_page_ids(page_table, req_idx[:, None], pages.long())
-        slots = page_ids * block_size + page_offsets
-        indices_2d = torch.where(
-            valid & (page_ids >= 0),
-            slots,
-            torch.full_like(slots, -1),
+        indices_2d, lens = dsv4_decode_dense_compressed_indices_and_lens(
+            positions=positions,
+            token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
+            block_table=page_table,
+            block_size=block_size,
+            compress_ratio=compress_ratio,
+            width=width,
+            block_table_base_offsets=None,
+            is_valid_token=is_valid_token,
+            out_indices=None,
+            out_lens=None,
         )
-        indices = indices_2d.to(torch.int32).unsqueeze(1)
+        indices = indices_2d.unsqueeze(1)
         dense_indices_cache[cache_key] = (indices, lens)
         if capturing:
             capture_safe_keys.add(cache_key)
@@ -1022,6 +1045,60 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         width = max(1, (self.context_len + compress_ratio - 1) // compress_ratio)
         alignment = DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
         return ((width + alignment - 1) // alignment) * alignment
+
+    def _pad_decode_query(
+        self,
+        q: torch.Tensor,
+        *,
+        padded_heads: int,
+    ) -> torch.Tensor:
+        """Return a FlashMLA query with an invariant zero-padded head tail."""
+        if q.ndim != 3:
+            raise ValueError(
+                "DeepSeek V4 decode query must have shape "
+                f"[tokens, heads, head_dim], got {tuple(q.shape)}"
+            )
+        num_heads = q.shape[1]
+        if num_heads > padded_heads:
+            raise ValueError(
+                "DeepSeek V4 decode padded_heads must cover all local heads: "
+                f"local_heads={num_heads}, padded_heads={padded_heads}"
+            )
+        if num_heads == padded_heads:
+            return q.contiguous()
+
+        if self.graph is None:
+            raise RuntimeError(
+                "DeepSeek V4 decode query padding requires initialized decode state"
+            )
+        max_query_tokens = self.graph.max_bs * self.graph.max_tokens_per_req
+        if q.shape[0] > max_query_tokens:
+            raise ValueError(
+                "DeepSeek V4 decode query exceeds the persistent padding workspace: "
+                f"tokens={q.shape[0]}, capacity={max_query_tokens}"
+            )
+
+        layout = (
+            q.device,
+            q.dtype,
+            num_heads,
+            padded_heads,
+            q.shape[2],
+        )
+        workspace = self._decode_q_padding_workspace
+        if workspace is None:
+            raise RuntimeError(
+                "DeepSeek V4 decode query padding workspace must be allocated "
+                "during decode-state initialization"
+            )
+        if layout != self._decode_q_padding_workspace_layout:
+            raise ValueError(
+                "DeepSeek V4 decode query padding layout changed after allocation: "
+                f"expected={self._decode_q_padding_workspace_layout}, actual={layout}"
+            )
+        workspace_view = workspace[: q.shape[0]]
+        workspace_view[:, :num_heads].copy_(q)
+        return workspace_view
 
     def _dense_prefill_local_compressed_indices(
         self,
@@ -1090,15 +1167,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if q.shape[1] == padded_heads:
-            q_padded = q.contiguous()
-        else:
-            q_padded = torch.zeros(
-                (q.shape[0], padded_heads, q.shape[2]),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            q_padded[:, : q.shape[1]].copy_(q)
+        q_padded = self._pad_decode_query(q, padded_heads=padded_heads)
         swa_block_size = token_to_kv_pool.swa_block_size
         attention_metadata = metadata.attention
         if (
@@ -1698,6 +1767,26 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             device=self.device,
         )
+        self._decode_q_padding_workspace = None
+        self._decode_q_padding_workspace_layout = None
+        padded_heads = dsv4_padded_heads(self.num_qo_heads)
+        if padded_heads != self.num_qo_heads:
+            self._decode_q_padding_workspace = torch.zeros(
+                (
+                    self.graph.max_bs * self.graph.max_tokens_per_req,
+                    padded_heads,
+                    self.head_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._decode_q_padding_workspace_layout = (
+                self._decode_q_padding_workspace.device,
+                self._decode_q_padding_workspace.dtype,
+                self.num_qo_heads,
+                padded_heads,
+                self.head_dim,
+            )
         self.draft_rounds = DeepseekV4DraftRounds(self.graph) if self.is_draft else None
         specs = self._configure_cache_group_contract(
             cache_group_specs,
@@ -1705,8 +1794,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         group_ids = self._expected_cache_group_ids
         assert group_ids is not None
+        self._cuda_graph_active_page_validity = None
         if not group_ids:
             return
+        self._cuda_graph_active_page_validity = torch.ones(
+            (len(group_ids),), dtype=torch.bool, device=self.device
+        )
         # The backend owns the contract math (per-group table widths); the
         # buffers object owns the storage those widths size.
         group_widths = {
