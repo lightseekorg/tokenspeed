@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention as attention
+import tokenspeed_kernel.ops.attention.kpool as attention
 import torch
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature

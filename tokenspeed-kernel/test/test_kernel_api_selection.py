@@ -40,6 +40,7 @@ import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
 import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
@@ -1797,7 +1798,7 @@ def test_dsa_topk_selection_receives_index_heads(
         captured.update(kwargs["traits"])
         return _SelectedKernel()
 
-    monkeypatch.setattr(_attention_pkg, "select_kernel", select_dsa_topk)
+    monkeypatch.setattr(_attention_dsa_pkg, "select_kernel", select_dsa_topk)
     q = torch.empty((1, index_heads, 128), dtype=torch.bfloat16)
     weights = torch.empty((1, index_heads), dtype=torch.float32)
     index_k_cache = torch.empty((64, 132), dtype=torch.uint8)
@@ -1846,7 +1847,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
             )
 
     monkeypatch.setattr(
-        _attention_pkg,
+        _attention_dsa_pkg,
         "select_kernel",
         lambda *args, **kwargs: _SelectedKernel(),
     )
@@ -1939,7 +1940,7 @@ def test_dsa_topk_selection_receives_cache_layout(
         captured.update(kwargs["traits"])
         return _SelectedKernel()
 
-    monkeypatch.setattr(_attention_pkg, "select_kernel", select_dsa_topk)
+    monkeypatch.setattr(_attention_dsa_pkg, "select_kernel", select_dsa_topk)
     q = torch.empty((1, 32, 128), dtype=torch.bfloat16)
     weights = torch.empty((1, 32), dtype=torch.float32)
 

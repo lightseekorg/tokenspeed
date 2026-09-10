@@ -9,10 +9,12 @@ import pytest
 import torch
 from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
-from tokenspeed_kernel.ops import attention as attention_ops
 from tokenspeed_kernel.ops.attention import (
     KdaPrefillResult,
     _attention_format_signature,
+)
+from tokenspeed_kernel.ops.attention import kda as attention_ops
+from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
     kda_recurrent_layout,

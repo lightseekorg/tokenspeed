@@ -668,7 +668,7 @@ def test_replay_probe_requires_both_commit_and_fused_verify_kernels():
     unsupported."""
     from unittest import mock
 
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.kda as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     real = attention_ops.select_kernel

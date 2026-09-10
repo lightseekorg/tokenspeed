@@ -941,7 +941,7 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
     monkeypatch: pytest.MonkeyPatch,
     use_gate: bool,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     latent = torch.arange(24, dtype=torch.float32).reshape(2, 1, 3, 4) / 16
@@ -1058,7 +1058,7 @@ def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
 def test_mla_project_value_fallback_preserves_fp32_gate_math(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -1081,7 +1081,7 @@ def test_mla_project_value_fallback_preserves_fp32_gate_math(
 def test_mla_project_value_nvidia_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -1121,7 +1121,7 @@ def test_mla_normalize_project_query_cuda_fallback(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -1171,7 +1171,7 @@ def test_mla_normalize_project_query_split_output(
     require,
     heads: int,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
 
     require(
         "attention",
