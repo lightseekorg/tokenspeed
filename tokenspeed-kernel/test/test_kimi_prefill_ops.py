@@ -70,7 +70,7 @@ def test_kimi3_router_projection_auto_splits_on_token_count() -> None:
     weight = torch.randn(
         kimi3_module.KIMI3_ROUTER_SIZE, kimi3_module.KIMI3_HIDDEN_SIZE
     ).to(torch.bfloat16)
-    platform = SimpleNamespace(is_cdna4=False, is_hopper_plus=True)
+    platform = SimpleNamespace(is_cdna4=False, is_cdna5=False, is_hopper_plus=True)
 
     def solution_for(m: int) -> str:
         x = hidden_states.expand(m, -1).contiguous()
@@ -134,7 +134,7 @@ def test_kimi3_mla_projection_owns_schedule_selection() -> None:
     with mock.patch.object(
         kimi3_module.Platform,
         "get",
-        return_value=SimpleNamespace(is_cdna4=True),
+        return_value=SimpleNamespace(is_cdna4=True, is_cdna5=False),
     ):
         decode = kimi3_mla_qkv_gate_projection(torch.ones(1, 5), weight, 6)
         prefill = kimi3_mla_qkv_gate_projection(torch.ones(33, 5), weight, 6)
@@ -152,7 +152,7 @@ def test_kimi3_mla_projection_preserves_non_cdna_prefill_schedule() -> None:
     with mock.patch.object(
         kimi3_module.Platform,
         "get",
-        return_value=SimpleNamespace(is_cdna4=False),
+        return_value=SimpleNamespace(is_cdna4=False, is_cdna5=False),
     ):
         projection = kimi3_mla_qkv_gate_projection(hidden_states, weight, 6)
 
