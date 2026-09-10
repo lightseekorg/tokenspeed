@@ -27,6 +27,7 @@ import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
+import tokenspeed_kernel.ops.moe.petit  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
@@ -479,7 +480,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "petit"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 

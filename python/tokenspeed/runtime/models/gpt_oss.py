@@ -63,6 +63,7 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
     CompiledMoEDecoderLayer,
 )
+from tokenspeed.runtime.models.base.module_spec import ModuleKind, ModuleSpec
 from tokenspeed.runtime.models.utils import (
     create_fused_set_kv_buffer_arg,
     validate_attention_partition,
@@ -516,6 +517,11 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
             layer_index=self.layer_id,
             prefix=add_prefix("mlp", prefix),
         )
+
+    def mlp_spec(self) -> ModuleSpec:
+        if not get_all2all_backend().is_petit():
+            return super().mlp_spec()
+        return ModuleSpec.from_kind(kind=ModuleKind.MOE, runs_on_empty_input=True)
 
 
 class GptOssModel(BaseTransformerModel):

@@ -223,6 +223,24 @@ class MoELayer(torch.nn.Module):
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 
+        if self._spec.use_petit:
+            if (
+                self._quant_kind != "mxfp4"
+                or not self.quant_config.is_checkpoint_mxfp4_serialized
+            ):
+                raise ValueError(
+                    "Petit MegaMoE requires serialized MXFP4 expert weights"
+                )
+            if swiglu_beta is None and swiglu_limit is not None:
+                raise ValueError(
+                    "Petit DeepSeek MegaMoE does not support activation clamps"
+                )
+            if swiglu_beta is None and activation_alpha is not None:
+                raise ValueError(
+                    "Petit DeepSeek MegaMoE does not support nonstandard SiLU alpha"
+                )
+            internal_activation_dtype = "mxfp4"
+
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16

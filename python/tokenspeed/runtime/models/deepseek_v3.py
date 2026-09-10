@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.utils import (
     CP_METADATA,
     ENABLE_CP,
@@ -310,7 +311,7 @@ class DeepseekV3MoE(nn.Module):
                 mapping=self.mapping,
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
-                is_shared_expert=True,
+                is_shared_expert=not get_all2all_backend().is_petit(),
             )
 
         self.experts = MoELayer(

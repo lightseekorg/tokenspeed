@@ -48,6 +48,7 @@ class FusionCapability(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ModuleSpec:
+    runs_on_empty_input: bool
     input_placement: Placement | None = None
     output_placement: Placement | None = None
     kind: ModuleKind = ModuleKind.GENERIC
@@ -66,6 +67,7 @@ class ModuleSpec:
         supports_fused_reduce_norm: bool = False,
         captures_aux: bool = False,
         skip_on_idle: bool = False,
+        runs_on_empty_input: bool,
     ) -> ModuleSpec:
         if kind == ModuleKind.NORM:
             call = CallConvention.NORM_WITH_OPTIONAL_RESIDUAL
@@ -90,4 +92,5 @@ class ModuleSpec:
             fusion=fusion,
             captures_aux=captures_aux,
             skip_on_idle=skip_on_idle,
+            runs_on_empty_input=runs_on_empty_input,
         )

@@ -328,7 +328,12 @@ def _compile_compute_step(
             pre_comms.append(ResidualAllGatherOp(mapping, gather_group))
             state.residual = Replicate(input_group)
         state.hidden = Replicate(input_group)
-    elif hidden is None and not (is_first_layer and spec.kind == ModuleKind.ATTENTION):
+    elif (
+        hidden is None
+        and spec.input_placement is not None
+        and spec.input_placement.type == PlacementType.REPLICATE
+        and not (is_first_layer and spec.kind == ModuleKind.ATTENTION)
+    ):
         # Data is not tracked (no previous TP/EP), but the current module
         # expects Replicate on a group with compiler-managed parallelism
         # (e.g. Dense TP, MoE TP/EP).  All-gather on the input group.
