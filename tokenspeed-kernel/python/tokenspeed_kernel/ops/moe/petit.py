@@ -37,6 +37,9 @@ from tokenspeed_kernel.thirdparty.petit import (
 
 _WORLD_SIZE = 8
 _MAX_TOKENS_PER_RANK = 1024
+_GPT_OSS_SWIGLU_ALPHA = 1.702
+_GPT_OSS_SWIGLU_LIMIT = 7.0
+_GPT_OSS_SWIGLU_BETA = 1.0
 
 
 @dataclass(frozen=True)
@@ -131,8 +134,18 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
     ):
         raise ValueError("Petit MegaMoE requires EP8, TP1 and contiguous expert shards")
     if profile.has_bias:
-        if w.activation != "swiglu" or w.swiglu_beta != 1.0:
-            raise ValueError("Petit GPT-OSS MegaMoE requires OpenAI SWIGLU beta=1.0")
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if (
+            w.activation != "swiglu"
+            or swiglu_arg is None
+            or swiglu_arg.alpha != _GPT_OSS_SWIGLU_ALPHA
+            or swiglu_arg.limit != _GPT_OSS_SWIGLU_LIMIT
+            or w.swiglu_beta != _GPT_OSS_SWIGLU_BETA
+        ):
+            raise ValueError(
+                "Petit GPT-OSS MegaMoE requires OpenAI SwiGLU "
+                "alpha=1.702, limit=7.0, beta=1.0"
+            )
         if w.w13_input_layout != "interleaved":
             raise ValueError("Petit GPT-OSS MegaMoE requires interleaved W13 input")
     else:

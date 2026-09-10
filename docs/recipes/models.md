@@ -787,13 +787,16 @@ tokenspeed serve <serialized-mxfp4-model-path> \
 ```
 
 The supported expert shapes are GPT-OSS 120B (128 experts, top-4, hidden size
-2880, biased SwiGLU) and DeepSeek V3 (256 experts, top-8, hidden size 7168,
-intermediate size 2048, bias-free SiLU). Attention TP, MoE TP, context
-parallelism, and dense TP must all be 1; world size and expert parallel size
-must both be 8. Use trivial expert placement without EPLB or redundant experts.
-Each rank is limited to 1024 tokens in prefill and decode; speculative draft
-tokens count toward the decode limit. DeepSeek V3 activation clamps,
-nonstandard SiLU alpha, and expert biases are not supported.
+2880, biased OpenAI SwiGLU with alpha 1.702, clamp limit 7.0, and beta 1.0) and
+DeepSeek V3 (256 experts, top-8, hidden size 7168, intermediate size 2048,
+bias-free SiLU). Attention TP, MoE TP, context parallelism, and dense TP must
+all be 1; world size and expert parallel size must both be 8. Use trivial
+expert placement without EPLB or redundant experts. Each rank is limited to
+1024 tokens in prefill and decode; speculative draft tokens count toward the
+decode limit. When speculative decoding is active, the target and draft MoE
+backends must both be Petit because they share one all-to-all backend. DeepSeek
+V3 activation clamps, nonstandard SiLU alpha, and expert biases are not
+supported.
 
 ## DeepSeek V4-Flash / V4-Pro
 

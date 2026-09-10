@@ -52,6 +52,7 @@ def test_validate_layer_selects_gpt_oss_profile() -> None:
         num_local_experts=16,
         activation="swiglu",
         swiglu_beta=1.0,
+        swiglu_arg=SimpleNamespace(alpha=1.702, limit=7.0),
         w13_input_layout="interleaved",
     )
 
@@ -65,6 +66,41 @@ def test_validate_layer_selects_gpt_oss_profile() -> None:
         inter_dim=3072,
         has_bias=True,
     )
+
+
+@pytest.mark.parametrize(
+    "alpha,limit,beta",
+    [
+        (1.0, 7.0, 1.0),
+        (1.702, None, 1.0),
+        (1.702, 8.0, 1.0),
+        (1.702, 7.0, 0.0),
+    ],
+)
+def test_validate_layer_rejects_noncanonical_gpt_oss_swiglu(
+    alpha: float,
+    limit: float | None,
+    beta: float,
+) -> None:
+    module = SimpleNamespace(
+        num_experts=128,
+        top_k=4,
+        hidden_size=2880,
+        intermediate_size=2880,
+        ep_size=8,
+        tp_size=1,
+        num_local_experts=16,
+        activation="swiglu",
+        swiglu_beta=beta,
+        swiglu_arg=SimpleNamespace(alpha=alpha, limit=limit),
+        w13_input_layout="interleaved",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="alpha=1.702, limit=7.0, beta=1.0",
+    ):
+        _validate_layer(module)
 
 
 def test_validate_layer_rejects_unsupported_geometry() -> None:

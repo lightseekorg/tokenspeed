@@ -920,14 +920,32 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
-        petit_moe = self.moe_backend == "petit"
         petit_all2all = self.all2all_backend == "petit"
-        if petit_moe != petit_all2all:
-            raise ValueError(
-                "Petit MegaMoE requires --moe-backend petit and "
-                "--all2all-backend petit together"
+        active_moe_backends = [("target", self.moe_backend)]
+        if self.speculative_algorithm is not None:
+            active_moe_backends.append(
+                ("draft", self.draft_moe_backend or self.moe_backend)
             )
-        if petit_moe:
+        petit_roles = [
+            role for role, backend in active_moe_backends if backend == "petit"
+        ]
+        non_petit_roles = [
+            f"{role}={backend}"
+            for role, backend in active_moe_backends
+            if backend != "petit"
+        ]
+        if petit_all2all and non_petit_roles:
+            raise ValueError(
+                "Petit MegaMoE requires every active MoE backend to be petit "
+                "when --all2all-backend petit is selected; incompatible "
+                + ", ".join(non_petit_roles)
+            )
+        if not petit_all2all and petit_roles:
+            raise ValueError(
+                "Petit MegaMoE requires --all2all-backend petit for the active "
+                f"{', '.join(petit_roles)} MoE backend"
+            )
+        if petit_roles:
             platform = current_platform()
             if not platform.is_cdna4:
                 raise ValueError("Petit MegaMoE currently requires AMD CDNA4 (gfx950)")

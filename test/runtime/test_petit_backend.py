@@ -41,18 +41,21 @@ def _mapping() -> SimpleNamespace:
 def _validation_args(
     *,
     moe_backend: str,
+    draft_moe_backend: str | None,
     all2all_backend: str,
+    speculative_algorithm: str | None,
     max_num_seqs: int,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         device="cuda",
         moe_backend=moe_backend,
+        draft_moe_backend=draft_moe_backend,
         all2all_backend=all2all_backend,
         mapping=_mapping(),
         enable_eplb=False,
         ep_num_redundant_experts=0,
         init_expert_location=None,
-        speculative_algorithm=None,
+        speculative_algorithm=speculative_algorithm,
         speculative_num_draft_tokens=0,
         max_num_seqs=max_num_seqs,
         chunked_prefill_size=1024,
@@ -73,18 +76,71 @@ def test_petit_moe_runs_on_dp_idle_ranks() -> None:
 def test_petit_requires_both_backend_flags() -> None:
     args = _validation_args(
         moe_backend="petit",
+        draft_moe_backend=None,
         all2all_backend="none",
+        speculative_algorithm=None,
         max_num_seqs=160,
     )
 
-    with pytest.raises(ValueError, match="requires --moe-backend petit"):
+    with pytest.raises(ValueError, match="requires --all2all-backend petit"):
+        ServerArgs.validate(args)
+
+
+def test_petit_rejects_non_petit_draft_backend() -> None:
+    args = _validation_args(
+        moe_backend="petit",
+        draft_moe_backend="triton",
+        all2all_backend="petit",
+        speculative_algorithm="MTP",
+        max_num_seqs=160,
+    )
+
+    with pytest.raises(ValueError, match="incompatible draft=triton"):
+        ServerArgs.validate(args)
+
+
+def test_petit_rejects_draft_only_selection() -> None:
+    args = _validation_args(
+        moe_backend="triton",
+        draft_moe_backend="petit",
+        all2all_backend="none",
+        speculative_algorithm="MTP",
+        max_num_seqs=160,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires --all2all-backend petit for the active draft",
+    ):
+        ServerArgs.validate(args)
+
+
+def test_petit_draft_inherits_target_backend() -> None:
+    args = _validation_args(
+        moe_backend="petit",
+        draft_moe_backend=None,
+        all2all_backend="petit",
+        speculative_algorithm="MTP",
+        max_num_seqs=160,
+    )
+    platform = SimpleNamespace(is_cdna4=False)
+
+    with (
+        mock.patch(
+            "tokenspeed.runtime.utils.server_args.current_platform",
+            return_value=platform,
+        ),
+        pytest.raises(ValueError, match="requires AMD CDNA4"),
+    ):
         ServerArgs.validate(args)
 
 
 def test_petit_rejects_decode_capacity_above_workspace_limit() -> None:
     args = _validation_args(
         moe_backend="petit",
+        draft_moe_backend=None,
         all2all_backend="petit",
+        speculative_algorithm=None,
         max_num_seqs=8200,
     )
     platform = SimpleNamespace(is_cdna4=True)
