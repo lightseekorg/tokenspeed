@@ -143,6 +143,82 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
+def test_triton_preparation_caps_buffers_at_dispatch_limits(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=256)
+    group = (0, 1)
+    process_group = object()
+    state = SimpleNamespace(
+        max_numel=128,
+        max_bytes=256,
+        attnres_max_numel=32,
+        max_token_num=4,
+    )
+    create = Mock(return_value=state)
+    initialize = Mock()
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    monkeypatch.setattr(
+        triton_allreduce_module.pg_manager,
+        "get_process_group",
+        lambda backend_name, requested_group: (
+            process_group
+            if (backend_name, requested_group) == ("nccl", group)
+            else None
+        ),
+    )
+    monkeypatch.setattr(triton_allreduce_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(triton_allreduce_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(triton_allreduce_module, "create_state", create)
+    monkeypatch.setattr(
+        triton_allreduce_module, "initialize_all_reduce_state", initialize
+    )
+
+    assert backend.prepare_all_reduce_buffers(
+        group,
+        staged_max_numel=512,
+        producer_direct_max_numel=512,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+        dtype=torch.bfloat16,
+    )
+    create.assert_called_once_with(
+        group=process_group,
+        rank_in_group=0,
+        max_tokens=0,
+        hidden_size=0,
+        device=torch.device("cuda:0"),
+        max_numel=128,
+        max_bytes=256,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+    )
+    initialize.assert_called_once_with(state, torch.bfloat16)
+    assert backend._instances[group] is state
+
+
+def test_prepared_capacity_does_not_expand_producer_dispatch(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024)
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_or_create",
+        Mock(side_effect=AssertionError("capacity gate must run first")),
+    )
+
+    assert not backend.can_acquire_outputs(
+        ((513,),),
+        SimpleNamespace(is_cuda=True, dtype=torch.bfloat16),
+        (0, 1),
+    )
+
+
 def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)

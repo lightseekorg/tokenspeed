@@ -94,10 +94,32 @@ _PRODUCER_DIRECT_GL_DTYPES = {
 
 
 @dataclass(frozen=True)
+class _StagedAllReduceKernelTuning:
+    world_size: int
+    dtype: torch.dtype
+    numel: int
+    block_size: int
+    num_subgroups: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.world_size <= 1
+            or self.numel <= 0
+            or self.block_size <= 0
+            or self.num_subgroups <= 0
+        ):
+            raise ValueError("invalid staged Iris kernel tuning")
+
+    def num_programs(self) -> int:
+        return triton.cdiv(self.numel, self.block_size)
+
+
+@dataclass(frozen=True)
 class _StagedAllReduceKernelConfig:
     block_size: int
     num_subgroups: int
     input_slots: int
+    cdna4_tunings: tuple[_StagedAllReduceKernelTuning, ...]
 
     def __post_init__(self) -> None:
         if self.block_size <= 0 or self.num_subgroups <= 0 or self.input_slots < 2:
@@ -105,6 +127,24 @@ class _StagedAllReduceKernelConfig:
 
     def max_programs(self, max_numel: int) -> int:
         return triton.cdiv(max_numel, self.block_size)
+
+    def tuning(
+        self,
+        numel: int,
+        world_size: int,
+        dtype: torch.dtype,
+        is_cdna4: bool,
+    ) -> _StagedAllReduceKernelTuning | None:
+        if not is_cdna4:
+            return None
+        for tuning in self.cdna4_tunings:
+            if (
+                tuning.world_size == world_size
+                and tuning.dtype == dtype
+                and tuning.numel == numel
+            ):
+                return tuning
+        return None
 
 
 @dataclass(frozen=True)
@@ -265,6 +305,16 @@ IRIS_ALL_REDUCE_KERNEL_CONFIG = IrisAllReduceKernelConfig(
         block_size=2048,
         num_subgroups=4,
         input_slots=2,
+        # This CDNA4 TP4 tuning came from GLM-5.3-Flash decode.
+        cdna4_tunings=(
+            _StagedAllReduceKernelTuning(
+                world_size=4,
+                dtype=torch.bfloat16,
+                numel=16 * 4096,
+                block_size=512,
+                num_subgroups=1,
+            ),
+        ),
     ),
     producer_direct=_ProducerDirectAllReduceKernelConfig(
         supported_world_sizes=(2, 4, 8),
@@ -378,6 +428,27 @@ def _use_two_stage_plain(
     )
 
 
+def _select_staged_all_reduce_path(
+    numel: int,
+    world_size: int,
+    dtype: torch.dtype,
+    two_stage_supported: bool,
+) -> tuple[_StagedAllReduceKernelTuning | None, bool]:
+    """Resolve the tuned one-shot override and two-stage dispatch together."""
+    tuning = IRIS_ALL_REDUCE_KERNEL_CONFIG.staged.tuning(
+        numel=numel,
+        world_size=world_size,
+        dtype=dtype,
+        is_cdna4=_platform.is_cdna4,
+    )
+    use_two_stage = (
+        tuning is None
+        and two_stage_supported
+        and _use_two_stage_plain(world_size, numel, dtype)
+    )
+    return tuning, use_two_stage
+
+
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.is_available():
         with torch.cuda.device(gpu_id):
@@ -395,6 +466,12 @@ def _get_or_create_iris_context(heap_size: int):
     global _iris_ctx_singleton
     if _iris_ctx_singleton is None:
         _iris_ctx_singleton = iris.iris(heap_size=heap_size)
+    elif heap_size > _iris_ctx_singleton.heap_size:
+        raise RuntimeError(
+            f"Iris has a {_iris_ctx_singleton.heap_size}-byte symmetric heap, "
+            f"but this state requires {heap_size} bytes; prepare the largest "
+            "state first"
+        )
     return _iris_ctx_singleton
 
 
@@ -682,6 +759,14 @@ class IrisAllReduce(object):
         self._staged_max_programs = staged_config.max_programs(
             max_numel=staged_max_numel
         )
+        self._staged_tunings = tuple(
+            tuning
+            for tuning in staged_config.cdna4_tunings
+            if _platform.is_cdna4
+            and tuning.world_size == self.world_size
+            and tuning.dtype == dtype
+            and tuning.numel <= staged_max_numel
+        )
 
         # Whether this state can ever dispatch a two-stage reduction. Platform,
         # group size and element type are all fixed for the life of the state,
@@ -708,12 +793,15 @@ class IrisAllReduce(object):
                 producer_direct_max_numel
                 + self._producer_direct_scratch_numel
                 + staged_config.input_slots * staged_max_numel
+                + staged_config.input_slots
+                * sum(tuning.numel for tuning in self._staged_tunings)
                 + 2 * attnres_max_numel
                 + (staged_max_numel if self._staged_two_stage_supported else 0)
                 + self._staged_two_stage_scratch_numel
             )
             flag_numel = self.world_size * (
                 self._staged_max_programs
+                + sum(tuning.num_programs() for tuning in self._staged_tunings)
                 + 2 * attnres_max_rows
                 + (
                     self._producer_direct_max_programs
@@ -787,6 +875,17 @@ class IrisAllReduce(object):
             if staged_max_numel
             else None
         )
+        # Different block geometries cannot share per-block epochs or rotating
+        # slots because their block IDs cover overlapping element ranges.
+        self._staged_tuning_workspaces = {
+            tuning: (
+                self._ctx.zeros((staged_config.input_slots, tuning.numel), dtype=dtype),
+                self._ctx.zeros(
+                    (tuning.num_programs(), self.world_size), dtype=torch.int32
+                ),
+            )
+            for tuning in self._staged_tunings
+        }
         # Two-stage plain all-reduce. One-shot stages inside its own kernel and
         # picks a slot from its per-block epoch; the two-stage kernel instead
         # reads peers' inputs out of symmetric memory, so the payload has to be
@@ -874,6 +973,13 @@ class IrisAllReduce(object):
             f"tensor numel ({numel}) exceeds iris buffer capacity "
             f"({self.staged_max_numel})"
         )
+        kernel_config = self._kernel_config.staged
+        tuning, use_two_stage = _select_staged_all_reduce_path(
+            numel=numel,
+            world_size=self.world_size,
+            dtype=self.dtype,
+            two_stage_supported=self._staged_two_stage_supported,
+        )
         # One-shot has every rank publish the whole payload and read world_size
         # copies of it, so its cost grows with the payload; the two-stage form
         # moves 2x however wide the world is. Measured on gfx950 at world 8,
@@ -884,25 +990,35 @@ class IrisAllReduce(object):
         # The two-stage kernel stores through a CDNA4 buffer intrinsic, so it is
         # gated the same way the producer-direct reduce is; older AMD parts keep
         # the portable one-shot path.
-        if self._staged_two_stage_supported and _use_two_stage_plain(
-            self.world_size, numel, self.dtype
-        ):
+        # Keep an explicitly tuned one-shot shape on that path. On TP4 gfx950,
+        # one-shot remains faster for 16x4096 while two-stage wins at 64x4096.
+        if use_two_stage:
             return self._all_reduce_two_stage(tensor, numel, safe=safe)
-        kernel_config = self._kernel_config.staged
-        block_size = kernel_config.block_size
+        if tuning is None:
+            block_size = kernel_config.block_size
+            num_subgroups = kernel_config.num_subgroups
+            input_buf = self._staged_input_buf
+            ready_flags = self._ready_flags
+            slot_stride = self.staged_max_numel
+        else:
+            block_size = tuning.block_size
+            num_subgroups = tuning.num_subgroups
+            input_buf, ready_flags = self._staged_tuning_workspaces[tuning]
+            slot_stride = tuning.numel
+        assert input_buf is not None and ready_flags is not None
         iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, block_size),)](
             tensor.view(-1),
-            self._staged_input_buf.view(-1),
+            input_buf.view(-1),
             tensor.view(-1),
-            self._ready_flags,
+            ready_flags,
             self._group_heap_bases,
             numel,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
             BLOCK_SIZE=block_size,
-            SLOT_STRIDE=self.staged_max_numel,
+            SLOT_STRIDE=slot_stride,
             NUM_SLOTS=kernel_config.input_slots,
-            num_warps=kernel_config.num_subgroups,
+            num_warps=num_subgroups,
         )
 
         return tensor.clone() if safe else tensor

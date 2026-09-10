@@ -291,16 +291,6 @@ class GptOssAttention(nn.Module):
         return self.forward_core(s)
 
 
-def routing_function(hidden_states, gating_output, topk, renormalize):
-
-    experts = torch.topk(gating_output, k=topk, dim=-1, sorted=True)
-    expert_weights = torch.nn.functional.softmax(
-        experts.values.to(torch.float32), dim=1
-    )
-    expert_indices = experts.indices.to(torch.int32)
-    return expert_weights, expert_indices
-
-
 class GptOssSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -366,9 +356,12 @@ class GptOssSparseMoeBlock(nn.Module):
             params_dtype=config.dtype,
         )
 
+        # Declare model semantics only; the kernel package selects the
+        # platform- and shape-specific softmax top-k implementation.
         self.topk = TopK(
             top_k=top_k,
-            custom_routing_function=routing_function,
+            renormalize=True,
+            custom_routing_function=None,
             output_format=self.experts.topk_output_format,
             topk_indices_dtype=(
                 torch.int64 if get_all2all_backend().is_deepep() else torch.int32

@@ -298,9 +298,9 @@ if current_platform().is_amd:
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({True}),
             "sparse_kv_cache_available": frozenset({False}),
