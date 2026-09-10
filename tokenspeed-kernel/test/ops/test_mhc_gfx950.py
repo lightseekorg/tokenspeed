@@ -91,7 +91,7 @@ def test_gluon_mhc_pre_multitoken_matches_reference(
     )
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
 
-    actual = tokenspeed_kernel.mhc_pre(*args)
+    actual = tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
     expected = _reference(*args)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):

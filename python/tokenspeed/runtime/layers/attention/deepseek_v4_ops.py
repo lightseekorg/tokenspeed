@@ -82,6 +82,8 @@ def fused_qnorm_rope_kv_insert(
     rms_norm_eps: float,
     block_size: int,
     q_out: torch.Tensor | None = None,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Run the DeepSeek V4 fused SWA cache insert op.
 
@@ -104,6 +106,7 @@ def fused_qnorm_rope_kv_insert(
         rms_norm_eps=rms_norm_eps,
         page_size=block_size,
         q_out=q_out,
+        validate_positions=validate_positions,
     )
 
 
@@ -174,6 +177,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         weights=weights,
         softmax_scale=softmax_scale,
         head_scale=head_scale,
+        prefer_serial_four_block=True,
     )
 
 

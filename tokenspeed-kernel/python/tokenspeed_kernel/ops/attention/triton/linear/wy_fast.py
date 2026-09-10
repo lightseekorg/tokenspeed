@@ -28,6 +28,7 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.linear.index import prepare_chunk_indices
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -51,7 +52,10 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -118,6 +122,8 @@ def recompute_w_u_fwd_kernel(
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def recompute_w_u_fwd(
@@ -128,6 +134,7 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    enable_pdl = pdl_enabled()
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
@@ -160,6 +167,8 @@ def recompute_w_u_fwd(
         BV=BV,
         num_warps=4,
         num_stages=3,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return w, u
 

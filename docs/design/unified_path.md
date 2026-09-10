@@ -89,6 +89,18 @@ on replay. PLE's uniform index bundles are reused during capture only; eager
 prefill and decode construct their indices through the same builder outside
 the capture pool.
 
+GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
+and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
+use uninitialized output and a placeholder for a disabled intermediate cache:
+live rows are fully written, while negative padding rows skip state access
+and leave output undefined. Consumers must ignore padded output; enabled
+intermediate caches always require real storage.
+
+GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
+reading inputs and signal after computation; FlashInfer adapters preserve the
+upstream CuTe body and isolate PDL compilation caches. Graphs retain their
+capture-time PDL setting and must be recaptured to change it.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base
@@ -378,6 +390,9 @@ The staging flag records whether forward or capture has ever used staging,
 not whether one round is pending. Commit must not clear it: graph replay
 updates staging tensors without re-running the Python assignment. Staged
 keys retain the model dtype; commit converts them to the fixed BF16 raw cache.
+QSA compression callers explicitly select target-verification and draft staging;
+the runtime wrapper and kernel API require both controls, including `None` and
+`False` when staging is disabled.
 
 `Qwen4ExpPLEBackend` resolves its own input/output checkpoints and query
 lengths from the PLE cache group. It validates and slices rollback scratch by

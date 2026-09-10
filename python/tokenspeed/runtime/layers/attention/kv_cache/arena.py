@@ -94,13 +94,13 @@ class CacheArena:
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        plan_groups = {group.group_id: group for group in plan.groups}
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
         # packing; the contract carries them beside the specs rather than
         # copying them in, and the recipe packs the plan from the same
         # (spec, fields) pairs these specs come from, so both name one group
         # set by construction.
-        plan_groups = {group.group_id: group for group in plan.groups}
         self.runtime_contract = CacheRuntimeContract(
             # The identity axis comes from the plan, never read back out of
             # view state. Per-group CacheBlock spans live in the group specs

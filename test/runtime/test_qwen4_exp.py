@@ -995,6 +995,8 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
         (64 + logical).to(torch.int32),
         object(),
         recent_request_limit=0,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     assert len(compression_calls) == 1
@@ -1159,6 +1161,8 @@ def test_qwen4_exp_qsa_compresses_across_chunks_with_recent_raw_keys() -> None:
         256 + first_positions.to(torch.int32),
         64 + first_positions.to(torch.int32),
         pool,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     second_positions = torch.arange(2, 8, dtype=torch.long, device=device)
@@ -1173,6 +1177,8 @@ def test_qwen4_exp_qsa_compresses_across_chunks_with_recent_raw_keys() -> None:
         256 + second_positions.to(torch.int32),
         64 + second_positions.to(torch.int32),
         pool,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     expected_recent = torch.tensor([[4.0, 8.0], [5.0, 10.0], [6.0, 12.0], [7.0, 14.0]])
@@ -1207,6 +1213,8 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
         256 + committed_positions.to(torch.int32),
         64 + committed_positions.to(torch.int32),
         pool,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
     raw[1, 3, 0] = -99
     seed_position = torch.tensor([3], dtype=torch.long, device=device)
@@ -1230,6 +1238,7 @@ def test_qwen4_exp_qsa_draft_scratch_spans_compression_boundaries() -> None:
             pool,
             draft_scratch=scratch,
             stage_draft=True,
+            stage_verify_buffers=None,
         )
 
     torch.testing.assert_close(
@@ -1266,6 +1275,8 @@ def test_qwen4_exp_qsa_draft_mask_blocks_rejected_cache_writes() -> None:
         256 + committed_positions.to(torch.int32),
         64 + committed_positions.to(torch.int32),
         pool,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
     compressed[1, 1, 0] = -77
 
@@ -1284,6 +1295,8 @@ def test_qwen4_exp_qsa_draft_mask_blocks_rejected_cache_writes() -> None:
         64 + candidates.to(torch.int32),
         pool,
         write_mask=torch.tensor([True, False, False, False], device=device),
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     torch.testing.assert_close(
@@ -1314,6 +1327,8 @@ def test_qwen4_exp_qsa_does_not_mix_adjacent_requests() -> None:
         qsa_locs,
         recent_locs,
         pool,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     torch.testing.assert_close(

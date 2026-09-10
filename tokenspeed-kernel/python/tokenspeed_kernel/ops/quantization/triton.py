@@ -267,6 +267,77 @@ def _fp8_token_group_quantize(
     return out, scales
 
 
+@triton.jit
+def _fp8_quantize_dequantize_kernel(
+    x_ptr,
+    out_ptr,
+    x_row_stride,
+    out_row_stride,
+    groups_per_row: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    row = group_id // groups_per_row
+    column_group = group_id - row * groups_per_row
+    columns = column_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    x = tl.load(x_ptr + row * x_row_stride + columns).to(tl.float32)
+
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-4)
+    scale = tl.exp2(tl.ceil(tl.log2(absmax / 448.0)))
+    quantized = tl.clamp(x / scale, -448.0, 448.0).to(tl.float8e4nv)
+    dequantized = quantized.to(tl.float32) * scale
+    tl.store(out_ptr + row * out_row_stride + columns, dequantized)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_quantize_dequantize",
+    name="triton_fp8_quantize_dequantize",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    traits={
+        "group_size": frozenset({64, 128}),
+        "scale_encoding": frozenset({"ue8m0"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_fp8_quantize_dequantize(
+    x: torch.Tensor,
+    group_size: int,
+    scale_encoding: str,
+) -> torch.Tensor:
+    if group_size not in {64, 128}:
+        raise ValueError(f"unsupported FP8 round-trip group_size: {group_size}")
+    if scale_encoding != "ue8m0":
+        raise ValueError(
+            f"unsupported FP8 round-trip scale encoding: {scale_encoding!r}"
+        )
+
+    rows, width, x_row_stride = _flatten_to_2d(x)
+    if width % group_size != 0:
+        raise ValueError(
+            f"last dimension {width} must be divisible by group_size {group_size}"
+        )
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    out_rows, _, out_row_stride = _flatten_to_2d(out)
+    assert out_rows == rows
+    groups_per_row = width // group_size
+    _fp8_quantize_dequantize_kernel[(rows * groups_per_row,)](
+        x,
+        out,
+        x_row_stride,
+        out_row_stride,
+        groups_per_row=groups_per_row,
+        GROUP_SIZE=group_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
 @register_kernel(
     "quantization",
     "fp8",
@@ -548,6 +619,7 @@ def triton_quantize_mxfp4(
 __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
+    "triton_fp8_quantize_dequantize",
     "triton_quantize_mxfp4",
     "triton_quantize_fp8_with_scale",
 ]

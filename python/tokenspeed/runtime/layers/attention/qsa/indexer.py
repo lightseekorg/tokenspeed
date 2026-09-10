@@ -226,11 +226,11 @@ class QSAIndexer(nn.Module):
         recent_request_limit: int | None = None,
         write_mask: torch.Tensor | None = None,
         draft_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-        stage_draft: bool = False,
+        stage_draft: bool,
         query: torch.Tensor | None = None,
         stage_verify_buffers: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ) = None,
+        ),
     ) -> torch.Tensor | None:
         raw, compressed, position_cache = self._fields(pool)
         position_values = self._position_values(rope_positions)

@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.mhc.triton_prefill import (
     mhc_pre_mix_hc4,
     mhc_prefill_project_hc4,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -44,6 +44,35 @@ def _compute_num_split(
         num_block_k = triton.cdiv(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     return max(split_k, 1)
+
+
+def _pre_reduce_apply_is_supported(
+    pre_reduce_apply_impl,
+    n_splits: int,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+) -> bool:
+    if pre_reduce_apply_impl is None:
+        return False
+    supported = getattr(pre_reduce_apply_impl, "supported_n_splits", None)
+    if supported is not None and n_splits not in supported:
+        return False
+    supported_hc_mults = getattr(pre_reduce_apply_impl, "supported_hc_mults", None)
+    if supported_hc_mults is not None and hc_mult not in supported_hc_mults:
+        return False
+    hidden_size_multiple = getattr(pre_reduce_apply_impl, "hidden_size_multiple", None)
+    return hidden_size_multiple is None or hidden_size % hidden_size_multiple == 0
+
+
+def _pre_reduce_apply_fuses_norm(
+    pre_reduce_apply_impl, use_pre_reduce_apply: bool, has_norm_weight: bool
+) -> bool:
+    return bool(
+        use_pre_reduce_apply
+        and has_norm_weight
+        and getattr(pre_reduce_apply_impl, "supports_fused_norm", False)
+    )
 
 
 @triton.jit
@@ -414,9 +443,13 @@ def _mhc_pre_impl(
     hc_eps: float,
     sinkhorn_iters: int,
     prenorm_gemm,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
     pre_mix_impl=None,
     pre_reduce_apply_impl=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
     if not residual.is_cuda:
@@ -458,9 +491,15 @@ def _mhc_pre_impl(
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
+    use_pre_reduce_apply = _pre_reduce_apply_is_supported(
+        pre_reduce_apply_impl,
+        n_splits,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+    )
     pre_mix = (
         None
-        if pre_reduce_apply_impl is not None
+        if use_pre_reduce_apply
         else torch.empty(
             num_tokens, hc_mult, dtype=torch.float32, device=residual.device
         )
@@ -487,7 +526,20 @@ def _mhc_pre_impl(
         n_splits,
     )
     block_h = 1024
-    if pre_reduce_apply_impl is not None:
+    fused_norm = _pre_reduce_apply_fuses_norm(
+        pre_reduce_apply_impl,
+        use_pre_reduce_apply,
+        norm_weight is not None,
+    )
+    if use_pre_reduce_apply:
+        fused_norm_kwargs = {}
+        if getattr(pre_reduce_apply_impl, "supports_fused_norm", False):
+            fused_norm_kwargs = {
+                "norm_weight": norm_weight if fused_norm else None,
+                "norm_eps": norm_eps if fused_norm else 0.0,
+                "block_size": 512,
+                "enable_pdl": pdl_enabled(),
+            }
         pre_reduce_apply_impl(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -503,6 +555,7 @@ def _mhc_pre_impl(
             sinkhorn_iters,
             n_splits,
             num_tokens,
+            **fused_norm_kwargs,
         )
     else:
         if pre_mix_impl is None:
@@ -550,6 +603,13 @@ def _mhc_pre_impl(
             hc_mult=hc_mult,
             block_h=block_h,
             num_warps=4,
+        )
+
+    if norm_weight is not None and not fused_norm:
+        if norm_eps is None:
+            raise ValueError("norm_eps is required when norm_weight is provided")
+        layer_input = torch.nn.functional.rms_norm(
+            layer_input, (hidden_size,), norm_weight, norm_eps
         )
 
     return (
@@ -667,11 +727,13 @@ def triton_mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the portable Triton mHC pre-mapping."""
     num_tokens = residual.numel() // (residual.shape[-2] * residual.shape[-1])
     if residual.shape[-2] == 4 and num_tokens > 256:
-        return _tiled_mhc_pre_hc4(
+        layer_input, post_mix, comb_mix = _tiled_mhc_pre_hc4(
             residual,
             fn,
             hc_scale,
@@ -680,6 +742,13 @@ def triton_mhc_pre(
             hc_eps,
             sinkhorn_iters,
         )
+        if norm_weight is not None:
+            if norm_eps is None:
+                raise ValueError("norm_eps is required when norm_weight is provided")
+            layer_input = torch.nn.functional.rms_norm(
+                layer_input, (residual.shape[-1],), norm_weight, norm_eps
+            )
+        return layer_input, post_mix, comb_mix
     return _mhc_pre_impl(
         residual,
         fn,
@@ -689,6 +758,8 @@ def triton_mhc_pre(
         hc_eps,
         sinkhorn_iters,
         _mhc_prenorm_gemm_triton,
+        norm_weight,
+        norm_eps,
     )
 
 

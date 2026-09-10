@@ -28,6 +28,7 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.linear.utils import input_guard
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit
@@ -37,7 +38,10 @@ def l2norm_fwd_kernel1(
     D,
     BD: tl.constexpr,
     eps,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t = tl.program_id(0)
     x += i_t * D
     y += i_t * D
@@ -51,6 +55,8 @@ def l2norm_fwd_kernel1(
     # Normalize and apply linear transformation
     b_y = b_x * b_rstd
     tl.store(y + cols, b_y, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -63,7 +69,10 @@ def l2norm_fwd_kernel(
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t = tl.program_id(0)
     p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
@@ -71,11 +80,14 @@ def l2norm_fwd_kernel(
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
 ):
+    enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
     # allocate output
@@ -108,6 +120,8 @@ def l2norm_fwd(
             BT=16,
             num_warps=8,
             num_stages=3,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     else:
         l2norm_fwd_kernel1[(T,)](
@@ -118,6 +132,8 @@ def l2norm_fwd(
             BD=BD,
             num_warps=8,
             num_stages=3,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
     return y.view(x_shape_og)

@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.utils import (
     check_shared_mem,
     input_guard,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -57,7 +58,10 @@ def chunk_local_cumsum_scalar_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -90,6 +94,8 @@ def chunk_local_cumsum_scalar_kernel(
     if HAS_SCALE:
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics(
@@ -104,7 +110,7 @@ def chunk_local_cumsum_scalar_kernel(
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    key=["ENABLE_PDL", "B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
@@ -123,7 +129,10 @@ def chunk_local_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -183,6 +192,8 @@ def chunk_local_cumsum_vector_kernel(
     if HAS_SCALE:
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def chunk_local_cumsum_scalar(
@@ -194,6 +205,7 @@ def chunk_local_cumsum_scalar(
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
 ) -> torch.Tensor:
+    enable_pdl = pdl_enabled()
     if head_first:
         B, H, T = g.shape
     else:
@@ -222,6 +234,8 @@ def chunk_local_cumsum_scalar(
         REVERSE=reverse,
         num_warps=8,
         num_stages=3,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return g
 
@@ -235,6 +249,7 @@ def chunk_local_cumsum_vector(
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
 ) -> torch.Tensor:
+    enable_pdl = pdl_enabled()
     if head_first:
         B, H, T, S = g.shape
     else:
@@ -271,6 +286,8 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return g
 

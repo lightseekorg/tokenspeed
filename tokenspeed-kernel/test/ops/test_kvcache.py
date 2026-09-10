@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_per_layer_mla,
     zero_byte_ranges,
 )
+from tokenspeed_kernel.platform import current_platform
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])
@@ -165,7 +166,10 @@ def test_copy_state_rows_accepts_32_and_64_bit_row_ids(
         assert torch.equal(actual, reference)
 
 
-def test_copy_state_rows_masks_null_destination_pages(device: str) -> None:
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_copy_state_rows_masks_null_destination_pages(
+    device: str, enable_pdl: bool, monkeypatch
+) -> None:
     """A layer whose destination rows are all null must be left untouched.
 
     This is the contract PLE's batched post-verify commit depends on: cache
@@ -173,6 +177,12 @@ def test_copy_state_rows_masks_null_destination_pages(device: str) -> None:
     layer's slab must survive bit-identically while its peers in the same
     launch still commit.
     """
+
+    if enable_pdl and not current_platform().is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.kvcache.triton.pdl_enabled", lambda: enable_pdl
+    )
 
     num_layers = 3
     rows_per_layer = 4

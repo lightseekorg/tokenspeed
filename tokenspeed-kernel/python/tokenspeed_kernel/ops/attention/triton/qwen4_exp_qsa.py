@@ -720,8 +720,8 @@ def qwen4_exp_qsa_compress_and_store(
     num_query_heads: int | None = None,
     stage_verify_buffers: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-    ) = None,
-    stage_draft: bool = False,
+    ),
+    stage_draft: bool,
 ) -> torch.Tensor | None:
     """Pool, normalize, rotate, and scatter compressed QSA keys in one kernel.
 
@@ -770,10 +770,12 @@ def qwen4_exp_qsa_compress_and_store(
         query_norm_weight: Gemma RMSNorm weight for ``query``.
         query_norm_epsilon: RMSNorm epsilon for ``query``.
         num_query_heads: Query heads packed into each projected row.
-        stage_verify_buffers: Optional contiguous K, position, logical-position,
-            and recent-location destinations for target verification.
+        stage_verify_buffers: Contiguous K, position, logical-position,
+            and recent-location destinations for target verification. Pass
+            None explicitly when target verification staging is not needed.
         stage_draft: Store each row into the supplied request-local draft
             scratch after compression has consumed its previous contents.
+            Pass False explicitly when draft staging is not needed.
 
     Returns:
         Normalized and rotated query rows when ``query`` is provided;

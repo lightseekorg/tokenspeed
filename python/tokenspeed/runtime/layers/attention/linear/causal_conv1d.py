@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import pdl_enabled
 
 PAD_SLOT_ID = -1
 
@@ -74,7 +75,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
     stride_conv_state_seq = stride_istate_seq
@@ -393,6 +397,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_fn(
@@ -450,6 +456,7 @@ def causal_conv1d_fn(
 
     out: same shape as `x`
     """
+    enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
@@ -606,6 +613,8 @@ def causal_conv1d_fn(
         BLOCK_M=8,
         BLOCK_N=256,
         num_stages=2,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out
 
@@ -661,8 +670,11 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -897,6 +909,8 @@ def _causal_conv1d_update_kernel(
                     tl.store(output_base + 1 * stride_conv_state_tok, col1, mask=mask_w)
                 if KERNEL_WIDTH >= 4:
                     tl.store(output_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_update(
@@ -937,6 +951,7 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    enable_pdl = pdl_enabled()
     if validate_data:
         assert cache_seqlens is None
         assert pad_slot_id is not None
@@ -1061,6 +1076,8 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     if unsqueeze:
         out = out.squeeze(-1)

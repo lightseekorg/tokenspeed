@@ -61,7 +61,11 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
+from tokenspeed_kernel import (
+    pack_topk_router_logits,
+)
 from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
 from torch import nn
@@ -249,6 +253,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_pre(
         residual,
@@ -258,6 +264,8 @@ def mhc_pre(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -281,6 +289,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -293,6 +303,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
@@ -326,15 +338,7 @@ def pack_topk_as_router_logits(
     selected ids and weights without changing the shared backend.
     """
 
-    router_logits = torch.full(
-        (topk_ids.shape[0], num_experts),
-        -1e20,
-        dtype=torch.float32,
-        device=topk_weights.device,
-    )
-    safe_weights = topk_weights.clamp_min(torch.finfo(torch.float32).tiny)
-    router_logits.scatter_(1, topk_ids.long(), safe_weights.log())
-    return router_logits
+    return pack_topk_router_logits(topk_weights, topk_ids, num_experts)
 
 
 @dataclass(frozen=True)
@@ -906,9 +910,24 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
         if indexer_metadata is None
         else indexer_metadata.decode_schedule_metadata_cache
     )
+    refreshed_keys = (
+        None
+        if indexer_metadata is None
+        else indexer_metadata.decode_schedule_metadata_refreshed_keys
+    )
     schedule_metadata = (
         schedule_cache.get(schedule_key) if schedule_cache is not None else None
     )
+    # The attention backend refreshes cached schedule buffers once after the
+    # decode metadata changes.  Every indexer layer sees the same positions and
+    # geometry, so re-planning and copying the same schedule per layer only adds
+    # graph work without changing the result.
+    if (
+        schedule_metadata is not None
+        and refreshed_keys is not None
+        and schedule_key in refreshed_keys
+    ):
+        return schedule_metadata
 
     with nvtx_range("indexer_decode_schedule_metadata"):
         refreshed = dsv4_plan(
@@ -925,13 +944,19 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
         ):
             with torch.inference_mode():
                 schedule_metadata.copy_(refreshed)
+            if refreshed_keys is not None:
+                refreshed_keys.add(schedule_key)
             return schedule_metadata
         if schedule_cache is not None:
             schedule_cache[schedule_key] = refreshed
+        if refreshed_keys is not None:
+            refreshed_keys.add(schedule_key)
         return refreshed
     schedule_metadata = refreshed
     if schedule_cache is not None:
         schedule_cache[schedule_key] = schedule_metadata
+    if refreshed_keys is not None:
+        refreshed_keys.add(schedule_key)
     return schedule_metadata
 
 
@@ -1360,6 +1385,32 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
+def _deepseek_v4_group_slot_mapping(
+    positions: torch.Tensor,
+    req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    rows_per_block: int,
+    is_valid_token: torch.Tensor | None,
+) -> torch.Tensor:
+    if positions.is_cuda and block_table.is_cuda:
+        return dsv4_group_slot_mapping(
+            positions=positions,
+            req_indices=req_indices,
+            block_table=block_table,
+            rows_per_block=rows_per_block,
+            entry_stride_tokens=1,
+            base_offsets=None,
+            is_valid_token=is_valid_token,
+        )
+    mapping = _group_slot_mapping_from_raw(
+        positions,
+        req_indices,
+        block_table,
+        rows_per_block,
+    )
+    return _mask_invalid_graph_tokens(mapping, is_valid_token)
+
+
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
     capacity: int,
@@ -1402,6 +1453,9 @@ def _deepseek_v4_swa_slot_mapping(
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+    is_valid_token = getattr(metadata, "is_valid_token", None)
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[: positions.numel()]
     if cache_metadata.swa_page_table is None or (
         token_to_req_indices.numel() != positions.numel()
         and (
@@ -1413,15 +1467,13 @@ def _deepseek_v4_swa_slot_mapping(
             (positions.numel(),), -1, dtype=torch.int64, device=positions.device
         )
     else:
-        slot_mapping = _group_slot_mapping_from_raw(
+        slot_mapping = _deepseek_v4_group_slot_mapping(
             positions,
             token_to_req_indices,
             cache_metadata.swa_page_table,
             ctx.token_to_kv_pool.swa_block_size,
+            is_valid_token,
         )
-    is_valid_token = getattr(metadata, "is_valid_token", None)
-    if is_valid_token is not None:
-        is_valid_token = is_valid_token[: positions.numel()]
     # Attribute access is deliberately unguarded: a pool without
     # swa_capacity_slots must fail fast here rather than skip the bounds
     # check that protects the fused cache-insert kernels.
@@ -1943,9 +1995,20 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=False,
-                routing_mode="precomputed_topk",
+                # FlashInfer's standard MXFP4 kernel performs routing in-kernel.
+                # Keep precomputed top-k for backends that require it; for
+                # FlashInfer, MoELayer repacks the already-selected routes into
+                # router logits before invoking the kernel.
+                routing_mode=(
+                    None
+                    if get_moe_backend().is_flashinfer_trtllm()
+                    else "precomputed_topk"
+                ),
                 routing_config={
-                    "routed_scaling_factor": self.routed_scaling_factor,
+                    # Keep scaling at the common post-expert boundary below.
+                    # Kernel-routing backends otherwise apply the same factor
+                    # internally and the routed contribution is scaled twice.
+                    "routed_scaling_factor": 1.0,
                     "normalize_topk_weights": config.norm_topk_prob,
                     "correction_bias": self.gate.e_score_correction_bias,
                     "routing_method_type": RoutingMethodType.Renormalize,
@@ -2077,6 +2140,8 @@ class DeepseekV4MoE(nn.Module):
                     num_global_tokens=num_global_tokens,
                     max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 )
+                if topk_output.format.is_bypassed() and not self.config.norm_topk_prob:
+                    routed *= topk_weights.sum(dim=-1, keepdim=True).to(routed.dtype)
                 if self.routed_scaling_factor != 1.0:
                     routed *= self.routed_scaling_factor
             with fork.branch():
@@ -2225,14 +2290,15 @@ class DeepseekV4Compressor(nn.Module):
                         "DeepSeek V4 missing cache-group block table for compressor "
                         f"state ratio={self.compress_ratio}"
                     )
-                mapping = _group_slot_mapping_from_raw(
+                mapping = _deepseek_v4_group_slot_mapping(
                     positions,
                     metadata.token_to_req_indices[: positions.numel()],
                     resolved_state_block_table,
                     state_block_size,
+                    valid_token,
                 )
                 return (
-                    _mask_invalid_graph_tokens(mapping, valid_token),
+                    mapping,
                     resolved_state_block_table,
                 )
 
@@ -2708,14 +2774,15 @@ class DeepseekV4Indexer(nn.Module):
                     "compressor state"
                 )
             block_size = pool.get_indexer_state_block_size(layer_index)
-            mapping = _group_slot_mapping_from_raw(
+            mapping = _deepseek_v4_group_slot_mapping(
                 positions,
                 metadata.token_to_req_indices[: positions.numel()],
                 block_table,
                 block_size,
+                valid_token,
             )
             return (
-                _mask_invalid_graph_tokens(mapping, valid_token),
+                mapping,
                 block_table,
                 block_size,
             )
@@ -2999,6 +3066,7 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         block_size: int,
+        validate_positions: bool,
     ) -> None:
         # slot_mapping arrives pre-sanitized from _deepseek_v4_swa_slot_mapping
         # (invalid tokens and out-of-capacity slots masked to -1); sanitizing
@@ -3014,6 +3082,7 @@ class DeepseekV4Attention(nn.Module):
             cos_sin_cache=cos_sin_cache,
             rms_norm_eps=self.q_norm.variance_epsilon,
             block_size=block_size,
+            validate_positions=validate_positions,
         )
 
     def _project_attention_output(
@@ -3079,6 +3148,14 @@ class DeepseekV4Attention(nn.Module):
                 hidden_states,
             )
 
+        # Every layer sees the same position values.  Keep the public kernel
+        # check enabled, but execute its five comparison/reduction/assert
+        # launches only once per distinct RoPE-cache capacity in this forward.
+        position_capacity = int(cos_sin_cache.shape[0])
+        validate_positions = slot_mappings.first_use(
+            ("position_capacity", position_capacity)
+        )
+
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
         # After this phase, each compressor's forward() receives its
@@ -3118,6 +3195,7 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
+                    validate_positions=validate_positions,
                 )
 
         def run_compressor() -> None:
@@ -3356,6 +3434,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
         else:
             residual = hidden_states
@@ -3368,9 +3448,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
-        with nvtx_range("attn_norm"):
-            hidden_states = self.attn_norm(hidden_states)
 
         with nvtx_range("attn_total"):
             hidden_states = self.attn(positions, hidden_states, ctx)
@@ -3387,9 +3467,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_sinkhorn_iters,
+                norm_weight=self.ffn_norm.weight,
+                norm_eps=self.ffn_norm.variance_epsilon,
             )
-        with nvtx_range("ffn_norm"):
-            hidden_states = self.ffn_norm(hidden_states)
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)

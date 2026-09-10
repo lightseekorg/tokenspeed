@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -36,6 +37,9 @@ _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
 HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
+
+
+logger = logging.getLogger(__name__)
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -428,8 +432,10 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     # state field. Bound the rectangle and let each CTA stride its own range.
     # Few large ranges still need enough CTAs to occupy the device.
     tiles_per_range = max(32, triton.cdiv(1024, len(ranges)))
-    grid = (len(ranges), min(tiles_per_range, triton.cdiv(max_size, block_size)))
-
+    grid = (
+        len(ranges),
+        min(tiles_per_range, triton.cdiv(max_size, block_size)),
+    )
     _zero_byte_ranges_kernel[grid](
         backing,
         range_table,
@@ -454,6 +460,7 @@ def _copy_state_rows_kernel(
     rows_per_layer,
     ROW_I32: tl.constexpr,
     BLOCK_I32: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Copy one state row between two slabs of one layer.
 
@@ -462,6 +469,8 @@ def _copy_state_rows_kernel(
     stores zeros instead (seed-invalid fill). A negative destination row id
     skips the store entirely, which is how callers mask a null cache page.
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     work_index = tl.program_id(0)
     chunk_index = tl.program_id(1)
     layer_index = work_index // rows_per_layer
@@ -488,6 +497,8 @@ def _copy_state_rows_kernel(
         values,
         mask=mask & (dst_row >= 0),
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def copy_state_rows(
@@ -526,6 +537,7 @@ def copy_state_rows(
     Returns:
         None. Rows are copied in place in one launch.
     """
+    enable_pdl = pdl_enabled()
     total = src_rows.numel()
     if total == 0:
         return
@@ -562,6 +574,8 @@ def copy_state_rows(
         total // num_layers,
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 

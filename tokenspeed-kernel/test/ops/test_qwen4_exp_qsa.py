@@ -214,6 +214,8 @@ def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
         recent_page_size,
         ratio,
         compressed_token_page_size,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     pooled, first_positions = _ref_compress_pool(
@@ -331,6 +333,8 @@ def test_qwen4_exp_qsa_fused_query_and_verify_staging_matches_separate(
         ratio,
         256,
         sections=sections,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
     staged = (
         token_k.new_empty((1, 4, 1, head_dim)),
@@ -361,6 +365,7 @@ def test_qwen4_exp_qsa_fused_query_and_verify_staging_matches_separate(
         query_norm_epsilon=1e-6,
         num_query_heads=heads,
         stage_verify_buffers=staged,
+        stage_draft=False,
     )
 
     torch.testing.assert_close(actual_query, expected_query, rtol=2e-2, atol=2e-2)
@@ -427,6 +432,8 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
         draft_raw_cache=expected_scratch[0],
         draft_position_cache=expected_scratch[1],
         draft_logical_positions=expected_scratch[2],
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
     scratch_slots = torch.remainder(logical, ratio).long()
     request_rows = requests.long()
@@ -458,6 +465,7 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
         query_norm_epsilon=1e-6,
         num_query_heads=1,
         stage_draft=True,
+        stage_verify_buffers=None,
     )
 
     torch.testing.assert_close(
@@ -515,6 +523,8 @@ def test_qwen4_exp_qsa_ignores_negative_draft_scratch_tags(device: str) -> None:
         draft_logical_positions=draft_logical,
         draft_position_cache=draft_positions,
         enable_pdl=True,
+        stage_verify_buffers=None,
+        stage_draft=False,
     )
 
     torch.cuda.synchronize()
@@ -1211,6 +1221,8 @@ def test_qwen4_exp_qsa_compress_and_store_reads_strided_token_k(device: str) -> 
             ratio,
             compressed_token_page_size,
             enable_pdl=pdl,
+            stage_verify_buffers=None,
+            stage_draft=False,
         )
         return compressed
 
