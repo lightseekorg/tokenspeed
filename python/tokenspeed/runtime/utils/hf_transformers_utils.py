@@ -431,13 +431,20 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if (
-            speculative_algorithm == "DSPARK"
-            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
         ):
             config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
         else:
             config.architectures[0] += "NextN"
+
+    if (
+        config.architectures
+        and config.architectures[0] == "DeepseekV4ForCausalLM"
+        and int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    ):
+        config.architectures[0] = "DeepseekV4ForConditionalGeneration"
 
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1
@@ -546,6 +553,9 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMNextN",
     }
 )
 

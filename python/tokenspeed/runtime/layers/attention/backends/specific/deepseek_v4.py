@@ -47,7 +47,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.graph_buffers import (
     DeepseekV4GraphBuffers,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
+    DEFAULT_VISION_MAX_N_TOKEN,
     DeepseekV4ForwardMetadata,
+    build_image_window,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
     DeepseekV4ForwardSlotMappings,
@@ -746,6 +748,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "extend/mixed/idle"
             )
         dsv4_reset_attention_state()
+        multimodal_context = kwargs.pop("multimodal_context", None)
         del req_pool_indices, kwargs
         num_tokens = int(num_tokens)
         device = seq_lens.device
@@ -893,6 +896,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
         )
+        swa_left = None
+        swa_right = None
+        swa_max_image_tokens = 0
+        if multimodal_context is not None and num_prefill_reqs > 0:
+            swa_left, swa_right, swa_max_image_tokens = build_image_window(
+                mm_inputs=multimodal_context.mm_inputs[:num_prefill_reqs],
+                prefix_lens=extend_prefix_lens_cpu[:num_prefill_reqs].tolist(),
+                query_lens=prefill_query_lens,
+                device=device,
+            )
         metadata = DeepseekV4ForwardMetadata(
             seq_lens=seq_lens,
             query_lens=query_lens,
@@ -904,6 +917,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
+            swa_left=swa_left,
+            swa_right=swa_right,
+            swa_max_image_tokens=swa_max_image_tokens,
         )
         if forward_mode.is_idle():
             # A pure DECODE init raises at the top, so idle is the only
@@ -1332,9 +1348,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
+        # Host-side bound from the image items (metadata build time); no
+        # per-layer device reduction of swa_left/swa_right.
+        max_image_tokens = max(
+            DEFAULT_VISION_MAX_N_TOKEN, int(metadata.swa_max_image_tokens)
+        )
+        gather_window = max(window_size - 1, 0)
+        if metadata.swa_left is not None:
+            gather_window = max(window_size + max_image_tokens - 1, 0)
         gather_lens = metadata.query_lens + torch.minimum(
             prefix_lens,
-            torch.full_like(prefix_lens, max(window_size - 1, 0)),
+            torch.full_like(prefix_lens, gather_window),
         )
         if cache_metadata.swa_page_table is None:
             raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
@@ -1348,8 +1372,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.seq_lens_cpu,
             metadata.query_lens_cpu,
             num_reqs=num_reqs,
-            window_size=window_size,
             compress_ratio=compress_ratio,
+            gather_window=gather_window,
         )
         workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
@@ -1398,6 +1422,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_base=compressed_base,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
+                swa_left=metadata.swa_left,
+                swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1458,6 +1485,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_base=compressed_base,
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
+                swa_left=metadata.swa_left,
+                swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
+            )
+            return kv_workspace, indices, lens
+
+        if metadata.swa_left is not None:
+            empty_topk = torch.full(
+                (positions.numel(), 1),
+                -1,
+                dtype=torch.int32,
+                device=positions.device,
+            )
+            indices, lens = dsv4_combine_topk_swa_indices(
+                topk_indices=empty_topk,
+                query_start_loc=metadata.query_start_loc,
+                seq_lens=metadata.seq_lens,
+                gather_lens=gather_lens,
+                window_size=window_size,
+                compress_ratio=max(compress_ratio, 1),
+                topk=0,
+                workspace_width=workspace_width,
+                compressed_base=compressed_base,
+                swa_left=metadata.swa_left,
+                swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1480,8 +1533,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         query_lens_cpu: torch.Tensor | None,
         *,
         num_reqs: int,
-        window_size: int,
         compress_ratio: int,
+        gather_window: int,
     ) -> tuple[int, int]:
         """Compute prefill allocation bounds without reading the CUDA stream."""
         if num_reqs < 0:
@@ -1510,7 +1563,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "DeepSeek V4 prefill workspace CPU length mirrors contain an "
                 "invalid sequence/query pair"
             )
-        gather_window = max(window_size - 1, 0)
         max_gather_len = max(
             query_len + min(seq_len - query_len, gather_window)
             for seq_len, query_len in zip(seq_lens, query_lens, strict=True)
@@ -1553,6 +1605,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 for key, table in cache_metadata.block_tables.items()
             },
         )
+        # Flash-Vision visible-window extras are per prefill token. A prefill
+        # slice (mixed-batch prefill half, chunked prefill) must keep its
+        # tokens' extras or image spans silently fall back to causal SWA;
+        # decode slices never carry them.
+        swa_left = None
+        swa_right = None
+        if (
+            forward_mode.is_extend_or_mixed()
+            and metadata.swa_left is not None
+            and metadata.swa_right is not None
+        ):
+            if metadata.swa_left.numel() < token_end:
+                raise RuntimeError(
+                    "DeepSeek V4 visible-window metadata is shorter than the "
+                    f"prefill slice: swa_tokens={metadata.swa_left.numel()}, "
+                    f"token_end={token_end}"
+                )
+            swa_left = metadata.swa_left[token_start:token_end]
+            swa_right = metadata.swa_right[token_start:token_end]
         return DeepseekV4ForwardMetadata(
             seq_lens=metadata.seq_lens[req_start:req_end],
             query_lens=query_lens,
@@ -1577,6 +1648,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
+            swa_left=swa_left,
+            swa_right=swa_right,
+            swa_max_image_tokens=metadata.swa_max_image_tokens,
         )
 
     def _forward_deepseek_v4_prefill_chunk(

@@ -4544,4 +4544,132 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+class UnsplittableSpanChunkSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.max_scheduled_tokens = 16;
+        cfg.cache_groups[0].block_granularity = cfg.prefix_granularity;
+        return cfg;
+    }
+};
+
+TEST_F(UnsplittableSpanChunkSuite, FirstChunkStopsBeforeASpanThatDoesNotFit) {
+    RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(32), .unsplittable_spans = {{10, 26}}};
+    Submit(spec);
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->input_lengths.at(0), 10);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+
+    SendForwardDone("r0", {});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 10);
+    EXPECT_EQ(second->input_lengths.at(0), 16);
+}
+
+TEST_F(UnsplittableSpanChunkSuite, CompletingPromptKeepsTheWholeRemainingSpan) {
+    RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(12), .unsplittable_spans = {{4, 12}}};
+    Submit(spec);
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->input_lengths.at(0), 12);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+}
+
+TEST_F(PrefixHitSuite, RefusesAHitThatEndsInsideAnUnsplittableSpan) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    first.unsplittable_spans = {{2, 7}};
+    RunLifecycle(first);
+
+    RequestSpec second{.request_id = "r2", .tokens = first.tokens, .unsplittable_spans = {{2, 7}}};
+    Submit(second);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 2);
+    EXPECT_EQ(op->input_lengths.at(0), 6);
+}
+
+TEST_F(PrefixHitSuite, KeepsAHitThatEndsOnAnUnsplittableSpanEnd) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    first.unsplittable_spans = {{2, 6}};
+    RunLifecycle(first);
+
+    RequestSpec second{.request_id = "r2", .tokens = first.tokens, .unsplittable_spans = {{2, 6}}};
+    Submit(second);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6);
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+}
+
+TEST_F(PrefixHitSuite, PageRoundingCannotResumeInsideAnEarlierSpan) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    first.unsplittable_spans = {{5, 7}, {1, 5}};
+    RunLifecycle(first);
+
+    first.request_id = "r2";
+    Submit(first);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    // Hit 6 retreats to 5, rounds to page 4 inside the preceding span,
+    // then retreats to 1 and rounds to 0. Neither image may be resumed midway.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+}
+
+class SubPageSpanBudgetSuite : public UnsplittableSpanChunkSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = UnsplittableSpanChunkSuite::MakeConfig();
+        cfg.prefix_granularity = 16;
+        cfg.max_scheduled_tokens = 8;
+        cfg.cache_groups[0].block_granularity = cfg.prefix_granularity;
+        return cfg;
+    }
+};
+
+TEST_F(SubPageSpanBudgetSuite, SmallBudgetMakesProgressThroughAnOffPageSpan) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = MakeTokens(32), .unsplittable_spans = {{10, 18}}});
+    std::int32_t prefix = 0;
+    for (const std::int32_t length : {8, 2, 8, 8, 6}) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        EXPECT_EQ(op->extend_prefix_lens.at(0), prefix);
+        EXPECT_EQ(op->input_lengths.at(0), length);
+        prefix += length;
+        SendForwardDone("r0", {});
+    }
+    EXPECT_EQ(prefix, 32);
+}
+
+TEST_F(MambaStateCheckpointSplitSuite, TailCheckpointDoesNotSplitAnUnsplittableSpan) {
+    RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(10), .unsplittable_spans = {{6, 10}}};
+    Submit(spec);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->input_lengths.at(0), 10);
+}
+
+TEST_F(MambaStateCheckpointSplitSuite, SpanEndingAtCheckpointKeepsTheReservedTail) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = MakeTokens(10), .unsplittable_spans = {{4, 8}}});
+    const ExecutionPlan body = PlanOnce();
+    ASSERT_NE(FindForwardBatch(body), nullptr);
+    EXPECT_EQ(FindForwardBatch(body)->input_lengths.at(0), 8);
+    const ExecutionPlan tail = PlanOnce();
+    ASSERT_NE(FindForwardBatch(tail), nullptr);
+    EXPECT_EQ(FindForwardBatch(tail)->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(FindForwardBatch(tail)->input_lengths.at(0), 2);
+}
+
 }  // namespace tokenspeed::test

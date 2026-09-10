@@ -20,6 +20,8 @@
 
 #include "scheduler/request.h"
 
+#include <algorithm>
+#include <ranges>
 #include <stdexcept>
 
 #include "fsm/forward_events.h"
@@ -32,8 +34,24 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
       prefix_granularity_{prefix_granularity},
+      unsplittable_spans_{spec.unsplittable_spans},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {
+    std::ranges::sort(unsplittable_spans_);
+}
+
+std::int32_t Request::AdjustPrefillEnd(std::int32_t first_pos, std::int32_t end, std::int32_t max_end) const {
+    for (const auto& [start, stop] : unsplittable_spans_) {
+        if (stop <= first_pos || stop <= end) {
+            continue;
+        }
+        if (end <= start && first_pos < start) {
+            break;
+        }
+        return stop <= max_end ? stop : std::max(first_pos, start);
+    }
+    return end;
+}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

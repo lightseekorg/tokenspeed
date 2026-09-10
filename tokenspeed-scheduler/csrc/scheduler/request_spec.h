@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tokenspeed {
@@ -31,6 +32,9 @@ struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
+    // Half-open [start, end) prompt ranges that must stay in one prefill
+    // chunk. A prefix-cache hit may land on either endpoint, not inside.
+    std::vector<std::pair<std::int32_t, std::int32_t>> unsplittable_spans;
 };
 
 struct PrefillInfo {

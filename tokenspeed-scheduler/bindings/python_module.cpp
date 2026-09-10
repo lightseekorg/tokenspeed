@@ -26,6 +26,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/vector.h>
 
 #include "scheduler/outside_events/inc.h"
@@ -157,7 +158,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
-        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
+        .def_rw("unsplittable_spans", &tokenspeed::RequestSpec::unsplittable_spans);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")

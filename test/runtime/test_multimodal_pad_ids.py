@@ -1,10 +1,20 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+import pytest
 import torch
 
+from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputs,
     is_mm_pad_value,
     is_mm_pad_value_for,
     resolve_mm_pad_substitute_ids,
@@ -100,3 +110,22 @@ def test_resolve_mtp_tokens_supports_specific_and_shared_model_configs():
         )[Modality.IMAGE]
         == 10
     )
+
+
+@pytest.mark.parametrize("modality", [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO])
+@pytest.mark.parametrize("token_id", [None, 0])
+def test_padding_uses_placeholder_ids(modality, token_id):
+    item = MultimodalDataItem(modality=modality, pad_value=123, offsets=[(1, 3)])
+    inputs = MultimodalInputs(
+        mm_items=[item], im_token_id=token_id, video_token_id=token_id
+    )
+    tokens = [9, 0, 7, 0, 8]
+    expected = [9, 123, 7, 123, 8]
+    if token_id is None or modality == Modality.AUDIO:
+        expected[2] = 123
+    assert pad_input_tokens(tokens, inputs) == expected
+    assert tokens == [9, 0, 7, 0, 8]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

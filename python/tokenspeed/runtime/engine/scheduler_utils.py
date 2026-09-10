@@ -142,11 +142,20 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    max_new_tokens: int = 0,
+    *,
+    unsplittable_spans: Sequence[tuple[int, int]],
+) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.unsplittable_spans = [
+        (int(start), int(end)) for start, end in unsplittable_spans
+    ]
     return spec
 
 

@@ -361,7 +361,23 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (token_limit > max_single_request_tokens_) {
             throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        auto request = std::make_unique<Request>(spec, config_.prefix_granularity, config_.role);
+        const auto spans = request->UnsplittableSpans();
+        for (std::size_t i = 0; i < spans.size(); ++i) {
+            const auto [start, stop] = spans[i];
+            if (start < 0 || stop <= start || static_cast<std::size_t>(stop) > spec.tokens.size()) {
+                throw std::invalid_argument("Scheduler: unsplittable span is outside the prompt");
+            }
+            if (i > 0 && start < spans[i - 1].second) {
+                throw std::invalid_argument("Scheduler: unsplittable spans overlap");
+            }
+            // A span wider than one round's prefill budget could never be
+            // scheduled whole; refuse it instead of parking the request forever.
+            if (stop - start > config_.max_scheduled_tokens) {
+                throw std::invalid_argument("Scheduler: unsplittable span exceeds max_scheduled_tokens");
+            }
+        }
+        pending_requests.push_back(std::move(request));
     }
 
     requests_.reserve(requests_.size() + pending_requests.size());

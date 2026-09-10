@@ -69,6 +69,7 @@ from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+from tokenspeed.runtime.multimodal.inputs import Modality
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
@@ -290,9 +291,19 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        unsplittable_spans = []
+        if recv_req.multimodal_inputs is not None:
+            unsplittable_spans = [
+                (int(start), int(end) + 1)
+                for item in recv_req.multimodal_inputs.mm_items
+                if item.modality == Modality.IMAGE
+                and "types" in item.model_specific_data
+                for start, end in (item.offsets or [])
+            ]
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            unsplittable_spans=unsplittable_spans,
         )
         req_state = RequestState.from_recv_req(
             recv_req,
@@ -316,6 +327,23 @@ class RequestHandler:
                     recv_req.bootstrap_room,
                 ),
             )
+
+        for start, end in unsplittable_spans:
+            if end - start > self.server_args.chunked_prefill_size:
+                req_state.finished_reason = FINISH_ABORT(
+                    f"Invalid request: image block [{start}, {end}) of {end - start} tokens exceeds "
+                    f"--chunked-prefill-size {self.server_args.chunked_prefill_size}; "
+                    "it must be prefilled in one chunk"
+                )
+                return (
+                    req_spec,
+                    req_state,
+                    BootstrapInfo(
+                        recv_req.bootstrap_host,
+                        recv_req.bootstrap_port,
+                        recv_req.bootstrap_room,
+                    ),
+                )
 
         if (
             recv_req.session_params is not None

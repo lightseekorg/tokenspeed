@@ -1282,6 +1282,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_tokenizer_is_auto_selected_by_architecture(self):
         self.assertTrue(prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"]))
+        self.assertTrue(
+            prefers_deepseek_v4_tokenizer(["DeepseekV4ForConditionalGeneration"])
+        )
         self.assertFalse(prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
         self.assertFalse(prefers_deepseek_v4_tokenizer(None))
 
@@ -3574,22 +3577,23 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
-        self.assertEqual(
-            DeepseekV4AttentionBackend._prefill_workspace_bounds(
-                torch.tensor([17, 65], dtype=torch.int32),
-                torch.tensor([5, 9], dtype=torch.int32),
-                num_reqs=2,
-                window_size=16,
-                compress_ratio=4,
-            ),
-            (24, 16),
-        )
+        for gather_window, max_gather_len in ((15, 24), (63, 65)):
+            self.assertEqual(
+                DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                    torch.tensor([17, 65], dtype=torch.int32),
+                    torch.tensor([5, 9], dtype=torch.int32),
+                    num_reqs=2,
+                    gather_window=gather_window,
+                    compress_ratio=4,
+                ),
+                (max_gather_len, 16),
+            )
         self.assertEqual(
             DeepseekV4AttentionBackend._prefill_workspace_bounds(
                 torch.tensor([17], dtype=torch.int32),
                 torch.tensor([5], dtype=torch.int32),
                 num_reqs=1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=1,
             ),
             (17, 0),
@@ -3599,7 +3603,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=0,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             ),
             (1, 0),
@@ -3628,7 +3632,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=2 if seq_lens_cpu.numel() == 2 else 1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3654,7 +3658,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3663,7 +3667,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=-1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             )
 
@@ -3995,6 +3999,52 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(sliced.cache.indexer_state_block_table, indexer_state[1:3])
         )
+
+        # Reuse the batch as two prefills followed by one decode/verify request.
+        metadata.forward_mode = ForwardMode.MIXED
+        metadata.num_prefill_reqs = 2
+        metadata.num_prefill_tokens = 3
+        metadata.swa_left = swa_left = torch.tensor([0, 1, 0], dtype=torch.int32)
+        metadata.swa_right = swa_right = torch.tensor([1, 0, 0], dtype=torch.int32)
+        metadata.swa_max_image_tokens = 384
+
+        for req_start, req_end, token_start, token_end, mode in (
+            (0, 2, 0, 3, ForwardMode.EXTEND),
+            (1, 2, 2, 3, ForwardMode.EXTEND),
+            (2, 3, 3, 6, ForwardMode.DECODE),
+        ):
+            with self.subTest(mode=mode, req_start=req_start):
+                sliced = backend._metadata_slice(
+                    metadata,
+                    req_start=req_start,
+                    req_end=req_end,
+                    token_start=token_start,
+                    token_end=token_end,
+                    forward_mode=mode,
+                )
+                if mode == ForwardMode.DECODE:
+                    self.assertIsNone(sliced.swa_left)
+                    self.assertIsNone(sliced.swa_right)
+                else:
+                    self.assertEqual(
+                        sliced.swa_left.tolist(),
+                        swa_left[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(
+                        sliced.swa_right.tolist(),
+                        swa_right[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(sliced.swa_max_image_tokens, 384)
+
+        with self.assertRaisesRegex(RuntimeError, "visible-window metadata"):
+            backend._metadata_slice(
+                metadata,
+                req_start=0,
+                req_end=3,
+                token_start=0,
+                token_end=6,
+                forward_mode=ForwardMode.EXTEND,
+            )
 
     def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
         config = SimpleNamespace(
@@ -6521,6 +6571,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6557,6 +6609,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6648,6 +6702,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()

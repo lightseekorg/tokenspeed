@@ -895,6 +895,47 @@ production load, confirm that every rank reports a nonzero Prefix Replay window,
 then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
 
+### V4-Flash Vision
+
+The configuration below encodes each image on a single GPU and distributes
+images across GPUs. Vision attention uses the shared backend selected by
+`--mm-attention-backend`:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-v4-flash-vision \
+  --trust-remote-code \
+  --data-parallel-size 4 \
+  --enable-expert-parallel \
+  --mm-encoder-tp-mode data \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend mega_moe \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 80000 \
+  --max-total-tokens 163840 \
+  --chunked-prefill-size 8192 \
+  --enable-mixed-batch \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Notes:
+
+- Image requests require an upstream processor (such as SMG) that supplies
+  patches through `precomputed_multimodal_inputs` and expands the prompt's
+  `input_ids`. Every image-block position uses `<｜deepseek_image｜>` (129264); `types` carries
+  the start, pad, image, newline and end roles (0–4). Each image item has one
+  contiguous offset range. Prefix-cache IDs cover the whole block. With SMG, `types` may include leading alignment pads trimmed
+  from the token sequence; the engine uses the trailing block-length entries.
+- `--chunked-prefill-size` must fit the largest image token block; requests
+  with larger blocks are rejected.
+- For OCR workloads, set `chat_template_kwargs.thinking=false`.
+- For agent benchmarks, add
+  `--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'`
+  when clients omit these sampling settings.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

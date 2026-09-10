@@ -264,12 +264,14 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_k=hidden,
     ).view(-1, gemm1_n)
 
-    beta = float(getattr(w, "activation_situ_beta", 1.0))
-    linear_beta = getattr(w, "activation_situ_linear_beta", None)
     if activation == "situ":
+        # SwiGLU checkpoints (DeepSeek V4 Flash) carry ``activation_situ_beta =
+        # None``; only SiTU reads it, and a missing beta means the default 1.0.
+        beta = getattr(w, "activation_situ_beta", None)
+        linear_beta = getattr(w, "activation_situ_linear_beta", None)
         intermediate2 = situ_and_mul(
             intermediate1,
-            beta=beta,
+            beta=1.0 if beta is None else float(beta),
             linear_beta=None if linear_beta is None else float(linear_beta),
         )
     else:

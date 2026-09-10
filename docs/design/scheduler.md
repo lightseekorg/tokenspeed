@@ -18,7 +18,12 @@ scheduled, never for the whole prompt**: `schedulePrefill` /
 this chunk's tokens, and the coordinator either grants the pages or the
 request stays put.
 
-Two adjustments ride on top of the raw chunk size:
+Three adjustments ride on top of the raw chunk size:
+
+**Unsplittable spans.** `RequestSpec.unsplittable_spans` marks prompt ranges
+that must be prefilled in one chunk. Chunk boundaries and prefix-cache hits
+must not fall inside a span. A span wider than `max_scheduled_tokens` is
+rejected at submission, since no round could execute it whole.
 
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
 boundary (or on a promotion boundary), because a page is the unit of prefix
