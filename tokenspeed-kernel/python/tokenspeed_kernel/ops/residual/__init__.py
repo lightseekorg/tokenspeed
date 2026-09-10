@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 
-import torch
+import torch as _torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -261,7 +261,7 @@ def attn_res_fwd_available(
 # ===-----------------------------------------------------------------------===#
 
 
-def _flatten_rows(value: torch.Tensor, width: int, name: str) -> torch.Tensor:
+def _flatten_rows(value: _torch.Tensor, width: int, name: str) -> _torch.Tensor:
     if value.ndim < 1 or value.shape[-1] != width:
         raise ValueError(
             f"{name} must have last dimension {width}, got {tuple(value.shape)}"
@@ -270,7 +270,7 @@ def _flatten_rows(value: torch.Tensor, width: int, name: str) -> torch.Tensor:
 
 
 def _same_tensor_contract(
-    reference: torch.Tensor, value: torch.Tensor, name: str
+    reference: _torch.Tensor, value: _torch.Tensor, name: str
 ) -> None:
     if value.dtype != reference.dtype:
         raise ValueError(
@@ -282,7 +282,7 @@ def _same_tensor_contract(
         )
 
 
-def prepare_gated_residual_weight_cache(up_weight: torch.Tensor, lowrank: int) -> bool:
+def prepare_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) -> bool:
     """Prepare derived mix-up weights after an initial or online weight load.
 
     CUDA graphs retain the address of backend-specific derived weights. The
@@ -312,9 +312,9 @@ def prepare_gated_residual_weight_cache(up_weight: torch.Tensor, lowrank: int) -
 
 
 def gated_residual_mix(
-    normalized: torch.Tensor,
-    projection_weight: torch.Tensor,
-    up_weight: torch.Tensor,
+    normalized: _torch.Tensor,
+    projection_weight: _torch.Tensor,
+    up_weight: _torch.Tensor,
     hc_count: int,
     hidden_size: int,
     lowrank: int,
@@ -322,7 +322,7 @@ def gated_residual_mix(
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[_torch.Tensor, _torch.Tensor | None]:
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
     The first projection is stored as one matrix. Its leading ``lowrank`` rows
@@ -400,8 +400,8 @@ def gated_residual_mix(
             and up_weight.is_contiguous()
         ),
         "folded_scale": projection_scale == 1.0,
-        "deterministic": torch.are_deterministic_algorithms_enabled(),
-        "capturing": bool(flat.is_cuda and torch.cuda.is_current_stream_capturing()),
+        "deterministic": _torch.are_deterministic_algorithms_enabled(),
+        "capturing": bool(flat.is_cuda and _torch.cuda.is_current_stream_capturing()),
     }
     signature = format_signature(
         normalized=dense_tensor_format(flat.dtype),
@@ -442,15 +442,15 @@ def gated_residual_mix(
 
 
 def gated_residual_combine(
-    block_output: torch.Tensor,
-    residual: torch.Tensor,
-    inject_logits: torch.Tensor,
+    block_output: _torch.Tensor,
+    residual: _torch.Tensor,
+    inject_logits: _torch.Tensor,
     hc_count: int,
     hidden_size: int,
     *,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
+) -> _torch.Tensor:
     """Gate one sublayer output and inject it into every residual branch.
 
     Args:
@@ -524,16 +524,16 @@ def gated_residual_combine(
 
 
 def mhc_pre(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
+    residual: _torch.Tensor,
+    fn: _torch.Tensor,
+    hc_scale: _torch.Tensor,
+    hc_base: _torch.Tensor,
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
     override: str | None = None,
     solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """Compute the mHC pre-mapping for one residual stream.
 
     Args:
@@ -599,13 +599,13 @@ def mhc_pre(
 
 
 def mhc_post(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
+    hidden_states: _torch.Tensor,
+    residual: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
+) -> _torch.Tensor:
     """Compute the mHC post-mapping and residual-stream update.
 
     Args:
@@ -656,17 +656,17 @@ def mhc_post(
 
 
 def mhc_fused_hc(
-    x_prev: torch.Tensor,
-    residual_prev: torch.Tensor,
-    post_prev: torch.Tensor,
-    comb_prev: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
+    x_prev: _torch.Tensor,
+    residual_prev: _torch.Tensor,
+    post_prev: _torch.Tensor,
+    comb_prev: _torch.Tensor,
+    fn: _torch.Tensor,
+    hc_scale: _torch.Tensor,
+    hc_base: _torch.Tensor,
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """Compose the registered previous post-mapping and current pre-mapping.
 
     Args:

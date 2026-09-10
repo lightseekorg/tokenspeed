@@ -128,7 +128,7 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
         selected_solutions.append(kwargs["solution"])
         return lambda **kwargs: None
 
-    monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
+    monkeypatch.setattr(residual_ops, "select_kernel", capture_selection)
     cases = (
         (16384, 7168, True),
         (16385, 7168, True),
