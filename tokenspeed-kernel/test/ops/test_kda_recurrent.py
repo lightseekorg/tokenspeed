@@ -217,24 +217,35 @@ def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
     )
     expected_pool[:batch].copy_(initial)
     expected_output = torch.empty_like(v, dtype=torch.float32)
-    for batch_idx in range(batch):
-        running = initial[batch_idx]
-        for step_idx in range(steps):
-            output, running = reference_kda_recurrent(
-                q[batch_idx, step_idx : step_idx + 1],
-                k[batch_idx, step_idx : step_idx + 1],
-                v[batch_idx, step_idx : step_idx + 1],
-                g[batch_idx, step_idx : step_idx + 1],
-                beta[batch_idx, step_idx : step_idx + 1],
-                running,
+    batched_reference = torch.vmap(
+        lambda q_row, k_row, v_row, g_row, beta_row, state_row: (
+            reference_kda_recurrent(
+                q_row,
+                k_row,
+                v_row,
+                g_row,
+                beta_row,
+                state_row,
                 a_log,
                 dt_bias,
                 output_dtype=torch.float32,
                 lower_bound=LOWER_BOUND,
                 eps=NORM_EPS,
             )
-            expected_output[batch_idx, step_idx].copy_(output[0])
-            expected_pool[write_indices[batch_idx, step_idx].long()].copy_(running)
+        )
+    )
+    running = initial
+    for step_idx in range(steps):
+        output, running = batched_reference(
+            q[:, step_idx : step_idx + 1],
+            k[:, step_idx : step_idx + 1],
+            v[:, step_idx : step_idx + 1],
+            g[:, step_idx : step_idx + 1],
+            beta[:, step_idx : step_idx + 1],
+            running,
+        )
+        expected_output[:, step_idx].copy_(output[:, 0])
+        expected_pool[write_indices[:, step_idx].long()] = running
 
     grid = triton.cdiv(value_dim, 32) * batch * heads
 
