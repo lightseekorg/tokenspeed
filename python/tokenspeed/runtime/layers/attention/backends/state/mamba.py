@@ -1951,9 +1951,9 @@ class MambaAttnBackend(AttentionBackend):
             output_state_indices = None
         else:
             initial_state = ssm_scratch
-            initial_indices = self._verify_seed_dst_rows(batch_size, draft_token_num)[
-                :batch_size
-            ]
+            initial_indices = self._verify_scratch_base_rows(
+                batch_size, draft_token_num
+            )
             output_state_indices = output_indices
         (
             mtp_initial_indices,
