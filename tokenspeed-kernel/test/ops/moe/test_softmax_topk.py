@@ -29,15 +29,17 @@ from tokenspeed_kernel.ops.moe.triton.softmax_topk import triton_softmax_topk
 from tokenspeed_kernel.platform import Platform
 
 
-def test_torch_reference_runs_on_cpu():
+def test_torch_reference_runs_on_cpu() -> None:
     # FP64 is intentionally outside the fused signature and exercises the
     # portable fallback while preserving the previous runtime behavior.
     logits = torch.tensor([[0.0, 2.0, 1.0, -1.0]], dtype=torch.float64)
     weights, ids = moe_softmax_topk(
         logits,
         2,
+        topk_indices_dtype=torch.int64,
         renormalize=True,
         routed_scaling_factor=2.0,
+        solution=None,
     )
     assert torch.equal(ids, torch.tensor([[1, 2]], dtype=torch.int64))
     torch.testing.assert_close(
@@ -46,9 +48,10 @@ def test_torch_reference_runs_on_cpu():
     )
 
 
-needs_nvidia = pytest.mark.skipif(
-    not torch.cuda.is_available() or not Platform.get().is_nvidia,
-    reason="fused softmax-topk needs NVIDIA CUDA",
+needs_fused_softmax_topk = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not (Platform.get().is_nvidia or Platform.get().is_cdna5),
+    reason="fused softmax-topk requires NVIDIA or gfx1250",
 )
 
 
@@ -87,7 +90,7 @@ def _assert_valid_topk(
     )
 
 
-@needs_nvidia
+@needs_fused_softmax_topk
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize(
     "tokens,experts,topk,dtype",
@@ -105,47 +108,84 @@ def test_triton_matches_softmax_topk(
     topk: int,
     dtype: torch.dtype,
     renormalize: bool,
-):
+) -> None:
     torch.manual_seed(tokens * 1000 + experts)
     logits = torch.randn(tokens, experts, device="cuda", dtype=dtype)
     scale = 2.5
     weights, ids = triton_softmax_topk(
         router_logits=logits,
         topk=topk,
+        topk_indices_dtype=torch.int64,
         renormalize=renormalize,
         routed_scaling_factor=scale,
+        enable_pdl=False,
     )
     _assert_valid_topk(logits, weights, ids, topk, renormalize, scale)
 
 
-@needs_nvidia
-def test_lowest_id_tie_break_and_strided_rows():
+@needs_fused_softmax_topk
+def test_lowest_id_tie_break_and_strided_rows() -> None:
     storage = torch.zeros((6, 272), dtype=torch.bfloat16, device="cuda")
     logits = storage[::2, :256]
     assert not logits.is_contiguous() and logits.stride(1) == 1
-    weights, ids = moe_softmax_topk(logits, 8, renormalize=True)
+    weights, ids = moe_softmax_topk(
+        router_logits=logits,
+        topk=8,
+        topk_indices_dtype=torch.int64,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        solution=None,
+    )
     expected_ids = torch.arange(8, dtype=torch.int64, device="cuda")
     assert torch.equal(ids, expected_ids.expand(3, 8))
     torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 8.0))
 
 
-@needs_nvidia
-def test_public_entry_point_is_cuda_graph_capturable():
+@needs_fused_softmax_topk
+def test_public_entry_point_is_cuda_graph_capturable() -> None:
     logits = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
     # Compile before capture; production warms the kernels before capturing a
     # decode graph as well.
-    moe_softmax_topk(logits, 8, renormalize=True)
+    moe_softmax_topk(
+        router_logits=logits,
+        topk=8,
+        topk_indices_dtype=torch.int64,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        solution=None,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = moe_softmax_topk(logits, 8, renormalize=True)
+        weights, ids = moe_softmax_topk(
+            router_logits=logits,
+            topk=8,
+            topk_indices_dtype=torch.int64,
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            solution=None,
+        )
     graph.replay()
     torch.cuda.synchronize()
-    _assert_valid_topk(logits, weights, ids, 8, True, 1.0)
+    _assert_valid_topk(
+        logits,
+        weights,
+        ids,
+        8,
+        True,
+        1.0,
+    )
 
 
-@needs_nvidia
-def test_empty_batch():
+@needs_fused_softmax_topk
+def test_empty_batch() -> None:
     logits = torch.empty((0, 256), dtype=torch.bfloat16, device="cuda")
-    weights, ids = moe_softmax_topk(logits, 8)
+    weights, ids = moe_softmax_topk(
+        router_logits=logits,
+        topk=8,
+        topk_indices_dtype=torch.int64,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        solution=None,
+    )
     assert weights.shape == ids.shape == (0, 8)
     assert weights.dtype == torch.float32 and ids.dtype == torch.int64

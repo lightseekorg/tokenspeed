@@ -6,7 +6,7 @@ exec ts serve \
     --model deepseek-ai/DeepSeek-V4-Flash-0731 \
     --attn-tp-size 4 \
     --dense-tp-size 4 \
-    --ep-size 4 \
+    --moe-tp-size 4 \
     --max-model-len 102400 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
@@ -17,7 +17,7 @@ exec ts serve \
     --trust-remote-code \
     --attention-use-fp4-indexer-cache \
     --moe-backend flashinfer_trtllm \
-    --draft-moe-backend mega_moe \
+    --draft-moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
     --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
     --speculative-eagle-topk 1 \

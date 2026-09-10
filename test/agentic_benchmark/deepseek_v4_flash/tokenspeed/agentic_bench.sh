@@ -35,6 +35,7 @@ fi
 
 # Sweep configs
 CONFIGS=(
+    attn_tp4_moe_tp4
     attn_tp4_moe_ep4
 )
 

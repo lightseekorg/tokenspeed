@@ -39,10 +39,12 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
+    "initialize_all_reduce_state",
     "symm_outputs_can_run",
     "acquire_symm_outputs",
     "all_reduce_symm_can_run",
     "all_reduce_symmetric",
+    "allreduce_residual_attnres_max_tokens",
     "allreduce_residual_attnres_combine_supported",
     "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
@@ -53,6 +55,7 @@ __all__ = [
 
 
 allreduce_residual_rmsnorm_states = {}
+_ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS = 16
 
 
 @dataclass
@@ -1895,6 +1898,7 @@ def create_state(
     max_numel: int,
     max_bytes: int,
     attnres_max_numel: int,
+    attnres_max_rows: int,
 ) -> TritonCommState:
     """Create an all-reduce or reduce-scatter/all-gather communication state.
 
@@ -1908,6 +1912,8 @@ def create_state(
         max_bytes: Maximum producer-direct all-reduce payload in bytes.
         attnres_max_numel: Maximum fused attention/AttnRes payload in elements;
             pass zero when the state does not use AttnRes.
+        attnres_max_rows: Maximum fused attention/AttnRes payload in rows; pass
+            zero when the state does not use AttnRes.
 
     Returns:
         The initialized communication state.
@@ -1915,6 +1921,10 @@ def create_state(
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
+    if bool(attnres_max_numel) != bool(attnres_max_rows):
+        raise ValueError(
+            "AttnRes element and row capacities must both be zero or non-zero"
+        )
     if max_numel or max_bytes or attnres_max_numel:
         device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         world_size = group.size()
@@ -1935,7 +1945,7 @@ def create_state(
             max_numel=max_numel,
             max_bytes=max_bytes,
             attnres_max_numel=attnres_max_numel,
-            max_token_num=0,
+            max_token_num=attnres_max_rows,
             hidden_dim=0,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
@@ -1990,12 +2000,34 @@ def _iris_state_key(state: TritonCommState, dtype: torch.dtype) -> tuple:
     )
 
 
+def _iris_state_is_compatible(iris_state, state, dtype: torch.dtype) -> bool:
+    return (
+        iris_state.group is state.group
+        and iris_state.rank_in_group == state.rank_in_group
+        and iris_state.device == state.device
+        and iris_state.dtype == dtype
+        and iris_state.staged_max_numel >= state.max_numel
+        and iris_state.producer_direct_max_numel >= state.max_bytes // dtype.itemsize
+        and iris_state.attnres_max_numel >= state.attnres_max_numel
+        and iris_state.attnres_max_rows >= state.max_token_num
+    )
+
+
 def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
     """Return the Iris state sized for this communication backing buffer."""
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     key = _iris_state_key(state, dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = next(
+            (
+                candidate
+                for candidate in _iris_mod.IRIS_AR_STATES.values()
+                if _iris_state_is_compatible(candidate, state, dtype)
+            ),
+            None,
+        )
     if iris_state is None:
         iris_state = _iris_mod.create_iris_state(
             group=state.group,
@@ -2008,8 +2040,24 @@ def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
             heap_size=None,
             device=state.device,
         )
-        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    _iris_mod.IRIS_AR_STATES[key] = iris_state
     return iris_state
+
+
+def initialize_all_reduce_state(
+    state: TritonCommState,
+    dtype: torch.dtype,
+) -> None:
+    """Allocate the backend storage described by an all-reduce state.
+
+    Args:
+        state: Communication state carrying the requested buffer capacities.
+        dtype: Element type used by the all-reduce buffers.
+
+    Returns:
+        None.
+    """
+    _get_or_create_iris_state(state, dtype)
 
 
 def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.Tensor:
@@ -2108,6 +2156,23 @@ def all_reduce_symmetric(
     return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
 
 
+def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
+    """Return the Kimi-K3 AttnRes token limit for a communication group.
+
+    Args:
+        world_size: Number of ranks participating in the all-reduce.
+
+    Returns:
+        The supported token count, or zero when the group size is unsupported.
+    """
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    if world_size != kernel_config.world_size:
+        return 0
+    return _ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS
+
+
 def _all_reduce_residual_attnres_can_run(
     state: TritonCommState,
     partial: torch.Tensor,
@@ -2132,7 +2197,7 @@ def _all_reduce_residual_attnres_can_run(
     return (
         state.world_size == kernel_config.world_size
         and op == torch.distributed.ReduceOp.SUM
-        and 0 < num_tokens <= 16
+        and 0 < num_tokens <= allreduce_residual_attnres_max_tokens(state.world_size)
         and num_tokens <= state.max_token_num
         and partial.shape == residual.shape == (num_tokens, kernel_config.hidden_size)
         and score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)

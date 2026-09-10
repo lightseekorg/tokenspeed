@@ -265,6 +265,13 @@ def gluon_bf16_moe_reduce_kernel(
     gl.store(out_ptrs, acc.to(out_ptr.type.element_ty), mask=mask)
 
 
+def _select_reduce_schedule(num_tokens: int) -> tuple[int, int]:
+    """Select the top-k reduction tile for graph decode or the general path."""
+    if num_tokens <= 64:
+        return 16, 128
+    return 64, 256
+
+
 def invoke_stage2(
     inter_states: torch.Tensor,  # (num_tokens*topk, I) bf16
     w2: torch.Tensor,  # (E, D, I)            bf16
@@ -378,8 +385,7 @@ def invoke_stage2(
         num_warps=num_warps,
     )
 
-    R_BLOCK_M = 64
-    R_BLOCK_N = 256
+    R_BLOCK_M, R_BLOCK_N = _select_reduce_schedule(num_tokens)
     rgrid = (triton.cdiv(num_tokens, R_BLOCK_M) * triton.cdiv(D, R_BLOCK_N),)
     gluon_bf16_moe_reduce_kernel[rgrid](
         partials,

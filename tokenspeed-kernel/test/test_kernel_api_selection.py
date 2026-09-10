@@ -65,7 +65,9 @@ import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
+import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -190,11 +192,13 @@ _RELOAD_MODULES = [
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
     _moe_sigmoid_topk,
+    _moe_softmax_topk,
     _moe_gluon_sigmoid_topk,
     _moe_gluon,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
     _moe_triton_mxfp4,
+    _moe_triton_softmax_topk,
     _moe_triton,
     _moe_pkg,
     # Quantization registration modules.
@@ -2655,6 +2659,56 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
     assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert other_shape.name == "torch_sigmoid_bias_topk"
     assert reduced_precision.name == "torch_sigmoid_bias_topk"
+
+
+def test_amd_softmax_topk_selects_triton_on_gfx1250(
+    mi350_platform: PlatformInfo,
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    triton_spec = registry.get_by_name("triton_softmax_topk_gfx1250")
+    torch_spec = registry.get_by_name("torch_softmax_topk")
+    if triton_spec is None or torch_spec is None:
+        pytest.skip("softmax top-k kernels are unavailable")
+
+    bf16_signature = format_signature(
+        router_logits=dense_tensor_format(torch.bfloat16),
+    )
+    fp32_signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        gfx950 = select_kernel(
+            "moe",
+            "softmax_topk",
+            bf16_signature,
+            traits={"tokens": 1, "experts": 128, "topk": 4},
+        )
+
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        standard_shape = select_kernel(
+            "moe",
+            "softmax_topk",
+            bf16_signature,
+            traits={"tokens": 1, "experts": 128, "topk": 4},
+        )
+        general_shape = select_kernel(
+            "moe",
+            "softmax_topk",
+            fp32_signature,
+            traits={"tokens": 2, "experts": 896, "topk": 16},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert gfx950.name == "torch_softmax_topk"
+    assert standard_shape.name == "triton_softmax_topk_gfx1250"
+    assert general_shape.name == "triton_softmax_topk_gfx1250"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
