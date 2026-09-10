@@ -44,10 +44,8 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.kda.capture_payload import (
+from tokenspeed_kernel.ops.attention.kda.triton import (
     capture_replay_payload,
-)
-from tokenspeed_kernel.ops.attention.kda.state_pages import (
     commit_state_pages,
 )
 from tokenspeed_kernel.platform import pdl_enabled

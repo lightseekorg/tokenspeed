@@ -496,9 +496,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         try:
             import torch
             from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
-            from tokenspeed_kernel.ops.attention.mha.flashinfer import (
-                gated_delta_rule as gdn,
-            )
+            from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
@@ -584,7 +582,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.gdn.triton_linear.chunk import (
+        from tokenspeed_kernel.ops.attention.gdn._triton.linear.chunk import (
             chunk_gated_delta_rule,
         )
 

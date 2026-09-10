@@ -47,7 +47,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton_linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.gdn._triton.linear.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,

@@ -19,7 +19,7 @@ import importlib.util
 from collections.abc import Sequence
 
 import torch
-from tokenspeed_kernel.ops.attention.msa.indexer import (
+from tokenspeed_kernel.ops.attention.msa._triton.indexer import (
     SPARSE_BLOCK_SIZE,
     minimax_indexer,
 )

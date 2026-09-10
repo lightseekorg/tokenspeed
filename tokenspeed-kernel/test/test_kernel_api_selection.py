@@ -39,13 +39,19 @@ import pytest
 import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
+import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.dsa._triton.topk as _attention_triton_dsa_topk
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
-import tokenspeed_kernel.ops.attention.merge_state_cuda as _attention_cuda
-import tokenspeed_kernel.ops.attention.mha.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.mha._triton.decode as _attention_triton_mha_decode
+import tokenspeed_kernel.ops.attention.mha._triton.prefill as _attention_triton_mha_prefill
+import tokenspeed_kernel.ops.attention.mha.cuda as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon
-import tokenspeed_kernel.ops.attention.mla.flash_mla as _attention_flash_mla
+import tokenspeed_kernel.ops.attention.mla._triton.decode as _attention_triton_mla_decode
+import tokenspeed_kernel.ops.attention.mla._triton.prefill as _attention_triton_mla_prefill
+import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
+import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
@@ -79,27 +85,9 @@ from tokenspeed_kernel.ops.attention import (
     GdnChunkPrefillResult,
     KdaPrefillResult,
 )
-from tokenspeed_kernel.ops.attention import (
-    merge_state_triton as _attention_triton_merge_state,
-)
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
-from tokenspeed_kernel.ops.attention.dsa import (
-    triton_topk as _attention_triton_dsa_topk,
-)
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
 from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
-from tokenspeed_kernel.ops.attention.mha import (
-    triton_decode as _attention_triton_mha_decode,
-)
-from tokenspeed_kernel.ops.attention.mha import (
-    triton_prefill as _attention_triton_mha_prefill,
-)
-from tokenspeed_kernel.ops.attention.mla import (
-    triton_decode as _attention_triton_mla_decode,
-)
-from tokenspeed_kernel.ops.attention.mla import (
-    triton_prefill as _attention_triton_mla_prefill,
-)
 from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
 from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import (

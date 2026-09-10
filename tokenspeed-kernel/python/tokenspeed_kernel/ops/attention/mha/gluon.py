@@ -40,7 +40,7 @@ if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048, 2049, 2050, 2051})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
-    from tokenspeed_kernel.ops.attention.kpool.gluon_select import (
+    from tokenspeed_kernel.ops.attention.kpool.gluon import (
         gluon_kpool_prefill_topk_fp8_gfx950 as _kpool_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (

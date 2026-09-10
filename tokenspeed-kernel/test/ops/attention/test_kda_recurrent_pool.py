@@ -10,7 +10,7 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.kda.fla import (
+from tokenspeed_kernel.ops.attention.kda._triton.fla import (
     kda_recurrent_decode,
     kda_recurrent_decode_pool,
 )

@@ -34,6 +34,13 @@ lower bound is baked into the CUBIN and validated on every call.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda.triton import (
+    _DENSE_HALF_SIGNATURES,
+    _nvidia_kda_prefill,
+)
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.thirdparty.cutedsl_kda import (
     DEFAULT_SCALE,
     cutedsl_kda_check_config,
@@ -43,6 +50,21 @@ from tokenspeed_kernel.thirdparty.cutedsl_kda import (
 )
 
 __all__ = ["cutedsl_kda_chunk_prefill", "is_cutedsl_kda_installed"]
+
+
+@register_kernel(
+    "attention",
+    "kda_paged_prefill",
+    name="cutedsl_kda_nvidia_paged_prefill",
+    solution="cutedsl_kda",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={"recurrent_layout": frozenset({"k_major"})},
+    tags={"nvidia", "paged_cache"},
+)
+def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
+    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)
 
 
 def cutedsl_kda_chunk_prefill(

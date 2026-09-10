@@ -43,8 +43,17 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton_linear.chunk import (
+from tokenspeed_kernel.ops.attention.gdn._triton.linear.chunk import (
     chunk_gated_delta_rule,
+)
+from tokenspeed_kernel.ops.attention.gdn._triton.linear.chunk_delta_h import CHUNK_SIZE
+from tokenspeed_kernel.ops.attention.gdn._triton.linear.index import (
+    prepare_chunk_indices,
+    set_total_chunks_hint,
+    set_total_chunks_hint_uniform,
+)
+from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
+    fused_qkv_split_gdn_prefill,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel

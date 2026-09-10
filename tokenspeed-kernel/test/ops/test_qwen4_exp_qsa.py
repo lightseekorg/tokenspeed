@@ -21,11 +21,11 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention.qsa.qwen4_exp as qsa_ops
+import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.ops.attention.dsa.cuda_topk import has_ragged_decode_topk
-from tokenspeed_kernel.ops.attention.qsa.qwen4_exp import (
+from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
     qwen4_exp_qsa_block_topk,

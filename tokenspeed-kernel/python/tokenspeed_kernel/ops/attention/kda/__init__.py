@@ -850,12 +850,9 @@ def kda_replay_commit_supported(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.kda.capture_payload  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.fla  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.flash  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kda.state_pages  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 
 # isort: on
 

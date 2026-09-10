@@ -35,16 +35,12 @@ from tokenspeed_kernel.ops.attention import (
     gdn_decode_step,
     gdn_replay_commit,
 )
-from tokenspeed_kernel.ops.attention.gdn.qkv_split import (
+from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
-)
-from tokenspeed_kernel.ops.attention.gdn.triton_linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from tokenspeed_kernel.ops.attention.kda.state_pages import (
-    verify_state_blocks,
-)
+from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,

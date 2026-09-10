@@ -75,7 +75,7 @@ def _assert_matches_portable(
     out_max_error: float = OUTPUT_MAX_ERROR,
     state_max_error: float = STATE_MAX_ERROR,
 ):
-    from tokenspeed_kernel.ops.attention.kda.fla import kda_chunk_prefill
+    from tokenspeed_kernel.ops.attention.kda._triton.fla import kda_chunk_prefill
 
     kwargs = dict(cu_seqlens=cu_seqlens, lower_bound=LOWER_BOUND, beta_is_logit=True)
     expected_out, expected_state = kda_chunk_prefill(

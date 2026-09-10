@@ -43,3 +43,29 @@ def test_attention_implementations_are_grouped_by_variant():
         "qsa",
         "rmha",
     }
+
+    implementations = {
+        "cuda",
+        "cute_dsl",
+        "deep_gemm",
+        "flashinfer",
+        "gluon",
+        "tokenspeed_mla",
+        "triton",
+    }
+    assert {path.stem for path in attention_dir.glob("*.py")} == {
+        "__init__",
+        "cuda",
+        "triton",
+    }
+
+    for variant in package_dirs:
+        variant_dir = attention_dir / variant
+        assert {
+            path.stem for path in variant_dir.glob("*.py") if path.name != "__init__.py"
+        } <= implementations
+        assert all(
+            path.name.startswith("_")
+            for path in variant_dir.iterdir()
+            if path.is_dir() and (path / "__init__.py").is_file()
+        )

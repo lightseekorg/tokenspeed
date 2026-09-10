@@ -415,7 +415,7 @@ def triton_nvidia_kda_paged_decode(
     lower_bound: float | None,
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA indexed recurrent decode kernel."""
-    from tokenspeed_kernel.ops.attention.kda.fla import (
+    from tokenspeed_kernel.ops.attention.kda._triton.fla import (
         kda_recurrent_decode_pool,
     )
 
@@ -627,7 +627,7 @@ def triton_nvidia_kda_batched_replay_commit(
     tags={"nvidia", "paged_cache"},
 )
 def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
-    from tokenspeed_kernel.ops.attention.kda.fla import (
+    from tokenspeed_kernel.ops.attention.kda._triton.fla import (
         kda_chunk_prefill,
     )
 
@@ -636,35 +636,10 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
 
 
-@register_kernel(
-    "attention",
-    "kda_paged_prefill",
-    name="flashkda_nvidia_kda_paged_prefill",
-    solution="flashkda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
-    tags={"nvidia", "paged_cache"},
+from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noqa: E402
+    capture_replay_payload,
 )
-def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
-    from tokenspeed_kernel.ops.attention.kda.flash import flash_kda_chunk_prefill
-
-    return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)
-
-
-@register_kernel(
-    "attention",
-    "kda_paged_prefill",
-    name="cutedsl_kda_nvidia_paged_prefill",
-    solution="cutedsl_kda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
-    tags={"nvidia", "paged_cache"},
+from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+    commit_state_pages,
+    verify_state_blocks,
 )
-def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_chunk_prefill
-
-    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)

@@ -89,7 +89,8 @@ Inside the root `tokenspeed-kernel/` directory:
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
-  `attention/mha/triton_prefill.py`.
+  `attention/mha/triton.py`; multi-file implementations keep helpers under a
+  private directory such as `attention/mha/_triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
 
 ## tokenspeed-kernel-amd

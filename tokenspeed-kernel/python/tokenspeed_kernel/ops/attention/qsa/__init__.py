@@ -187,7 +187,7 @@ def qsa_sparse_attention(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.qsa.qwen4_exp  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
 
 # isort: on
 

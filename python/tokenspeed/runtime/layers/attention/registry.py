@@ -578,8 +578,8 @@ def _resolve_kda_backend(kda_backend: str) -> str:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 
+    from tokenspeed_kernel.ops.attention.kda.cuda import is_flash_kda_installed
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
-    from tokenspeed_kernel.ops.attention.kda.flash import is_flash_kda_installed
 
     if kda_backend == "auto":
         if is_cutedsl_kda_installed():

@@ -1468,7 +1468,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
-            from tokenspeed_kernel.ops.attention.mla.flash_mla import (
+            from tokenspeed_kernel.ops.attention.mla.cuda import (
                 flash_mla_sparse_fwd,
                 flash_mla_with_kvcache,
                 get_mla_metadata,

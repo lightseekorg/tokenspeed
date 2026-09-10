@@ -144,7 +144,7 @@ def dsv4_padded_heads(num_local_heads: int) -> int:
 
 def dsv4_reset_attention_state() -> None:
     """Reset backend-owned value-dependent state before a DSV4 forward."""
-    from tokenspeed_kernel.ops.attention.mla.flash_mla import reset_dsv4_tile_metadata
+    from tokenspeed_kernel.ops.attention.mla.cuda import reset_dsv4_tile_metadata
 
     reset_dsv4_tile_metadata()
 

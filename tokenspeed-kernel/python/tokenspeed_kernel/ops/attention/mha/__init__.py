@@ -513,12 +513,10 @@ def mha_decode_with_kvcache(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.mha.ascend  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.mha.flash_attn  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mha.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mha.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.mha.triton_decode  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.mha.triton_prefill  # noqa: E402,F401
 
 # isort: on
 

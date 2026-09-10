@@ -22,16 +22,17 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.attention.kpool._triton.cache  # noqa: F401
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsa.cute_dsl_topk import (
+from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.kpool.expand import (
+from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
-from tokenspeed_kernel.ops.attention.kpool.score import (
+from tokenspeed_kernel.ops.attention.kpool._triton.score import (
     score_kpool_dense,
     select_kpool_chunked,
 )

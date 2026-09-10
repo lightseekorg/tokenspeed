@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import math
+
+import torch
 from tokenspeed_kernel.ops.attention.dsa import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.dsa import __all__ as _dsa_all
 from tokenspeed_kernel.ops.attention.dsv4 import *  # noqa: F403
@@ -30,22 +33,101 @@ from tokenspeed_kernel.ops.attention.kda import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.kda import __all__ as _kda_all
 from tokenspeed_kernel.ops.attention.kpool import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.kpool import __all__ as _kpool_all
-from tokenspeed_kernel.ops.attention.merge_state import attn_merge_state
 
 # Preserve the long-standing module aliases exposed by this package.
 from tokenspeed_kernel.ops.attention.mha import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha import __all__ as _mha_all
-from tokenspeed_kernel.ops.attention.mha import flash_attn
+from tokenspeed_kernel.ops.attention.mha import cuda as flash_attn
 from tokenspeed_kernel.ops.attention.mla import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mla import __all__ as _mla_all
 from tokenspeed_kernel.ops.attention.mla import tokenspeed_mla
 from tokenspeed_kernel.ops.attention.msa import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.msa import __all__ as _msa_all
-from tokenspeed_kernel.ops.attention.msa import score as msa_score
+from tokenspeed_kernel.ops.attention.msa import cuda as msa_score
 from tokenspeed_kernel.ops.attention.qsa import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.qsa import __all__ as _qsa_all
 from tokenspeed_kernel.ops.attention.rmha import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.rmha import __all__ as _rmha_all
+from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+LSE_LN = math.log2(math.e)
+
+
+def attn_merge_state(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    *,
+    lse_scale_log2: float = LSE_LN,
+    inplace: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two partial attention states.
+
+    Args:
+        out_a: First partial output with shape [total_q, num_heads, head_dim].
+        lse_a: First partial log-sum-exp with shape [total_q, num_heads].
+        out_b: Second partial output with shape [total_q, num_heads, head_dim].
+        lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
+        lse_scale_log2: Multiplier that converts input LSE to log2 domain.
+        inplace: Whether to write the merged state back into ``out_a``/``lse_a``.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    This is shared by MHA and MLA because the merge only depends on partial
+    attention outputs and LSE values, not on how the K/V states were produced.
+    """
+    signature = format_signature(
+        out_a=dense_tensor_format(out_a.dtype),
+        out_b=dense_tensor_format(out_b.dtype),
+    )
+    kernel = select_kernel(
+        "attention",
+        "attn_merge_state",
+        signature,
+        traits={"head_dim": out_a.shape[-1]},
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "total_q": out_a.shape[0],
+        "num_heads": out_a.shape[1],
+        "head_dim": out_a.shape[2],
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "attn_merge_state",
+        kernel.name,
+        out_a.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "attn_merge_state",
+        out_a.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            out_a=out_a,
+            lse_a=lse_a,
+            out_b=out_b,
+            lse_b=lse_b,
+            lse_scale_log2=lse_scale_log2,
+            inplace=inplace,
+            enable_pdl=pdl_enabled(),
+        )
+
+
+# Merge-state implementation registration.
+import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
 __all__ = [
     *_mha_all,

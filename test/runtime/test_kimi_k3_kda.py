@@ -548,7 +548,7 @@ class _KDAHarness:
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
         sequence starting from the zero state."""
-        from tokenspeed_kernel.ops.attention.kda.fla import (
+        from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
 

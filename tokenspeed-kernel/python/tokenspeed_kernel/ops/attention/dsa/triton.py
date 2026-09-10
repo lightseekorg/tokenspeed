@@ -570,3 +570,6 @@ def triton_dsa_prefill(
         k_scale=k_scale,
         out=out,
     )
+
+
+from tokenspeed_kernel.ops.attention.dsa._triton.topk import *  # noqa: E402,F403

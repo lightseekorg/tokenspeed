@@ -25,12 +25,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.mha.flash_attn import flash_attn_varlen_func
+from tokenspeed_kernel.ops.attention.mha.cuda import flash_attn_varlen_func
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     BatchMLAPagedAttentionWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
 )
-from tokenspeed_kernel.ops.attention.mla.flash_mla import (
+from tokenspeed_kernel.ops.attention.mla.cuda import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )

@@ -603,10 +603,7 @@ def kpool_prefill_topk(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.kpool.cache  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kpool.expand  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kpool.gluon_select  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.kpool.score  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kpool.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kpool.triton  # noqa: E402,F401
 
 # isort: on

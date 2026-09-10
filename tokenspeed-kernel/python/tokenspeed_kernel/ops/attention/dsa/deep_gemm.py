@@ -3,22 +3,22 @@ from __future__ import annotations
 import os
 
 import torch
-from tokenspeed_kernel.ops.attention.dsa.cuda_topk import (
+from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.cute_dsl_topk import (
+from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.flashinfer_topk import (
+from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     deterministic_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.triton_topk import (
+from tokenspeed_kernel.ops.attention.dsa.triton import (
     combine_topk_weights,
     local_topk_to_global_slots,
 )
-from tokenspeed_kernel.ops.attention.kpool.expand import (
+from tokenspeed_kernel.ops.attention.kpool.triton import (
     expand_kpool_to_flat_kv,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale

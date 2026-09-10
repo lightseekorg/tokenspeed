@@ -391,8 +391,7 @@ def msa_extend_with_kvcache(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.msa.cute_dsl  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.msa.indexer  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.msa.score  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.msa.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.msa.triton  # noqa: E402,F401
 
 # isort: on

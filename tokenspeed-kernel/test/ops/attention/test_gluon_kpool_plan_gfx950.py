@@ -33,10 +33,11 @@ if not is_cdna4():
     )
 
 from tokenspeed_kernel import kpool_prefill_topk  # isort: skip
-from tokenspeed_kernel.ops.attention.mha.gluon import (  # isort: skip
-    kpool_select as gluon_kpool_select,
+from tokenspeed_kernel.ops.attention.kpool import (
+    gluon as gluon_kpool_select,  # isort: skip
 )
-from tokenspeed_kernel.ops.attention.kpool.gluon_select import (  # isort: skip
+
+from tokenspeed_kernel.ops.attention.kpool.gluon import (  # isort: skip
     gluon_kpool_prefill_topk_fp8_gfx950,
 )
 from tokenspeed_kernel.ops.attention.kpool.triton import (  # isort: skip
