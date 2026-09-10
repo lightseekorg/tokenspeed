@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
 from tokenspeed_kernel.ops.attention.kpool._triton.score import (
+    _kpool_sort_topk_kernel,
     score_kpool_dense,
     select_kpool_chunked,
 )

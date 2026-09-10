@@ -1051,10 +1051,12 @@ def dsv4_warmup(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv4.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv4.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv4.triton  # noqa: E402,F401
 
 # isort: on
+
+if current_platform().is_nvidia:
+    import tokenspeed_kernel.ops.attention.dsv4.deep_gemm  # noqa: E402,F401
 
 __all__ = [
     "dsv4_indexer_cache_format",

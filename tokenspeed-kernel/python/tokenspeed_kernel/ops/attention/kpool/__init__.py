@@ -603,10 +603,12 @@ def kpool_prefill_topk(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.kpool.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kpool.triton  # noqa: E402,F401
 
 # isort: on
+
+if current_platform().is_amd:
+    import tokenspeed_kernel.ops.attention.kpool.gluon  # noqa: E402,F401
 
 __all__ = [
     "kpool_prefill_write",
