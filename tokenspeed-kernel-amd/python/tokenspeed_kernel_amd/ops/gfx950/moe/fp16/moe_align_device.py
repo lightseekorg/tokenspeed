@@ -244,12 +244,8 @@ def _prepare_small_kernel(
         gl.store(
             sei_ptr + block_ids,
             gl.full([BLOCK_NB], -1, gl.int32, layout=LE),
-            mask=block_ids < nb_max,
+            mask=(block_ids >= num_blocks) & (block_ids < nb_max),
         )
-
-    # The sentinel fill is owned by one wave; synchronize before other waves
-    # overwrite live block ranges with expert IDs.
-    gl.barrier()
 
     for block_offset in gl.static_range(0, MAX_BLOCKS_PER_EXPERT):
         gl.store(
@@ -361,7 +357,7 @@ def moe_align_block_size_device(
             sentinel,
             BLOCK_G=triton.next_power_of_2(N),
             BLOCK_E=BLOCK_E,
-            BLOCK_NB=64,
+            BLOCK_NB=256,
             # N is the flattened route count (token rows * top-k), not a GEMM dimension.
             # block_m is routed rows per expert block; this matches the worst
             # case, where all routes hit one expert.

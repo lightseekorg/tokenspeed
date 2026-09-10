@@ -259,10 +259,10 @@ def test_small_route_boundary_alignment_contract(case: str) -> None:
 
 
 def test_small_route_production_alignment_graph_replay() -> None:
-    """Graph replay preserves cross-wave block-table initialization ordering."""
+    """Graph replay updates the live block prefix and padded suffix."""
     num_tokens, num_experts, top_k, block_m = 64, 288, 8, 16
     flat_slots = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
-    topk_ids = ((flat_slots.remainder(3) + 1) * 64).reshape(num_tokens, top_k)
+    topk_ids = torch.zeros((num_tokens, top_k), device="cuda", dtype=torch.int32)
     topk_weights = (flat_slots.float() + 0.25).reshape(num_tokens, top_k)
 
     moe_align_block_size_device(
@@ -295,7 +295,7 @@ def test_small_route_production_alignment_graph_replay() -> None:
     )
     first_experts = outputs[1].clone()
 
-    topk_ids.copy_((((flat_slots + 1).remainder(3) + 1) * 64 + 1).reshape_as(topk_ids))
+    topk_ids.copy_((flat_slots * 37).remainder(num_experts).reshape_as(topk_ids))
     topk_weights.copy_(torch.flip(topk_weights, dims=(0, 1)))
     for _ in range(32):
         graph.replay()
@@ -309,6 +309,20 @@ def test_small_route_production_alignment_graph_replay() -> None:
         expert_start=0,
     )
     assert not torch.equal(outputs[1], first_experts)
+
+    topk_ids.zero_()
+    for _ in range(32):
+        graph.replay()
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=0,
+    )
+    torch.testing.assert_close(outputs[1], first_experts, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64, 256])
