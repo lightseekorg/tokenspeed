@@ -88,7 +88,8 @@ Inside the root `tokenspeed-kernel/` directory:
   stay optional, and other solutions may be used as temporary transitions, but
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
-  `gemm/trtllm.py` or `attention/triton/`.
+  `gemm/trtllm.py`. Attention adds its variant before the solution, for example
+  `attention/mha/triton_prefill.py`.
 * When defining new public APIs, explain arguments and returns in docstring.
 
 ## tokenspeed-kernel-amd

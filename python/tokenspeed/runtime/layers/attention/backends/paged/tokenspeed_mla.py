@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,

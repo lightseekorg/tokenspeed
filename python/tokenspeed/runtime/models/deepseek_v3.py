@@ -36,7 +36,7 @@ from tokenspeed_kernel.ops.attention import (
     mla_project_value,
     mla_project_value_prefers_contiguous_weight,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.embedding import apply_rope_mla, apply_rope_mla_set_kv
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm

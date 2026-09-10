@@ -694,7 +694,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     twin is named directly: the point here is that dropping the tape does not
     disturb the recurrence, not which producers ran.
     """
-    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store as kda_fused_paged_verify,
     )
 
@@ -780,7 +780,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
 @requires_registered_replay
 @pytest.mark.parametrize("n", [1, 4])
 def test_split_verify_wrapper_matches_fused_wrapper(n):
-    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store,
         triton_nvidia_kda_fused_paged_verify_split,
     )

@@ -55,7 +55,7 @@ HEADS_KV = 4
 
 
 def _require_blockscaled_fa4():
-    flash_attn = pytest.importorskip("tokenspeed_kernel.ops.attention.flash_attn")
+    flash_attn = pytest.importorskip("tokenspeed_kernel.ops.attention.mha.flash_attn")
     if not getattr(flash_attn, "_FA4_HAS_BLOCKSCALED", False):
         pytest.skip("installed FA4 build has no blockscaled (sfq) support")
 
@@ -241,7 +241,7 @@ def test_rel_decode_oob_pool_bytes_have_zero_effect(window_left: int):
     output even when their bytes decode to fp8 NaN (recycled pages hold
     arbitrary bytes; P@V would compute 0 * NaN = NaN without the kernel's
     seqused V-zeroing, and the S-side masks only cover the K side)."""
-    import tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode as rel_decode
+    import tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode as rel_decode
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
 
     torch.manual_seed(3)

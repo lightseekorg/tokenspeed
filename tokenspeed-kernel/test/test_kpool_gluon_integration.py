@@ -33,7 +33,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.attention.gluon import kpool_select  # isort: skip
+from tokenspeed_kernel.ops.attention.mha.gluon import kpool_select  # isort: skip
 
 
 class _FakeSortKernel:

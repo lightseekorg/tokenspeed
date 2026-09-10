@@ -32,10 +32,10 @@ wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention.cutedsl_kda as cutedsl_op
+import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
 from tokenspeed_kernel.ops.attention import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+from tokenspeed_kernel.ops.attention.kda.triton import (
     _nvidia_kda_prefill,
 )
 from tokenspeed_kernel.selection import SelectedKernel
@@ -208,7 +208,7 @@ def test_facade_requires_host_boundaries(monkeypatch):
 
 
 def test_solution_wrappers_forward_host_boundaries(monkeypatch):
-    import tokenspeed_kernel.ops.attention.triton.kda_dispatch as kd
+    import tokenspeed_kernel.ops.attention.kda.triton as kd
 
     received = []
 

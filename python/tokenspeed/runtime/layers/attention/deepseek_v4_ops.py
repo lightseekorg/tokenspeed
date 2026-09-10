@@ -27,7 +27,7 @@ from tokenspeed_kernel import (
     dsv4_csa_indexer_fp8_cache_insert,
     dsv4_swa_cache_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_fused_csa_indexer_mxfp4_cache_insert,
     dsv4_fused_indexer_q_rope_hadamard_mxfp4,
     dsv4_fused_sparse_compress_cache_insert,

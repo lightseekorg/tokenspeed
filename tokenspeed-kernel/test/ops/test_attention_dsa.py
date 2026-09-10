@@ -32,7 +32,7 @@ from tokenspeed_kernel import (
     dsa_prefill_topk,
     dsv4_plan,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa.triton_topk import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
 

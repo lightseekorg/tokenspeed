@@ -19,11 +19,11 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -1468,7 +1468,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
-            from tokenspeed_kernel.ops.attention.flash_mla import (
+            from tokenspeed_kernel.ops.attention.mla.flash_mla import (
                 flash_mla_sparse_fwd,
                 flash_mla_with_kvcache,
                 get_mla_metadata,

@@ -39,14 +39,13 @@ import pytest
 import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
-import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
-import tokenspeed_kernel.ops.attention.cuda.dsv4 as _attention_cuda_dsv4
-import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
-import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
-import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
-import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention_flashinfer_gdn
-import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
-import tokenspeed_kernel.ops.attention.triton as _attention_triton
+import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
+import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
+import tokenspeed_kernel.ops.attention.merge_state_cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.mha.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer
+import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon
+import tokenspeed_kernel.ops.attention.mla.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
@@ -76,31 +75,32 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
-from tokenspeed_kernel.ops.attention import GdnChunkPrefillResult, KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
-from tokenspeed_kernel.ops.attention.triton import (
-    dsa_topk as _attention_triton_dsa_topk,
+from tokenspeed_kernel.ops.attention import (
+    GdnChunkPrefillResult,
+    KdaPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.triton import dsv4 as _attention_triton_dsv4
-from tokenspeed_kernel.ops.attention.triton import (
-    gated_delta_rule as _attention_triton_gdn,
+from tokenspeed_kernel.ops.attention import (
+    merge_state_triton as _attention_triton_merge_state,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    merge_state as _attention_triton_merge_state,
+from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
+from tokenspeed_kernel.ops.attention.dsa import (
+    triton_topk as _attention_triton_dsa_topk,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mha_decode as _attention_triton_mha_decode,
+from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
+from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
+from tokenspeed_kernel.ops.attention.mha import (
+    triton_decode as _attention_triton_mha_decode,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mha_prefill as _attention_triton_mha_prefill,
+from tokenspeed_kernel.ops.attention.mha import (
+    triton_prefill as _attention_triton_mha_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mla_decode as _attention_triton_mla_decode,
+from tokenspeed_kernel.ops.attention.mla import (
+    triton_decode as _attention_triton_mla_decode,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mla_prefill as _attention_triton_mla_prefill,
+from tokenspeed_kernel.ops.attention.mla import (
+    triton_prefill as _attention_triton_mla_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton import rel_mha as _attention_triton_rel_mha
+from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
 from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
@@ -147,7 +147,6 @@ _RELOAD_MODULES = [
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
-    _attention_triton,
     # The facade owns public result classes imported by other test modules.
     # Reloading it would replace those class objects and break isinstance checks.
     # GEMM registration modules.
@@ -1882,7 +1881,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
 
 
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:
-    from tokenspeed_kernel.ops.attention.deep_gemm import (
+    from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         _resolve_prefill_tile_max_seqlen_k,
     )
 

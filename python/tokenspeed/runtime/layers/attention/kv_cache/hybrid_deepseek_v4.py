@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsv4 import dsv4_compressed_slot_mapping
+from tokenspeed_kernel.ops.attention.dsv4.triton import dsv4_compressed_slot_mapping
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
