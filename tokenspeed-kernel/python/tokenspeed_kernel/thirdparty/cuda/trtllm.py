@@ -362,13 +362,24 @@ class MnnvlAllReduceFusionWorkspace:
         self.oneshot_token_cap = oneshot_token_cap
         self._refs = refs  # keep the symm_mem tensor + handle alive
 
-    def resolve_use_oneshot(self, token_num: int, requested: Optional[bool]) -> bool:
-        """Resolve dispatch against the one-shot lane this workspace owns."""
+    def resolve_use_oneshot(
+        self,
+        token_num: int,
+        requested: Optional[bool],
+        hidden_dim: Optional[int] = None,
+    ) -> bool:
+        """Resolve dispatch against the one-shot lane this workspace owns.
+
+        Arming is grow-only, so the stored cap is the traffic rule at the widest
+        width any caller on this group reserved, not at the width in hand: scale
+        it, bounded by the rows the buffer was armed for. Scaling rather than
+        recomputing keeps dispatch off the environment override.
+        """
         if requested is False:
             return False
-        # This cap is both the creation-time traffic rule and the allocation
-        # bound. A forced request beyond it must use the always-sized two-shot lane.
-        return token_num <= self.oneshot_token_cap
+        width = hidden_dim or self.hidden_dim
+        cap = self.oneshot_token_cap * self.hidden_dim // width
+        return token_num <= min(cap, self.max_token_num)
 
     def supports(
         self,

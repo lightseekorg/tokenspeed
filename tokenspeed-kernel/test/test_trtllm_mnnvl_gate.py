@@ -78,3 +78,35 @@ def test_unsupported_world_size_rejected():
     _, probe = _probe()
 
     assert probe(3) is False
+
+
+def test_the_oneshot_cap_follows_the_call_width_not_the_armed_lane():
+    """Arming is grow-only, so a retired wide lane must not pin narrow calls."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import MnnvlAllReduceFusionWorkspace
+
+    def ws(armed, cap, max_token_num=2048):
+        return MnnvlAllReduceFusionWorkspace(
+            tp_rank=0,
+            tp_size=8,
+            max_token_num=max_token_num,
+            hidden_dim=armed,
+            buffer_size_bytes=0,
+            multicast_ptr=1,
+            peer_ptrs=None,
+            local_ptr=1,
+            buffer_flags=None,
+            oneshot_token_cap=cap,
+            refs=(),
+        )
+
+    # K3 arms 3584 + 7168 for a lane-norm path that is retired, and every live
+    # all-reduce is 7168 wide. At the armed width the cap is 6; at the width in
+    # hand it is 9, which is what an eight-token spec-decode step needs.
+    k3 = ws(10752, 6)
+    assert k3.resolve_use_oneshot(8, None) is False
+    assert k3.resolve_use_oneshot(8, None, 7168) is True
+    assert k3.resolve_use_oneshot(10, None, 7168) is False
+    assert k3.resolve_use_oneshot(8, False, 7168) is False
+
+    # Scaling never promises more rows than the buffer was armed for.
+    assert ws(8192, 4096, max_token_num=64).resolve_use_oneshot(65, None, 4096) is False
