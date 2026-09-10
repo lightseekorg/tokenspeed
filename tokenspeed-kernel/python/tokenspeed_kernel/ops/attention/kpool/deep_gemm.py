@@ -68,9 +68,7 @@ if current_platform().is_nvidia:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        signatures=frozenset(
-            {format_signature(q=dense_tensor_format(torch.bfloat16))}
-        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
         traits={
             "head_dim": frozenset({128}),
             "pool_size": frozenset({4}),
