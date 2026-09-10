@@ -1659,6 +1659,32 @@ def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     )
 
 
+def _attention_dsa_prefill_glm53_flash_fp8_dense(
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> object:
+    q = torch.empty((1, 16, 512), dtype=dtype)
+    kv_cache = torch.empty((2051, 512), dtype=dtype)
+    topk_slots = torch.empty((1, 2051), dtype=torch.int32)
+    topk_lens = torch.empty((1,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=2051,
+        qk_nope_head_dim=256,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        softmax_scale=1.0,
+        page_size=64,
+    )
+
+
+def _attention_dsa_prefill_glm53_flash_fp8_e5m2_dense() -> object:
+    return _attention_dsa_prefill_glm53_flash_fp8_dense(torch.float8_e5m2)
+
+
 def _attention_dsa_prefill_fp8_dense(
     dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> object:
@@ -4005,6 +4031,22 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_prefill_glm53_flash_fp8_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx950",
+        _attention_dsa_prefill_glm53_flash_fp8_dense,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_glm53_flash_fp8_e5m2_dense",
+        "gluon_dsa_prefill_fp8_dense_gfx950",
+        _attention_dsa_prefill_glm53_flash_fp8_e5m2_dense,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill_fp8_dense_rank512",
         "gluon_dsa_prefill_fp8_dense_gfx950",
         _attention_dsa_prefill_fp8_dense,
@@ -4860,6 +4902,45 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
 
     assert result is expected
     assert forwarded == {"marker": marker}
+
+
+@pytest.mark.parametrize(
+    ("qk_nope_head_dim", "kv_lora_rank", "qk_rope_head_dim", "matches"),
+    [
+        pytest.param(128, 512, 0, True, id="nope128-norope"),
+        pytest.param(128, 512, 64, True, id="nope128-rope64"),
+        pytest.param(192, 512, 0, True, id="nope192-norope"),
+        pytest.param(192, 512, 64, True, id="nope192-rope64"),
+        pytest.param(256, 512, 0, True, id="glm53-flash"),
+        pytest.param(256, 512, 64, True, id="nope256-rope64"),
+        pytest.param(64, 512, 0, False, id="unsupported-nope"),
+        pytest.param(256, 128, 0, False, id="unsupported-rank"),
+        pytest.param(256, 512, 32, False, id="unsupported-rope"),
+    ],
+)
+def test_gluon_dsa_prefill_fp8_dense_traits(
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    matches: bool,
+) -> None:
+    spec = KernelRegistry.get().get_by_name("gluon_dsa_prefill_fp8_dense_gfx950")
+    if spec is None:
+        pytest.skip("gfx950 Gluon DSA registration is unavailable")
+    traits = {
+        "page_size": 64,
+        "q_len_per_req": 1,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "topk": 2051,
+        "kv_cache_available": True,
+        "sparse_kv_cache_available": False,
+        "topk_layout": "global_slots",
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+    assert spec_matches_traits(spec, traits) is matches
 
 
 _GLUON_MLA_FIXED_KERNELS = (
