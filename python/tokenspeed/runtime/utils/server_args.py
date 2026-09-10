@@ -990,10 +990,15 @@ class ServerArgs:
                     "reduce --max-num-seqs or the speculative draft token count "
                     f"(configured {decode_tokens_per_rank} tokens per rank)"
                 )
-            if self.chunked_prefill_size > 1024 or self.max_prefill_tokens > 1024:
+            if (
+                self.chunked_prefill_size <= 0
+                or self.chunked_prefill_size > 1024
+                or self.max_prefill_tokens > 1024
+            ):
                 raise ValueError(
                     "Petit MegaMoE supports at most 1024 prefill tokens per rank; "
-                    "set --chunked-prefill-size 1024 and --max-prefill-tokens 1024"
+                    "set --chunked-prefill-size to a positive value no greater "
+                    "than 1024 and --max-prefill-tokens no greater than 1024"
                 )
 
         if (

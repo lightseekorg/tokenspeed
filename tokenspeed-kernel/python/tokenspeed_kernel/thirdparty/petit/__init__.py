@@ -22,6 +22,14 @@
 
 
 def import_petit_kernel():
+    """Import and return the optional :mod:`petit_kernel` module.
+
+    Returns:
+        The imported ``petit_kernel`` module.
+
+    Raises:
+        RuntimeError: If ``petit_kernel`` is not installed.
+    """
     try:
         import petit_kernel
     except ImportError as exc:
