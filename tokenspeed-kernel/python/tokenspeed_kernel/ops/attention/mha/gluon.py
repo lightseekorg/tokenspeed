@@ -1232,7 +1232,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1}),
+            "batch_size": frozenset({1, 2, 4}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
             "page_size": frozenset({64}),
@@ -1265,7 +1265,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1}),
+            "batch_size": frozenset({1, 2, 4}),
             "num_heads": frozenset({12, 16}),
             "latent_dim": frozenset({512}),
             "value_dim": frozenset({128}),
@@ -1448,7 +1448,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1}),
+            "batch_size": frozenset({1, 2, 4, 8}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({12, 16}),
             "page_size": frozenset({64}),
@@ -1481,7 +1481,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1}),
+            "batch_size": frozenset({1, 2, 4, 8}),
             "num_heads": frozenset({12, 16}),
             "latent_dim": frozenset({512}),
             "value_dim": frozenset({128}),

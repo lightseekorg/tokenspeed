@@ -195,7 +195,7 @@ def mla_project_value(
         "inputs_contiguous": (
             attention.is_contiguous()
             and weight.is_contiguous()
-            and (gate is None or gate.is_contiguous())
+            and (gate is None or gate.stride(-1) == 1)
             and out.is_contiguous()
         ),
     }

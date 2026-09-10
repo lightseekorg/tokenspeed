@@ -104,6 +104,28 @@ class CacheArenaContractTest(unittest.TestCase):
         # 2 parents * 2 history blocks per parent * P=4.
         self.assertEqual(arena.size, 16)
 
+    def test_block_segments_match_the_canonical_plan_geometry(self):
+        arena = _arena()
+
+        expected = [
+            (
+                arena.plan.field_page_byte_offset(field.field_id, block_id),
+                field.payload_bytes,
+            )
+            for block_id in (0, 2)
+            for field in arena.plan.fields
+            if field.group_id == "history"
+        ]
+
+        self.assertEqual(arena.block_byte_segments("history", [0, 2]), expected)
+
+    def test_block_segments_reject_invalid_ids_before_expansion(self):
+        arena = _arena()
+
+        for invalid in (-1, True, arena.plan.group("history").page_count):
+            with self.subTest(invalid=invalid), self.assertRaises(IndexError):
+                arena.block_byte_segments("history", [invalid])
+
 
 class CachePoolViewTest(unittest.TestCase):
     def test_a_pool_reports_the_arena_it_views(self):

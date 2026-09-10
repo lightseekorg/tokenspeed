@@ -9,6 +9,7 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
+    mla_project_value,
     supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -854,28 +855,47 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
     )
 
 
-def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
+@pytest.mark.parametrize("batch", [1, 4, 8])
+def test_mla_decode_with_kvcache_projected_value_matches_split(
     device: str,
+    batch: int,
 ) -> None:
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("K3 fused MLA epilogue requires CDNA4 or CDNA5")
-    from tokenspeed_kernel import mla_project_value
+    if platform.is_cdna4 and batch > 4:
+        pytest.skip("gfx950 projected MLA is restricted to batch <= 4")
 
     torch.manual_seed(67)
-    q = torch.randn(1, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
+    q = torch.randn(batch, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    kv_cache = torch.randn(64, 64, 1, 576, device=device, dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
+    kv_cache = torch.randn(
+        batch * 64,
+        64,
+        1,
+        576,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    page_table = torch.arange(
+        batch * 64,
+        device=device,
+        dtype=torch.int32,
+    ).view(batch, 64)
+    cache_seqlens = torch.tensor(
+        [4096 - 64 * (index % 4) for index in range(batch)],
+        device=device,
+        dtype=torch.int32,
     )
-    page_table = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
-    cache_seqlens = torch.tensor([4096], device=device, dtype=torch.int32)
     weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
-    gate = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
-    output = torch.empty_like(gate)
-    projected_override = (
-        "gluon_mla_decode_projected_value_gfx1250" if platform.is_cdna5 else None
+    gate_storage = torch.randn(
+        batch,
+        3648,
+        device=device,
+        dtype=torch.bfloat16,
     )
+    gate = gate_storage[:, -1536:]
+    output = torch.empty_like(gate)
     attention = mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
@@ -888,11 +908,12 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
         softmax_scale=1.0 / math.sqrt(192),
         solution="gluon",
     )
-    expected = mla_project_value(
-        attention.reshape(1, 12, 512),
+    projected = torch.bmm(
+        attention.reshape(batch, 12, 512).transpose(0, 1).contiguous(),
         weight,
-        gate=gate,
     )
+    expected = projected.transpose(0, 1).contiguous().reshape_as(output)
+    expected = (expected.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
 
     mla_decode_with_kvcache(
         q=q,
@@ -907,7 +928,6 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
         value_weight=weight,
         gate=gate,
         out=output,
-        override=projected_override,
     )
     eager_output = output.clone()
     graph = torch.cuda.CUDAGraph()
@@ -925,15 +945,17 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
             value_weight=weight,
             gate=gate,
             out=output,
-            override=projected_override,
         )
     assert returned.data_ptr() == output.data_ptr()
+    output.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
     torch.testing.assert_close(output, eager_output, atol=0, rtol=0)
-    # Split scheduling and reducer order can differ from the generic
-    # composition. Validate within the established FP8 reduction envelope.
-    torch.testing.assert_close(output, expected, atol=0.125, rtol=0.05)
+    # Different split partitions are bitwise identical when matched, but can
+    # cross a BF16 rounding boundary when the optimized and composed paths use
+    # different split counts.
+    torch.testing.assert_close(output, expected, atol=0.25, rtol=0.05)
 
 
 @pytest.mark.parametrize("use_gate", [False, True])
@@ -1076,6 +1098,47 @@ def test_mla_project_value_fallback_preserves_fp32_gate_math(
 
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
     assert not torch.equal(output, attention.reshape(1, 1) * gate.sigmoid())
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+def test_mla_project_value_amd_batches(
+    device: str,
+    batch: int,
+) -> None:
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("batched MLA value projection requires CDNA4 or CDNA5")
+    if platform.is_cdna4 and batch not in {1, 2, 4}:
+        pytest.skip("gfx950 MLA value projection supports batches 1, 2, and 4")
+
+    torch.manual_seed(73 + batch)
+    attention = torch.randn(batch, 12, 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
+    gate_storage = torch.randn(
+        batch,
+        3648,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gate = gate_storage[:, -1536:]
+    out = torch.empty(batch, 1536, device=device, dtype=torch.bfloat16)
+    expected = torch.einsum("bhl,hlv->bhv", attention, weight).reshape_as(out)
+    expected = (expected.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+
+    override = (
+        "gluon_mla_project_value_gfx1250"
+        if platform.is_cdna5
+        else "gluon_mla_project_value_gfx950"
+    )
+    returned = mla_project_value(
+        attention,
+        weight,
+        gate=gate,
+        out=out,
+        override=override,
+    )
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.05)
 
 
 def test_mla_project_value_nvidia_fallback_writes_projection_directly(
@@ -1231,6 +1294,32 @@ def test_mla_normalize_project_query_split_output(
         rtol=2e-2,
     )
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
+
+
+def test_gfx1250_projected_decode_split_policy() -> None:
+    if not current_platform().is_cdna5:
+        pytest.skip("K3 projected MLA split policy targets CDNA5")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        _select_projected_value_num_kv_splits,
+    )
+
+    def select(batch_size: int, max_seqlen_k: int) -> int:
+        return _select_projected_value_num_kv_splits(
+            batch_size=batch_size,
+            num_sms=256,
+            num_q_programs=batch_size,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=64,
+        )
+
+    assert select(1, 64) == 1
+    assert select(1, 4097) == 16
+    assert select(2, 4097) == 8
+    assert select(8, 16384) == 16
+    assert select(16, 16384) == 16
+    assert select(16, 32768) == 32
+    assert select(8, 32769) == 64
+    assert select(16, 32769) == 32
 
 
 def test_gfx950_k3_decode_split_policy() -> None:

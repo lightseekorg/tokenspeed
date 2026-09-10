@@ -32,6 +32,7 @@ import-guarded on missing optional backend packages are skipped.
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -60,10 +61,6 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
-import tokenspeed_kernel.ops.mhc as _mhc_pkg
-import tokenspeed_kernel.ops.mhc.deep_gemm as _mhc_deep_gemm
-import tokenspeed_kernel.ops.mhc.gluon as _mhc_gluon
-import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
@@ -73,11 +70,19 @@ import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
+import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
 import tokenspeed_kernel.ops.quantization.trtllm as _quantization_trtllm
+import tokenspeed_kernel.ops.residual as _residual_pkg
+import tokenspeed_kernel.ops.residual.cuda as _residual_cuda
+import tokenspeed_kernel.ops.residual.cute_dsl as _residual_cute_dsl
+import tokenspeed_kernel.ops.residual.deep_gemm as _residual_deep_gemm
+import tokenspeed_kernel.ops.residual.gluon as _residual_gluon
+import tokenspeed_kernel.ops.residual.torch as _residual_torch
+import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
@@ -147,11 +152,14 @@ _RELOAD_MODULES = [
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
-    # mHC registration modules.
-    _mhc_deep_gemm,
-    _mhc_gluon,
-    _mhc_triton,
-    _mhc_pkg,
+    # Residual registration modules.
+    _residual_cuda,
+    _residual_cute_dsl,
+    _residual_deep_gemm,
+    _residual_gluon,
+    _residual_torch,
+    _residual_triton,
+    _residual_pkg,
     # MoE registration modules.
     _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
@@ -169,6 +177,7 @@ _RELOAD_MODULES = [
     _moe_gluon_dsv4,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
+    _moe_sigmoid_topk,
     _moe_gluon_sigmoid_topk,
     _moe_gluon,
     _moe_triton_bf16,
@@ -200,6 +209,37 @@ def _kernel_registry(fresh_registry):
 def test_attention_result_type_identity_is_stable():
     assert _attention_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_pkg.KdaPrefillResult is KdaPrefillResult
+
+
+def test_residual_family_exports_and_modes():
+    expected_exports = {
+        "attn_res_fwd",
+        "attn_res_fwd_available",
+        "gated_residual_combine",
+        "gated_residual_mix",
+        "mhc_fused_hc",
+        "mhc_post",
+        "mhc_pre",
+        "prepare_gated_residual_weight_cache",
+    }
+    assert set(_residual_pkg.__all__) == expected_exports
+    assert all(
+        getattr(tokenspeed_kernel, name) is getattr(_residual_pkg, name)
+        for name in expected_exports
+    )
+
+    residual_modes = {
+        mode
+        for family, mode in KernelRegistry.get().list_operators()
+        if family == "residual"
+    }
+    assert residual_modes == {
+        "attn_res_fwd",
+        "hyperconnection_combine",
+        "hyperconnection_mix",
+        "mhc_post",
+        "mhc_pre",
+    }
 
 
 def test_builtin_moe_preprocessor_links_are_callables():
@@ -366,6 +406,17 @@ def _fp8_dtype() -> torch.dtype:
 def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
     return tokenspeed_kernel.quantize_mxfp8(x)
+
+
+def _fp8_quantize_dequantize() -> torch.Tensor:
+    x = torch.empty((4, 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.fp8_quantize_dequantize(
+        x,
+        group_size=128,
+        scale_encoding="ue8m0",
+        override=None,
+        solution=None,
+    )
 
 
 def _mm_dense() -> torch.Tensor:
@@ -1045,13 +1096,19 @@ def _attention_mla_decode_fp8q_unsupported_heads() -> object:
     )
 
 
-def _attention_mla_decode_projected_value_gfx1250(heads: int = 12) -> object:
-    q = torch.empty((1, 1, heads, 576), dtype=torch.float8_e4m3fn)
+def _attention_mla_decode_projected_value_amd(
+    heads: int = 12,
+    *,
+    batch: int = 1,
+) -> object:
+    q = torch.empty((batch, 1, heads, 576), dtype=torch.float8_e4m3fn)
     kv_cache = torch.empty((64, 64, 1, 576), dtype=torch.float8_e4m3fn)
-    page_table = torch.arange(64, dtype=torch.int32).view(1, 64)
-    cache_seqlens = torch.tensor([4096], dtype=torch.int32)
+    page_table = (
+        torch.arange(64, dtype=torch.int32).view(1, 64).expand(batch, -1).contiguous()
+    )
+    cache_seqlens = torch.full((batch,), 4096, dtype=torch.int32)
     value_weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
-    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
     return tokenspeed_kernel.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
@@ -1067,14 +1124,15 @@ def _attention_mla_decode_projected_value_gfx1250(heads: int = 12) -> object:
     )
 
 
-def _attention_mla_project_value_gfx1250(
+def _attention_mla_project_value_amd(
     *,
+    batch: int = 1,
     heads: int = 12,
     use_gate: bool = False,
 ) -> object:
-    attention = torch.empty((1, heads, 512), dtype=torch.bfloat16)
+    attention = torch.empty((batch, heads, 512), dtype=torch.bfloat16)
     weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
-    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
     gate = torch.empty_like(out) if use_gate else None
     return tokenspeed_kernel.mla_project_value(
         attention,
@@ -1414,7 +1472,58 @@ def _attention_dsv4_swa_cache_insert() -> object:
         1e-6,
         64,
         q_out=q_out,
+        validate_positions=True,
     )
+
+
+def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime may skip only the redundant position check, not the insert."""
+    calls: list[dict[str, object]] = []
+
+    class _SelectedKernel:
+        name = "test_dsv4_swa_cache_insert"
+
+        def __call__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        _attention_pkg,
+        "select_kernel",
+        lambda *args, **kwargs: _SelectedKernel(),
+    )
+    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
+    kv = torch.empty((1, 512), dtype=torch.bfloat16)
+    cache = torch.empty((1, 584), dtype=torch.uint8)
+    slots = torch.zeros((1,), dtype=torch.int64)
+    positions = torch.ones((1,), dtype=torch.int64)
+    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="positions entries must index"):
+        tokenspeed_kernel.dsv4_swa_cache_insert(
+            q,
+            kv,
+            cache,
+            slots,
+            positions,
+            cos_sin_cache,
+            1e-6,
+            1,
+            validate_positions=True,
+        )
+    tokenspeed_kernel.dsv4_swa_cache_insert(
+        q,
+        kv,
+        cache,
+        slots,
+        positions,
+        cos_sin_cache,
+        1e-6,
+        1,
+        validate_positions=False,
+    )
+    assert len(calls) == 1
 
 
 def _attention_dsa_decode_fp8_dense_rank128_q4(
@@ -2019,7 +2128,94 @@ def _mhc_pre() -> object:
         1e-6,
         1e-6,
         2,
+        norm_weight=None,
+        norm_eps=None,
     )
+
+
+def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
+    selected: dict[str, object] = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        selected.update(kwargs)
+
+        def kernel(*kernel_args):
+            return kernel_args
+
+        kernel.name = "fake_mhc_pre"
+        return kernel
+
+    monkeypatch.setattr(
+        _residual_pkg,
+        "select_kernel",
+        fake_select_kernel,
+    )
+    residual = torch.empty((1, 4, 8), dtype=torch.bfloat16)
+    fn = torch.empty((24, 32), dtype=torch.float32)
+    hc_scale = torch.empty(3, dtype=torch.float32)
+    hc_base = torch.empty(24, dtype=torch.float32)
+    tokenspeed_kernel.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        2,
+        "legacy_override",
+        "legacy_solution",
+        norm_weight=None,
+        norm_eps=None,
+    )
+    assert selected["override"] == "legacy_override"
+    assert selected["solution"] == "legacy_solution"
+
+
+def test_mhc_normalization_contract_is_explicit() -> None:
+    parameters = inspect.signature(tokenspeed_kernel.mhc_pre).parameters
+
+    for name in ("norm_weight", "norm_eps"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("norm_weight", "norm_eps"),
+    [
+        (torch.empty(16, dtype=torch.bfloat16), None),
+        (None, 1e-6),
+    ],
+)
+def test_mhc_normalization_arguments_must_be_paired(
+    monkeypatch, norm_weight: torch.Tensor | None, norm_eps: float | None
+) -> None:
+    def fail_select_kernel(*args, **kwargs):
+        raise AssertionError("invalid normalization arguments reached kernel selection")
+
+    monkeypatch.setattr(
+        _residual_pkg,
+        "select_kernel",
+        fail_select_kernel,
+    )
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    fn = torch.empty((24, 64), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+
+    with pytest.raises(
+        ValueError, match="norm_weight and norm_eps must be provided together"
+    ):
+        tokenspeed_kernel.mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            1e-6,
+            1e-6,
+            2,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
 
 
 def _mhc_post() -> object:
@@ -2369,6 +2565,58 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert triton_spec.priority == Priority.SPECIALIZED + 1
     assert gluon_spec.priority == Priority.SPECIALIZED
     assert selected.name == "triton_decode_sigmoid_bias_topk"
+
+
+def test_gfx1250_sigmoid_topk_selects_by_token_count(
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx1250")
+    triton_spec = registry.get_by_name("triton_decode_sigmoid_bias_topk")
+    if gluon_spec is None or triton_spec is None:
+        pytest.skip("gfx1250 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        decode = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1, "experts": 896, "topk": 16},
+        )
+        batched = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+        other_shape = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 256, "topk": 8},
+        )
+        reduced_precision = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode.name == "triton_decode_sigmoid_bias_topk"
+    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert other_shape.name == "torch_sigmoid_bias_topk"
+    assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
@@ -3550,7 +3798,7 @@ _CASES = [
         "attention",
         "mla_decode_projected_value",
         "gluon_mla_decode_projected_value_gfx1250",
-        _attention_mla_decode_projected_value_gfx1250,
+        _attention_mla_decode_projected_value_amd,
     ),
     _case(
         _is_cdna5,
@@ -3558,16 +3806,17 @@ _CASES = [
         "attention",
         "mla_decode_projected_value",
         "gluon_mla_decode_projected_value_gfx1250",
-        lambda: _attention_mla_decode_projected_value_gfx1250(16),
+        lambda: _attention_mla_decode_projected_value_amd(16),
         id_suffix="h16",
     ),
     _case(
         _is_cdna5,
         "cdna5",
         "attention",
-        "mla_project_value",
-        "gluon_mla_project_value_gfx1250",
-        _attention_mla_project_value_gfx1250,
+        "mla_decode_projected_value",
+        "gluon_mla_decode_projected_value_gfx1250",
+        lambda: _attention_mla_decode_projected_value_amd(batch=8),
+        id_suffix="batch8",
     ),
     _case(
         _is_cdna5,
@@ -3575,8 +3824,25 @@ _CASES = [
         "attention",
         "mla_project_value",
         "gluon_mla_project_value_gfx1250",
-        lambda: _attention_mla_project_value_gfx1250(use_gate=True),
+        _attention_mla_project_value_amd,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        lambda: _attention_mla_project_value_amd(use_gate=True),
         id_suffix="sigmoid-gate",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        lambda: _attention_mla_project_value_amd(batch=8, use_gate=True),
+        id_suffix="batch8-sigmoid-gate",
     ),
     _case(
         _is_cdna5,
@@ -4070,6 +4336,14 @@ _CASES = [
     ),
     # Quantization API x architecture golden cases.
     _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "quantization",
+        "fp8_quantize_dequantize",
+        "triton_fp8_quantize_dequantize",
+        _fp8_quantize_dequantize,
+    ),
+    _case(
         _is_hopper,
         "hopper",
         "quantization",
@@ -4244,16 +4518,16 @@ _CASES = [
     _case(
         _is_cdna4,
         "cdna4",
-        "mhc",
-        "pre",
+        "residual",
+        "mhc_pre",
         "triton_mhc_pre",
         _mhc_pre,
     ),
     _case(
         _is_cdna4,
         "cdna4",
-        "mhc",
-        "post",
+        "residual",
+        "mhc_post",
         "triton_mhc_post",
         _mhc_post,
     ),
@@ -4363,8 +4637,8 @@ def selected_kernel_spy(monkeypatch):
                 )
             return torch.empty_like(kwargs["x"])
 
-        if case.family == "mhc":
-            if case.mode == "pre":
+        if case.family == "residual":
+            if case.mode == "mhc_pre":
                 residual = args[0]
                 return (
                     torch.empty(
@@ -4590,6 +4864,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("num_q_heads", 12, True, id="matched"),
         pytest.param("num_q_heads", 16, True, id="h16"),
         pytest.param("num_q_heads", 32, False, id="unsupported-heads"),
+        pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
         pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
@@ -4615,6 +4890,32 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "support_logit_cap": False,
     }
     traits[trait] = value
+    assert spec_matches_traits(spec, traits) is matches
+
+
+@pytest.mark.parametrize(
+    "batch_size,matches",
+    [
+        pytest.param(1, True, id="batch1"),
+        pytest.param(8, True, id="batch8"),
+        pytest.param(16, False, id="batch16"),
+    ],
+)
+def test_gluon_mla_project_value_gfx1250_batch_traits(
+    batch_size: int,
+    matches: bool,
+) -> None:
+    spec = KernelRegistry.get().get_by_name("gluon_mla_project_value_gfx1250")
+    if spec is None:
+        pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
+    traits = {
+        "batch_size": batch_size,
+        "num_heads": 12,
+        "latent_dim": 512,
+        "value_dim": 128,
+        "gate_kind": "sigmoid",
+        "inputs_contiguous": True,
+    }
     assert spec_matches_traits(spec, traits) is matches
 
 

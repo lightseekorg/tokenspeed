@@ -52,6 +52,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -60,47 +61,28 @@ platform = current_platform()
 SUPPORTED_HEAD_DIM = 128
 
 _chunk_gated_delta_rule = error_fn
-
-if platform.is_hopper_plus:
-    try:
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
-
-        _chunk_gated_delta_rule = _fi_chunk
-    except ImportError:
-        pass
-
-# Decode / MTP (K-last, SM90+).
 _gated_delta_rule_decode_pretranspose = error_fn
 _gated_delta_rule_mtp = error_fn
+_gated_delta_rule_bf16_mtp = None
 _has_gdn_decode = False
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gdn_decode import (
-            gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
-        )
-        from flashinfer.gdn_decode import gated_delta_rule_mtp as _fi_mtp
-
-        _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
-        _gated_delta_rule_mtp = _fi_mtp
-        _has_gdn_decode = True
+        from tokenspeed_kernel.thirdparty.flashinfer import gdn as _flashinfer_gdn
     except ImportError:
         pass
-
-# BF16-state MTP kernel: a separate, optional entry point. Needed so
-# gdn_decode_mtp can forward the intermediate-state and per-token state-pool
-# scatter arguments that are not exposed by gated_delta_rule_decode_pretranspose.
-_gated_delta_rule_bf16_mtp = None
-
-if platform.is_hopper_plus:
-    try:
-        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-            gated_delta_rule_mtp as _fi_bf16_mtp,
+    else:
+        if _flashinfer_gdn.HAS_PREFILL:
+            _chunk_gated_delta_rule = _flashinfer_gdn.chunk_gated_delta_rule
+        _has_gdn_decode = _flashinfer_gdn.HAS_DECODE
+        _gated_delta_rule_decode_pretranspose = (
+            _flashinfer_gdn.gated_delta_rule_decode_pretranspose
         )
-
-        _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
-    except ImportError:
-        pass
+        _gated_delta_rule_mtp = _flashinfer_gdn.gated_delta_rule_mtp
+        # BF16 MTP exposes intermediate-state/scatter arguments absent from
+        # the single-token entry point, and remains independently optional.
+        if _flashinfer_gdn.HAS_BF16_MTP:
+            _gated_delta_rule_bf16_mtp = _flashinfer_gdn.gated_delta_rule_bf16_mtp
 
 
 def is_available() -> bool:
@@ -279,6 +261,7 @@ if is_available():
             # upstream. Disabling CP can slow long-context GDN prefill but
             # does not change correctness.
             use_cp=False,
+            enable_pdl=pdl_enabled(),
         )
 
         out = out.to(q.dtype)
@@ -361,6 +344,7 @@ if is_decode_available():
         A_log = A_log.detach().float()
         dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
+            enable_pdl=pdl_enabled(),
             q=q,
             k=k,
             v=v,
@@ -423,7 +407,8 @@ if is_decode_available():
 
         Padding behavior depends on the state dtype. The standalone FP32 MTP
         kernel skips a batch row when ``initial_state_indices`` is negative;
-        its per-token state indices may remain negative for that skipped row.
+        its output is undefined and its per-token state indices may remain
+        negative for that skipped row, matching the portable Triton contract.
         The BF16 fast path redirects negative read indices to row 0 and does
         not mask negative per-token scatter indices, so callers must provide
         non-negative destinations (typically by clamping padding to a reserved
@@ -459,6 +444,7 @@ if is_decode_available():
         )
         if use_bf16_state:
             out = _gated_delta_rule_bf16_mtp(
+                enable_pdl=pdl_enabled(),
                 A_log=A_log,
                 a=a.to(q.dtype),
                 dt_bias=dt_bias,
@@ -475,12 +461,22 @@ if is_decode_available():
                 scale=scale,
             )
             return out
-        out, _ = _gated_delta_rule_mtp(
+        # The kernel overwrites every live output. Its disabled intermediate
+        # cache needs only a typed pointer, so bypass the public wrapper's two
+        # zero fills through the third-party adapter.
+        out = torch.empty(
+            (*q.shape[:2], v.shape[2], V_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        _gated_delta_rule_mtp(
+            enable_pdl=pdl_enabled(),
             q=q,
             k=k,
             v=v,
             initial_state=initial_state,
             initial_state_indices=initial_state_indices,
+            output=out,
             A_log=A_log,
             a=a.to(q.dtype),
             dt_bias=dt_bias,
@@ -491,4 +487,4 @@ if is_decode_available():
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         )
-        return out
+        return out.to(q.dtype)

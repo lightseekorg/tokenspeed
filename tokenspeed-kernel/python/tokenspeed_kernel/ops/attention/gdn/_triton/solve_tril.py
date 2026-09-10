@@ -27,10 +27,9 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.gdn._triton.index import (
-    prepare_chunk_indices,
-)
+from tokenspeed_kernel.ops.attention.gdn._triton.index import prepare_chunk_indices
 from tokenspeed_kernel.ops.attention.gdn._triton.utils import input_guard
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -44,7 +43,10 @@ def solve_tril_16x16_kernel(
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -81,6 +83,8 @@ def solve_tril_16x16_kernel(
         b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
         boundary_check=(0, 1),
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -95,7 +99,10 @@ def merge_16x16_to_32x32_inverse_kernel(
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -153,6 +160,8 @@ def merge_16x16_to_32x32_inverse_kernel(
         Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
         boundary_check=(0, 1),
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -167,7 +176,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -388,6 +400,8 @@ def merge_16x16_to_64x64_inverse_kernel(
         fill_zeros.to(p_Ai_34.dtype.element_ty, fp_downcast_rounding="rtne"),
         boundary_check=(0, 1),
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @input_guard
@@ -412,6 +426,7 @@ def solve_tril(
     Returns:
         (I + A)^-1 with the same shape as A
     """
+    enable_pdl = pdl_enabled()
     assert A.shape[-1] in [16, 32, 64]
 
     B, T, H, BT = A.shape
@@ -433,6 +448,8 @@ def solve_tril(
         BT=BT,
         num_warps=1,
         num_stages=4,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     if BT == 16:
         return Ad
@@ -458,5 +475,7 @@ def solve_tril(
         BT=BT,
         num_warps=4,
         num_stages=3,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return Ai

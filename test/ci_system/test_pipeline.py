@@ -1,7 +1,10 @@
 import re
 import subprocess
 import textwrap
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pipeline
 import pytest
@@ -63,6 +66,28 @@ def test_stale_process_patterns_match_existing_targets():
         assert any(
             re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pipeline.URLError("not ready"),
+        ConnectionResetError("connection reset by peer"),
+        TimeoutError("probe timed out"),
+    ],
+)
+def test_poll_readiness_retries_transient_errors(monkeypatch, error):
+    probe = Mock(side_effect=[error, nullcontext(SimpleNamespace(status=200))])
+    monkeypatch.setattr(pipeline, "urlopen", probe)
+
+    poll_readiness(
+        {"url": "http://127.0.0.1:8000/readiness", "interval": 0, "timeout": 1},
+        False,
+        process=None,
+        log_path=None,
+    )
+
+    assert probe.call_count == 2
 
 
 def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):

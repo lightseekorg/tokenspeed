@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 def _autotune_configs():
@@ -33,7 +34,9 @@ def _autotune_configs():
     ]
 
 
-@triton.autotune(configs=_autotune_configs(), key=["qkv_dim", "HAS_REPLAY_PAYLOAD"])
+@triton.autotune(
+    configs=_autotune_configs(), key=["ENABLE_PDL", "qkv_dim", "HAS_REPLAY_PAYLOAD"]
+)
 @triton.jit
 def _fused_qkv_split_kernel(
     q,
@@ -61,7 +64,10 @@ def _fused_qkv_split_kernel(
     BLOCK_SIZE: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
     HAS_REPLAY_PAYLOAD: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -126,9 +132,13 @@ def _fused_qkv_split_kernel(
             replay_b_values,
             mask=gate_mask,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.autotune(configs=_autotune_configs(), key=["qkv_dim", "HAS_REPLAY_PAYLOAD"])
+@triton.autotune(
+    configs=_autotune_configs(), key=["ENABLE_PDL", "qkv_dim", "HAS_REPLAY_PAYLOAD"]
+)
 @triton.jit
 def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     q,
@@ -156,6 +166,7 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     BLOCK_SIZE: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
     HAS_REPLAY_PAYLOAD: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Split + per-head L2 normalisation of Q and K in one pass.
 
@@ -164,6 +175,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     One program per token; per-head reduction is done inside BLOCK_SIZE.
     HEAD_Q must fit within BLOCK_SIZE (true for all Qwen3.5 configs).
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
 
@@ -244,6 +257,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
             replay_b_values,
             mask=gate_mask,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkv_split_gdn_prefill(
@@ -274,6 +289,7 @@ def fused_qkv_split_gdn_prefill(
     Returns:
         (q, k, v) each shaped ``[1, T, H, D]``.
     """
+    enable_pdl = pdl_enabled()
     if not mixed_qkv.is_contiguous():
         mixed_qkv = mixed_qkv.contiguous()
 
@@ -356,5 +372,7 @@ def fused_qkv_split_gdn_prefill(
         BLOCK_SIZE=block_size,
         GATE_BLOCK=gate_block,
         HAS_REPLAY_PAYLOAD=has_replay,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return q, k, v

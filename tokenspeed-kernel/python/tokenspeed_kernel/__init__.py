@@ -93,13 +93,7 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_nvfp4_a16_weights,
     warmup_prepared_fp8_linears,
 )
-from tokenspeed_kernel.ops.hyperconnection import (
-    gated_residual_combine,
-    gated_residual_mix,
-    prepare_gated_residual_weight_cache,
-)
 from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
-from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
     dsv4_mega_moe_apply,
     dsv4_mega_moe_plan,
@@ -112,13 +106,25 @@ from tokenspeed_kernel.ops.moe import (
     moe_sigmoid_bias_topk,
     moe_softmax_topk,
     native_latent_moe_available,
+    pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.quantization import (
+    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
+)
+from tokenspeed_kernel.ops.residual import (
+    attn_res_fwd,
+    attn_res_fwd_available,
+    gated_residual_combine,
+    gated_residual_mix,
+    mhc_fused_hc,
+    mhc_post,
+    mhc_pre,
+    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.transform import hadamard_transform
@@ -148,11 +154,17 @@ __all__ = [
     "prepare_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
-    # hyperconnection
+    # residual
+    "attn_res_fwd",
+    "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
-    "grouped_gemma_rmsnorm",
+    "mhc_fused_hc",
+    "mhc_post",
+    "mhc_pre",
     "prepare_gated_residual_weight_cache",
+    # layernorm
+    "grouped_gemma_rmsnorm",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -211,12 +223,10 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "pack_topk_router_logits",
     "moe_softmax_topk",
-    # mhc
-    "mhc_fused_hc",
-    "mhc_post",
-    "mhc_pre",
     # quantization
+    "fp8_quantize_dequantize",
     "quantize_fp8",
     "quantize_fp8_with_scale",
     "quantize_mxfp8",

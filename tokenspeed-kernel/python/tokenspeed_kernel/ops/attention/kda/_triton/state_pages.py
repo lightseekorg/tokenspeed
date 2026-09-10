@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit(
@@ -40,7 +41,10 @@ def _verify_state_blocks_kernel(
     granularity,
     table_stride,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < bs
     committed = tl.maximum(
@@ -51,6 +55,8 @@ def _verify_state_blocks_kernel(
     # A request with no committed history has no state page to read.
     tl.store(pages_out + row, tl.where(committed > 0, page, -1).to(tl.int32), mask=live)
     tl.store(committed_out + row, committed, mask=live)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _torch_verify_state_blocks(
@@ -95,6 +101,7 @@ def verify_state_blocks(
             no committed history.
         committed_out: INT64 destination ``[>=batch_size]``.
     """
+    enable_pdl = pdl_enabled()
     if (
         seq_lens.stride(0) != 1
         or table.stride(1) != 1
@@ -137,6 +144,8 @@ def verify_state_blocks(
         granularity,
         table.stride(0),
         BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -165,7 +174,10 @@ def _commit_state_pages_kernel(
     out_row,
     out_stride,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < bs
     # The target token always advances state, so a round commits at least one.
@@ -178,6 +190,8 @@ def _commit_state_pages_kernel(
     page = tl.load(table + row * table_stride + slot, mask=live, other=0)
     tl.store(pages_out + out_row * out_stride + row, page.to(tl.int32), mask=live)
     tl.store(steps_out + row, steps.to(tl.int32), mask=live)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _torch_commit_state_pages(
@@ -231,6 +245,7 @@ def commit_state_pages(
         out_row: Which group row to fill.
         steps_out: INT32 destination ``[>=batch_size]`` for the clamped steps.
     """
+    enable_pdl = pdl_enabled()
     if (
         accepted_length.stride(0) != 1
         or committed.stride(0) != 1
@@ -281,4 +296,6 @@ def commit_state_pages(
         out_row,
         pages_out.stride(0),
         BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )

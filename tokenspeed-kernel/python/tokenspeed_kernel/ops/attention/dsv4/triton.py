@@ -54,8 +54,11 @@ __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",
     "dsv4_combine_dense_swa_indices",
     "dsv4_combine_topk_swa_indices",
+    "dsv4_compact_compressed_slot_mapping",
     "dsv4_compressed_slot_mapping",
+    "dsv4_group_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
+    "dsv4_decode_dense_compressed_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
     "dsv4_dequantize_and_gather_k_cache",
     "dsv4_fused_csa_indexer_fp8_cache_insert",
@@ -67,6 +70,7 @@ __all__ = [
     "dsv4_indexer_decode_metadata_compute",
     "dsv4_save_compressor_state",
     "dsv4_sparse_attention",
+    "dsv4_validate_active_cache_pages",
     "write_dsv4_indexer_mxfp4_cache_cuda",
 ]
 
@@ -823,6 +827,213 @@ def _dsv4_fused_indexer_q_rope_hadamard_mxfp4_kernel(
     )
 
 
+@triton.jit
+def _dsv4_fused_indexer_q_rope_hadamard_mxfp4_serial_four_block_kernel(
+    positions_ptr,
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    cos_sin_cache_ptr,
+    cos_sin_cache_stride,
+    q_packed_ptr,
+    q_packed_stride0,
+    q_packed_stride1,
+    q_scale_ptr,
+    q_scale_stride0,
+    q_scale_stride1,
+    weights_ptr,
+    weights_stride,
+    weights_softmax_scale,
+    weights_head_scale,
+    weights_out_ptr,
+    weights_out_stride,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+    NUM_QUANT_BLOCKS: tl.constexpr,
+    HADAMARD_SCALE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    """Reuse Q/RoPE setup while producing the four fixed MXFP4 blocks."""
+
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pos = tl.load(positions_ptr + token_idx)
+    dim = tl.arange(0, TRITON_BLOCK_SIZE)
+    q_base = index_q_ptr + token_idx * index_q_stride0 + head_idx * index_q_stride1
+    q = tl.load(q_base + dim, mask=dim < HEAD_DIM, other=0.0).to(tl.float32)
+
+    NOPE_DIM: tl.constexpr = HEAD_DIM - ROPE_DIM
+    HALF_ROPE: tl.constexpr = ROPE_DIM // 2
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
+
+    pair_2d = tl.reshape(q, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = rope_pair >= 0
+    cs_idx = tl.maximum(rope_pair, 0)
+    cs_base = cos_sin_cache_ptr + pos * cos_sin_cache_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
+    sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    rotated_even = even * cos_v - odd * sin_v
+    rotated_odd = odd * cos_v + even * sin_v
+    rotated = tl.interleave(rotated_even, rotated_odd)
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    in_idx = tl.arange(0, TRITON_BLOCK_SIZE)
+    for quant_block_idx in tl.static_range(0, NUM_QUANT_BLOCKS):
+        out_idx = quant_block_idx * QUANT_BLOCK + tl.arange(0, QUANT_BLOCK)
+        bits = (in_idx[:, None] & out_idx[None, :]).to(tl.int32)
+        parity = bits ^ (bits >> 4)
+        parity = parity ^ (parity >> 2)
+        parity = parity ^ (parity >> 1)
+        parity = parity & 1
+        signs = tl.where(parity == 0, 1.0, -1.0)
+        hadamard = tl.sum(rotated[:, None] * signs, axis=0) * HADAMARD_SCALE
+        hadamard = hadamard.to(tl.bfloat16).to(tl.float32)
+
+        hadamard_2d = tl.reshape(hadamard, (HALF_BLOCK, 2))
+        x_lo, x_hi = tl.split(hadamard_2d)
+        amax = tl.maximum(tl.max(tl.abs(x_lo)), tl.max(tl.abs(x_hi)))
+        amax = tl.maximum(amax, 1.0e-4)
+        exponent = tl.ceil(tl.log2(amax / 6.0))
+        exponent = tl.minimum(tl.maximum(exponent, -127.0), 127.0)
+        inv_scale = tl.exp2(-exponent)
+        lo = _dsv4_mxfp4_e2m1_nibble(x_lo * inv_scale)
+        hi = _dsv4_mxfp4_e2m1_nibble(x_hi * inv_scale)
+        packed = lo | (hi << 4)
+        scale = (exponent + 127.0).to(tl.uint8)
+
+        packed_base = (
+            q_packed_ptr
+            + token_idx * q_packed_stride0
+            + head_idx * q_packed_stride1
+            + quant_block_idx * HALF_BLOCK
+        )
+        scale_base = (
+            q_scale_ptr
+            + token_idx * q_scale_stride0
+            + head_idx * q_scale_stride1
+            + quant_block_idx
+        )
+        tl.store(packed_base + tl.arange(0, HALF_BLOCK), packed)
+        tl.store(scale_base, scale)
+
+    weights = tl.load(weights_ptr + token_idx * weights_stride + head_idx).to(
+        tl.float32
+    )
+    weights = weights * weights_softmax_scale * weights_head_scale
+    tl.store(weights_out_ptr + token_idx * weights_out_stride + head_idx, weights)
+
+
+def _dsv4_use_serial_four_block_indexer_q(
+    *,
+    num_tokens: int,
+    head_dim: int,
+    rope_dim: int,
+    quant_block: int,
+    is_cuda: bool,
+    is_hip: bool,
+    capability: tuple[int, int] | None,
+    shapes_valid: bool,
+    dtypes_valid: bool,
+    devices_valid: bool,
+    inner_strides: tuple[int, int, int, int],
+) -> bool:
+    """Return whether the exact 8192-token SM100 specialization is eligible."""
+
+    return (
+        num_tokens == 8192
+        and head_dim == DEEPSEEK_V4_INDEXER_DIM
+        and rope_dim == DEEPSEEK_V4_ROPE_DIM
+        and quant_block == DEEPSEEK_V4_MXFP4_BLOCK_SIZE
+        and is_cuda
+        and not is_hip
+        and capability == (10, 0)
+        and shapes_valid
+        and dtypes_valid
+        and devices_valid
+        and inner_strides == (1, 1, 1, 1)
+    )
+
+
+@functools.cache
+def _dsv4_indexer_q_cuda_capability(
+    device: torch.device | int | None,
+) -> tuple[int, int] | None:
+    try:
+        if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
+            return None
+        return torch.cuda.get_device_capability(device)
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+@functools.cache
+def _log_serial_four_block_indexer_q_selection(capability: tuple[int, int]) -> None:
+    logger.info(
+        "DeepSeek V4 Indexer-Q launch selection: serial_four_block=True "
+        "tokens=8192 capability=%s",
+        capability,
+    )
+
+
+def _dsv4_serial_four_block_indexer_q_supported(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+) -> bool:
+    if index_q.dim() != 3:
+        return False
+    num_tokens, num_heads, head_dim = index_q.shape
+    capability = (
+        _dsv4_indexer_q_cuda_capability(index_q.device) if num_tokens == 8192 else None
+    )
+    supported = _dsv4_use_serial_four_block_indexer_q(
+        num_tokens=num_tokens,
+        head_dim=head_dim,
+        rope_dim=DEEPSEEK_V4_ROPE_DIM,
+        quant_block=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        is_cuda=index_q.is_cuda,
+        is_hip=getattr(torch.version, "hip", None) is not None,
+        capability=capability,
+        shapes_valid=(
+            positions.shape == (num_tokens,)
+            and cos_sin_cache.dim() == 2
+            and cos_sin_cache.shape[1] == DEEPSEEK_V4_ROPE_DIM
+            and weights.shape == (num_tokens, num_heads)
+        ),
+        dtypes_valid=(
+            index_q.dtype == torch.bfloat16
+            and positions.dtype == torch.int64
+            and cos_sin_cache.dtype == torch.float32
+            and weights.dtype in (torch.bfloat16, torch.float32)
+        ),
+        devices_valid=(
+            positions.device == index_q.device
+            and cos_sin_cache.device == index_q.device
+            and weights.device == index_q.device
+        ),
+        inner_strides=(
+            index_q.stride(-1),
+            positions.stride(-1) if positions.dim() == 1 else 0,
+            cos_sin_cache.stride(-1) if cos_sin_cache.dim() == 2 else 0,
+            weights.stride(-1) if weights.dim() == 2 else 0,
+        ),
+    )
+    if supported:
+        assert capability is not None
+        _log_serial_four_block_indexer_q_selection(capability)
+    return supported
+
+
 def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
     *,
     index_q: torch.Tensor,
@@ -831,6 +1042,7 @@ def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
     weights: torch.Tensor,
     softmax_scale: float,
     head_scale: float,
+    prefer_serial_four_block: bool,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     num_tokens, num_heads, head_dim = index_q.shape
     q_packed = torch.empty(
@@ -847,9 +1059,36 @@ def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
     if num_tokens == 0:
         return (q_packed, q_scale_bytes.view(torch.int32).squeeze(-1)), weights_out
 
-    _dsv4_fused_indexer_q_rope_hadamard_mxfp4_kernel[
-        (num_tokens, num_heads, head_dim // DEEPSEEK_V4_MXFP4_BLOCK_SIZE)
-    ](
+    use_serial_four_block = prefer_serial_four_block and (
+        _dsv4_serial_four_block_indexer_q_supported(
+            index_q,
+            positions,
+            cos_sin_cache,
+            weights,
+        )
+    )
+    kernel = (
+        _dsv4_fused_indexer_q_rope_hadamard_mxfp4_serial_four_block_kernel
+        if use_serial_four_block
+        else _dsv4_fused_indexer_q_rope_hadamard_mxfp4_kernel
+    )
+    grid = (
+        (num_tokens, num_heads)
+        if use_serial_four_block
+        else (num_tokens, num_heads, head_dim // DEEPSEEK_V4_MXFP4_BLOCK_SIZE)
+    )
+    launch_kwargs = {
+        "HEAD_DIM": head_dim,
+        "ROPE_DIM": DEEPSEEK_V4_ROPE_DIM,
+        "QUANT_BLOCK": DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        "HALF_BLOCK": DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2,
+        "HADAMARD_SCALE": head_dim**-0.5,
+        "TRITON_BLOCK_SIZE": triton.next_power_of_2(head_dim),
+        "num_warps": 4,
+    }
+    if use_serial_four_block:
+        launch_kwargs["NUM_QUANT_BLOCKS"] = head_dim // DEEPSEEK_V4_MXFP4_BLOCK_SIZE
+    kernel[grid](
         positions,
         index_q,
         index_q.stride(0),
@@ -868,13 +1107,7 @@ def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
         head_scale,
         weights_out,
         weights_out.stride(0),
-        HEAD_DIM=head_dim,
-        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
-        QUANT_BLOCK=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-        HALF_BLOCK=DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2,
-        HADAMARD_SCALE=head_dim**-0.5,
-        TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
-        num_warps=4,
+        **launch_kwargs,
     )
     return (
         q_packed,
@@ -2170,6 +2403,232 @@ def dsv4_compute_global_topk_indices_and_lens(
     return global_topk_indices, topk_lens
 
 
+@triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
+def _dsv4_decode_dense_compressed_indices_and_lens_kernel(
+    indices_ptr,
+    indices_stride,
+    lens_ptr,
+    positions_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    num_reqs,
+    max_blocks_per_seq,
+    has_valid_token: tl.constexpr,
+    has_block_table_base_offsets: tl.constexpr,
+    block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    width: tl.constexpr,
+    candidate_block: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_is_valid = tl.full((), True, tl.int1)
+    if has_valid_token:
+        token_is_valid = tl.load(is_valid_token_ptr + token_idx)
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int32)
+    req_is_valid = (req_idx >= 0) & (req_idx < num_reqs)
+    position = tl.load(positions_ptr + token_idx).to(tl.int64)
+    compressed_len = tl.minimum(
+        tl.maximum((position + 1) // compress_ratio, 0),
+        width,
+    ).to(tl.int32)
+    compressed_len = tl.where(token_is_valid, compressed_len, 0)
+    tl.store(lens_ptr + token_idx, compressed_len)
+
+    base_page = tl.zeros((), dtype=tl.int32)
+    if has_block_table_base_offsets:
+        base_page = tl.load(
+            block_table_base_offsets_ptr + req_idx,
+            mask=req_is_valid,
+            other=0,
+        ).to(tl.int32)
+
+    for start in range(0, width, candidate_block):
+        offsets = start + tl.arange(0, candidate_block)
+        store_mask = offsets < width
+        entry_is_valid = store_mask & token_is_valid & (offsets < compressed_len)
+        logical_page = offsets // block_size
+        table_page = logical_page - base_page
+        page_is_valid = (
+            entry_is_valid
+            & req_is_valid
+            & (table_page >= 0)
+            & (table_page < max_blocks_per_seq)
+        )
+        block_number = tl.load(
+            block_table_ptr + req_idx * block_table_stride + table_page,
+            mask=page_is_valid,
+            other=-1,
+        ).to(tl.int32)
+        slot = block_number * block_size + offsets % block_size
+        value = tl.where(page_is_valid & (block_number >= 0), slot, -1)
+        tl.store(
+            indices_ptr + token_idx * indices_stride + offsets,
+            value,
+            mask=store_mask,
+        )
+
+
+def dsv4_decode_dense_compressed_indices_and_lens(
+    *,
+    positions: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    compress_ratio: int,
+    width: int,
+    block_table_base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
+    out_indices: torch.Tensor | None,
+    out_lens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build dense compressed decode KV slots and per-token lengths.
+
+    The result matches the logical dense-prefix mapping previously expressed
+    as a chain of PyTorch div/clamp/where/index operations.  On CUDA, one
+    Triton launch constructs physical cache slots directly so a first HCA
+    layer cannot permanently capture that elementwise chain into every graph
+    replay.
+    """
+
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if width < 0:
+        raise ValueError(f"width must be non-negative, got {width}")
+    num_tokens = positions.numel()
+    if token_to_req_indices.numel() < num_tokens:
+        raise ValueError(
+            "token_to_req_indices must cover every position: "
+            f"positions={num_tokens}, request_indices={token_to_req_indices.numel()}"
+        )
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
+    if out_indices is None:
+        out_indices = torch.empty(
+            (num_tokens, width),
+            dtype=torch.int32,
+            device=positions.device,
+        )
+    if out_lens is None:
+        out_lens = torch.empty(
+            num_tokens,
+            dtype=torch.int32,
+            device=positions.device,
+        )
+    if out_indices.shape != (num_tokens, width) or out_indices.dtype != torch.int32:
+        raise ValueError(
+            "out_indices must be int32 with shape "
+            f"{(num_tokens, width)}, got {tuple(out_indices.shape)} {out_indices.dtype}"
+        )
+    if out_lens.shape != (num_tokens,) or out_lens.dtype != torch.int32:
+        raise ValueError(
+            "out_lens must be int32 with shape "
+            f"{(num_tokens,)}, got {tuple(out_lens.shape)} {out_lens.dtype}"
+        )
+    if num_tokens == 0 or width == 0:
+        return out_indices, out_lens
+
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[:num_tokens].to(
+            device=positions.device,
+            dtype=torch.bool,
+        )
+    if positions.is_cuda:
+        if is_valid_token is None:
+            is_valid_token = torch.empty(
+                0,
+                dtype=torch.bool,
+                device=positions.device,
+            )
+        block_table_i32 = _as_int32_block_table(block_table)
+        candidate_block = min(1024, triton.next_power_of_2(max(1, width)))
+        _dsv4_decode_dense_compressed_indices_and_lens_kernel[(num_tokens,)](
+            out_indices,
+            out_indices.stride(0),
+            out_lens,
+            positions,
+            token_to_req_indices.to(torch.int32),
+            is_valid_token,
+            block_table_i32,
+            (
+                block_table_base_offsets.to(torch.int32)
+                if block_table_base_offsets is not None
+                else None
+            ),
+            block_table_i32.stride(0),
+            block_table_i32.shape[0],
+            block_table_i32.shape[1],
+            is_valid_token.numel() != 0,
+            block_table_base_offsets is not None,
+            block_size=block_size,
+            compress_ratio=compress_ratio,
+            width=width,
+            candidate_block=candidate_block,
+        )
+        return out_indices, out_lens
+
+    req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+    compressed_lens = torch.div(
+        positions.to(torch.int64) + 1,
+        compress_ratio,
+        rounding_mode="floor",
+    ).clamp(0, width)
+    if is_valid_token is not None:
+        compressed_lens = torch.where(
+            is_valid_token,
+            compressed_lens,
+            torch.zeros_like(compressed_lens),
+        )
+    offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
+    valid = offsets[None, :] < compressed_lens[:, None]
+    safe_local = torch.where(
+        valid, offsets[None, :], torch.zeros_like(offsets)[None, :]
+    )
+    pages = torch.div(safe_local, block_size, rounding_mode="floor")
+    if block_table_base_offsets is not None:
+        rows = int(block_table_base_offsets.shape[0])
+        valid_req = (req_idx >= 0) & (req_idx < rows)
+        safe_req = req_idx.clamp(0, max(0, rows - 1))
+        if rows <= 0:
+            pages = torch.full_like(pages, -1)
+        else:
+            base_pages = block_table_base_offsets.to(torch.int64)[safe_req]
+            pages = torch.where(valid_req[:, None], pages - base_pages[:, None], -1)
+    page_offsets = safe_local % block_size
+    rows = int(block_table.shape[0])
+    cols = int(block_table.shape[1])
+    if rows <= 0 or cols <= 0:
+        page_ids = torch.full_like(pages, -1)
+    else:
+        page_valid = (
+            (req_idx[:, None] >= 0)
+            & (req_idx[:, None] < rows)
+            & (pages >= 0)
+            & (pages < cols)
+        )
+        safe_req = req_idx.clamp(0, rows - 1)
+        safe_page = pages.clamp(0, cols - 1)
+        page_ids = torch.where(
+            page_valid,
+            block_table.to(torch.int64)[safe_req[:, None], safe_page],
+            torch.full_like(pages, -1),
+        )
+    out_indices.copy_(
+        torch.where(
+            valid & (page_ids >= 0),
+            page_ids * block_size + page_offsets,
+            torch.full_like(page_ids, -1),
+        ).to(torch.int32)
+    )
+    out_lens.copy_(compressed_lens.to(torch.int32))
+    return out_indices, out_lens
+
+
 @triton.jit
 def _dsv4_combine_topk_swa_indices_kernel(
     combined_indices_ptr,
@@ -2725,6 +3184,509 @@ def dsv4_compressed_slot_mapping(
         candidate_block=1024,
     )
     return slot_mapping
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "num_reqs",
+        "max_blocks_per_seq",
+    ]
+)
+def _dsv4_compact_compressed_slot_mapping_kernel(
+    slot_mapping_ptr,
+    token_to_req_indices_ptr,
+    token_to_req_indices_stride,
+    query_start_loc_ptr,
+    query_start_loc_stride,
+    seq_lens_ptr,
+    seq_lens_stride,
+    is_valid_token_ptr,
+    is_valid_token_stride,
+    block_table_ptr,
+    block_table_stride,
+    block_table_base_offsets_ptr,
+    block_table_base_offsets_stride,
+    num_tokens,
+    num_reqs,
+    max_blocks_per_seq,
+    has_valid_token: tl.constexpr,
+    has_block_table_base_offsets: tl.constexpr,
+    block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_is_valid = token_idx < num_tokens
+    if has_valid_token:
+        token_is_valid &= tl.load(
+            is_valid_token_ptr + token_idx * is_valid_token_stride,
+            mask=token_is_valid,
+            other=False,
+        )
+
+    req_idx = tl.load(
+        token_to_req_indices_ptr + token_idx * token_to_req_indices_stride,
+        mask=token_is_valid,
+        other=-1,
+    ).to(tl.int32)
+    req_is_valid = token_is_valid & (req_idx >= 0) & (req_idx < num_reqs)
+    query_start = tl.load(
+        query_start_loc_ptr + req_idx * query_start_loc_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    query_end = tl.load(
+        query_start_loc_ptr + (req_idx + 1) * query_start_loc_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    seq_len = tl.load(
+        seq_lens_ptr + req_idx * seq_lens_stride,
+        mask=req_is_valid,
+        other=0,
+    ).to(tl.int64)
+    position = seq_len - (query_end - query_start) + token_idx - query_start
+    compressed_position = position // compress_ratio
+    logical_page = compressed_position // block_size
+    offset = compressed_position % block_size
+
+    base_page = tl.zeros((), dtype=tl.int64)
+    if has_block_table_base_offsets:
+        base_page = tl.load(
+            block_table_base_offsets_ptr + req_idx * block_table_base_offsets_stride,
+            mask=req_is_valid,
+            other=0,
+        ).to(tl.int64)
+    table_page = logical_page - base_page
+    page_is_valid = (
+        req_is_valid
+        & (position >= 0)
+        & ((position + 1) % compress_ratio == 0)
+        & (table_page >= 0)
+        & (table_page < max_blocks_per_seq)
+    )
+    page_id = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_page,
+        mask=page_is_valid,
+        other=-1,
+    ).to(tl.int64)
+    slot = page_id * block_size + offset
+    tl.store(
+        slot_mapping_ptr + token_idx,
+        tl.where(page_is_valid & (page_id >= 0), slot, -1),
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "num_reqs",
+        "max_blocks_per_req",
+    ]
+)
+def _dsv4_group_slot_mapping_kernel(
+    out_ptr,
+    positions_ptr,
+    positions_stride,
+    req_indices_ptr,
+    req_indices_stride,
+    block_table_ptr,
+    block_table_stride,
+    base_offsets_ptr,
+    base_offsets_stride,
+    valid_token_ptr,
+    valid_token_stride,
+    num_tokens,
+    num_reqs,
+    max_blocks_per_req,
+    req_repeat: tl.constexpr,
+    valid_repeat: tl.constexpr,
+    has_base_offsets: tl.constexpr,
+    has_valid_token: tl.constexpr,
+    rows_per_block: tl.constexpr,
+    entry_stride_tokens: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_in_range = token_idx < num_tokens
+    position = tl.load(
+        positions_ptr + token_idx * positions_stride,
+        mask=token_in_range,
+        other=-1,
+    ).to(tl.int64)
+    req_value_idx = token_idx // req_repeat
+    req_idx = tl.load(
+        req_indices_ptr + req_value_idx * req_indices_stride,
+        mask=token_in_range,
+        other=-1,
+    ).to(tl.int64)
+    req_is_valid = token_in_range & (req_idx >= 0) & (req_idx < num_reqs)
+
+    token_is_valid = req_is_valid
+    if has_valid_token:
+        valid_value_idx = token_idx // valid_repeat
+        token_is_valid &= tl.load(
+            valid_token_ptr + valid_value_idx * valid_token_stride,
+            mask=token_in_range,
+            other=False,
+        )
+
+    logical_row = position // entry_stride_tokens
+    logical_block = logical_row // rows_per_block
+    row_offset = logical_row % rows_per_block
+    base_block = tl.zeros((), dtype=tl.int64)
+    if has_base_offsets:
+        base_block = tl.load(
+            base_offsets_ptr + req_idx * base_offsets_stride,
+            mask=req_is_valid,
+            other=0,
+        ).to(tl.int64)
+    table_block = logical_block - base_block
+    table_entry_is_valid = (
+        token_is_valid
+        & (position >= 0)
+        & (table_block >= 0)
+        & (table_block < max_blocks_per_req)
+    )
+    block_id = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_block,
+        mask=table_entry_is_valid,
+        other=-1,
+    ).to(tl.int64)
+    slot = block_id * rows_per_block + row_offset
+    tl.store(
+        out_ptr + token_idx,
+        tl.where(table_entry_is_valid & (block_id >= 0), slot, -1),
+        mask=token_in_range,
+    )
+
+
+def dsv4_compact_compressed_slot_mapping(
+    *,
+    num_tokens: int,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    compress_ratio: int,
+    block_table_base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Build slots for a grouped DeepSeek V4 compressed-cache page table.
+
+    The table may contain full logical rows or compact rows accompanied by a
+    per-request base logical-page offset. Invalid and non-boundary tokens map
+    to ``-1``.
+    """
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if token_to_req_indices.numel() < num_tokens:
+        raise ValueError(
+            "token_to_req_indices must cover every token: "
+            f"tokens={num_tokens}, request_indices={token_to_req_indices.numel()}"
+        )
+    if query_start_loc.dim() != 1 or seq_lens.dim() != 1:
+        raise ValueError("query_start_loc and seq_lens must be 1-D")
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
+    if block_table_base_offsets is not None and block_table_base_offsets.dim() != 1:
+        raise ValueError("block_table_base_offsets must be 1-D")
+    if is_valid_token is not None:
+        if is_valid_token.numel() != num_tokens:
+            if is_valid_token.numel() <= 0 or num_tokens % is_valid_token.numel() != 0:
+                raise ValueError(
+                    "is_valid_token must cover or evenly expand across every token: "
+                    f"tokens={num_tokens}, validity={is_valid_token.numel()}"
+                )
+            is_valid_token = is_valid_token.repeat_interleave(
+                num_tokens // is_valid_token.numel()
+            )
+        is_valid_token = is_valid_token.to(device=seq_lens.device, dtype=torch.bool)
+    if out is None:
+        out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
+    if out.dim() != 1 or out.dtype != torch.int64 or out.numel() < num_tokens:
+        raise ValueError(
+            "out must be a 1-D int64 tensor with at least num_tokens entries, got "
+            f"shape={tuple(out.shape)} dtype={out.dtype} tokens={num_tokens}"
+        )
+    if out.stride(0) != 1:
+        raise ValueError("out must be contiguous")
+
+    slot_mapping = out[:num_tokens]
+    if out.numel() == 0:
+        return slot_mapping
+
+    num_reqs = min(
+        seq_lens.numel(),
+        max(0, query_start_loc.numel() - 1),
+        block_table.shape[0],
+        (
+            block_table_base_offsets.numel()
+            if block_table_base_offsets is not None
+            else seq_lens.numel()
+        ),
+    )
+    if seq_lens.is_cuda:
+        req_indices_i32 = token_to_req_indices.to(torch.int32)
+        query_start_i32 = query_start_loc.to(torch.int32)
+        seq_lens_i32 = seq_lens.to(torch.int32)
+        block_table_i32 = _as_int32_block_table(block_table)
+        validity_arg = seq_lens_i32 if is_valid_token is None else is_valid_token
+        base_offsets_arg = (
+            seq_lens_i32
+            if block_table_base_offsets is None
+            else block_table_base_offsets.to(torch.int32)
+        )
+        _dsv4_compact_compressed_slot_mapping_kernel[(out.numel(),)](
+            out,
+            req_indices_i32,
+            req_indices_i32.stride(0),
+            query_start_i32,
+            query_start_i32.stride(0),
+            seq_lens_i32,
+            seq_lens_i32.stride(0),
+            validity_arg,
+            validity_arg.stride(0),
+            block_table_i32,
+            block_table_i32.stride(0),
+            base_offsets_arg,
+            base_offsets_arg.stride(0),
+            num_tokens,
+            num_reqs,
+            block_table_i32.shape[1],
+            has_valid_token=is_valid_token is not None,
+            has_block_table_base_offsets=block_table_base_offsets is not None,
+            block_size=block_size,
+            compress_ratio=compress_ratio,
+        )
+        return slot_mapping
+
+    out.fill_(-1)
+    if num_tokens == 0 or num_reqs == 0:
+        return slot_mapping
+    req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
+    valid_req = (req_idx >= 0) & (req_idx < num_reqs)
+    safe_req = req_idx.clamp(0, num_reqs - 1)
+    query_starts = query_start_loc[safe_req].to(torch.int64)
+    query_lens = query_start_loc[safe_req + 1].to(torch.int64) - query_starts
+    positions = (
+        seq_lens[safe_req].to(torch.int64)
+        - query_lens
+        + torch.arange(num_tokens, dtype=torch.int64, device=seq_lens.device)
+        - query_starts
+    )
+    compressed_positions = torch.div(positions, compress_ratio, rounding_mode="floor")
+    table_pages = torch.div(compressed_positions, block_size, rounding_mode="floor")
+    if block_table_base_offsets is not None:
+        table_pages -= block_table_base_offsets[safe_req].to(torch.int64)
+    valid_page = (
+        valid_req
+        & (positions >= 0)
+        & (((positions + 1) % compress_ratio) == 0)
+        & (table_pages >= 0)
+        & (table_pages < block_table.shape[1])
+    )
+    safe_page = table_pages.clamp(0, max(0, block_table.shape[1] - 1))
+    if block_table.shape[1] == 0:
+        page_ids = torch.full_like(table_pages, -1)
+    else:
+        page_ids = block_table.to(torch.int64)[safe_req, safe_page]
+    valid_page &= page_ids >= 0
+    if is_valid_token is not None:
+        valid_page &= is_valid_token[:num_tokens]
+    slots = page_ids * block_size + compressed_positions % block_size
+    slot_mapping.copy_(torch.where(valid_page, slots, torch.full_like(slots, -1)))
+    return slot_mapping
+
+
+def dsv4_group_slot_mapping(
+    *,
+    positions: torch.Tensor,
+    req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    rows_per_block: int,
+    entry_stride_tokens: int,
+    base_offsets: torch.Tensor | None,
+    is_valid_token: torch.Tensor | None,
+) -> torch.Tensor:
+    """Map logical token positions to physical rows of a cache block table.
+
+    Request indices and validity values may either have one entry per token or
+    evenly expand across packed token groups. Invalid requests, table entries,
+    positions, pages, and graph-padding tokens map to ``-1``.
+    """
+
+    if rows_per_block <= 0:
+        raise ValueError(f"rows_per_block must be positive, got {rows_per_block}")
+    if entry_stride_tokens <= 0:
+        raise ValueError(
+            f"entry_stride_tokens must be positive, got {entry_stride_tokens}"
+        )
+    if positions.dim() != 1 or req_indices.dim() != 1:
+        raise ValueError("positions and req_indices must be 1-D")
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
+    num_tokens = positions.numel()
+    if not positions.is_cuda:
+        raise ValueError("dsv4_group_slot_mapping requires CUDA tensors")
+    out = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
+    if num_tokens == 0:
+        return out
+    if req_indices.numel() <= 0 or num_tokens % req_indices.numel() != 0:
+        raise ValueError(
+            "req_indices must evenly expand across positions: "
+            f"tokens={num_tokens}, request_indices={req_indices.numel()}"
+        )
+    if base_offsets is not None and base_offsets.dim() != 1:
+        raise ValueError("base_offsets must be 1-D")
+    if is_valid_token is not None:
+        if is_valid_token.dim() != 1:
+            raise ValueError("is_valid_token must be 1-D")
+        if is_valid_token.numel() <= 0 or num_tokens % is_valid_token.numel() != 0:
+            raise ValueError(
+                "is_valid_token must evenly expand across positions: "
+                f"tokens={num_tokens}, validity={is_valid_token.numel()}"
+            )
+    if block_table.shape[0] == 0 or block_table.shape[1] == 0:
+        out.fill_(-1)
+        return out
+    dummy = positions
+    base_arg = dummy if base_offsets is None else base_offsets
+    valid_arg = dummy if is_valid_token is None else is_valid_token
+    _dsv4_group_slot_mapping_kernel[(num_tokens,)](
+        out,
+        positions,
+        positions.stride(0),
+        req_indices,
+        req_indices.stride(0),
+        block_table,
+        block_table.stride(0),
+        base_arg,
+        base_arg.stride(0),
+        valid_arg,
+        valid_arg.stride(0),
+        num_tokens,
+        block_table.shape[0],
+        block_table.shape[1],
+        req_repeat=num_tokens // req_indices.numel(),
+        valid_repeat=(
+            1 if is_valid_token is None else num_tokens // is_valid_token.numel()
+        ),
+        has_base_offsets=base_offsets is not None,
+        has_valid_token=is_valid_token is not None,
+        rows_per_block=rows_per_block,
+        entry_stride_tokens=entry_stride_tokens,
+    )
+    return out
+
+
+@triton.jit(do_not_specialize=["actual_bs"])
+def _dsv4_validate_active_cache_pages_kernel(
+    out_ptr,
+    seq_lens_ptr,
+    seq_lens_stride,
+    block_table_ptr,
+    block_table_row_stride,
+    block_table_col_stride,
+    actual_bs,
+    table_width,
+    raw_tokens_per_page,
+    max_page_id,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.arange(0, BLOCK_SIZE)
+    row_is_live = row < actual_bs
+    seq_len = tl.load(
+        seq_lens_ptr + row * seq_lens_stride,
+        mask=row_is_live,
+        other=0,
+    ).to(tl.int64)
+    has_tokens = row_is_live & (seq_len > 0)
+    required_page = (tl.maximum(seq_len, 1) - 1) // raw_tokens_per_page
+    page_is_in_bounds = required_page < table_width
+    safe_page = tl.minimum(tl.maximum(required_page, 0), table_width - 1)
+    page_id = tl.load(
+        block_table_ptr
+        + row * block_table_row_stride
+        + safe_page * block_table_col_stride,
+        mask=has_tokens & page_is_in_bounds,
+        other=1,
+    ).to(tl.int64)
+    invalid = row_is_live & (
+        (seq_len < 0)
+        | (
+            has_tokens
+            & ((~page_is_in_bounds) | (page_id <= 0) | (page_id > max_page_id))
+        )
+    )
+    any_invalid = tl.max(invalid.to(tl.int32), axis=0)
+    tl.store(out_ptr, any_invalid == 0)
+
+
+def dsv4_validate_active_cache_pages(
+    *,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_bs: int,
+    raw_tokens_per_page: int,
+    max_page_id: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Validate every live request's active cache page with one CUDA kernel."""
+    if seq_lens.dim() != 1:
+        raise ValueError(f"seq_lens must be 1-D, got {tuple(seq_lens.shape)}")
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2-D, got {tuple(block_table.shape)}")
+    if not seq_lens.is_cuda or not block_table.is_cuda:
+        raise ValueError("dsv4_validate_active_cache_pages requires CUDA tensors")
+    if seq_lens.device != block_table.device:
+        raise ValueError("seq_lens and block_table must use the same CUDA device")
+    if actual_bs < 0 or actual_bs > min(seq_lens.numel(), block_table.shape[0]):
+        raise ValueError(
+            "actual_bs must fit seq_lens and block_table rows: "
+            f"actual_bs={actual_bs}, seq_lens={seq_lens.numel()}, "
+            f"table_rows={block_table.shape[0]}"
+        )
+    if block_table.shape[1] <= 0:
+        raise ValueError("block_table must have at least one column")
+    if raw_tokens_per_page <= 0:
+        raise ValueError(
+            f"raw_tokens_per_page must be positive, got {raw_tokens_per_page}"
+        )
+    if max_page_id <= 0:
+        raise ValueError(f"max_page_id must be positive, got {max_page_id}")
+    if (
+        out.shape != (1,)
+        or out.dtype != torch.bool
+        or not out.is_cuda
+        or out.device != seq_lens.device
+    ):
+        raise ValueError(
+            "out must be a one-element CUDA bool tensor on the input device"
+        )
+    if actual_bs == 0:
+        out.fill_(True)
+        return out
+    block_size = triton.next_power_of_2(max(1, int(seq_lens.numel())))
+    _dsv4_validate_active_cache_pages_kernel[(1,)](
+        out,
+        seq_lens,
+        seq_lens.stride(0),
+        block_table,
+        block_table.stride(0),
+        block_table.stride(1),
+        actual_bs,
+        block_table.shape[1],
+        raw_tokens_per_page,
+        max_page_id,
+        BLOCK_SIZE=block_size,
+    )
+    return out
 
 
 @triton.jit

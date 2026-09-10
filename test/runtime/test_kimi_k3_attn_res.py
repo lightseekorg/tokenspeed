@@ -39,9 +39,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-import tokenspeed_kernel.ops.attn_res as attn_res_ops  # noqa: E402
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
-from tokenspeed_kernel.ops.attn_res.torch import torch_attn_res_fwd  # noqa: E402
+import tokenspeed_kernel.ops.residual as residual_ops  # noqa: E402
+from tokenspeed_kernel.ops.residual import attn_res_fwd  # noqa: E402
+from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd  # noqa: E402
 
 from tokenspeed.runtime.layers.layernorm import RMSNorm  # noqa: E402
 from tokenspeed.runtime.models import kimi_k3  # noqa: E402
@@ -247,10 +247,10 @@ class AttnResTests(unittest.TestCase):
         prefix_sum, block_residual, proj, norm = _make_inputs(3)
         selected = SimpleNamespace(impl=torch_attn_res_fwd)
         with mock.patch.object(
-            attn_res_ops, "select_kernel", return_value=selected
+            residual_ops, "select_kernel", return_value=selected
         ) as select:
             self.assertFalse(
-                attn_res_ops.attn_res_fwd_available(
+                residual_ops.attn_res_fwd_available(
                     prefix_sum,
                     block_residual,
                     proj.weight.reshape(-1).to(torch.bfloat16),
@@ -268,7 +268,7 @@ class AttnResTests(unittest.TestCase):
         weight = torch.ones(hidden, dtype=torch.bfloat16)
 
         self.assertFalse(
-            attn_res_ops.attn_res_fwd_available(
+            residual_ops.attn_res_fwd_available(
                 prefix_sum,
                 block_residual,
                 weight,
@@ -507,12 +507,12 @@ class AttnResTests(unittest.TestCase):
     def test_cuda_kernel_matches_torch_fallback(self):
         # Only runs where the Blackwell attn_res build is present (e.g. B300 CI).
         try:
-            from tokenspeed_kernel.ops.attn_res.cuda import _HAS_CUDA_KERNEL
+            from tokenspeed_kernel.ops.residual.cuda import _HAS_CUDA_KERNEL
         except ImportError:
             _HAS_CUDA_KERNEL = False
         if not (_HAS_CUDA_KERNEL and torch.cuda.is_available()):
             self.skipTest("Blackwell attn_res kernel not available")
-        from tokenspeed_kernel.ops.attn_res import attn_res_fwd
+        from tokenspeed_kernel.ops.residual import attn_res_fwd
 
         torch.manual_seed(0)
         T, H, K = 128, 7168, 8  # kernel-eligible shape (H in supported set)
@@ -541,12 +541,12 @@ class AttnResTests(unittest.TestCase):
         must stay on the torch fallback.
         """
         try:
-            from tokenspeed_kernel.ops.attn_res.cuda import _HAS_CUDA_KERNEL
+            from tokenspeed_kernel.ops.residual.cuda import _HAS_CUDA_KERNEL
         except ImportError:
             _HAS_CUDA_KERNEL = False
         if not (_HAS_CUDA_KERNEL and torch.cuda.is_available()):
             self.skipTest("Blackwell attn_res kernel not available")
-        from tokenspeed_kernel.ops.attn_res import attn_res_fwd
+        from tokenspeed_kernel.ops.residual import attn_res_fwd
 
         torch.manual_seed(0)
         T, H = 1, 7168
@@ -651,12 +651,12 @@ class AttnResOutNormTests(unittest.TestCase):
 
     def test_cuda_kernel_out_norm_matches_torch(self):
         try:
-            from tokenspeed_kernel.ops.attn_res.cuda import _HAS_CUDA_KERNEL
+            from tokenspeed_kernel.ops.residual.cuda import _HAS_CUDA_KERNEL
         except ImportError:
             _HAS_CUDA_KERNEL = False
         if not (_HAS_CUDA_KERNEL and torch.cuda.is_available()):
             self.skipTest("Blackwell attn_res kernel not available")
-        from tokenspeed_kernel.ops.attn_res import attn_res_fwd
+        from tokenspeed_kernel.ops.residual import attn_res_fwd
 
         torch.manual_seed(1)
         T, H, K = 64, 7168, 8

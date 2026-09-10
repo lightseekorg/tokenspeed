@@ -89,6 +89,18 @@ on replay. PLE's uniform index bundles are reused during capture only; eager
 prefill and decode construct their indices through the same builder outside
 the capture pool.
 
+GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
+and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
+use uninitialized output and a placeholder for a disabled intermediate cache:
+live rows are fully written, while negative padding rows skip state access
+and leave output undefined. Consumers must ignore padded output; enabled
+intermediate caches always require real storage.
+
+GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
+reading inputs and signal after computation; FlashInfer adapters preserve the
+upstream CuTe body and isolate PDL compilation caches. Graphs retain their
+capture-time PDL setting and must be recaptured to change it.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base
@@ -453,7 +465,10 @@ buffer; `fill_input_buffers` takes no table.
   write. A model path that writes multiple mode windows in one shot (the
   MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
   DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. V4 composes the shared token-shaped resolve
+  graph. The router performs the same composition when a draft step-0
+  forward locally dispatches as DECODE while retaining the round's full K/V
+  rows; target MIXED decode halves and later draft steps keep their ordinary
+  decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
