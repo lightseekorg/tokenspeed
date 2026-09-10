@@ -32,6 +32,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_amd,
+    reason="Iris communication tests require AMD ROCm",
+)
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
