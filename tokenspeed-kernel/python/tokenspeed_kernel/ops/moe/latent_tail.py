@@ -348,6 +348,7 @@ class KimiK3LatentTailOp:
                         scratch_allocator=effective_scratch_allocator,
                         finalize_top_k=contract.finalize_top_k,
                         precompile_split=contract.split_collective,
+                        residual_from_shared=False,
                     ),
                     up_projection=AdaptiveUpProjectionKernel(
                         group=group,

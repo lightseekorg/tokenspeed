@@ -60,6 +60,9 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     latent_tail_supported,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
+    CollectiveKernel as _AttnCollective,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
@@ -76,6 +79,15 @@ from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+# The one-shot window for a 7168 hidden at TP8; wider batches keep the vendor AR.
+ATTN_AR_MAX_TOKENS = 8
+
+
+def attn_ar_eligible(armed: bool, has_prefix: bool, num_tokens: int) -> bool:
+    """Whether the tokenspeed collective, not the vendor AR, serves this reduce."""
+    return armed and has_prefix and 0 < num_tokens <= ATTN_AR_MAX_TOKENS
+
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +253,31 @@ class K3AttnCommState:
             device=torch.device("cuda", torch.cuda.current_device()),
         )
         self.dummy_norm.weight.requires_grad_(False)
+
+        # Callers hand in their own output buffer, so one instance serves every
+        # layer: layer L's output is still the reduce operand of layer L+1.
+        self.cute_ar = None
+        if self.attn_ar_fusion_ok:
+            group = _get_process_group(mapping.attn.tp_group)
+            self.cute_ar = _AttnCollective(
+                group=group,
+                rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                latent_dim=hidden,
+                hidden_dim=hidden,
+                max_m=ATTN_AR_MAX_TOKENS,
+                max_token_ctas=ATTN_AR_MAX_TOKENS,
+                # Unread here: residual_from_shared compiles the RMSNorm out.
+                rms_eps=1.0,
+                fp32_internal=True,
+                scratch_allocator=None,
+                finalize_top_k=None,
+                precompile_split=True,
+                residual_from_shared=True,
+            )
+            logger.info("Kimi K3 attention AR backend: tokenspeed CuteDSL collective")
+        else:
+            logger.info("Kimi K3 attention AR backend: vendor fused all-reduce")
 
 
 class K3MoeTailCommState:
@@ -417,6 +454,25 @@ class K3AttnComm:
         combine kernels consume it in place of the separate weights.
         """
         num_tokens = attn_partial.shape[0]
+        if attn_ar_eligible(
+            self.state.cute_ar is not None, prefix_sum is not None, num_tokens
+        ):
+            # The kernel writes a full max_m rows, so the buffer is that wide
+            # even when the batch is not; ``prefix_sum`` carries the residual.
+            residual_out, _ = self.state.cute_ar(
+                attn_partial,
+                prefix_sum,
+                self.state.dummy_norm.weight,
+                include_reduce_scatter=False,
+                include_routed=True,
+                latent_output_override=torch.empty(
+                    ATTN_AR_MAX_TOKENS,
+                    attn_partial.shape[1],
+                    dtype=attn_partial.dtype,
+                    device=attn_partial.device,
+                ),
+            )
+            return residual_out, None
         if (
             prefix_sum is not None
             and self.state.attn_ar_fusion_ok

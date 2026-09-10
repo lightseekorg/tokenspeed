@@ -114,6 +114,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         max_m: int,
         max_token_ctas: int,
         fp32_internal: bool = False,
+        # Swaps the epilogue: emit reduced + shared_source instead of
+        # RMSNorm(reduced). ``gamma`` and ``rms_eps`` go unread in this mode.
+        residual_from_shared: bool = False,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         use_pdl: bool | None = None,
@@ -177,6 +180,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             min(max_m, max_token_ctas) if include_reduce_scatter else max_m
         )
         self.fp32_internal = fp32_internal
+        self.residual_from_shared = residual_from_shared
         self.include_reduce_scatter = include_reduce_scatter
         self.include_routed = include_routed
 
@@ -502,62 +506,82 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             if cutlass.const_expr(self.fp32_internal):
                 # High-precision fused mode: keep the rank reduction in FP32 through the RMS square.
                 norm_input = accum.load()
-                norm_square = norm_input * norm_input
             else:
                 norm_input_bf16 = accum.load().to(BFloat16)
                 norm_input = norm_input_bf16.to(Float32)
-                # Upstream-compatible mode: BF16 * BF16 first, then promote the rounded square to FP32.
-                norm_square = (norm_input_bf16 * norm_input_bf16).to(Float32)
-            thread_sum = norm_square.reduce(
-                cute.ReductionOp.ADD,
-                init_val=Float32(0.0),
-                reduction_profile=0,
-            )
-            smem = cutlass.utils.SmemAllocator()
-            warp_sums = smem.allocate_tensor(
-                Float32, cute.make_layout((self.warps,)), byte_alignment=4
-            )
-            cluster_sums = smem.allocate_tensor(
-                Float32,
-                cute.make_layout((self.cluster_ctas,)),
-                byte_alignment=4,
-            )
-            block_sum = block_sum_specialized(
-                thread_sum,
-                warp_sums,
-                tidx,
-                self.warps,
-                self.last_warp_lanes,
-                self.last_warp_mask,
-            )
-            if tidx < self.cluster_ctas:
-                local_slot = cluster_sums.iterator + cluster_rank
-                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-                store_shared_cluster_f32(remote_slot, block_sum)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            if cutlass.const_expr(self.residual_from_shared):
+                # Attention reduce: emit reduced+residual, not RMSNorm(reduced).
+                res_ptr = cute.make_ptr(
+                    BFloat16,
+                    (shared_source.iterator + element_offset).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                res_values = packed_u32x4_to_bf16x8(
+                    load_global_u32x4(res_ptr, volatile=False)
+                )
+                prefix = (norm_input + res_values.to(Float32)).to(BFloat16)
+                store_global_u32x4(
+                    Int64((latent_output.iterator + element_offset).toint()),
+                    bf16x8_to_packed_u32x4(prefix),
+                    volatile=False,
+                )
+            else:
+                if cutlass.const_expr(self.fp32_internal):
+                    norm_square = norm_input * norm_input
+                else:
+                    # Upstream-compatible mode: BF16 * BF16 first, then promote the rounded square to FP32.
+                    norm_square = (norm_input_bf16 * norm_input_bf16).to(Float32)
+                thread_sum = norm_square.reduce(
+                    cute.ReductionOp.ADD,
+                    init_val=Float32(0.0),
+                    reduction_profile=0,
+                )
+                smem = cutlass.utils.SmemAllocator()
+                warp_sums = smem.allocate_tensor(
+                    Float32, cute.make_layout((self.warps,)), byte_alignment=4
+                )
+                cluster_sums = smem.allocate_tensor(
+                    Float32,
+                    cute.make_layout((self.cluster_ctas,)),
+                    byte_alignment=4,
+                )
+                block_sum = block_sum_specialized(
+                    thread_sum,
+                    warp_sums,
+                    tidx,
+                    self.warps,
+                    self.last_warp_lanes,
+                    self.last_warp_mask,
+                )
+                if tidx < self.cluster_ctas:
+                    local_slot = cluster_sums.iterator + cluster_rank
+                    remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                    store_shared_cluster_f32(remote_slot, block_sum)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
 
-            full_sum = Float32(0.0)
-            for peer in cutlass.range_constexpr(self.cluster_ctas):
-                full_sum = full_sum + cluster_sums[peer]
-            inv_rms = cute.math.rsqrt(
-                full_sum / Float32(self.latent_dim) + epsilon, fastmath=True
-            )
-            gamma_ptr = cute.make_ptr(
-                BFloat16,
-                (gamma.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            gamma_values = packed_u32x4_to_bf16x8(
-                load_global_u32x4(gamma_ptr, volatile=False)
-            )
-            result = (norm_input * inv_rms * gamma_values.to(Float32)).to(BFloat16)
-            store_global_u32x4(
-                Int64((latent_output.iterator + element_offset).toint()),
-                bf16x8_to_packed_u32x4(result),
-                volatile=False,
-            )
+                full_sum = Float32(0.0)
+                for peer in cutlass.range_constexpr(self.cluster_ctas):
+                    full_sum = full_sum + cluster_sums[peer]
+                inv_rms = cute.math.rsqrt(
+                    full_sum / Float32(self.latent_dim) + epsilon, fastmath=True
+                )
+                gamma_ptr = cute.make_ptr(
+                    BFloat16,
+                    (gamma.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                gamma_values = packed_u32x4_to_bf16x8(
+                    load_global_u32x4(gamma_ptr, volatile=False)
+                )
+                result = (norm_input * inv_rms * gamma_values.to(Float32)).to(BFloat16)
+                store_global_u32x4(
+                    Int64((latent_output.iterator + element_offset).toint()),
+                    bf16x8_to_packed_u32x4(result),
+                    volatile=False,
+                )
 
             # The x=0 CTA rotates only on its final token wave: waiting for all M arrivals guarantees every token-wave CTA loaded the current generation before the metadata advances.
             if (
@@ -758,6 +782,7 @@ def _compile_key(
     max_m: int,
     max_token_ctas: int,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool,
     include_routed: bool,
     finalize_top_k: int | None = None,
@@ -771,6 +796,7 @@ def _compile_key(
         max_m,
         max_token_ctas,
         fp32_internal,
+        residual_from_shared,
         include_reduce_scatter,
         include_routed,
         finalize_top_k,
@@ -837,6 +863,7 @@ def compile_kernel(
     shared_peer_ptrs: torch.Tensor,
     rms_eps: float,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
     finalize_top_k: int | None = None,
@@ -851,6 +878,7 @@ def compile_kernel(
         max_m,
         max_token_ctas,
         fp32_internal,
+        residual_from_shared,
         include_reduce_scatter,
         include_routed,
         finalize_top_k,
@@ -875,6 +903,7 @@ def compile_kernel(
         max_m=max_m,
         max_token_ctas=max_token_ctas,
         fp32_internal=fp32_internal,
+        residual_from_shared=residual_from_shared,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
         finalize_top_k=finalize_top_k,
@@ -925,6 +954,7 @@ def launch(
     max_m: int,
     max_token_ctas: int,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
     finalize_top_k: int | None = None,
@@ -946,6 +976,7 @@ def launch(
         shared_peer_ptrs=shared_peer_ptrs,
         rms_eps=rms_eps,
         fp32_internal=fp32_internal,
+        residual_from_shared=residual_from_shared,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
         finalize_top_k=finalize_top_k,
@@ -959,6 +990,7 @@ def launch(
             max_m,
             max_token_ctas,
             fp32_internal,
+            residual_from_shared,
             include_reduce_scatter,
             include_routed,
             finalize_top_k,
@@ -999,6 +1031,7 @@ class CollectiveKernel:
         max_token_ctas: int,
         rms_eps: float,
         fp32_internal: bool,
+        residual_from_shared: bool,
         scratch_allocator=None,
         finalize_top_k: int | None = None,
         precompile_split: bool = False,
@@ -1019,6 +1052,7 @@ class CollectiveKernel:
         self.max_token_ctas = max_token_ctas
         self.rms_eps = float(rms_eps)
         self.fp32_internal = fp32_internal
+        self.residual_from_shared = residual_from_shared
         self.precompile_split = precompile_split
         # When set, ``call_deferred`` additionally accepts the MoE kernel's
         # deferred-finalize triple; the standard materialized-input mode
@@ -1135,6 +1169,7 @@ class CollectiveKernel:
                         shared_peer_ptrs=self._shared_peer_ptrs,
                         rms_eps=self.rms_eps,
                         fp32_internal=fp32_internal,
+                        residual_from_shared=residual_from_shared,
                         include_reduce_scatter=include_reduce_scatter,
                         include_routed=include_routed,
                         finalize_top_k=variant_top_k,
@@ -1150,6 +1185,7 @@ class CollectiveKernel:
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         shared_output_override: torch.Tensor | None = None,
+        latent_output_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")
@@ -1185,6 +1221,7 @@ class CollectiveKernel:
             include_reduce_scatter=include_reduce_scatter,
             include_routed=include_routed,
             shared_output_override=shared_output_override,
+            latent_output_override=latent_output_override,
         )
 
     def call_deferred(
@@ -1285,6 +1322,7 @@ class CollectiveKernel:
             include_reduce_scatter=include_reduce_scatter,
             include_routed=True,
             shared_output_override=None,
+            latent_output_override=None,
         )
 
     def _dispatch(
@@ -1300,6 +1338,7 @@ class CollectiveKernel:
         include_reduce_scatter: bool,
         include_routed: bool,
         shared_output_override: torch.Tensor | None,
+        latent_output_override: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self._routed_workspace.device
         if self._scratch_allocator is not None:
@@ -1323,6 +1362,21 @@ class CollectiveKernel:
                 "shared_output_override must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.hidden_dim}]"
             )
+        latent_output = (
+            self._latent_output
+            if latent_output_override is None
+            else latent_output_override
+        )
+        if (
+            latent_output.shape != (self.max_m, self.latent_dim)
+            or latent_output.dtype != torch.bfloat16
+            or latent_output.device != device
+            or not latent_output.is_contiguous()
+        ):
+            raise ValueError(
+                "latent_output_override must be contiguous CUDA BF16 "
+                f"[{self.max_m}, {self.latent_dim}]"
+            )
         shard_start = self.rank * self.shard_dim
         shared_shard = shared_output[:, shard_start : shard_start + self.shard_dim]
 
@@ -1330,7 +1384,7 @@ class CollectiveKernel:
             launch(
                 latent_source,
                 gamma,
-                self._latent_output,
+                latent_output,
                 self._routed_workspace,
                 self._routed_flags,
                 self._routed_multicast_ptr,
@@ -1350,12 +1404,13 @@ class CollectiveKernel:
                 max_m=self.max_m,
                 max_token_ctas=self.max_token_ctas,
                 fp32_internal=self.fp32_internal,
+                residual_from_shared=self.residual_from_shared,
                 include_reduce_scatter=include_reduce_scatter,
                 include_routed=include_routed,
                 finalize_top_k=finalize_top_k,
             )
         return (
-            self._latent_output[:m],
+            latent_output[:m],
             shared_shard,
         )
 

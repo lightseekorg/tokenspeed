@@ -32,7 +32,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tokenspeed.runtime.models.kimi_k3_comm import _tail_finalize_top_k
+from tokenspeed.runtime.models.kimi_k3_comm import (
+    ATTN_AR_MAX_TOKENS,
+    _tail_finalize_top_k,
+    attn_ar_eligible,
+)
 
 
 def test_arming_requires_experts_capability_bit():
@@ -49,3 +53,19 @@ def test_arming_requires_fused_moe_ar():
     plan = SimpleNamespace(fused_moe_ar=False, use_trtllm=True)
     assert _tail_finalize_top_k(10, plan, True) is None
     assert _tail_finalize_top_k(10, plan, False) is None
+
+
+def test_attention_collective_gate():
+    # Literals, not ATTN_AR_MAX_TOKENS: asserting the constant against itself
+    # passes for every value and pins nothing.
+    assert ATTN_AR_MAX_TOKENS == 8
+    # An unarmed group never takes the collective; shape cannot override that.
+    assert not attn_ar_eligible(False, True, 1)
+    # The vendor AR owns everything wider than the one-shot window, and the
+    # window edge itself belongs to us.
+    assert attn_ar_eligible(True, True, 8)
+    assert not attn_ar_eligible(True, True, 9)
+    # Block-write layers hand the prefix to the snapshot, so there is no
+    # residual left for the collective to fold in.
+    assert not attn_ar_eligible(True, False, 1)
+    assert not attn_ar_eligible(True, True, 0)
