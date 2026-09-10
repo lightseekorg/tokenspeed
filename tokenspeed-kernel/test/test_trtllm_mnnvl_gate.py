@@ -103,10 +103,37 @@ def test_the_oneshot_cap_follows_the_call_width_not_the_armed_lane():
     # all-reduce is 7168 wide. At the armed width the cap is 6; at the width in
     # hand it is 9, which is what an eight-token spec-decode step needs.
     k3 = ws(10752, 6)
-    assert k3.resolve_use_oneshot(8, None) is False
+    assert k3.resolve_use_oneshot(8, None, 10752) is False
     assert k3.resolve_use_oneshot(8, None, 7168) is True
     assert k3.resolve_use_oneshot(10, None, 7168) is False
     assert k3.resolve_use_oneshot(8, False, 7168) is False
 
     # Scaling never promises more rows than the buffer was armed for.
     assert ws(8192, 4096, max_token_num=64).resolve_use_oneshot(65, None, 4096) is False
+
+
+def test_every_resolution_passes_the_call_width():
+    """Resolution is authoritative wherever it runs, so none may omit the width.
+
+    Upstream wrappers resolve, then the launcher resolves again; a site that
+    left the width out would recompute the armed-width answer and undo the
+    decision, which is invisible to a unit test calling the method directly.
+    """
+    import ast
+    import pathlib
+
+    import tokenspeed_kernel
+
+    root = pathlib.Path(tokenspeed_kernel.__file__).parent
+    sites = 0
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "resolve_use_oneshot"
+            ):
+                sites += 1
+                assert len(node.args) == 3, f"{path}:{node.lineno} omits the width"
+    assert sites >= 5, f"expected every resolution site to be checked, saw {sites}"
