@@ -25,7 +25,7 @@ env:
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-bh16bn64]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
-    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache_projected_value_matches_split_and_captures
+    tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache_projected_value_matches_split[1]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_split_output[12]
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_decode_defaults_to_specialized_kernel_on_amd[2-8-8-False--5.0]

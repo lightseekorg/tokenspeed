@@ -26,8 +26,8 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 _LANES = gl.constexpr(32)
-_BLOCK_N = 8
-_NUM_WARPS = 8
+_BLOCK_N = 32
+_NUM_WARPS = 4
 
 
 @gluon.jit
@@ -36,15 +36,25 @@ def _mla_project_value_kernel(
     weight_ptr,
     gate_ptr,
     output_ptr,
+    HEADS: gl.constexpr,
     LATENT: gl.constexpr,
     VALUE: gl.constexpr,
+    GATE_STRIDE_B: gl.constexpr,
+    GATE_STRIDE_N: gl.constexpr,
     HAS_GATE: gl.constexpr,
+    BATCHED: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     pid = gl.program_id(0)
     num_pid_n: gl.constexpr = VALUE // BLOCK_N
-    head = pid // num_pid_n
+    batch_head = pid // num_pid_n
+    if BATCHED:
+        batch = batch_head // HEADS
+        head = batch_head % HEADS
+    else:
+        batch = 0
+        head = batch_head
     pid_n = pid % num_pid_n
     layout: gl.constexpr = gl.BlockedLayout(
         [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, LATENT // _LANES],
@@ -58,7 +68,7 @@ def _mla_project_value_kernel(
     offs_k = gl.arange(0, LATENT, layout=k_layout)
     attention = gl.amd.cdna5.buffer_load(
         attention_ptr,
-        (head * LATENT + offs_k).to(gl.int32),
+        (batch_head * LATENT + offs_k).to(gl.int32),
     ).to(gl.float32)
     weight = gl.amd.cdna5.buffer_load(
         weight_ptr,
@@ -72,10 +82,12 @@ def _mla_project_value_kernel(
     projected = gl.sum(weight.to(gl.float32) * attention, axis=1)
     projected = projected.to(gl.bfloat16).to(gl.float32)
     if HAS_GATE:
-        gate = gl.load(gate_ptr + head * VALUE + offs_n).to(gl.float32)
+        gate = gl.load(
+            gate_ptr + batch * GATE_STRIDE_B + (head * VALUE + offs_n) * GATE_STRIDE_N
+        ).to(gl.float32)
         projected *= 1.0 / (1.0 + gl.exp(-gate))
     gl.store(
-        output_ptr + head * VALUE + offs_n,
+        output_ptr + batch_head * VALUE + offs_n,
         projected.to(output_ptr.dtype.element_ty),
     )
 
@@ -87,30 +99,28 @@ def gluon_mla_project_value_gfx1250(
     gate: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project one BF16 latent row per head and optionally apply a sigmoid gate.
+    """Project BF16 latent rows per head and optionally apply a sigmoid gate.
 
     Args:
-        attention: Contiguous BF16 latent values shaped ``[1, heads, latent]``.
+        attention: Contiguous BF16 latent values shaped ``[batch, heads, latent]``.
         weight: Contiguous BF16 projection weights shaped
             ``[heads, latent, value]``.
-        gate: Optional contiguous BF16 sigmoid gate shaped
-            ``[1, heads * value]``.
-        out: Optional contiguous BF16 output shaped ``[1, heads * value]``.
+        gate: Optional BF16 sigmoid gate shaped ``[batch, heads * value]``
+            with a contiguous inner dimension.
+        out: Optional contiguous BF16 output shaped ``[batch, heads * value]``.
 
     Returns:
         The projected values in ``out`` when supplied, otherwise a new tensor.
     """
 
     heads, latent, value = weight.shape
-    expected_attention = (1, heads, latent)
-    expected_output = (1, heads * value)
-    tensors = (
+    batch = attention.shape[0]
+    expected_attention = (batch, heads, latent)
+    expected_output = (batch, heads * value)
+    for tensor, shape, name in (
         (attention, expected_attention, "attention"),
         (weight, (heads, latent, value), "weight"),
-    )
-    if gate is not None:
-        tensors += ((gate, expected_output, "gate"),)
-    for tensor, shape, name in tensors:
+    ):
         if tuple(tensor.shape) != shape:
             raise ValueError(f"MLA value projection requires {name} {shape}")
         if tensor.dtype != torch.bfloat16:
@@ -123,6 +133,16 @@ def gluon_mla_project_value_gfx1250(
             raise ValueError(
                 f"MLA value projection requires contiguous colocated {name}"
             )
+    if gate is not None:
+        if gate.shape != expected_output or gate.dtype != torch.bfloat16:
+            raise ValueError(
+                f"MLA value projection requires BF16 gate {expected_output}"
+            )
+        if not gate.is_cuda or gate.device != attention.device or gate.stride(1) != 1:
+            raise ValueError(
+                "MLA value projection requires a colocated gate with "
+                "contiguous inner dimension"
+            )
     if out is None:
         out = attention.new_empty(expected_output)
     elif (
@@ -134,14 +154,18 @@ def gluon_mla_project_value_gfx1250(
         raise ValueError("MLA value projection out must be contiguous BF16")
 
     gate_tensor = attention if gate is None else gate
-    _mla_project_value_kernel[(heads * value // _BLOCK_N,)](
+    _mla_project_value_kernel[(batch * heads * value // _BLOCK_N,)](
         attention,
         weight,
         gate_tensor,
         out,
+        HEADS=heads,
         LATENT=latent,
         VALUE=value,
+        GATE_STRIDE_B=0 if gate is None else gate.stride(0),
+        GATE_STRIDE_N=0 if gate is None else gate.stride(1),
         HAS_GATE=gate is not None,
+        BATCHED=batch > 1,
         BLOCK_N=_BLOCK_N,
         NUM_WARPS=_NUM_WARPS,
         num_warps=_NUM_WARPS,

@@ -1,28 +1,29 @@
 #!/usr/bin/bash
-# agentic_bench.sh as a Slurm sweep: dataset prep, the server, and evalscope
-# run as job steps in the same named container (the world-size-8 configs span
-# nodes on 4-GPU machines).
+# Decode-node simulation as a Slurm sweep: dataset prep, the server and
+# pd_client run as job steps (attention-DP 16 spans 4 nodes of 4 GPUs).
 #
-#   sbatch -N 2 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
+#   sbatch -N 4 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
 #       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
-#       --wrap "bash test/agentic_benchmark/kimi_k3/tokenspeed/agentic_bench.slurm"
+#       --wrap "bash test/agentic_benchmark/kimi_k3/tokenspeed_disagg/d_bench.slurm"
 #
-#   SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> bash agentic_bench.slurm
+#   SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> bash d_bench.slurm
 
 set -euo pipefail
 
-# Sweep configs
 CONFIGS=(
-    attn_tp8_moe_tp8
-    attn_tp8_moe_ep8
+    attn_dp16_moe_ep16
 )
 
 # Passing this file to sbatch directly runs a spool copy and loses this
 # directory; the usage above wraps it so the real path is used in both modes.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MODEL=nvidia/Kimi-K3-NVFP4
+DATASET="${SCRIPT_DIR}/agentic_dataset_x32.json"
 SERVER_PID=
 SERVER_LOG=
-STEP_NAME=agentic_server
+STEP_NAME=disagg_server
+# A prime runs one cold 50K prefill per DP rank.
+PRIME_PARALLEL=16
 
 JOBID="${SLURM_JOB_ID:?run via sbatch, or export SLURM_JOB_ID=<id> of a held allocation}"
 CONTAINER_IMAGE="${CONTAINER_IMAGE:?set CONTAINER_IMAGE to an enroot image with tokenspeed + evalscope}"
@@ -37,6 +38,7 @@ NNODES="${#NODES[@]}"
 # srun places task 0 -- the gateway rank -- on the first node of the list.
 HEAD="${NODES[0]}"
 BASE_URL="http://${HEAD}:8000"
+URL="${BASE_URL}/v1/chat/completions"
 
 SRUN=(srun --jobid="$JOBID" --overlap)
 SRUN_ARGS=(
@@ -49,7 +51,8 @@ SRUN_ARGS=(
     --container-writable
 )
 
-# Prepare dataset
+# Prepare dataset: the 71-conversation build, then 32 cache-bust replicas
+# (the duplicator's default); the 128-wide rung replays 128 distinct prefixes.
 "${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" bash -c '
 set -euo pipefail
 
@@ -69,6 +72,10 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
     --number 128 \
     --output-path agentic_dataset.json \
     --num-workers 32
+
+[ -f agentic_dataset_x32.json ] || python3 duplicate_agentic_dataset.py \
+    --input agentic_dataset.json \
+    --output agentic_dataset_x32.json
 '
 
 server_steps() {
@@ -78,7 +85,7 @@ server_steps() {
 
 launch_server() {
     local config=$1
-    SERVER_LOG=/tmp/tokenspeed_server_${config}.log
+    SERVER_LOG=/tmp/tokenspeed_server_disagg_${config}_${SWEEP_TS}.log
     "${SRUN[@]}" --job-name="$STEP_NAME" \
         --nodes="$NNODES" --ntasks-per-node=1 --mpi=pmix "${SRUN_ARGS[@]}" \
         "${SCRIPT_DIR}/configs/${config}.sh" > "$SERVER_LOG" 2>&1 &
@@ -138,14 +145,35 @@ wait_for_port_free() {
     done
 }
 
+# One pd_client phase as a single-task step; phase flags are passed through.
+client() {
+    "${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" \
+        python3 "${SCRIPT_DIR}/pd_client.py" --url "$URL" --model "$MODEL" \
+        --dataset "$DATASET" "$@"
+}
+
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
 # Preflight: bail out if something already serves on the port
 wait_for_port_free
 
+# Ladder: parallel / number = parallel, one lockstep wave, so every rank runs
+# exactly parallel/16 requests for the whole rung (sticky placement cannot
+# keep per-rank concurrency constant under rolling admission). Each rung
+# primes its own conversations 0..number-1 right before measuring them: a
+# finished request keeps checkpoint blocks for the tokens it generated, so a
+# measured rung grows its contexts and would evict the ones a later rung needs.
+LADDER=(
+    "16 16"
+    "32 32"
+    "64 64"
+    "128 128"
+)
+
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
-SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
-echo "Sweep outputs: ${SWEEP_DIR}"
+SWEEP_DIR="${SCRIPT_DIR}/outputs/d_${SWEEP_TS}"
+mkdir -p "$SWEEP_DIR"
+echo "D-sim sweep outputs: ${SWEEP_DIR}"
 
 for CONFIG in "${CONFIGS[@]}"; do
     echo "=== Running $CONFIG ==="
@@ -156,39 +184,25 @@ for CONFIG in "${CONFIGS[@]}"; do
         exit 1
     fi
 
-    echo "Warmup..."
-    "${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" \
-        evalscope perf \
-        --model nvidia/Kimi-K3-NVFP4 \
-        --url ${BASE_URL}/v1/chat/completions \
-        --api openai \
-        --dataset swe_smith \
-        --dataset-path agentic_dataset.json \
-        --max-tokens 500 \
-        --multi-turn \
-        --number 2 \
-        --parallel 2 \
-        --extra-args '{"ignore_eos": true}' \
-        --dataset-offset 68 \
-        --outputs-dir /tmp/outputs
+    for rung in "${LADDER[@]}"; do
+        read -r P N <<< "$rung"
+        echo "--- prime for parallel $P ($N conversations) ---"
+        client --phase d-prime --parallel "$PRIME_PARALLEL" --number "$N" --offset 0 --max-tokens 1 \
+            --name "${CONFIG}_d_prime" --outputs-dir "$SWEEP_DIR"
+        echo "settle 10s..."
+        sleep 10
 
-    echo "Benchmark..."
-    "${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" \
-        evalscope perf \
-        --model nvidia/Kimi-K3-NVFP4 \
-        --url ${BASE_URL}/v1/chat/completions \
-        --api openai \
-        --dataset swe_smith \
-        --dataset-path agentic_dataset.json \
-        --max-tokens 500 \
-        --multi-turn \
-        --number 4 8 8 16 32 \
-        --parallel 1 2 4 8 16 \
-        --extra-args '{"ignore_eos": true}' \
-        --name $CONFIG \
-        --outputs-dir $SWEEP_DIR \
-        --no-timestamp
+        echo "--- measure parallel $P ---"
+        client --phase d-measure --parallel "$P" --number "$N" --offset 0 --max-tokens 2000 \
+            --name "${CONFIG}_d_measure" --outputs-dir "$SWEEP_DIR"
+        if ! curl -sf -m 5 -o /dev/null "${BASE_URL}/readiness"; then
+            echo "server stopped answering after rung ${P}; aborting the ladder" >&2
+            break
+        fi
+    done
 
     stop_server
     wait_for_port_free
 done
+
+echo "D-sim sweep done: ${SWEEP_DIR}"

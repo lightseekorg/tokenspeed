@@ -49,10 +49,10 @@ logged fallback, never silent misuse).
 Examples (Kimi-K3 on EP8, defaults):
 
     # Generate the environment-specific filename in the current directory.
-    python -m tokenspeed_kernel.benchmark.moe_tactic_sweep
+    python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep
 
     # Or select the output path explicitly.
-    python -m tokenspeed_kernel.benchmark.moe_tactic_sweep \\
+    python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep \\
         --output moe-tactics-kimi-k3-ep8.json
 """
 

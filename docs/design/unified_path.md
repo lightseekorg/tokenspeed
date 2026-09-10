@@ -465,7 +465,10 @@ buffer; `fill_input_buffers` takes no table.
   write. A model path that writes multiple mode windows in one shot (the
   MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
   DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. V4 composes the shared token-shaped resolve
+  graph. The router performs the same composition when a draft step-0
+  forward locally dispatches as DECODE while retaining the round's full K/V
+  rows; target MIXED decode halves and later draft steps keep their ordinary
+  decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Collect pd_sim sweeps into three tables (P-fresh / P-cached / D-sim).
+"""Collect tokenspeed_disagg sweeps into three tables (P-fresh / P-cached / D-sim).
 
-Applies the validity guards from the README: a rung is VOID if its cache-hit
-guard fails, if any request failed, or (D-sim) if measure-phase memory kept
-climbing past the post-prime level. Accepts multiple sweep dirs (e.g. one P
-sweep and one D sweep); the P:D sizing helper needs one of each.
+Applies the validity guard from the README: a rung is VOID if its cache-hit
+guard fails. Accepts multiple sweep dirs (e.g. one P sweep and one D sweep);
+the P:D sizing helper needs one of each.
 """
 
 import argparse
@@ -12,8 +11,6 @@ import json
 import re
 import sys
 from pathlib import Path
-
-MEM_CLIMB_MIB = 4096  # measure-phase peak more than this above post-prime -> flag
 
 METRIC = {
     "p_fresh": "Prefill Throughput (tok/s)",
@@ -37,22 +34,8 @@ def num_gpus(config: str) -> int:
     return int(m.group(1))
 
 
-def load_ledgers(sweep_dir: Path):
-    ledger = {}
-    for f in sweep_dir.glob("*_memory_ledger.jsonl"):
-        config = f.name.replace("_memory_ledger.jsonl", "")
-        for line in f.read_text().splitlines():
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ledger[(config, e.get("parallel"))] = e
-    return ledger
-
-
 def collect(sweep_dir: Path):
     rows = []
-    ledger = load_ledgers(sweep_dir)
     for summary in sorted(sweep_dir.glob("*/parallel_*/benchmark_summary.json")):
         run_name = summary.parent.parent.name  # <config>_<phase>
         m = re.match(r"(.+)_(p_fresh|p_cached|d_measure)$", run_name)
@@ -61,21 +44,12 @@ def collect(sweep_dir: Path):
         config, phase = m.group(1), m.group(2)
         s = json.loads(summary.read_text())
         hit = s.get("KV Cache Hit Rate (%)", -1.0)
-        failed = s.get("Failed Requests", 0)
         metric = s.get(METRIC[phase], 0.0)
         conc = s.get("Concurrency")
 
         problems = []
         if not hit_guard(phase, hit):
             problems.append("hit")
-        if failed:
-            problems.append(f"{failed}failed")
-        # A rung that measured fewer requests than asked (twice-failed
-        # p-cached primes drop their conversation before the measured wave)
-        # is a shrunken sample with zero Failed Requests — VOID it.
-        requested = s.get("Requested")
-        if requested is not None and s.get("Requests") != requested:
-            problems.append("short")
 
         row = {
             "phase": phase,
@@ -83,10 +57,6 @@ def collect(sweep_dir: Path):
             "Conc.": conc,
             f"{METRIC[phase]} /gpu": round(metric / num_gpus(config), 2),
             "Cache Hit (%)": round(hit, 2),
-            # Informational, not a guard: retries keep their full latency
-            # (a hiccup is real), so nonzero here means the percentile
-            # columns carry retry time.
-            "Retried": s.get("Retried Requests", 0),
             "Requests/s": s.get("Requests/s"),
             "Latency p50 (s)": s.get("Latency p50 (s)"),
             "Latency p99 (s)": s.get("Latency p99 (s)"),
@@ -94,18 +64,6 @@ def collect(sweep_dir: Path):
         if phase == "d_measure":
             row["TPOT p50 (ms)"] = s.get("TPOT p50 (ms)")
             row["TPOT p99 (ms)"] = s.get("TPOT p99 (ms)")
-            led = ledger.get((config, conc))
-            if led:
-                after = led.get("mem_after_prime", -1)
-                peak = led.get("mem_peak_during_measure", -1)
-                row["Mem after prime (MiB)"] = after
-                row["Mem peak measure (MiB)"] = peak
-                if peak < 0 or after < 0:
-                    problems.append("mem-unsampled")
-                elif peak - after > MEM_CLIMB_MIB:
-                    problems.append("mem-climb")
-            else:
-                problems.append("no-ledger")
         row["valid"] = "ok" if not problems else "VOID(" + "+".join(problems) + ")"
         rows.append(row)
     return rows

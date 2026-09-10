@@ -689,6 +689,25 @@ def _select_num_kv_splits(
     return triton.next_power_of_2(min(max_kv_splits, target))
 
 
+def _select_projected_value_num_kv_splits(
+    *,
+    batch_size: int,
+    num_sms: int,
+    num_q_programs: int,
+    max_seqlen_k: int,
+    tile_size: int,
+) -> int:
+    pages = max(1, math.ceil(max_seqlen_k / tile_size))
+    work_cap = max(16 if batch_size == 1 else 8, math.ceil(pages / 16))
+    occupancy_cap = max(1, 512 // batch_size)
+    split_cap = triton.next_power_of_2(min(64, occupancy_cap, work_cap))
+    target = max(
+        1,
+        (num_sms * 2) // max(1, num_q_programs),
+    )
+    return triton.next_power_of_2(min(pages, split_cap, target))
+
+
 def gluon_mla_decode_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -781,19 +800,20 @@ def gluon_mla_decode_gfx1250(
     total_num_q_blocks = batch_size * num_head_blocks
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     if projected_value:
-        if max_seqlen_k > 32768:
-            split_cap = 32
-        else:
-            split_cap = 16
+        num_kv_splits = _select_projected_value_num_kv_splits(
+            batch_size=batch_size,
+            num_sms=num_sms,
+            num_q_programs=total_num_q_blocks,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=page_size,
+        )
     else:
-        split_cap = 64
-    num_kv_splits = _select_num_kv_splits(
-        num_sms=num_sms,
-        num_q_programs=total_num_q_blocks,
-        max_seqlen_k=max_seqlen_k,
-        tile_size=page_size,
-        split_cap=split_cap,
-    )
+        num_kv_splits = _select_num_kv_splits(
+            num_sms=num_sms,
+            num_q_programs=total_num_q_blocks,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=page_size,
+        )
 
     split_output = torch.empty(
         (batch_size, num_query_heads, num_kv_splits, kv_lora_rank),
@@ -928,10 +948,11 @@ def gluon_mla_decode_projected_value_gfx1250(
     """Decode MLA and fuse split reduction, BF16 projection, and sigmoid gating.
 
     Args:
-        q: FP8 absorbed query shaped ``[1, 1, heads, 576]`` for 12 or 16 heads.
+        q: FP8 absorbed query shaped ``[batch, 1, heads, 576]`` for 12 or
+            16 heads.
         kv_cache: Contiguous matching-FP8 paged cache with page size 64.
-        page_table: Int32 page table for the single sequence.
-        cache_seqlens: Int32 visible cache length for the sequence.
+        page_table: Batched Int32 page table.
+        cache_seqlens: Int32 visible cache length for each sequence.
         max_seqlen_k: Maximum visible KV length used for split selection.
         qk_nope_head_dim: Original non-RoPE head width, which must be 128.
         kv_lora_rank: Latent rank, which must be 512.
@@ -939,8 +960,8 @@ def gluon_mla_decode_projected_value_gfx1250(
         softmax_scale: Scale applied to QK logits.
         value_weight: Contiguous BF16 weights shaped ``[heads, 512, 128]``.
         gate: Optional contiguous BF16 raw sigmoid gate shaped
-            ``[1, heads * 128]``.
-        out: Contiguous BF16 output shaped ``[1, heads * 128]``.
+            ``[batch, heads * 128]``.
+        out: Contiguous BF16 output shaped ``[batch, heads * 128]``.
         logit_cap: Unsupported logit cap; must be zero.
 
     Returns:
@@ -955,9 +976,16 @@ def gluon_mla_decode_projected_value_gfx1250(
             "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "
             "(128, 512, 64)"
         )
-    expected_weight = (q.shape[2], kv_lora_rank, out.shape[-1] // q.shape[2])
+    if value_weight.ndim != 3:
+        raise ValueError("value_weight must be rank-3")
+    batch, heads = q.shape[0], q.shape[2]
+    value = value_weight.shape[2]
+    expected_weight = (heads, kv_lora_rank, value)
     if tuple(value_weight.shape) != expected_weight:
         raise ValueError(f"value_weight must have shape {expected_weight}")
+    expected_out = (batch, heads * value)
+    if tuple(out.shape) != expected_out:
+        raise ValueError(f"out must have shape {expected_out}")
     if gate is not None and gate.shape != out.shape:
         raise ValueError("gate and out must have matching shapes")
     if (
