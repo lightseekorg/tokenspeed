@@ -42,6 +42,12 @@ _LARGEM_SHAPES = {
 }
 
 
+def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
+    """Return whether CDNA5 large-M WMMA accepts this K3 projection shape."""
+
+    return m >= _LARGEM_MIN_M and (k, n) in _LARGEM_SHAPES
+
+
 @gluon.jit
 def _wmma_tdm_dense_m16_kernel(
     a_ptr,
@@ -748,7 +754,7 @@ def gluon_mm_a16w16_largem_gfx1250(
         raise ValueError("gfx1250 large-M projection expects A [M,K], B [N,K]")
     m, k = map(int, A.shape)
     n = int(B.shape[0])
-    if m < _LARGEM_MIN_M or (k, n) not in _LARGEM_SHAPES:
+    if not use_gluon_largem_gfx1250(m, k, n):
         raise ValueError(
             f"gfx1250 large-M projection requires M >= {_LARGEM_MIN_M} "
             f"and a K3 shape, got M={m} N={n} K={k}"
@@ -824,6 +830,7 @@ def gluon_mm_a16w16_largem_gfx1250(
 
 
 __all__ = [
+    "use_gluon_largem_gfx1250",
     "gluon_mm_a16w16_largem_gfx1250",
     "gluon_wmma_tdm_kda_qkvfab_gfx1250",
     "gluon_wmma_tdm_mla_qkv_gate_gfx1250",

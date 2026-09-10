@@ -19,6 +19,16 @@ from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
 from tokenspeed_kernel.platform import Platform, pdl_enabled
 
+try:
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        use_gluon_largem_gfx1250,
+    )
+except ImportError:
+
+    def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
+        return False
+
+
 # FP8 storage dtypes served by the w8a8 projection branch (matches the
 # runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -69,22 +79,6 @@ def _use_gluon_largem(m: int, k: int, n: int) -> bool:
     return m >= min_m and m % 256 == 0
 
 
-def _use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
-    return m >= 512 and (k, n) in {
-        (512, 3072),
-        (768, KIMI3_HIDDEN_SIZE),
-        (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, KIMI3_HIDDEN_SIZE),
-        (KIMI3_SHARED_GATE_UP_LOCAL_SIZE, 2304),
-        (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE),
-        (4224, KIMI3_HIDDEN_SIZE),
-        (KIMI3_HIDDEN_SIZE, 1536),
-        (KIMI3_HIDDEN_SIZE, 2112),
-        (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE),
-        (KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE),
-        (KIMI3_HIDDEN_SIZE, 8448),
-    }
-
-
 def _try_gluon_largem_gfx1250(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -116,7 +110,7 @@ def _try_gluon_largem_gfx1250(
                 or not out.is_contiguous()
             )
         )
-        or not _use_gluon_largem_gfx1250(
+        or not use_gluon_largem_gfx1250(
             int(activation.shape[0]),
             int(activation.shape[1]),
             int(weight.shape[0]),
@@ -388,7 +382,7 @@ def kimi3_latent_projection(
         elif (
             Platform.get().is_cdna5
             and specialized
-            and _use_gluon_largem_gfx1250(m, k, n)
+            and use_gluon_largem_gfx1250(m, k, n)
             and (out is None or out.is_contiguous())
         ):
             solution = "gluon_largem_gfx1250"
@@ -448,7 +442,7 @@ def kimi3_latent_projection(
         if not (
             Platform.get().is_cdna5
             and specialized
-            and _use_gluon_largem_gfx1250(m, k, n)
+            and use_gluon_largem_gfx1250(m, k, n)
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 Gluon projection requires a contiguous BF16 "
@@ -526,8 +520,8 @@ def kimi3_mla_qkv_gate_projection(
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and weight.is_contiguous()
-            and _use_gluon_largem_gfx1250(m, hidden_states.shape[1], qkv_width)
-            and _use_gluon_largem_gfx1250(
+            and use_gluon_largem_gfx1250(m, hidden_states.shape[1], qkv_width)
+            and use_gluon_largem_gfx1250(
                 m,
                 hidden_states.shape[1],
                 output_width - qkv_width,
@@ -585,8 +579,8 @@ def kimi3_mla_qkv_gate_projection(
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and weight.is_contiguous()
-            and _use_gluon_largem_gfx1250(m, hidden_states.shape[1], qkv_width)
-            and _use_gluon_largem_gfx1250(
+            and use_gluon_largem_gfx1250(m, hidden_states.shape[1], qkv_width)
+            and use_gluon_largem_gfx1250(
                 m,
                 hidden_states.shape[1],
                 output_width - qkv_width,
@@ -1027,7 +1021,7 @@ def kimi3_shared_down_projection(
             and hidden_states.is_contiguous()
             and weight.is_contiguous()
             and out.is_contiguous()
-            and _use_gluon_largem_gfx1250(
+            and use_gluon_largem_gfx1250(
                 m,
                 input_width,
                 output_width,
@@ -1061,7 +1055,7 @@ def kimi3_shared_down_projection(
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and weight.is_contiguous()
-            and _use_gluon_largem_gfx1250(m, input_width, output_width)
+            and use_gluon_largem_gfx1250(m, input_width, output_width)
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 shared down projection requires a contiguous "
@@ -1194,7 +1188,7 @@ def kimi3_qkvfab_projection(
             Platform.get().is_cdna5
             and hidden_states.is_cuda
             and weight.is_cuda
-            and _use_gluon_largem_gfx1250(m, input_width, output_width)
+            and use_gluon_largem_gfx1250(m, input_width, output_width)
             and hidden_states.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
@@ -1259,7 +1253,7 @@ def kimi3_qkvfab_projection(
     if solution == "gluon_largem_gfx1250":
         if not (
             Platform.get().is_cdna5
-            and _use_gluon_largem_gfx1250(m, input_width, output_width)
+            and use_gluon_largem_gfx1250(m, input_width, output_width)
             and hidden_states.dtype == torch.bfloat16
             and weight.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
