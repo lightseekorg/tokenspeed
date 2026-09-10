@@ -56,6 +56,12 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 LSE_LN = math.log2(math.e)
 
 
+def _attention_format_signature(**roles: torch.Tensor):
+    return format_signature(
+        **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
+
 def attn_merge_state(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
@@ -82,10 +88,7 @@ def attn_merge_state(
     This is shared by MHA and MLA because the merge only depends on partial
     attention outputs and LSE values, not on how the K/V states were produced.
     """
-    signature = format_signature(
-        out_a=dense_tensor_format(out_a.dtype),
-        out_b=dense_tensor_format(out_b.dtype),
-    )
+    signature = _attention_format_signature(out_a=out_a, out_b=out_b)
     kernel = select_kernel(
         "attention",
         "attn_merge_state",

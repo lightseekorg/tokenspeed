@@ -506,10 +506,14 @@ def rel_mha_decode_with_kvcache(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.rmha.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.rmha.triton  # noqa: E402,F401
 
 # isort: on
+
+try:
+    import tokenspeed_kernel.ops.attention.rmha.cute_dsl  # noqa: E402,F401
+except ImportError:
+    pass
 
 __all__ = [
     "rel_mha_plan",
