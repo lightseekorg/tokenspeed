@@ -227,26 +227,31 @@ class _Qwen4ExpDecoderMixin:
         if self.ple is not None:
             # The PLE layer folds this residual add into its conv epilogue.
             hidden_states = self.ple(hidden_states, input_ids, ctx)
-        return self.attn_hyper_connection.mix(hidden_states)
+        return self.attn_hyper_connection.mix(
+            hidden_states, block_output=None, inject_logits=None, preload_residual=False
+        )
 
     def _finish_attention(
         self,
         attention_output: torch.Tensor,
         residuals,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
-        if ctx.forward_mode.is_idle():
-            return self.attn_hyper_connection.combine(attention_output, residuals)
-        attention_output, residual = self.comm_manager.post_attn_comm(
-            attention_output, residuals[0], ctx
-        )
-        return self.attn_hyper_connection.combine(
-            attention_output,
-            self.attn_hyper_connection.norm_for(residual, residuals),
+    ):
+        if not ctx.forward_mode.is_idle():
+            attention_output, residual = self.comm_manager.post_attn_comm(
+                attention_output, residuals[0], ctx
+            )
+            residuals = self.attn_hyper_connection.norm_for(residual, residuals)
+        # The MLP consumes this updated residual immediately, so inject the
+        # attention output in the MLP's grouped norm before its mix projection.
+        return self.mlp_hyper_connection.mix(
+            residuals[0],
+            block_output=attention_output,
+            inject_logits=residuals[2],
+            preload_residual=True,
         )
 
-    def _run_mlp(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        mixed, residuals = self.mlp_hyper_connection.mix(hidden_states)
+    def _run_mlp(self, mixed: torch.Tensor, residuals, ctx: ForwardContext):
         num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(ctx)
         if self.is_moe:
             deferred_reduce = (
@@ -320,8 +325,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         attention_output = (
             mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx), None
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -480,8 +485,8 @@ class Qwen4ExpAttentionDecoderLayer(
             if ctx.forward_mode.is_idle()
             else self.self_attention(positions, mixed, ctx)
         )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx), None
 
 
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
@@ -580,7 +585,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 hidden_states, hidden_states, ctx
             )
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(
+            hidden_states, block_output=None, inject_logits=None, preload_residual=False
+        )
         return hidden_states, [hc_hidden_states]
 
 

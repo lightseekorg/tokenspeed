@@ -704,6 +704,11 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+Attention residual injection and the following MLP's grouped RMSNorm run in
+one kernel. The updated residual remains available for the MLP's own injection;
+see [gated residual normalization](../design/hyperconnection.md) for the
+calculation and fusion boundaries.
+
 ```bash
 ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \

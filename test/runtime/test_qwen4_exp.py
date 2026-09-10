@@ -278,7 +278,9 @@ def test_hyperconnection_mix_and_combine_shapes() -> None:
         )
     ).cuda()
     hyper_input = torch.randn(5, 32, device="cuda")
-    mixed, residuals = mixer.mix(hyper_input)
+    mixed, residuals = mixer.mix(
+        hyper_input, block_output=None, inject_logits=None, preload_residual=False
+    )
     combined = mixer.combine(torch.randn(5, 8, device="cuda"), residuals)
 
     assert mixed.shape == (5, 8)
@@ -298,7 +300,9 @@ def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
         )
     ).cuda()
     hyper_input = torch.randn(6, 32, device="cuda")
-    _, residuals = mixer.mix(hyper_input)
+    _, residuals = mixer.mix(
+        hyper_input, block_output=None, inject_logits=None, preload_residual=False
+    )
     sliced = hyper_input[2:5]
     unrelated = torch.randn(3, 32, device="cuda")
     sliced_reference = mixer.hc_norm(sliced)
@@ -352,7 +356,9 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
 
     hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
     block_output = torch.randn(5, hidden_size, device="cuda")
-    mixed, residuals = mixer.mix(hyper_input)
+    mixed, residuals = mixer.mix(
+        hyper_input, block_output=None, inject_logits=None, preload_residual=False
+    )
     combined = mixer.combine(block_output, residuals)
 
     normalized = residuals[1]

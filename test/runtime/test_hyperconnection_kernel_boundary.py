@@ -21,12 +21,14 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 from tokenspeed_kernel import (
     gated_residual_combine,
+    gated_residual_combine_norm,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
@@ -36,6 +38,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
     HyperConnectionConfig,
 )
+from tokenspeed.runtime.models.qwen4_exp import _Qwen4ExpDecoderMixin
 
 
 def test_runtime_uses_tokenspeed_kernel_boundary() -> None:
@@ -55,6 +58,17 @@ def test_kernel_boundary_is_gpu_only() -> None:
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
     with pytest.raises(ValueError, match="requires GPU tensors"):
         grouped_gemma_rmsnorm(normalized, torch.empty(8), 4, 1e-6)
+    with pytest.raises(ValueError, match="requires GPU tensors"):
+        gated_residual_combine_norm(
+            torch.empty(1, 4),
+            normalized,
+            torch.empty(1, 2),
+            torch.empty(8),
+            2,
+            4,
+            1e-6,
+            preload_residual=False,
+        )
 
 
 def test_up_weight_loader_prepares_kernel_cache(monkeypatch) -> None:
@@ -92,6 +106,116 @@ def test_up_weight_loader_rejects_shape_change(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("per_branch_norm", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_mix_fuses_previous_combine_with_its_own_norm(
+    per_branch_norm: bool, dtype: torch.dtype
+) -> None:
+    config = HyperConnectionConfig(
+        hc_count=3,
+        hidden_size=13,
+        hc_lowrank=7,
+        rms_norm_eps=1e-6,
+        params_dtype=dtype,
+        hc_per_branch_norm=per_branch_norm,
+    )
+    previous = GatedResidualSimple(config, use_mix=True, use_combine=True).to(
+        device="cuda", dtype=dtype
+    )
+    current = GatedResidualSimple(config, use_mix=True, use_combine=True).to(
+        device="cuda", dtype=dtype
+    )
+    with torch.no_grad():
+        previous.hc_norm.weight.fill_(0.25)
+        current.hc_norm.weight.fill_(-0.125)
+    residual = torch.randn(5, 39, device="cuda", dtype=dtype)
+    block = torch.randn(5, 13, device="cuda", dtype=dtype)
+    _, previous_residuals = previous.mix(
+        residual, block_output=None, inject_logits=None, preload_residual=False
+    )
+    combined = previous.combine(block, previous_residuals)
+    expected_mix, expected_residuals = current.mix(
+        combined, block_output=None, inject_logits=None, preload_residual=False
+    )
+
+    with mock.patch.object(
+        current.hc_norm,
+        "forward",
+        side_effect=AssertionError("unexpected separate norm"),
+    ):
+        actual_mix, actual_residuals = current.mix(
+            residual,
+            block_output=block,
+            inject_logits=previous_residuals[2],
+            preload_residual=True,
+        )
+
+    torch.testing.assert_close(actual_mix, expected_mix, rtol=0, atol=0)
+    for actual, expected in zip(actual_residuals, expected_residuals, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # The next injection must retain the unnormalized residual from the fused op.
+    next_block = torch.randn_like(block)
+    torch.testing.assert_close(
+        current.combine(next_block, actual_residuals),
+        current.combine(next_block, expected_residuals),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("communication", ["idle", "unchanged", "row_slice"])
+def test_attention_to_mlp_fusion_after_communication(communication: str) -> None:
+    config = HyperConnectionConfig(
+        hc_count=4,
+        hidden_size=8,
+        hc_lowrank=6,
+        rms_norm_eps=1e-6,
+        params_dtype=torch.float32,
+        hc_per_branch_norm=True,
+    )
+    attention = GatedResidualSimple(config, use_mix=True, use_combine=True).cuda()
+    mlp = GatedResidualSimple(config, use_mix=True, use_combine=True).cuda()
+    rows = 0 if communication == "idle" else 6
+    residual = torch.randn(rows, 32, device="cuda")
+    output = torch.randn(rows, 8, device="cuda")
+    _, residuals = attention.mix(
+        residual, block_output=None, inject_logits=None, preload_residual=False
+    )
+    row_slice = slice(2, 5) if communication == "row_slice" else slice(None)
+    communicated_residual = residual[row_slice]
+    communicated_output = output[row_slice]
+    aligned_residuals = attention.norm_for(communicated_residual, residuals)
+    combined = attention.combine(communicated_output, aligned_residuals)
+    expected_mix, expected_residuals = mlp.mix(
+        combined, block_output=None, inject_logits=None, preload_residual=False
+    )
+    post_attn_comm = mock.Mock(
+        return_value=(communicated_output, communicated_residual)
+    )
+    layer = SimpleNamespace(
+        attn_hyper_connection=attention,
+        mlp_hyper_connection=mlp,
+        comm_manager=SimpleNamespace(post_attn_comm=post_attn_comm),
+    )
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: communication == "idle")
+    )
+
+    with mock.patch.object(
+        attention, "combine", side_effect=AssertionError("unexpected separate combine")
+    ):
+        actual_mix, actual_residuals = _Qwen4ExpDecoderMixin._finish_attention(
+            layer, output, residuals, ctx
+        )
+
+    torch.testing.assert_close(actual_mix, expected_mix, rtol=0, atol=0)
+    for actual, expected in zip(actual_residuals, expected_residuals, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert post_attn_comm.call_count == (0 if communication == "idle" else 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_non_power_of_two_hc_scales_projection_results() -> None:
     hc_count, hidden_size, lowrank = 3, 8, 6
     mixer = GatedResidualSimple(
@@ -115,7 +239,9 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
 
     hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
     block_output = torch.randn(5, hidden_size, device="cuda")
-    mixed, residuals = mixer.mix(hyper_input)
+    mixed, residuals = mixer.mix(
+        hyper_input, block_output=None, inject_logits=None, preload_residual=False
+    )
     combined = mixer.combine(block_output, residuals)
     normalized = residuals[1]
 

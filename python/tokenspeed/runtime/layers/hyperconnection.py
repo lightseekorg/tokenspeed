@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     gated_residual_combine,
+    gated_residual_combine_norm,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
     prepare_gated_residual_weight_cache,
@@ -229,8 +230,25 @@ class GatedResidualSimple(nn.Module):
         rows = slice(start, start + value.shape[0])
         return value, normalized[rows], inject_logits[rows]
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        *,
+        block_output: torch.Tensor | None,
+        inject_logits: torch.Tensor | None,
+        preload_residual: bool,
+    ):
         """Mix ``hc_count`` residual branches into one sublayer input.
+
+        Args:
+            hyper_input: Residual streams shaped ``[..., hc_count * hidden_size]``.
+            block_output: Previous sublayer output to inject before normalization,
+                or ``None`` when the residual streams are already updated.
+            inject_logits: Previous sublayer's per-branch gate logits, supplied
+                together with ``block_output`` or ``None``.
+            preload_residual: Whether residual and norm weights are already
+                visible before the current PDL producer. Only valid with a
+                pending combine; permits loading them before waiting.
 
         Returns:
             A pair containing the mixed ``[..., hidden_size]`` input and the
@@ -241,7 +259,23 @@ class GatedResidualSimple(nn.Module):
             raise ValueError(
                 f"hyper input width must be {expected}, got {hyper_input.shape[-1]}"
             )
-        normalized = self._normalize(hyper_input)
+        if (block_output is None) != (inject_logits is None):
+            raise ValueError("block_output and inject_logits must be supplied together")
+        if block_output is None:
+            if preload_residual:
+                raise ValueError("residual preloading requires a combine input")
+            normalized = self._normalize(hyper_input)
+        else:
+            hyper_input, normalized = gated_residual_combine_norm(
+                block_output,
+                hyper_input,
+                inject_logits,
+                self.hc_norm.weight,
+                self.hc_count,
+                self.hidden_size,
+                self.hc_norm.variance_epsilon,
+                preload_residual=preload_residual,
+            )
         mixed, inject_logits = gated_residual_mix(
             normalized,
             self.mix_inject_proj.weight,

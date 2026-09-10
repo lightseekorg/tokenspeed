@@ -30,10 +30,12 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Callable
+from functools import partial
 
 import torch
 from tokenspeed_kernel import (
     gated_residual_combine,
+    gated_residual_combine_norm,
     gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
@@ -83,18 +85,21 @@ def _graph_time(call: Callable[[], object], iterations: int) -> float:
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        call()
+        for _ in range(iterations):
+            call()
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
+    timings = []
+    for _ in range(5):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         graph.replay()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1000.0 / iterations
+        end.record()
+        end.synchronize()
+        timings.append(start.elapsed_time(end) * 1000.0 / iterations)
+    return sorted(timings)[len(timings) // 2]
 
 
 def _backend_supported(name: str, rows: int, dtype: torch.dtype) -> bool:
@@ -159,6 +164,47 @@ def _case(rows: int, dtype: torch.dtype, backend: str) -> Callable[[], torch.Ten
     return chain
 
 
+def _combine_norm_cases(
+    rows: int, dtype: torch.dtype
+) -> dict[str, Callable[[], object]]:
+    generator = torch.Generator(device="cuda").manual_seed(2026 + rows)
+    residual = torch.randn(rows, WIDE, dtype=dtype, device="cuda", generator=generator)
+    block = torch.randn(
+        rows, HIDDEN_SIZE, dtype=dtype, device="cuda", generator=generator
+    )
+    inject = torch.randn(
+        rows, HC_COUNT, dtype=dtype, device="cuda", generator=generator
+    )
+    weight = torch.randn(WIDE, dtype=dtype, device="cuda", generator=generator) * 0.02
+
+    def separate() -> tuple[torch.Tensor, torch.Tensor]:
+        combined = gated_residual_combine(
+            block, residual, inject, HC_COUNT, HIDDEN_SIZE, override=None, solution=None
+        )
+        normalized = grouped_gemma_rmsnorm(
+            combined, weight, HIDDEN_SIZE, 1e-6, out=None
+        )
+        return combined, normalized
+
+    def fused(preload_residual: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        return gated_residual_combine_norm(
+            block,
+            residual,
+            inject,
+            weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
+            1e-6,
+            preload_residual=preload_residual,
+        )
+
+    return {
+        "separate": separate,
+        "fused": partial(fused, preload_residual=False),
+        "preloaded": partial(fused, preload_residual=True),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -167,6 +213,9 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--backend", choices=tuple(BACKENDS), default="default")
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
+    parser.add_argument(
+        "--operation", choices=("chain", "combine_norm"), default="chain"
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA/ROCm device is required")
@@ -174,23 +223,33 @@ def main() -> None:
     rows_values = tuple(int(value) for value in args.rows.split(","))
     results = []
     for rows in rows_values:
-        if not _backend_supported(args.backend, rows, dtype):
+        if rows <= 0 or (
+            args.operation == "chain"
+            and not _backend_supported(args.backend, rows, dtype)
+        ):
             results.append(
                 {"rows": rows, "backend": args.backend, "status": "unsupported"}
             )
             continue
-        chain = _case(rows, dtype, args.backend)
+        cases = (
+            _combine_norm_cases(rows, dtype)
+            if args.operation == "combine_norm"
+            else {"chain": _case(rows, dtype, args.backend)}
+        )
         iterations = _iterations(rows)
         result: dict[str, object] = {
             "rows": rows,
             "dtype": args.dtype,
             "backend": args.backend,
+            "operation": args.operation,
             "iterations": iterations,
         }
-        if args.mode in ("eager", "both"):
-            result["eager_us"] = round(_event_time(chain, iterations), 3)
-        if args.mode in ("graph", "both"):
-            result["graph_us"] = round(_graph_time(chain, iterations), 3)
+        for name, case in cases.items():
+            prefix = "" if name == "chain" else f"{name}_"
+            if args.mode in ("eager", "both"):
+                result[f"{prefix}eager_us"] = round(_event_time(case, iterations), 3)
+            if args.mode in ("graph", "both"):
+                result[f"{prefix}graph_us"] = round(_graph_time(case, iterations), 3)
         results.append(result)
         print(json.dumps(result, sort_keys=True), flush=True)
     print(json.dumps({"results": results}, indent=2, sort_keys=True))

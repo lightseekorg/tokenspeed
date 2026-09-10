@@ -156,8 +156,8 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
             residuals = tuple(
                 value.index_select(0, ctx.gather_ids) for value in residuals
             )
-        hidden_states = self._finish_attention(attention_output, residuals, ctx)
-        return self._run_mlp(hidden_states, ctx), None
+        mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
+        return self._run_mlp(mixed, residuals, ctx), None
 
 
 class Qwen4ExpDraftModel(Qwen4ExpModel):

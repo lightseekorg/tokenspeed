@@ -116,8 +116,9 @@ def grouped_gemma_rmsnorm(
 
     Args:
         x: GPU input shaped ``[..., width]``.
-        weight: Gemma checkpoint weight offset shaped ``[width]``; the
-            effective multiplier is ``1 + weight``.
+        weight: Gemma checkpoint weight offset shaped ``[width]`` or
+            ``[group_size]`` for shared group weights; the effective multiplier
+            is ``1 + weight``.
         group_size: Elements sharing one variance statistic. ``None`` means
             the full last dimension.
         eps: Epsilon added before reciprocal square root.
@@ -130,7 +131,17 @@ def grouped_gemma_rmsnorm(
         raise ValueError("grouped_gemma_rmsnorm requires GPU tensors")
     width = int(x.shape[-1])
     effective_group_size = width if group_size is None else int(group_size)
-    return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
+    return _grouped_gemma_rmsnorm(
+        x,
+        weight,
+        effective_group_size,
+        eps,
+        out=out,
+        block_output=None,
+        inject_logits=None,
+        residual_out=None,
+        preload_residual=False,
+    )
 
 
 def grouped_rmsnorm(
@@ -156,4 +167,67 @@ def grouped_rmsnorm(
     return _grouped_rmsnorm(x, int(group_size), eps, out=out)
 
 
-__all__ = ["grouped_gemma_rmsnorm", "grouped_rmsnorm", "qk_rmsnorm", "rmsnorm"]
+def gated_residual_combine_norm(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    inject_logits: torch.Tensor,
+    weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    eps: float,
+    *,
+    preload_residual: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inject a sublayer output and normalize each updated residual branch.
+
+    One CTA computes both outputs for one token and branch. The updated
+    residual is rounded to the input dtype before computing RMS statistics,
+    matching a standalone combine followed by grouped Gemma RMSNorm.
+
+    Args:
+        block_output: GPU sublayer output shaped ``[..., hidden_size]``.
+        residual: GPU residual streams shaped ``[..., hc_count * hidden_size]``.
+        inject_logits: Per-branch gate logits shaped ``[..., hc_count]``.
+            The injection multiplier is ``2 * sigmoid(inject_logits)``.
+        weight: Gemma weight offsets shaped ``[hc_count * hidden_size]`` or
+            ``[hidden_size]`` for weights shared across branches. The effective
+            norm multiplier is ``1 + weight``.
+        hc_count: Number of residual branches, greater than one.
+        hidden_size: Width of one branch and the RMS reduction size.
+        eps: Epsilon added to the per-branch mean square.
+        preload_residual: Whether residual and weight are already visible before
+            the current PDL producer starts. If true, load both before the PDL
+            wait; block output and injection logits are always read after it.
+
+    Returns:
+        Updated residual and normalized residual, both matching the residual
+        shape and dtype. Inputs are left unchanged.
+    """
+    if not residual.is_cuda:
+        raise ValueError("gated_residual_combine_norm requires GPU tensors")
+    if hc_count <= 1 or hidden_size <= 0:
+        raise ValueError("hc_count must exceed one and hidden_size must be positive")
+    if residual.ndim < 1 or residual.shape[-1] != hc_count * hidden_size:
+        raise ValueError("residual last dimension must equal hc_count * hidden_size")
+    combined = torch.empty_like(residual, memory_format=torch.contiguous_format)
+    normalized = _grouped_gemma_rmsnorm(
+        residual,
+        weight,
+        hidden_size,
+        eps,
+        out=None,
+        block_output=block_output,
+        inject_logits=inject_logits,
+        residual_out=combined,
+        preload_residual=preload_residual,
+    )
+    return combined, normalized
+
+
+__all__ = [
+    "gated_residual_combine_norm",
+    "grouped_gemma_rmsnorm",
+    "grouped_rmsnorm",
+    "qk_rmsnorm",
+    "rmsnorm",
+]

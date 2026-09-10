@@ -134,35 +134,47 @@ def _grouped_gemma_rmsnorm_kernel(
     x_ptr,
     weight_ptr,
     out_ptr,
-    row_stride,
-    out_row_stride,
+    block_ptr,
+    inject_ptr,
+    residual_out_ptr,
+    weight_group_stride,
     eps: tl.constexpr,
+    WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_COMBINE: tl.constexpr,
+    PRELOAD_RESIDUAL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     group = tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < GROUP_SIZE
-    group_offset = group * GROUP_SIZE
-    if ENABLE_PDL:
+    positions = row * WIDTH + group * GROUP_SIZE + offsets
+    if ENABLE_PDL and not PRELOAD_RESIDUAL:
         tl.extra.cuda.gdc_wait()
-    x = tl.load(
-        x_ptr + row * row_stride + group_offset + offsets,
-        mask=mask,
-        other=0.0,
+    x = tl.load(x_ptr + positions, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + group * weight_group_stride + offsets, mask=mask, other=0.0
     ).to(tl.float32)
+    if ENABLE_PDL and PRELOAD_RESIDUAL:
+        # The caller guarantees residual and norm weights are already visible.
+        # Block output and injection logits may still be produced upstream.
+        tl.extra.cuda.gdc_wait()
+    if HAS_COMBINE:
+        value = tl.load(
+            block_ptr + row * GROUP_SIZE + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        logit = tl.load(inject_ptr + row * (WIDTH // GROUP_SIZE) + group).to(tl.float32)
+        x = x + value * 2.0 * tl.sigmoid(logit)
+        # Match the standalone combine's store before the next norm reads it.
+        # Keeping the unrounded FP32 sum would change BF16/FP16 model semantics.
+        x = x.to(x_ptr.dtype.element_ty).to(tl.float32)
+        tl.store(residual_out_ptr + positions, x, mask=mask)
+        x = tl.where(mask, x, 0.0)
     variance = tl.sum(x * x, axis=0) / GROUP_SIZE
-    weight = tl.load(weight_ptr + group_offset + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
     normalized = x * tl.rsqrt(variance + eps) * (1.0 + weight)
-    tl.store(
-        out_ptr + row * out_row_stride + group_offset + offsets,
-        normalized,
-        mask=mask,
-    )
+    tl.store(out_ptr + positions, normalized, mask=mask)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -172,7 +184,12 @@ def grouped_gemma_rmsnorm(
     weight: torch.Tensor,
     group_size: int,
     eps: float,
-    out: torch.Tensor | None = None,
+    out: torch.Tensor | None,
+    *,
+    block_output: torch.Tensor | None,
+    inject_logits: torch.Tensor | None,
+    residual_out: torch.Tensor | None,
+    preload_residual: bool,
 ) -> torch.Tensor:
     """Grouped Gemma RMSNorm without the unused inverse-RMS output.
 
@@ -186,9 +203,10 @@ def grouped_gemma_rmsnorm(
         raise ValueError(
             f"group_size must divide the last dimension ({width}), got {group_size}"
         )
-    if weight.shape != (width,):
+    if weight.shape not in ((width,), (group_size,)):
         raise ValueError(
-            f"weight must have shape {(width,)}, got {tuple(weight.shape)}"
+            f"weight must have shape {(width,)} or {(group_size,)}, "
+            f"got {tuple(weight.shape)}"
         )
     if weight.dtype != x.dtype or weight.device != x.device:
         raise ValueError("weight must match x dtype and device")
@@ -198,17 +216,45 @@ def grouped_gemma_rmsnorm(
         raise ValueError("out must match x shape, dtype, and device")
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
+    has_combine = block_output is not None
+    if preload_residual and not has_combine:
+        raise ValueError("residual preloading requires a combine input")
+    if has_combine != (inject_logits is not None) or has_combine != (
+        residual_out is not None
+    ):
+        raise ValueError(
+            "block_output, inject_logits, and residual_out are required together"
+        )
+    groups = width // group_size
+    if has_combine:
+        for name, value, shape in (
+            ("block_output", block_output, (*x.shape[:-1], group_size)),
+            ("inject_logits", inject_logits, (*x.shape[:-1], groups)),
+            ("residual_out", residual_out, x.shape),
+        ):
+            if (
+                value.shape != shape
+                or value.dtype != x.dtype
+                or value.device != x.device
+            ):
+                raise ValueError(
+                    f"{name} must have shape {tuple(shape)} and match x dtype and device"
+                )
+        if not residual_out.is_contiguous():
+            raise ValueError("residual_out must be contiguous")
     if x.numel() == 0:
         return out
     if not x.is_contiguous():
         x = x.contiguous()
+        preload_residual = False
     if not weight.is_contiguous():
         weight = weight.contiguous()
+        preload_residual = False
 
     rows = x.numel() // width
-    groups = width // group_size
-    x_2d = x.view(rows, width)
-    out_2d = out.view(rows, width)
+    if has_combine:
+        block_output = block_output.contiguous()
+        inject_logits = inject_logits.contiguous()
     block = triton.next_power_of_2(group_size)
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
@@ -217,14 +263,19 @@ def grouped_gemma_rmsnorm(
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
     _grouped_gemma_rmsnorm_kernel[(rows, groups)](
-        x_2d,
+        x,
         weight,
-        out_2d,
-        x_2d.stride(0),
-        out_2d.stride(0),
+        out,
+        block_output,
+        inject_logits,
+        residual_out,
+        group_size if weight.numel() == width else 0,
         eps=eps,
+        WIDTH=width,
         GROUP_SIZE=group_size,
         BLOCK=block,
+        HAS_COMBINE=has_combine,
+        PRELOAD_RESIDUAL=preload_residual,
         ENABLE_PDL=enable_pdl,
         **launch_kwargs,
     )
