@@ -81,6 +81,31 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
+def _packed_qkv_views(
+    mixed_qkv: torch.Tensor,
+    *,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose packed Q/K/V rows without changing storage or materializing copies."""
+    seq_len = mixed_qkv.shape[0]
+    widths = (
+        num_q_heads * head_q,
+        num_k_heads * head_k,
+        num_v_heads * head_v,
+    )
+    query, key, value = mixed_qkv.split(widths, dim=-1)
+    return (
+        query.view(1, seq_len, num_q_heads, head_q),
+        key.view(1, seq_len, num_k_heads, head_k),
+        value.view(1, seq_len, num_v_heads, head_v),
+    )
+
+
 def _prepare_cache_prefill_state_inputs(
     conv_states: torch.Tensor,
     ssm_states: torch.Tensor,
@@ -193,6 +218,8 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
+    _verify_reads_committed_recurrent_state: bool = False
+    _verify_packed_qkv_views: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -537,7 +564,7 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
         )
-        if not self.replay_ssm:
+        if not self.replay_ssm and not self._verify_reads_committed_recurrent_state:
             copy_state_rows(
                 tables["ssm_comp"],
                 tables["ssm_scratch"],
@@ -559,16 +586,27 @@ class MambaAttnBackend(AttentionBackend):
         grid = cache.get((bs, draft_token_num))
         if grid is not None:
             return grid
-        stride = draft_token_num + 1
-        base = (
-            torch.arange(bs, dtype=torch.int32, device=self.device) * stride
-        ).unsqueeze(1)
+        base = self._verify_scratch_base_rows(bs, draft_token_num).unsqueeze(1)
         steps = torch.arange(
             1, draft_token_num + 1, dtype=torch.int32, device=self.device
         ).unsqueeze(0)
         grid = base + steps
         cache[(bs, draft_token_num)] = grid
         return grid
+
+    def _verify_scratch_base_rows(self, bs: int, draft_token_num: int) -> torch.Tensor:
+        """Graph-stable scratch initialization row for each request."""
+        cache = getattr(self, "_verify_base_cache", None)
+        if cache is None:
+            cache = self._verify_base_cache = {}
+        key = (bs, draft_token_num)
+        rows = cache.get(key)
+        if rows is None:
+            rows = torch.arange(bs, dtype=torch.int32, device=self.device) * (
+                draft_token_num + 1
+            )
+            cache[key] = rows
+        return rows
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""
@@ -1468,7 +1506,7 @@ class MambaAttnBackend(AttentionBackend):
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             conv_states = conv_scratch
-            conv_read = output_indices[:batch_size, 0] - 1
+            conv_read = self._verify_scratch_base_rows(batch_size, draft_token_num)
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
@@ -1540,16 +1578,30 @@ class MambaAttnBackend(AttentionBackend):
                 b.view(seq_len, -1),
             )
 
-        query, key, value = fused_qkv_split_gdn_prefill(
-            mixed_qkv,
-            num_q_heads=num_heads,
-            num_k_heads=num_heads,
-            num_v_heads=num_value_heads,
-            head_q=head_k_dim,
-            head_k=head_k_dim,
-            head_v=head_v_dim,
-            replay=replay_inputs,
-        )
+        # KDA can consume zero-copy strided views. When recurrent-state replay is
+        # enabled, the existing split kernel must remain because it also saves the
+        # persistent inputs needed to reconstruct accepted state later.
+        if is_target_verify and self._verify_packed_qkv_views and replay_inputs is None:
+            query, key, value = _packed_qkv_views(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+            )
+        else:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+                replay=replay_inputs,
+            )
 
         if is_target_verify:
             core_attn_out = self._verify_scan(

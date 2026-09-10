@@ -3,16 +3,19 @@
 
 evalscope's swe_smith plugin has no prime/measure phase control, so the
 prime waves, the P-cached turn replay, and the measured waves all run
-through this thin client. It replays the frozen agentic dataset, drives a
-fixed concurrency with rolling admission, and emits a benchmark_summary.json
-consumed by pd_sim's own collect_outputs.py (NOT column-compatible with the
-parent bench's collect — pd_sim has its own).
+through this thin client. It replays the duplicated agentic dataset,
+drives a fixed concurrency with rolling admission, and emits a
+benchmark_summary.json consumed by collect_outputs.py in this directory.
 
 Phases (--phase):
   p-fresh   unique first turns, max_tokens 1        -> prefill tok/s
   p-cached  turn-1 prime (500) then turn-2 measure  -> computed tok/s
   d-prime   first turns, max_tokens 1, low parallel  (no summary emitted)
   d-measure resend first turns, max_tokens N        -> output tok/s
+
+Every request carries rid=pdsim-conv-<index> (index into the deduplicated
+conversation list), so a gateway running sticky sessions keeps a
+conversation on the DP rank that primed it across phases.
 """
 
 import argparse
@@ -29,7 +32,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True, help="chat/completions endpoint")
     p.add_argument("--model", required=True, help="served model name")
-    p.add_argument("--dataset", required=True, help="frozen agentic_dataset.json")
+    p.add_argument("--dataset", required=True, help="agentic_dataset_x32.json")
     p.add_argument(
         "--phase",
         required=True,
@@ -56,13 +59,31 @@ def first_turn_messages(conv):
     return conv[0]["messages"]
 
 
+def conv_rid(index):
+    return f"pdsim-conv-{index}"
+
+
+def request_body(model, messages, max_tokens, rid):
+    return json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "ignore_eos": True,
+            "rid": rid,
+        }
+    ).encode()
+
+
 def unique_first_turn_conversations(convs):
     """Drop conversations whose first turn duplicates an earlier one.
 
-    The frozen artifact contains exact duplicate first-turn pairs (7 in the
-    current file, 64 unique of 71). P-fresh's <=5% hit guard assumes every
-    ladder rung prefills content never seen before, so --offset/--number
-    index into this deduplicated, order-preserving list for ALL phases.
+    The 71-conversation build contains exact duplicate first-turn pairs (7
+    pairs, 64 unique); the cache-bust replicas are distinct by construction.
+    P-fresh's <=5% hit guard assumes every ladder rung prefills content never
+    seen before, so --offset/--number index into this deduplicated,
+    order-preserving list for ALL phases.
     """
     seen = set()
     out = []
@@ -80,49 +101,23 @@ class Runner:
         self.lock = threading.Lock()
         self.results = []
 
-    def request(self, messages, max_tokens):
-        body = json.dumps(
-            {
-                "model": self.args.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "ignore_eos": True,
-            }
-        ).encode()
+    def request(self, messages, max_tokens, rid):
+        body = request_body(self.args.model, messages, max_tokens, rid)
         req = urllib.request.Request(
             self.args.url, data=body, headers={"Content-Type": "application/json"}
         )
         t0 = time.monotonic()
-        retried = False
         try:
             with urllib.request.urlopen(req, timeout=self.args.timeout) as r:
                 out = json.load(r)
-        except Exception:
-            # One retry; a request that fails twice is recorded, not fatal —
-            # the rung completes and collect VOIDs it on failures. The retry
-            # deliberately stays inside the t0..t1 window (a hiccup is part of
-            # the request's real latency); 'Retried Requests' in the summary
-            # flags rungs whose percentiles carry retry time.
-            retried = True
-            try:
-                with urllib.request.urlopen(
-                    urllib.request.Request(
-                        self.args.url,
-                        data=body,
-                        headers={"Content-Type": "application/json"},
-                    ),
-                    timeout=self.args.timeout,
-                ) as r:
-                    out = json.load(r)
-            except Exception as e:
-                return {"failed": True, "error": str(e)[:200]}
+        except Exception as e:
+            raise SystemExit(f"request {rid} failed: {str(e)[:200]}") from e
         t1 = time.monotonic()
         usage = out.get("usage") or {}
         details = usage.get("prompt_tokens_details") or {}
         msg = out["choices"][0]["message"]
         return {
             "latency_s": t1 - t0,
-            "retried": retried,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "cached_tokens": details.get("cached_tokens") or 0,
@@ -130,35 +125,44 @@ class Runner:
             "reasoning_content": msg.get("reasoning_content"),
         }
 
-    def prime_item(self, conv):
+    def prime_item(self, item):
         # P-cached prime: turn 1 with up to 500 generated tokens builds a
         # realistic prefix (50K prompt + completion). Excluded from timing.
         # BOTH reasoning_content and content are passed back verbatim: K3's
         # chat template renders them into the think/response channels, so the
         # re-rendered assistant turn retokenizes onto the cached token stream
         # instead of diverging at the <think> open tag.
+        index, conv = item
+        if len(conv) < 2:
+            raise SystemExit(f"conversation {index} has no second turn")
         t1_msgs = list(first_turn_messages(conv))
-        prime = self.request(t1_msgs, 500)
-        if prime.get("failed") or len(conv) < 2:
-            return None
+        prime = self.request(t1_msgs, 500, conv_rid(index))
         assistant = {"role": "assistant", "content": prime["content"] or ""}
         if prime.get("reasoning_content"):
             assistant["reasoning_content"] = prime["reasoning_content"]
-        return t1_msgs + [assistant] + list(conv[1]["messages"])
+        return index, t1_msgs + [assistant] + list(conv[1]["messages"])
 
-    def one_item(self, payload):
+    def one_item(self, item):
         a = self.args
+        index, payload = item
         if a.phase == "p-cached":
             msgs = payload  # pre-assembled turn-2 message list
         else:
             msgs = list(first_turn_messages(payload))
-        res = self.request(msgs, a.max_tokens)
+        res = self.request(msgs, a.max_tokens, conv_rid(index))
         with self.lock:
             self.results.append(res)
         return res
 
-    # NOTE: failed requests carry {'failed': True} and are excluded from the
-    # token/latency aggregates but counted in 'Failed Requests'.
+    def _map(self, fn, items):
+        # A failed request raises; cancel the queued ones so the run stops
+        # after the in-flight requests instead of sending the rest.
+        with cf.ThreadPoolExecutor(max_workers=self.args.parallel) as ex:
+            try:
+                return list(ex.map(fn, items))
+            except BaseException:
+                ex.shutdown(cancel_futures=True)
+                raise
 
     def run(self, convs):
         a = self.args
@@ -168,18 +172,17 @@ class Runner:
                 f"dataset has only {len(picked)} conversations at offset "
                 f"{a.offset}; need {a.number}"
             )
+        # Items carry the conversation's absolute index so every phase sends
+        # the same rid for the same conversation.
+        items = list(enumerate(picked, start=a.offset))
         if a.phase == "p-cached":
             # Phase 1 (untimed): prime every conversation's turn-1 prefix.
-            with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-                payloads = [m for m in ex.map(self.prime_item, picked) if m]
-            if not payloads:
-                raise SystemExit("no conversation has a second turn")
+            payloads = self._map(self.prime_item, items)
         else:
-            payloads = picked
+            payloads = items
         # Phase 2 (timed): only the measured requests count toward wall time.
         t0 = time.monotonic()
-        with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-            list(ex.map(self.one_item, payloads))
+        self._map(self.one_item, payloads)
         wall = time.monotonic() - t0
         return wall
 
@@ -202,8 +205,7 @@ def _nearest_rank(sorted_vals, p):
 
 
 def summarize(args, results, wall_s):
-    failed = [r for r in results if r.get("failed")]
-    ok = [r for r in results if not r.get("failed")]
+    ok = results
     n = len(ok)
     prompt = sum(r["prompt_tokens"] for r in ok)
     cached = sum(r["cached_tokens"] for r in ok)
@@ -215,13 +217,7 @@ def summarize(args, results, wall_s):
     summary = {
         "Phase": args.phase,
         "Concurrency": args.parallel,
-        # Requested vs Requests: a p-cached prime that fails twice silently
-        # drops its conversation from the measured wave, so the two can
-        # diverge with zero Failed Requests. collect VOIDs the mismatch.
-        "Requested": args.number,
         "Requests": n,
-        "Failed Requests": len(failed),
-        "Retried Requests": sum(1 for r in ok if r.get("retried")),
         "Wall (s)": round(wall_s, 3),
         "Prompt Tokens": prompt,
         "Cached Tokens": cached,
