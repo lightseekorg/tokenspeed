@@ -168,7 +168,7 @@ def test_petit_rejects_decode_capacity_above_workspace_limit() -> None:
         ServerArgs.validate(args)
 
 
-@pytest.mark.parametrize("dtype", ["half", "float16", "float", "float32"])
+@pytest.mark.parametrize("dtype", ["auto", "half", "float16", "float", "float32"])
 def test_petit_rejects_non_bfloat16_dtype(dtype: str) -> None:
     args = _validation_args(
         moe_backend="petit",

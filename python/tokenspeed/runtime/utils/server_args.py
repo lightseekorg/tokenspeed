@@ -946,7 +946,7 @@ class ServerArgs:
                 f"{', '.join(petit_roles)} MoE backend"
             )
         if petit_roles:
-            if self.dtype not in ("auto", "bfloat16"):
+            if self.dtype != "bfloat16":
                 raise ValueError(
                     "Petit MegaMoE requires --dtype bfloat16; "
                     f"configured dtype={self.dtype}"
