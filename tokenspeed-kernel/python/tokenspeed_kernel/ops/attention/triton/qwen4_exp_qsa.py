@@ -50,9 +50,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     complete_blocks,
     draft_logical_positions,
     uniform_len,
-    qsa_expansion,
     qsa_page_size,
-    recent_expansion,
     recent_page_size,
     stride_seq_b,
     stride_len_b,
@@ -109,11 +107,10 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
 
         qsa_columns = safe_logical // qsa_page_size
         qsa_pages = tl.load(
-            qsa_page_table + request * stride_qsa_pt_b + qsa_columns * qsa_expansion,
+            qsa_page_table + request * stride_qsa_pt_b + qsa_columns,
             mask=mask & valid,
             other=0,
         ).to(tl.int64)
-        qsa_pages = qsa_pages // qsa_expansion
         qsa_values = qsa_pages * qsa_page_size + safe_logical % qsa_page_size
         qsa_valid = valid & (qsa_pages > 0)
         tl.store(
@@ -124,13 +121,10 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
 
         recent_columns = safe_logical // recent_page_size
         recent_pages = tl.load(
-            recent_page_table
-            + request * stride_recent_pt_b
-            + recent_columns * recent_expansion,
+            recent_page_table + request * stride_recent_pt_b + recent_columns,
             mask=mask & valid,
             other=0,
         ).to(tl.int64)
-        recent_pages = recent_pages // recent_expansion
         recent_values = (
             recent_pages * recent_page_size + safe_logical % recent_page_size
         )
@@ -147,10 +141,8 @@ def qwen4_exp_qsa_prepare_metadata(
     query_lengths: torch.Tensor | int,
     total_tokens: int,
     qsa_page_table: torch.Tensor,
-    qsa_expansion: int,
     qsa_page_size: int,
     recent_page_table: torch.Tensor,
-    recent_expansion: int,
     recent_page_size: int,
     compress_ratio: int,
     *,
@@ -172,11 +164,10 @@ def qwen4_exp_qsa_prepare_metadata(
         seq_lens: Sequence length per request.
         query_lengths: Per-request row counts or one uniform Python integer.
         total_tokens: Total flattened query rows.
-        qsa_page_table: Compressed-cache page table at consumer granularity.
-        qsa_expansion: Consumer pages per compressed logical page.
+        qsa_page_table: Raw compressed-cache block ids, with holes and padding
+            normalized to zero; one entry per logical page.
         qsa_page_size: Logical tokens covered by a compressed page.
-        recent_page_table: Recent-cache page table at consumer granularity.
-        recent_expansion: Consumer pages per recent logical page.
+        recent_page_table: Raw recent-cache block ids in the same format.
         recent_page_size: Logical tokens covered by a recent page.
         compress_ratio: Raw tokens represented by one compressed key.
         draft_logical_positions: Optional request-local draft tags to reset.
@@ -229,9 +220,7 @@ def qwen4_exp_qsa_prepare_metadata(
         *outputs,
         draft_arg,
         uniform_len,
-        qsa_expansion,
         qsa_page_size,
-        recent_expansion,
         recent_page_size,
         seq_lens.stride(0),
         stride_len_b,
@@ -1401,7 +1390,6 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     head_dim,
     num_blocks,
     page_size,
-    page_expansion,
     blocks_per_split,
     stride_q_n,
     stride_q_h,
@@ -1446,14 +1434,11 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         tile_mask = block_ids < block_end
         columns = block_ids // page_size
         offsets = block_ids % page_size
-        # Page tables live at consumer granularity; entry ``col * expansion``
-        # maps back to one logical compressed page.
         pages = tl.load(
-            page_table + request * stride_pt_b + columns * page_expansion,
+            page_table + request * stride_pt_b + columns,
             mask=tile_mask,
             other=0,
         ).to(tl.int64)
-        pages = pages // page_expansion
         slots = pages * page_size + offsets
         keys = tl.load(
             key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
@@ -1613,7 +1598,6 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     head_dim,
     num_blocks,
     page_size,
-    page_expansion,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -1646,14 +1630,11 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     tile_mask = block_ids < num_blocks
     columns = block_ids // page_size
     offsets = block_ids % page_size
-    # Page tables live at consumer granularity; entry ``col * expansion``
-    # maps back to one logical compressed page.
     pages = tl.load(
-        page_table + request * stride_pt_b + columns * page_expansion,
+        page_table + request * stride_pt_b + columns,
         mask=tile_mask,
         other=0,
     ).to(tl.int64)
-    pages = pages // page_expansion
     slots = pages * page_size + offsets
     valid = tile_mask & (block_ids < complete)
     keys = tl.load(
@@ -1681,7 +1662,6 @@ def _qwen4_exp_qsa_block_topk_stream(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int,
     max_partial_bytes: int,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -1695,7 +1675,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     """
 
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     if rows == 0 or num_blocks == 0:
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
@@ -1740,7 +1720,6 @@ def _qwen4_exp_qsa_block_topk_stream(
         query.shape[2],
         num_blocks,
         page_size,
-        page_expansion,
         blocks_per_split,
         query.stride(0),
         query.stride(1),
@@ -1824,7 +1803,6 @@ def _qwen4_exp_qsa_block_topk_logits(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -1840,7 +1818,7 @@ def _qwen4_exp_qsa_block_topk_logits(
     """
 
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
@@ -1855,7 +1833,6 @@ def _qwen4_exp_qsa_block_topk_logits(
         query.shape[2],
         num_blocks,
         page_size,
-        page_expansion,
         query.stride(0),
         query.stride(1),
         query.stride(2),
@@ -1905,7 +1882,6 @@ def qwen4_exp_qsa_block_topk(
     *,
     page_size: int,
     block_topk: int,
-    page_expansion: int = 1,
     max_partial_bytes: int = 32 * 1024 * 1024,
     solution: str = "stream",
     persistent_topk_workspace: torch.Tensor | None = None,
@@ -1916,15 +1892,13 @@ def qwen4_exp_qsa_block_topk(
     Args:
         query: Query tensor shaped ``[rows, heads, head_dim]``.
         key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Page table shaped ``[requests, max_pages]`` stored at
-            consumer granularity.
+        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
+            with holes and padding normalized to zero; one entry per logical page.
         request_indices: Owning request id per query row.
         complete_blocks: Fully compressed block counts shaped ``[rows]``.
         page_size: Compressed-cache rows covered by one logical page.
         block_topk: Blocks selected per row; must be a power of two and at
             least 64.
-        page_expansion: Consumer page-table entries covered by one logical
-            page.
         max_partial_bytes: Memory budget for the partial top-k buffers
             (``stream`` solution only).
         solution: ``"stream"`` fuses scoring and selection without
@@ -1946,16 +1920,13 @@ def qwen4_exp_qsa_block_topk(
         raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
     if block_topk < 64 or (block_topk & (block_topk - 1)):
         raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    page_expansion = int(page_expansion)
-    if page_expansion < 1:
-        raise ValueError("Qwen4-Exp QSA block top-k needs a positive expansion")
     if solution not in ("stream", "logits"):
         raise ValueError(
             "Qwen4-Exp QSA block top-k solution must be 'stream' or 'logits', "
             f"got {solution!r}"
         )
     rows = query.shape[0]
-    num_blocks = triton.cdiv(page_table.shape[1], page_expansion) * page_size
+    num_blocks = page_table.shape[1] * page_size
     if rows == 0 or num_blocks == 0:
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
@@ -1969,7 +1940,6 @@ def qwen4_exp_qsa_block_topk(
             complete_blocks,
             page_size=page_size,
             block_topk=block_topk,
-            page_expansion=page_expansion,
             persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
@@ -1981,7 +1951,6 @@ def qwen4_exp_qsa_block_topk(
         complete_blocks,
         page_size=page_size,
         block_topk=block_topk,
-        page_expansion=page_expansion,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
     )

@@ -43,9 +43,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("query_lengths", [4, [3, 4, 5]])
-@pytest.mark.parametrize("qsa_expansion", [1, 2])
 def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
-    device: str, query_lengths: int | list[int], qsa_expansion: int
+    device: str, query_lengths: int | list[int]
 ) -> None:
     seq_lens = torch.tensor([3, 14, 23], device=device, dtype=torch.int32)
     if not isinstance(query_lengths, int):
@@ -58,12 +57,8 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     ratio = 4
     qsa_page_size = 8
     recent_page_size = 4
-    qsa_logical = torch.tensor(
+    qsa_table = torch.tensor(
         [[2, 3, 4], [5, 6, 7], [8, 9, 10]], device=device, dtype=torch.int32
-    )
-    qsa_table = qsa_logical.repeat_interleave(qsa_expansion, dim=1)
-    qsa_table = qsa_table * qsa_expansion + (
-        torch.arange(qsa_table.shape[1], device=device) % qsa_expansion
     )
     recent_table = torch.arange(2, 2 + 3 * 6, device=device, dtype=torch.int32).reshape(
         3, 6
@@ -77,10 +72,8 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
         query_lengths,
         total_tokens,
         qsa_table,
-        qsa_expansion,
         qsa_page_size,
         recent_table,
-        1,
         recent_page_size,
         ratio,
         draft_logical_positions=draft_tags,
@@ -101,13 +94,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     row_offsets = torch.arange(total_tokens, device=device) - row_starts
     expected_positions = (seq_lens.long() - lengths)[expected_requests] + row_offsets
     safe_positions = expected_positions.clamp_min(0)
-    qsa_pages = (
-        qsa_table[
-            expected_requests,
-            (safe_positions // qsa_page_size) * qsa_expansion,
-        ].long()
-        // qsa_expansion
-    )
+    qsa_pages = qsa_table[expected_requests, safe_positions // qsa_page_size].long()
     expected_qsa = qsa_pages * qsa_page_size + safe_positions % qsa_page_size
     expected_qsa = torch.where(
         (expected_positions >= 0) & (qsa_pages > 0), expected_qsa, 0
@@ -729,7 +716,6 @@ def test_qwen4_exp_qsa_stream_skips_empty_split_writes(device: str) -> None:
         head_dim,
         num_blocks,
         page_size,
-        1,
         blocks_per_split,
         query.stride(0),
         query.stride(1),
@@ -804,21 +790,6 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         got = [int(value) for value in actual[row] if value >= 0]
         assert len(got) == len(expected)
         assert set(got) == expected
-
-    # The same selection must come out of a consumer-granularity page table
-    # whose entries are expanded 2x.
-    expanded_pt = page_table.repeat_interleave(2, dim=1) * 2
-    actual_expanded = qwen4_exp_qsa_block_topk(
-        query,
-        key_cache,
-        expanded_pt,
-        requests,
-        complete_blocks,
-        page_size=page_size,
-        block_topk=block_topk,
-        page_expansion=2,
-    )
-    torch.testing.assert_close(actual_expanded, actual)
 
 
 def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> None:
@@ -1159,7 +1130,7 @@ def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_qwen4_exp_qsa_block_topk_reads_strided_query(device: str) -> None:
+def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
     torch.manual_seed(53)
     rows, heads, head_dim, page_size = 3, 4, 16, 64
     block_topk = 64
@@ -1171,8 +1142,8 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_query(device: str) -> None:
         4 * num_blocks, 1, head_dim, device=device, dtype=torch.bfloat16
     )
     page_table = torch.randint(
-        1, 4 * pages_per_request, (rows, pages_per_request), device=device
-    )
+        1, 4 * pages_per_request, (rows, pages_per_request + 2), device=device
+    )[:, :pages_per_request]
     requests = torch.arange(rows, device=device)
     complete_blocks = torch.tensor([num_blocks, 40, 200], device=device)
 
@@ -1190,7 +1161,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_query(device: str) -> None:
         packed = qwen4_exp_qsa_block_topk(
             query.contiguous(),
             key_cache,
-            page_table,
+            page_table.contiguous(),
             requests.to(torch.int32),
             complete_blocks,
             page_size=page_size,

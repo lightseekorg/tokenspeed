@@ -57,6 +57,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
     STATE_LAYER_TYPES,
 )
 from tokenspeed.runtime.layers.attention.utils import (
@@ -438,9 +439,6 @@ def create_paged_router(
     """
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        FULL_ATTENTION,
     )
 
     spec = config.component(SoftmaxAttnConfig)

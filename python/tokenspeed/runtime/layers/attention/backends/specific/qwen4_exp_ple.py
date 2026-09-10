@@ -328,21 +328,25 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         )
 
     def ple_verify_scratch(
-        self, context_field_id: str, layer_id: int
+        self, context_field_id: str, layer_id: int, bs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return stable shared-context and local-layer convolution rollback rows."""
+        """Return shared-context and local-layer rollback views for ``bs`` requests."""
         if context_field_id != self._context_field_id:
             raise RuntimeError("PLE layer names a context outside its cache view")
         global_layer_id = self.cache_pool._field_layer_id(layer_id)
         try:
-            return (
-                self._ple_verify_scratch[context_field_id],
-                self._ple_verify_scratch[qwen4_exp_ple_conv_field(global_layer_id)],
-            )
+            context = self._ple_verify_scratch[context_field_id]
+            conv = self._ple_verify_scratch[qwen4_exp_ple_conv_field(global_layer_id)]
         except KeyError as exc:
             raise RuntimeError(
                 "PLE verify workspace was not preallocated for this layer"
             ) from exc
+        rows = bs * (self.spec_num_tokens + 1)
+        if context.shape[0] < rows or conv.shape[0] < rows:
+            raise RuntimeError(
+                f"PLE verify workspace needs {rows} rows, exceeding preallocated capacity"
+            )
+        return context[:rows], conv[:rows]
 
     @staticmethod
     def _u64(values: list[int], device: torch.device) -> torch.Tensor:

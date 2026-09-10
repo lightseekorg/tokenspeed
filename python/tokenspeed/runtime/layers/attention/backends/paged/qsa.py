@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention import qsa_sparse_attention
-from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -61,7 +60,6 @@ class QSAAttnBackend(MHAAttnBackend):
             dataclasses.replace(spec, backend_name="mha"),
             kernel_page_size=kernel_page_size,
         )
-        self._metadata_capacity_rows = config.max_bs * self.spec_num_tokens
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
@@ -78,6 +76,10 @@ class QSAAttnBackend(MHAAttnBackend):
         topk_indices: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
+        if self.is_mxfp8:
+            raise NotImplementedError(
+                "QSA sparse attention does not support MXFP8 KV cache"
+            )
         num_real = current_valid_rows()
         if num_real is not None:
             q, k, v, out_cache_loc, topk_indices = slice_to_real_tokens(
@@ -88,23 +90,8 @@ class QSAAttnBackend(MHAAttnBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        if (
-            k_cache.dtype == torch.float8_e4m3fn
-            and v_cache.dtype == torch.float8_e4m3fn
-            and k.dtype != k_cache.dtype
-            and v.dtype != v_cache.dtype
-        ):
-            fused_fp8_set_kv_buffer(
-                k=k,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=full_locs,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.kernel_page_size,
-            )
-        else:
+        if self.is_fp8 and (k.dtype == k_cache.dtype or v.dtype == v_cache.dtype):
+            # Already-quantized inputs must not be scaled a second time.
             token_to_kv_pool.set_kv_buffer(
                 layer,
                 full_locs,
@@ -113,6 +100,8 @@ class QSAAttnBackend(MHAAttnBackend):
                 layer.k_scale,
                 layer.v_scale,
             )
+        else:
+            self._save_kv_cache(layer, full_locs, token_to_kv_pool, k, v)
         max_seqlen_q = decode_query_lengths(
             ctx,
             q.shape[0],

@@ -42,9 +42,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     qwen4_exp_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
-    QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
-    QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE,
     qsa_compressed_field,
     qsa_raw_key_field,
@@ -362,7 +360,6 @@ class QSAIndexer(nn.Module):
             complete_blocks,
             page_size=page_size,
             block_topk=self.block_topk,
-            page_expansion=1,
             solution=self._topk_solution(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=pdl_enabled(),
@@ -512,11 +509,4 @@ class QSAIndexer(nn.Module):
         return selected_slots
 
 
-__all__ = [
-    "QWEN4_EXP_QSA_CACHE_GROUP",
-    "QWEN4_EXP_QSA_RECENT_CACHE_GROUP",
-    "QSAIndexer",
-    "qsa_compressed_field",
-    "qsa_raw_key_field",
-    "qsa_rope_position_field",
-]
+__all__ = ["QSAIndexer"]

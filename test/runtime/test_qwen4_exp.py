@@ -945,7 +945,6 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
 
     assert second is first
     assert backend.sparse_topk.qsa_metadata is first
-    assert launches[0][0][4] == launches[0][0][7] == 1
     assert len(launches) == 1
     assert torch.all(first_tags == torch.iinfo(torch.int64).min)
     assert torch.all(second_tags == torch.iinfo(torch.int64).min)
@@ -1521,21 +1520,27 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
 
 
 @pytest.mark.parametrize(
-    "cache_dtype,expect_fused",
+    "cache_dtype,input_dtype,mxfp8,expect_fused",
     [
-        (torch.float8_e4m3fn, True),
-        (torch.bfloat16, False),
+        (torch.float8_e4m3fn, torch.bfloat16, False, True),
+        (torch.bfloat16, torch.bfloat16, False, False),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, False, False),
+        (torch.float8_e4m3fn, torch.bfloat16, True, False),
     ],
 )
 def test_qwen4_exp_qsa_fuses_fp8_kv_store(
     monkeypatch: pytest.MonkeyPatch,
     cache_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    mxfp8: bool,
     expect_fused: bool,
 ) -> None:
     backend = object.__new__(QSAAttnBackend)
     page_size = 16
     backend.kernel_page_size = page_size
     backend._metadata_capacity_rows = 32
+    backend.is_mxfp8 = mxfp8
+    backend.is_fp8 = cache_dtype == torch.float8_e4m3fn and not mxfp8
 
     k_cache = torch.empty((32, 1, 8), dtype=cache_dtype)
     v_cache = torch.empty_like(k_cache)
@@ -1558,8 +1563,8 @@ def test_qwen4_exp_qsa_fuses_fp8_kv_store(
         tp_v_head_num=1,
         head_dim=8,
         v_head_dim=8,
-        k_scale=None,
-        v_scale=None,
+        k_scale=2.0,
+        v_scale=4.0,
         scaling=0.5,
     )
     fused_store_calls = []
@@ -1574,36 +1579,50 @@ def test_qwen4_exp_qsa_fuses_fp8_kv_store(
         )
         return torch.ones_like(query)
 
-    monkeypatch.setattr(qsa_backend_module, "fused_fp8_set_kv_buffer", fused_store)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.paged.mha.fused_fp8_set_kv_buffer",
+        fused_store,
+    )
     monkeypatch.setattr(qsa_backend_module, "qsa_sparse_attention", sparse_attention)
 
-    full_locs = torch.tensor([7], dtype=torch.int32)
+    # Draft step zero narrows Q while retaining every row in its KV window.
+    full_locs = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
     selected_slots = torch.tensor([[5, 9]], dtype=torch.int32)
-    output = backend._sparse_attention(
+    args = (
         torch.zeros((1, 8), dtype=torch.bfloat16),
-        torch.ones((1, 8), dtype=torch.bfloat16),
-        torch.full((1, 8), 2.0, dtype=torch.bfloat16),
+        torch.ones((4, 8), dtype=torch.bfloat16).to(input_dtype),
+        torch.full((4, 8), 2.0, dtype=torch.bfloat16).to(input_dtype),
         attention_layer,
         full_locs,
         pool,
         selected_slots,
         ctx,
     )
+    if mxfp8:
+        with pytest.raises(NotImplementedError, match="MXFP8"):
+            backend._sparse_attention(*args)
+        assert not (pool_store_calls or fused_store_calls or sparse_attention_calls)
+        return
+    output = backend._sparse_attention(*args)
 
     assert output.shape == (1, 8)
     assert len(sparse_attention_calls) == 1
     assert sparse_attention_calls[0][-1]["metadata_capacity_rows"] == 32
+    assert len(pool_store_calls) + len(fused_store_calls) == 1
     if expect_fused:
-        assert pool_store_calls == []
-        assert len(fused_store_calls) == 1
         call = fused_store_calls[0]
         assert call["k_cache"] is k_cache
         assert call["v_cache"] is v_cache
         torch.testing.assert_close(call["cache_loc"], full_locs)
         assert call["page_size"] == page_size
+        assert call["k_scale"] == 2.0 and call["v_scale"] == 4.0
+        assert call["k"].shape == call["v"].shape == (4, 1, 8)
     else:
-        assert fused_store_calls == []
-        assert len(pool_store_calls) == 1
+        _, locs, keys, values, k_scale, v_scale = pool_store_calls[0]
+        torch.testing.assert_close(locs, full_locs)
+        assert keys.dtype == values.dtype == input_dtype
+        assert keys.shape == values.shape == (4, 1, 8)
+        assert k_scale == 2.0 and v_scale == 4.0
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:

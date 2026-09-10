@@ -294,6 +294,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
     ctx = SimpleNamespace(bs=2, forward_mode=ForwardMode.DECODE, attn_backend=backend)
 
     def refresh(actual_bs: int) -> None:
+        backend.sparse_topk.qsa_metadata = object()
         backend.refresh_decode_metadata(
             2,
             actual_bs,
@@ -304,6 +305,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             num_extends=0,
             for_graph_replay=use_graph,
         )
+        assert backend.sparse_topk.qsa_metadata is None
 
     def stage() -> None:
         layout = qsa_forward_layout(

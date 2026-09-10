@@ -206,13 +206,17 @@ def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
 
 
 def test_ple_preallocation_preserves_workspace_and_budget(backend):
-    scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0)
+    scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, 4)
     allocated = backend.preallocate_verify_workspace(4, 3)
     assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8
     assert backend.preallocate_verify_workspace(2, 3) == allocated
-    assert (
-        backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0)[0] is scratch[0]
-    )
+    for bs in (1, 2, 4):
+        views = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, bs)
+        for view, full in zip(views, scratch, strict=True):
+            assert view.shape == (bs * 4, *full.shape[1:])
+            assert view.data_ptr() == full.data_ptr()
+    with pytest.raises(RuntimeError, match="preallocated capacity"):
+        backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, 5)
     with pytest.raises(RuntimeError, match="preallocated capacity"):
         backend.preallocate_verify_workspace(5, 3)
     with pytest.raises(ValueError, match="width differs"):

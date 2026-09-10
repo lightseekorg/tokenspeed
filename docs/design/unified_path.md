@@ -347,15 +347,21 @@ Draft views have no GDN or PLE child. PLE and QSA remain available on targets
 without linear-attention layers; the model retains their computation order.
 
 QSA's full-KV attention uses the ordinary router and an MHA-derived leaf.
+The leaf reuses MHA's KV writer; already-quantized FP8 inputs retain direct
+stores to avoid rescaling. Sparse attention has no MXFP8 block-scale input.
 Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
 to extra attention leaves. The indexer backend refreshes stable raw group
 tables with the shared `GroupTableStacks` fill at expansion ratio one:
 block ids remain unchanged, holes become zero, and padded requests and
-column tails are cleared. QSA kernel calls explicitly use ratio one; the
-layout carries no expansion factor. The indexer owns its query/sequence
-metadata and borrows the full-KV table and kernel page size from
+column tails are cleared. QSA metadata and top-k kernels consume these raw
+block ids directly; neither their APIs nor the layout carry expansion factors.
+The recipe rejects compressed fields whose row count or group's token span
+differs from the model's single-page geometry before cache allocation.
+The indexer owns its query/sequence metadata and borrows the full-KV table
+and kernel page size from
 `router.group_view`. Layer-shared layout and top-k still use `SparseTopKShare`
-with the existing forward and MTP reuse boundaries.
+with the existing forward and MTP reuse boundaries. The router clears this
+share before the root prepares its indexer child; the indexer does not clear it again.
 
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
 dense attention. Draft step zero still preserves the dense decode-context
@@ -374,7 +380,9 @@ updates staging tensors without re-running the Python assignment. Staged
 keys retain the model dtype; commit converts them to the fixed BF16 raw cache.
 
 `Qwen4ExpPLEBackend` resolves its own input/output checkpoints and query
-lengths from the PLE cache group. It shares the checkpoint arithmetic with
+lengths from the PLE cache group. It validates and slices rollback scratch by
+batch size using its own verify width; layers consume these views directly.
+It shares the checkpoint arithmetic with
 recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.

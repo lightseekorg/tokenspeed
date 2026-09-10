@@ -211,7 +211,6 @@ class QSAIndexerBackend(AttentionBackend):
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError("QSA decode metadata uses refresh_decode_metadata")
         self._fill_tables(bs, 0 if forward_mode.is_idle() else bs, block_tables)
-        self.full_attn_backend.sparse_topk.qsa_metadata = None
         # Keep this slot independent: draft extend init is followed by a decode
         # refresh before the first (still extend-shaped) model invocation.
         lengths = extend_seq_lens[:num_extends]
@@ -242,7 +241,6 @@ class QSAIndexerBackend(AttentionBackend):
         if not forward_mode.is_decode_or_idle():
             raise RuntimeError("QSA refresh_decode_metadata serves decode only")
         self._fill_tables(bs, actual_bs, block_tables)
-        self.full_attn_backend.sparse_topk.qsa_metadata = None
         torch.clamp_min(
             seq_lens[:bs],
             1 if self.is_draft else self.spec_num_tokens,

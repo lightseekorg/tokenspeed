@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupSpec,
 )
 
 
@@ -156,6 +157,43 @@ def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative, width) 
         assert setup.fixed_workspace_bytes == 576 + 440
     else:
         assert setup.fixed_workspace_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "group_rows,entry_stride,field_rows",
+    [(128, 4, 128), (64, 8, 64), (64, 4, 128)],
+)
+def test_qwen4_qsa_rejects_geometry_outside_model_page(
+    monkeypatch, group_rows, entry_stride, field_rows
+) -> None:
+    recipe = _recipe(layer_types=(FULL_ATTENTION,), speculative=False, width=1)
+    compressed, recent = recipe._qsa_fields()
+    monkeypatch.setattr(
+        recipe,
+        "_qsa_fields",
+        lambda: (
+            tuple(
+                replace(field, shape=(field_rows, *field.shape[1:]))
+                for field in compressed
+            ),
+            recent,
+        ),
+    )
+
+    def group_spec(**kwargs):
+        spec = CacheGroupSpec(**kwargs)
+        if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP:
+            spec = replace(
+                spec, rows_per_page=group_rows, entry_stride_tokens=entry_stride
+            )
+        return spec
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp.CacheGroupSpec",
+        group_spec,
+    )
+    with pytest.raises(ValueError, match="must match one model page"):
+        recipe.setup()
 
 
 def test_qwen4_state_layer_still_requires_linear_geometry() -> None:

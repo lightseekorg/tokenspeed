@@ -172,10 +172,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         ratio = self._qsa_compress_ratio
         compressed_fields = []
         recent_fields = []
-        unit = 0
-
-        def add_layer(layer_id: int, index_dim: int) -> None:
-            nonlocal unit
+        for unit, (layer_id, index_dim) in enumerate(self._qsa_layers):
             recent_plane = f"qwen4_exp.qsa.unit.{unit}.recent"
             recent_fields.extend(
                 (
@@ -203,10 +200,6 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     cache_dtype_name(torch.bfloat16),
                 )
             )
-            unit += 1
-
-        for layer_id, index_dim in self._qsa_layers:
-            add_layer(layer_id, index_dim)
         return tuple(compressed_fields), tuple(recent_fields)
 
     @override
@@ -265,16 +258,28 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             )
         qsa_compressed_fields, qsa_recent_fields = self._qsa_fields()
         if qsa_compressed_fields:
+            qsa_spec = CacheGroupSpec(
+                group_id=QWEN4_EXP_QSA_CACHE_GROUP,
+                retention="full_history",
+                rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
+                entry_stride_tokens=self._qsa_compress_ratio,
+                sliding_window_tokens=None,
+                family="history",
+            )
+            # Raw block ids require exactly one model/kernel page per block.
+            for field in qsa_compressed_fields:
+                if not (
+                    field.shape[0] * self._qsa_compress_ratio
+                    == qsa_spec.block_granularity
+                    == QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE * self._qsa_compress_ratio
+                ):
+                    raise ValueError(
+                        f"Qwen4-Exp QSA compressed field {field.field_id!r}: "
+                        "field rows and block_granularity must match one model page"
+                    )
             extras += (
                 (
-                    CacheGroupSpec(
-                        group_id=QWEN4_EXP_QSA_CACHE_GROUP,
-                        retention="full_history",
-                        rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
-                        entry_stride_tokens=self._qsa_compress_ratio,
-                        sliding_window_tokens=None,
-                        family="history",
-                    ),
+                    qsa_spec,
                     qsa_compressed_fields,
                 ),
                 (

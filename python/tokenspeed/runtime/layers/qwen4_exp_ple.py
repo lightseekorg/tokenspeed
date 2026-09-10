@@ -823,21 +823,6 @@ class Qwen4ExpPLELayer(nn.Module):
             final_conv = values.new_empty((bs, channels, 0))
         return conv_output, final_conv, intermediate_conv
 
-    def _verify_scratch_for(
-        self,
-        bs: int,
-        width: int,
-        backend: Qwen4ExpPLEBackend,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        rows = bs * (width + 1)
-        external = backend.ple_verify_scratch(self.context_field_id, self.layer_id)
-        if external[0].shape[0] < rows or external[1].shape[0] < rows:
-            raise RuntimeError(
-                "Qwen4-Exp PLE verify workspace is smaller than the "
-                f"captured batch: need {rows} rows"
-            )
-        return external[0][:rows], external[1][:rows]
-
     def _final_context(
         self,
         flat_ids: torch.Tensor,
@@ -957,13 +942,10 @@ class Qwen4ExpPLELayer(nn.Module):
         if verify:
             # Both CUDA state producers write directly into this stable rollback
             # workspace, including each request's carried row.
-            width = metadata.verify_width
-            context_scratch, conv_scratch = self._verify_scratch_for(
-                ctx.bs,
-                width,
-                backend,
+            context_scratch, conv_scratch = backend.ple_verify_scratch(
+                self.context_field_id, self.layer_id, ctx.bs
             )
-            scratch_stride = width + 1
+            scratch_stride = metadata.verify_width + 1
         if flat_ids.is_cuda:
             # The n-gram windows are gathered inside the hash kernel; verify
             # writes their state rows directly instead of returning a packed tail.
