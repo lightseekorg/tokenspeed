@@ -68,6 +68,9 @@ class CacheArena:
                 "cache arena requires at least one cache group spec to publish"
             )
         self.plan = plan
+        # Materialize immutable byte geometry at setup, not on first hand-out.
+        for group in plan.groups:
+            plan.block_byte_segments(group.group_id, [])
         self.device = device
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in cache_group_specs
@@ -234,16 +237,7 @@ class CacheArena:
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:
-        self.plan.group(group_id)
-        fields = [field for field in self.plan.fields if field.group_id == group_id]
-        return [
-            (
-                self.field_block_byte_offset(field.field_id, block_id),
-                field.payload_bytes,
-            )
-            for block_id in block_ids
-            for field in fields
-        ]
+        return self.plan.block_byte_segments(group_id, block_ids)
 
     @property
     def supports_disaggregation(self) -> bool:

@@ -383,14 +383,17 @@ def _zero_byte_ranges_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     range_id = tl.program_id(0)
-    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     range_offset = tl.load(ranges_ptr + range_id * 2)
     range_size = tl.load(ranges_ptr + range_id * 2 + 1)
-    tl.store(
-        backing_ptr + range_offset + byte_offsets,
-        0,
-        mask=byte_offsets < range_size,
-    )
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
 
 
 def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> None:
@@ -404,8 +407,9 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
         return
     if backing.dtype != torch.uint8 or not backing.is_contiguous():
         raise ValueError("backing must be a contiguous uint8 tensor")
+    backing_size = backing.numel()
     if any(
-        offset < 0 or size <= 0 or offset + size > backing.numel()
+        offset < 0 or size <= 0 or offset + size > backing_size
         for offset, size in ranges
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
@@ -419,7 +423,11 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     block_size = 1024
     max_size = max(size for _, size in ranges)
 
-    grid = (len(ranges), triton.cdiv(max_size, block_size))
+    # A short range must not launch one CTA for every tile of the largest
+    # state field. Bound the rectangle and let each CTA stride its own range.
+    # Few large ranges still need enough CTAs to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, len(ranges)))
+    grid = (len(ranges), min(tiles_per_range, triton.cdiv(max_size, block_size)))
 
     _zero_byte_ranges_kernel[grid](
         backing,

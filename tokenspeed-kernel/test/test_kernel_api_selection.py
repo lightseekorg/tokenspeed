@@ -63,6 +63,7 @@ import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
+import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -187,6 +188,7 @@ _RELOAD_MODULES = [
     _moe_gluon_dsv4,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
+    _moe_sigmoid_topk,
     _moe_gluon_sigmoid_topk,
     _moe_gluon,
     _moe_triton_bf16,
@@ -1094,13 +1096,19 @@ def _attention_mla_decode_fp8q_unsupported_heads() -> object:
     )
 
 
-def _attention_mla_decode_projected_value_gfx1250(heads: int = 12) -> object:
-    q = torch.empty((1, 1, heads, 576), dtype=torch.float8_e4m3fn)
+def _attention_mla_decode_projected_value_amd(
+    heads: int = 12,
+    *,
+    batch: int = 1,
+) -> object:
+    q = torch.empty((batch, 1, heads, 576), dtype=torch.float8_e4m3fn)
     kv_cache = torch.empty((64, 64, 1, 576), dtype=torch.float8_e4m3fn)
-    page_table = torch.arange(64, dtype=torch.int32).view(1, 64)
-    cache_seqlens = torch.tensor([4096], dtype=torch.int32)
+    page_table = (
+        torch.arange(64, dtype=torch.int32).view(1, 64).expand(batch, -1).contiguous()
+    )
+    cache_seqlens = torch.full((batch,), 4096, dtype=torch.int32)
     value_weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
-    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
     return tokenspeed_kernel.mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
@@ -1116,14 +1124,15 @@ def _attention_mla_decode_projected_value_gfx1250(heads: int = 12) -> object:
     )
 
 
-def _attention_mla_project_value_gfx1250(
+def _attention_mla_project_value_amd(
     *,
+    batch: int = 1,
     heads: int = 12,
     use_gate: bool = False,
 ) -> object:
-    attention = torch.empty((1, heads, 512), dtype=torch.bfloat16)
+    attention = torch.empty((batch, heads, 512), dtype=torch.bfloat16)
     weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
-    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    out = torch.empty((batch, heads * 128), dtype=torch.bfloat16)
     gate = torch.empty_like(out) if use_gate else None
     return tokenspeed_kernel.mla_project_value(
         attention,
@@ -2420,6 +2429,58 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert selected.name == "triton_decode_sigmoid_bias_topk"
 
 
+def test_gfx1250_sigmoid_topk_selects_by_token_count(
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx1250")
+    triton_spec = registry.get_by_name("triton_decode_sigmoid_bias_topk")
+    if gluon_spec is None or triton_spec is None:
+        pytest.skip("gfx1250 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        decode = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1, "experts": 896, "topk": 16},
+        )
+        batched = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+        other_shape = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 256, "topk": 8},
+        )
+        reduced_precision = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode.name == "triton_decode_sigmoid_bias_topk"
+    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert other_shape.name == "torch_sigmoid_bias_topk"
+    assert reduced_precision.name == "torch_sigmoid_bias_topk"
+
+
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     mi350_platform: PlatformInfo,
 ) -> None:
@@ -3599,7 +3660,7 @@ _CASES = [
         "attention",
         "mla_decode_projected_value",
         "gluon_mla_decode_projected_value_gfx1250",
-        _attention_mla_decode_projected_value_gfx1250,
+        _attention_mla_decode_projected_value_amd,
     ),
     _case(
         _is_cdna5,
@@ -3607,16 +3668,17 @@ _CASES = [
         "attention",
         "mla_decode_projected_value",
         "gluon_mla_decode_projected_value_gfx1250",
-        lambda: _attention_mla_decode_projected_value_gfx1250(16),
+        lambda: _attention_mla_decode_projected_value_amd(16),
         id_suffix="h16",
     ),
     _case(
         _is_cdna5,
         "cdna5",
         "attention",
-        "mla_project_value",
-        "gluon_mla_project_value_gfx1250",
-        _attention_mla_project_value_gfx1250,
+        "mla_decode_projected_value",
+        "gluon_mla_decode_projected_value_gfx1250",
+        lambda: _attention_mla_decode_projected_value_amd(batch=8),
+        id_suffix="batch8",
     ),
     _case(
         _is_cdna5,
@@ -3624,8 +3686,25 @@ _CASES = [
         "attention",
         "mla_project_value",
         "gluon_mla_project_value_gfx1250",
-        lambda: _attention_mla_project_value_gfx1250(use_gate=True),
+        _attention_mla_project_value_amd,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        lambda: _attention_mla_project_value_amd(use_gate=True),
         id_suffix="sigmoid-gate",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        lambda: _attention_mla_project_value_amd(batch=8, use_gate=True),
+        id_suffix="batch8-sigmoid-gate",
     ),
     _case(
         _is_cdna5,
@@ -4639,6 +4718,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("num_q_heads", 12, True, id="matched"),
         pytest.param("num_q_heads", 16, True, id="h16"),
         pytest.param("num_q_heads", 32, False, id="unsupported-heads"),
+        pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
         pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
@@ -4664,6 +4744,32 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "support_logit_cap": False,
     }
     traits[trait] = value
+    assert spec_matches_traits(spec, traits) is matches
+
+
+@pytest.mark.parametrize(
+    "batch_size,matches",
+    [
+        pytest.param(1, True, id="batch1"),
+        pytest.param(8, True, id="batch8"),
+        pytest.param(16, False, id="batch16"),
+    ],
+)
+def test_gluon_mla_project_value_gfx1250_batch_traits(
+    batch_size: int,
+    matches: bool,
+) -> None:
+    spec = KernelRegistry.get().get_by_name("gluon_mla_project_value_gfx1250")
+    if spec is None:
+        pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
+    traits = {
+        "batch_size": batch_size,
+        "num_heads": 12,
+        "latent_dim": 512,
+        "value_dim": 128,
+        "gate_kind": "sigmoid",
+        "inputs_contiguous": True,
+    }
     assert spec_matches_traits(spec, traits) is matches
 
 

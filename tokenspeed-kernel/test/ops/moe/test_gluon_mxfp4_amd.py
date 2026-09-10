@@ -413,39 +413,265 @@ def test_gfx1250_resolve_block_m_tracks_decode_occupancy(
     expected_block_m: int,
 ) -> None:
     num_experts, top_k = 256, 4
-    assert (
-        _resolve_block_m(
-            True,
-            tokens * top_k,
-            num_experts,
-            is_combine=False,
-        )
-        == expected_block_m
-    )
+    assert _resolve_block_m(True, tokens * top_k, num_experts) == expected_block_m
 
 
 @pytest.mark.parametrize(
-    "decode,num_experts,is_combine,expected_block_m",
+    "m,num_experts",
     [
-        (False, None, False, 128),
-        (False, None, True, 256),
+        (256, None),
+        (8192 * 16, 896),
     ],
 )
 def test_gfx1250_resolve_block_m_defaults(
-    decode: bool,
+    m: int,
     num_experts: int | None,
-    is_combine: bool,
-    expected_block_m: int,
 ) -> None:
-    assert (
-        _resolve_block_m(
-            decode,
-            256,
-            num_experts,
-            is_combine=is_combine,
-        )
-        == expected_block_m
+    assert _resolve_block_m(False, m, num_experts) == 64
+
+
+def test_gfx1250_weighted_topk_reduce_matches_torch() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 weighted reduction")
+
+    torch.manual_seed(41)
+    tokens, topk, width = 5, 3, 300
+    flat = torch.randn(
+        tokens * topk,
+        width,
+        device="cuda",
+        dtype=torch.bfloat16,
     )
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+    output = torch.empty(tokens, width, device="cuda", dtype=torch.bfloat16)
+    expected = (
+        (flat.float() * weights.reshape(-1, 1))
+        .view(tokens, topk, width)
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+    actual = gfx1250_fused._weighted_topk_reduce_gfx1250(
+        flat,
+        weights,
+        out=output,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.01)
+
+
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_gfx1250_small_m_route_matches_expert_grouping(tokens: int) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    experts, topk = 896, 16
+    ids = torch.stack(
+        [
+            (torch.arange(topk, device="cuda", dtype=torch.int32) + token * 7) % experts
+            for token in range(tokens)
+        ]
+    )
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+    metadata, gather, scatter, gate = (
+        gfx1250_fused._precomputed_topk_route_small_m_gfx1250(
+            weights,
+            ids,
+            experts,
+        )
+    )
+    torch.cuda.synchronize()
+
+    flat_ids = ids.reshape(-1)
+    expected_sizes = torch.bincount(flat_ids, minlength=experts).to(torch.int32)
+    assert torch.equal(metadata.slice_sizes, expected_sizes)
+    expected_offsets = torch.cat(
+        (
+            torch.zeros(1, device="cuda", dtype=torch.int32),
+            expected_sizes.cumsum(0),
+        )
+    )
+    assert torch.equal(metadata.slice_offs, expected_offsets)
+    assert int(metadata.slice_sizes.sum()) == tokens * topk
+    assert torch.equal(
+        flat_ids[scatter.long()],
+        ids[gather.long(), (scatter % topk).long()],
+    )
+    assert torch.equal(gate, weights.reshape(-1)[scatter.long()])
+
+
+def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    tokens, experts, topk = 16, 896, 16
+    ids = (
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32)
+        .reshape(tokens, topk)
+        .remainder(experts)
+    )
+    ids[0, 0] = -1
+    ids[-1, -1] = experts
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+    metadata, gather, scatter, gate = (
+        gfx1250_fused._precomputed_topk_route_small_m_gfx1250(
+            weights,
+            ids,
+            experts,
+        )
+    )
+    torch.cuda.synchronize()
+
+    flat_ids = ids.reshape(-1)
+    valid = (flat_ids >= 0) & (flat_ids < experts)
+    valid_count = int(valid.sum())
+    valid_scatter = scatter[:valid_count]
+    expected_sizes = torch.bincount(
+        flat_ids[valid].long(),
+        minlength=experts,
+    ).to(torch.int32)
+    assert torch.equal(metadata.slice_sizes, expected_sizes)
+    assert torch.equal(
+        torch.sort(valid_scatter).values,
+        torch.nonzero(valid, as_tuple=False).flatten().to(torch.int32),
+    )
+    assert torch.equal(gather[:valid_count], valid_scatter // topk)
+    assert torch.equal(gate[:valid_count], weights.reshape(-1)[valid_scatter.long()])
+
+
+def _assert_gfx1250_large_route(
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    experts: int,
+    route,
+) -> None:
+    metadata, gather, scatter, gate = route
+    flat_ids = ids.reshape(-1)
+    flat_weights = weights.reshape(-1)
+    valid = (flat_ids >= 0) & (flat_ids < experts)
+    valid_indices = torch.nonzero(valid, as_tuple=False).flatten().to(torch.int32)
+    valid_count = int(valid_indices.numel())
+    valid_scatter = scatter[:valid_count]
+
+    expected_sizes = torch.bincount(
+        flat_ids[valid].long(),
+        minlength=experts,
+    ).to(torch.int32)
+    expected_slice_offsets = torch.cat(
+        (
+            torch.zeros(1, device=ids.device, dtype=torch.int32),
+            expected_sizes.cumsum(0),
+        )
+    )
+    assert torch.equal(metadata.slice_sizes, expected_sizes)
+    assert torch.equal(metadata.slice_offs, expected_slice_offsets)
+    assert torch.equal(
+        torch.sort(valid_scatter).values,
+        torch.sort(valid_indices).values,
+    )
+    assert torch.equal(gather[:valid_count], valid_scatter // ids.shape[1])
+    routed_ids = flat_ids[valid_scatter.long()]
+    assert torch.all((routed_ids >= 0) & (routed_ids < experts))
+    assert torch.equal(
+        gate[:valid_count],
+        flat_weights[valid_scatter.long()],
+    )
+    assert torch.count_nonzero(gate[valid_count:]) == 0
+
+    for block_size in metadata.block_sizes():
+        expected_blocks = (expected_sizes + block_size - 1) // block_size
+        expected_block_offsets = torch.cat(
+            (
+                torch.zeros(1, device=ids.device, dtype=torch.int32),
+                expected_blocks.cumsum(0),
+            )
+        )
+        actual_block_offsets = metadata.block_offs(block_size)
+        assert torch.equal(actual_block_offsets, expected_block_offsets)
+        num_blocks = int(expected_block_offsets[-1])
+        expected_schedule = []
+        for expert, count in enumerate(expected_blocks.tolist()):
+            expected_schedule.extend((block << 16) | expert for block in range(count))
+        assert metadata.block_schedule(block_size)[:num_blocks].tolist() == (
+            expected_schedule
+        )
+        assert torch.all(metadata.block_schedule(block_size)[num_blocks:] == -1)
+
+
+def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    torch.manual_seed(43)
+    tokens, topk, experts = 37, 7, 11
+    ids = (
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
+            tokens, topk
+        )
+        % experts
+    )
+    ids[:, 1] = 3
+    ids[::3, 2] = -1
+    ids[1::4, 4] = experts
+    ids[2::5, 5] = experts + 9
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+
+    route = gfx1250_fused._precomputed_topk_route(
+        weights,
+        ids,
+        experts,
+    )
+    torch.cuda.synchronize()
+
+    _assert_gfx1250_large_route(ids, weights, experts, route)
+    block64_offsets = route[0].block_offs(64)
+    expected64 = (route[0].slice_sizes + 63) // 64
+    assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
+
+
+def test_gfx1250_weighted_topk_reduce_masks_invalid_rows() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 weighted reduction")
+
+    tokens, topk, width, experts = 3, 4, 64, 5
+    ids = torch.tensor(
+        [[0, -1, 2, experts], [3, 3, experts + 4, 1], [-2, 4, 0, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+    flat = torch.randn(
+        tokens * topk,
+        width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    invalid = ~((ids >= 0) & (ids < experts)).reshape(-1)
+    flat[invalid] = float("nan")
+    expected_weights = torch.where(
+        (ids >= 0) & (ids < experts),
+        weights,
+        torch.zeros_like(weights),
+    )
+    expected = (
+        (torch.nan_to_num(flat.float(), nan=0.0) * expected_weights.reshape(-1, 1))
+        .view(tokens, topk, width)
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+    actual = gfx1250_fused._weighted_topk_reduce_gfx1250(
+        flat,
+        weights,
+        topk_ids=ids,
+        num_experts=experts,
+        out=None,
+        out_dtype=torch.bfloat16,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.01)
 
 
 def test_gfx1250_ragged_matmul_forwards_fused_activation(

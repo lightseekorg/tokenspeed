@@ -23,6 +23,7 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import Platform
 
 
 @triton.jit
@@ -402,9 +403,10 @@ def _kda_mtp_launch_config(
     key_dim: int,
     value_dim: int,
     recurrent_layout: str,
+    is_amd: bool,
 ) -> tuple[int, int]:
-    """Choose the measured GLM-5.3-Flash target-verify launch schedule."""
-    if (
+    """Route the AMD-measured GLM-5.3-Flash schedule or the direct default."""
+    if is_amd and (
         batch_size,
         draft_tokens,
         num_heads,
@@ -474,6 +476,7 @@ def fused_recurrent_kda_mtp(
         K,
         V,
         recurrent_layout,
+        Platform.get().is_amd,
     )
     grid = (triton.cdiv(V, 32) * B * HV,)
     fused_recurrent_kda_mtp_fwd_kernel[grid](
