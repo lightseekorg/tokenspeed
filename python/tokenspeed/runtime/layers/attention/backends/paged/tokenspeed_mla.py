@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,
@@ -64,6 +64,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = logging.getLogger(__name__)
@@ -181,6 +182,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
         self._logged_block_layouts: set[tuple[int, int, bool]] = set()
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
+        self._block_page_table_buf = None
+        self._block_seq_lens_buf = None
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""

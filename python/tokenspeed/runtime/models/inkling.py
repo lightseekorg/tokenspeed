@@ -81,7 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.triton.log_scaling import (
+from tokenspeed_kernel.ops.attention.rmha.triton import (
     log_scaling_tau as compute_log_scaling_tau,
 )
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv

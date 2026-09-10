@@ -63,6 +63,55 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Rebinding a cache pool
+
+`set_cache_pool` may run more than once on the same backend tree: a memory
+probe binds a small pool, captures into a throwaway graph pool, then binds
+the real pool. The contract is that a rebound backend is indistinguishable
+from one first bound to that pool:
+
+* Every node first answers `validate_cache_pool` for the whole subtree, and
+  only then do the children and the node publish, without a second
+  validation, so a rejected rebind moves nothing (a router's leaves exist
+  only from its first bind on, so the first bind builds and binds them
+  inside its own publish); `set_cache_pool` is that sequence, shared by
+  every node through `CachePoolBinding` and never overridden; a node does
+  its own work in `_publish_cache_pool` (`set_kv_pool` on the state backends
+  is a retained alias). Atomicity covers rejections only: a failure inside a
+  node's own binding work propagates, and the caller rebuilds the tree. A
+  node rejects a pool that changes the geometry it owns: the router its
+  group geometry (granularities, families, retentions and the row layout the
+  leaves' kernels read), the state backends the state group ids, checkpoint
+  grain and the state layers' ids and shapes, DeepSeek V4 the group ids and
+  row geometry, Inkling the ShortConv geometry. Page counts and transfer
+  policy may change. Paged leaves own kernel geometry only; the router
+  validates group geometry for them.
+* Binding drops every pool-derived latch: pointer tables, scratch and views,
+  per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
+  ring and pending remote restores, and side-state verify caches. The state
+  backends keep their pool-independent index buffers, so a same-geometry
+  replacement stays usable without re-initialisation of those buffers (a
+  router in the same tree still needs `init_cuda_graph_state` before any
+  metadata call); the caller still runs `configure_runtime` (with the new
+  pool's specs and page counts), `init_cuda_graph_state`,
+  `init_prefill_graph_state` and `preallocate_verify_workspace` again after
+  a rebind, as after a first bind. A probe pool must still hold `max_bs`
+  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
+  slab. The backend tree covers only itself: the executor's own pool
+  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  pool) and the layer-to-group stamps `bind_cache_groups` writes on the
+  model are the caller's to re-publish.
+* A rebind is an operation inside executor construction, owned by the
+  orchestrator a later change adds; nothing in the backend tree guards
+  against a rebind at another time. That orchestrator releases both graph
+  owners' captures first (the captured graphs record the buffers a publish
+  drops, and eager kernels cache pointers they allocated inside a capture,
+  such as flashinfer's trtllm-gen MoE runner and Qwen4-Exp's uniform index
+  bundles), unfreezes the device-global workspace pool the executor froze
+  before capturing, rebinds the trees, re-runs `bind_cache_groups` and the
+  initialisation sequence above, freezes the workspace again and captures
+  again.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under

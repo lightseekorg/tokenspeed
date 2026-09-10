@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.ops.attention.triton import dsv4 as ops
+from tokenspeed_kernel.ops.attention.dsv4 import triton as ops
 
 
 def _is_sm100() -> bool:

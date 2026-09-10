@@ -292,7 +292,7 @@ class TopKConfig:
     routed_scaling_factor: float | None = None
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
-    topk_indices_dtype: torch.dtype | None = torch.int32
+    topk_indices_dtype: torch.dtype = torch.int32
     # Weights dtype for the biased-grouped path; bf16 lets consumers skip a cast.
     topk_weights_dtype: torch.dtype = torch.float32
     # Shared-expert sink (Inkling)
@@ -352,7 +352,7 @@ class TopK(torch.nn.Module):
         routed_scaling_factor: float | None = None,
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
-        topk_indices_dtype=torch.int32,
+        topk_indices_dtype: torch.dtype = torch.int32,
         topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
@@ -600,10 +600,12 @@ def select_experts(
         topk_weights, topk_ids = moe_softmax_topk(
             router_logits,
             top_k,
+            topk_indices_dtype=topk_config.topk_indices_dtype,
             renormalize=renormalize,
             routed_scaling_factor=(
                 1.0 if routed_scaling_factor is None else routed_scaling_factor
             ),
+            solution=None,
         )
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,

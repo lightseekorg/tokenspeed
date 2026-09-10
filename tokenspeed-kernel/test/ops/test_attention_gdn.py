@@ -20,19 +20,17 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.gdn import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
 )
-from tokenspeed_kernel.ops.attention import (
-    GdnCheckpointLayout,
-    GdnChunkPrefillResult,
-)
 
 
 def _fla_chunk_gated_delta_rule():
-    from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
+    from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
         chunk_gated_delta_rule,
     )
 
@@ -269,7 +267,7 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
 
 def test_flashinfer_prefill_supported_shapes(device: str, require):
     require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
-    from tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule import is_supported
+    from tokenspeed_kernel.ops.attention.gdn.flashinfer import is_supported
 
     assert is_supported(128, torch.bfloat16, 16, 16)
     assert is_supported(128, torch.bfloat16, 16, 32)

@@ -272,6 +272,34 @@ def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     assert not _use_two_stage_producer_direct(2, min_numel, dtype)
 
 
+@pytest.mark.parametrize(
+    ("numel", "expected_path", "expected_schedule"),
+    [
+        (16 * 4096, "one_shot", (512, 1)),
+        (64 * 4096, "two_stage", None),
+    ],
+)
+def test_tp4_decode_staged_path_only_keeps_small_one_shot_shape(
+    monkeypatch,
+    numel,
+    expected_path,
+    expected_schedule,
+):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+    monkeypatch.setattr(iris_ops, "_platform", SimpleNamespace(is_cdna4=True))
+
+    tuning, use_two_stage = iris_ops._select_staged_all_reduce_path(
+        numel,
+        4,
+        torch.bfloat16,
+        two_stage_supported=True,
+    )
+    assert ("two_stage" if use_two_stage else "one_shot") == expected_path
+    schedule = None if tuning is None else (tuning.block_size, tuning.num_subgroups)
+    assert schedule == expected_schedule
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_plain_two_stage_admits_partitionable_shapes(dtype):
     try:
@@ -379,6 +407,10 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
+def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
+    return [(16, 4096), (64, 4096)]
+
+
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
@@ -426,7 +458,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         attnres_config = kernel_config.kimi_k3_attnres
         output_shape_cases = _ar_output_shape_cases()
         staged_max_numel = max(
-            int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()
+            max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
+            max(int(torch.tensor(shape).prod()) for shape in _ar_graph_shape_cases()),
         )
         producer_direct_max_numel = max(
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
@@ -477,6 +510,26 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             kernel_config.staged.input_slots,
             staged_max_numel,
         )
+        assert state._ready_flags.shape == (
+            kernel_config.staged.max_programs(staged_max_numel),
+            world_size,
+        )
+        if world_size == 4 and current_platform().is_cdna4:
+            tuning = kernel_config.staged.tuning(
+                numel=16 * 4096,
+                world_size=world_size,
+                dtype=torch.bfloat16,
+                is_cdna4=True,
+            )
+            assert tuning is not None
+            tuned_input, tuned_ready = state._staged_tuning_workspaces[tuning]
+            assert tuned_input.shape == (
+                kernel_config.staged.input_slots,
+                tuning.numel,
+            )
+            assert tuned_ready.shape == (tuning.num_programs(), world_size)
+            assert tuned_input.data_ptr() != state._staged_input_buf.data_ptr()
+            assert tuned_ready.data_ptr() != state._ready_flags.data_ptr()
         if state._staged_two_stage_supported:
             assert state._staged_two_stage_input_buf.numel() == staged_max_numel
             assert (
@@ -507,6 +560,22 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        if world_size == 4:
+            for shape in _ar_graph_shape_cases():
+                _check_all_reduce_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    shape,
+                    device,
+                )
+            if current_platform().is_cdna4:
+                _check_mixed_geometry_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    device,
+                )
         for shapes in output_shape_cases:
             _check_all_reduce_symmetric_outputs(
                 state,
@@ -591,6 +660,92 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_all_reduce_graph_replay(
+    state,
+    rank: int,
+    world_size: int,
+    shape,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
+    result = iris_all_reduce(state, local, safe=False)
+    expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(
+        result,
+        torch.full_like(result, expected_value),
+        atol=0,
+        rtol=0,
+    )
+
+    local.fill_(rank + 1)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = iris_all_reduce(state, local, safe=False)
+
+    for replay_index in range(1, 5):
+        scale = replay_index + 1
+        local.fill_(scale * (rank + 1))
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_result,
+            torch.full_like(graph_result, scale * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+
+def _check_mixed_geometry_graph_replay(
+    state,
+    rank: int,
+    world_size: int,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    shapes = ((16, 4096), (65535,))
+    inputs = [
+        torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes
+    ]
+    graphs = []
+    for local in inputs:
+        local.fill_(rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            iris_all_reduce(state, local, safe=False)
+        graphs.append(graph)
+
+    expected_rank_sum = world_size * (world_size + 1) // 2
+    snapshots = [[torch.empty_like(local) for _ in range(8)] for local in inputs]
+    for replay_index in range(8):
+        scale = replay_index + 1
+        for local, graph, outputs in zip(inputs, graphs, snapshots, strict=True):
+            local.fill_(scale * (rank + 1))
+            if rank == 0:
+                torch.cuda._sleep(1_000_000)
+            graph.replay()
+            outputs[replay_index].copy_(local)
+
+    torch.cuda.synchronize()
+    for outputs in snapshots:
+        for replay_index, output in enumerate(outputs):
+            expected = (replay_index + 1) * expected_rank_sum
+            torch.testing.assert_close(
+                output,
+                torch.full_like(output, expected),
+                atol=0,
+                rtol=0,
+            )
 
 
 def _check_all_reduce_symmetric_outputs(

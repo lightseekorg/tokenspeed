@@ -55,7 +55,7 @@ HEADS_KV = 4
 
 
 def _require_blockscaled_fa4():
-    flash_attn = pytest.importorskip("tokenspeed_kernel.ops.attention.flash_attn")
+    flash_attn = pytest.importorskip("tokenspeed_kernel.ops.attention.mha.cuda")
     if not getattr(flash_attn, "_FA4_HAS_BLOCKSCALED", False):
         pytest.skip("installed FA4 build has no blockscaled (sfq) support")
 
@@ -143,7 +143,7 @@ def _check(out: torch.Tensor, ref: torch.Tensor):
 @requires_sm100
 def test_decode_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
-    from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
+    from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
 
     seq_lens = [900, 300, 1533]
     cache = _build_paged_cache(seq_lens, seed=7)
@@ -187,7 +187,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
 @requires_sm100
 def test_extend_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
-    from tokenspeed_kernel.ops.attention import mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
 
     seq_lens = [700, 1200]
     extend_lens = [64, 96]
@@ -241,7 +241,7 @@ def test_rel_decode_oob_pool_bytes_have_zero_effect(window_left: int):
     output even when their bytes decode to fp8 NaN (recycled pages hold
     arbitrary bytes; P@V would compute 0 * NaN = NaN without the kernel's
     seqused V-zeroing, and the S-side masks only cover the K side)."""
-    import tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode as rel_decode
+    import tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_decode as rel_decode
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
 
     torch.manual_seed(3)

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = get_colorful_logger(__name__)
@@ -172,6 +173,14 @@ class MLAAttnBackend(PagedAttentionBackend):
                 sliding_window,
             )
         return answer
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
+        self._block_page_table_buf = None
+        self._block_seq_lens_buf = None
 
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int

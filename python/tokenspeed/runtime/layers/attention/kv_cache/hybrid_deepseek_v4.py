@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
 )

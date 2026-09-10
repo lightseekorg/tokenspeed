@@ -27,7 +27,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.attention import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     kda_replay_commit_supported,
     resolve_kda_batched_replay_commit,
 )
@@ -656,7 +656,7 @@ def test_in_place_commit_full_pool_accounting():
 @requires_registered_replay
 def test_replay_commit_probe_tracks_dtype():
     """The capability probe must use the actual activation dtype."""
-    from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+    from tokenspeed_kernel.ops.attention.kda import kda_replay_commit_supported
 
     assert not kda_replay_commit_supported(torch.float32)
     assert kda_replay_commit_supported(torch.bfloat16)
@@ -668,7 +668,7 @@ def test_replay_probe_requires_both_commit_and_fused_verify_kernels():
     unsupported."""
     from unittest import mock
 
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.kda as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     real = attention_ops.select_kernel
@@ -694,7 +694,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     twin is named directly: the point here is that dropping the tape does not
     disturb the recurrence, not which producers ran.
     """
-    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store as kda_fused_paged_verify,
     )
 
@@ -780,7 +780,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
 @requires_registered_replay
 @pytest.mark.parametrize("n", [1, 4])
 def test_split_verify_wrapper_matches_fused_wrapper(n):
-    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store,
         triton_nvidia_kda_fused_paged_verify_split,
     )

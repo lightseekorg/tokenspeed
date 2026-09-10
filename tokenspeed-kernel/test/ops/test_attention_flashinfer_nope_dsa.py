@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import dsa_decode, dsa_prefill
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
 from tokenspeed_kernel.registry import KernelRegistry
 
 PAGE_SIZE = 64
