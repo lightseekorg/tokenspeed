@@ -946,6 +946,11 @@ class ServerArgs:
                 f"{', '.join(petit_roles)} MoE backend"
             )
         if petit_roles:
+            if self.dtype not in ("auto", "bfloat16"):
+                raise ValueError(
+                    "Petit MegaMoE requires --dtype bfloat16; "
+                    f"configured dtype={self.dtype}"
+                )
             platform = current_platform()
             if not platform.is_cdna4:
                 raise ValueError("Petit MegaMoE currently requires AMD CDNA4 (gfx950)")

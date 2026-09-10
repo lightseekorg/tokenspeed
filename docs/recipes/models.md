@@ -779,6 +779,7 @@ tokenspeed serve <serialized-mxfp4-model-path> \
   --expert-parallel-size 8 \
   --dense-tp-size 1 \
   --moe-tp-size 1 \
+  --dtype bfloat16 \
   --moe-backend petit \
   --all2all-backend petit \
   --chunked-prefill-size 1024 \
@@ -790,7 +791,8 @@ The supported expert shapes are GPT-OSS 120B (128 experts, top-4, hidden size
 2880, biased OpenAI SwiGLU with alpha 1.702, clamp limit 7.0, and beta 1.0) and
 DeepSeek V3 (256 experts, top-8, hidden size 7168, intermediate size 2048,
 bias-free SiLU). Attention TP, MoE TP, context parallelism, and dense TP must
-all be 1; world size and expert parallel size must both be 8. Use trivial
+all be 1; world size and expert parallel size must both be 8. Petit requires
+BF16 model activations (`--dtype bfloat16`). Use trivial
 expert placement without EPLB or redundant experts. Each rank is limited to
 1024 tokens in prefill and decode; speculative draft tokens count toward the
 decode limit. When speculative decoding is active, the target and draft MoE

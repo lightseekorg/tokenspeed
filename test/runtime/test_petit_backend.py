@@ -45,6 +45,7 @@ def _validation_args(
     all2all_backend: str,
     speculative_algorithm: str | None,
     max_num_seqs: int,
+    dtype: str,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         device="cuda",
@@ -58,6 +59,7 @@ def _validation_args(
         speculative_algorithm=speculative_algorithm,
         speculative_num_draft_tokens=0,
         max_num_seqs=max_num_seqs,
+        dtype=dtype,
         chunked_prefill_size=1024,
         max_prefill_tokens=1024,
     )
@@ -80,6 +82,7 @@ def test_petit_requires_both_backend_flags() -> None:
         all2all_backend="none",
         speculative_algorithm=None,
         max_num_seqs=160,
+        dtype="bfloat16",
     )
 
     with pytest.raises(ValueError, match="requires --all2all-backend petit"):
@@ -93,6 +96,7 @@ def test_petit_rejects_non_petit_draft_backend() -> None:
         all2all_backend="petit",
         speculative_algorithm="MTP",
         max_num_seqs=160,
+        dtype="bfloat16",
     )
 
     with pytest.raises(ValueError, match="incompatible draft=triton"):
@@ -106,6 +110,7 @@ def test_petit_rejects_draft_only_selection() -> None:
         all2all_backend="none",
         speculative_algorithm="MTP",
         max_num_seqs=160,
+        dtype="bfloat16",
     )
 
     with pytest.raises(
@@ -122,6 +127,7 @@ def test_petit_draft_inherits_target_backend() -> None:
         all2all_backend="petit",
         speculative_algorithm="MTP",
         max_num_seqs=160,
+        dtype="bfloat16",
     )
     platform = SimpleNamespace(is_cdna4=False)
 
@@ -142,6 +148,7 @@ def test_petit_rejects_decode_capacity_above_workspace_limit() -> None:
         all2all_backend="petit",
         speculative_algorithm=None,
         max_num_seqs=8200,
+        dtype="bfloat16",
     )
     platform = SimpleNamespace(is_cdna4=True)
 
@@ -152,4 +159,19 @@ def test_petit_rejects_decode_capacity_above_workspace_limit() -> None:
         ),
         pytest.raises(ValueError, match="1024 decode tokens per rank"),
     ):
+        ServerArgs.validate(args)
+
+
+@pytest.mark.parametrize("dtype", ["half", "float16", "float", "float32"])
+def test_petit_rejects_non_bfloat16_dtype(dtype: str) -> None:
+    args = _validation_args(
+        moe_backend="petit",
+        draft_moe_backend=None,
+        all2all_backend="petit",
+        speculative_algorithm=None,
+        max_num_seqs=160,
+        dtype=dtype,
+    )
+
+    with pytest.raises(ValueError, match="requires --dtype bfloat16"):
         ServerArgs.validate(args)
