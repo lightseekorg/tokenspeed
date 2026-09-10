@@ -549,8 +549,8 @@ def _acquire_symm_join_outputs(
     The pair matters, not just the memory: ``AutoBackend.all_reduce`` only
     consults ``can_reduce_outputs`` on its tuple branch, so a single
     concatenated operand can never reach the symmetric kernel however it was
-    allocated. This is the shape ``latent_moe_expert_shared_all_reduce`` uses
-    for EP-only layouts.
+    allocated. ``latent_moe_expert_shared_all_reduce`` uses this pair on AMD
+    for both TP/TP and TP/EP mappings; the collective group is MoE TP x EP.
 
     Collective in the same sense the acquire is: every rank of the MoE TP x EP
     group reaches this with rank-uniform shapes, so none can disagree about
