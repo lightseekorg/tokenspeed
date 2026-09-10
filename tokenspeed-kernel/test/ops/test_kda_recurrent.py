@@ -278,8 +278,9 @@ def test_glm53_flash_mtp_graph_shape_matches_baseline_and_replays() -> None:
         )
 
     tuned_output = run_tuned()
+    # The two valid launch geometries can differ by one BF16 output ULP.
     torch.testing.assert_close(
-        tuned_output.float(), reference_output.float(), atol=1e-4, rtol=1e-4
+        tuned_output.float(), reference_output.float(), atol=2e-4, rtol=1e-4
     )
     torch.testing.assert_close(
         tuned_pool[batch:], reference_pool[batch:], atol=1e-4, rtol=1e-4
