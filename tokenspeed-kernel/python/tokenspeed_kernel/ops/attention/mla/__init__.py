@@ -479,8 +479,6 @@ def mla_normalize_project_query(
         else:
             from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
 
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         query_norm = torch.empty_like(query)
         rmsnorm_fused_parallel(
             input1=query,
@@ -491,7 +489,24 @@ def mla_normalize_project_query(
             output2=kv,
             eps=eps,
         )
-        decode_gemv(query_norm, projection_weight, out=projection_out)
+        if current_platform().is_cdna5 and tokens > 1:
+            from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+
+            if (
+                _try_gluon_largem_gfx1250(
+                    query_norm,
+                    projection_weight,
+                    out=projection_out,
+                )
+                is None
+            ):
+                from tokenspeed_kernel.ops.gemm import mm
+
+                mm(query_norm, projection_weight, out=projection_out)
+        else:
+            from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+            decode_gemv(query_norm, projection_weight, out=projection_out)
     else:
         query_fp32 = query.float()
         query_norm = query_fp32 * torch.rsqrt(

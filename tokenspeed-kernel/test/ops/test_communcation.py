@@ -106,8 +106,12 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
         rsag = create_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
+            attnres_max_numel=0,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
+            device=None,
+            max_numel=0,
+            max_bytes=0,
         )
 
         for tokens in cases:
@@ -151,8 +155,18 @@ def check_all_reduce(rank: int, world_size: int, device) -> None:
     state = create_state(
         group=dist.group.WORLD,
         rank_in_group=rank,
+        attnres_max_numel=0,
+        max_tokens=0,
+        hidden_size=0,
         max_numel=max_numel,
+        max_bytes=0,
         device=device,
+    )
+    assert state.max_bytes == 0
+    assert not triton_communication.symm_outputs_can_run(
+        state,
+        ((4,),),
+        torch.bfloat16,
     )
 
     for numel in [2880, 20160, 23040, 92160, 184320]:
