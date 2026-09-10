@@ -20,7 +20,7 @@
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -36,7 +36,10 @@ if platform.is_nvidia:
         "rope",
         name="cuda_embedding_rope",
         solution="cuda",
-        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(9, 0),
+        ),
         signatures=format_signatures(
             ("q", "k"), "dense", {torch.float16, torch.bfloat16}
         ),

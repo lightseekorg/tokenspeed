@@ -38,8 +38,10 @@ _BACKEND_REGISTRY: dict[str, type[SamplingBackend]] = {}
 
 
 def _get_default_backend_name() -> str:
-    if current_platform().is_nvidia:
+    if current_platform().is_nvidia and current_platform().is_hopper_plus:
         return "flashinfer"
+    if current_platform().is_nvidia:
+        return "triton"
     return "greedy"
 
 

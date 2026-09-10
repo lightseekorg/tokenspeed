@@ -166,7 +166,8 @@ def set_autotune_process_group(process_group) -> None:
         import flashinfer.autotuner
     except ImportError:
         return
-    flashinfer.autotuner.set_autotune_process_group(process_group)
+    if hasattr(flashinfer.autotuner, "set_autotune_process_group"):
+        flashinfer.autotuner.set_autotune_process_group(process_group)
 
 
 def load_flashinfer_tuning_cache(path: str) -> bool:

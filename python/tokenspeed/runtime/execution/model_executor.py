@@ -461,7 +461,7 @@ class ModelExecutor:
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        if config.enforce_eager:
+        if config.enforce_eager and config.world_size > 1:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.prewarm_comm_states(batch_sizes=(1,))
             logger.info("Finished prewarming Triton RSAG communication states")

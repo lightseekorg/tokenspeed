@@ -46,6 +46,7 @@ def silu_and_mul(
     if (
         limit is not None
         or current_platform().is_amd
+        or (current_platform().is_nvidia and not current_platform().is_hopper_plus)
         or flashinfer_silu_and_mul is error_fn
     ):
         return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)

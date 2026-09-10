@@ -118,6 +118,9 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
+    def get_quant_method(self, layer=None, prefix=""):
+        return self.get_linear_method()
+
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 

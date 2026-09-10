@@ -278,7 +278,7 @@ if platform.is_nvidia:
         # rather than tuned; the autotuner's default initializer handles their
         # dtype. Cold L2 matches the conditions this GEMM meets in a decode
         # step, as in flashinfer's own CuteDSL tuning configs.
-        TUNING_CONFIG = TuningConfig(
+        tuning_kwargs = dict(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
                     (0, 6),  # a, out
@@ -291,12 +291,18 @@ if platform.is_nvidia:
                 ConstraintSpec(1, 0, lambda shapes: _round_up(shapes[0][0], 128)),
                 ConstraintSpec(7, 0, lambda shapes: _round_up(shapes[0][0], 128)),
             ),
-            tensor_initializers=(
-                (0, _init_packed_fp4),
-                (6, autotuner_initializer_empty),
-            ),
             use_cold_l2_cache=True,
         )
+        try:
+            TUNING_CONFIG = TuningConfig(
+                **tuning_kwargs,
+                tensor_initializers=(
+                    (0, _init_packed_fp4),
+                    (6, autotuner_initializer_empty),
+                ),
+            )
+        except TypeError:
+            TUNING_CONFIG = TuningConfig(**tuning_kwargs)
 
     def nvfp4_gemm_swiglu_nvfp4_quant(
         a: torch.Tensor,

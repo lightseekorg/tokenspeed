@@ -76,14 +76,19 @@ def softmax(
         temp_arr = None
         temp_val = 1.0 if temperature is None else float(temperature)
 
-    output = torch.empty_like(logits, dtype=torch.float32)
-    workspace = _get_workspace(logits.device)
-    _load_module().softmax(
-        workspace,
-        logits,
-        output,
-        temp_arr,
-        float(temp_val),
-        enable_pdl,
-    )
-    return output
+    try:
+        output = torch.empty_like(logits, dtype=torch.float32)
+        workspace = _get_workspace(logits.device)
+        _load_module().softmax(
+            workspace,
+            logits,
+            output,
+            temp_arr,
+            float(temp_val),
+            enable_pdl,
+        )
+        return output
+    except Exception:
+        if temp_arr is not None:
+            return torch.softmax(logits / temp_arr.view(-1, 1).clamp(min=1e-5), dim=-1, dtype=torch.float32)
+        return torch.softmax(logits / max(temp_val, 1e-5), dim=-1, dtype=torch.float32)
