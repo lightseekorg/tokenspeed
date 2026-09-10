@@ -26,8 +26,8 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 @register_kernel(
-    "attn_res",
-    "fwd",
+    "residual",
+    "attn_res_fwd",
     name="torch_attn_res_fwd",
     solution="torch",
     signatures=format_signatures(

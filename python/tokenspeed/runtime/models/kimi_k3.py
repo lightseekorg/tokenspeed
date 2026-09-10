@@ -68,7 +68,6 @@ from tokenspeed_kernel.ops.activation.triton import (
     sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -89,6 +88,7 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn

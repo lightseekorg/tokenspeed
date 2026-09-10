@@ -45,8 +45,8 @@ if platform.is_nvidia and platform.is_blackwell:
 if _HAS_CUDA_KERNEL:
 
     @register_kernel(
-        "attn_res",
-        "fwd",
+        "residual",
+        "attn_res_fwd",
         name="cuda_attn_res_fwd",
         solution="cuda",
         capability=CapabilityRequirement(

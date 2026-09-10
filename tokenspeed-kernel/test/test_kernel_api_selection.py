@@ -55,10 +55,6 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
-import tokenspeed_kernel.ops.mhc as _mhc_pkg
-import tokenspeed_kernel.ops.mhc.deep_gemm as _mhc_deep_gemm
-import tokenspeed_kernel.ops.mhc.gluon as _mhc_gluon
-import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
@@ -74,6 +70,13 @@ import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
 import tokenspeed_kernel.ops.quantization.trtllm as _quantization_trtllm
+import tokenspeed_kernel.ops.residual as _residual_pkg
+import tokenspeed_kernel.ops.residual.cuda as _residual_cuda
+import tokenspeed_kernel.ops.residual.cute_dsl as _residual_cute_dsl
+import tokenspeed_kernel.ops.residual.deep_gemm as _residual_deep_gemm
+import tokenspeed_kernel.ops.residual.gluon as _residual_gluon
+import tokenspeed_kernel.ops.residual.torch as _residual_torch
+import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
@@ -161,11 +164,14 @@ _RELOAD_MODULES = [
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
-    # mHC registration modules.
-    _mhc_deep_gemm,
-    _mhc_gluon,
-    _mhc_triton,
-    _mhc_pkg,
+    # Residual registration modules.
+    _residual_cuda,
+    _residual_cute_dsl,
+    _residual_deep_gemm,
+    _residual_gluon,
+    _residual_torch,
+    _residual_triton,
+    _residual_pkg,
     # MoE registration modules.
     _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
@@ -215,6 +221,37 @@ def _kernel_registry(fresh_registry):
 def test_attention_result_type_identity_is_stable():
     assert _attention_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_pkg.KdaPrefillResult is KdaPrefillResult
+
+
+def test_residual_family_exports_and_modes():
+    expected_exports = {
+        "attn_res_fwd",
+        "attn_res_fwd_available",
+        "gated_residual_combine",
+        "gated_residual_mix",
+        "mhc_fused_hc",
+        "mhc_post",
+        "mhc_pre",
+        "prepare_gated_residual_weight_cache",
+    }
+    assert set(_residual_pkg.__all__) == expected_exports
+    assert all(
+        getattr(tokenspeed_kernel, name) is getattr(_residual_pkg, name)
+        for name in expected_exports
+    )
+
+    residual_modes = {
+        mode
+        for family, mode in KernelRegistry.get().list_operators()
+        if family == "residual"
+    }
+    assert residual_modes == {
+        "attn_res_fwd",
+        "hyperconnection_combine",
+        "hyperconnection_mix",
+        "mhc_post",
+        "mhc_pre",
+    }
 
 
 def test_builtin_moe_preprocessor_links_are_callables():
@@ -2121,7 +2158,7 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
         return kernel
 
     monkeypatch.setattr(
-        tokenspeed_kernel.ops.mhc,
+        _residual_pkg,
         "select_kernel",
         fake_select_kernel,
     )
@@ -2168,7 +2205,7 @@ def test_mhc_normalization_arguments_must_be_paired(
         raise AssertionError("invalid normalization arguments reached kernel selection")
 
     monkeypatch.setattr(
-        tokenspeed_kernel.ops.mhc,
+        _residual_pkg,
         "select_kernel",
         fail_select_kernel,
     )
@@ -4493,16 +4530,16 @@ _CASES = [
     _case(
         _is_cdna4,
         "cdna4",
-        "mhc",
-        "pre",
+        "residual",
+        "mhc_pre",
         "triton_mhc_pre",
         _mhc_pre,
     ),
     _case(
         _is_cdna4,
         "cdna4",
-        "mhc",
-        "post",
+        "residual",
+        "mhc_post",
         "triton_mhc_post",
         _mhc_post,
     ),
@@ -4612,8 +4649,8 @@ def selected_kernel_spy(monkeypatch):
                 )
             return torch.empty_like(kwargs["x"])
 
-        if case.family == "mhc":
-            if case.mode == "pre":
+        if case.family == "residual":
+            if case.mode == "mhc_pre":
                 residual = args[0]
                 return (
                     torch.empty(

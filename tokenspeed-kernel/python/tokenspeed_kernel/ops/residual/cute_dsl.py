@@ -27,7 +27,7 @@ import threading
 import weakref
 
 import torch
-from tokenspeed_kernel.ops.hyperconnection.triton import (
+from tokenspeed_kernel.ops.residual.triton import (
     _launch_mix_epilogue,
     _launch_projection_epilogue,
 )
@@ -138,8 +138,8 @@ def _get_prepared_padded_up_weight(
 if _CUTEDSL_AVAILABLE:
 
     @register_kernel(
-        "hyperconnection",
-        "mix",
+        "residual",
+        "hyperconnection_mix",
         name="cute_dsl_hyperconnection_mix",
         solution="cute_dsl",
         capability=CapabilityRequirement(

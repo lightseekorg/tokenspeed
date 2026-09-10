@@ -22,7 +22,7 @@ import inspect
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.mhc.triton import (
+from tokenspeed_kernel.ops.residual.triton import (
     _pre_reduce_apply_fuses_norm,
     _pre_reduce_apply_is_supported,
 )
