@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from utils import is_amd
@@ -34,7 +35,7 @@ if not is_amd():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel_amd._triton import gl, gluon_ir, ir  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common  # noqa: E402
 
 # Read sources from the tree the import resolved to, not the repo layout.
@@ -53,24 +54,21 @@ INDEX_LAYOUT_CONSUMERS = (
 # (NUM_INDICES, NUM_WARPS); these kernels run 4 or 8 warps per CTA.
 INDEX_SHAPES = ((16, 4), (16, 8), (32, 4), (32, 8), (64, 8))
 
-_CONTEXT = ir.context()
-ir.load_dialects(_CONTEXT)
-_BUILDER = gluon_ir.GluonOpBuilder(_CONTEXT)
+
+class IndexOwnership(NamedTuple):
+    """Warps over the index dimension, and the rows they cover between them."""
+
+    warps: int
+    rows_covered: int
 
 
-def index_warp_bases(num_indices: int, num_warps: int, slice_dim: int) -> list[int]:
-    """Return the warp bases of the index layout a consumer builds."""
-    base = _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
-    layout = gl.SliceLayout(slice_dim, base)
-    linear = _BUILDER.to_linear_layout(layout._to_ir(_BUILDER), [num_indices])
-    assert len(linear.shape) == 1
-    return [basis[0] for basis in linear.warp_bases]
-
-
-def expected_warp_bases(num_indices: int, num_warps: int) -> list[int]:
-    """Warp bases that hand warp ``w`` the rows ``[w, w + 1) * rows_per_warp``."""
-    rows_per_warp = num_indices // num_warps
-    return [rows_per_warp << bit for bit in range(num_warps.bit_length() - 1)]
+def index_ownership(base: gl.BlockedLayout, slice_dim: int) -> IndexOwnership:
+    """Report how ``base`` spreads rows once ``slice_dim`` is sliced away."""
+    assert slice_dim in (0, 1), f"index layouts are rank 2, got slice dim {slice_dim}"
+    index_dim = 1 - slice_dim
+    warps = base.warps_per_cta[index_dim]
+    rows_per_warp = base.size_per_thread[index_dim] * base.threads_per_warp[index_dim]
+    return IndexOwnership(warps=warps, rows_covered=rows_per_warp * warps)
 
 
 def index_layout_slice_dim(path: Path) -> int:
@@ -95,11 +93,9 @@ def index_layout_slice_dim(path: Path) -> int:
 def test_index_layout_partitions_rows_across_all_warps(
     num_indices: int, num_warps: int
 ) -> None:
-    # A zero warp basis is exactly the defect: the index does not depend on warp
-    # id, so every warp reads the same rows and the TDM lowering elects a single
-    # producer for the CTA.
-    assert index_warp_bases(num_indices, num_warps, 0) == expected_warp_bases(
-        num_indices, num_warps
+    base = _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
+    assert index_ownership(base, 0) == IndexOwnership(
+        warps=num_warps, rows_covered=num_indices
     )
 
 
@@ -118,6 +114,7 @@ def test_consumers_slice_the_dimension_that_leaves_rows_distributed(
     slice_dim = index_layout_slice_dim(path)
 
     num_indices, num_warps = 16, 8
-    assert index_warp_bases(num_indices, num_warps, slice_dim) == expected_warp_bases(
-        num_indices, num_warps
+    base = _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
+    assert index_ownership(base, slice_dim) == IndexOwnership(
+        warps=num_warps, rows_covered=num_indices
     )
