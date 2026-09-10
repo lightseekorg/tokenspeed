@@ -69,3 +69,7 @@ def test_attention_implementations_are_grouped_by_variant():
             for path in variant_dir.iterdir()
             if path.is_dir() and (path / "__init__.py").is_file()
         )
+
+    assert not (attention_dir / "dsa" / "_cuda" / "__init__.py").exists()
+    assert not (attention_dir / "gdn" / "_triton" / "linear" / "__init__.py").exists()
+    assert not (attention_dir / "mla" / "_tokenspeed_mla" / "__init__.py").exists()

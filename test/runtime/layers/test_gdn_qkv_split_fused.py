@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.gdn._triton.linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
 from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
 )

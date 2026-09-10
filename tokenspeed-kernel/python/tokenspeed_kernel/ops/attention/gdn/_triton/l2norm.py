@@ -27,7 +27,7 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.gdn._triton.linear.utils import input_guard
+from tokenspeed_kernel.ops.attention.gdn._triton.utils import input_guard
 
 
 @triton.jit

@@ -582,7 +582,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.gdn._triton.linear.chunk import (
+        from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
             chunk_gated_delta_rule,
         )
 

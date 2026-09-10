@@ -27,10 +27,10 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.gdn._triton.linear.index import (
+from tokenspeed_kernel.ops.attention.gdn._triton.index import (
     prepare_chunk_indices,
 )
-from tokenspeed_kernel.ops.attention.gdn._triton.linear.utils import input_guard
+from tokenspeed_kernel.ops.attention.gdn._triton.utils import input_guard
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})

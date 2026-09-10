@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.attention import (
 
 
 def _fla_chunk_gated_delta_rule():
-    from tokenspeed_kernel.ops.attention.gdn._triton.linear.chunk import (
+    from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
         chunk_gated_delta_rule,
     )
 
