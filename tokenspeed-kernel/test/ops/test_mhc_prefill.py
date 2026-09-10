@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.mhc.triton import triton_mhc_pre
+from tokenspeed_kernel.ops.residual.triton import triton_mhc_pre
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

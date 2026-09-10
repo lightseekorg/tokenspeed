@@ -18,37 +18,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registration shim for the GFX950 mHC specialization."""
-
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.mhc.triton import (
-    _mhc_pre_impl,
-    _mhc_prenorm_gemm_triton,
-)
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-)
+from tokenspeed_kernel.ops.residual.triton import _mhc_pre_impl
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-if current_platform().is_amd:
-    from tokenspeed_kernel_amd.ops.gfx950.mhc import (
-        gluon_mhc_pre_reduce_apply_gfx950 as _mhc_pre_reduce_apply_impl,
+try:
+    from tokenspeed_kernel.thirdparty.deep_gemm import (
+        get_pdl,
+        set_pdl,
+        tf32_hc_prenorm_gemm,
     )
+except Exception:
+    tf32_hc_prenorm_gemm = None  # type: ignore[assignment]
+
+
+if tf32_hc_prenorm_gemm is not None:
 
     @register_kernel(
-        "mhc",
-        "pre",
-        name="gluon_mhc_pre_gfx950",
-        solution="gluon",
+        "residual",
+        "mhc_pre",
+        name="deep_gemm_mhc_pre",
+        solution="deep_gemm",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
             {
@@ -60,16 +57,10 @@ if current_platform().is_amd:
                 )
             }
         ),
-        traits={
-            "num_tokens": frozenset(range(1, 65)),
-            "hc_mult": frozenset({4}),
-            "hidden_size": frozenset({4096, 7168}),
-            "sinkhorn_iters": frozenset({20}),
-        },
-        priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "latency"},
+        priority=Priority.PERFORMANT,
+        tags={"throughput"},
     )
-    def gluon_mhc_pre_gfx950(
+    def deep_gemm_mhc_pre(
         residual: torch.Tensor,
         fn: torch.Tensor,
         hc_scale: torch.Tensor,
@@ -78,7 +69,9 @@ if current_platform().is_amd:
         hc_eps: float,
         sinkhorn_iters: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run split-K prenorm with a GFX950 Gluon reduction/Sinkhorn stage."""
+        """Run mHC pre-mapping with DeepGEMM prenorm and Triton mixing."""
+        if get_pdl() != pdl_enabled():
+            set_pdl(pdl_enabled())
         return _mhc_pre_impl(
             residual,
             fn,
@@ -87,6 +80,5 @@ if current_platform().is_amd:
             rms_eps,
             hc_eps,
             sinkhorn_iters,
-            _mhc_prenorm_gemm_triton,
-            pre_reduce_apply_impl=_mhc_pre_reduce_apply_impl,
+            tf32_hc_prenorm_gemm,
         )
