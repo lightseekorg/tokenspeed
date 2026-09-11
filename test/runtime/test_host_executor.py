@@ -313,7 +313,9 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_trackers = [(tracker, 1)]
         executor._load_poisoned = False
 
-        executor.submit_load_backs(SimpleNamespace(cache=[]))
+        executor.submit_load_backs(
+            SimpleNamespace(cache=[]), prerequisite_stream=object()
+        )
 
         tracker.set_consumers.assert_called_once_with(-1)
 
@@ -339,7 +341,6 @@ class GroupAwareWireTest(unittest.TestCase):
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
-        executor._ready_write_op_ids = []
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
@@ -364,17 +365,19 @@ class GroupAwareWireTest(unittest.TestCase):
         executor_module = self._executor_module()
         executor, device = self._make_write_executor(executor_module)
         lane = executor._pinned_write_lane
-        caller_stream = object()
-        producer_stream = object()
+        prerequisite_stream = object()
         finish = Mock()
         metadata_done = Mock()
+        # Every stream the executor touches is one the caller named; the
+        # thread's current stream is never consulted.
+        no_current_stream = patch.object(
+            executor_module.device_module,
+            "current_stream",
+            side_effect=AssertionError("current stream must not be consulted"),
+        )
 
         with (
-            patch.object(
-                executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
-            ),
+            no_current_stream,
             patch.object(executor_module.device_module, "stream") as stream_ctx,
             patch.object(
                 executor_module.device_module,
@@ -388,16 +391,15 @@ class GroupAwareWireTest(unittest.TestCase):
                 [(0, 5, 9)],
                 backup_pages=[],
                 lane=lane,
-                producer_stream=producer_stream,
+                prerequisite_stream=prerequisite_stream,
             )
 
-        # On the write stream, ordered after the producer stream the caller
-        # named (the forwards that wrote the pages) -- not after whatever
-        # stream happens to be current. The completion event is handed back
-        # so a stream-ordered submission can fence the caller on it; a pinned
-        # one simply drops it.
+        # On the write stream, ordered after the prerequisite stream the
+        # caller named (the forwards that wrote the pages). The completion
+        # event is handed back so a stream-ordered submission can fence the
+        # caller's fence stream on it; a pinned one simply drops it.
         self.assertIs(fence, finish)
-        executor.write_stream.wait_stream.assert_called_once_with(producer_stream)
+        executor.write_stream.wait_stream.assert_called_once_with(prerequisite_stream)
         # The address tables and the metadata H2D are enqueued on the write
         # stream too: the payload kernel reads them from that stream, and a
         # copy left on the caller's stream would land behind the wait above
@@ -441,11 +443,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 order.attach_mock(lane.workspace.commit_block_transfers, "upload")
                 order.attach_mock(metadata_done.record, "record")
                 with (
-                    patch.object(
-                        executor_module.device_module,
-                        "current_stream",
-                        return_value=caller_stream,
-                    ),
+                    no_current_stream,
                     patch.object(executor_module.device_module, "stream") as stream_ctx,
                     patch.object(
                         executor_module.device_module, "Event", return_value=finish
@@ -459,7 +457,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         [(0, 6, 10)],
                         backup_pages=[],
                         lane=lane,
-                        producer_stream=producer_stream,
+                        prerequisite_stream=prerequisite_stream,
                     )
                 names = [call[0] for call in order.mock_calls]
                 self.assertEqual(
@@ -480,8 +478,8 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
-        caller_stream = Mock(name="caller_stream")
-        producer = object()
+        fence_stream = Mock(name="fence_stream")
+        prerequisite = object()
         ordered_finish = Mock(name="ordered_finish")
         pinned_finish = Mock(name="pinned_finish")
         events = iter(
@@ -508,11 +506,6 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
             ),
             patch.object(
-                executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
-            ),
-            patch.object(
                 executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(
@@ -523,12 +516,15 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
             executor.submit_write_backs(
-                SimpleNamespace(cache=[WriteBackOp()]), producer_stream=producer
+                SimpleNamespace(cache=[WriteBackOp()]),
+                prerequisite_stream=prerequisite,
+                fence_stream=fence_stream,
             )
 
-        # The stream-ordered op (12) launches first and the caller's stream
-        # waits on ITS completion only; the pinned ops (11, 13) follow on the
-        # write stream and fence nothing -- the scheduler holds their sources.
+        # The stream-ordered op (12) launches first and the fence stream the
+        # caller named waits on ITS completion only; the pinned ops (11, 13)
+        # follow on the write stream and fence nothing -- the scheduler holds
+        # their sources.
         ordered_lane = executor._ordered_write_lane
         pinned_lane = executor._pinned_write_lane
         ordered_lane.workspace.load_block_transfers.assert_called_once_with(
@@ -541,7 +537,7 @@ class GroupAwareWireTest(unittest.TestCase):
             [call.args[4] for call in transfer.call_args_list],
             [ordered_lane.workspace, pinned_lane.workspace],
         )
-        caller_stream.wait_event.assert_called_once_with(ordered_finish)
+        fence_stream.wait_event.assert_called_once_with(ordered_finish)
         self.assertEqual(
             [(ack.finish_event, ack.op_ids) for ack in executor._write_acks],
             [(ordered_finish, [12]), (pinned_finish, [11, 13])],
@@ -552,8 +548,8 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         self.assertEqual(
             executor.write_stream.wait_stream.call_args_list,
-            [call(producer), call(producer)],
-            "both launches order behind the producer stream the caller named",
+            [call(prerequisite), call(prerequisite)],
+            "both launches order behind the prerequisite stream the caller named",
         )
 
     def test_mixed_write_lanes_ack_only_their_completed_l3_put(self):
@@ -623,7 +619,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 patch.object(executor_module, "transfer_cache_blocks"),
             ):
                 executor.submit_write_backs(
-                    SimpleNamespace(cache=[WriteBackOp()]), producer_stream=object()
+                    SimpleNamespace(cache=[WriteBackOp()]),
+                    prerequisite_stream=object(),
+                    fence_stream=Mock(),
                 )
 
             self.assertEqual(executor.poll_results(), [])
@@ -659,8 +657,8 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
-        caller_stream = Mock(name="caller_stream")
-        producer = object()
+        fence_stream = Mock(name="fence_stream")
+        prerequisite = object()
 
         class WriteBackOp:
             def __init__(self):
@@ -675,27 +673,24 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
             ),
             patch.object(
-                executor_module.device_module,
-                "current_stream",
-                return_value=caller_stream,
-            ),
-            patch.object(
                 executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(executor_module.device_module, "Event", side_effect=Mock),
             patch.object(executor_module, "transfer_cache_blocks"),
         ):
             executor.submit_write_backs(
-                SimpleNamespace(cache=[WriteBackOp()]), producer_stream=producer
+                SimpleNamespace(cache=[WriteBackOp()]),
+                prerequisite_stream=prerequisite,
+                fence_stream=fence_stream,
             )
 
-        caller_stream.wait_event.assert_not_called()
+        fence_stream.wait_event.assert_not_called()
         executor._ordered_write_lane.workspace.load_block_transfers.assert_not_called()
 
     def test_submit_write_backs_rejects_ragged_guard_vector(self):
         executor_module = self._executor_module()
         executor, _ = self._make_write_executor(executor_module)
-        producer = object()
+        prerequisite = object()
 
         class WriteBackOp:
             def __init__(self):
@@ -710,8 +705,30 @@ class GroupAwareWireTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 executor.submit_write_backs(
-                    SimpleNamespace(cache=[WriteBackOp()]), producer_stream=producer
+                    SimpleNamespace(cache=[WriteBackOp()]),
+                    prerequisite_stream=prerequisite,
+                    fence_stream=object(),
                 )
+
+    def test_cache_operation_without_transfers_is_refused(self):
+        # An op is acknowledged by its copy's completion event, so one with
+        # nothing to copy could never be acknowledged; the scheduler never
+        # emits one, and the runtime refuses rather than inventing an ack.
+        L2CacheExecutor = self._executor_module().L2CacheExecutor
+        for source_is_device in (True, False):
+            with self.subTest(source_is_device=source_is_device):
+                op_ids: list[int] = []
+                transfers: list[tuple[int, int, int]] = []
+                with self.assertRaisesRegex(ValueError, "operation 11 carries no"):
+                    L2CacheExecutor._append_transfers(
+                        [7, 11],
+                        [[0], []],
+                        [[1], []],
+                        [[5], []],
+                        collected_op_ids=op_ids,
+                        transfers=transfers,
+                        source_is_device=source_is_device,
+                    )
 
     def test_loadback_logs_non_empty_batch(self):
         executor_module, executor, _, geometry, workspace = self._make_load_executor(
@@ -727,6 +744,7 @@ class GroupAwareWireTest(unittest.TestCase):
         tracker.event_sets = [load_events]
         executor._load_trackers = [(tracker, 1)]
         finish = Mock()
+        prerequisite_stream = object()
 
         with (
             patch.object(executor_module, "get_is_capture_mode", return_value=False),
@@ -737,7 +755,12 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
             patch.object(executor_module.logger, "info") as log_info,
         ):
-            executor._start_loading([9], [(0, 2, 1), (0, 5, 4)], success=True)
+            executor._start_loading(
+                [9],
+                [(0, 2, 1), (0, 5, 4)],
+                success=True,
+                prerequisite_stream=prerequisite_stream,
+            )
 
         workspace.load_block_transfers.assert_called_once_with(
             [(0, 2, 1), (0, 5, 4)], geometry=geometry
@@ -747,6 +770,10 @@ class GroupAwareWireTest(unittest.TestCase):
         log_info.assert_called_once_with(
             "[L2] load started: operations=%d blocks=%d", 1, 2
         )
+        # The load orders after the prerequisite stream the caller named --
+        # the one that zeroed its destinations -- not after the current stream.
+        load_events.start_event.record.assert_called_once_with(prerequisite_stream)
+        load_events.start_event.wait.assert_called_once_with(executor.load_stream)
 
     def test_resolved_transport_selects_events_even_with_device_geometry(self):
         for uses_device_tables in (False, True):
@@ -774,7 +801,9 @@ class GroupAwareWireTest(unittest.TestCase):
                     ),
                     patch.object(module, "transfer_cache_blocks") as transfer,
                 ):
-                    executor._start_loading([9], [(0, 1, 1)], success=True)
+                    executor._start_loading(
+                        [9], [(0, 1, 1)], success=True, prerequisite_stream=object()
+                    )
                 self.assertEqual(
                     workspace.commit_block_transfers.call_count, int(uses_device_tables)
                 )
@@ -1011,15 +1040,15 @@ class GroupAwareWireTest(unittest.TestCase):
             for name, sentinel in sentinels.items():
                 self.assertIs(sys.modules[name], sentinel)
 
-    def test_two_isolated_loads_preserve_imported_torch_modules(self):
+    def test_two_isolated_loads_preserve_imported_real_modules(self):
         first = _load_executor_module_without_triton(force_isolated=True)
-        first_torch = first.torch
+        first_psutil = first.psutil
 
-        self.assertIs(sys.modules["torch"], first_torch)
+        self.assertIs(sys.modules["psutil"], first_psutil)
         second = _load_executor_module_without_triton(force_isolated=True)
 
-        self.assertIs(second.torch, first_torch)
-        self.assertIs(sys.modules["torch"], first_torch)
+        self.assertIs(second.psutil, first_psutil)
+        self.assertIs(sys.modules["psutil"], first_psutil)
 
     def test_loadback_commits_block_ids_once_and_launches_one_flagged_kernel(self):
         executor_module, executor, device, geometry, workspace = (
@@ -1055,7 +1084,9 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(executor_module.device_module, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_blocks") as transfer,
         ):
-            executor._start_loading([9], [(0, 2, 1)], success=True)
+            executor._start_loading(
+                [9], [(0, 2, 1)], success=True, prerequisite_stream=object()
+            )
 
         workspace.load_block_transfers.assert_called_once_with(
             [(0, 2, 1)], geometry=geometry
@@ -1132,7 +1163,9 @@ class GroupAwareWireTest(unittest.TestCase):
             ) as transfer,
         ):
             with self.assertRaisesRegex(RuntimeError, "layer launch failed"):
-                executor._start_loading([9], [(0, 2, 1)], success=True)
+                executor._start_loading(
+                    [9], [(0, 2, 1)], success=True, prerequisite_stream=object()
+                )
 
         self.assertEqual(transfer.call_count, 1)
         retirement.record.assert_called_once_with(executor.load_stream)
@@ -1152,7 +1185,6 @@ class GroupAwareWireTest(unittest.TestCase):
             load_stream=Mock(),
         )
         executor._write_acks = []
-        executor._ready_write_op_ids = []
         load_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[Mock()],
@@ -1188,7 +1220,9 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
         ):
             with self.assertRaises(RuntimeError) as raised:
-                executor._start_loading([9], [(0, 2, 1)], success=True)
+                executor._start_loading(
+                    [9], [(0, 2, 1)], success=True, prerequisite_stream=object()
+                )
 
             self.assertIs(raised.exception, original_error)
             self.assertEqual(str(raised.exception), "original layer launch failed")
@@ -1202,7 +1236,9 @@ class GroupAwareWireTest(unittest.TestCase):
             executor.reset()
             self.assertTrue(executor._load_poisoned)
             with self.assertRaisesRegex(RuntimeError, "poisoned"):
-                executor._start_loading([10], [(0, 3, 2)], success=True)
+                executor._start_loading(
+                    [10], [(0, 3, 2)], success=True, prerequisite_stream=object()
+                )
 
         tracker.begin_load.assert_called_once_with()
 
@@ -1300,7 +1336,6 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._write_acks = []
         executor._load_acks = []
-        executor._ready_write_op_ids = []
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
@@ -1414,7 +1449,6 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._write_acks = []
         executor._load_acks = []
-        executor._ready_write_op_ids = []
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._backup_poll_failed = False
@@ -1474,14 +1508,22 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
-        executor._ready_write_op_ids = []
         executor._ready_load_acks = []
         executor._load_poisoned = False
         executor._write_acks = []
         executor._load_acks = []
         executor._backup_futures = []
         executor.l3_store = None
-        self.assertIsNone(executor._start_loading([9], [], success=False))
+        with self.assertRaisesRegex(ValueError, "must not launch transfers"):
+            executor._start_loading(
+                [9], [(0, 2, 1)], success=False, prerequisite_stream=object()
+            )
+        self.assertEqual(executor.poll_results(), [])
+        self.assertIsNone(
+            executor._start_loading(
+                [9], [], success=False, prerequisite_stream=object()
+            )
+        )
         events = executor.poll_results()
         self.assertEqual(len(events), 1)
         self.assertEqual(int(events[0].op_id), 9)
@@ -1515,13 +1557,13 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor.l3_store.backup.return_value = [True]
         default_stream = Mock()
         with patch.object(
-            executor_module.torch.cuda, "current_stream", return_value=default_stream
+            executor_module.device_module,
+            "synchronize",
+            side_effect=default_stream.synchronize,
         ):
             executor.shutdown()
 
         default_stream.synchronize.assert_called_once_with()
-        executor.load_stream.synchronize.assert_called_once_with()
-        executor.write_stream.synchronize.assert_called_once_with()
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
         executor.l3_store.close.assert_called_once_with()
         self.assertEqual(executor._write_acks, [])
@@ -1624,7 +1666,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
             backup_pages=[],
             lane=executor._pinned_write_lane,  # pylint: disable=protected-access
-            producer_stream=torch.cuda.current_stream(),
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         executor.write_stream.synchronize()
         write_results = executor.poll_results()
@@ -1640,6 +1682,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
             success=True,
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)
         pool.load_tracker.set_consumers(load_index)
@@ -1682,14 +1725,17 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                     [(0, block, block)],
                     backup_pages=[],
                     lane=executor._pinned_write_lane,
-                    producer_stream=torch.cuda.current_stream(),
+                    prerequisite_stream=torch.cuda.current_stream(),
                 )
             # The load below has no scheduler ACK to wait for, so order it
             # behind the copies the way a stream-ordered submission would.
             torch.cuda.current_stream().wait_stream(executor.write_stream)
             device.fill_(0xEE)
             load_index = executor._start_loading(
-                [9], [(0, block, block) for block in range(1, 4)], success=True
+                [9],
+                [(0, block, block) for block in range(1, 4)],
+                success=True,
+                prerequisite_stream=torch.cuda.current_stream(),
             )
             pool.load_tracker.set_consumers(load_index)
             pool.load_tracker.wait_for_layer(0)
@@ -1726,7 +1772,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [(0, 1, 1)],
             backup_pages=[],
             lane=executor._pinned_write_lane,
-            producer_stream=torch.cuda.current_stream(),
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         torch.cuda.synchronize()
         self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
@@ -1734,7 +1780,10 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         device.fill_(0xEE)
         torch.cuda.synchronize()
         load_index = executor._start_loading(  # pylint: disable=protected-access
-            [9], [(0, 2, 1)], success=True
+            [9],
+            [(0, 2, 1)],
+            success=True,
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)
         target_pool.load_tracker.set_consumers(load_index)

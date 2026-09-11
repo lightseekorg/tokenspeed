@@ -326,7 +326,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.gdn_replay_commit_supported",
+        "tokenspeed_kernel.ops.attention.gdn.gdn_replay_commit_supported",
         lambda dtype: replay_supported,
     )
     model_config = SimpleNamespace(

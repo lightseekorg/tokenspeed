@@ -21,20 +21,16 @@ namespace tokenspeed::test {
 static_assert(std::is_aggregate_v<WriteBackOperation>);
 static_assert(std::is_aggregate_v<LoadBackOperation>);
 
-TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
+TEST(CacheOperationTest, WriteBackFlattensOpsInOrderWithPerOpGuard) {
     WriteBackOperation op;
     op.op_id = 7;
-    op.transfers = {
-        CacheTransfer{0, 1, 11},
-        CacheTransfer{0, 2, 22},
-        CacheTransfer{0, 1, 11},
-    };
-    WriteBackOperation duplicate;
-    duplicate.op_id = 8;
-    duplicate.transfers = {CacheTransfer{0, 2, 22}, CacheTransfer{0, 3, 33}};
-    duplicate.source_pinned = true;
+    op.transfers = {CacheTransfer{0, 1, 11}, CacheTransfer{0, 2, 22}};
+    WriteBackOperation pinned;
+    pinned.op_id = 8;
+    pinned.transfers = {CacheTransfer{0, 3, 33}};
+    pinned.source_pinned = true;
 
-    WriteBackBatch batch({op, duplicate});
+    WriteBackBatch batch({op, pinned});
 
     ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({7, 8}));
     EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 0}));
@@ -44,6 +40,41 @@ TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
     EXPECT_EQ(batch.dst_pages[1], std::vector<std::int32_t>({33}));
     EXPECT_EQ(batch.source_pinned, std::vector<bool>({false, true}))
         << "the guard travels per op; an unset op reads as stream-ordered";
+}
+
+TEST(CacheOperationTest, RepeatedTransferWithinOnePlanIsASchedulerBug) {
+    // A store skips keys already in flight and a load targets freshly acquired
+    // pages, so the same (group, source, destination) cannot legitimately
+    // appear twice in one plan -- neither within an op nor across ops. The
+    // wire type refuses it instead of silently dropping the repeat, which
+    // would hand the runtime an op it can never acknowledge.
+    WriteBackOperation within;
+    within.op_id = 7;
+    within.transfers = {CacheTransfer{0, 1, 11}, CacheTransfer{0, 1, 11}};
+    EXPECT_THROW(WriteBackBatch{{within}}, std::runtime_error);
+
+    WriteBackOperation first;
+    first.op_id = 7;
+    first.transfers = {CacheTransfer{0, 2, 22}};
+    WriteBackOperation second;
+    second.op_id = 8;
+    second.transfers = {CacheTransfer{0, 2, 22}};
+    EXPECT_THROW(WriteBackBatch({first, second}), std::runtime_error);
+
+    LoadBackOperation load;
+    load.op_id = 9;
+    load.transfers = {CacheTransfer{0, 10, 20}, CacheTransfer{0, 10, 20}};
+    EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
+}
+
+TEST(CacheOperationTest, OpWithoutTransfersIsASchedulerBug) {
+    WriteBackOperation store;
+    store.op_id = 7;
+    EXPECT_THROW(WriteBackBatch{{store}}, std::runtime_error);
+
+    LoadBackOperation load;
+    load.op_id = 9;
+    EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
 }
 
 TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {

@@ -153,7 +153,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
             backup_pages,
             lane=executor._pinned_write_lane,
-            producer_stream=torch.cuda.current_stream(),
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         executor.write_stream.synchronize()
         write_results = executor.poll_results()
@@ -184,6 +184,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
             success=True,
+            prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)
         pool.load_tracker.set_consumers(load_index)

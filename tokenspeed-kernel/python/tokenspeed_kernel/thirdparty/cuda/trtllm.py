@@ -362,13 +362,23 @@ class MnnvlAllReduceFusionWorkspace:
         self.oneshot_token_cap = oneshot_token_cap
         self._refs = refs  # keep the symm_mem tensor + handle alive
 
-    def resolve_use_oneshot(self, token_num: int, requested: Optional[bool]) -> bool:
-        """Resolve dispatch against the one-shot lane this workspace owns."""
+    def resolve_use_oneshot(
+        self, token_num: int, requested: Optional[bool], hidden_dim: int
+    ) -> bool:
+        """Resolve dispatch against the one-shot lane this workspace owns.
+
+        Arming is grow-only, so the stored cap is the traffic rule at the widest
+        width any caller on this group reserved, not at the width in hand: scale
+        it, bounded by the rows the buffer was armed for. Scaling rather than
+        recomputing keeps dispatch off the environment override. ``hidden_dim``
+        is required because every resolution is authoritative -- the last one to
+        run decides -- so a caller that omitted it would quietly restore the
+        armed-width answer.
+        """
         if requested is False:
             return False
-        # This cap is both the creation-time traffic rule and the allocation
-        # bound. A forced request beyond it must use the always-sized two-shot lane.
-        return token_num <= self.oneshot_token_cap
+        cap = self.oneshot_token_cap * self.hidden_dim // hidden_dim
+        return token_num <= min(cap, self.max_token_num)
 
     def supports(
         self,
@@ -411,7 +421,7 @@ class MnnvlAllReduceFusionWorkspace:
         # recoverable RuntimeError before any launch.
         if token_num <= 0 or token_num > MNNVL_TWOSHOT_MAX_TOKEN:
             return False
-        use_oneshot = self.resolve_use_oneshot(token_num, use_oneshot)
+        use_oneshot = self.resolve_use_oneshot(token_num, use_oneshot, hidden_dim)
         # Validate the layout selected by the real device parameter. Resolution
         # above downgrades an unsafe forced one-shot request to the always-sized
         # two-shot layout.
@@ -633,14 +643,18 @@ def trtllm_allreduce_fusion(
     launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     if use_oneshot is None:
         if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
-            use_oneshot = workspace_ptrs.resolve_use_oneshot(token_num, None)
+            use_oneshot = workspace_ptrs.resolve_use_oneshot(
+                token_num, None, hidden_dim
+            )
         else:
             use_oneshot = _ar_should_use_oneshot(
                 token_num, hidden_dim, allreduce_in.dtype, world_size
             )
 
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
-        use_oneshot = workspace_ptrs.resolve_use_oneshot(token_num, use_oneshot)
+        use_oneshot = workspace_ptrs.resolve_use_oneshot(
+            token_num, use_oneshot, hidden_dim
+        )
         # MNNVL-structured one-shot path: single NVLS multicast payload store,
         # local-buffer Lamport polling, same FusedOp epilogues.
         # RuntimeError, not assert: callers such as PrefillGraph catch

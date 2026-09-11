@@ -4,7 +4,8 @@
 # nodes on 4-GPU machines).
 #
 #   sbatch -N 2 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
-#       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> agentic_bench.slurm
+#       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
+#       --wrap "bash test/agentic_benchmark/kimi_k3/tokenspeed/agentic_bench.slurm"
 #
 #   SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> bash agentic_bench.slurm
 
@@ -16,9 +17,9 @@ CONFIGS=(
     attn_tp8_moe_ep8
 )
 
-# Under sbatch this file runs from the spool directory; SLURM_SUBMIT_DIR is
-# where sbatch was invoked (this directory, per the usage above).
-SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Passing this file to sbatch directly runs a spool copy and loses this
+# directory; the usage above wraps it so the real path is used in both modes.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SERVER_PID=
 SERVER_LOG=
 STEP_NAME=agentic_server

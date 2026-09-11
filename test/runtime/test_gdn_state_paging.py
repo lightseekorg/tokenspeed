@@ -270,7 +270,7 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         stub_pool = _ContractPool(
             self.P,
-            {0: ("linear_attention", object(), object())},
+            {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
         )
         backend.set_kv_pool(stub_pool)
         self.assertTrue(backend.state_paging_active)
@@ -479,6 +479,18 @@ class VerifyMetadataTest(unittest.TestCase):
             560,
         )
 
+    def test_target_verify_reuses_graph_stable_scratch_base_rows(self):
+        rows = self.backend._verify_scratch_base_rows(3, 4)
+        grid = self.backend._verify_scratch_grid(3, 4)
+
+        self.assertIs(rows, self.backend._verify_scratch_base_rows(3, 4))
+        self.assertEqual(rows.dtype, self.torch.int32)
+        self.assertEqual(rows.tolist(), [0, 5, 10])
+        self.assertEqual(
+            grid.tolist(),
+            [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]],
+        )
+
 
 class GDNStatePagingGPUTest(unittest.TestCase):
     """MambaAttnBackend state paging vs the
@@ -495,9 +507,9 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
-            from tokenspeed_kernel.ops.attention.flashinfer import (
-                gated_delta_rule as gdn,
+            from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
+            from tokenspeed_kernel.ops.attention.gdn import (
+                gdn_replay_commit_supported,
             )
 
             from tokenspeed.runtime.execution.forward_batch_info import (
@@ -584,7 +596,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
+        from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
             chunk_gated_delta_rule,
         )
 

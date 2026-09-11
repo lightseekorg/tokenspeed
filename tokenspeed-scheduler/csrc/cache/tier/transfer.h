@@ -31,6 +31,8 @@
 #include <variant>
 #include <vector>
 
+#include "utils.h"
+
 namespace tokenspeed {
 
 struct CacheTransfer {
@@ -77,6 +79,12 @@ struct WriteBackOperation {
     bool source_pinned{false};
 };
 
+// Every op on the wire carries at least one transfer, and no (group, source,
+// destination) repeats within one plan: a store skips keys already in flight
+// and a load targets freshly acquired pages. The runtime relies on both -- an
+// op is acknowledged by its copy's completion event, so an empty op would
+// never be acknowledged and its tickets would leak. A violation is a
+// scheduler bug and fails here rather than being papered over.
 struct WriteBackBatch {
     std::vector<std::uint32_t> op_ids;
     std::vector<std::vector<std::uint32_t>> group_ids;
@@ -92,19 +100,19 @@ struct WriteBackBatch {
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            _assert(!op.transfers.empty(), "write-back op carries no transfers");
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
             std::vector<std::string> operation_hashes;
             std::vector<std::int32_t> operation_offsets;
             for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                    operation_hashes.push_back(transfer.content_hash);
-                    operation_offsets.push_back(transfer.page_offset);
-                }
+                _assert(seen.insert(transfer).second, "duplicate write-back transfer within one plan");
+                operation_groups.push_back(transfer.group_id);
+                operation_sources.push_back(transfer.source_page);
+                operation_destinations.push_back(transfer.destination_page);
+                operation_hashes.push_back(transfer.content_hash);
+                operation_offsets.push_back(transfer.page_offset);
             }
 
             op_ids.push_back(op.op_id);
@@ -135,6 +143,7 @@ struct LoadBackBatch {
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            _assert(!op.transfers.empty(), "load-back op carries no transfers");
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
@@ -142,14 +151,13 @@ struct LoadBackBatch {
             std::vector<std::int32_t> operation_offsets;
             std::vector<std::uint8_t> operation_prefetch;
             for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                    operation_hashes.push_back(transfer.content_hash);
-                    operation_offsets.push_back(transfer.page_offset);
-                    operation_prefetch.push_back(transfer.prefetch_from_storage ? std::uint8_t{1} : std::uint8_t{0});
-                }
+                _assert(seen.insert(transfer).second, "duplicate load-back transfer within one plan");
+                operation_groups.push_back(transfer.group_id);
+                operation_sources.push_back(transfer.source_page);
+                operation_destinations.push_back(transfer.destination_page);
+                operation_hashes.push_back(transfer.content_hash);
+                operation_offsets.push_back(transfer.page_offset);
+                operation_prefetch.push_back(transfer.prefetch_from_storage ? std::uint8_t{1} : std::uint8_t{0});
             }
 
             op_ids.push_back(op.op_id);

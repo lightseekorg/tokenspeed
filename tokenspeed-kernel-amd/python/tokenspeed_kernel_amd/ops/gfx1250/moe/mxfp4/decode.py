@@ -343,7 +343,7 @@ def _matmul_decode(
         IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
             BLOCK_M, cfg.NUM_WARPS
         )
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(0, IDX_BASE_LAYOUT)
 
         idx_offs = gl.arange(0, BLOCK_M, IDX_LAYOUT)
         idx_mask = (off_m + idx_offs < eM) & (

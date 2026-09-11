@@ -132,6 +132,7 @@ def _handle(trace, **kwargs):
             forward_thread=_ForwardThread(trace),
             execute_forward_op=lambda *a, **k: trace.append("forward"),
             execution_stream="execution-stream",
+            default_stream="default-stream",
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
             ),
@@ -242,18 +243,24 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     """The FIFO carries the correctness order for same-round page reuse: the
     write-backs are submitted ahead of the new owner's zeroing (a
-    stream-ordered snapshot copy lands its fence there), and the load-backs
-    target zeroed pages. The copies are told which stream wrote the pages;
-    the zeroing orders itself behind that stream."""
+    stream-ordered snapshot copy lands its fence on the default stream the
+    zeroing runs on), and the load-backs target zeroed pages. Every stream is
+    named: the copies are told which stream wrote the pages and which one
+    the fence lands on; the loads are told which stream zeroed their
+    destinations."""
     trace: list = []
     plan = _plan(pages_to_zero=[3, 4], cache=["op"])
     handle = _handle(
         trace,
         l2_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda p, *, producer_stream: trace.append(
-                ("write_backs", p.cache, producer_stream)
+            submit_write_backs=lambda p, *, prerequisite_stream, fence_stream: (
+                trace.append(
+                    ("write_backs", p.cache, prerequisite_stream, fence_stream)
+                )
             ),
-            submit_load_backs=lambda p: trace.append(("load_backs", p.cache)),
+            submit_load_backs=lambda p, *, prerequisite_stream: trace.append(
+                ("load_backs", p.cache, prerequisite_stream)
+            ),
             poll_results=lambda: ["done"],
         ),
     )
@@ -265,11 +272,11 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
 
     assert trace == [
         "submit",
-        ("write_backs", ["op"], "execution-stream"),
+        ("write_backs", ["op"], "execution-stream", "default-stream"),
         "submit",
         ("zero", (3, 4)),
         "submit",
-        ("load_backs", ["op"]),
+        ("load_backs", ["op"], "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
@@ -302,14 +309,14 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     would leave its ops counted in flight forever."""
     trace: list = []
 
-    def exploding(plan, *, producer_stream):
+    def exploding(plan, *, prerequisite_stream, fence_stream):
         raise ValueError("bad cache op")
 
     handle = _handle(
         trace,
         l2_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
-            submit_load_backs=lambda p: None,
+            submit_load_backs=lambda p, *, prerequisite_stream: None,
             poll_results=lambda: [],
         ),
     )
@@ -770,6 +777,32 @@ def test_only_the_builder_constructs_the_device_side():
             if factory in text and f"def {factory}" not in text:
                 offenders.append(f"{rel}: {factory}")
     assert not offenders, offenders
+
+
+def test_communication_buffers_precede_cache_capacity_planning():
+    import inspect
+    import textwrap
+
+    from tokenspeed.runtime.execution.device import build_device_side
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
+    prepare_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "prepare_communication_runtime"
+    ]
+    cache_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_attn_components"
+    ]
+
+    assert prepare_lines and cache_lines
+    assert max(prepare_lines) < min(cache_lines)
 
 
 def test_collaborators_hold_the_handle_instead_of_walking_to_it():

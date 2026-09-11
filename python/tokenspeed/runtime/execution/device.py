@@ -321,13 +321,15 @@ class DeviceHandle:
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
-            # forward thread's stream here, before the zeroing is enqueued.
-            # The copies themselves order behind the execution stream, where
-            # the forwards wrote the pages.
+            # default stream the zeroing runs on, before the zeroing is
+            # enqueued. The copies themselves order behind the execution
+            # stream, where the forwards wrote the pages.
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_write_backs(
-                        execution_plan, producer_stream=executor.execution_stream
+                        execution_plan,
+                        prerequisite_stream=executor.execution_stream,
+                        fence_stream=executor.default_stream,
                     )
                 )
             )
@@ -338,8 +340,14 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # Behind the zeroing: the loads' destinations were zeroed on the
+            # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_load_backs(
+                        execution_plan, prerequisite_stream=executor.default_stream
+                    )
+                )
             )
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
@@ -753,7 +761,18 @@ class DeviceHandle:
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
-        return self._thread.run(lambda: handler(req))
+
+        def _apply_update():
+            result = handler(req)
+            if (
+                type(req) is UpdateWeightsFromDistributedReqInput
+                and result[0]
+                and self._executor.drafter is not None
+            ):
+                self._executor.drafter.on_target_weights_updated()
+            return result
+
+        return self._thread.run(_apply_update)
 
 
 def build_device_side(
@@ -777,11 +796,11 @@ def build_device_side(
     control face and the encoder-facts callable it consumes at startup, and
     the handle it runs with.
 
-    The chain is linear and the order is load-bearing: the multimodal
-    runtime must be prepared after weights are loaded and before
-    ``create_attn_components`` profiles memory for the KV budget, and the
-    chunked-prefill limit must be aligned to the cache groups before
-    ``ModelExecutorConfig`` sizes the input buffers from it.
+    The chain is linear and the order is load-bearing: the multimodal runtime
+    and persistent communication buffers must be prepared after weights are
+    loaded and before ``create_attn_components`` profiles memory for the KV
+    budget, and the chunked-prefill limit must be aligned to the cache groups
+    before ``ModelExecutorConfig`` sizes the input buffers from it.
 
     Args:
         server_args: Parsed server arguments. ``chunked_prefill_size`` may
@@ -829,6 +848,18 @@ def build_device_side(
     )
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
+    max_forward_tokens = (
+        server_args.chunked_prefill_size
+        if server_args.chunked_prefill_size > 0
+        else server_args.max_prefill_tokens + server_args.max_model_len
+    )
+    max_forward_tokens = max(
+        max_forward_tokens,
+        max_batch_size * decode_input_tokens,
+    )
+    target.prepare_communication_runtime(max_forward_tokens)
+    if draft is not None:
+        draft.prepare_communication_runtime(max_forward_tokens)
 
     (
         attn_backend,

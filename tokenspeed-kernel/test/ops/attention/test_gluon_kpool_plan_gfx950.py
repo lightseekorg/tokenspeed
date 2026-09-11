@@ -32,14 +32,15 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel import kpool_prefill_topk  # isort: skip
-from tokenspeed_kernel.ops.attention.gluon import (  # isort: skip
-    kpool_select as gluon_kpool_select,
+from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_topk  # isort: skip
+from tokenspeed_kernel.ops.attention.kpool import (
+    gluon as gluon_kpool_select,  # isort: skip
 )
-from tokenspeed_kernel.ops.attention.gluon.kpool_select import (  # isort: skip
+
+from tokenspeed_kernel.ops.attention.kpool.gluon import (  # isort: skip
     gluon_kpool_prefill_topk_fp8_gfx950,
 )
-from tokenspeed_kernel.ops.attention.triton.kpool_select import (  # isort: skip
+from tokenspeed_kernel.ops.attention.kpool.triton import (  # isort: skip
     triton_kpool_prefill_topk,
 )
 from tokenspeed_kernel.selection import select_kernel  # isort: skip

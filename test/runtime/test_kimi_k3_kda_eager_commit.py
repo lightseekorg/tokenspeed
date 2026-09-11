@@ -7,16 +7,25 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+from test.runtime.cache_pool_test_utils import (
+    assert_no_alias,
+    binding_state,
+    storages_of,
+)
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
 from test.runtime.conftest import block_tables_for as _tables_for
 from test.runtime.conftest import kimi_recipe as _kimi_recipe
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
-from types import SimpleNamespace  # noqa: E402
+from types import MethodType, SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
+    _packed_qkv_views,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
 
@@ -29,9 +38,16 @@ DEV = "cuda"
 
 
 class _Harness:
-    def __init__(self, *, eager_replay: bool, seed: int = 0):
+    def __init__(
+        self,
+        *,
+        eager_replay: bool,
+        seed: int = 0,
+        max_bs: int = 8,
+        usable_pages: int = 24,
+    ):
         torch.manual_seed(seed)
-        self.pool = _make_kimi_pool(DEV, usable_pages=24)
+        self.pool = _make_kimi_pool(DEV, usable_pages=usable_pages)
         self.contract = self.pool.arena.runtime_contract
         spec = SimpleNamespace(
             num_attention_heads=H,
@@ -44,11 +60,12 @@ class _Harness:
             dtype=torch.bfloat16,
             is_draft=False,
             speculative_num_draft_tokens=T,
-            max_bs=8,
+            max_bs=max_bs,
             components=(spec,),
             # Stub component(): this backend construction never queries components.
             component=lambda cls: None,
         )
+        self.config = config
         self.backend = KdaAttnBackend(config, spec)
         self.backend.set_kv_pool(self.pool)
         # The persistent decode buffers exist from construction, as at the
@@ -163,6 +180,225 @@ def _assert_committed_pages_equal(left, right, pages):
                 atol=1e-5,
                 rtol=1e-3,
             )
+
+
+def test_packed_qkv_views_keep_projection_storage_and_stride():
+    rows, row_width, production_steps = 64, 6416, 4
+    packed_width = 3 * 16 * D
+    projection = torch.randn(rows, row_width, dtype=torch.bfloat16, device=DEV)
+    packed = projection[:, :packed_width]
+
+    query, key, value = _packed_qkv_views(
+        packed,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        head_q=D,
+        head_k=D,
+        head_v=D,
+    )
+
+    storage_ptr = projection.untyped_storage().data_ptr()
+    for tensor in (query, key, value):
+        assert tensor.untyped_storage().data_ptr() == storage_ptr
+        assert tensor.stride()[1:] == (row_width, D, 1)
+        recurrent_view = tensor.view(16, production_steps, 16, D)
+        assert recurrent_view.stride() == (
+            production_steps * row_width,
+            row_width,
+            D,
+            1,
+        )
+
+
+def test_direct_committed_read_matches_seeded_verify_and_commit_bitwise():
+    """The fallback may skip only the recurrent-state seed copy."""
+    direct = _Harness(eager_replay=False, seed=73)
+    seeded = _Harness(eager_replay=False, seed=73)
+    for harness in (direct, seeded):
+        harness.backend._verify = MethodType(MambaAttnBackend._verify, harness.backend)
+    seeded.backend._verify_reads_committed_recurrent_state = False
+
+    def seeded_verify_scan(
+        self,
+        query,
+        key,
+        value,
+        ssm_comp,
+        ssm_scratch,
+        state_in_blocks,
+        output_indices,
+        **kwargs,
+    ):
+        del ssm_comp, state_in_blocks
+        return KdaAttnBackend._verify_scan(
+            self,
+            query,
+            key,
+            value,
+            ssm_scratch,
+            ssm_scratch,
+            output_indices[: kwargs["batch_size"], 0] - 1,
+            output_indices,
+            **kwargs,
+        )
+
+    seeded.backend._verify_scan = MethodType(seeded_verify_scan, seeded.backend)
+    rpis = [0, 1, 2]
+    pages = {
+        group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    generator = torch.Generator(device=DEV).manual_seed(79)
+    for direct_layer, seeded_layer in zip(direct.layer_ids, seeded.layer_ids):
+        direct_group = direct.pool.state_group_by_layer[direct_layer]
+        seeded_group = seeded.pool.state_group_by_layer[seeded_layer]
+        assert direct_group == seeded_group
+        page_ids = torch.tensor(pages[direct_group], dtype=torch.int64, device=DEV)
+        for component in ("conv_state", "recurrent_state"):
+            direct_pool = direct.pool.get_component(direct_layer, component)
+            seeded_pool = seeded.pool.get_component(seeded_layer, component)
+            values = torch.randn(
+                (len(page_ids), *direct_pool.shape[1:]),
+                dtype=direct_pool.dtype,
+                device=DEV,
+                generator=generator,
+            )
+            direct_pool[page_ids] = values
+            seeded_pool[page_ids] = values
+
+    committed_before = {
+        (layer_id, component): direct.pool.get_component(layer_id, component).clone()
+        for layer_id in direct.layer_ids
+        for component in ("conv_state", "recurrent_state")
+    }
+
+    seq_lens = [8 + T] * len(rpis)
+    for harness in (direct, seeded):
+        harness.prepare_metadata(rpis, pages, seq_lens)
+    inputs = direct.inputs(len(rpis), 83)
+    direct_out = direct.forward(inputs, len(rpis))
+    seeded_out = seeded.forward(inputs, len(rpis))
+    torch.cuda.synchronize()
+
+    write_rows = direct.backend.forward_metadata.mamba_output_indices.long()
+    for layer_id, actual, expected in zip(direct.layer_ids, direct_out, seeded_out):
+        assert torch.equal(actual, expected)
+        direct_conv, direct_state = direct.backend._verify_scratch[layer_id]
+        seeded_conv, seeded_state = seeded.backend._verify_scratch[layer_id]
+        assert torch.equal(direct_conv[write_rows], seeded_conv[write_rows])
+        assert torch.equal(direct_state[write_rows], seeded_state[write_rows])
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                direct.pool.get_component(layer_id, component),
+                committed_before[(layer_id, component)],
+            )
+
+    accepted = torch.tensor([1, T, 2], dtype=torch.int32, device=DEV)
+    direct.backend.commit_verified_state(accepted)
+    seeded.backend.commit_verified_state(accepted)
+    torch.cuda.synchronize()
+    for layer_id in direct.layer_ids:
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                direct.pool.get_component(layer_id, component),
+                seeded.pool.get_component(layer_id, component),
+            )
+
+
+def test_packed_qkv_views_match_materialized_split_across_commits():
+    """Packed views preserve verifier outputs and committed state over rounds."""
+    rpis = [0, 1]
+    viewed = _Harness(
+        eager_replay=False,
+        seed=89,
+        max_bs=len(rpis),
+        usable_pages=8,
+    )
+    materialized = _Harness(
+        eager_replay=False,
+        seed=89,
+        max_bs=len(rpis),
+        usable_pages=8,
+    )
+    for harness in (viewed, materialized):
+        harness.backend._verify = MethodType(MambaAttnBackend._verify, harness.backend)
+    materialized.backend._verify_packed_qkv_views = False
+
+    # One layer per state group covers routing without recompiling all layers.
+    for harness in (viewed, materialized):
+        harness.layer_ids = [
+            next(
+                layer_id
+                for layer_id in harness.layer_ids
+                if harness.pool.state_group_by_layer[layer_id] == group_id
+            )
+            for group_id in _STATE_GROUPS
+        ]
+
+    pages = {
+        group_id: [
+            2 + group_index * len(rpis) + request_index
+            for request_index in range(len(rpis))
+        ]
+        for group_index, group_id in enumerate(_STATE_GROUPS)
+    }
+    all_pages = [page for group_pages in pages.values() for page in group_pages]
+    assert len(all_pages) == len(set(all_pages))
+    page_ids = torch.tensor(all_pages, dtype=torch.int64, device=DEV)
+    generator = torch.Generator(device=DEV).manual_seed(93)
+    for viewed_layer, materialized_layer in zip(
+        viewed.layer_ids, materialized.layer_ids, strict=True
+    ):
+        group_id = viewed.pool.state_group_by_layer[viewed_layer]
+        assert group_id == materialized.pool.state_group_by_layer[materialized_layer]
+        for component in ("conv_state", "recurrent_state"):
+            viewed_state = viewed.pool.get_component(viewed_layer, component)
+            viewed_state[page_ids] = torch.randn(
+                (len(page_ids), *viewed_state.shape[1:]),
+                dtype=viewed_state.dtype,
+                device=DEV,
+                generator=generator,
+            )
+            materialized.pool.get_component(materialized_layer, component).copy_(
+                viewed_state
+            )
+
+    seq_lens = [8 + T] * len(rpis)
+    accepts = ([0, T], [2, 1], [T, 0], [1, 2])
+    for round_index, accepted in enumerate(accepts):
+        for harness in (viewed, materialized):
+            harness.prepare_metadata(rpis, pages, seq_lens)
+        inputs = viewed.inputs(len(rpis), 97 + round_index)
+        viewed_out = viewed.forward(inputs, len(rpis))
+        materialized_out = materialized.forward(inputs, len(rpis))
+        torch.cuda.synchronize()
+
+        write_rows = viewed.backend.forward_metadata.mamba_output_indices.long()
+        for viewed_layer, actual, expected in zip(
+            viewed.layer_ids, viewed_out, materialized_out, strict=True
+        ):
+            assert torch.equal(actual, expected), f"layer {viewed_layer}"
+            viewed_conv, viewed_state = viewed.backend._verify_scratch[viewed_layer]
+            materialized_conv, materialized_state = (
+                materialized.backend._verify_scratch[viewed_layer]
+            )
+            assert torch.equal(viewed_conv[write_rows], materialized_conv[write_rows])
+            assert torch.equal(viewed_state[write_rows], materialized_state[write_rows])
+
+        accepted_tensor = torch.tensor(accepted, dtype=torch.int32, device=DEV)
+        viewed.backend.commit_verified_state(accepted_tensor)
+        materialized.backend.commit_verified_state(accepted_tensor)
+        torch.cuda.synchronize()
+        for viewed_layer in viewed.layer_ids:
+            for component in ("conv_state", "recurrent_state"):
+                assert torch.equal(
+                    viewed.pool.get_component(viewed_layer, component),
+                    materialized.pool.get_component(viewed_layer, component),
+                )
+        seq_lens = [
+            length + count for length, count in zip(seq_lens, accepted, strict=True)
+        ]
 
 
 def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
@@ -396,9 +632,8 @@ def test_verify_scratch_cannot_grow_after_preallocation():
     harness = _Harness(eager_replay=True)
     harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
     capacity = next(iter(harness.backend._verify_scratch.values()))[0].shape[0]
-    harness.backend.query_start_loc_list.extend([None] * (capacity + 1))
     with pytest.raises(RuntimeError, match="preallocated scratch holds"):
-        harness.backend._ensure_verify_scratch(1, T)
+        harness.backend._ensure_verify_scratch(capacity + 1, T)
 
 
 def test_no_store_fused_verify_matches_decomposed_outputs():
@@ -431,3 +666,231 @@ def test_no_store_fused_verify_matches_decomposed_outputs():
     wrong = decomposed.forward(inputs, len(rpis))[0]
     with pytest.raises(AssertionError):
         torch.testing.assert_close(fused_out[0], wrong, atol=2e-2, rtol=2e-2)
+
+
+def test_rebinding_the_pool_reissues_the_raw_gate_scratch(monkeypatch):
+    """Raw-gate scratch is issued against the bound pool; a rebind must not keep the old one."""
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: True,
+    )
+    harness = _Harness(eager_replay=True)
+    assert harness.backend._replay_uses_raw_gate
+    harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    old_pool = storages_of(
+        *(
+            harness.backend._state_components(layer_id)[component]
+            for layer_id in harness.layer_ids
+            for component in (0, 1)
+        )
+    )
+    replacement = _make_kimi_pool(DEV, usable_pages=24)
+
+    harness.backend.set_kv_pool(replacement)
+    assert harness.backend._verify_scratch is None
+    harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    assert_no_alias(harness.backend, old_pool)
+    for layer_id in harness.layer_ids:
+        rows = harness.backend._verify_scratch[layer_id][0]
+        assert rows.device == replacement.get_component(layer_id, "conv_state").device
+        assert rows.shape[0] >= harness.config.max_bs
+
+
+def test_rebinding_the_pool_commits_like_a_fresh_bind():
+    """Verify/commit after a rebind lands in the new pool exactly as a fresh bind's does."""
+    rebound = _Harness(eager_replay=True)
+    fresh = _Harness(eager_replay=True)
+    rpis = [0, 1]
+    pages = {
+        group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    seq_lens = [8 + T] * len(rpis)
+    rebound.round(rpis, pages, seq_lens, 100, [1, T])
+
+    replacement = _make_kimi_pool(DEV, usable_pages=24)
+    rebound.backend.set_kv_pool(replacement)
+    rebound.backend.init_cuda_graph_state(rebound.config.max_bs)
+    rebound.pool = replacement
+    rebound.contract = replacement.arena.runtime_contract
+    for round_index, accepted in enumerate(([0, T], [T, 2])):
+        for harness in (rebound, fresh):
+            harness.round(rpis, pages, seq_lens, 200 + round_index, accepted)
+        _assert_committed_pages_equal(rebound, fresh, pages)
+        seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
+    layer_id = fresh.layer_ids[0]
+    page = pages[fresh.pool.state_group_by_layer[layer_id]][0]
+    for harness in (rebound, fresh):
+        for component in ("conv_state", "recurrent_state"):
+            assert harness.pool.get_component(layer_id, component)[page].abs().sum() > 0
+
+
+def test_reordered_state_groups_are_the_same_geometry():
+    """Group ids name the groups; the contract's enumeration order is not geometry."""
+    harness = _Harness(eager_replay=False)
+    specs = harness.pool.arena.runtime_contract.group_specs
+    reordered = SimpleNamespace(
+        arena=SimpleNamespace(
+            cache_group_specs=harness.pool.arena.cache_group_specs,
+            runtime_contract=SimpleNamespace(group_specs=tuple(reversed(specs))),
+        ),
+        paged_group_ids=harness.pool.paged_group_ids,
+        state_group_by_layer=harness.pool.state_group_by_layer,
+        get_component=harness.pool.get_component,
+    )
+
+    harness.backend.validate_cache_pool(reordered)
+
+
+def test_a_rejected_hybrid_rebind_moves_no_child():
+    """The router accepts a pool the state backend rejects; two-phase binding must move nothing."""
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+
+    harness = _Harness(eager_replay=False)
+    leaves = []
+
+    def leaf_factory(group_id, granularity):
+        leaf = SimpleNamespace(group_id=group_id, cache_pool=None)
+        leaf.validate_cache_pool = lambda pool: None
+        leaf.set_cache_pool = leaf._bind = lambda pool: setattr(
+            leaf, "cache_pool", pool
+        )
+        leaves.append(leaf)
+        return leaf
+
+    router = CacheGroupRouter(
+        leaf_factory, is_draft=False, spec_num_tokens=T, device=DEV
+    )
+    hybrid = HybridLinearAttnBackend(router, harness.backend, [])
+    hybrid.set_cache_pool(harness.pool)
+    assert leaves and all(leaf.cache_pool is harness.pool for leaf in leaves)
+
+    def retyped(layer, name):
+        component = harness.pool.get_component(layer, name)
+        if name == "conv_state":
+            return component.to(
+                torch.float32 if component.dtype != torch.float32 else torch.float16
+            )
+        return component
+
+    retyped_pool = SimpleNamespace(
+        arena=harness.pool.arena,
+        paged_group_ids=harness.pool.paged_group_ids,
+        state_group_by_layer=harness.pool.state_group_by_layer,
+        get_component=retyped,
+    )
+    router.validate_cache_pool(retyped_pool)
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        hybrid.set_cache_pool(retyped_pool)
+
+    assert hybrid.cache_pool is harness.pool
+    assert router.cache_pool is harness.pool
+    assert all(leaf.cache_pool is harness.pool for leaf in leaves)
+    assert harness.backend.kv_pool is harness.pool
+
+
+def test_a_rejected_hybrid_rebind_publishes_nothing():
+    harness = _Harness(eager_replay=False)
+    full = SimpleNamespace(device=DEV, cache_pool=harness.pool)
+    full.set_cache_pool = full._bind = lambda pool: setattr(full, "cache_pool", pool)
+    full.validate_cache_pool = lambda pool: None
+    hybrid = HybridLinearAttnBackend(full, harness.backend, [])
+    hybrid.set_cache_pool(harness.pool)
+
+    contract = harness.pool.arena.runtime_contract
+    coarser = SimpleNamespace(
+        arena=SimpleNamespace(
+            runtime_contract=SimpleNamespace(
+                group_specs=tuple(
+                    (
+                        SimpleNamespace(
+                            group_id=spec.group_id,
+                            family=spec.family,
+                            checkpoint_granularity=2 * spec.checkpoint_granularity,
+                        )
+                        if spec.family == "state"
+                        else spec
+                    )
+                    for spec in contract.group_specs
+                )
+            )
+        ),
+        state_group_by_layer=harness.pool.state_group_by_layer,
+        get_component=harness.pool.get_component,
+    )
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        hybrid.set_cache_pool(coarser)
+
+    assert hybrid.cache_pool is harness.pool
+    assert harness.backend.kv_pool is harness.pool
+
+
+def test_a_rebound_backend_matches_a_fresh_one_field_by_field():
+    """After the documented re-initialisation, no attribute tells a rebind from a fresh bind."""
+    rebound = _Harness(eager_replay=True)
+    fresh = _Harness(eager_replay=True)
+    pages = {group: [2] for group in _STATE_GROUPS}
+    rebound.round([0], pages, [8 + T], 100, [1])
+    old_slabs = storages_of(
+        *(
+            rebound.backend._state_components(layer_id)[component]
+            for layer_id in rebound.backend._state_layer_ids()
+            for component in (0, 1)
+        )
+    )
+
+    rebound.backend.set_kv_pool(_make_kimi_pool(DEV, usable_pages=24))
+    for harness in (rebound, fresh):
+        harness.backend.init_cuda_graph_state(harness.config.max_bs)
+        harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+
+    assert binding_state(rebound.backend) == binding_state(fresh.backend)
+    assert_no_alias(rebound.backend, old_slabs)
+
+
+def test_a_pool_too_small_for_the_raw_gate_scratch_is_refused(monkeypatch):
+    """The raw-gate scratch is the pool's own conv slab, so a probe pool must hold max_bs rows."""
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: True,
+    )
+    harness = _Harness(eager_replay=True)
+    assert harness.backend._replay_uses_raw_gate
+    harness.backend.set_kv_pool(_make_kimi_pool(DEV, usable_pages=4))
+
+    with pytest.raises(RuntimeError, match="transient conv rows"):
+        harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+
+
+def test_hybrid_rebinding_reaches_the_state_child():
+    harness = _Harness(eager_replay=False)
+    full = SimpleNamespace(device=DEV, cache_pool=None)
+    full.set_cache_pool = full._bind = lambda pool: setattr(full, "cache_pool", pool)
+    full.validate_cache_pool = lambda pool: None
+    full.init_prefill_graph_state = lambda max_num_tokens, max_bs: None
+    hybrid = HybridLinearAttnBackend(full, harness.backend, [])
+    side_state = SimpleNamespace(
+        dropped=False, commit_after_mtp_verify=lambda *a, **k: None
+    )
+    side_state.drop_verify_scratch = lambda: setattr(side_state, "dropped", True)
+    hybrid.register_speculative_state_backend(side_state)
+    share = harness.backend.sparse_topk
+    share.prefill = share.decode = object()
+
+    old_slabs = storages_of(
+        *(
+            harness.backend._state_components(layer_id)[component]
+            for layer_id in harness.backend._state_layer_ids()
+            for component in (0, 1)
+        )
+    )
+    replacement = _make_kimi_pool(DEV, usable_pages=24)
+    hybrid.set_cache_pool(replacement)
+    assert full.cache_pool is replacement
+    assert harness.backend.kv_pool is replacement
+    assert side_state.dropped
+    assert share.prefill is None and share.decode is None
+    assert_no_alias(hybrid, old_slabs)
+    assert_no_alias(harness.backend, old_slabs)

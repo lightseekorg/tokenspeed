@@ -696,7 +696,7 @@ if current_platform().is_nvidia:
         resolved_oneshot = requested_oneshot
         if manager.mnnvl_workspace is not None:
             resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
-                token_num, None
+                token_num, None, hidden_dim
             )
         workspace = _ar_fusion_workspace(
             manager,
@@ -826,7 +826,7 @@ if current_platform().is_nvidia:
         resolved_oneshot = requested_oneshot
         if manager.mnnvl_workspace is not None:
             resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
-                token_num, use_oneshot
+                token_num, use_oneshot, hidden_dim
             )
         workspace = _ar_fusion_workspace(
             manager,

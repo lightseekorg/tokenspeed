@@ -24,8 +24,8 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel import (
-    attn_merge_state,
+from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,

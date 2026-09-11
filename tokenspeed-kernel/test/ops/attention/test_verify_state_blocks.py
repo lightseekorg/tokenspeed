@@ -33,7 +33,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
     verify_state_blocks,
 )
 
@@ -162,7 +162,7 @@ def test_layouts_and_arguments_the_kernel_cannot_serve_are_rejected():
         )
 
 
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
     commit_state_pages,
 )
 

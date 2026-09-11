@@ -24,7 +24,7 @@ import pytest
 
 tile_scheduler = pytest.importorskip("flash_attn.cute.tile_scheduler")
 
-from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha import fmha_bias_helper
+from tokenspeed_kernel.ops.attention.rmha.cute_dsl import fmha_bias_helper
 
 
 def test_rel_mha_uses_current_fa4_scheduler_state_api() -> None:

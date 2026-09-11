@@ -496,12 +496,12 @@ class ModelExecutor:
 
         self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
-        # own: everything the data plane enqueues outside an explicit stream
-        # context -- page zeroing, the cache ops' fences and start events --
-        # lands here. `execution_stream` carries the model launches and the
-        # runtime-state writes. Dependencies between them are placed by the
-        # consumer: each forward waits on the default stream in its prologue;
-        # zeroing and write-back wait on the execution stream themselves.
+        # own: page zeroing runs here, and the cache ops take it by name for
+        # their fences and start events. `execution_stream` carries the model
+        # launches and the runtime-state writes. Dependencies between them are
+        # placed by the consumer: each forward waits on the default stream in
+        # its prologue; zeroing and write-back wait on the execution stream
+        # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
