@@ -34,6 +34,8 @@ decode fused tail       ``1 <= M <= latent-tail capacity``
                         (multicast tail, tp_ep spanning WORLD) — see
                         ``select_k3_moe_tail_tier``
 multimem AR window      ``MULTIMEM_AR_MIN_TOKENS..MAX`` (prefill)
+attention reduce        ``1 <= M <= ATTN_AR_MAX_TOKENS`` (tokenspeed
+                        CuteDSL collective, attn TP group)
 fused-lane one-shot     everything else with a fused plan
 ======================  =========================================
 """
@@ -85,8 +87,12 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-# The kernel's own max_m. Wider steps mostly never reach this reduce at all:
-# they take the fused AttnRes graph, which only declines at one token.
+logger = logging.getLogger(__name__)
+
+_IRIS_MAX_TOKENS = 8192
+_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+
+# One-shot window: 7168 bf16 at TP8 still fits the AR threshold at eight rows.
 ATTN_AR_MAX_TOKENS = 8
 
 
@@ -115,12 +121,6 @@ def attn_ar_eligible(
     """
     window = min(ATTN_AR_MAX_TOKENS, fusion_max_tokens)
     return armed and has_prefix and 0 < num_tokens <= window
-
-
-logger = logging.getLogger(__name__)
-
-_IRIS_MAX_TOKENS = 8192
-_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
 
 class K3MoETailTier(IntEnum):
@@ -349,19 +349,13 @@ class K3AttnCommState:
         )
         self.dummy_norm.weight.requires_grad_(False)
 
-        # Callers hand in their own output buffer, so one instance serves
-        # every layer without its internal latent scratch being the thing that
-        # carries a layer's residual into the next one.
-        # The build is collective, so the decision to build must be too: a rank
-        # that skipped it would strand its peers inside the rendezvous.
+        # Build collectively or not at all: a rank that skipped the build
+        # would strand its peers inside the rendezvous.
         self.cute_ar = None
-        # Gate on config, which cannot differ across ranks, and vote on the
-        # probes: prepare_all_reduce_fusion turns any failure into False.
         if dist.is_initialized() and mapping.attn.tp_size > 1:
             group = _get_process_group(mapping.attn.tp_group)
             # The vendor arming bit is not this kernel's capability: the
-            # collective also needs an NVLS multicast mapping, and raises
-            # without one.
+            # collective also needs an NVLS multicast mapping.
             local_ok = (
                 self.attn_ar_fusion_ok
                 and multicast_backend_available(group)
@@ -369,28 +363,31 @@ class K3AttnCommState:
             )
             vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
             dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
-        else:
-            vote = torch.zeros(1, dtype=torch.int32)
-        if bool(vote.item()):
-            self.cute_ar = _AttnCollective(
-                group=group,
-                rank=mapping.attn.tp_rank,
-                tp_size=mapping.attn.tp_size,
-                latent_dim=hidden,
-                hidden_dim=hidden,
-                max_m=ATTN_AR_MAX_TOKENS,
-                max_token_ctas=ATTN_AR_MAX_TOKENS,
-                # Unread here: residual_from_shared compiles the RMSNorm out.
-                rms_eps=1.0,
-                fp32_internal=True,
-                scratch_allocator=None,
-                finalize_top_k=None,
-                precompile_split=True,
-                residual_from_shared=True,
-            )
-            logger.info("Kimi K3 attention AR backend: tokenspeed CuteDSL collective")
-        else:
-            logger.info("Kimi K3 attention AR backend: vendor fused all-reduce")
+            if bool(vote.item()):
+                self.cute_ar = _AttnCollective(
+                    group=group,
+                    rank=mapping.attn.tp_rank,
+                    tp_size=mapping.attn.tp_size,
+                    latent_dim=hidden,
+                    hidden_dim=hidden,
+                    max_m=ATTN_AR_MAX_TOKENS,
+                    max_token_ctas=ATTN_AR_MAX_TOKENS,
+                    # Unread here: residual_from_shared compiles the RMSNorm out.
+                    rms_eps=1.0,
+                    fp32_internal=True,
+                    scratch_allocator=None,
+                    finalize_top_k=None,
+                    precompile_split=True,
+                    residual_from_shared=True,
+                )
+        logger.info(
+            "Kimi K3 attention reduce: %s",
+            (
+                "tokenspeed CuteDSL collective at M<=%d" % ATTN_AR_MAX_TOKENS
+                if self.cute_ar is not None
+                else "not armed; the existing backends serve every M"
+            ),
+        )
 
 
 class K3MoeTailCommState:
@@ -543,8 +540,8 @@ class K3AttnComm:
         self.mapping = state.mapping
 
     # ------------------------------------------------------------------
-    # Attention-side reduction (moved verbatim from
-    # KimiLinearDecoderLayer._reduce_attn_accumulate; behavior unchanged).
+    # Attention-side reduction (hoisted from
+    # KimiLinearDecoderLayer._reduce_attn_accumulate).
     # ------------------------------------------------------------------
     def attn_reduce(
         self,
@@ -567,6 +564,10 @@ class K3AttnComm:
         ``combine`` is set, so the caller runs the combine as its own kernel.
         Measured net faster at bs=1 despite the extra launch.
 
+        Like the vendor branch below it, that window does not consult
+        ``force_deterministic_rsag``: the collective reduces in ascending rank
+        order with an fp32 accumulator, so it is already run-to-run stable.
+
         ``mlp_wp`` is the calling layer's precomputed ``rms_w * res_w``
         product (per-layer state, filled in post_load_weights); the B1
         combine kernels consume it in place of the separate weights.
@@ -578,8 +579,7 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # max_m rows because the dispatch validates that exact shape,
-            # though only the m being reduced are written.
+            # The dispatch validates this exact shape; only m rows are written.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,

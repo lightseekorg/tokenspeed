@@ -231,8 +231,6 @@ def test_attention_collective_gate():
 
 def test_the_collective_is_what_serves_an_eligible_reduce():
     """The predicate is half the contract; the branch must hand it the operands."""
-    import torch
-
     from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
 
     reduced = torch.zeros(1, 8)
@@ -271,8 +269,6 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
 
 def test_the_operator_can_forbid_the_fused_attention_reduce():
     """A negative window is how a server forbids fusing this reduce at all."""
-    from tokenspeed.runtime.models.kimi_k3_comm import attn_ar_eligible
-
     # server_args sets -1 when attn and dense TP disagree; 0 is reachable too.
     for window in (-1, 0):
         assert not attn_ar_eligible(

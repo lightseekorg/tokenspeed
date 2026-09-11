@@ -404,6 +404,39 @@ def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix(m):
     assert bad > 8e-3 * max(scale, 1.0)
 
 
+def test_residual_from_shared_rejects_the_reduce_scatter_role():
+    """This epilogue emits reduced+residual; scattering the residual is nonsense."""
+    _, dev = _setup()
+    _require_attn_collective()
+    m = 2
+    kernel = _attn_collective(dev, 8)
+    partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+    override = torch.empty(8, H, dtype=torch.bfloat16, device=dev)
+    with pytest.raises(ValueError, match="include_reduce_scatter"):
+        kernel(
+            partial,
+            prefix,
+            gamma,
+            include_reduce_scatter=True,
+            include_routed=True,
+            latent_output_override=override,
+        )
+    # Positive control: the same call with the role off must go through, or the
+    # test would pass on a kernel that rejects everything.
+    out, _ = kernel(
+        partial,
+        prefix,
+        gamma,
+        include_reduce_scatter=False,
+        include_routed=True,
+        latent_output_override=override,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (m, H)
+
+
 def test_residual_from_shared_rejects_a_mismatched_latent_width():
     """The residual read walks shared_source with the latent pitch."""
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501

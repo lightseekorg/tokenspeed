@@ -115,10 +115,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         max_token_ctas: int,
         fp32_internal: bool = False,
         # Swaps the epilogue: emit reduced + shared_source instead of
-        # RMSNorm(reduced). ``gamma`` and ``rms_eps`` go unread in this mode,
-        # though both are still validated. The reduce order differs from the
-        # vendor path's, so equal inputs give numerically equivalent output,
-        # not the same bits; greedy decoding turns that into different text.
+        # RMSNorm(reduced). ``gamma`` is unread here but still shape-checked;
+        # ``rms_eps`` is unread and unchecked. The reduce order differs from
+        # the vendor path's, so equal inputs give numerically equivalent
+        # output, not the same bits.
         residual_from_shared: bool,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
@@ -141,13 +141,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             raise ValueError("at least one collective role must be enabled")
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
-        if residual_from_shared and latent_dim != hidden_dim:
-            # The residual read walks shared_source with the latent row pitch,
-            # so a narrower latent silently reads the wrong row, never faults.
-            raise ValueError(
-                "residual_from_shared requires latent_dim == hidden_dim, got "
-                f"{latent_dim} and {hidden_dim}"
-            )
         # Deferred-finalize input mode: the routed publish phase consumes the
         # MoE kernel's (gemm2 permuted rows, expert weights, expanded->permuted
         # index) triple instead of a materialized [M, latent] partial. The
@@ -1206,6 +1199,12 @@ class CollectiveKernel:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")
+        if include_reduce_scatter and self.residual_from_shared:
+            # This epilogue emits reduced+residual, so a reduce-scatter of the
+            # residual alongside it has no meaning.
+            raise ValueError(
+                "residual_from_shared cannot be combined with include_reduce_scatter"
+            )
         if include_reduce_scatter != include_routed and not self.precompile_split:
             raise RuntimeError("split collective roles require precompile_split=True")
         if latent_source.ndim != 2 or shared_source.ndim != 2:
@@ -1274,6 +1273,10 @@ class CollectiveKernel:
             raise RuntimeError(
                 "CollectiveKernel was constructed without finalize_top_k; "
                 "the deferred-finalize variant is not compiled"
+            )
+        if include_reduce_scatter and self.residual_from_shared:
+            raise ValueError(
+                "residual_from_shared cannot be combined with include_reduce_scatter"
             )
         if not include_reduce_scatter and not self.precompile_split:
             raise RuntimeError("split collective roles require precompile_split=True")
@@ -1391,7 +1394,7 @@ class CollectiveKernel:
             or not latent_output.is_contiguous()
         ):
             raise ValueError(
-                "latent_output_override must be contiguous CUDA BF16 "
+                "the latent output buffer must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.latent_dim}]"
             )
         shard_start = self.rank * self.shard_dim
