@@ -455,3 +455,15 @@ from the compute node and should be on shared storage. Use `--artifact-root`
 persistent host cache at `/home/runner/.cache`, matching the NVIDIA release
 image, and points the Hugging Face and XDG caches there; the directory must
 likewise be visible on the compute node.
+
+### Retry unsuccessful Slurm cases
+
+Open **Actions → Retry Failed CI Cases → Run workflow** and enter the run URL
+or ID (for example `34550905154`) in `source_run`. The latest completed attempt
+of **Slurm Dispatch**, or a previous retry, supplies the failed cases.
+Only `COMPLETED` cases with exit code zero and `ok: true` are skipped.
+Retries reuse the original submission scripts and source snapshot, preserving
+the tested commit, image, configuration and GPU allocation. The original
+report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
+The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
+For workflows with one case per GitHub job, use **Re-run failed jobs**.
