@@ -85,7 +85,11 @@ class TestInklingCacheContract(unittest.TestCase):
         )
 
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
-        backend.conv_columns = {"block_tokens": 128}
+        backend.conv_columns = {
+            "block_tokens": 128,
+            "group_block_tokens": {"kvconv": 128, "hiddenconv": 128},
+            "pd_endpoint_snapshots": False,
+        }
 
         def metadata(*, seq_len: int, page: int, restore: bool = False):
             return InklingConvMetadata(

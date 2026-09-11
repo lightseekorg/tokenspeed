@@ -226,7 +226,7 @@ if fp8_einsum is not None:
         tma_aligned_scales: bool,
         recipe: tuple[int, int, int],
     ) -> torch.Tensor:
-        from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+        from tokenspeed_kernel.ops.attention.dsv4.triton import (
             dsv4_fused_inv_rope_fp8_quant,
         )
 

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,9 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from tokenspeed.runtime.utils import add_prefix
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # Uniform-batch index bundles captured into a CUDA graph. During capture the
@@ -452,6 +456,7 @@ class Qwen4ExpPLELayer(nn.Module):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._active_verify_key: tuple[int, int] | None = None
+        self._last_pool: CachePool | None = None
 
     def _load_kv_proj_shard(
         self,
@@ -849,6 +854,12 @@ class Qwen4ExpPLELayer(nn.Module):
         scratch = (external[0][:rows], external[1][:rows])
         self._verify_scratch[key] = scratch
         return scratch
+
+    def drop_verify_scratch(self) -> None:
+        """Forget the workspace views; the backend reissues them for a rebound pool."""
+        self._verify_scratch.clear()
+        self._active_verify_key = None
+        self._last_pool = None
 
     def commit_verified(
         self,

@@ -46,11 +46,11 @@ from test_attention_rel_mha import (  # noqa: E402
     _ref_rel_attn,
     _require_fa4,
 )
-from tokenspeed_kernel import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod  # noqa: E402
+from tokenspeed_kernel.ops.attention.rmha import (  # noqa: E402
     rel_mha_decode_with_kvcache,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.attention import flash_attn as fa_mod  # noqa: E402
 
 torch.manual_seed(11)
 

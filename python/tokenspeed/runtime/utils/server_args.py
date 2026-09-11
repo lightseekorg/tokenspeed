@@ -28,9 +28,7 @@ import random
 import socket
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
+from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes

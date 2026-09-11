@@ -65,6 +65,7 @@ class TritonRSAGBackend:
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
             attnres_max_numel=0,
+            attnres_max_rows=0,
             max_tokens=max_num_tokens,
             hidden_size=hidden_size,
             device=None,

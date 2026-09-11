@@ -1097,7 +1097,7 @@ def triton_dsv4_grouped_output_projection(
     del recipe
     if tma_aligned_scales:
         raise ValueError("the portable projection requires canonical scales")
-    from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    from tokenspeed_kernel.ops.attention.dsv4.triton import (
         dsv4_fused_inv_rope_fp8_quant,
     )
 

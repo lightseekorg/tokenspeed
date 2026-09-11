@@ -237,9 +237,10 @@ def test_workspace_dispatch_cap_is_frozen(monkeypatch):
     ctx = _skip_unless_mnnvl()
     workspace = ctx["mnnvl"]
     monkeypatch.setenv("TOKENSPEED_MNNVL_ONESHOT_BYTES", str(1 << 40))
-    assert workspace.resolve_use_oneshot(workspace.oneshot_token_cap, None)
-    assert not workspace.resolve_use_oneshot(workspace.oneshot_token_cap + 1, None)
-    assert not workspace.resolve_use_oneshot(workspace.oneshot_token_cap + 1, True)
+    cap = workspace.oneshot_token_cap
+    assert workspace.resolve_use_oneshot(cap, None, H)
+    assert not workspace.resolve_use_oneshot(cap + 1, None, H)
+    assert not workspace.resolve_use_oneshot(cap + 1, True, H)
 
 
 # --------------------------------------------------------------------------

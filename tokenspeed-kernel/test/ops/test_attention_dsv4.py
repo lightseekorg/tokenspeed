@@ -15,13 +15,13 @@ import math
 import unittest
 
 import torch
-from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     _dsv4_decode_dense_compressed_indices_and_lens_kernel,
     _dsv4_decode_swa_indices_and_lens_kernel,
     _dsv4_dequantize_and_gather_k_kernel,

@@ -33,7 +33,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.attention.triton.capture_payload import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noqa: E402
     capture_replay_payload,
 )
 

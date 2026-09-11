@@ -13,17 +13,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_padded_heads,
     dsv4_plan,
     dsv4_prefill,
     dsv4_reset_attention_state,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_build_dense_prefill_local_compressed_indices,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
@@ -68,6 +69,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
 
@@ -219,6 +223,15 @@ def _refresh_decode_indexer_schedule_metadata(
             refreshed_keys.add(key)
 
 
+class _CacheGroupContract(NamedTuple):
+    specs: tuple[CacheGroupSpec, ...]
+    group_ids: tuple[str, ...]
+    group_kinds: dict[str, tuple[int, str, str]]
+    row_geometry: dict[str, tuple[int, int]]
+    raw_tokens_per_page: dict[str, int]
+    max_page_ids: dict[str, int]
+
+
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
@@ -264,9 +277,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # The persistent decode buffers + per-shape views; allocated by
         # init_cuda_graph_state (unconditionally at wrapper construction).
         self.graph: DeepseekV4GraphBuffers | None = None
-        self._expected_cache_group_ids: tuple[str, ...] | None = None
-        self._cache_group_raw_tokens_per_page: dict[str, int] = {}
-        self._cache_group_max_page_ids: dict[str, int] = {}
+        self._init_cache_group_latches()
         self._cuda_graph_active_page_validity: torch.Tensor | None = None
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
@@ -301,11 +312,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.step_counter.record_cache()
         return hidden_states
 
-    def _configure_cache_group_contract(
-        self,
-        cache_group_specs=(),
-        cache_group_page_counts=None,
-    ) -> tuple[CacheGroupSpec, ...]:
+    @staticmethod
+    def _derive_cache_group_contract(
+        cache_group_specs: Sequence[CacheGroupSpec],
+        cache_group_page_counts: Mapping[str, int] | None,
+    ) -> _CacheGroupContract:
         specs = tuple(cache_group_specs or ())
         group_ids = tuple(spec.group_id for spec in specs)
         if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
@@ -320,6 +331,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 raise RuntimeError(
                     "DeepSeek V4 cache page counts require matching group specs"
                 )
+            row_geometry: dict[str, tuple[int, int]] = {}
             raw_tokens_per_page: dict[str, int] = {}
             max_page_ids: dict[str, int] = {}
         else:
@@ -341,6 +353,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     "DeepSeek V4 cache groups must reserve page 0 and at least one "
                     f"live page: {invalid_counts!r}"
                 )
+            row_geometry = {}
             raw_tokens_per_page = {}
             for spec, group_id in zip(specs, group_ids, strict=True):
                 raw_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
@@ -350,24 +363,116 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         f"group={group_id!r} rows_per_page={spec.rows_per_page} "
                         f"entry_stride_tokens={spec.entry_stride_tokens}"
                     )
+                row_geometry[group_id] = (
+                    int(spec.rows_per_page),
+                    int(spec.entry_stride_tokens),
+                )
                 raw_tokens_per_page[group_id] = raw_tokens
             max_page_ids = {
                 group_id: int(page_counts[group_id]) - 1 for group_id in group_ids
             }
 
-        if self._expected_cache_group_ids is not None:
-            if (
-                self._expected_cache_group_ids != group_ids
-                or self._cache_group_raw_tokens_per_page != raw_tokens_per_page
-                or self._cache_group_max_page_ids != max_page_ids
-            ):
-                raise RuntimeError(
-                    "DeepSeek V4 cache group contract changed after initialization"
-                )
+        group_kinds = {
+            str(spec.group_id): (
+                int(spec.block_granularity),
+                str(spec.family),
+                str(spec.retention),
+            )
+            for spec in specs
+        }
+        return _CacheGroupContract(
+            specs,
+            group_ids,
+            group_kinds,
+            row_geometry,
+            raw_tokens_per_page,
+            max_page_ids,
+        )
+
+    def _configure_cache_group_contract(
+        self,
+        cache_group_specs: Sequence[CacheGroupSpec],
+        cache_group_page_counts: Mapping[str, int] | None,
+    ) -> tuple[CacheGroupSpec, ...]:
+        contract = self._derive_cache_group_contract(
+            cache_group_specs, cache_group_page_counts
+        )
+        (
+            specs,
+            group_ids,
+            group_kinds,
+            row_geometry,
+            raw_tokens_per_page,
+            max_page_ids,
+        ) = contract
+        if self._expected_cache_group_ids is not None and (
+            self._expected_cache_group_ids != group_ids
+            or self._cache_group_kinds != group_kinds
+            or self._cache_group_row_geometry != row_geometry
+            or self._cache_group_raw_tokens_per_page != raw_tokens_per_page
+            or self._cache_group_max_page_ids != max_page_ids
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 cache group contract changed after initialization"
+            )
         self._expected_cache_group_ids = group_ids
+        self._cache_group_kinds = group_kinds
+        self._cache_group_row_geometry = row_geometry
         self._cache_group_raw_tokens_per_page = raw_tokens_per_page
         self._cache_group_max_page_ids = max_page_ids
         return specs
+
+    def _init_cache_group_latches(self) -> None:
+        """The contract latched from the bound pool; a fixture built with __new__ calls this."""
+        self._expected_cache_group_ids: tuple[str, ...] | None = None
+        self._cache_group_kinds: dict[str, tuple[int, str, str]] = {}
+        self._cache_group_row_geometry: dict[str, tuple[int, int]] = {}
+        self._cache_group_raw_tokens_per_page: dict[str, int] = {}
+        self._cache_group_max_page_ids: dict[str, int] = {}
+
+    def _rebind_contract(self, cache_pool: CachePool) -> _CacheGroupContract:
+        """The contract ``cache_pool`` publishes, or raise on a geometry change."""
+        contract = self._derive_cache_group_contract(
+            tuple(cache_pool.arena.cache_group_specs),
+            cache_pool.arena.cache_group_page_counts,
+        )
+        if self.cache_pool is not None and (
+            sorted(contract.group_ids) != sorted(self._expected_cache_group_ids or ())
+            or contract.group_kinds != self._cache_group_kinds
+            or contract.row_geometry != self._cache_group_row_geometry
+        ):
+            raise RuntimeError("DeepSeek V4 cache group geometry changed on rebind")
+        return contract
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        self._rebind_contract(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        # Page counts may change between binds: relatch the contract.
+        contract = self._rebind_contract(cache_pool)
+        super()._publish_cache_pool(cache_pool)
+        self._expected_cache_group_ids = contract.group_ids
+        self._cache_group_kinds = contract.group_kinds
+        self._cache_group_row_geometry = contract.row_geometry
+        self._cache_group_raw_tokens_per_page = contract.raw_tokens_per_page
+        self._cache_group_max_page_ids = contract.max_page_ids
+        # Sized from the old pool's page counts; init_cuda_graph_state rebuilds them.
+        self.graph = None
+        self._cuda_graph_active_page_validity = None
+        self._decode_q_padding_workspace = None
+        self._decode_q_padding_workspace_layout = None
+        self.draft_rounds = None
+        self.forward_metadata = None
+        self.forward_prefill_metadata = None
+        self.forward_decode_metadata = None
+        self.slot_mappings = DeepseekV4ForwardSlotMappings()
+        self._swa_window_size = 0
+        self._swa_block_size = 0
+        self._prefill_workspace_buffer = None
+        self._prefill_workspace_rows = 0
+        self._prefill_workspace_head_dim = 0
+        self._prefill_dense_compressed_indices_buffer = None
 
     def configure_runtime(self, **kwargs) -> None:
         self._configure_cache_group_contract(

@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import kda_recurrent_layout
+from tokenspeed_kernel.ops.attention.kda import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
 # The chunked-prefill KDA path resolves to the flash-linear-attention ("fla")
@@ -589,7 +589,7 @@ class _KDAHarness:
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
         sequence starting from the zero state."""
-        from tokenspeed_kernel.ops.attention.triton.linear.kda import (
+        from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
 

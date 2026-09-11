@@ -45,11 +45,13 @@ and overwritten.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
     rel_mha_extend_with_kvcache,
     rel_mha_plan,
@@ -65,6 +67,11 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
+logger = logging.getLogger(__name__)
 
 # Matches the runtime causal_conv1d kernels' padded-slot sentinel.
 PAD_SLOT_ID = -1
@@ -150,6 +157,45 @@ class InklingConvStatePool:
         return self.conv_state.nbytes + self.remote_restore_pending.nbytes
 
 
+_ConvGeometry = tuple[int, tuple[tuple[str, int], ...], tuple[str, ...]]
+
+
+class InklingConvColumns(TypedDict):
+    block_tokens: int
+    group_block_tokens: dict[str, int]
+    pd_endpoint_snapshots: bool
+
+
+def conv_columns_for_pool(pool: CachePool) -> InklingConvColumns:
+    """The paged ShortConv geometry a backend derives from its bound pool."""
+    prefix_granularity = pool.arena.plan.prefix_granularity
+    # The checkpoint grain belongs to the conv groups' own specs; P is only
+    # the fallback when a group is absent from the plan.
+    specs_by_id = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
+
+    def conv_grain(group_id: str) -> int:
+        spec = specs_by_id.get(group_id)
+        return spec.block_granularity if spec is not None else prefix_granularity
+
+    conv_columns: InklingConvColumns = {
+        "block_tokens": conv_grain("kvconv"),
+        "group_block_tokens": {
+            "kvconv": conv_grain("kvconv"),
+            "hiddenconv": conv_grain("hiddenconv"),
+        },
+        "pd_endpoint_snapshots": all(
+            spec.transfer_policy == "latest_snapshot"
+            for spec in pool.arena.cache_group_specs
+            if spec.group_id in ("kvconv", "hiddenconv")
+        )
+        and any(
+            spec.group_id in ("kvconv", "hiddenconv")
+            for spec in pool.arena.cache_group_specs
+        ),
+    }
+    return conv_columns
+
+
 class InklingAttnBackend(AttentionBackend):
     """Thin wrapper over the dense MHA backend adding conv metadata.
 
@@ -164,16 +210,16 @@ class InklingAttnBackend(AttentionBackend):
         inner: AttentionBackend,
         conv_pool: InklingConvStatePool,
         *,
-        conv_columns: dict,
         spec_num_tokens: int = 1,
         enable_layerwise_cache_ready: bool = False,
-    ):
+    ) -> None:
         # Deliberately skip AttentionBackend.__init__: the wrapper mirrors inner via __getattr__.
         self.inner = inner
         self.conv_pool = conv_pool
-        # Paged conv geometry (see _inkling_conv_columns). Mandatory: the
+        # Paged conv geometry (see conv_columns_for_pool). Mandatory: the
         # sconv state always has its paged bridges; there is no rolling mode.
-        self.conv_columns = conv_columns
+        self.conv_columns: InklingConvColumns
+        self._conv_geometry_latched: _ConvGeometry | None = None
         # The conv groups are state-family: the inner router builds leaves
         # for history groups only, so it never sees them; this wrapper reads
         # them straight out of block_tables.
@@ -188,6 +234,35 @@ class InklingAttnBackend(AttentionBackend):
         # Spec decoding: >1 means decode rounds carry this many tokens/request (verify / catch-up).
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
         self.enable_layerwise_cache_ready = enable_layerwise_cache_ready
+        self._reset_graph_state()
+        self._init_pool_binding()
+        # Registered lazily by the model's four ShortConv sites. The buffers
+        # are fixed LCM field views; target verify publishes them only after
+        # accepted-length selection.
+        self._checkpoint_streams: dict[
+            tuple[int, int, int, str], tuple[torch.Tensor, ...]
+        ] = {}
+
+    @property
+    def _inner_max_context_len(self) -> int:
+        # Router and bare leaf both expose it (a property raising
+        # AttributeError here would fall through to __getattr__ and surface
+        # as a confusing "inner has no _inner_max_context_len").
+        return self.inner.max_context_len
+
+    def __getattr__(self, name: str) -> Any:
+        # Guard `inner` so a half-constructed wrapper raises AttributeError instead of recursing.
+        if name == "inner":
+            raise AttributeError(name)
+        if name == "conv_columns":
+            raise AttributeError("conv_columns is learnt by set_cache_pool")
+        return getattr(self.inner, name)
+
+    def child_backends(self) -> tuple[AttentionBackend, ...]:
+        return (self.inner,)
+
+    def _reset_graph_state(self) -> None:
+        """Forget every graph and breakable-prefill buffer; the next init rebuilds them."""
         # Persistent spec conv metadata buffers for CUDA graphs; sized in init_cuda_graph_state.
         self._graph_spec_qsl: torch.Tensor | None = None
         self._graph_spec_seq_idx: torch.Tensor | None = None
@@ -206,36 +281,48 @@ class InklingAttnBackend(AttentionBackend):
         self._pfg_cache_indices: torch.Tensor | None = None
         self._pfg_has_initial_state: torch.Tensor | None = None
         self._pfg_max_bs = 0
-        # Registered lazily by the model's four ShortConv sites. The buffers
-        # are fixed LCM field views; target verify publishes them only after
-        # accepted-length selection.
-        self._checkpoint_streams: dict[
-            tuple[int, int, int, str], tuple[torch.Tensor, ...]
-        ] = {}
+        self._graph_col_tables: dict[str, torch.Tensor] | None = None
+        self._graph_seq_lens: torch.Tensor | None = None
+        self._rel_qsl_cache: dict[int, torch.Tensor] = {}
+        self._rel_qsl_retired: list[torch.Tensor] = []
 
-    @property
-    def _inner_max_context_len(self) -> int:
-        # Router and bare leaf both expose it (a property raising
-        # AttributeError here would fall through to __getattr__ and surface
-        # as a confusing "inner has no _inner_max_context_len").
-        return self.inner.max_context_len
+    @staticmethod
+    def _conv_geometry(pool: CachePool) -> _ConvGeometry:
+        """The ShortConv geometry a rebind keeps; ``pd_endpoint_snapshots`` is policy."""
+        columns = conv_columns_for_pool(pool)
+        published = {spec.group_id for spec in pool.arena.cache_group_specs}
+        return (
+            columns["block_tokens"],
+            tuple(sorted(columns["group_block_tokens"].items())),
+            tuple(gid for gid in ("hiddenconv", "kvconv") if gid in published),
+        )
 
-    def __getattr__(self, name):
-        # Guard `inner` so a half-constructed wrapper raises AttributeError instead of recursing.
-        if name == "inner":
-            raise AttributeError(name)
-        return getattr(self.inner, name)
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        if self.cache_pool is None:
+            return
+        if self._conv_geometry(cache_pool) != self._conv_geometry_latched:
+            raise RuntimeError("Inkling ShortConv geometry changed on rebind")
 
-    def child_backends(self):
-        return (self.inner,)
-
-    def set_cache_pool(self, cache_pool) -> None:
-        # Explicit forward: the base class DEFINES set_cache_pool (it only
-        # stores the pool), so the __getattr__ fallback never fires -- without
-        # this the inner router would keep zero leaves and die at
-        # init_cuda_graph_state.
-        self.cache_pool = cache_pool
-        self.inner.set_cache_pool(cache_pool)
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        rebinding = self.cache_pool is not None
+        super()._publish_cache_pool(cache_pool)
+        # The recorded checkpoint streams are views into the old pool.
+        self._checkpoint_streams.clear()
+        self.conv_prefill_metadata = None
+        self.conv_decode_metadata = None
+        self._reset_graph_state()
+        if rebinding:
+            # The ring rows and pending restores belonged to the old pool's requests.
+            self.conv_pool.conv_state.zero_()
+            self.conv_pool.remote_restore_pending.zero_()
+        self.conv_columns = conv_columns_for_pool(cache_pool)
+        self._conv_geometry_latched = self._conv_geometry(cache_pool)
+        logger.info(
+            "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
+            cache_pool.arena.plan.prefix_granularity,
+            tuple(self.conv_columns["group_block_tokens"]),
+        )
 
     @property
     def supports_layer_sliding_window(self):
@@ -528,7 +615,7 @@ class InklingAttnBackend(AttentionBackend):
             col_block_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
             remote_restore_mask=(
                 self._graph_remote_restore_mask[:bs]
-                if self.conv_columns.get("pd_endpoint_snapshots", False)
+                if self.conv_columns["pd_endpoint_snapshots"]
                 else None
             ),
         )
@@ -606,10 +693,7 @@ class InklingAttnBackend(AttentionBackend):
         Grown buffers are retained (never freed): their static contents stay
         correct for any graph that recorded them.
         """
-        cache = getattr(self, "_rel_qsl_cache", None)
-        if cache is None:
-            cache = self._rel_qsl_cache = {}
-            self._rel_qsl_retired = []
+        cache = self._rel_qsl_cache
         buf = cache.get(max_seqlen_q)
         if buf is None or buf.shape[0] < bs + 1:
             if buf is not None:
@@ -838,6 +922,7 @@ class InklingAttnBackend(AttentionBackend):
                 extends beyond it run eager and skip the static route).
             max_bs: Request capacity; also the PAD request row index.
         """
+        self.inner.init_prefill_graph_state(max_num_tokens, max_bs)
         geo = self.conv_columns
         device = self.conv_pool.conv_state.device
         self._pfg_max_bs = min(max_bs, self.conv_pool.num_slots - 2)
@@ -954,7 +1039,7 @@ class InklingAttnBackend(AttentionBackend):
             # k-token spec chunk (target verify / draft window).
             self.conv_decode_metadata = self._spec_conv_metadata(bs)
             return
-        if self.conv_columns.get("pd_endpoint_snapshots", False):
+        if self.conv_columns["pd_endpoint_snapshots"]:
             self._graph_remote_restore_mask[:bs].zero_()
         self.conv_decode_metadata = self._graph_decode_conv_metadata(bs)
 
@@ -1007,7 +1092,7 @@ class InklingAttnBackend(AttentionBackend):
             # Rebuild so the eager post-verify hook (outside the graph) sees this round's bs and mode.
             self.conv_decode_metadata = self._spec_conv_metadata(bs)
             return
-        if self.conv_columns.get("pd_endpoint_snapshots", False):
+        if self.conv_columns["pd_endpoint_snapshots"]:
             self._consume_remote_restore_mask(
                 self._graph_cache_indices[:bs],
                 out=self._graph_remote_restore_mask[:bs],
