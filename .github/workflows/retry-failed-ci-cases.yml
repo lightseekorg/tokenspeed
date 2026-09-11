@@ -1,0 +1,112 @@
+name: Retry Failed CI Cases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: "Slurm Dispatch run URL or ID; retry unsuccessful cases at their original commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_attempt: ${{ steps.source.outputs.source_attempt }}
+      artifact_id: ${{ steps.source.outputs.artifact_id }}
+      coordinator: ${{ steps.source.outputs.coordinator }}
+      dispatcher_sha: ${{ steps.source.outputs.dispatcher_sha }}
+    steps:
+      - name: Checkout retry tooling
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Resolve original run and report
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          set -euo pipefail
+          python3 test/ci_system/retry_ci.py \
+            --source-run "$SOURCE_RUN" \
+            --repository "$GITHUB_REPOSITORY" \
+            --github-output "$GITHUB_OUTPUT"
+          echo "dispatcher_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  retry:
+    needs: resolve
+    runs-on: ${{ needs.resolve.outputs.coordinator }}
+    timeout-minutes: 720
+    concurrency:
+      group: retry-failed-ci-cases-${{ needs.resolve.outputs.source_run_id }}
+      cancel-in-progress: false
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Checkout trusted retry tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.dispatcher_sha }}
+          persist-credentials: false
+
+      - name: Download original attempt report
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.source_run_id }}
+          artifact-ids: ${{ needs.resolve.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/slurm-source-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Retry unsuccessful Slurm cases
+        env:
+          COORDINATOR: ${{ needs.resolve.outputs.coordinator }}
+        run: |
+          set -euo pipefail
+          case "$COORDINATOR" in
+            slurm-dispatch) ;;
+            slurm-dispatch-gb300)
+              coordinator_user=${USER:-$(id -un)}
+              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+              ;;
+            *) echo "Unsupported coordinator: $COORDINATOR" >&2; exit 2 ;;
+          esac
+          exec test/ci/run_slurm.sh \
+            --replay-manifest "$RUNNER_TEMP/slurm-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/manifest.json" \
+            --replay-coordinator "$COORDINATOR" \
+            --wait \
+            --report-dir "$RUNNER_TEMP/slurm-report-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+      - name: Publish retry summary
+        if: always()
+        env:
+          SOURCE_RUN_ID: ${{ needs.resolve.outputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ needs.resolve.outputs.source_attempt }}
+        run: |
+          report="$RUNNER_TEMP/slurm-report-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$report"
+          if [ ! -f "$report/summary.md" ]; then
+            echo "Retry stopped before producing a report; see the validation error above." > "$report/summary.md"
+          fi
+          printf '\nSource: [%s, attempt %s](https://github.com/%s/actions/runs/%s/attempts/%s)\n' \
+            "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" "$GITHUB_REPOSITORY" "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" \
+            >> "$report/summary.md"
+          cat "$report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload retry results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slurm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn

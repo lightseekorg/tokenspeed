@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import html
 import json
 import os
@@ -14,9 +15,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -64,6 +66,271 @@ class Submission:
     task: Task
     job_id: str
     log: Path
+    replay: dict
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def replay_context(
+    source: Path, args: argparse.Namespace, commit: str, source_pr: str | None
+) -> dict:
+    """Record non-secret submission inputs that are not embedded in the script."""
+    return {
+        "version": 1,
+        "commit": commit,
+        "snapshot": str(source),
+        "snapshot_sha256": file_sha256(source) if source.exists() else None,
+        "container_image": args.container_image,
+        "partition": args.partition,
+        "time": args.time,
+        "nodelist": args.nodelist,
+        "source_pr": source_pr,
+        "environment": {
+            "INSTALL_TOKENSPEED_MLA_FROM_SOURCE": os.environ.get(
+                "INSTALL_TOKENSPEED_MLA_FROM_SOURCE"
+            ),
+            "TS_CI_LOCAL_MODEL_ROOT": os.environ.get("TS_CI_LOCAL_MODEL_ROOT"),
+        },
+    }
+
+
+def failed_report_rows(manifest: Path) -> list[dict]:
+    """A missing/invalid result is retryable, even if Slurm reports exit zero."""
+    rows = json.loads(manifest.read_text())
+    if not isinstance(rows, list):
+        raise ValueError("Slurm manifest must be a list of submitted cases")
+    failed = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("invalid case row in Slurm manifest")
+        job_id = row.get("job_id")
+        if not isinstance(job_id, str) or not re.fullmatch(r"[1-9]\d*", job_id):
+            raise ValueError("invalid Slurm job ID in manifest")
+        if job_id in seen:
+            raise ValueError(f"duplicate Slurm job ID: {job_id}")
+        seen.add(job_id)
+        result_path = manifest.parent / f"{job_id}-result.json"
+        try:
+            result = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            result = None
+        if not (
+            row.get("state") == "COMPLETED"
+            and row.get("exit_code") in ("0", "0:0")
+            and isinstance(result, dict)
+            and result.get("ok") is True
+        ):
+            failed.append(row)
+    return failed
+
+
+def script_array(script: str, name: str) -> list[str]:
+    matches = re.findall(rf"^{re.escape(name)}=\(\n(.*?)\n\)$", script, re.M | re.S)
+    if len(matches) != 1:
+        raise ValueError(f"retained script has no unique {name} array")
+    return shlex.split(matches[0])
+
+
+def script_option(arguments: list[str], name: str) -> str:
+    values = [
+        value[len(name) + 1 :] for value in arguments if value.startswith(name + "=")
+    ]
+    if len(values) != 1:
+        raise ValueError(f"retained script has no unique {name}")
+    return values[0]
+
+
+def prepare_replay(
+    manifest: Path, artifact_root: Path, coordinator: str
+) -> list[tuple[Task, str, dict]]:
+    """Validate every retained script/snapshot before allowing any submission.
+
+    Paths from the downloaded report may only identify scripts under this
+    coordinator's configured artifact root. Script text is parsed as data;
+    it is never sourced during preparation.
+    """
+    rows = failed_report_rows(manifest)
+    prepared = []
+    snapshot_hashes = {}
+    for row in rows:
+        data = row["task"]
+        task = Task(**data)
+        if not re.fullmatch(
+            r"test/ci/(?:eval|perf|ut)/[A-Za-z0-9_.-]+\.yaml", task.config
+        ):
+            raise ValueError(f"invalid CI config: {task.config}")
+        if task.task_type not in TASK_TYPES or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+", task.name
+        ):
+            raise ValueError("invalid task name or type")
+        if type(task.nodes) is not int or task.nodes < 1 or type(task.gpus) is not int:
+            raise ValueError("invalid Slurm topology")
+        if task.gpus != gpu_count(task.runner):
+            raise ValueError("GPU count does not match recorded runner")
+        is_gb300 = task.runner.startswith(("gb300-", "slurm-gb300-"))
+        expected = "slurm-dispatch-gb300" if is_gb300 else "slurm-dispatch"
+        if coordinator != expected or not task.runner.startswith(
+            ("b200-", "gb200-", "slurm-gb200-", "gb300-", "slurm-gb300-")
+        ):
+            raise ValueError("recorded task does not belong to this coordinator")
+        log = Path(row["log"])
+        suffix = f"-{row['job_id']}.out"
+        if log.parent.resolve() != artifact_root / "logs" or not log.name.endswith(
+            suffix
+        ):
+            raise ValueError("recorded log is outside this coordinator's artifact root")
+        stem = log.name[: -len(suffix)]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+-[0-9a-f]{12}-\d+", stem):
+            raise ValueError("invalid retained script name")
+        script_path = (artifact_root / "scripts" / f"{stem}.sbatch").resolve()
+        if script_path.parent != artifact_root / "scripts":
+            raise ValueError("retained script resolves outside the artifact root")
+        script = script_path.read_text()
+        sources = re.findall(r"^source_archive=(.+)$", script, re.M)
+        if len(sources) != 1 or len(shlex.split(sources[0])) != 1:
+            raise ValueError("retained script has no unique source snapshot")
+        source = Path(shlex.split(sources[0])[0]).resolve()
+        if source.parent != artifact_root / "snapshots" or not re.fullmatch(
+            r"[0-9a-f]{40}\.tar", source.name
+        ):
+            raise ValueError("retained snapshot is outside the artifact root")
+        commit = source.stem
+        if f"-{commit[:12]}-" not in stem:
+            raise ValueError("script and snapshot commit disagree")
+        with tarfile.open(source) as archive:
+            if archive.pax_headers.get("comment") != commit:
+                raise ValueError("source snapshot git-archive commit does not match")
+        command_name = "container_command" if task.nodes == 1 else "server_command"
+        srun_name = "srun_args" if task.nodes == 1 else "server_srun_args"
+        command = script_array(script, command_name)
+        srun = script_array(script, srun_name)
+        declared = script_option(command, "--runner")
+        override = [
+            value for value in command if value.startswith("--runner-override=")
+        ]
+        if declared != task.runner:
+            validate_gb300_runner_alias(declared, task.runner)
+            if override != [f"--runner-override={task.runner}"]:
+                raise ValueError("retained runner override does not match manifest")
+        elif override and override != [f"--runner-override={task.runner}"]:
+            raise ValueError("unexpected retained runner override")
+        if task.declared_runner is not None and task.declared_runner != declared:
+            raise ValueError("recorded declared runner does not match retained script")
+        task = replace(
+            task, declared_runner=declared if declared != task.runner else None
+        )
+        if script_option(command, "--config") != task.config:
+            raise ValueError("retained config does not match manifest")
+        if (
+            script_option(srun, "--nodes") != str(task.nodes)
+            or script_option(srun, "--gres") != f"gpu:{task.gpus}"
+        ):
+            raise ValueError("retained script topology does not match manifest")
+        image = script_option(srun, "--container-image")
+        if not re.fullmatch(
+            r"ghcr\.io/lightseekorg/tokenspeed-runner:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}@sha256:[0-9a-f]{64}",
+            image,
+        ):
+            raise ValueError("retained container image must be immutable")
+        metadata = row.get("replay")
+        if metadata is None:
+            # Legacy Slurm Dispatch used these sbatch defaults and set the
+            # install switch for every PR. Both become explicit in new reports.
+            summary = (manifest.parent / "summary.md").read_text()
+            prs = re.findall(
+                r"^\*\*Target PR:\*\* (?:\[#([1-9]\d*)\]\([^\n]+\)|#([1-9]\d*))[ \t]*$",
+                summary,
+                re.M,
+            )
+            if len(prs) > 1 or ("Target PR:" in summary and not prs):
+                raise ValueError("ambiguous source PR in legacy report")
+            source_pr = next(value for value in prs[0] if value) if prs else None
+            metadata = {
+                "version": 1,
+                "commit": commit,
+                "snapshot": str(source),
+                "partition": "batch",
+                "time": "12:00:00",
+                "nodelist": None,
+                "source_pr": source_pr,
+                "environment": {
+                    "INSTALL_TOKENSPEED_MLA_FROM_SOURCE": "1" if source_pr else "0",
+                    "TS_CI_LOCAL_MODEL_ROOT": None,
+                },
+            }
+        else:
+            metadata = dict(metadata)
+            if metadata.get("version") != 1:
+                raise ValueError("unsupported replay metadata version")
+            if metadata.get("commit") != commit or metadata.get("snapshot") != str(
+                source
+            ):
+                raise ValueError("recorded source does not match retained script")
+            if (
+                metadata.get("script") != str(script_path)
+                or metadata.get("script_sha256")
+                != hashlib.sha256(script.encode()).hexdigest()
+            ):
+                raise ValueError("retained script checksum does not match report")
+            if metadata.get("container_image") != image:
+                raise ValueError("recorded image does not match retained script")
+            if source not in snapshot_hashes:
+                snapshot_hashes[source] = file_sha256(source)
+            if metadata.get("snapshot_sha256") != snapshot_hashes[source]:
+                raise ValueError("retained snapshot checksum does not match report")
+        if not re.fullmatch(r"[A-Za-z0-9_,-]+", metadata["partition"]):
+            raise ValueError("invalid recorded partition")
+        if metadata["time"] is not None and not re.fullmatch(
+            r"(?:\d+-)?\d+(?::\d+){0,2}", metadata["time"]
+        ):
+            raise ValueError("invalid recorded time limit")
+        if metadata["nodelist"] is not None and not re.fullmatch(
+            r"[A-Za-z0-9_.,\[\]-]+", metadata["nodelist"]
+        ):
+            raise ValueError("invalid recorded nodelist")
+        source_pr = metadata["source_pr"]
+        if source_pr is not None:
+            if not isinstance(source_pr, str):
+                raise ValueError("invalid recorded source PR")
+            parse_pr_number(source_pr)
+        environment = metadata["environment"]
+        if not isinstance(environment, dict) or set(environment) - {
+            "INSTALL_TOKENSPEED_MLA_FROM_SOURCE",
+            "TS_CI_LOCAL_MODEL_ROOT",
+        }:
+            raise ValueError("unsupported recorded environment variable")
+        if environment.get("INSTALL_TOKENSPEED_MLA_FROM_SOURCE") not in (
+            None,
+            "",
+            "0",
+            "1",
+        ):
+            raise ValueError("invalid recorded installation mode")
+        model_root = environment.get("TS_CI_LOCAL_MODEL_ROOT")
+        if model_root is not None and (
+            not isinstance(model_root, str)
+            or (model_root != "" and not model_root.startswith("/"))
+            or any(c in model_root for c in "\n\r\x00")
+        ):
+            raise ValueError("invalid recorded model cache root")
+        if source not in snapshot_hashes:
+            snapshot_hashes[source] = file_sha256(source)
+        metadata["snapshot_sha256"] = snapshot_hashes[source]
+        metadata["container_image"] = image
+        metadata["source_job_id"] = row["job_id"]
+        print(
+            f"Retry: {task.name} ({task.runner}), commit {commit}, image {image}",
+            flush=True,
+        )
+        prepared.append((task, script, metadata))
+    return prepared
 
 
 def gpu_count(runner: str) -> int:
@@ -661,6 +928,7 @@ def submit(
     artifact_root: Path,
     args: argparse.Namespace,
     commit: str,
+    replay: dict,
 ) -> Submission:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", task.name).strip("-")
     unique = f"{commit[:12]}-{time.time_ns()}"
@@ -670,6 +938,11 @@ def submit(
     log_pattern.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
     script_path.chmod(0o755)
+    replay = {
+        **replay,
+        "script": str(script_path),
+        "script_sha256": hashlib.sha256(script.encode()).hexdigest(),
+    }
 
     command = [
         "sbatch",
@@ -695,13 +968,21 @@ def submit(
     if args.render:
         print(f"$ {shlex.join(command)}")
         print(script, end="")
-        return Submission(task, "", log_pattern)
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+        return Submission(task, "", log_pattern, replay)
+    environment = dict(os.environ)
+    for name, value in replay.get("environment", {}).items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    result = subprocess.run(
+        command, check=True, capture_output=True, text=True, env=environment
+    )
     job_id = result.stdout.strip().split(";", 1)[0]
     log = Path(str(log_pattern).replace("%j", job_id))
     print(f"Submitted {job_id}: {task.config}", flush=True)
     print(f"Log: {log}", flush=True)
-    return Submission(task, job_id, log)
+    return Submission(task, job_id, log, replay)
 
 
 def follow(job_id: str, log: Path) -> None:
@@ -812,6 +1093,27 @@ def queued_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
     return states
 
 
+def active_replay_jobs(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    """Check old jobs individually because purged IDs can invalidate a batch query."""
+    active = {}
+    for job_id in job_ids:
+        try:
+            states = queued_states([job_id])
+        except subprocess.CalledProcessError as error:
+            if not (error.stdout or "").strip() and re.fullmatch(
+                r"(?:squeue: )?slurm_load_jobs error: Invalid job id specified",
+                (error.stderr or "").strip(),
+            ):
+                continue
+            raise
+        active.update(
+            (key, state)
+            for key, state in states.items()
+            if state["state"] not in TERMINAL_STATES
+        )
+    return active
+
+
 def print_progress(
     submissions: list[Submission],
     states: dict[str, dict[str, str]],
@@ -920,6 +1222,16 @@ def write_report(
     ]
     if source_pr:
         summary.extend([source_pr_summary(source_pr), ""])
+    commits = sorted(
+        {item.replay["commit"] for item in submissions if item.replay.get("commit")}
+    )
+    if commits:
+        summary.extend(
+            [
+                "**Tested commits:** " + ", ".join(f"`{commit}`" for commit in commits),
+                "",
+            ]
+        )
     summary.extend(
         [
             "| Job | Type | Runner | Task | State | Elapsed | Result |",
@@ -928,10 +1240,12 @@ def write_report(
     )
     details = []
     for submission in submissions:
-        state = states.get(
-            submission.job_id,
-            {"state": "UNKNOWN", "elapsed": "", "exit_code": ""},
-        )
+        state = {
+            "state": "UNKNOWN",
+            "elapsed": "",
+            "exit_code": "",
+            **(states.get(submission.job_id) or {}),
+        }
         result_path = run_root / submission.job_id / "result.json"
         detail = result_detail(result_path)
         row = {
@@ -943,11 +1257,13 @@ def write_report(
                 "runner": submission.task.runner,
                 "gpus": submission.task.gpus,
                 "nodes": submission.task.nodes,
+                "declared_runner": submission.task.declared_runner,
             },
             "log": str(submission.log),
             "result": str(result_path),
             **state,
             "detail": detail,
+            "replay": submission.replay,
         }
         rows.append(row)
         display_state = {
@@ -993,6 +1309,7 @@ def wait_all(
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, cancel_jobs)
+    states = {}
     try:
         previous_snapshot = None
         last_update = 0.0
@@ -1031,6 +1348,9 @@ def wait_all(
         return all(item.get("state") == "COMPLETED" for item in states.values()) and (
             len(states) == len(job_ids)
         )
+    except BaseException:
+        write_report(submissions, states, run_root, report_dir, source_pr)
+        raise
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -1041,6 +1361,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--config")
     source.add_argument("--all", action="store_true")
+    source.add_argument(
+        "--replay-manifest",
+        help="Retry unsuccessful cases using retained Slurm scripts.",
+    )
+    parser.add_argument(
+        "--replay-coordinator", choices=("slurm-dispatch", "slurm-dispatch-gb300")
+    )
     parser.add_argument("--runner", action="append")
     parser.add_argument(
         "--runner-alias",
@@ -1096,11 +1423,52 @@ def main(argv: Iterable[str] | None = None) -> int:
         repo = Path(args.repo_root).resolve()
         artifact_root = Path(args.artifact_root).expanduser().resolve()
         cache = Path(args.cache_dir).expanduser().resolve()
+        if args.replay_manifest:
+            if (
+                args.pr
+                or args.source_pr
+                or args.runner
+                or args.runner_alias
+                or args.task_types
+                or args.match
+                or args.exclude_match
+                or args.trigger
+            ):
+                raise ValueError(
+                    "replay cannot override the original source or task selection"
+                )
+            if not args.replay_coordinator:
+                raise ValueError("replay requires --replay-coordinator")
+            prepared = prepare_replay(
+                Path(args.replay_manifest).resolve(),
+                artifact_root,
+                args.replay_coordinator,
+            )
+            print(f"Unsuccessful cases to retry: {len(prepared)}", flush=True)
+            if args.list:
+                print_tasks([task for task, _, _ in prepared])
+                return 0
+            if prepared and not args.render:
+                active = active_replay_jobs(
+                    [metadata["source_job_id"] for _, _, metadata in prepared]
+                )
+                if active:
+                    raise ValueError(
+                        "original Slurm cases are still active; wait for them to stop before retrying"
+                    )
+            return submit_prepared(prepared, args, artifact_root)
         if args.pr:
             with pr_worktree(repo, args.pr) as checkout:
                 return run(args, checkout, artifact_root, cache)
         return run(args, repo, artifact_root, cache)
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        tarfile.TarError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -1123,26 +1491,65 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
     if not args.render:
         source = snapshot(repo, artifact_root, commit)
         cache.mkdir(parents=True, exist_ok=True)
-    submitted = [
-        submit(
+    metadata = replay_context(source, args, commit, source_pr)
+    prepared = [
+        (
             task,
             render_script(
                 task, source, artifact_root / "runs", cache, args.container_image
             ),
-            artifact_root,
-            args,
-            commit,
+            metadata,
         )
         for task in tasks
     ]
+    return submit_prepared(prepared, args, artifact_root)
+
+
+def submit_prepared(
+    prepared: list[tuple[Task, str, dict]],
+    args: argparse.Namespace,
+    artifact_root: Path,
+) -> int:
+    """Use the same submission and reporting path for new runs and replays."""
+    if args.wait and args.render:
+        raise ValueError("--wait cannot be combined with --render")
+    report_dir = (
+        Path(args.report_dir).expanduser().resolve()
+        if args.report_dir
+        else artifact_root / "reports" / str(time.time_ns())
+    )
+    if not prepared:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "manifest.json").write_text("[]\n")
+        (report_dir / "summary.md").write_text("All cases passed; nothing to retry.\n")
+        return 0
+    source_pr = prepared[0][2]["source_pr"]
+    submitted = []
+    try:
+        for task, script, metadata in prepared:
+            options = argparse.Namespace(
+                **{
+                    **vars(args),
+                    **{key: metadata[key] for key in ("partition", "time", "nodelist")},
+                }
+            )
+            submitted.append(
+                submit(
+                    task, script, artifact_root, options, metadata["commit"], metadata
+                )
+            )
+            if args.wait:
+                # Preserve already submitted cases even if a later sbatch fails.
+                write_report(
+                    submitted, {}, artifact_root / "runs", report_dir, source_pr
+                )
+    except BaseException:
+        if submitted and not args.render:
+            subprocess.run(
+                ["scancel", *[item.job_id for item in submitted]], check=False
+            )
+        raise
     if args.wait:
-        if args.render:
-            raise ValueError("--wait cannot be combined with --render")
-        report_dir = (
-            Path(args.report_dir).expanduser().resolve()
-            if args.report_dir
-            else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
-        )
         completed = wait_all(
             submitted, artifact_root / "runs", report_dir, source_pr=source_pr
         )
