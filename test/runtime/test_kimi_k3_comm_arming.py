@@ -208,46 +208,91 @@ def test_attention_collective_gate():
     # passes for every value and pins nothing.
     assert ATTN_AR_MAX_TOKENS == 8
     # An unarmed group never takes the collective; shape cannot override that.
-    assert not attn_ar_eligible(armed=False, has_prefix=True, num_tokens=1)
+    assert not attn_ar_eligible(
+        armed=False, has_prefix=True, num_tokens=1, fusion_max_tokens=2048
+    )
     # The vendor AR owns everything wider than the one-shot window, and the
     # window edge itself belongs to us.
-    assert attn_ar_eligible(armed=True, has_prefix=True, num_tokens=8)
-    assert not attn_ar_eligible(armed=True, has_prefix=True, num_tokens=9)
+    assert attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=8, fusion_max_tokens=2048
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=9, fusion_max_tokens=2048
+    )
     # Block-write layers hand the prefix to the snapshot, so there is no
     # residual left for the collective to fold in.
-    assert not attn_ar_eligible(armed=True, has_prefix=False, num_tokens=1)
-    assert not attn_ar_eligible(armed=True, has_prefix=True, num_tokens=0)
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=False, num_tokens=1, fusion_max_tokens=2048
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=0, fusion_max_tokens=2048
+    )
 
 
 def test_the_collective_is_what_serves_an_eligible_reduce():
-    """The predicate is only half the contract: the branch must call the kernel."""
+    """The predicate is half the contract; the branch must hand it the operands."""
     import torch
 
     from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
 
     reduced = torch.zeros(1, 8)
     collective = Mock(return_value=(reduced, "shared"))
+    vendor = Mock(return_value=(None, "vendor-residual", None))
     comm = K3AttnComm.__new__(K3AttnComm)
     comm.state = SimpleNamespace(
-        cute_ar=collective, dummy_norm=SimpleNamespace(weight=None)
+        cute_ar=collective,
+        dummy_norm=SimpleNamespace(
+            weight="gamma", forward_with_allreduce_fusion=vendor
+        ),
+        attn_ar_fusion_ok=True,
     )
-    comm.mapping = None
+    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1)))
 
-    out, mixed = comm.attn_reduce(
-        torch.zeros(1, 8), torch.zeros(1, 8), None, mlp_wp=None
-    )
+    partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
+    out, mixed = comm.attn_reduce(partial, prefix, None, mlp_wp=None)
+
+    # Operand order is not observable from shapes -- both are [m, hidden] bf16 --
+    # so assert identity, not just that the kernel was reached.
+    args, kwargs = collective.call_args
+    assert args[0] is partial and args[1] is prefix
+    assert kwargs["include_reduce_scatter"] is False
+    assert kwargs["include_routed"] is True
     assert collective.call_count == 1
     assert out is reduced and mixed is None
 
-    # Nine tokens and a consumed prefix are both the vendor's, and neither may
-    # reach the kernel.
+    # Nine tokens belong to the vendor. Assert it took over, not merely that we
+    # did not: an exception on the way there would satisfy a call_count of zero.
     collective.reset_mock()
-    for partial, prefix in (
-        (torch.zeros(9, 8), torch.zeros(9, 8)),
-        (torch.zeros(1, 8), None),
-    ):
-        try:
-            comm.attn_reduce(partial, prefix, None, mlp_wp=None)
-        except Exception:
-            pass
+    wide = torch.zeros(9, 8)
+    comm.attn_reduce(wide, wide, None, mlp_wp=None)
     assert collective.call_count == 0
+    assert vendor.call_count == 1
+
+
+def test_the_operator_can_forbid_the_fused_attention_reduce():
+    """A negative window is how a server forbids fusing this reduce at all."""
+    from tokenspeed.runtime.models.kimi_k3_comm import attn_ar_eligible
+
+    # server_args sets -1 when attn and dense TP disagree; 0 is reachable too.
+    for window in (-1, 0):
+        assert not attn_ar_eligible(
+            armed=True, has_prefix=True, num_tokens=1, fusion_max_tokens=window
+        )
+    # A window narrower than the kernel's own ceiling still binds.
+    assert attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=4, fusion_max_tokens=4
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=5, fusion_max_tokens=4
+    )
+
+
+def test_widths_the_collective_cannot_serve_are_declined_not_raised():
+    """The constructor raises; the gate has to answer before it is reached."""
+    from tokenspeed.runtime.models.kimi_k3_comm import _attn_collective_shape_ok
+
+    assert _attn_collective_shape_ok(8, 7168)
+    assert _attn_collective_shape_ok(16, 7168)
+    # Cluster width is tp_size here, and the kernel takes powers of two <= 16.
+    for tp in (7, 12, 24, 32):
+        assert not _attn_collective_shape_ok(tp, 7168)

@@ -64,6 +64,9 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
     CollectiveKernel as _AttnCollective,
 )
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
+    validate_shape as validate_attn_collective_shape,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
@@ -82,15 +85,36 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-# Upper bound only: every shape measured -- single-stream decode, eight
-# concurrent streams, DSpark verify -- reaches this reduce with the prefix
-# already consumed above one token, so the vendor AR serves everything wider.
+# The kernel's own max_m. Wider steps mostly never reach this reduce at all:
+# they take the fused AttnRes graph, which only declines at one token.
 ATTN_AR_MAX_TOKENS = 8
 
 
-def attn_ar_eligible(*, armed: bool, has_prefix: bool, num_tokens: int) -> bool:
-    """Whether the tokenspeed collective, not the vendor AR, serves this reduce."""
-    return armed and has_prefix and 0 < num_tokens <= ATTN_AR_MAX_TOKENS
+def _attn_collective_shape_ok(tp_size: int, hidden: int) -> bool:
+    """Whether the collective's geometry admits this width at all.
+
+    The multicast probe answers capability, not shape, and the constructor
+    raises rather than declining, so ask its own validator first.
+    """
+    try:
+        validate_attn_collective_shape(
+            tp_size=tp_size, latent_dim=hidden, hidden_dim=hidden
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def attn_ar_eligible(
+    *, armed: bool, has_prefix: bool, num_tokens: int, fusion_max_tokens: int
+) -> bool:
+    """Whether the tokenspeed collective, not the vendor AR, serves this reduce.
+
+    ``fusion_max_tokens`` is the operator's window; it goes negative to forbid a
+    fused attention all-reduce outright, and this path is one.
+    """
+    window = min(ATTN_AR_MAX_TOKENS, fusion_max_tokens)
+    return armed and has_prefix and 0 < num_tokens <= window
 
 
 logger = logging.getLogger(__name__)
@@ -331,13 +355,17 @@ class K3AttnCommState:
         # that skipped it would strand its peers inside the rendezvous.
         self.cute_ar = None
         # Gate on config, which cannot differ across ranks, and vote on the
-        # probes, which can: both arming helpers swallow their exceptions.
+        # probes: prepare_all_reduce_fusion turns any failure into False.
         if dist.is_initialized() and mapping.attn.tp_size > 1:
             group = _get_process_group(mapping.attn.tp_group)
             # The vendor arming bit is not this kernel's capability: the
             # collective also needs an NVLS multicast mapping, and raises
             # without one.
-            local_ok = self.attn_ar_fusion_ok and multicast_backend_available(group)
+            local_ok = (
+                self.attn_ar_fusion_ok
+                and multicast_backend_available(group)
+                and _attn_collective_shape_ok(mapping.attn.tp_size, hidden)
+            )
             vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
             dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
         else:
@@ -533,6 +561,11 @@ class K3AttnComm:
         hidden comes back as the second return (else None -- block-write
         layers, large batches and the plain-reduce fallback).
 
+        The tokenspeed collective is the exception: it serves the narrow window
+        ahead of those branches and returns None for the mixed hidden even when
+        ``combine`` is set, so the caller runs the combine as its own kernel.
+        Measured net faster at bs=1 despite the extra launch.
+
         ``mlp_wp`` is the calling layer's precomputed ``rms_w * res_w``
         product (per-layer state, filled in post_load_weights); the B1
         combine kernels consume it in place of the separate weights.
@@ -542,6 +575,7 @@ class K3AttnComm:
             armed=self.state.cute_ar is not None,
             has_prefix=prefix_sum is not None,
             num_tokens=num_tokens,
+            fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
             # The kernel writes only the m rows it reduces; the buffer is
             # max_m wide because the dispatch validates that exact shape.
