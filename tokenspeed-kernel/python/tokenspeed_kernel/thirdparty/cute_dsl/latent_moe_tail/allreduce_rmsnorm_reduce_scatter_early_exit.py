@@ -119,7 +119,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # though both are still validated. The reduce order differs from the
         # vendor path's, so equal inputs give numerically equivalent output,
         # not the same bits; greedy decoding turns that into different text.
-        residual_from_shared: bool = False,
+        residual_from_shared: bool,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         use_pdl: bool | None = None,

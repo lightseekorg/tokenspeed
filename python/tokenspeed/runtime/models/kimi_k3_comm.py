@@ -349,8 +349,9 @@ class K3AttnCommState:
         )
         self.dummy_norm.weight.requires_grad_(False)
 
-        # Callers hand in their own output buffer, so one instance serves every
-        # layer: layer L's output is still the reduce operand of layer L+1.
+        # Callers hand in their own output buffer, so one instance serves
+        # every layer without its internal latent scratch being the thing that
+        # carries a layer's residual into the next one.
         # The build is collective, so the decision to build must be too: a rank
         # that skipped it would strand its peers inside the rendezvous.
         self.cute_ar = None
@@ -577,9 +578,8 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # The kernel writes only the m rows it reduces; the buffer is
-            # max_m wide because the dispatch validates that exact shape.
-            # ``prefix_sum`` carries the residual this epilogue folds in.
+            # max_m rows because the dispatch validates that exact shape,
+            # though only the m being reduced are written.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,
