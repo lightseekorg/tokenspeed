@@ -372,40 +372,55 @@ def _attn_collective(dev, max_m):
     )
 
 
-@pytest.mark.parametrize("m", [1, 2, 8])
-def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix(m):
-    """The attention epilogue must emit all-reduce(partial) + prefix."""
+def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix():
+    """The attention epilogue must emit all-reduce(partial) + prefix.
+
+    One instance, many widths: production reuses a single kernel across ~93
+    calls per step, so the Lamport re-arm between calls is part of what the
+    epilogue has to get right.
+    """
     rank, dev = _setup()
     _require_attn_collective()
     max_m = 8
-    torch.manual_seed(7 + rank)
-    partial = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
-    torch.manual_seed(99)  # the prefix is rank-uniform, like the residual stream
-    prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
-    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+    kernel = _attn_collective(dev, max_m)
+    # Not ones: a gamma-scaled or RMS-normalised epilogue must not pass here.
+    gamma = torch.full((H,), 3.0, dtype=torch.bfloat16, device=dev).contiguous()
 
-    expected = partial.float().clone()
-    dist.all_reduce(expected)
-    expected = (expected + prefix.float()).to(torch.bfloat16)
+    for call, m in enumerate((1, 8, 1, 3, 8, 2, 5, 1)):
+        torch.manual_seed(7 + rank + 31 * call)
+        partial = (
+            torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1
+        ).contiguous()
+        torch.manual_seed(99 + call)  # rank-uniform, like the residual stream
+        prefix = (
+            torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1
+        ).contiguous()
 
-    out, _ = _attn_collective(dev, max_m)(
-        partial,
-        prefix,
-        gamma,
-        include_reduce_scatter=False,
-        include_routed=True,
-        latent_output_override=torch.empty(max_m, H, dtype=torch.bfloat16, device=dev),
-    )
-    torch.cuda.synchronize()
-    err = (out.float() - expected.float()).abs().max().item()
-    scale = expected.float().abs().max().item()
-    # One bf16 ulp at this scale; the reduce order differs from torch's.
-    assert err <= 8e-3 * max(scale, 1.0), f"max|err|={err} scale={scale}"
+        expected = partial.float().clone()
+        dist.all_reduce(expected)
+        expected = (expected + prefix.float()).to(torch.bfloat16)
 
-    # Negative control: the same comparison must reject a missing residual, or
-    # it cannot tell a correct epilogue from one that drops the prefix.
-    bad = (out.float() - prefix.float() - expected.float()).abs().max().item()
-    assert bad > 8e-3 * max(scale, 1.0)
+        out, _ = kernel(
+            partial,
+            prefix,
+            gamma,
+            include_reduce_scatter=False,
+            include_routed=True,
+            latent_output_override=torch.empty(
+                max_m, H, dtype=torch.bfloat16, device=dev
+            ),
+        )
+        torch.cuda.synchronize()
+        err = (out.float() - expected.float()).abs().max().item()
+        scale = expected.float().abs().max().item()
+        tol = 8e-3 * max(scale, 1.0)  # one bf16 ulp; reduce order differs
+        assert err <= tol, f"call={call} m={m} max|err|={err} scale={scale}"
+
+        # Negative control: the same comparison must reject a missing residual,
+        # or it cannot tell a correct epilogue from one that drops the prefix.
+        assert (
+            out.float() - prefix.float() - expected.float()
+        ).abs().max().item() > tol
 
 
 def test_residual_from_shared_rejects_the_reduce_scatter_role():

@@ -116,9 +116,11 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         fp32_internal: bool = False,
         # Swaps the epilogue: emit reduced + shared_source instead of
         # RMSNorm(reduced). ``gamma`` is unread here but still shape-checked;
-        # ``rms_eps`` is unread and unchecked. The reduce order differs from
-        # the vendor path's, so equal inputs give numerically equivalent
-        # output, not the same bits.
+        # ``rms_eps`` is unread and unchecked. This accumulates ranks in fp32
+        # where the vendor all-reduce does not, so against it roughly 40% of
+        # output elements differ (measured, tp4/7168) while being ~3x closer
+        # to an fp32 reference. Greedy decoding turns that into different
+        # text, and any sampled accuracy gate will move.
         residual_from_shared: bool,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
@@ -433,6 +435,18 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 )
                 * 2
             )
+            if cutlass.const_expr(self.residual_from_shared):
+                # Read the caller's residual before admitting the PDL successor:
+                # past launch_dependents that buffer is the successor's to write.
+                res_ptr = cute.make_ptr(
+                    BFloat16,
+                    (shared_source.iterator + element_offset).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                res_values = packed_u32x4_to_bf16x8(
+                    load_global_u32x4(res_ptr, volatile=False)
+                )
             store_global_u32x4(
                 latent_multicast_ptr + multicast_offset,
                 local_packed,
@@ -514,15 +528,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 norm_input = norm_input_bf16.to(Float32)
             if cutlass.const_expr(self.residual_from_shared):
                 # Attention reduce: emit reduced+residual, not RMSNorm(reduced).
-                res_ptr = cute.make_ptr(
-                    BFloat16,
-                    (shared_source.iterator + element_offset).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                res_values = packed_u32x4_to_bf16x8(
-                    load_global_u32x4(res_ptr, volatile=False)
-                )
                 prefix = (norm_input + res_values.to(Float32)).to(BFloat16)
                 store_global_u32x4(
                     Int64((latent_output.iterator + element_offset).toint()),
