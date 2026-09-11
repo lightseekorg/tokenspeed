@@ -115,6 +115,22 @@ void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32
     }
 }
 
+TEST(FullAttnMatcherTest, ProbeRequiresExplicitL3HitSet) {
+    BlockPool pool(8);
+    PrefixCacheIndex index(/*group_id=*/0);
+    const CacheKey key{.group_id = 0, .content_hash = "l3"};
+    const std::array keys{key};
+    std::unordered_set<CacheKey, CacheKeyHash> l3_hits{key};
+
+    EXPECT_TRUE(FullAttnMatcher{}
+                    .Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, /*extra_hits=*/nullptr)
+                    .hits.empty());
+    const GroupPrefixProbe probe =
+        FullAttnMatcher{}.Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, &l3_hits);
+    ASSERT_EQ(probe.hits.size(), 1u);
+    EXPECT_EQ(probe.hits.front(), 1);
+}
+
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8);
     auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7);

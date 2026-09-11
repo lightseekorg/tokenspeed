@@ -5,10 +5,6 @@ api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k3-eagle3-mxfp4-tp8ep1-aime26-amd
 type: eval
 workflow_stage: model-test
-# AIME26 has 30 problems. The server uses greedy sampling despite the client
-# temperature below; a retry does not establish that a score miss was random.
-# Keep one extra server+eval attempt with the same correctness floor.
-retries: 1
 triggers:
   - per-commit
   - manual
@@ -67,7 +63,6 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --work-dir .ci-artifacts/evalscope-results
     --model kimi-k3
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN

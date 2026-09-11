@@ -396,3 +396,15 @@ def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
     assert list(op.request_ids) == ["r1"]
     assert list(op.extend_prefix_lens) == [0]
     assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
+
+
+def test_l3_storage_prefix_hash_and_register_bindings() -> None:
+    cfg = _l3_config(num_device_pages=32, num_host_pages=32, with_swa=True)
+    scheduler = ts.Scheduler(cfg)
+    assert hasattr(scheduler, "prefix_hashes_for_tokens")
+    hashes = scheduler.prefix_hashes_for_tokens([1, 2, 3, 4, 5])
+    assert hashes
+    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    assert group_ids
+    assert len(group_ids) == len(expanded) == len(offsets)
+    scheduler.register_storage_keys(group_ids, expanded, offsets)

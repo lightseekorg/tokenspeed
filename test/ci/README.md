@@ -78,19 +78,7 @@ same workflow stage; later stages cannot contend with earlier ones.
 managed server and reruns later stages that many extra times after a crash or
 score miss. Use it for infrastructure flakes (CUDA launch failure, NVLink
 barrier timeout, GPU memory-access fault) where a clean second attempt is
-cheap relative to a red PR. The result JSON retains every attempt's score,
-commands, and error under `attempts`; `.ci-artifacts/server-attempt-N.log`
-retains each managed server's log when available. A log archive failure emits
-a warning and preserves the original attempt result and retry behavior.
-Top-level fields still describe the final
-attempt. Readiness probes retry transient connection resets and timeouts until
-the readiness deadline, while a managed server exit still fails immediately.
-
-The Kimi-K2.5 NVIDIA AIME25 and Kimi-K3 AMD AIME26 gates put EvalScope output
-under `.ci-artifacts/evalscope-results`, so uploaded artifacts include per-question
-predictions and scoring details. EvalScope's timestamped directories preserve
-separate evaluation attempts. Compare these outputs when investigating a score
-change before attributing it to sampling, truncation, or answer extraction.
+cheap relative to a red PR.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows
