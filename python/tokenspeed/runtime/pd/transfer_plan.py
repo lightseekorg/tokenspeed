@@ -23,6 +23,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from tokenspeed.runtime.distributed.partition import (
+    target_execution_stage_windows,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    pipeline_cache_ownership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     cache_field_layer_id,
 )
@@ -108,7 +114,7 @@ class CacheTransferPlanner:
 
         Args:
             prefill_layer_window: With prefill chunk-pipeline parallelism, the
-                ``[start, end)`` global layer window whose KV THIS planning
+                ``[start, end)`` cache-layer window whose KV THIS planning
                 context transfers. Fields owned by other pipeline stages are
                 excluded from the route (each stage runs its own planner over
                 its own window, and the union of stages covers the plan).
@@ -373,3 +379,72 @@ class CacheTransferPlanner:
             for prefill_rank in self._fragments_for_decode_rank(decode_tp_rank):
                 decode_ranks[prefill_rank].add(decode_tp_rank)
         return {rank: frozenset(ranks) for rank, ranks in decode_ranks.items()}
+
+
+def build_pipeline_transfer_plan(
+    *,
+    prefill_tp_size: int,
+    decode_tp_size: int,
+    decode_tp_rank: int,
+    prefill_layout: CacheTransferContract,
+    decode_layout: CacheTransferContract,
+    num_target_cache_layers: int,
+    pp_size: int,
+    pp_layer_partition: tuple[int, ...] | None,
+) -> tuple[RankTransferPlan, tuple[int, ...]]:
+    """Plan every Prefill stage's resident fields for one Decode TP rank.
+
+    Args:
+        prefill_tp_size: Attention TP width inside one Prefill stage.
+        decode_tp_size: Attention TP width inside one Decode replica.
+        decode_tp_rank: Receiving TP coordinate inside that replica.
+        prefill_layout: Complete logical source cache contract.
+        decode_layout: Complete destination cache contract.
+        num_target_cache_layers: Recipe-declared target cache-layer count,
+            excluding independent draft cache layers.
+        pp_size: Number of Prefill stages.
+        pp_layer_partition: Explicit target layers per stage, or None.
+
+    Returns:
+        A stage-major source-rank plan and dummy source ranks whose empty
+        registrations still need to join Prefill completion consensus.
+    """
+    cache_layer_extent = (
+        max(
+            cache_field_layer_id(field.field_id) for field in prefill_layout.plan.fields
+        )
+        + 1
+    )
+    # The current PP wire contract covers targets whose execution blocks map
+    # one-to-one to cache layers. The legacy partition counts execution blocks.
+    target_cache_windows = target_execution_stage_windows(
+        num_target_cache_layers, pp_size, pp_layer_partition
+    )
+    owners = pipeline_cache_ownership(
+        num_target_cache_layers,
+        cache_layer_extent - num_target_cache_layers,
+        target_cache_windows,
+    )
+    fragments: dict[int, tuple[CacheTransferFragment, ...]] = {}
+    dummy_ranks: list[int] = []
+    for stage, owner in enumerate(owners):
+        planner = CacheTransferPlanner(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=decode_tp_size,
+            prefill_layout=prefill_layout,
+            decode_layout=decode_layout,
+            prefill_layer_window=(owner.resident_cache_window if pp_size > 1 else None),
+        )
+        stage_plan = planner.plan_for_decode_rank(decode_tp_rank)
+        base = stage * prefill_tp_size
+        for rank, stage_fragments in stage_plan.fragments_by_prefill_rank.items():
+            fragments[base + rank] = stage_fragments
+        if decode_tp_rank == 0:
+            dummy_ranks.extend(
+                base + rank
+                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
+                if not decode_ranks
+            )
+    return RankTransferPlan(fragments_by_prefill_rank=fragments), tuple(
+        sorted(dummy_ranks)
+    )

@@ -77,7 +77,7 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -90,6 +90,14 @@ from tokenspeed.runtime.execution.types import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
 
 
 @dataclass(frozen=True)
@@ -712,13 +720,7 @@ def build_device_side(
     if draft is not None:
         draft.prepare_communication_runtime(max_forward_tokens)
 
-    (
-        attn_backend,
-        token_to_kv_pool,
-        draft_attn_backend,
-        draft_token_to_kv_pool,
-        cache_storage,
-    ) = create_attn_components(
+    attention = create_attn_components(
         server_args,
         model_config,
         gpu_id,
@@ -729,6 +731,8 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
+    token_to_kv_pool = attention.token_to_kv_pool
+    draft_token_to_kv_pool = attention.draft_token_to_kv_pool
 
     cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)
     cache_groups = pool_to_cache_groups(token_to_kv_pool)
@@ -762,9 +766,9 @@ def build_device_side(
         ),
         model_runner=target,
         draft_model_runner=draft,
-        attn_backend=attn_backend,
+        attn_backend=attention.attn_backend,
         token_to_kv_pool=token_to_kv_pool,
-        draft_attn_backend=draft_attn_backend,
+        draft_attn_backend=attention.draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
 
@@ -801,6 +805,8 @@ def build_device_side(
     kv_transfer = _build_kv_transfer(
         server_args,
         executor,
+        layer_ownership=attention.layer_ownership,
+        logical_plan=attention.logical_plan,
         model_config=model_config,
         draft_model_config=draft_model_config,
         gpu_id=gpu_id,
@@ -810,14 +816,18 @@ def build_device_side(
     specs = DeviceSpecs(
         cache_geometry=cache_geometry,
         cache_groups=cache_groups,
-        cache_storage=cache_storage,
+        cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
         spec_num_steps=executor.config.spec_num_steps or 0,
         spec_num_tokens=executor.config.spec_num_tokens or 0,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
-            getattr(executor.drafter, "supports_pd_layerwise_finalization", False)
+            getattr(
+                executor.context_producer or executor.drafter,
+                "supports_pd_layerwise_finalization",
+                False,
+            )
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
@@ -962,6 +972,8 @@ def _build_kv_transfer(
     server_args,
     executor,
     *,
+    layer_ownership: CacheLayerOwnership,
+    logical_plan: CacheMemoryPlan | None,
     model_config,
     draft_model_config,
     gpu_id: int,
@@ -970,9 +982,9 @@ def _build_kv_transfer(
     """Build the PD transfer peer, or None outside disaggregation.
 
     Here rather than in the event loop because everything it needs is either
-    ``server_args`` or the KV pool this function already owns: the topology
-    comes from the mapping, the sync group from the process-group manager,
-    and the peer-facing KV description from the pool's transfer layout.
+    ``server_args`` or the completed attention build: the topology comes from
+    the mapping, the sync group from the process-group manager, and the
+    peer-facing KV description from the pool and explicit cache placement.
     """
     if server_args.disaggregation_mode == "null":
         return None
@@ -988,16 +1000,6 @@ def _build_kv_transfer(
     mapping = server_args.mapping
     topology = PDParallelTopology.from_mapping(mapping)
     topology.require_cache_pd_supported()
-
-    pp_layer_window = None
-    if mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import (
-            pp_layer_window as resolve_pp_layer_window,
-        )
-
-        pp_layer_window = resolve_pp_layer_window(
-            model_config.num_attention_layers, mapping
-        )
 
     # PP: transfer-status consensus must span every stage — all ranks run the
     # same deterministic scheduler and must agree on Bootstrapped/Succeeded
@@ -1025,7 +1027,8 @@ def _build_kv_transfer(
             executor.token_to_kv_pool,
             model_config=model_config,
             draft_model_config=draft_model_config,
-            pp_layer_window=pp_layer_window,
+            layer_ownership=layer_ownership,
+            logical_plan=logical_plan,
         ),
         gloo_group=sync_group,
     )

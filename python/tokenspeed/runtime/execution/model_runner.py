@@ -28,6 +28,7 @@ import torch
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.moe.capacity import resolve_deepep_token_capacity
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -116,6 +117,45 @@ class ModelRunner:
                         "quant config (kv_cache_quant_algo=%s)",
                         kv_algo,
                     )
+
+        if not self.is_draft_worker:
+            token_sliced = server_args.all2all_backend == "deepep" and (
+                getattr(model_config.hf_config, "model_type", None) == "kimi_k3"
+                or getattr(model_config.hf_text_config, "model_type", None)
+                == "kimi_linear"
+            )
+            server_args.low_latency_max_num_tokens_per_gpu = (
+                resolve_deepep_token_capacity(
+                    requested_capacity=server_args.low_latency_max_num_tokens_per_gpu,
+                    max_num_seqs=server_args.max_num_seqs,
+                    attn_dp_size=self.mapping.attn.dp_size,
+                    attn_tp_size=self.mapping.attn.tp_size,
+                    tokens_per_request=(
+                        server_args.speculative_num_draft_tokens
+                        if server_args.speculative_algorithm is not None
+                        else 1
+                    ),
+                    token_sliced=token_sliced,
+                    low_latency_enabled=server_args.deepep_mode != "normal",
+                    max_extend_tokens=(
+                        (
+                            server_args.chunked_prefill_size
+                            if server_args.chunked_prefill_size > 0
+                            else server_args.max_prefill_tokens
+                            + model_config.context_len
+                        )
+                        if server_args.deepep_mode == "low_latency"
+                        else 0
+                    ),
+                )
+            )
+            if token_sliced and server_args.deepep_mode != "normal":
+                logger.info(
+                    "K3 DeepEP low-latency send capacity: %s rows per rank "
+                    "after TP%s token slicing",
+                    server_args.low_latency_max_num_tokens_per_gpu,
+                    self.mapping.attn.tp_size,
+                )
 
         global_server_args_dict_update(server_args)
         initialize_moe_config(server_args)

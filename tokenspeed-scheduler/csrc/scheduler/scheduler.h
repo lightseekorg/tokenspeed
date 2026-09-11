@@ -63,11 +63,19 @@ public:
     // Host L2 prefix indexes were removed.
     bool ClearCache();
 
+    // Lifecycle counters read the current FSM state; they do not schedule work.
+    std::size_t BootstrappingSize() const;
+    // Submitted plus Retracted requests waiting for admission/readmission.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
+    // Includes local/remote prefills and completed prefills awaiting transition.
     std::size_t PrefillSize() const;
+    // RemotePrefilling only: a subset of PrefillSize(), never an extra total.
+    std::size_t RemotePrefillSize() const;
+    // Requests whose pages PD still pins. This resource count overlaps FSM states.
+    std::size_t PdTransferSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit

@@ -9,6 +9,9 @@ set -e
 # Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "${CUDA_VARIANT:-}" = "cu129" ]; then
+    exec python3 "${SCRIPT_DIR}/install_deps_cu129.py"
+fi
 source "${SCRIPT_DIR}/package_cache.sh"
 AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
 

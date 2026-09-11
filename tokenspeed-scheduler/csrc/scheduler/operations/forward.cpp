@@ -113,6 +113,9 @@ struct PrefillReserve {
     // Width of the decode step that follows the completed prompt; 0 on the P
     // role, which never decodes locally.
     std::int32_t decode_input_tokens;
+    // Transient history writes after every prefill chunk, independently of
+    // whether this engine will execute the next target decode.
+    std::int32_t workspace_tokens;
     bool completes_prefill;
     // Rest of the prompt plus escalating decode room, prepaid by a decoding
     // role at first-chunk admission (Request::AdmissionHeadroom); 0 on later
@@ -137,7 +140,8 @@ struct PrefillReserve {
 // round is accountable for, including the prepaid prompt headroom: a
 // partially prefetched request must never be stranded. Sliding-window groups
 // recycle slid-out pages, so the rest of the prompt costs them nothing and
-// they hold only the tail and decode slot. Snapshot-state groups bank one
+// they hold only the tail and decode slot. Both history retentions also
+// cover the transient proposal workspace. Snapshot-state groups bank one
 // growth block (max(block_granularity, tail, decode)) on the admission that
 // finishes shaping them, so the first boundary crossing never needs an empty
 // parent; every other round reserves 0 there.
@@ -149,15 +153,16 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
         return std::max({group.block_granularity, reserve.split_tail_tokens, reserve.decode_input_tokens});
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-        return reserve.TailAndDecodeTokens();
+        return std::max(reserve.TailAndDecodeTokens(), reserve.workspace_tokens);
     }
-    return std::max(reserve.TailAndDecodeTokens(), reserve.prompt_headroom_tokens);
+    return std::max({reserve.TailAndDecodeTokens(), reserve.prompt_headroom_tokens, reserve.workspace_tokens});
 }
 
 void reservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                            const PrefillReserve& reserve) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(reserve.split_tail_tokens >= 0 && reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
+    _assert(reserve.split_tail_tokens >= 0 && reserve.decode_input_tokens >= 0 && reserve.workspace_tokens >= 0 &&
+                reserve.prompt_headroom_tokens >= 0,
             "prefill reserve inputs must be non-negative");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");
@@ -394,6 +399,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const PrefillReserve reserve{
         .split_tail_tokens = split_tail_tokens,
         .decode_input_tokens = decode_input_tokens,
+        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens_this_round + headroom : 0,
         // A remote landing always finishes the shaping; the P role never
@@ -502,6 +508,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const PrefillReserve reserve{
         .split_tail_tokens = checkpoint_tail_reserve,
         .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
+        .workspace_tokens = config_.prefill_workspace_tokens,
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
         // The round that spends a banked tail got its growth block with the

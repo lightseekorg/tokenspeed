@@ -476,6 +476,33 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
 
+Cache-layer counts come from the recipe's existing `CacheSetup.num_target_layers`
+and `num_draft_layers`: target cache layers first, then independent draft cache
+layers. PP construction gives these values explicit `*_cache_layers` local
+names; a drafter that shares target cache contributes no independent cache
+layers. Neither count means captured target taps or draft execution depth.
+
+`distributed/partition.py` owns the pure target execution-window calculation,
+shared by pipeline stages, model construction and PD topology. The model/cache
+construction boundary maps those execution windows to explicit
+`target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
+cache window. Cache ownership consumes cache-ID windows; execution partitioning
+belongs to the distributed layer. Current PP targets K3 and V4 have one cache
+layer per execution block; non-PP ownership covers the complete cache namespace
+without assuming that equality. Resident windows, transfer filtering and
+producer-field groups all use cache-layer IDs.
+The PD wire key `num_target_layers` retains its spelling for compatibility and
+carries the target cache-layer count. Its complete field plan supplies the
+merged cache-ID extent (`max(layer_id) + 1`), not the number of fields.
+
+`create_attn_components` returns a frozen `AttentionBuild` naming the target
+and draft backends and pools, `cache_storage`, `layer_ownership` and
+`logical_plan`. Ownership and transfer geometry travel as explicit construction
+arguments, never as attributes added after arena construction.
+`logical_plan: CacheMemoryPlan | None` holds the complete logical plan only
+when PP narrows the physical arena. Otherwise it is `None`, and PD uses the
+arena's plan. The arena remains the owner of physical allocation.
+
 `CacheRecipe` (`recipes/base.py`) is a template method: `setup()` is the one
 place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,

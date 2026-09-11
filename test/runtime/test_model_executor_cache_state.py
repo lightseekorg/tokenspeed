@@ -128,6 +128,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
+    executor.context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),

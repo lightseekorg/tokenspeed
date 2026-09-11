@@ -36,8 +36,9 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-# The checkpoint ships an embed_tokens copy of the frozen target embedding and
-# a training-only confidence head. Neither is instantiated at serving time.
+# The checkpoint ships a frozen target embedding copy, needed on PP's final
+# stage where the target embedding is remote. Other stages skip it along with
+# the absent LM head and training-only confidence head.
 K3_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("embed_tokens.", "lm_head.", "confidence_head.")
 
 SUPPORTED_MARKOV_HEAD_TYPES = ("vanilla",)
@@ -105,6 +106,8 @@ class KimiK3DSparkConfig(PretrainedConfig):
         self.max_position_embeddings = int(max_position_embeddings)
         self.rope_theta = float(rope_theta)
         self.rope_parameters = rope_parameters
+        # Checkpoint spelling: this counts captured target taps, not target
+        # execution layers or draft blocks. Preserve the serialized key.
         self.num_target_layers = int(num_target_layers)
         self.target_hidden_size = int(target_hidden_size)
         self.target_num_hidden_layers = int(target_num_hidden_layers)
@@ -203,11 +206,12 @@ def validate_k3_dspark_config(config: KimiK3DSparkConfig, target_config=None) ->
         raise ValueError(
             f"K3 DSpark draft needs at least one layer; got {config.num_hidden_layers}."
         )
-    if len(config.target_layer_ids) != config.num_target_layers:
+    num_target_taps = len(config.target_layer_ids)
+    if num_target_taps != config.num_target_layers:
         raise ValueError(
-            f"K3 DSpark target_layer_ids has {len(config.target_layer_ids)} entries "
-            f"but num_target_layers={config.num_target_layers}. context_proj expects "
-            f"exactly num_target_layers x hidden_size inputs."
+            f"K3 DSpark target_layer_ids has {num_target_taps} entries "
+            f"but num_target_layers={config.num_target_layers} declares the tap count. "
+            "context_proj requires one target_hidden_size segment per tap."
         )
     if not config.target_layer_ids:
         raise ValueError("K3 DSpark draft requires a non-empty target_layer_ids.")

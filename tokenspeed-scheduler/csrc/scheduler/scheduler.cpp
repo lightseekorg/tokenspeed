@@ -107,9 +107,11 @@ Scheduler::Scheduler(SchedulerConfig config)
 std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit) const {
     _assert(token_limit >= 0, "single-request token limit must be non-negative");
     const std::int64_t decode_width = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+    const std::int64_t workspace_tokens = config_.prefill_workspace_tokens;
     // An overlapped forward protects one additional decode reservation that
     // cannot yet be reclaimed from the request table.
     const std::int64_t protected_tokens = static_cast<std::int64_t>(config_.overlap_schedule_depth) * decode_width;
+    const std::int64_t prefill_tail_tokens = std::max(decode_width + protected_tokens, workspace_tokens);
     // The largest accepted prompt must still leave the first decode/MTP
     // reservation inside token_limit.
     const std::int64_t max_prompt_tokens =
@@ -157,19 +159,23 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
             const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, block_granularity);
+            std::int64_t pages = ceilDiv(first_prompt + prefill_tail_tokens, block_granularity);
             if (max_prompt_tokens > chunk_tokens) {
                 const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
                 const std::int64_t lookback_pages = coordinator_.GroupBoundaryLookbackPages(i);
-                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, block_granularity));
-                pages = std::max(
-                    pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, block_granularity));
+                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens + workspace_tokens, block_granularity));
+                pages =
+                    std::max(pages, lookback_pages + ceilDiv(later_prompt + prefill_tail_tokens, block_granularity));
             }
             return pages;
         };
         std::int64_t child_pages = 0;
         if (coordinator_.GroupIsPrefixClosed(i)) {
-            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
+            // token_limit already includes the next decode reservation on
+            // decoding roles; a P prompt must additionally fit its workspace.
+            const std::int64_t extra_workspace = std::max(workspace_tokens - decode_width, std::int64_t{0});
+            child_pages =
+                ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens + extra_workspace, block_granularity);
         } else if (config_.role == Role::kD) {
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 // Remote landing: endpoint snapshot + banked growth block.
@@ -372,6 +378,11 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     }
 }
 
+std::size_t Scheduler::BootstrappingSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const auto& request) { return request->template Is<fsm::Bootstrapping>(); }));
+}
+
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& request) {
         return request->template Is<fsm::Submitted>() || request->template Is<fsm::Retracted>();
@@ -388,6 +399,15 @@ std::size_t Scheduler::PrefillSize() const {
         return request->template Is<fsm::Prefilling>() || request->template Is<fsm::RemotePrefilling>() ||
                request->template Is<fsm::PrefillAwaitingResult>() || request->template Is<fsm::PrefillDone>();
     }));
+}
+
+std::size_t Scheduler::RemotePrefillSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const auto& request) { return request->template Is<fsm::RemotePrefilling>(); }));
+}
+
+std::size_t Scheduler::PdTransferSize() const {
+    return pd_transfer_pins_.size();
 }
 
 std::size_t Scheduler::AvailableKvPages() const {

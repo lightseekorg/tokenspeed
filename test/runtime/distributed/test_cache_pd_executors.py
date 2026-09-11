@@ -434,6 +434,9 @@ def test_failed_room_fanout_never_restores_state(
 def test_cache_factory_exposes_only_typed_arena() -> None:
     import torch
 
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        CacheLayerOwnership,
+    )
     from tokenspeed.runtime.pd.factory import get_kv_args
 
     layout = _layout()
@@ -452,6 +455,9 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
         0,
         "mlx5_0",
         pool,
+        draft_model_config=None,
+        layer_ownership=CacheLayerOwnership(2, 0, (0, 2)),
+        logical_plan=None,
         model_config=SimpleNamespace(
             num_attention_layers=2,
             num_key_value_heads=1,
@@ -1120,6 +1126,7 @@ def test_cache_heterogeneous_gqa_route_rendezvous_idle_prefill_ranks() -> None:
     prefill = PrefillParallelInfo(
         tp_size=4,
         dp_size=1,
+        num_target_cache_layers=1,
         cache_layout=prefill_layout,
     )
 

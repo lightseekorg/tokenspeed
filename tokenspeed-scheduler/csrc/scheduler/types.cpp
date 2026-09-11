@@ -63,6 +63,9 @@ void SchedulerConfig::Validate() const {
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }
+    if (prefill_workspace_tokens < 0) {
+        throw std::invalid_argument("Scheduler: prefill_workspace_tokens must be >= 0");
+    }
     if (max_scheduled_tokens <= 0) {
         throw std::invalid_argument("Scheduler: max_scheduled_tokens must be > 0");
     }

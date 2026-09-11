@@ -307,7 +307,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             # PP: this stage transfers only its own layers' fields; the other
             # stages run their own planners over their windows, and the union
             # covers the whole plan on the Decode side.
-            prefill_layer_window=getattr(self.kv_args, "pp_layer_window", None),
+            prefill_layer_window=(
+                self.kv_args.layer_ownership.resident_cache_window
+                if self.topology.pp_size > 1
+                else None
+            ),
         )
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
@@ -1144,6 +1148,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             "world_size": self.topology.world_size,
             "dp_size": self.topology.dp_size,
             "pp_size": self.topology.pp_size,
+            "num_target_layers": self.kv_args.layer_ownership.num_target_cache_layers,
             "pp_layer_partition": (
                 list(pp_layer_partition) if pp_layer_partition else None
             ),

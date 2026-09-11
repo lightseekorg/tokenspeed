@@ -32,6 +32,7 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_qwen4_exp,
 )
+from tokenspeed.runtime.distributed.partition import target_execution_stage_windows
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
@@ -50,6 +51,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    CacheLayerOwnership,
+    pipeline_cache_ownership,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
@@ -70,7 +75,29 @@ _ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+@dataclasses.dataclass(frozen=True)
+class AttentionBuild:
+    """Complete attention resources and cache placement for device assembly.
+
+    ``layer_ownership`` is the same owner used to select resident cache fields.
+    ``logical_plan`` preserves the full PD wire layout when PP narrows the
+    physical arena; it is None when the arena already holds the complete plan.
+    Placement stays in the build result rather than on the allocation owner.
+    """
+
+    attn_backend: AttentionBackend
+    token_to_kv_pool: CachePool
+    draft_attn_backend: AttentionBackend | None
+    draft_token_to_kv_pool: CachePool | None
+    cache_storage: dict
+    layer_ownership: CacheLayerOwnership
+    logical_plan: CacheMemoryPlan | None
 
 
 def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
@@ -663,7 +690,17 @@ def _create_hybrid_linear_attn_backend(
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
-        config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        if server_args.mapping.has_pp:
+            # PP only executes committed prefill state. A KDA backend starts
+            # allocating replay payloads in set_kv_pool, before explicit
+            # workspace preparation, so its verify width must already be one.
+            # Keep the original target/draft configs intact for logical cache
+            # geometry and other backend views.
+            config = dataclasses.replace(config, speculative_num_draft_tokens=1)
+        else:
+            config.speculative_num_draft_tokens = (
+                server_args.speculative_num_draft_tokens
+            )
 
     # The linear component's presence decides whether this model actually
     # has any linear / mamba layers. A draft model on a hybrid-GDN target
@@ -914,22 +951,19 @@ def _prepare_verify_workspace(
 
 
 # ---------- public API ----------
-def _narrow_spec_for_pp(spec: CachePoolSpec, mapping) -> tuple[CachePoolSpec, object]:
+def _narrow_spec_for_pp(
+    spec: CachePoolSpec, ownership: CacheLayerOwnership
+) -> CachePoolSpec:
     """Chunk-pipeline stage: physically allocate only this stage's layers'
     planes. The logical geometry (parents, packing, page math) stays the
-    full model's so every rank's scheduler plans identically; the returned
-    full plan serves the PD wire contract (every stage registers the same
-    logical layout, Decode plans stage windows against it).
+    full model's so every rank's scheduler plans identically. The caller
+    retains the complete plan separately for the PD wire contract.
     """
-    from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
-
-    stage_start, stage_end = pp_layer_window(len(spec.layer_types), mapping)
-    pp_logical_plan = spec.memory_plan
-    spec = dataclasses.replace(
+    stage_start, stage_end = ownership.resident_cache_window
+    return dataclasses.replace(
         spec,
         memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
     )
-    return spec, pp_logical_plan
 
 
 def create_attn_components(
@@ -942,13 +976,8 @@ def create_attn_components(
     draft_model_config: ModelConfig | None = None,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
-) -> tuple[
-    AttentionBackend,
-    CachePool,
-    AttentionBackend | None,
-    CachePool | None,
-    dict | None,
-]:
+) -> AttentionBuild:
+    """Build attention resources and return their explicit cache placement."""
     target = _resolve_attn_side(model_config, server_args.attention_backend)
     draft = (
         _resolve_attn_side(draft_model_config, server_args.drafter_attention_backend)
@@ -1016,18 +1045,36 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     spec = cache_setup.spec
+    num_target_cache_layers = cache_setup.num_target_layers
+    num_draft_cache_layers = cache_setup.num_draft_layers
+    if server_args.mapping.has_pp:
+        # K3 and V4, the supported PP targets, have one cache layer per
+        # execution block. Map their execution windows to the identical cache
+        # IDs here; cache ownership itself does not partition execution blocks.
+        target_cache_windows = target_execution_stage_windows(
+            model_config.num_hidden_layers,
+            server_args.mapping.pp_size,
+            server_args.mapping.pp_layer_partition,
+        )
+    else:
+        target_cache_windows = [(0, num_target_cache_layers)]
+    layer_ownership = pipeline_cache_ownership(
+        num_target_cache_layers,
+        num_draft_cache_layers,
+        target_cache_windows,
+    )[server_args.mapping.pp_rank]
     target_spec = spec
     draft_view_spec = None
-    if cache_setup.num_draft_layers:
+    if num_draft_cache_layers:
         # Transfer fields need one owner even when target and draft share a
         # cache family, so both compute views use disjoint layer windows.
         target_spec = spec.layer_view(
             first_layer=0,
-            num_layers=cache_setup.num_target_layers,
+            num_layers=num_target_cache_layers,
         )
         draft_view_spec = spec.layer_view(
-            first_layer=cache_setup.num_target_layers,
-            num_layers=cache_setup.num_draft_layers,
+            first_layer=num_target_cache_layers,
+            num_layers=num_draft_cache_layers,
             family=heterogeneous_draft_family,
         )
     prefix_granularity = spec.memory_plan.prefix_granularity
@@ -1050,7 +1097,7 @@ def create_attn_components(
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
         len(spec.layer_types),
-        cache_setup.num_draft_layers,
+        num_draft_cache_layers,
         {
             group.group_id: group.cache_blocks_per_lcm_block
             for group in spec.memory_plan.groups
@@ -1059,17 +1106,20 @@ def create_attn_components(
 
     # One model, one arena: the merged plan's single allocation, which every
     # compute view below (target, draft) is a layer window onto.
-    pp_logical_plan = None
+    logical_plan = None
     if server_args.mapping.has_pp:
-        spec, pp_logical_plan = _narrow_spec_for_pp(spec, server_args.mapping)
-        target_spec = spec
+        logical_plan = spec.memory_plan
+        spec = _narrow_spec_for_pp(spec, layer_ownership)
+        target_spec = dataclasses.replace(target_spec, memory_plan=spec.memory_plan)
+        if draft_view_spec is not None:
+            draft_view_spec = dataclasses.replace(
+                draft_view_spec, memory_plan=spec.memory_plan
+            )
     arena = create_cache_arena(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
     )
-    if pp_logical_plan is not None:
-        arena.pp_logical_plan = pp_logical_plan
     backend, pool = _create_target_components(
         server_args=server_args,
         model_config=model_config,
@@ -1085,10 +1135,14 @@ def create_attn_components(
     draft_attn_backend, draft_pool = _create_draft_components(
         server_args=server_args,
         model_config=draft_model_config,
-        config=draft_attn_config,
+        config=(
+            draft_attn_config
+            if not server_args.mapping.has_pp or layer_ownership.owns_draft_cache
+            else None
+        ),
         pool=pool,
         cache_spec=draft_view_spec,
-        num_target_layers=cache_setup.num_target_layers,
+        num_target_layers=num_target_cache_layers,
         full_attn_backend_name=draft_full_attn_backend_name,
         is_heterogeneous=heterogeneous_draft_family is not None,
         is_hybrid_linear=draft is not None and draft.is_hybrid_linear,
@@ -1121,10 +1175,12 @@ def create_attn_components(
         fixed_workspace_bytes=fixed_workspace_bytes,
     )
 
-    return (
-        backend,
-        pool,
-        draft_attn_backend,
-        draft_pool,
-        cache_storage,
+    return AttentionBuild(
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        draft_attn_backend=draft_attn_backend,
+        draft_token_to_kv_pool=draft_pool,
+        cache_storage=cache_storage,
+        layer_ownership=layer_ownership,
+        logical_plan=logical_plan,
     )
