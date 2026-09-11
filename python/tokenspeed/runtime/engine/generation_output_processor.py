@@ -606,7 +606,7 @@ class OutputProcesser:
             self.metrics.record_spec_decode_step(
                 num_decode_slots=num_slots,
                 accepted_draft_tokens=accepted_draft_tokens,
-                draft_width=self.spec_num_tokens,
+                draft_width=self.spec_num_tokens - 1,
             )
 
     def add_cached_tokens(self, rids: list[str], extend_prefix_lens: list[int]) -> None:

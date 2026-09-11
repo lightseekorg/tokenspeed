@@ -307,7 +307,8 @@ class OutputProcessor:
                     meta_info["spec_verify_ct"] = verify_ct
                     accepted = getattr(recv_obj, "spec_accepted_tokens", None)
                     if accepted and i < len(accepted):
-                        width = self.engine.server_args.speculative_num_draft_tokens
+                        # Slot 0 of each verify window is the already-accepted root.
+                        width = self.engine.server_args.speculative_num_draft_tokens - 1
                         meta_info["spec_accepted_tokens"] = accepted[i]
                         meta_info["spec_draft_tokens"] = verify_ct * width
                 state.finished_time = time.time()
