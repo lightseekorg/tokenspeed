@@ -46,7 +46,10 @@ result = harness.run(
                 "rtol": 0.015,
             },
         },
+        solution=None,
         registration="gluon_bmm_a16w16_gfx950",
+        seed=42,
+        definition_version=1,
     )
 )
 ```

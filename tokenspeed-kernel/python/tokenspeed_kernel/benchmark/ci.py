@@ -327,10 +327,8 @@ def run_suite(
     suite: BenchmarkSuite,
     revision: str,
     *,
-    harness_factory: Callable[[GraphBenchmarkConfig], KernelBenchmarkHarness] = (
-        KernelBenchmarkHarness
-    ),
-    environment_provider: Callable[[], dict[str, Any]] = _collect_environment,
+    harness_factory: Callable[[GraphBenchmarkConfig], KernelBenchmarkHarness],
+    environment_provider: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
     """Run a validated suite and return its coordinator-facing envelope."""
 
@@ -462,7 +460,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         suite = load_suite(args.suite)
-        payload = run_suite(suite, args.revision)
+        payload = run_suite(
+            suite,
+            args.revision,
+            harness_factory=KernelBenchmarkHarness,
+            environment_provider=_collect_environment,
+        )
         _write_output(payload, args.output)
     except (OSError, SuiteConfigError) as error:
         parser.exit(2, f"error: {error}\n")

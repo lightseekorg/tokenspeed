@@ -410,7 +410,19 @@ def test_main_writes_successful_run_document(tmp_path, monkeypatch):
     suite_path = _write_suite(tmp_path, _suite_payload())
     output_path = tmp_path / "output" / "result.json"
     expected = {"schema_version": 1, "cases": []}
-    monkeypatch.setattr(benchmark_ci, "run_suite", lambda _suite, _revision: expected)
+
+    def fake_run_suite(
+        _suite,
+        _revision,
+        *,
+        harness_factory,
+        environment_provider,
+    ):
+        assert harness_factory is benchmark_ci.KernelBenchmarkHarness
+        assert environment_provider is benchmark_ci._collect_environment
+        return expected
+
+    monkeypatch.setattr(benchmark_ci, "run_suite", fake_run_suite)
 
     exit_code = main(
         [
