@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _fused_norm_rope_stacked_scatter,
     _get_kv_buffer_ptrs,
+    forget_kv_buffer_ptrs,
 )
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -630,6 +631,13 @@ class DFlash(BaseDrafter):
                 target_cache_locs,
                 self.token_to_kv_pool,
             )
+
+    def set_cache_pool(self, token_to_kv_pool) -> None:
+        """The stacked KV views and their raw pointers name the old arena."""
+        super().set_cache_pool(token_to_kv_pool)
+        # Keyed on layer 0, which the replacement arena may be handed again.
+        forget_kv_buffer_ptrs()
+        self._init_fused_kv_helper()
 
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache at construction."""

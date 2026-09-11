@@ -626,6 +626,26 @@ class DeviceHandle:
         return self._thread.run(_apply_update)
 
 
+def _can_probe_cudagraph_memory(server_args, model_config) -> bool:
+    """Whether this boot can use a probe, which is not the same as wanting one.
+
+    ``enforce_eager`` captures nothing to measure. A family that stages
+    speculative verify scratch in the bound pool needs a row per request at
+    the serving concurrency, which a probe arena can only supply by growing
+    to serving size -- measured at 31 GiB for Kimi-K3 at ``--max-num-seqs
+    256``, for four captures it then throws away.
+    """
+    from tokenspeed.runtime.layers.attention.registry import (
+        cudagraph_probe_supported,
+    )
+
+    return (
+        not server_args.disable_cudagraph_memory_reserve
+        and not server_args.enforce_eager
+        and cudagraph_probe_supported(server_args, model_config)
+    )
+
+
 def build_device_side(
     *,
     server_args,
@@ -682,11 +702,16 @@ def build_device_side(
         pool_to_cache_groups,
         scheduler_cache_geometry_from_pool,
     )
+    from tokenspeed.runtime.execution.cudagraph_memory import (
+        probe_arena_parent_blocks,
+        reserve_and_rebind,
+    )
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         create_model_executor,
         create_model_runner,
     )
+    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -707,27 +732,52 @@ def build_device_side(
     max_forward_tokens = max(
         max_forward_tokens,
         max_batch_size * decode_input_tokens,
+        # The bucket ladder is clamped by the chunk only when the chunk is set.
+        server_args.prefill_graph_max_tokens or 0,
     )
     target.prepare_communication_runtime(max_forward_tokens)
     if draft is not None:
         draft.prepare_communication_runtime(max_forward_tokens)
 
+    def build_components(
+        *,
+        graph_reserve_bytes: int,
+        num_lcm_blocks_override: int | None,
+        reuse_backends: tuple[object, object | None] | None,
+    ):
+        return create_attn_components(
+            server_args,
+            model_config,
+            gpu_id,
+            global_rank,
+            min_per_gpu_mem,
+            server_args.enable_memory_saver,
+            draft_model_config,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+            graph_reserve_bytes=graph_reserve_bytes,
+            num_lcm_blocks_override=num_lcm_blocks_override,
+            reuse_backends=reuse_backends,
+        )
+
+    probing = _can_probe_cudagraph_memory(server_args, model_config)
     (
         attn_backend,
         token_to_kv_pool,
         draft_attn_backend,
         draft_token_to_kv_pool,
         cache_storage,
-    ) = create_attn_components(
-        server_args,
-        model_config,
-        gpu_id,
-        global_rank,
-        min_per_gpu_mem,
-        server_args.enable_memory_saver,
-        draft_model_config,
-        decode_input_tokens=decode_input_tokens,
-        overlap_schedule_depth=overlap_schedule_depth,
+    ) = build_components(
+        graph_reserve_bytes=0,
+        num_lcm_blocks_override=(
+            probe_arena_parent_blocks(
+                max_forward_tokens=max_forward_tokens,
+                context_len=model_config.context_len,
+            )
+            if probing
+            else None
+        ),
+        reuse_backends=None,
     )
 
     cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)
@@ -767,7 +817,20 @@ def build_device_side(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
-    executor.capture_graphs()
+    if probing:
+        (
+            attn_backend,
+            token_to_kv_pool,
+            draft_attn_backend,
+            draft_token_to_kv_pool,
+            cache_storage,
+        ) = reserve_and_rebind(executor, build_components, server_args, gpu_id)
+        cache_geometry = scheduler_cache_geometry_from_pool(token_to_kv_pool)
+        cache_groups = pool_to_cache_groups(token_to_kv_pool)
+
+    # Once per process, against the arena that serves and will be captured.
+    executor.autotune()
+    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
 

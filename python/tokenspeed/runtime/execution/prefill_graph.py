@@ -45,7 +45,7 @@ finished with the model's eager logits tail.
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -60,6 +60,9 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+)
+from tokenspeed.runtime.execution.memory_delta import (
+    MemoryDeltaObserver,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -88,6 +91,17 @@ PREFILL_BUCKET_STEP_DIVISOR: int = 8
 
 # Absolute rung-spacing cap, bounding the worst case at the top of the ladder.
 PREFILL_BUCKET_MAX_STEP: int = 512
+
+
+def dummy_batch_size(num_tokens: int, context_len: int) -> int:
+    """Rows a fabricated extend of ``num_tokens`` splits into.
+
+    ``make_dummy_batch`` splits the tokens into requests of at most the logical
+    context length, and ``_dummy_group_tables`` gives row ``i`` block ``i + 1``,
+    so this is also the parent count a capture-time arena has to hold.
+    """
+    max_req_tokens = max(1, int(context_len))
+    return max(1, -(-int(num_tokens) // max_req_tokens))
 
 
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
@@ -272,11 +286,19 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
+    def capture(
+        self,
+        decode_wrapper: ForwardStepRunner | None = None,
+        *,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
-        not stored). Buckets share
+        not stored); ``entries`` captures only the largest few buckets and
+        ``observer`` measures each one, for a caller that measures a sample
+        rather than serving from it. Buckets share
         one PRIVATE mempool (first capture
         allocates it), so graph memory stays ~the largest bucket's peak --
         but never the decode graphs' pool: eager ops cache raw pointers to
@@ -311,11 +333,16 @@ class PrefillGraph:
             // max(int(self.config.data_parallel_size), 1),
         )
         with maybe_inference_mode():
-            self._capture_all_buckets(decode_wrapper)
+            self._capture_all_buckets(decode_wrapper, entries, observer)
 
-    def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
+    def _capture_all_buckets(
+        self,
+        decode_wrapper: ForwardStepRunner | None,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ) -> None:
         rank = self.config.global_rank
-        buckets = sorted(self.capture_buckets, reverse=True)
+        buckets = sorted(self.capture_buckets, reverse=True)[:entries]
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
         for bucket in capture_range:
             if rank == 0:
@@ -333,7 +360,9 @@ class PrefillGraph:
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
             try:
                 with active_forward(self._ctx):
-                    self._capture_bucket(bucket, decode_wrapper)
+                    self._capture_bucket(
+                        bucket, decode_wrapper, observer.measure("prefill")
+                    )
             finally:
                 self._ctx = None
         if self.config.global_rank == 0:
@@ -345,16 +374,41 @@ class PrefillGraph:
                 sample.num_segments if sample is not None else 0,
             )
 
+    @property
+    def capture_entries(self) -> dict[str, int]:
+        """Graphs a full capture records: one per token bucket, one series."""
+        return {} if self.disable else {"prefill": len(self.capture_buckets)}
+
+    def release_graphs(self) -> None:
+        """Drop the captured buckets and the private pool they share.
+
+        The captures recorded the bound cache pool's buffers, so a caller that
+        rebinds releases here first; the next capture allocates a fresh pool.
+        """
+        self._captures.clear()
+        self._outputs.clear()
+        self._pool = None
+        self._input_embeds_buf = None
+        self._captured_hidden_mode = None
+
     def _capture_bucket(
-        self, bucket: int, decode_wrapper: ForwardStepRunner | None
+        self,
+        bucket: int,
+        decode_wrapper: ForwardStepRunner | None,
+        observer: AbstractContextManager[None] = nullcontext(),
     ) -> None:
-        """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
+        """Warm up and capture the breakable graph for ``bucket`` from the buffers.
+
+        ``observer`` wraps the capture alone: the warmups above it are eager
+        forwards whose allocations either survive to the memory profile, which
+        already counts them, or are handed back by its empty_cache.
+        """
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
         torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
-        with cap:
+        with observer, cap:
             self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
@@ -465,7 +519,7 @@ class PrefillGraph:
         for ``physical_context_len``, and a longer fabricated request indexes
         past them. It does not bound the request-indexed buffers, which are
         sized ``max_num_seqs // dp``: a bucket above ``context_len * max_bs``
-        overflows them and kills the boot (pre-existing; ``_autotune`` clamps
+        overflows them and kills the boot (pre-existing; ``autotune`` clamps
         its token count for exactly that reason, the bucket ladder does not). A real forward carries more than ``context_len`` tokens only as
         a multi-request batch, never as one sequence.
 
@@ -481,7 +535,7 @@ class PrefillGraph:
         # the rope tables; per-request structures are sized for the (larger)
         # physical extent, so this remains in bounds.
         max_req_tokens = max(1, int(self.config.context_len))
-        bs = max(1, -(-num_tokens // max_req_tokens))
+        bs = dummy_batch_size(num_tokens, max_req_tokens)
         seq_lens = [max_req_tokens] * (bs - 1) + [
             num_tokens - max_req_tokens * (bs - 1)
         ]

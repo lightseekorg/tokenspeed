@@ -74,6 +74,10 @@ class BaseDrafter:
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size
 
+    def set_cache_pool(self, token_to_kv_pool) -> None:
+        """Take a replacement pool; a drafter that caches views rebuilds them."""
+        self.token_to_kv_pool = token_to_kv_pool
+
     def wire_target(self, target_model: torch.nn.Module) -> None:
         """Wire this drafter to the loaded target model.
 

@@ -317,6 +317,7 @@ class ServerArgs:
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
+    disable_cudagraph_memory_reserve: bool = False
     enable_custom_logit_processor: bool = False
     mla_disable_ragged: bool = False
     warmups: str | None = None
@@ -1991,6 +1992,11 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--disable-cudagraph-memory-reserve",
+            action="store_true",
+            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
         )
         parser.add_argument(
             "--enable-custom-logit-processor",

@@ -39,11 +39,15 @@ import triton.language as tl
 
 # ---------------------------------------------------------------------------
 # Module-level cache for per-layer buffer pointer tensors.
-# KV pool buffers are allocated once and never reallocated, so data_ptr()
-# stays valid for the entire server lifetime.
+# Keyed on layer 0 and read per forward: a pool that moves invalidates it.
 # ---------------------------------------------------------------------------
 
 _cached_kv_ptrs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def forget_kv_buffer_ptrs() -> None:
+    """Drop the cached pointer tensors; the pool they name has been replaced."""
+    _cached_kv_ptrs.clear()
 
 
 def _get_kv_buffer_ptrs(

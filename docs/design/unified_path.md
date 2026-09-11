@@ -116,6 +116,18 @@ from one first bound to that pool:
   global workspace pool the executor froze before capturing, rebinds the
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
+* The KV budget reserves what the graphs will cost: a probe binds the
+  smallest arena the family can run on, captures the largest few entries of
+  each ladder with a driver-memory delta around each capture, extrapolates
+  the rest at the mean of the floored marginals (bounded by what was
+  measured), and reduces the result across ranks with MAX. The orchestrator
+  releases the probe's graphs and collects the cycles they sit in before it
+  profiles memory again, and the budget leaves the utilization headroom
+  *plus* the projection unallocated -- taking the larger of the two was
+  measured wrong, because the headroom funds activations and fragmentation
+  rather than graph pools. Not covered: the buffers capture allocates around
+  the measured regions, and the probe's own arena, which is still referenced
+  when the profile runs.
 
 ### Padding contract
 
