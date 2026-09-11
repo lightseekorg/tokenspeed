@@ -840,6 +840,15 @@ def triton_cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _count_live_workgroups(
+    *, cu_seqlens_cpu: list[int], n_heads: int, block_m: int
+) -> int:
+    return n_heads * sum(
+        triton_cdiv(seq_end - seq_start, block_m)
+        for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
+    )
+
+
 def gluon_mha_prefill_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -898,7 +907,11 @@ def gluon_mha_prefill_gfx1250(
         block_m=config.block_m,
         max_seqlen=config.max_seqlen,
         window_left=config.window_left,
-        workgroups=math.prod(config.grid),
+        workgroups=_count_live_workgroups(
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            n_heads=config.n_heads,
+            block_m=config.block_m,
+        ),
     )
 
     _mha_prefill_gfx1250[config.grid](

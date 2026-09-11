@@ -184,6 +184,33 @@ def test_select_reverse_q_blocks():
         assert not prefill._select_reverse_q_blocks(**(kwargs | override))
 
 
+def test_mha_prefill_reverse_counts_live_ragged_workgroups():
+    device, dtype = "cuda", torch.bfloat16
+    seqlens = [4096] + [1] * 31
+    n_q_heads, n_kv_heads, head_dim = 1, 1, 64
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    assert len(seqlens) * n_q_heads * prefill.triton_cdiv(max_seqlen, 256) == 512
+
+    original_order = prefill._select_reverse_q_blocks
+    observed_workgroups = []
+
+    def capture_workgroups(**kwargs):
+        observed_workgroups.append(kwargs["workgroups"])
+        return False
+
+    prefill._select_reverse_q_blocks = capture_workgroups
+    try:
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill._select_reverse_q_blocks = original_order
+
+    assert observed_workgroups == [47]
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+
+
 def test_mha_prefill_tdm_warp_hint_remainder():
     device, dtype = "cuda", torch.bfloat16
     n_q_heads, n_kv_heads, head_dim = 8, 2, 128
