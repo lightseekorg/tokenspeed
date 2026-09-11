@@ -60,6 +60,7 @@ class AttentionConfig:
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    TDM_WARP_HINT: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -88,6 +89,7 @@ class AttentionConfig:
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        TDM_WARP_HINT,
         q_strides,
         k_strides,
         v_strides,
@@ -133,6 +135,7 @@ class AttentionConfig:
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -318,14 +321,22 @@ class AttentionProgram:
 
     @gluon.jit
     def tdm_load_global_to_shared_k(self, kv_start, buffer_index):
+        warp_used_hint: gl.constexpr = 0x0F if self.cfg.TDM_WARP_HINT else None
         cdna5.tdm.async_load(
-            self.k_desc, [kv_start, 0], self.k_buffer.index(buffer_index)
+            self.k_desc,
+            [kv_start, 0],
+            self.k_buffer.index(buffer_index),
+            warp_used_hint=warp_used_hint,
         )
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, kv_start, buffer_index):
+        warp_used_hint: gl.constexpr = 0x0F if self.cfg.TDM_WARP_HINT else None
         cdna5.tdm.async_load(
-            self.v_desc, [kv_start, 0], self.v_buffer.index(buffer_index)
+            self.v_desc,
+            [kv_start, 0],
+            self.v_buffer.index(buffer_index),
+            warp_used_hint=warp_used_hint,
         )
 
     @gluon.jit
@@ -646,6 +657,7 @@ def _mha_prefill_gfx1250(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    TDM_WARP_HINT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -662,6 +674,7 @@ def _mha_prefill_gfx1250(
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        TDM_WARP_HINT,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -712,6 +725,29 @@ def _select_llvm_fn_attrs(*, head_dim: int, max_seqlen: int, window_left: int) -
     """
     use_max_ilp = head_dim == 128 and max_seqlen >= 512 and window_left < 0
     return "amdgpu-sched-strategy=max-ilp" if use_max_ilp else ""
+
+
+def _select_tdm_warp_hint(
+    *,
+    block_m: int,
+    block_n: int,
+    num_warps: int,
+    window_left: int,
+    workgroups: int,
+) -> bool:
+    """Use four TDM producer warps for the fully occupied eight-warp tile.
+
+    Without the hint all eight warps participate in each descriptor load.
+    Sliding-window and underfilled launches do not amortize this specialization
+    and retain the original all-warp behavior.
+    """
+    return (
+        block_m == 256
+        and block_n == 64
+        and num_warps == 8
+        and window_left < 0
+        and workgroups >= _GFX1250_NUM_CUS
+    )
 
 
 def _select_m_tile(
@@ -833,6 +869,13 @@ def gluon_mha_prefill_gfx1250(
     )
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
+    tdm_warp_hint = _select_tdm_warp_hint(
+        block_m=config.block_m,
+        block_n=config.block_n,
+        num_warps=config.num_warps,
+        window_left=config.window_left,
+        workgroups=math.prod(config.grid),
+    )
 
     _mha_prefill_gfx1250[config.grid](
         q,
@@ -861,6 +904,7 @@ def gluon_mha_prefill_gfx1250(
         sinks is not None,
         return_lse,
         config.window_left,
+        tdm_warp_hint,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,

@@ -337,6 +337,28 @@ def shell_array(name: str, values: list[str]) -> str:
     return f"{name}=(\n{body}\n)"
 
 
+def harden_bootstrap(script: str) -> str:
+    """Update only the download step in a retained Slurm script."""
+    original = (
+        "python3 -m pip install --no-cache-dir "
+        '--target=/tmp/tokenspeed-ci-python "PyYAML>=6,<7"; '
+    )
+    # No single quotes: this text is inside a shlex-quoted bash command.
+    hardened = (
+        "for pip_attempt in 1 2 3; do "
+        "python3 -m pip install --timeout 120 --progress-bar off "
+        '--target=/tmp/tokenspeed-ci-python "PyYAML>=6,<7" && break; '
+        'echo "PyYAML install failed ($pip_attempt/3)" >&2; '
+        '[ "$pip_attempt" = 3 ] && exit 1; sleep 10; done; '
+    )
+    if original not in script and hardened not in script:
+        print(
+            "Unrecognized PyYAML bootstrap; retained script left unchanged.",
+            file=sys.stderr,
+        )
+    return script.replace(original, hardened)
+
+
 def render_script(
     task: Task,
     source: Path,
