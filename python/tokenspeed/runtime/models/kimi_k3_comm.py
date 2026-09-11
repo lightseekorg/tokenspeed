@@ -80,7 +80,9 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-# The one-shot window for a 7168 hidden at TP8; wider batches keep the vendor AR.
+# Upper bound only: every shape measured -- single-stream decode, eight
+# concurrent streams, DSpark verify -- reaches this reduce with the prefix
+# already consumed above one token, so the vendor AR serves everything wider.
 ATTN_AR_MAX_TOKENS = 8
 
 
