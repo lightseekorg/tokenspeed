@@ -104,9 +104,6 @@ class BaseCausalLM(nn.Module):
             return self.model.embed_tokens
 
         if self.mapping.attn.has_dp:
-            # A TP1 ParallelLMHead is replicated while retaining the LM-head
-            # quantization policy; global model quantization does not imply
-            # that an unquantized checkpoint head has quantization scales.
             return ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
