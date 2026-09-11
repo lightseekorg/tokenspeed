@@ -382,6 +382,7 @@ class PrefillGraph:
             positions,
             self._ctx,
             input_embeds=self._input_embeds_buf[:num_tokens],
+            **ib.ngram_model_kwargs(num_tokens),
         )
 
     def _land_input_embeds(self, embeds: torch.Tensor, bucket: int) -> None:

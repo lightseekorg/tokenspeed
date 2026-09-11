@@ -28,17 +28,28 @@ nothing else is spawned here — an external frontend such as ``smg serve
 this engine dials in at ``tcp://{--data-parallel-address}:
 {--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
 mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
-``launch_scheduler_headless``)."""
+``launch_scheduler_headless``).
+
+V4.1's default gateway template supports text chat only. Set
+``chat_template_kwargs.enable_thinking`` to true for thinking, with
+``reasoning_effort`` in 1-100 or low/high/max (50/75/100). Effort alone does not
+turn thinking on. Tools, media, and thinking/thinking_mode aliases are rejected;
+SMG's response parser tracks the canonical enable_thinking toggle. An explicit
+``--chat-template`` remains an operator override.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 from tokenspeed_kernel.platform import current_platform
@@ -65,6 +76,7 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+DEEPSEEK_V41_REASONING_PARSER = "deepseek_v31"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
@@ -89,6 +101,93 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-retries",
     "--disable-load-monitoring",
 )
+
+
+# Bundled here so wheels need no external asset/package-data lookup. SMG renders
+# this with MiniJinja; parity against encoding/encoding.py is tested through HTTP.
+# Phase 1 deliberately rejects tools/media instead of using V4's DSML format.
+# The explicit enable_thinking=false assignment also tells SMG's toggle detector
+# that requests without a thinking override start in chat, not reasoning.
+# SMG tracks one toggle key: accept enable_thinking only, including for parsing.
+_DEEPSEEK_V41_CHAT_TEMPLATE = r"""
+{%- if tools -%}
+    {{- raise_exception('DeepSeek V4.1 gateway supports text chat only; tools are not supported.') -}}
+{%- endif -%}
+{%- if enable_thinking is not defined -%}
+    {%- set enable_thinking = false -%}
+{%- endif -%}
+{%- if (thinking | default(none)) is not none or (thinking_mode | default(none)) is not none -%}
+    {{- raise_exception('DeepSeek V4.1 gateway requires chat_template_kwargs.enable_thinking; thinking/thinking_mode aliases are not supported by SMG.') -}}
+{%- endif -%}
+{%- if enable_thinking is not boolean -%}
+    {{- raise_exception('DeepSeek V4.1 enable_thinking must be a boolean.') -}}
+{%- endif -%}
+{%- set use_thinking = enable_thinking -%}
+
+{%- set drop = drop_thinking | default(true) -%}
+{%- set effort = reasoning_effort | default(none) -%}
+{%- if effort is none -%}{%- set effort = 'high' -%}{%- endif -%}
+{%- if effort is string and effort in ['low', 'high', 'max'] -%}
+    {%- set effort = {'low': 50, 'high': 75, 'max': 100}[effort] -%}
+{%- elif effort is not integer or effort is boolean or effort < 1 or effort > 100 -%}
+    {{- raise_exception('DeepSeek V4.1 reasoning_effort must be an integer 1-100 or low/high/max.') -}}
+{%- endif -%}
+{%- macro text(content) -%}
+    {%- if content is string -%}
+        {%- if '<｜deepseek_image｜>' in content -%}
+            {{- raise_exception('DeepSeek V4.1 gateway supports text chat only; media is not supported.') -}}
+        {%- endif -%}
+        {{- content -}}
+    {%- elif content is not none -%}
+        {%- if content is not sequence or content is mapping -%}
+            {{- raise_exception('DeepSeek V4.1 content must be text or text blocks.') -}}
+        {%- endif -%}
+        {%- for block in content -%}
+            {%- if block.type != 'text' or block.text is not string -%}
+                {{- raise_exception('DeepSeek V4.1 gateway supports text chat only; media is not supported.') -}}
+            {%- endif -%}
+            {%- if not loop.first -%}{{- '\n\n' -}}{%- endif -%}
+            {{- text(block.text) -}}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+    {%- if message.role == 'user' or (message.role == 'system' and not loop.first) -%}
+        {%- set ns.last_user = loop.index0 -%}
+    {%- endif -%}
+    {%- if message.role not in ['system', 'user', 'assistant'] or message.tool_calls or message.tools -%}
+        {{- raise_exception('DeepSeek V4.1 gateway supports system/user/assistant text chat only; tools are not supported.') -}}
+    {%- endif -%}
+    {%- if message.task or message.response_format or message.content_blocks -%}
+        {{- raise_exception('DeepSeek V4.1 gateway does not support task/response_format/content_blocks message fields; use text content.') -}}
+    {%- endif -%}
+{%- endfor -%}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- for message in messages -%}
+    {%- if loop.first -%}
+        {%- if use_thinking or message.role == 'system' -%}{{- '<｜System｜>' -}}{%- endif -%}
+        {%- if use_thinking -%}
+            {{- 'Reasoning Effort: ' ~ effort ~ ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -}}
+        {%- endif -%}
+    {%- endif -%}
+    {%- if message.role == 'system' -%}
+        {%- if not loop.first -%}{{- '<｜System｜>' -}}{%- endif -%}
+    {%- elif message.role == 'user' -%}
+        {{- '\n\n' if not loop.first and messages[loop.index0 - 1].role == 'user' else '<｜User｜>' -}}
+    {%- elif use_thinking and (not drop or loop.index0 > ns.last_user) -%}
+        {{- text(message.reasoning_content | default(none)) ~ '</think>' -}}
+    {%- endif -%}
+    {{- text(message.content | default(none)) -}}
+    {%- if message.role == 'assistant' and not message.wo_eos -%}
+        {{- '<｜end▁of▁sentence｜>' -}}
+    {%- endif -%}
+    {%- if (message.role == 'user' or (message.role == 'system' and not loop.first)) and (loop.last or messages[loop.index0 + 1].role == 'assistant') -%}
+        {{- '<｜Assistant｜>' -}}
+        {{- '<think>' if use_thinking and (not drop or loop.index0 >= ns.last_user) else '</think>' -}}
+    {%- endif -%}
+{%- endfor -%}
+"""
 
 
 def _set_default_grpc_max_message_bytes() -> None:
@@ -343,8 +442,22 @@ def _load_model_config(model_id: str | None) -> dict:
     return config if isinstance(config, dict) else {}
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
+def _is_deepseek_v41_model(model_id: str | None) -> bool:
     if not model_id:
+        return False
+    config = _load_model_config(model_id)
+    if config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"} or (
+        "DeepseekV41ForCausalLM" in (config.get("architectures") or [])
+    ):
+        return True
+    return (
+        re.search(r"deepseek[-_]?v4[._-]?1(?:[-_/]|$)", model_id, re.IGNORECASE)
+        is not None
+    )
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id or _is_deepseek_v41_model(model_id):
         return False
     normalized = model_id.lower().replace("_", "-")
     if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
@@ -418,7 +531,24 @@ def _args_with_default_model_parsers(
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v4_model(model_id):
+    if _is_deepseek_v41_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V41_REASONING_PARSER])
+        tool_parser = _get_from_args(gateway_result, "--tool-call-parser", None)
+        if tool_parser not in (None, "passthrough"):
+            raise ValueError(
+                "DeepSeek V4.1 gateway supports text chat only; tool calling is not "
+                "supported by the installed SMG integration. The V4 DSML parser "
+                "is incompatible with V4.1. Use --tool-call-parser passthrough."
+            )
+        if tool_parser is None:
+            gateway_result.extend(["--tool-call-parser", "passthrough"])
+
+    elif _is_deepseek_v4_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -832,15 +962,32 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
         model_id = _get_from_args(gateway_args, "--model")
         if model_id is not None:
             _prewarm_hf_tokenizer(model_id)
-        rc = asyncio.run(
-            run_smg(
-                engine_args=engine_args,
-                gateway_args=gateway_args,
-                opts=split.opts,
-                user_host=user_host,
-                user_port=user_port,
+        with contextlib.ExitStack() as stack:
+            if (
+                _is_deepseek_v41_model(
+                    model_id or _get_from_args(engine_args, "--model", None)
+                )
+                and "--chat-template" not in gateway_args
+            ):
+                # SMG consumes a template file, not the Python HF wrapper. Keep
+                # the bundled text template alive through registration/reloads.
+                template = stack.enter_context(
+                    tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", suffix=".jinja"
+                    )
+                )
+                template.write(_DEEPSEEK_V41_CHAT_TEMPLATE)
+                template.flush()
+                gateway_args = [*gateway_args, "--chat-template", template.name]
+            rc = asyncio.run(
+                run_smg(
+                    engine_args=engine_args,
+                    gateway_args=gateway_args,
+                    opts=split.opts,
+                    user_host=user_host,
+                    user_port=user_port,
+                )
             )
-        )
         sys.exit(rc)
     else:
         # Non-zero-rank nodes never create a gRPC servicer, so they run the

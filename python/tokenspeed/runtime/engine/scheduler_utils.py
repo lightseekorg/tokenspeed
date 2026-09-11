@@ -40,6 +40,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -66,6 +67,63 @@ _TRANSFER_POLICY_MAP = {
     "full_suffix": CacheTransferPolicy.FullSuffix,
     "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
 }
+
+
+def engram_context_len(text_config) -> int:
+    """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
+    if not getattr(text_config, "engram_layer_ids", ()):
+        return 0
+    if getattr(text_config, "ngram_context_len", None) != 3:
+        raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
+    return text_config.ngram_context_len
+
+
+def ngram_inputs_for_forward(
+    forward_op, rid_to_state: Mapping, context_len: int
+) -> NGramInputs | None:
+    """Snapshot only this forward's raw physical-token windows, never long history.
+
+    Prefix hits, chunking, retraction and PD all read the same prompt/output
+    lists; detokenizer's unpadded prompt is not physical model input. At PP=1,
+    overlap leaves at most the *current* decode token uncommitted. Its three
+    predecessors are already on the host. The device position selects whether
+    the snapshot's newest token is current (committed) or previous (pending).
+    """
+    if context_len == 0:
+        return None
+    tokens, positions = [], []
+    num_extends = forward_op.num_extends()
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state[rid]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        prompt_len = len(prompt)
+        total = prompt_len + len(output)
+        length = forward_op.input_lengths[i]
+        if i < num_extends:
+            start = forward_op.extend_prefix_lens[i]
+            if start < 0 or start + length > total:
+                raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
+        else:
+            if length != 1:
+                raise NotImplementedError(
+                    "Engram input history does not support speculation"
+                )
+            start = total - 1
+            if start < 0:
+                raise ValueError(f"N-gram decode requires physical tokens for {rid}")
+        for position in range(start, start + length):
+            tokens.append(
+                tuple(
+                    (
+                        -1
+                        if p < 0
+                        else prompt[p] if p < prompt_len else output[p - prompt_len]
+                    )
+                    for p in range(position, position - context_len - 1, -1)
+                )
+            )
+            positions.append(position)
+    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
 
 
 @dataclass(frozen=True)

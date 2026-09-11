@@ -45,6 +45,8 @@ from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
@@ -74,6 +76,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
     DeepseekV4Config.model_type: DeepseekV4Config,
+    DeepseekV41Config.model_type: DeepseekV41Config,
+    DeepseekV41TextConfig.model_type: DeepseekV41TextConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
@@ -112,7 +116,7 @@ def _snapshot_commit_hash(snapshot_path: str) -> str | None:
     return candidate if _HF_COMMIT_HASH_RE.fullmatch(candidate) else None
 
 
-_DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
+_DEEPSEEK_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_encoding"
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -446,6 +450,7 @@ def get_config(
         text_config.update(model_override_args)
 
     if resolve_architecture(config) in [
+        "DeepseekV41ForCausalLM",
         "KimiK25ForConditionalGeneration",
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
@@ -597,12 +602,20 @@ def _load_deepseek_v4_encode_messages(
     tokenizer_name: str,
     tokenizer_revision: str | None,
 ) -> Callable[..., str]:
-    encoding_path = _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
+    return _load_deepseek_encode_messages(
+        _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
+    )
+
+
+def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
+    """Load a standalone encoder from the already resolved checkpoint snapshot."""
+    if not os.path.isfile(encoding_path):
+        raise RuntimeError(f"DeepSeek tokenizer requires {encoding_path}.")
     spec = importlib.util.spec_from_file_location(
-        _DEEPSEEK_V4_ENCODING_MODULE_NAME, encoding_path
+        _DEEPSEEK_ENCODING_MODULE_NAME, encoding_path
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load DeepSeek V4 encoding from {encoding_path}")
+        raise RuntimeError(f"Unable to load DeepSeek encoding from {encoding_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     encode_messages = getattr(module, "encode_messages", None)
@@ -615,18 +628,53 @@ def _wrap_deepseek_v4_tokenizer(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     encode_messages: Callable[..., str],
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer.
+    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer."""
+    return _wrap_deepseek_tokenizer(tokenizer, encode_messages, is_v41=False)
 
-    This loads the official encoder from the checkpoint instead of vendoring it
-    in TokenSpeed.
+
+def _validate_deepseek_v41_text_content(content: Any) -> None:
+    """Reject media, including nested tool-result blocks, before prompt encoding."""
+    error = "DeepSeek V4.1 tokenizer supports text-only messages; media content is not supported."
+    if content is None:
+        return
+    if isinstance(content, str):
+        if "<｜deepseek_image｜>" in content:
+            raise ValueError(error)
+        return
+    if not isinstance(content, list):
+        raise ValueError(error)
+    for block in content:
+        if not isinstance(block, dict):
+            raise ValueError(error)
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            _validate_deepseek_v41_text_content(block["text"])
+        elif block.get("type") == "tool_result":
+            _validate_deepseek_v41_text_content(block.get("content"))
+        else:
+            raise ValueError(error)
+
+
+def _wrap_deepseek_tokenizer(
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    encode_messages: Callable[..., str],
+    *,
+    is_v41: bool,
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+    """Attach the checkpoint encoder without changing the backend vocabulary.
+
+    V4.1 accepts text-only messages and passes numeric reasoning budgets and
+    low/high/max aliases unchanged to encoding/encoding.py. V4 retains its
+    high/max filtering and legacy vocabulary bookkeeping.
     """
-
-    dsv4_tokenizer = copy.copy(tokenizer)
+    wrapped_tokenizer = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
-    added_vocab_size = len(added_vocab)
-    tokenizer_vocab_size = tokenizer.vocab_size
+    # V4.1's added tokens overlap its base vocabulary. Double-counting them
+    # changes Engram's compressed token map and therefore its n-gram hashes.
+    tokenizer_vocab_size = (
+        len(tokenizer) if is_v41 else tokenizer.vocab_size + len(added_vocab)
+    )
 
-    class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
+    class _DeepseekTokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
             self,
             messages: list[dict[str, Any]],
@@ -642,7 +690,11 @@ def _wrap_deepseek_v4_tokenizer(
                 conversation.insert(0, {"role": "system", "tools": tools})
 
             reasoning_effort = kwargs.get("reasoning_effort")
-            if reasoning_effort not in ("max", "high"):
+            if is_v41:
+                for message in conversation:
+                    for key in ("content", "content_blocks", "reasoning_content"):
+                        _validate_deepseek_v41_text_content(message.get(key))
+            elif reasoning_effort not in ("max", "high"):
                 reasoning_effort = None
 
             prompt = encode_messages(
@@ -677,14 +729,15 @@ def _wrap_deepseek_v4_tokenizer(
             return len(self.encode(""))
 
         def __len__(self) -> int:
-            return tokenizer_vocab_size + added_vocab_size
+            return tokenizer_vocab_size
 
         def get_added_vocab(self) -> dict[str, int]:
             return added_vocab.copy()
 
-    _DeepseekV4Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
-    dsv4_tokenizer.__class__ = _DeepseekV4Tokenizer
-    return dsv4_tokenizer
+    version = "DSV41" if is_v41 else "DSV4"
+    _DeepseekTokenizer.__name__ = f"{version}{tokenizer.__class__.__name__}"
+    wrapped_tokenizer.__class__ = _DeepseekTokenizer
+    return wrapped_tokenizer
 
 
 def get_tokenizer(
@@ -706,7 +759,9 @@ def get_tokenizer(
 
     ``architectures`` is the model's ``config.architectures`` list. Callers
     should pass it when available so model-specific tokenizer handling can be
-    selected.
+    selected. DeepseekV41ForCausalLM in auto mode uses the snapshot's standalone
+    ``encoding/encoding.py`` and requires ``trust_remote_code=True`` even for
+    local checkpoints. Its chat wrapper supports text only; media is rejected.
 
     ``revision`` is the production-facing alias for ``tokenizer_revision``.
     When both are provided they must name the same snapshot.
@@ -724,6 +779,15 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    use_v41_encoder = tokenizer_mode == "auto" and (
+        "DeepseekV41ForCausalLM" in (architectures or [])
+    )
+    if use_v41_encoder and not trust_remote_code:
+        raise ValueError(
+            "DeepSeek V4.1 requires executing the checkpoint's encoding/encoding.py. "
+            "Set trust_remote_code=True or use --trust-remote-code."
+        )
 
     tokenizer_path = tokenizer_name
     tokenizer = None
@@ -774,7 +838,15 @@ def get_tokenizer(
                 "slowdown. Consider using a fast tokenizer instead."
             )
 
-        if tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
+        if use_v41_encoder:
+            loaded_tokenizer = _wrap_deepseek_tokenizer(
+                loaded_tokenizer,
+                _load_deepseek_encode_messages(
+                    os.path.join(tokenizer_path, "encoding", "encoding.py")
+                ),
+                is_v41=True,
+            )
+        elif tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
             loaded_tokenizer = _wrap_deepseek_v4_tokenizer(
                 loaded_tokenizer,
                 _load_deepseek_v4_encode_messages(tokenizer_path, tokenizer_revision),

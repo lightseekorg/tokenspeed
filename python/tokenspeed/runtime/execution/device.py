@@ -418,6 +418,7 @@ class DeviceHandle:
                 grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
+                ngram_inputs=planned.ngram_inputs,
             )
 
         return PendingExecution(self._thread.submit(_forward))
