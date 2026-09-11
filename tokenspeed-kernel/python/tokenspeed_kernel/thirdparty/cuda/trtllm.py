@@ -377,9 +377,6 @@ class MnnvlAllReduceFusionWorkspace:
         """
         if requested is False:
             return False
-        import os as _os
-        if _os.environ.get("TS2_PERCALL_WIDTH") == "0":  # A/B only, not for merge
-            return token_num <= self.oneshot_token_cap
         cap = self.oneshot_token_cap * self.hidden_dim // hidden_dim
         return token_num <= min(cap, self.max_token_num)
 
