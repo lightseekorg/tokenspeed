@@ -305,12 +305,14 @@ class OutputProcessor:
                 if self.engine.server_args.speculative_algorithm:
                     verify_ct = recv_obj.spec_verify_ct[i]
                     meta_info["spec_verify_ct"] = verify_ct
-                    accepted = getattr(recv_obj, "spec_accepted_tokens", None)
-                    if accepted and i < len(accepted):
-                        # Slot 0 of each verify window is the already-accepted root.
-                        width = self.engine.server_args.speculative_num_draft_tokens - 1
-                        meta_info["spec_accepted_tokens"] = accepted[i]
-                        meta_info["spec_draft_tokens"] = verify_ct * width
+                    if verify_ct > 0:
+                        # Prefill emits 1 token and each verify step 1 more;
+                        # the rest are accepted drafts.
+                        n = self.engine.server_args.speculative_num_draft_tokens
+                        meta_info["spec_accepted_tokens"] = (
+                            recv_obj.completion_tokens[i] - 1 - verify_ct
+                        )
+                        meta_info["spec_draft_tokens"] = verify_ct * (n - 1)
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 

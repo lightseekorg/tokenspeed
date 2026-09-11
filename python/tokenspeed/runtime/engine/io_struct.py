@@ -705,9 +705,6 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     output_extra_infos: list[dict[str, Any]]
 
     generated_time: float
-    # Accepted draft tokens per request (speculative decoding), excluding
-    # the bonus token. Empty when spec decoding is off.
-    spec_accepted_tokens: list[int] = []
 
 
 def _finish_type(finished_reason) -> str:
@@ -840,9 +837,6 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     output_extra_infos: list[dict[str, Any]]
 
     generated_time: float
-    # Accepted draft tokens per request (speculative decoding), excluding
-    # the bonus token. Empty when spec decoding is off.
-    spec_accepted_tokens: list[int] = []
 
 
 class BatchEmbeddingOut(BaseBatchReq, kw_only=True):
