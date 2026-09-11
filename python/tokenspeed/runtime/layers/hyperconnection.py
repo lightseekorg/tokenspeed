@@ -79,6 +79,30 @@ def _matching_rows(base: torch.Tensor, derived: torch.Tensor):
     return start
 
 
+@dataclass(frozen=True)
+class GatedResidualUpdate:
+    """Forward-local residual injection awaiting its consuming normalization.
+
+    All three tensors share a dtype and row layout. ``residual`` contains the
+    branch streams, ``block_output`` one sublayer output per row, and
+    ``inject_logits`` one gate per row and branch. Materialize before an
+    intervening operation that needs the updated, unnormalized streams.
+    """
+
+    residual: torch.Tensor
+    block_output: torch.Tensor
+    inject_logits: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        return gated_residual_combine(
+            self.block_output,
+            self.residual,
+            self.inject_logits,
+            self.inject_logits.shape[-1],
+            self.block_output.shape[-1],
+        )
+
+
 class GroupedGemmaRMSNorm(nn.Module):
     """GPU Gemma RMSNorm with optional independently-normalized feature groups."""
 
@@ -307,6 +331,7 @@ class GatedResidualSimple(nn.Module):
 
 __all__ = [
     "GatedResidualSimple",
+    "GatedResidualUpdate",
     "GroupedGemmaRMSNorm",
     "HyperConnectionConfig",
 ]

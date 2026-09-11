@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
+    GatedResidualUpdate,
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -85,6 +86,25 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _mix_gated_residual(
+    mixer: GatedResidualSimple,
+    hidden_states: torch.Tensor | GatedResidualUpdate,
+):
+    if isinstance(hidden_states, GatedResidualUpdate):
+        return mixer.mix(
+            hidden_states.residual,
+            block_output=hidden_states.block_output,
+            inject_logits=hidden_states.inject_logits,
+            preload_residual=True,
+        )
+    return mixer.mix(
+        hidden_states,
+        block_output=None,
+        inject_logits=None,
+        preload_residual=False,
+    )
 
 
 def _qwen4_exp_uses_sigmoid_output_gate(config: Qwen4ExpTextConfig) -> bool:
@@ -211,10 +231,14 @@ class _Qwen4ExpDecoderMixin:
 
     def _prepare_attention(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
     ):
+        if isinstance(hidden_states, GatedResidualUpdate):
+            if self.ple is None and not self.comm_manager.needs_pre_attn_all_gather():
+                return _mix_gated_residual(self.attn_hyper_connection, hidden_states)
+            hidden_states = hidden_states.materialize()
         expected = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] == self.hidden_size:
             hidden_states = hidden_states.repeat(1, self.hc_count)
@@ -227,9 +251,7 @@ class _Qwen4ExpDecoderMixin:
         if self.ple is not None:
             # The PLE layer folds this residual add into its conv epilogue.
             hidden_states = self.ple(hidden_states, input_ids, ctx)
-        return self.attn_hyper_connection.mix(
-            hidden_states, block_output=None, inject_logits=None, preload_residual=False
-        )
+        return _mix_gated_residual(self.attn_hyper_connection, hidden_states)
 
     def _finish_attention(
         self,
@@ -267,7 +289,11 @@ class _Qwen4ExpDecoderMixin:
             mixed = self.comm_manager.pre_mlp_comm(mixed, ctx)
             output = self.mlp(mixed)
             output, _ = self.comm_manager.post_mlp_comm(output, residuals[0], ctx)
-        return self.mlp_hyper_connection.combine(output, residuals)
+        return GatedResidualUpdate(
+            residual=residuals[0],
+            block_output=output,
+            inject_logits=residuals[2],
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLayer):
@@ -314,7 +340,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
@@ -472,7 +498,7 @@ class Qwen4ExpAttentionDecoderLayer(
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | GatedResidualUpdate,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
@@ -574,21 +600,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 and input_deepstack_embeds.numel()
                 and layer_id < 3
             ):
+                if isinstance(hidden_states, GatedResidualUpdate):
+                    hidden_states = hidden_states.materialize()
                 start = self.hidden_size * layer_id
                 deepstack = input_deepstack_embeds[
                     :, start : start + self.hidden_size
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
 
-        if self.layers:
+        if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
+            if isinstance(hidden_states, GatedResidualUpdate):
+                hidden_states = hidden_states.materialize()
             hidden_states, _ = self.layers[-1].comm_manager.post_final_norm_comm(
                 hidden_states, hidden_states, ctx
             )
-        hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(
-            hidden_states, block_output=None, inject_logits=None, preload_residual=False
+        hidden_states, residuals = _mix_gated_residual(
+            self.hyper_connection_mixer, hidden_states
         )
-        return hidden_states, [hc_hidden_states]
+        return hidden_states, [residuals[0]]
 
 
 def _normalize_checkpoint_name(name: str) -> str:

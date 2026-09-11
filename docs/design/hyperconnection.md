@@ -291,11 +291,24 @@ gate selections. Normal grouped RMSNorm waits before reading its activation.
 If the kernel wrapper must copy a noncontiguous residual or weight, it disables
 preloading for that invocation so the copy's output is not read prematurely.
 
-The MLP's final combine stays materialized at the layer boundary. The next
-attention preparation can communicate rows, apply PLE, or follow a multimodal
-deepstack addition. A norm must consume the result of those operations; it
-cannot be moved ahead of them. Likewise, the final output mixer runs after the
-model's final communication and retains the unnormalized HC output for MTP.
+The MLP returns a forward-local `GatedResidualUpdate` holding the original
+residual, block output and injection logits. When the next attention has no PLE
+or row gather, its mixer consumes this update through the same fused
+combine-and-norm kernel. The final output mixer consumes the last MLP update
+the same way and returns the fused kernel's updated, unnormalized residual as
+the HC hidden state required by MTP. No update escapes the model forward or is
+stored on a module; eager, prefill, decode, idle and CUDA graphs share this path.
+
+Operations between injection and normalization still consume a materialized
+residual: the model resolves the update before a multimodal deepstack addition,
+and attention preparation resolves it before PLE or a row all-gather. Final
+row gathering likewise resolves it before communication. `CommManager` owns
+the gather predicates used by both communication and these fusion boundaries.
+Normalization is never moved ahead of an operation that changes its input.
+In the TP4 all-reduce text path, MLP tails without an intervening PLE use the
+fused kernel, including the one-layer MTP draft's final mixer. Residual
+preloading is valid because the MLP has already consumed those streams before
+producing its output.
 
 ### Validation
 
@@ -305,7 +318,10 @@ non-power-of-two widths, empty inputs, and CUDA graph replay with PDL on/off.
 An intentionally delayed producer and poisoned output buffers check that
 activation loads remain behind the PDL wait.
 `test/runtime/test_hyperconnection_kernel_boundary.py` checks consumer norm
-weights, subsequent residual injection, and attention-to-MLP row alignment.
+weights, subsequent residual injection, attention-to-MLP row alignment, MLP
+tails across PLE/deepstack/gather boundaries, final HC hidden states, and graph
+replay with changing inputs. Communication predicate tests keep the fusion
+boundaries aligned with the actual all-gather decisions.
 
 Compare separate combine and norm with the fused kernel, with and without
 preloading:

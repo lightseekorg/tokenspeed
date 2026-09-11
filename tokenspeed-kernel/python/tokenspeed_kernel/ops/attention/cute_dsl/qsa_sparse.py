@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for the B200 QSA sparse-attention specialization."""
+"""CuTe DSL registration for the B200/B300 QSA sparse-attention specialization."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ _SELECTED_WIDTH = 2051
     solution="cute_dsl",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=frozenset(
@@ -80,7 +80,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the adaptive workspace-free B200 QSA specialization.
+    """Run the adaptive workspace-free B200/B300 QSA specialization.
 
     Args:
         q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,

@@ -130,14 +130,16 @@ class CommManager:
             return self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
         return self.mapping.attn.tp_size == self.mapping.dense.tp_size
 
+    def needs_pre_attn_all_gather(self) -> bool:
+        """Whether attention preparation must gather the previous layer's rows."""
+        return (
+            self.layer_id > 0
+            and self.mapping.has_attn_tp
+            and not self.use_all_reduce(self.prev_is_moe)
+        )
+
     def pre_attn_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        if self.layer_id == 0:
-            return hidden_states
-
-        if not self.mapping.has_attn_tp:
-            return hidden_states
-
-        if self.use_all_reduce(self.prev_is_moe):
+        if not self.needs_pre_attn_all_gather():
             return hidden_states
 
         return token_all_gather(
@@ -152,11 +154,7 @@ class CommManager:
 
         Mirrors the pre_attn_comm gather conditions.
         """
-        if self.layer_id == 0:
-            return residual
-        if not self.mapping.has_attn_tp:
-            return residual
-        if self.use_all_reduce(self.prev_is_moe):
+        if not self.needs_pre_attn_all_gather():
             return residual
         return token_all_gather(
             residual,
@@ -269,12 +267,14 @@ class CommManager:
         )
         return hidden_states, residual
 
+    def needs_final_all_gather(self) -> bool:
+        """Whether the model output must gather the final layer's rows."""
+        return self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)
+
     def post_final_norm_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.mapping.has_attn_tp:
-            return hidden_states, residual
-        if self.use_all_reduce(self.is_moe):
+        if not self.needs_final_all_gather():
             return hidden_states, residual
         hidden_states = token_all_gather(
             hidden_states,

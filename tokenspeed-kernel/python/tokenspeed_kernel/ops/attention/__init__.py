@@ -5748,7 +5748,7 @@ def qsa_sparse_attention(
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
-    The SM100 CuTe DSL implementation is preferred when its specialization
+    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
     matches. Other supported NVIDIA architectures use FlashInfer FA2 sparse
     attention as the registered fallback.
     """
