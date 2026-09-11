@@ -522,7 +522,7 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
 
 
 def test_history_views_replay_after_batch_shrink_and_idle(buffers):
-    """Check the input contract, not V4.1 backend graph support (still disabled)."""
+    """Engram replay reads refreshed history/masks, including padding and idle."""
     ib, runtime = buffers
     if ib.device != "cuda":
         pytest.skip("CUDA graph buffer contract")

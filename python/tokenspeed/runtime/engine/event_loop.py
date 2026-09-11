@@ -19,7 +19,9 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -1186,7 +1188,15 @@ def run_event_loop(
 
     event_loop = None
     shutdown_event = threading.Event()
+    received_signal = None
     previous_sigterm_handler = None
+
+    def request_shutdown(signum, _frame):
+        nonlocal received_signal
+        # Defer logging until outside the signal handler (logging takes locks).
+        received_signal = signum
+        shutdown_event.set()
+
     try:
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
@@ -1202,10 +1212,7 @@ def run_event_loop(
         # scheduler iteration and ordinary runtime cleanup can finish.
         if threading.current_thread() is threading.main_thread():
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-            signal.signal(
-                signal.SIGTERM,
-                lambda _signum, _frame: shutdown_event.set(),
-            )
+            signal.signal(signal.SIGTERM, request_shutdown)
 
         maybe_warm_cupti_for_graph_capture()
 
@@ -1244,6 +1251,17 @@ def run_event_loop(
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
     finally:
+        # SystemExit/KeyboardInterrupt bypass the Exception handler above;
+        # report their traceback without swallowing or changing the exit status.
+        exception_info = sys.exc_info()
+        logger.warning(
+            "Scheduler exiting: rank=%d pid=%d shutdown_requested=%s signal=%s",
+            global_rank,
+            os.getpid(),
+            shutdown_event.is_set(),
+            received_signal,
+            exc_info=exception_info if exception_info[0] is not None else None,
+        )
         if event_loop is not None:
             try:
                 event_loop.close()

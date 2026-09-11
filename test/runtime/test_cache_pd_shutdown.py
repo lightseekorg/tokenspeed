@@ -166,13 +166,19 @@ def test_abort_uses_the_output_marker() -> None:
     assert calls == [("request-0", {"notify_client": True})]
 
 
-def test_run_event_loop_sigterm_sets_event_and_finally_closes(
+@pytest.mark.parametrize("exit_kind", ["sigterm", "return", "system_exit"])
+def test_run_event_loop_reports_exit_and_finally_closes(
     monkeypatch: pytest.MonkeyPatch,
+    exit_kind: str,
 ) -> None:
     trace: list[str] = []
     signal_calls: list[tuple[int, object]] = []
     installed_handler: dict[str, object] = {}
     parent_signals: list[int] = []
+    exit_logs = []
+
+    def record_exit(message, *args, **kwargs):
+        exit_logs.append((message % args, kwargs["exc_info"]))
 
     previous_handler = object()
 
@@ -217,10 +223,14 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
         def event_loop(self) -> None:
             trace.append("loop_enter")
             assert not self.shutdown_event.is_set()
-            handler = installed_handler["value"]
-            assert callable(handler)
-            handler(signal.SIGTERM, None)
-            assert self.shutdown_event.is_set()
+            if exit_kind == "system_exit":
+                raise SystemExit(0)
+            if exit_kind == "sigterm":
+                handler = installed_handler["value"]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                assert self.shutdown_event.is_set()
+                assert not exit_logs
             trace.append("loop_return")
 
         def close(self) -> None:
@@ -261,10 +271,25 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
         event_loop_module.signal, "getsignal", lambda _sig: previous_handler
     )
     monkeypatch.setattr(event_loop_module.signal, "signal", fake_signal)
+    monkeypatch.setattr(event_loop_module.logger, "warning", record_exit)
 
-    event_loop_module.run_event_loop(server_args, object(), pipe_writer)
-
-    assert trace == ["construct", "loop_enter", "loop_return", "close"]
+    if exit_kind == "system_exit":
+        with pytest.raises(SystemExit) as raised:
+            event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+        assert raised.value.code == 0
+        assert trace == ["construct", "loop_enter", "close"]
+        assert exit_logs[0][1][0] is SystemExit
+    else:
+        event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+        assert trace == ["construct", "loop_enter", "loop_return", "close"]
+        assert exit_logs[0][1] is None
+    assert len(exit_logs) == 1
+    assert "rank=0 pid=" in exit_logs[0][0]
+    assert (
+        "shutdown_requested=True signal=15"
+        if exit_kind == "sigterm"
+        else "shutdown_requested=False signal=None"
+    ) in exit_logs[0][0]
     assert parent_signals == []
     assert len(pipe_writer.messages) == 1
     assert pipe_writer.messages[0]["status"] == "ready"

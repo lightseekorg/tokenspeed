@@ -47,6 +47,7 @@ __all__ = [
     "selected_attention",
     "index_score",
     "index_topk",
+    "compressor_tail_scatter",
 ]
 
 
@@ -119,6 +120,25 @@ def cache_gather(
     None to allocate BF16. Returns that destination, never the full history.
     """
     return _kernel("cache_gather", cache)(cache, slots, cache_format, out)
+
+
+def compressor_tail_scatter(
+    content: torch.Tensor,
+    scores: torch.Tensor,
+    tail: torch.Tensor,
+    slots: torch.Tensor,
+) -> None:
+    """Store FP32 projected compressor inputs without compacting live rows.
+
+    ``content`` and ``scores`` are FP32 [T, 512]; ``tail`` is a strided FP32
+    [pages, 2, 2, 512] field (page, token, content/score, channel). ``slots[T]``
+    are int32/int64 field-relative token slots. Negative/out-of-capacity slots
+    skip writes; valid slots must be unique. Page zero is not special to this
+    op: the caller maps null pages to -1. All input strides are honored.
+    Mutates tail and returns None. Read prior pairs BEFORE this write, since
+    scheduler-reused pages may still hold inputs needed by the current chunk.
+    """
+    return _kernel("compressor_tail_scatter", content)(content, scores, tail, slots)
 
 
 def index_q_quantize(q: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
@@ -199,8 +219,11 @@ def index_score(
     ``weights[T, H]`` is BF16/FP32, already multiplied by
     128**-0.5 * total_index_heads**-0.5. ``index_cache`` is the strided uint8
     [pages, 64, 68] field; ``physical_slots[T, rows]`` selects only rows to read.
-    ``process_group`` reduces head contributions before returning scores, or
-    None for unsharded heads. Every rank must use the same slots/tile schedule.
+    ``process_group`` gathers Q/weights across TP heads, or None for unsharded
+    heads. Every rank must use the same query/slot schedule. Each shard's head
+    sum rounds to weights' dtype; shard sums accumulate in rank-order FP32,
+    then round once to weights' dtype. This keeps the reference's dot/product/
+    shard-sum boundaries, not NCCL's unspecified final reduction order.
     ``out`` is contiguous [T, rows] with weights' dtype, or None to allocate.
 
     Returns sum_h(weights_h * relu(BF16 dot(q_h, k))), with reference rounding
@@ -251,8 +274,9 @@ def index_topk(
         candidate_block_size: Must be 8; each block score is its visible row max.
         query_chunk_size: Positive bound on simultaneously processed queries.
         score_chunk_size: Positive multiple of 8, bounding scored rows per tile.
-        process_group: TP head-sum group or None; see index_score's collective
-            contract. Reduction happens before either Top-K selection.
+        process_group: TP group or None; see index_score's numerical contract.
+            One packed Q/weights all-gather per query tile, no score-tile
+            collectives. All head contributions are combined before selection.
         out: Four contiguous int32 destinations ([T, topk], [T],
             [T, candidate_topk], [T]), or None to allocate them.
 
@@ -263,10 +287,14 @@ def index_topk(
         Empty history has zero lengths. Equal-score boundary ties may select
         any equivalent subset; no cross-chunk/TP bitwise tie guarantee.
 
-    Full scans the table capacity in bounded tiles; Reindex scans at most
-    2048*8 candidates. Scratch is bounded by the explicit tile sizes and Top-K
-    capacities, not T*history. This torch Top-K merge baseline has a launch/
-    bandwidth ceiling; fused streaming selection can replace the same operation.
+    Full uses 16 fixed partitions whose loops are bounded by device-visible
+    lengths, not table capacity; Reindex scores at most 2048*8 candidate rows.
+    Graph replay recomputes those loop bounds without host synchronization.
+    Each partition keeps exact row/block TopK, merged once across partitions.
+    Scratch is O(query_chunk_size * 16 * (rounded_topk + rounded_candidate_topk))
+    plus gathered Q/weights, independent of configured or visible history.
+    FP32 scores and int64 IDs use 12 bytes per partial entry; capacities round
+    to powers of two and at least the score tile width (at most 256 lanes).
     """
     return _kernel("index_topk", index_q)(
         index_q,

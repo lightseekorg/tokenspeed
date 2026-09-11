@@ -381,6 +381,8 @@ class DeepseekV41Compressor(nn.Module):
             content, positions, requests = backend.compress(
                 owner, content, scores, positions, requests, mode
             )
+            # Fixed-capacity pooled rows retain -1 positions through norm/RoPE;
+            # cache writers mask them, so odd/even replay never changes shape.
             content = content.to(x.dtype)
         return _norm(content, self.norm), positions, requests
 

@@ -21,7 +21,11 @@
 """Bounded real-checkpoint smoke/GSM8K run; cleans up only its own server tree.
 
 Activate the development venv and explicitly select available GPUs before use.
-All paths/ports/time limits are explicit; the supplied snapshot is never modified.
+All paths/ports/time limits, --execution-mode eager|graph, --batch-size,
+--max-total-tokens, --max-model-len and --chunked-prefill-size are explicit;
+the supplied snapshot is never modified.
+Batch size controls server admission, decode capture and EvalScope concurrency.
+Graph mode enables decode capture only.
 The output directory must exist and be empty. With --run-eval, EvalScope must
 finish successfully and report all 1,319 GSM8K test samples without errors.
 A complete run writes public result.json and fails unless accuracy > 0.90;
@@ -125,8 +129,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("model", "output-dir", "port", "server-timeout", "eval-timeout"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--execution-mode", choices=("eager", "graph"), required=True)
+    for name in (
+        "batch-size",
+        "max-total-tokens",
+        "max-model-len",
+        "chunked-prefill-size",
+    ):
+        parser.add_argument("--" + name, type=int, required=True)
     parser.add_argument("--run-eval", action="store_true")
     args = parser.parse_args()
+    if not 0 < args.batch_size <= args.max_total_tokens:
+        parser.error("Require 0 < batch-size <= max-total-tokens")
+    if args.max_model_len <= 0 or args.chunked_prefill_size <= 0:
+        parser.error("max-model-len and chunked-prefill-size must be positive")
     if len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")) != 4:
         parser.error("Explicitly select four free GPUs with CUDA_VISIBLE_DEVICES")
     output = Path(args.output_dir).resolve()
@@ -155,17 +171,16 @@ def main():
         "--dtype",
         "bfloat16",
         "--max-model-len",
-        "4096",
+        str(args.max_model_len),
         "--max-total-tokens",
-        "16384",
+        str(args.max_total_tokens),
         "--max-num-seqs",
-        "16",
+        str(args.batch_size),
         "--chunked-prefill-size",
-        "1024",
+        str(args.chunked_prefill_size),
         "--gpu-memory-utilization",
         "0.9",
         "--disable-kvstore",
-        "--enforce-eager",
         "--disable-prefill-graph",
         "--trust-remote-code",
         "--host",
@@ -173,6 +188,10 @@ def main():
         "--port",
         str(port),
     ]
+    if args.execution_mode == "eager":
+        command.append("--enforce-eager")
+    else:
+        command.extend(("--max-cudagraph-capture-size", str(args.batch_size)))
     # Store a reproducible public model ID rather than a developer's local path.
     public_command = [name if item == args.model else item for item in command]
     (output / "server-command.json").write_text(json.dumps(public_command, indent=2))
@@ -243,7 +262,7 @@ def main():
                     "--dataset-args",
                     json.dumps({"gsm8k": {"dataset_id": "openai/gsm8k"}}),
                     "--eval-batch-size",
-                    "16",
+                    str(args.batch_size),
                     "--generation-config",
                     json.dumps(
                         {"do_sample": False, "temperature": 0.0, "max_tokens": 512}
@@ -267,6 +286,11 @@ def main():
                         f"Server exited {process.returncode} during evaluation; see server.log"
                     )
                 result = read_gsm8k_result(output / "evalscope", version("evalscope"))
+                result["execution_mode"] = args.execution_mode
+                result["batch_size"] = args.batch_size
+                result["max_total_tokens"] = args.max_total_tokens
+                result["max_model_len"] = args.max_model_len
+                result["chunked_prefill_size"] = args.chunked_prefill_size
                 (output / "result.json").write_text(
                     json.dumps(result, indent=2) + "\n", encoding="utf-8"
                 )

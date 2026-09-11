@@ -336,6 +336,72 @@ def cache_gather(cache, slots, cache_format, out):
     return _gather(cache, slots, cache_format, out)
 
 
+@triton.jit
+def _compressor_tail_scatter_kernel(
+    Content,
+    Scores,
+    Tail,
+    Slots,
+    CS0,
+    CS1,
+    SS0,
+    SS1,
+    TP,
+    TR,
+    TK,
+    TD,
+    LS,
+    CAPACITY: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(Slots + row * LS).to(tl.int64)
+    if slot >= 0 and slot < CAPACITY:
+        d = tl.arange(0, 512)
+        base = Tail + slot // 2 * TP + slot % 2 * TR + d * TD
+        tl.store(base, tl.load(Content + row * CS0 + d * CS1))
+        tl.store(base + TK, tl.load(Scores + row * SS0 + d * SS1))
+
+
+@register_kernel(
+    "attention",
+    "dsv41_compressor_tail_scatter",
+    name="triton_dsv41_compressor_tail_scatter",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.float32))}),
+    priority=Priority.PORTABLE,
+)
+def compressor_tail_scatter(content, scores, tail, slots):
+    if (
+        content.ndim != 2
+        or content.shape[1] != 512
+        or scores.shape != content.shape
+        or content.dtype != torch.float32
+        or scores.dtype != torch.float32
+        or tail.ndim != 4
+        or tail.shape[1:] != (2, 2, 512)
+        or tail.dtype != torch.float32
+    ):
+        raise ValueError(
+            "require FP32 content/scores [T, 512] and tail [pages, 2, 2, 512]"
+        )
+    _same_device(content, (scores, tail, slots))
+    _integers(slots, (content.shape[0],), "slots")
+    if content.shape[0]:
+        _compressor_tail_scatter_kernel[(content.shape[0],)](
+            content,
+            scores,
+            tail,
+            slots,
+            *content.stride(),
+            *scores.stride(),
+            *tail.stride(),
+            slots.stride(0),
+            CAPACITY=tail.shape[0] * 2,
+            num_warps=4,
+        )
+
+
 @register_kernel(
     "attention",
     "dsv41_index_q_quantize",
@@ -454,13 +520,16 @@ def selected_attention(
 
 
 def _score(q, weights, cache, slots, process_group):
+    q, weights, shards = _index_gather_heads(q, weights, process_group)
     keys = cache_gather(cache, slots, "index", None)
-    # Reference einsum materializes BF16 dots; weighting and the head reduction
-    # each round to weights' dtype. Keeping FP32 throughout changes TopK ties.
+    # Reference einsum materializes BF16 dots; weighting and each shard's head
+    # sum round to weights' dtype, as in the fused scan below.
     dots = torch.bmm(q, keys.transpose(1, 2))
-    scores = (dots.relu_() * weights.unsqueeze(-1)).sum(dim=1)
-    if process_group is not None:
-        torch.distributed.all_reduce(scores, group=process_group)
+    products = dots.relu_() * weights.unsqueeze(-1)
+    scores = torch.zeros(slots.shape, dtype=torch.float32, device=q.device)
+    for partial in products.chunk(shards, dim=1):
+        scores.add_(partial.sum(dim=1).float())
+    scores = scores.to(weights.dtype)
     return scores.masked_fill((slots < 0) | (slots >= cache.shape[0] * 64), -torch.inf)
 
 
@@ -504,11 +573,190 @@ def index_score(index_q, weights, index_cache, physical_slots, process_group, ou
     return out
 
 
-def _merge_topk(scores, ids, new_scores, new_ids, k):
-    scores = torch.cat((scores, new_scores.float()), dim=1)
-    ids = torch.cat((ids, new_ids.expand_as(new_scores)), dim=1)
-    values, positions = scores.topk(min(k, scores.shape[1]), dim=1, sorted=False)
-    return values, ids.gather(1, positions)
+@triton.jit
+def _index_pack_scores(scores, ids):
+    bits = scores.to(tl.uint32, bitcast=True)
+    ordered = bits ^ tl.where((bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000)
+    packed = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - ids.to(tl.uint32)).to(
+        tl.uint64
+    )
+    return tl.where(scores > -float("inf"), packed, 0)
+
+
+@triton.jit
+def _index_merge(acc, scores, ids, N: tl.constexpr, K: tl.constexpr):
+    # Two opposite-order lists form a bitonic sequence. The pairwise maxima
+    # contain its exact upper half, not an elementwise approximation to TopK.
+    offsets = tl.arange(0, K)
+    packed = _index_pack_scores(scores, ids)
+    padded = tl.where(offsets < N, tl.gather(packed, offsets % N, 0), 0)
+    new = tl.sort(padded, descending=True)
+    return tl.sort(tl.maximum(tl.flip(acc, 0), new), descending=True)
+
+
+@triton.jit
+def _index_unpack(packed):
+    ordered = (packed >> 32).to(tl.uint32)
+    bits = ordered ^ tl.where((ordered & 0x80000000) != 0, 0x80000000, 0xFFFFFFFF)
+    scores = tl.where(packed != 0, bits.to(tl.float32, bitcast=True), -float("inf"))
+    ids = tl.where(packed != 0, (0xFFFFFFFF - (packed & 0xFFFFFFFF)).to(tl.int64), -1)
+    return scores, ids
+
+
+@triton.jit
+def _index_scan_kernel(
+    Q,
+    W,
+    Cache,
+    Table,
+    Visible,
+    Candidates,
+    RowScores,
+    RowIds,
+    BlockScores,
+    BlockIds,
+    QS0,
+    QS1,
+    QS2,
+    WS0,
+    WS1,
+    CP,
+    CR,
+    CB,
+    TS0,
+    TS1,
+    VS,
+    CS0,
+    CS1,
+    PAGES: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    CANDIDATES: tl.constexpr,
+    HEADS: tl.constexpr,
+    SHARD_HEADS: tl.constexpr,
+    SHARDS: tl.constexpr,
+    H: tl.constexpr,
+    PARTS: tl.constexpr,
+    B: tl.constexpr,
+    STEP: tl.constexpr,
+    ROW_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MAKE_BLOCKS: tl.constexpr,
+):
+    query, part = tl.program_id(0), tl.program_id(1)
+    visible = tl.minimum(tl.maximum(tl.load(Visible + query * VS), 0), TABLE_WIDTH * 64)
+    if CANDIDATES >= 0:
+        width = tl.where(visible > 0, CANDIDATES * 8, 0)
+    else:
+        width = visible
+    # All partitions have stable storage and launches; their bounds are device
+    # values and are recomputed on every graph replay. Never scan unused pages.
+    span = tl.cdiv(width, PARTS * 8) * 8
+    begin = part * span
+    end = tl.minimum(begin + span, width)
+    row_acc = tl.full((ROW_K,), 0, tl.uint64)
+    if MAKE_BLOCKS:
+        block_acc = tl.full((BLOCK_K,), 0, tl.uint64)
+    h = tl.arange(0, H)
+    d = tl.arange(0, 128)
+    q = tl.load(
+        Q + query * QS0 + h[:, None] * QS1 + d[None, :] * QS2,
+        h[:, None] < HEADS,
+        other=0,
+    )
+    weights = tl.load(W + query * WS0 + h * WS1, h < HEADS, other=0)
+    for start in range(begin, end, STEP):
+        col = start + tl.arange(0, B)
+        if CANDIDATES >= 0:
+            block = tl.load(
+                Candidates + query * CS0 + (col // 8) * CS1,
+                col < tl.minimum(start + STEP, end),
+                other=-1,
+            ).to(tl.int64)
+            logical = tl.where(block >= 0, block * 8 + col % 8, -1)
+        else:
+            logical = col.to(tl.int64)
+        valid = (
+            (col < tl.minimum(start + STEP, end)) & (logical >= 0) & (logical < visible)
+        )
+        page = tl.load(Table + query * TS0 + (logical // 64) * TS1, valid, other=-1).to(
+            tl.int64
+        )
+        valid = valid & (page >= 0) & (page < PAGES)
+        base = Cache + page * CP + (logical % 64) * CR
+        byte = tl.load(base[None, :] + (d[:, None] // 2) * CB, valid[None, :], other=0)
+        value = _e2m1_decode((byte >> ((d[:, None] % 2) * 4)) & 15)
+        scale_byte = tl.load(
+            base[None, :] + (64 + d[:, None] // 32) * CB, valid[None, :], other=0
+        )
+        scale = tl.where(
+            scale_byte == 0,
+            2.0**-127,
+            (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
+        )
+        key = (value * scale).to(tl.bfloat16)
+        dots = tl.dot(q, key).to(tl.bfloat16).to(tl.float32)
+        products = (
+            (tl.maximum(dots, 0.0) * weights[:, None].to(tl.float32))
+            .to(W.dtype.element_ty)
+            .to(tl.float32)
+        )
+        # Keep each TP shard's rounded head sum, then use a defined rank-order
+        # FP32 sum. NCCL's topology/protocol-dependent order is not bitwise fixed.
+        scores = tl.full((B,), 0.0, tl.float32)
+        for rank in tl.static_range(SHARDS):
+            partial = tl.sum(
+                tl.where(
+                    (h[:, None] >= rank * SHARD_HEADS)
+                    & (h[:, None] < (rank + 1) * SHARD_HEADS),
+                    products,
+                    0.0,
+                ),
+                0,
+            )
+            scores = scores + partial.to(W.dtype.element_ty).to(tl.float32)
+        scores = scores.to(W.dtype.element_ty).to(tl.float32)
+        scores = tl.where(valid, scores, -float("inf"))
+        row_acc = _index_merge(row_acc, scores, logical, B, ROW_K)
+        if MAKE_BLOCKS:
+            block_scores = tl.max(scores.reshape(B // 8, 8), 1)
+            block_ids = (start // 8 + tl.arange(0, B // 8)).to(tl.int64)
+            block_scores = tl.where(
+                (block_ids == (visible - 1) // 8) & (block_scores > -float("inf")),
+                float("inf"),
+                block_scores,
+            )
+            block_acc = _index_merge(
+                block_acc, block_scores, block_ids, B // 8, BLOCK_K
+            )
+    offset = (query * PARTS + part) * ROW_K + tl.arange(0, ROW_K)
+    scores, ids = _index_unpack(row_acc)
+    tl.store(RowScores + offset, scores)
+    tl.store(RowIds + offset, ids)
+    if MAKE_BLOCKS:
+        offset = (query * PARTS + part) * BLOCK_K + tl.arange(0, BLOCK_K)
+        scores, ids = _index_unpack(block_acc)
+        tl.store(BlockScores + offset, scores)
+        tl.store(BlockIds + offset, ids)
+
+
+def _index_gather_heads(q, weights, process_group):
+    if process_group is None:
+        return q, weights, 1
+    shards = torch.distributed.get_world_size(process_group)
+    # One small collective per query tile instead of one per history tile.
+    # Promoting BF16 Q to FP32 when weights are FP32 is lossless.
+    packed = torch.cat((q.to(weights.dtype), weights.unsqueeze(-1)), dim=-1)
+    gathered = torch.empty(
+        (shards * q.shape[0], q.shape[1], 129), dtype=weights.dtype, device=q.device
+    )
+    torch.distributed.all_gather_into_tensor(gathered, packed, group=process_group)
+    gathered = gathered.view(shards, *packed.shape).permute(1, 0, 2, 3).flatten(1, 2)
+    return gathered[..., :128].to(torch.bfloat16), gathered[..., 128], shards
+
+
+def _index_finish_parts(scores, ids, k, output, lengths):
+    values, positions = scores.topk(k, dim=1, sorted=False)
+    _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
 def _finish_topk(scores, ids, output, lengths):
@@ -595,61 +843,69 @@ def index_topk(
     row_lens.zero_()
     block_out.fill_(-1)
     block_lens.zero_()
-    # ponytail: Full remains an O(queries * history) scan, but scratch is only
-    # O(query_chunk * (score_chunk * heads + topk + candidate_topk)); replace
-    # repeated torch TopK merges with a fused streaming selector if latency binds.
-    width = (
-        page_table.shape[1] * 64
-        if candidate_blocks is None
-        else candidate_blocks.shape[1] * 8
-    )
-    if not width or not page_table.shape[1]:
+    if not tokens or not page_table.shape[1]:
         return out
+    # ponytail: exact bitonic TopK is deliberately portable. At long *visible*
+    # histories a radix selector can replace it without changing this API.
+    parts = 16
+    tile = max(16, min(256, 1 << (score_chunk_size.bit_length() - 1)))
+    row_k = max(tile, triton.next_power_of_2(topk))
+    block_k = max(tile // 8, triton.next_power_of_2(max(1, candidate_topk)))
     for start in range(0, tokens, query_chunk_size):
         end = min(start + query_chunk_size, tokens)
-        q = index_q_quantize(index_q[start:end], None)
-        table = page_table[start:end]
-        visible = visible_lens[start:end, None]
-        row_scores = torch.empty((end - start, 0), dtype=torch.float32, device=q.device)
-        row_ids = torch.empty((end - start, 0), dtype=torch.int64, device=q.device)
-        block_scores, block_ids = row_scores, row_ids
-        for offset in range(0, width, score_chunk_size):
-            col = torch.arange(
-                offset, min(offset + score_chunk_size, width), device=q.device
-            )
-            if candidate_blocks is None:
-                logical = col.expand(end - start, -1)
-            else:
-                blocks = candidate_blocks[start:end].to(torch.int64)[:, col // 8]
-                logical = torch.where(blocks >= 0, blocks * 8 + col % 8, -1)
-            valid = (
-                (logical >= 0) & (logical < visible) & (logical < table.shape[1] * 64)
-            )
-            pages = table.gather(1, (logical // 64).clamp(0, table.shape[1] - 1)).to(
-                torch.int64
-            )
-            slots = pages * 64 + logical % 64
-            slots = slots.masked_fill(
-                ~valid | (pages < 0) | (pages >= index_cache.shape[0]), -1
-            )
-            scores = _score(q, weights[start:end], index_cache, slots, process_group)
-            row_scores, row_ids = _merge_topk(
-                row_scores, row_ids, scores, logical, topk
-            )
-            if candidate_topk:
-                new_blocks = (col[::8] // 8).expand(end - start, -1)
-                new_scores = scores.float().unflatten(1, (-1, 8)).amax(dim=-1)
-                latest = (visible - 1) // 8
-                new_scores = new_scores.masked_fill(
-                    (new_blocks == latest) & (visible > 0) & (new_scores > -torch.inf),
-                    torch.inf,
-                )
-                block_scores, block_ids = _merge_topk(
-                    block_scores, block_ids, new_scores, new_blocks, candidate_topk
-                )
-        _finish_topk(row_scores, row_ids, row_out[start:end], row_lens[start:end])
+        q, w, shards = _index_gather_heads(
+            index_q[start:end], weights[start:end], process_group
+        )
+        q = index_q_quantize(q, None)
+        table, visible = page_table[start:end], visible_lens[start:end]
+        candidates = None if candidate_blocks is None else candidate_blocks[start:end]
+        shape = (end - start, parts * row_k)
+        row_scores = torch.empty(shape, dtype=torch.float32, device=q.device)
+        row_ids = torch.empty(shape, dtype=torch.int64, device=q.device)
+        shape = (end - start, parts * block_k if candidate_topk else 0)
+        block_scores = torch.empty(shape, dtype=torch.float32, device=q.device)
+        block_ids = torch.empty(shape, dtype=torch.int64, device=q.device)
+        _index_scan_kernel[(end - start, parts)](
+            q,
+            w,
+            index_cache,
+            table,
+            visible,
+            candidates,
+            row_scores,
+            row_ids,
+            block_scores,
+            block_ids,
+            *q.stride(),
+            *w.stride(),
+            *index_cache.stride(),
+            *table.stride(),
+            visible.stride(0),
+            *(candidates.stride() if candidates is not None else (0, 0)),
+            index_cache.shape[0],
+            table.shape[1],
+            -1 if candidates is None else candidates.shape[1],
+            q.shape[1],
+            index_q.shape[1],
+            shards,
+            max(16, triton.next_power_of_2(q.shape[1])),
+            parts,
+            tile,
+            min(tile, score_chunk_size),
+            row_k,
+            block_k,
+            bool(candidate_topk),
+            enable_fp_fusion=False,
+        )
+        _index_finish_parts(
+            row_scores, row_ids, topk, row_out[start:end], row_lens[start:end]
+        )
         if candidate_topk:
-            _finish_topk(
-                block_scores, block_ids, block_out[start:end], block_lens[start:end]
+            _index_finish_parts(
+                block_scores,
+                block_ids,
+                candidate_topk,
+                block_out[start:end],
+                block_lens[start:end],
             )
     return out

@@ -256,6 +256,16 @@ def main_env(tmp_path, report, monkeypatch):
             "1",
             "--eval-timeout",
             "7200",
+            "--execution-mode",
+            "eager",
+            "--batch-size",
+            "16",
+            "--max-total-tokens",
+            "16384",
+            "--max-model-len",
+            "4096",
+            "--chunked-prefill-size",
+            "1024",
             "--run-eval",
         ],
     )
@@ -289,16 +299,63 @@ def main_env(tmp_path, report, monkeypatch):
     return evaluate, launch
 
 
-def test_full_eval_writes_result_only_after_completion(tmp_path, main_env):
+@pytest.mark.parametrize("execution_mode", ["eager", "graph"])
+@pytest.mark.parametrize(
+    "batch_size,max_total_tokens,max_model_len,chunked_prefill_size",
+    [(16, 16384, 4096, 1024), (32, 32768, 4096, 1024), (32, 1048576, 1048576, 8192)],
+)
+def test_full_eval_writes_result_only_after_completion(
+    tmp_path,
+    main_env,
+    execution_mode,
+    batch_size,
+    max_total_tokens,
+    max_model_len,
+    chunked_prefill_size,
+    monkeypatch,
+):
     evaluate, launch = main_env
+    argv = list(sys.argv)
+    argv[argv.index("--execution-mode") + 1] = execution_mode
+    argv[argv.index("--batch-size") + 1] = str(batch_size)
+    argv[argv.index("--max-total-tokens") + 1] = str(max_total_tokens)
+    argv[argv.index("--max-model-len") + 1] = str(max_model_len)
+    argv[argv.index("--chunked-prefill-size") + 1] = str(chunked_prefill_size)
+    monkeypatch.setattr(sys, "argv", argv)
     harness.main()
     result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
     assert result["passed"] is True
     assert result["samples"] == 1319
+    assert result["execution_mode"] == execution_mode
+    assert result["batch_size"] == batch_size
+    assert result["max_total_tokens"] == max_total_tokens
+    assert result["max_model_len"] == max_model_len
+    assert result["chunked_prefill_size"] == chunked_prefill_size
+    server_command = launch.call_args.args[0]
+    assert server_command[server_command.index("--max-model-len") + 1] == str(
+        max_model_len
+    )
+    assert server_command[server_command.index("--chunked-prefill-size") + 1] == str(
+        chunked_prefill_size
+    )
+    assert server_command[server_command.index("--max-num-seqs") + 1] == str(batch_size)
+    assert server_command[server_command.index("--max-total-tokens") + 1] == str(
+        max_total_tokens
+    )
+    if execution_mode == "graph":
+        assert server_command[
+            server_command.index("--max-cudagraph-capture-size") + 1
+        ] == str(batch_size)
+    assert ("--enforce-eager" in server_command) == (execution_mode == "eager")
+    assert ("--max-cudagraph-capture-size" in server_command) == (
+        execution_mode == "graph"
+    )
+    assert "--disable-prefill-graph" in server_command
     assert str(tmp_path) not in json.dumps(result)
     evaluate.assert_called_once()
     command = evaluate.call_args.args[0]
     assert command[:2] == ["evalscope", "eval"]
+    assert command[command.index("--eval-batch-size") + 1] == str(batch_size)
     assert not {"--limit", "--ignore-errors", "--use-cache"}.intersection(command)
     assert evaluate.call_args.kwargs["check"] is True
     assert evaluate.call_args.kwargs["timeout"] == 7200
@@ -375,6 +432,42 @@ def test_smoke_only_has_no_result(tmp_path, main_env, monkeypatch):
     harness.main()
     evaluate.assert_not_called()
     assert not (tmp_path / "result.json").exists()
+
+
+@pytest.mark.parametrize(
+    "batch_size,max_total_tokens", [(0, 16384), (-1, 16384), (32, 0), (32, 16)]
+)
+def test_invalid_batch_capacity_rejected_before_launch(
+    tmp_path, main_env, monkeypatch, batch_size, max_total_tokens
+):
+    evaluate, launch = main_env
+    argv = list(sys.argv)
+    argv[argv.index("--batch-size") + 1] = str(batch_size)
+    argv[argv.index("--max-total-tokens") + 1] = str(max_total_tokens)
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        harness.main()
+    assert exc.value.code == 2
+    launch.assert_not_called()
+    evaluate.assert_not_called()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("name", ["--max-model-len", "--chunked-prefill-size"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_nonpositive_context_or_chunk_rejected(
+    tmp_path, main_env, monkeypatch, name, value
+):
+    evaluate, launch = main_env
+    argv = list(sys.argv)
+    argv[argv.index(name) + 1] = value
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        harness.main()
+    assert exc.value.code == 2
+    launch.assert_not_called()
+    evaluate.assert_not_called()
+    assert not list(tmp_path.iterdir())
 
 
 def test_nonempty_output_preserves_logs_without_launching(tmp_path, main_env):
