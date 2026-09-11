@@ -255,6 +255,13 @@ def test_config_rejects_invalid_counts(field: str, value: object) -> None:
         GraphBenchmarkConfig(**values)
 
 
+def test_timer_requires_explicit_configuration() -> None:
+    with pytest.raises(TypeError):
+        GraphBenchmarkConfig()
+    with pytest.raises(TypeError):
+        GraphTimer()
+
+
 @pytest.mark.parametrize("repeat_safe", [False, "true"])
 def test_multiple_calls_require_repeat_safe_invocation(repeat_safe: object) -> None:
     config = GraphBenchmarkConfig(

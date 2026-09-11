@@ -53,10 +53,10 @@ GraphBenchmarkPhase = Literal[
 class GraphBenchmarkConfig:
     """Fixed work and sampling configuration for a graph benchmark."""
 
-    calls_per_graph: int = 100
-    eager_warmup_iterations: int = 5
-    replay_warmup_iterations: int = 3
-    measurement_blocks: int = 30
+    calls_per_graph: int
+    eager_warmup_iterations: int
+    replay_warmup_iterations: int
+    measurement_blocks: int
 
     def __post_init__(self) -> None:
         _validate_positive_int("calls_per_graph", self.calls_per_graph)
@@ -211,11 +211,11 @@ class GraphTimer:
 
     def __init__(
         self,
-        config: GraphBenchmarkConfig | None = None,
+        config: GraphBenchmarkConfig,
         *,
         backend: _GraphBackend | None = None,
     ) -> None:
-        self.config = config or GraphBenchmarkConfig()
+        self.config = config
         self._backend = backend or _TorchCudaBackend()
         self._stream: object | None = None
 

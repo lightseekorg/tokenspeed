@@ -103,6 +103,7 @@ def _request(family: str) -> BenchmarkRequest:
         mode="test",
         parameters={"size": 8},
         solution="test_solution",
+        registration=None,
         seed=7,
         definition_version=2,
     )
@@ -128,9 +129,33 @@ def _prepared(request: BenchmarkRequest, platform: PlatformInfo) -> PreparedBenc
 
 def test_request_selection_modes_and_parameter_copy():
     parameters = {"size": 8}
-    normal = BenchmarkRequest("gemm", "bmm", parameters)
-    solution = BenchmarkRequest("gemm", "bmm", parameters, solution="gluon")
-    exact = BenchmarkRequest("gemm", "bmm", parameters, registration="gluon_bmm")
+    normal = BenchmarkRequest(
+        family="gemm",
+        mode="bmm",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        seed=42,
+        definition_version=1,
+    )
+    solution = BenchmarkRequest(
+        family="gemm",
+        mode="bmm",
+        parameters=parameters,
+        solution="gluon",
+        registration=None,
+        seed=42,
+        definition_version=1,
+    )
+    exact = BenchmarkRequest(
+        family="gemm",
+        mode="bmm",
+        parameters=parameters,
+        solution=None,
+        registration="gluon_bmm",
+        seed=42,
+        definition_version=1,
+    )
     parameters["size"] = 16
 
     assert normal.selection_mode == "normal"
@@ -147,13 +172,20 @@ def test_request_rejects_ambiguous_selection() -> None:
             {},
             solution="gluon",
             registration="exact",
+            seed=42,
+            definition_version=1,
         )
+
+
+def test_request_requires_identity_and_selection_fields() -> None:
+    with pytest.raises(TypeError):
+        BenchmarkRequest("gemm", "bmm", {})
 
 
 def test_harness_returns_measurement_and_actual_registration():
     set_benchmark_generator("unit_success", "test", _prepared)
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(_request("unit_success"))
 
     assert result.status is BenchmarkStatus.SUCCESS
@@ -217,7 +249,7 @@ def test_harness_routes_fresh_runs_to_each_output_validator() -> None:
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_output_routing", "test", generator)
-    result = KernelBenchmarkHarness(timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
         _request("unit_output_routing")
     )
 
@@ -289,7 +321,7 @@ def test_correctness_failure_skips_timing() -> None:
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_correctness_failure", "test", generator)
-    result = KernelBenchmarkHarness(timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
         _request("unit_correctness_failure")
     )
 
@@ -330,7 +362,7 @@ def test_correctness_exception_skips_timing() -> None:
 
     timer = _FakeTimer()
     set_benchmark_generator("unit_correctness_exception", "test", generator)
-    result = KernelBenchmarkHarness(timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
         _request("unit_correctness_exception")
     )
 
@@ -356,7 +388,7 @@ def test_correctness_exception_skips_timing() -> None:
 def test_harness_classifies_graph_failures(phase, status):
     set_benchmark_generator("unit_graph_failure", "test", _prepared)
     result = KernelBenchmarkHarness(
-        timer=_FailingTimer(phase), platform_provider=_platform
+        None, timer=_FailingTimer(phase), platform_provider=_platform
     ).run(_request("unit_graph_failure"))
 
     assert result.status is status
@@ -374,7 +406,7 @@ def test_harness_preserves_expected_preparation_outcome():
 
     set_benchmark_generator("unit_unavailable", "test", unavailable)
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(_request("unit_unavailable"))
 
     assert result.status is BenchmarkStatus.BACKEND_UNAVAILABLE
@@ -384,7 +416,7 @@ def test_harness_preserves_expected_preparation_outcome():
 
 def test_harness_reports_missing_generator_as_invalid_case():
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(_request("unit_missing_generator"))
 
     assert result.status is BenchmarkStatus.INVALID_CASE
@@ -406,7 +438,15 @@ def test_harness_reports_missing_generator_as_invalid_case():
     ],
 )
 def test_dense_bmm_rejects_invalid_generator_parameters(parameters, match):
-    request = BenchmarkRequest("gemm", "bmm", parameters)
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="bmm",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        seed=42,
+        definition_version=1,
+    )
 
     with pytest.raises(BenchmarkCaseError, match=match) as raised:
         gemm_generator.prepare_dense_bmm(request, _platform())
@@ -520,7 +560,7 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
     monkeypatch.setattr(gemm_generator, "get_input_generator", get_generator)
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
     timer = _FakeTimer()
-    result = KernelBenchmarkHarness(timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
@@ -532,8 +572,10 @@ def test_dense_bmm_uses_registered_reference_for_local_correctness(
                 "dtype": "bfloat16",
                 "validation": {"runs": 2, "atol": 0.0, "rtol": 0.0},
             },
+            solution=None,
             registration=candidate_spec.name,
             seed=7,
+            definition_version=1,
         )
     )
 
@@ -609,7 +651,7 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
     timer = _FakeTimer()
 
-    result = KernelBenchmarkHarness(timer=timer, platform_provider=_platform).run(
+    result = KernelBenchmarkHarness(None, timer=timer, platform_provider=_platform).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
@@ -621,7 +663,10 @@ def test_dense_bmm_validation_requires_a_compatible_registered_reference(
                 "dtype": "bfloat16",
                 "validation": {"runs": 1},
             },
+            solution=None,
             registration=candidate_spec.name,
+            seed=42,
+            definition_version=1,
         )
     )
 
@@ -657,13 +702,16 @@ def test_exact_dense_bmm_rejects_incompatible_shape(
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
 
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
+            solution=None,
             registration="unit_exact_bmm",
+            seed=42,
+            definition_version=1,
         )
     )
 
@@ -693,13 +741,16 @@ def test_dense_bmm_solution_shape_miss_is_invalid_not_backend_unavailable(
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
 
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
             parameters={"batch": 12, "M": 2, "N": 512, "K": 128},
             solution="unit",
+            registration=None,
+            seed=42,
+            definition_version=1,
         )
     )
 
@@ -715,13 +766,16 @@ def test_dense_bmm_missing_solution_reports_backend_unavailable(
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
 
     result = KernelBenchmarkHarness(
-        timer=_FakeTimer(), platform_provider=_platform
+        None, timer=_FakeTimer(), platform_provider=_platform
     ).run(
         BenchmarkRequest(
             family="gemm",
             mode="bmm",
             parameters={"batch": 12, "M": 1, "N": 512, "K": 128},
             solution="missing",
+            registration=None,
+            seed=42,
+            definition_version=1,
         )
     )
 
@@ -731,9 +785,12 @@ def test_dense_bmm_missing_solution_reports_backend_unavailable(
 @pytest.mark.parametrize(
     ("selection", "selection_mode"),
     [
-        ({}, "normal"),
-        ({"solution": "gluon"}, "solution"),
-        ({"registration": "gluon_bmm_a16w16_gfx950"}, "registration"),
+        ({"solution": None, "registration": None}, "normal"),
+        ({"solution": "gluon", "registration": None}, "solution"),
+        (
+            {"solution": None, "registration": "gluon_bmm_a16w16_gfx950"},
+            "registration",
+        ),
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
@@ -762,6 +819,8 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
                 "dtype": "bfloat16",
                 "validation": {"runs": 3},
             },
+            seed=42,
+            definition_version=1,
             **selection,
         )
     )

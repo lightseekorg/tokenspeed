@@ -87,10 +87,10 @@ class BenchmarkRequest:
     family: str
     mode: str
     parameters: dict[str, Any]
-    solution: str | None = None
-    registration: str | None = None
-    seed: int = 42
-    definition_version: int = 1
+    solution: str | None
+    registration: str | None
+    seed: int
+    definition_version: int
 
     def __post_init__(self) -> None:
         if self.solution is not None and self.registration is not None:
@@ -144,7 +144,18 @@ def set_benchmark_generator(
     mode: str,
     generator: BenchmarkGenerator,
 ) -> None:
-    """Register an operation-owned benchmark preparation function."""
+    """Associate an operation family and mode with a benchmark generator.
+
+    Args:
+        family: Operation family accepted by the generator.
+        mode: Operation mode within ``family`` accepted by the generator.
+        generator: Callable that receives a complete benchmark request and the
+            detected platform, then returns the registration, invocation,
+            parameters, and optional correctness work for the shared harness.
+
+    Returns:
+        None.
+    """
 
     _BENCHMARK_GENERATORS[(family, mode)] = generator
 
@@ -229,14 +240,18 @@ class KernelBenchmarkHarness:
 
     def __init__(
         self,
-        config: GraphBenchmarkConfig | None = None,
+        config: GraphBenchmarkConfig | None,
         *,
         timer: GraphTimer | None = None,
         platform_provider: Callable[[], PlatformInfo] = current_platform,
     ) -> None:
         if timer is not None and config is not None:
             raise ValueError("config cannot be provided with an explicit timer")
-        self._timer = timer or GraphTimer(config)
+        if timer is None:
+            if config is None:
+                raise ValueError("config is required when no timer is provided")
+            timer = GraphTimer(config)
+        self._timer = timer
         self._platform_provider = platform_provider
 
     def run(self, request: BenchmarkRequest) -> KernelBenchmarkResult:

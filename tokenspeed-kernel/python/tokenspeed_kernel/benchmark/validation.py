@@ -88,7 +88,17 @@ _OUTPUT_VALIDATORS: dict[str, OutputValidator] = {}
 
 
 def set_output_validator(name: str, validator: OutputValidator) -> None:
-    """Register a named output validator."""
+    """Associate a name with an output-validation function.
+
+    Args:
+        name: Name used by output validation specifications.
+        validator: Callable that receives an output specification and the
+            requested sequence of candidate/reference pairs, then returns a
+            validation outcome.
+
+    Returns:
+        None.
+    """
 
     _OUTPUT_VALIDATORS[name] = validator
 
