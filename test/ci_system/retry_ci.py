@@ -160,7 +160,7 @@ def replay(manifest: Path, root: Path, report: Path, coordinator: str) -> int:
         retained = (root / "scripts" / f"{stem}.sbatch").resolve()
         if retained.parent != root / "scripts":
             raise ValueError("retained script is outside the artifact root")
-        script = retained.read_text()
+        script = slurm.harden_bootstrap(retained.read_text())
         archives = re.findall(r"^source_archive=(.+)$", script, re.M)
         if len(archives) != 1 or len(shlex.split(archives[0])) != 1:
             raise ValueError("retained script has no unique source snapshot")

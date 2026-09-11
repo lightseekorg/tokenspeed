@@ -105,17 +105,22 @@ from one first bound to that pool:
   slab. The backend tree covers only itself: the executor's own pool
   references (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
-  model are the caller's to re-publish.
-* A rebind is an operation inside executor construction, owned by the
-  orchestrator a later change adds; nothing in the backend tree guards
-  against a rebind at another time. That orchestrator releases both graph
-  owners' captures first (the captured graphs record the buffers a publish
-  drops, and eager kernels cache pointers they allocated inside a capture,
-  such as flashinfer's trtllm-gen MoE runner and Qwen4-Exp's uniform index
-  bundles), unfreezes the device-global workspace pool the executor froze
-  before capturing, rebinds the trees, re-runs `bind_cache_groups` and the
-  initialisation sequence above, freezes the workspace again and captures
-  again.
+  model are the caller's to re-publish, as are the graph owners' own pool
+  references and the placeholder tables the decode runner sizes from the
+  arena. Of the sequence above only `init_prefill_graph_state` runs inside
+  `capture_graphs()`: `configure_runtime`, `init_cuda_graph_state` and
+  `preallocate_verify_workspace` all ran before the executor was returned,
+  so the orchestrator re-runs them itself.
+* A rebind is an operation between the executor's construction and
+  `ModelExecutor.capture_graphs()`, owned by the orchestrator a later change
+  adds; nothing in the backend tree guards against a rebind at another time.
+  That orchestrator releases both graph owners' captures first (the captured
+  graphs record the buffers a publish drops, and eager kernels cache
+  pointers they allocated inside a capture, such as flashinfer's trtllm-gen
+  MoE runner and Qwen4-Exp's uniform index bundles), unfreezes the device-
+  global workspace pool the executor froze before capturing, rebinds the
+  trees, re-runs `bind_cache_groups` and the initialisation sequence above,
+  freezes the workspace again and captures again.
 
 ### Padding contract
 
