@@ -458,43 +458,12 @@ likewise be visible on the compute node.
 
 ### Retry unsuccessful Slurm cases
 
-Open **Actions → Retry Failed CI Cases → Run workflow** and enter a Slurm
-Dispatch run URL or numeric run ID in `source_run`. For example,
-`https://github.com/lightseekorg/tokenspeed/actions/runs/34550905154` and
-`34550905154` identify the same source run. The latest completed attempt is
-used. You can also enter a run of **Retry Failed CI Cases** to retry only the
-cases that still have not passed.
-
-The workflow reads that attempt's report and returns to its original GB200 or
-GB300 coordinator pool. A case is successful only when Slurm reports
-`COMPLETED`, the exit code is zero, and its result JSON reports `ok: true`.
-Failed, cancelled, timed-out, and missing-result cases are eligible; successful
-cases are left alone. If every case passed, the retry submits nothing.
-
-Retries reuse the retained per-case submission script and git-archive snapshot.
-This preserves the actual tested commit, including a locally generated PR merge
-commit, YAML/runner pairing, GB300 runner alias, GPU/node allocation, container
-image digest, and cache mounts. The current checkout is used only for retry
-tooling. New reports also record script/snapshot checksums, scheduler options,
-and the non-secret installation environment, including unset variables so
-compute-node defaults still apply. Reports are saved as jobs are
-submitted and when a wait is interrupted.
-
-For older Slurm Dispatch reports, the retained script supplies the source SHA,
-image, and declared runner. The workflow used `batch`, `12:00:00`, no nodelist,
-and enabled in-tree MLA installation for PRs; these original defaults are
-recovered from the report's PR context. The original workflow's default model
-cache path is retained; custom ambient overrides were not recorded in legacy
-reports and cannot be recovered. Legacy snapshots are checked against
-their git-archive commit marker, but have no previously recorded checksum.
-All selected scripts and snapshots are checked before any job is submitted.
-If an interrupted dispatcher left original Slurm jobs active, the retry stops
-until those jobs finish or are cancelled, avoiding duplicate submissions.
-
-Both the GitHub report artifact and the original coordinator's shared
-`scripts/` and `snapshots/` files must still exist. Expired reports, pruned
-files, changed checksums, or incomplete context produce an error; the retry
-never substitutes latest `main` or recreates a PR merge. Package indexes,
-model downloads, and hardware availability can still change between runs.
-This entry point supports aggregate **Slurm Dispatch** reports. For workflows
-with one case per GitHub job, use GitHub's **Re-run failed jobs** instead.
+Open **Actions → Retry Failed CI Cases → Run workflow** and enter the run URL
+or ID (for example `34550905154`) in `source_run`. The latest completed attempt
+of **Slurm Dispatch**, or a previous retry, supplies the failed cases.
+Only `COMPLETED` cases with exit code zero and `ok: true` are skipped.
+Retries reuse the original submission scripts and source snapshot, preserving
+the tested commit, image, configuration and GPU allocation. The original
+report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
+The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
+For workflows with one case per GitHub job, use **Re-run failed jobs**.

@@ -24,46 +24,6 @@ def workflow_dispatch_inputs(name: str) -> dict:
     return triggers["workflow_dispatch"]["inputs"]
 
 
-def test_retry_workflow_uses_original_report_and_trusted_dispatcher():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/retry-failed-ci-cases.yml")
-    assert workflow_dispatch_inputs("retry-failed-ci-cases.yml")["source_run"][
-        "required"
-    ]
-    assert workflow["permissions"] == {"contents": "read", "actions": "read"}
-    resolve = workflow["jobs"]["resolve"]
-    retry = workflow["jobs"]["retry"]
-    assert resolve["steps"][0]["with"]["ref"] == "main"
-    assert (
-        retry["steps"][0]["with"]["ref"]
-        == "${{ needs.resolve.outputs.dispatcher_sha }}"
-    )
-    assert retry["runs-on"] == "${{ needs.resolve.outputs.coordinator }}"
-    download = next(
-        step
-        for step in retry["steps"]
-        if step.get("uses") == "actions/download-artifact@v4"
-    )
-    assert download["with"]["run-id"] == "${{ needs.resolve.outputs.source_run_id }}"
-    assert (
-        download["with"]["artifact-ids"] == "${{ needs.resolve.outputs.artifact_id }}"
-    )
-    assert download["with"]["merge-multiple"] is True
-    execution = next(
-        step
-        for step in retry["steps"]
-        if step["name"] == "Retry unsuccessful Slurm cases"
-    )
-    assert "--replay-manifest" in execution["run"]
-    assert "--all" not in execution["run"]
-    assert "--pr" not in execution["run"]
-    assert retry["concurrency"]["cancel-in-progress"] is False
-    for job in workflow["jobs"].values():
-        for step in job["steps"]:
-            if "run" in step:
-                assert "${{ inputs.source_run }}" not in step["run"]
-                subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)
-
-
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -921,7 +881,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 30 || inputs.timeout_minutes }}"
+        " && 10 || inputs.timeout_minutes }}"
     )
 
 

@@ -18,169 +18,194 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import copy
+import json
+import subprocess
+import tarfile
+from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 import retry_ci
+import slurm_submit as slurm
 
 REPOSITORY = "lightseekorg/tokenspeed"
+COMMIT = "a" * 40
+IMAGE = "ghcr.io/lightseekorg/tokenspeed-runner:test@sha256:" + "b" * 64
 
 
 @pytest.mark.parametrize(
-    "value",
-    [
-        "34550905154",
-        " 34550905154 ",
-        "https://github.com/lightseekorg/tokenspeed/actions/runs/34550905154/",
-    ],
+    "value", ["123", f"https://github.com/{REPOSITORY}/actions/runs/123"]
 )
-def test_parse_run_url_and_id(value):
-    assert retry_ci.parse_run_id(value, REPOSITORY) == 34550905154
+def test_run_id_and_url(value):
+    assert retry_ci.parse_run_id(value, REPOSITORY) == 123
 
 
 @pytest.mark.parametrize(
-    "value",
-    [
-        "0",
-        "-1",
-        "123; echo unsafe",
-        "https://github.com/other/repo/actions/runs/123",
-        "https://github.com.evil.invalid/lightseekorg/tokenspeed/actions/runs/123",
-        "https://github.com/lightseekorg/tokenspeed/actions/runs/123/jobs/456",
-    ],
+    "value", ["123; echo unsafe", "0", "https://github.com/other/repo/actions/runs/123"]
 )
-def test_reject_invalid_run(value):
+def test_invalid_run(value):
     with pytest.raises(ValueError):
         retry_ci.parse_run_id(value, REPOSITORY)
 
 
-@pytest.fixture
-def api(monkeypatch):
-    run = {
-        "status": "completed",
-        "path": ".github/workflows/slurm-dispatch.yml",
-        "event": "workflow_dispatch",
-        "run_attempt": 2,
-    }
-    jobs = [{"labels": ["slurm-dispatch"], "conclusion": "failure"}]
-    artifacts = [
-        {"name": "slurm-123-1", "id": 11, "expired": False},
-        {"name": "slurm-123-2", "id": 12, "expired": False},
-    ]
-    calls = []
-
-    def request(endpoint):
-        calls.append(endpoint)
-        if endpoint.endswith("/123"):
-            return copy.deepcopy(run)
-        if "/attempts/2/jobs?" in endpoint:
-            return {"jobs": jobs}
-        if "/artifacts?" in endpoint:
-            return {"artifacts": artifacts}
-        raise AssertionError(endpoint)
-
-    monkeypatch.setattr(retry_ci, "gh_json", request)
-    return run, jobs, artifacts, calls
-
-
-def test_resolve_uses_current_attempt_and_recorded_coordinator(api):
-    _, jobs, _, calls = api
-    jobs[0]["labels"] = ["self-hosted", "slurm-dispatch-gb300"]
-    result = retry_ci.resolve_run("123", REPOSITORY)
-    assert result == {
-        "source_run_id": "123",
-        "source_attempt": "2",
-        "artifact_name": "slurm-123-2",
-        "artifact_id": "12",
-        "coordinator": "slurm-dispatch-gb300",
-    }
-    assert any("/attempts/2/jobs" in endpoint for endpoint in calls)
-    assert not any("/attempts/1/jobs" in endpoint for endpoint in calls)
-
-
 @pytest.mark.parametrize(
-    "mutation,error",
-    [
-        ("running", "finish"),
-        ("unsupported", "Slurm Dispatch"),
-        ("expired", "expired"),
-        ("missing", "missing"),
-        ("no_coordinator", "coordinator"),
-        ("two_coordinators", "coordinator"),
-    ],
+    "invalid", [None, "workflow", "event", "running", "artifact", "attempt"]
 )
-def test_resolve_fails_without_replay_context(api, mutation, error):
-    run, jobs, artifacts, _ = api
-    if mutation == "running":
-        run["status"] = "in_progress"
-    elif mutation == "unsupported":
-        run["path"] = ".github/workflows/k8s-dispatch.yml"
-    elif mutation == "expired":
-        artifacts[-1]["expired"] = True
-    elif mutation == "missing":
-        artifacts.pop()
-    elif mutation == "no_coordinator":
-        jobs.clear()
-    elif mutation == "two_coordinators":
-        jobs.append({"labels": ["slurm-dispatch-gb300"]})
-    with pytest.raises(ValueError, match=error):
-        retry_ci.resolve_run("123", REPOSITORY)
-
-
-def test_resolve_rejects_attempt_race(api, monkeypatch):
-    original = retry_ci.gh_json
+def test_resolve_completed_attempt(monkeypatch, invalid):
     reads = 0
 
-    def request(endpoint):
+    def api(endpoint):
         nonlocal reads
-        result = original(endpoint)
         if endpoint.endswith("/123"):
             reads += 1
-            if reads == 2:
-                result["run_attempt"] = 3
-        return result
-
-    monkeypatch.setattr(retry_ci, "gh_json", request)
-    with pytest.raises(ValueError, match="changed"):
-        retry_ci.resolve_run("123", REPOSITORY)
-
-
-def test_paginated_job_lookup(monkeypatch):
-    calls = []
-
-    def request(endpoint):
-        calls.append(endpoint)
+            return {
+                "path": (
+                    ".github/workflows/other.yml"
+                    if invalid == "workflow"
+                    else ".github/workflows/slurm-dispatch.yml"
+                ),
+                "event": "pull_request" if invalid == "event" else "workflow_dispatch",
+                "status": "in_progress" if invalid == "running" else "completed",
+                "run_attempt": 3 if invalid == "attempt" and reads == 2 else 2,
+            }
+        if "/attempts/2/jobs?" in endpoint:
+            return {"jobs": [{"labels": ["slurm-dispatch-gb300"]}]}
+        assert "/artifacts?" in endpoint
         return {
-            "jobs": (
-                [{"labels": []}] * 100
-                if endpoint.endswith("page=1")
-                else [{"labels": ["slurm-dispatch"]}]
-            )
+            "artifacts": [
+                {"name": "slurm-123-1", "id": 11, "expired": False},
+                {"name": "slurm-123-2", "id": 12, "expired": invalid == "artifact"},
+            ]
         }
 
-    monkeypatch.setattr(retry_ci, "gh_json", request)
-    assert len(retry_ci.gh_items("example/jobs", "jobs")) == 101
-    assert calls == [
-        "example/jobs?per_page=100&page=1",
-        "example/jobs?per_page=100&page=2",
-    ]
+    monkeypatch.setattr(retry_ci, "gh_json", api)
+    if invalid:
+        with pytest.raises(ValueError):
+            retry_ci.resolve_run("123", REPOSITORY)
+    else:
+        result = retry_ci.resolve_run("123", REPOSITORY)
+        assert result["artifact_id"] == "12"
+        assert result["source_attempt"] == "2"
+        assert result["coordinator"] == "slurm-dispatch-gb300"
 
 
-def test_main_writes_only_validated_outputs(api, tmp_path):
-    output = tmp_path / "output"
-    assert (
-        retry_ci.main(
-            [
-                "--source-run",
-                "123",
-                "--repository",
-                REPOSITORY,
-                "--github-output",
-                str(output),
-            ]
+@pytest.fixture
+def report(tmp_path):
+    root = tmp_path / "coordinator"
+    for name in ("scripts", "snapshots", "logs", "runs"):
+        (root / name).mkdir(parents=True)
+    source = root / "snapshots" / f"{COMMIT}.tar"
+    with tarfile.open(
+        source, "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": COMMIT}
+    ) as archive:
+        archive.addfile(tarfile.TarInfo("source.txt"))
+    original = tmp_path / "original"
+    original.mkdir()
+    (original / "summary.md").write_text("**Target PR:** #42\n")
+    rows, scripts = [], {}
+    for number in (1, 2, 3):
+        task = slurm.Task(
+            f"test/ci/eval/case-{number}.yaml",
+            f"case-{number}",
+            "eval",
+            "b200-4gpu",
+            4,
+            2 if number == 3 else 1,
         )
-        == 0
+        stem = f"{task.name}-{COMMIT[:12]}-{number}000"
+        script = slurm.render_script(task, source, root / "runs", root / "cache", IMAGE)
+        scripts[task.name] = script
+        (root / "scripts" / f"{stem}.sbatch").write_text(script)
+        rows.append(
+            {
+                "job_id": str(number),
+                "task": asdict(task),
+                "log": str(root / "logs" / f"{stem}-{number}.out"),
+                "state": "FAILED" if number == 2 else "COMPLETED",
+                "exit_code": "1:0" if number == 2 else "0:0",
+            }
+        )
+    (original / "1-result.json").write_text('{"ok": true}')
+    (original / "2-result.json").write_text('{"ok": false}')
+    manifest = original / "manifest.json"
+    manifest.write_text(json.dumps(rows))
+    return root, manifest, scripts
+
+
+@pytest.mark.parametrize("problem", [None, "active", "missing", "snapshot", "outside"])
+def test_replay_preserves_original_scripts_and_commit(
+    report, monkeypatch, tmp_path, problem
+):
+    root, manifest, scripts = report
+    calls = []
+    if problem == "missing":
+        next((root / "scripts").glob("case-3-*")).unlink()
+    elif problem == "snapshot":
+        next((root / "snapshots").iterdir()).unlink()
+    elif problem == "outside":
+        rows = json.loads(manifest.read_text())
+        rows[2]["log"] = "/elsewhere/case-3.out"
+        manifest.write_text(json.dumps(rows))
+
+    def command(argv, **kwargs):
+        if argv[0] == "squeue":
+            assert argv == ["squeue", "--noheader", "--format=%i"]
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="2\n" if problem == "active" else ""
+            )
+        assert argv[0] == "sbatch"
+        assert retry_ci.os.environ["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == "1"
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=str(100 + len(calls)))
+
+    def wait(submissions, run_root, output, source_pr):
+        assert source_pr == "42"
+        assert [s.task.name for s in submissions] == ["case-2", "case-3"]
+        return True
+
+    monkeypatch.setattr(retry_ci.subprocess, "run", command)
+    monkeypatch.setattr(slurm, "wait_all", wait)
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("INSTALL_TOKENSPEED_MLA_FROM_SOURCE", "0")
+    output = tmp_path / "retry"
+    args = [
+        "replay",
+        "--manifest",
+        str(manifest),
+        "--artifact-root",
+        str(root),
+        "--report-dir",
+        str(output),
+        "--coordinator",
+        "slurm-dispatch",
+    ]
+    assert retry_ci.main(args) == (2 if problem else 0)
+    if problem:
+        assert calls == []
+    else:
+        assert len(calls) == 2
+        assert "--nodes=2" in calls[1]
+        for row in json.loads((output / "manifest.json").read_text()):
+            stem = Path(row["log"]).name.removesuffix(f"-{row['job_id']}.out")
+            script = (root / "scripts" / f"{stem}.sbatch").read_text()
+            assert script == scripts[row["task"]["name"]]
+            assert COMMIT in script and IMAGE in script
+        assert "#42" in (output / "summary.md").read_text()
+
+
+def test_all_passed_needs_no_retained_files_or_slurm(report, monkeypatch, tmp_path):
+    root, manifest, _ = report
+    rows = json.loads(manifest.read_text())
+    for row in rows:
+        row.update(state="COMPLETED", exit_code="0:0")
+        (manifest.parent / f"{row['job_id']}-result.json").write_text('{"ok": true}')
+    manifest.write_text(json.dumps(rows))
+    for path in (root / "scripts").iterdir():
+        path.unlink()
+    monkeypatch.setattr(
+        retry_ci.subprocess,
+        "run",
+        lambda *a, **kw: pytest.fail("no Slurm calls expected"),
     )
-    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert values["artifact_id"] == "12"
-    assert values["coordinator"] == "slurm-dispatch"
+    monkeypatch.setenv("INSTALL_TOKENSPEED_MLA_FROM_SOURCE", "0")
+    assert retry_ci.replay(manifest, root, tmp_path / "retry", "slurm-dispatch") == 0

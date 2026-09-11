@@ -18,15 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Resolve a Slurm run's report and coordinator without submitting any work."""
+"""Resolve a Slurm run and retry unsuccessful cases using its retained scripts."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 SUPPORTED_WORKFLOWS = {
@@ -115,20 +118,131 @@ def resolve_run(source_run: str, repository: str) -> dict[str, str]:
     }
 
 
+def failed_cases(manifest: Path) -> list[dict]:
+    failed = []
+    for row in json.loads(manifest.read_text()):
+        try:
+            result = json.loads(
+                (manifest.parent / f"{row['job_id']}-result.json").read_text()
+            )
+        except (OSError, ValueError):
+            result = {}
+        if not (
+            row["state"] == "COMPLETED"
+            and row["exit_code"] in ("0", "0:0")
+            and isinstance(result, dict)
+            and result.get("ok") is True
+        ):
+            failed.append(row)
+    return failed
+
+
+def replay(manifest: Path, root: Path, report: Path, coordinator: str) -> int:
+    import slurm_submit as slurm
+
+    root = root.resolve()
+    rows = failed_cases(manifest)
+    prepared = []
+    for row in rows:
+        task = slurm.Task(**row["task"])
+        gb300 = task.runner.startswith(("gb300-", "slurm-gb300-"))
+        if gb300 != (coordinator == "slurm-dispatch-gb300"):
+            raise ValueError("case belongs to a different Slurm coordinator")
+        log = Path(row["log"])
+        suffix = f"-{row['job_id']}.out"
+        stem = log.name.removesuffix(suffix)
+        if (
+            log.parent.resolve() != root / "logs"
+            or not log.name.endswith(suffix)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+-[0-9a-f]{12}-[0-9]+", stem)
+        ):
+            raise ValueError("invalid retained script path")
+        retained = (root / "scripts" / f"{stem}.sbatch").resolve()
+        if retained.parent != root / "scripts":
+            raise ValueError("retained script is outside the artifact root")
+        script = retained.read_text()
+        archives = re.findall(r"^source_archive=(.+)$", script, re.M)
+        if len(archives) != 1 or len(shlex.split(archives[0])) != 1:
+            raise ValueError("retained script has no unique source snapshot")
+        source = Path(shlex.split(archives[0])[0]).resolve()
+        if source.parent != root / "snapshots" or not re.fullmatch(
+            r"[0-9a-f]{40}\.tar", source.name
+        ):
+            raise ValueError("invalid retained snapshot path")
+        with tarfile.open(source) as archive:
+            if archive.pax_headers.get("comment") != source.stem:
+                raise ValueError("snapshot does not match its original commit")
+        prepared.append((task, script, source.stem))
+    if len({commit for _, _, commit in prepared}) > 1:
+        raise ValueError("source cases do not share one commit")
+
+    summary = (manifest.parent / "summary.md").read_text()
+    pr = re.search(r"^\*\*Target PR:\*\* \[?#([0-9]+)", summary, re.M)
+    source_pr = pr[1] if pr else None
+    if rows:
+        queued = subprocess.run(
+            ["squeue", "--noheader", "--format=%i"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if {row["job_id"] for row in rows}.intersection(queued.stdout.split()):
+            raise ValueError("original Slurm cases are still active")
+    os.environ["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] = "1" if source_pr else "0"
+    options = argparse.Namespace(
+        partition="batch", time="12:00:00", nodelist=None, render=False
+    )
+    submitted = []
+    try:
+        for task, script, commit in prepared:
+            print(f"Retry {task.name} at {commit}", flush=True)
+            submitted.append(slurm.submit(task, script, root, options, commit))
+        slurm.write_report(submitted, {}, root / "runs", report, source_pr)
+        return (
+            0
+            if not submitted
+            or slurm.wait_all(submitted, root / "runs", report, source_pr)
+            else 1
+        )
+    except BaseException:
+        if submitted:
+            subprocess.run(["scancel", *[s.job_id for s in submitted]], check=False)
+            slurm.write_report(submitted, {}, root / "runs", report, source_pr)
+        raise
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-run", required=True)
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--github-output", type=Path, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    resolve = commands.add_parser("resolve")
+    resolve.add_argument("--source-run", required=True)
+    resolve.add_argument("--repository", required=True)
+    resolve.add_argument("--github-output", type=Path, required=True)
+    retry = commands.add_parser("replay")
+    retry.add_argument("--manifest", type=Path, required=True)
+    retry.add_argument("--artifact-root", type=Path, required=True)
+    retry.add_argument("--report-dir", type=Path, required=True)
+    retry.add_argument("--coordinator", choices=sorted(COORDINATORS), required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == "replay":
+            return replay(
+                args.manifest, args.artifact_root, args.report_dir, args.coordinator
+            )
         outputs = resolve_run(args.source_run, args.repository)
         with args.github_output.open("a") as output:
             for key, value in outputs.items():
                 output.write(f"{key}={value}\n")
         print(json.dumps(outputs, indent=2))
         return 0
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        tarfile.TarError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"Cannot retry source run: {exc}", file=sys.stderr)
         return 2
 

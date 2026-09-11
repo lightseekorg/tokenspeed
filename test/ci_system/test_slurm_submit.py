@@ -671,7 +671,7 @@ def test_submit_requests_multi_node_allocation(capsys, tmp_path):
         render=True,
     )
 
-    submit(task, "#!/bin/bash\n", tmp_path, args, "a" * 40, {})
+    submit(task, "#!/bin/bash\n", tmp_path, args, "a" * 40)
 
     command = capsys.readouterr().out.splitlines()[0]
     assert "--nodes=4" in command
@@ -700,7 +700,7 @@ def test_write_report_collects_logs_and_results(monkeypatch, tmp_path):
 
     report = tmp_path / "report"
     write_report(
-        [Submission(task, "123", log, {})],
+        [Submission(task, "123", log)],
         {
             "123": {
                 "state": "COMPLETED",
@@ -723,7 +723,6 @@ def test_write_report_collects_logs_and_results(monkeypatch, tmp_path):
         "runner": "gb200-1gpu",
         "gpus": 1,
         "nodes": 1,
-        "declared_runner": None,
     }
     assert (
         "| 123 | eval | gb200-1gpu | example | ✅ |"
@@ -819,7 +818,6 @@ def test_wait_all_uses_scontrol_when_accounting_is_empty(monkeypatch, tmp_path):
         Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4),
         "123",
         tmp_path / "123.log",
-        {},
     )
     assert wait_all([submission], tmp_path / "runs", tmp_path / "report")
 
@@ -829,7 +827,6 @@ def test_print_progress_omits_running_node(capsys, tmp_path):
         Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
         "123",
         tmp_path / "job.log",
-        {},
     )
     print_progress(
         [submission],
@@ -853,7 +850,6 @@ def test_print_progress_handles_accounting_delay(capsys, tmp_path):
         Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
         "123",
         tmp_path / "job.log",
-        {},
     )
 
     print_progress([submission], {"123": {}})

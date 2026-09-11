@@ -18,7 +18,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       source_run_id: ${{ steps.source.outputs.source_run_id }}
-      source_attempt: ${{ steps.source.outputs.source_attempt }}
       artifact_id: ${{ steps.source.outputs.artifact_id }}
       coordinator: ${{ steps.source.outputs.coordinator }}
       dispatcher_sha: ${{ steps.source.outputs.dispatcher_sha }}
@@ -36,7 +35,7 @@ jobs:
           SOURCE_RUN: ${{ inputs.source_run }}
         run: |
           set -euo pipefail
-          python3 test/ci_system/retry_ci.py \
+          python3 test/ci_system/retry_ci.py resolve \
             --source-run "$SOURCE_RUN" \
             --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT"
@@ -72,36 +71,24 @@ jobs:
           COORDINATOR: ${{ needs.resolve.outputs.coordinator }}
         run: |
           set -euo pipefail
+          coordinator_user=${USER:-$(id -un)}
           case "$COORDINATOR" in
-            slurm-dispatch) ;;
-            slurm-dispatch-gb300)
-              coordinator_user=${USER:-$(id -un)}
-              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
-              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
-              ;;
-            *) echo "Unsupported coordinator: $COORDINATOR" >&2; exit 2 ;;
+            slurm-dispatch) artifact_root="${TS_CI_ARTIFACT_ROOT:-/mnt/nfs01/$coordinator_user/tokenspeed-slurm}" ;;
+            slurm-dispatch-gb300) artifact_root="/data/home/$coordinator_user/tokenspeed-slurm" ;;
           esac
-          exec test/ci/run_slurm.sh \
-            --replay-manifest "$RUNNER_TEMP/slurm-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/manifest.json" \
-            --replay-coordinator "$COORDINATOR" \
-            --wait \
+          python3 test/ci_system/retry_ci.py replay \
+            --manifest "$RUNNER_TEMP/slurm-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/manifest.json" \
+            --artifact-root "$artifact_root" \
+            --coordinator "$COORDINATOR" \
             --report-dir "$RUNNER_TEMP/slurm-report-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 
       - name: Publish retry summary
         if: always()
-        env:
-          SOURCE_RUN_ID: ${{ needs.resolve.outputs.source_run_id }}
-          SOURCE_ATTEMPT: ${{ needs.resolve.outputs.source_attempt }}
         run: |
-          report="$RUNNER_TEMP/slurm-report-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -p "$report"
-          if [ ! -f "$report/summary.md" ]; then
-            echo "Retry stopped before producing a report; see the validation error above." > "$report/summary.md"
+          report="$RUNNER_TEMP/slurm-report-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/summary.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
           fi
-          printf '\nSource: [%s, attempt %s](https://github.com/%s/actions/runs/%s/attempts/%s)\n' \
-            "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" "$GITHUB_REPOSITORY" "$SOURCE_RUN_ID" "$SOURCE_ATTEMPT" \
-            >> "$report/summary.md"
-          cat "$report/summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload retry results
         if: always()
