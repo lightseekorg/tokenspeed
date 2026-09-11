@@ -208,12 +208,46 @@ def test_attention_collective_gate():
     # passes for every value and pins nothing.
     assert ATTN_AR_MAX_TOKENS == 8
     # An unarmed group never takes the collective; shape cannot override that.
-    assert not attn_ar_eligible(False, True, 1)
+    assert not attn_ar_eligible(armed=False, has_prefix=True, num_tokens=1)
     # The vendor AR owns everything wider than the one-shot window, and the
     # window edge itself belongs to us.
-    assert attn_ar_eligible(True, True, 8)
-    assert not attn_ar_eligible(True, True, 9)
+    assert attn_ar_eligible(armed=True, has_prefix=True, num_tokens=8)
+    assert not attn_ar_eligible(armed=True, has_prefix=True, num_tokens=9)
     # Block-write layers hand the prefix to the snapshot, so there is no
     # residual left for the collective to fold in.
-    assert not attn_ar_eligible(True, False, 1)
-    assert not attn_ar_eligible(True, True, 0)
+    assert not attn_ar_eligible(armed=True, has_prefix=False, num_tokens=1)
+    assert not attn_ar_eligible(armed=True, has_prefix=True, num_tokens=0)
+
+
+def test_the_collective_is_what_serves_an_eligible_reduce():
+    """The predicate is only half the contract: the branch must call the kernel."""
+    import torch
+
+    from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
+
+    reduced = torch.zeros(1, 8)
+    collective = Mock(return_value=(reduced, "shared"))
+    comm = K3AttnComm.__new__(K3AttnComm)
+    comm.state = SimpleNamespace(
+        cute_ar=collective, dummy_norm=SimpleNamespace(weight=None)
+    )
+    comm.mapping = None
+
+    out, mixed = comm.attn_reduce(
+        torch.zeros(1, 8), torch.zeros(1, 8), None, mlp_wp=None
+    )
+    assert collective.call_count == 1
+    assert out is reduced and mixed is None
+
+    # Nine tokens and a consumed prefix are both the vendor's, and neither may
+    # reach the kernel.
+    collective.reset_mock()
+    for partial, prefix in (
+        (torch.zeros(9, 8), torch.zeros(9, 8)),
+        (torch.zeros(1, 8), None),
+    ):
+        try:
+            comm.attn_reduce(partial, prefix, None, mlp_wp=None)
+        except Exception:
+            pass
+    assert collective.call_count == 0

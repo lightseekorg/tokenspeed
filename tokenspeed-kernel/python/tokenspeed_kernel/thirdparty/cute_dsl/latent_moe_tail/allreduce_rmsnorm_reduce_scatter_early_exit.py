@@ -138,6 +138,13 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             raise ValueError("at least one collective role must be enabled")
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
+        if residual_from_shared and latent_dim != hidden_dim:
+            # The residual read walks shared_source with the latent row pitch,
+            # so a narrower latent silently reads the wrong row, never faults.
+            raise ValueError(
+                "residual_from_shared requires latent_dim == hidden_dim, got "
+                f"{latent_dim} and {hidden_dim}"
+            )
         # Deferred-finalize input mode: the routed publish phase consumes the
         # MoE kernel's (gemm2 permuted rows, expert weights, expanded->permuted
         # index) triple instead of a materialized [M, latent] partial. The
@@ -1043,6 +1050,13 @@ class CollectiveKernel:
         )
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
+        if residual_from_shared and latent_dim != hidden_dim:
+            # The residual read walks shared_source with the latent row pitch,
+            # so a narrower latent silently reads the wrong row, never faults.
+            raise ValueError(
+                "residual_from_shared requires latent_dim == hidden_dim, got "
+                f"{latent_dim} and {hidden_dim}"
+            )
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim

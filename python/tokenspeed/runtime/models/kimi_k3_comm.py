@@ -58,6 +58,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     latent_tail_supported,
+    multicast_backend_available,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
@@ -87,7 +88,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 ATTN_AR_MAX_TOKENS = 8
 
 
-def attn_ar_eligible(armed: bool, has_prefix: bool, num_tokens: int) -> bool:
+def attn_ar_eligible(*, armed: bool, has_prefix: bool, num_tokens: int) -> bool:
     """Whether the tokenspeed collective, not the vendor AR, serves this reduce."""
     return armed and has_prefix and 0 < num_tokens <= ATTN_AR_MAX_TOKENS
 
@@ -326,9 +327,22 @@ class K3AttnCommState:
 
         # Callers hand in their own output buffer, so one instance serves every
         # layer: layer L's output is still the reduce operand of layer L+1.
+        # The build is collective, so the decision to build must be too: a rank
+        # that skipped it would strand its peers inside the rendezvous.
         self.cute_ar = None
-        if self.attn_ar_fusion_ok:
+        # Gate on config, which cannot differ across ranks, and vote on the
+        # probes, which can: both arming helpers swallow their exceptions.
+        if dist.is_initialized() and mapping.attn.tp_size > 1:
             group = _get_process_group(mapping.attn.tp_group)
+            # The vendor arming bit is not this kernel's capability: the
+            # collective also needs an NVLS multicast mapping, and raises
+            # without one.
+            local_ok = self.attn_ar_fusion_ok and multicast_backend_available(group)
+            vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
+        else:
+            vote = torch.zeros(1, dtype=torch.int32)
+        if bool(vote.item()):
             self.cute_ar = _AttnCollective(
                 group=group,
                 rank=mapping.attn.tp_rank,
@@ -525,10 +539,13 @@ class K3AttnComm:
         """
         num_tokens = attn_partial.shape[0]
         if attn_ar_eligible(
-            self.state.cute_ar is not None, prefix_sum is not None, num_tokens
+            armed=self.state.cute_ar is not None,
+            has_prefix=prefix_sum is not None,
+            num_tokens=num_tokens,
         ):
-            # The kernel writes a full max_m rows, so the buffer is that wide
-            # even when the batch is not; ``prefix_sum`` carries the residual.
+            # The kernel writes only the m rows it reduces; the buffer is
+            # max_m wide because the dispatch validates that exact shape.
+            # ``prefix_sum`` carries the residual this epilogue folds in.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,

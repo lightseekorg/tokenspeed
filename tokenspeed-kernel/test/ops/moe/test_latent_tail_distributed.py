@@ -329,3 +329,101 @@ def test_latent_tail_accepts_sharded_weight(m):
     sharded = op(routed, shared, rms_w, up_w_shard)
     torch.cuda.synchronize()
     assert torch.equal(full, sharded), "sharded weight must be bit-identical"
+
+
+def _require_attn_collective():
+    """Rank-agreed multicast probe; a one-sided skip hangs the rendezvous."""
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+    from tokenspeed_kernel.ops.moe.latent_tail import multicast_backend_available
+
+    # The probe refuses to gather the fabric map itself; a server does it at
+    # distributed init, so a standalone test has to stand in for that.
+    gather_fabric_map()
+    ok = multicast_backend_available(dist.group.WORLD)
+    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if not bool(flag.item()):
+        pytest.skip("platform has no rank-agreed multicast support")
+
+
+def _attn_collective(dev, max_m):
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        CollectiveKernel,
+    )
+
+    return CollectiveKernel(
+        group=dist.group.WORLD,
+        rank=dist.get_rank(),
+        tp_size=_world_size(),
+        latent_dim=H,
+        hidden_dim=H,
+        max_m=max_m,
+        max_token_ctas=max_m,
+        rms_eps=1.0,
+        fp32_internal=True,
+        scratch_allocator=None,
+        finalize_top_k=None,
+        precompile_split=True,
+        residual_from_shared=True,
+    )
+
+
+@pytest.mark.parametrize("m", [1, 2, 8])
+def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix(m):
+    """The attention epilogue must emit all-reduce(partial) + prefix."""
+    rank, dev = _setup()
+    _require_attn_collective()
+    max_m = 8
+    torch.manual_seed(7 + rank)
+    partial = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    torch.manual_seed(99)  # the prefix is rank-uniform, like the residual stream
+    prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+
+    expected = partial.float().clone()
+    dist.all_reduce(expected)
+    expected = (expected + prefix.float()).to(torch.bfloat16)
+
+    out, _ = _attn_collective(dev, max_m)(
+        partial,
+        prefix,
+        gamma,
+        include_reduce_scatter=False,
+        include_routed=True,
+        latent_output_override=torch.empty(max_m, H, dtype=torch.bfloat16, device=dev),
+    )
+    torch.cuda.synchronize()
+    err = (out.float() - expected.float()).abs().max().item()
+    scale = expected.float().abs().max().item()
+    # One bf16 ulp at this scale; the reduce order differs from torch's.
+    assert err <= 8e-3 * max(scale, 1.0), f"max|err|={err} scale={scale}"
+
+    # Negative control: the same comparison must reject a missing residual, or
+    # it cannot tell a correct epilogue from one that drops the prefix.
+    bad = (out.float() - prefix.float() - expected.float()).abs().max().item()
+    assert bad > 8e-3 * max(scale, 1.0)
+
+
+def test_residual_from_shared_rejects_a_mismatched_latent_width():
+    """The residual read walks shared_source with the latent pitch."""
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        CollectiveKernel,
+    )
+
+    _setup()
+    with pytest.raises(ValueError, match="latent_dim == hidden_dim"):
+        CollectiveKernel(
+            group=dist.group.WORLD,
+            rank=dist.get_rank(),
+            tp_size=_world_size(),
+            latent_dim=L,
+            hidden_dim=H,
+            max_m=8,
+            max_token_ctas=8,
+            rms_eps=1.0,
+            fp32_internal=True,
+            scratch_allocator=None,
+            finalize_top_k=None,
+            precompile_split=True,
+            residual_from_shared=True,
+        )
