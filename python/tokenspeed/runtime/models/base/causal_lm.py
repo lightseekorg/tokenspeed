@@ -31,7 +31,6 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
@@ -105,9 +104,12 @@ class BaseCausalLM(nn.Module):
             return self.model.embed_tokens
 
         if self.mapping.attn.has_dp:
-            return ReplicatedLinear(
-                config.hidden_size,
+            # A TP1 ParallelLMHead is replicated while retaining the LM-head
+            # quantization policy; global model quantization does not imply
+            # that an unquantized checkpoint head has quantization scales.
+            return ParallelLMHead(
                 config.vocab_size,
+                config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),

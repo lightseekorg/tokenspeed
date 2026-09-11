@@ -63,6 +63,11 @@ With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 releases that carry the TokenSpeed dp-affinity support; see the lockstep
 note in `serve_smg.py`.
 
+Attention-DP ranks keep a full LM head so each replica can produce logits for
+its own requests. The replicated head follows the same checkpoint-aware
+quantization policy as a tensor-parallel LM head: a model-wide quantization
+setting does not quantize a head whose checkpoint tensor is stored unquantized.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:
