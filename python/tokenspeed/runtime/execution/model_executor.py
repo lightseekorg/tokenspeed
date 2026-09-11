@@ -39,6 +39,7 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -57,6 +58,7 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
+    NGramInputs,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -347,6 +349,16 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+        if ngram_context and (
+            config.spec_algo is not None
+            or config.pp_size != 1
+            or config.overlap_schedule_depth > 1
+        ):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and non-speculative decoding"
+            )
+        self.input_buffers.init_ngram_buffers(ngram_context)
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -586,6 +598,11 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
+            # Reuse idle's dummy-input scrub before prefill writes its geometry;
+            # borrowed Engram views must not retain live history or masks.
+            ib.fill_dummy_decode_buffers(
+                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
+            )
             ctx = self.prefill_graph.make_dummy_batch(num_tokens)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
@@ -597,6 +614,7 @@ class ModelExecutor:
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
+                    **ib.ngram_model_kwargs(num_tokens),
                 )
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
@@ -710,6 +728,7 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
                 pp_inbound=pp_inbound,
+                **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
             )
             return output
         # Prefill-graph replay when captured for this forward (the decode graph
@@ -730,6 +749,7 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             multimodal_context=self._active_multimodal_context,
+            **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
         )
 
     def _apply_force_single_token_verify(
@@ -1050,6 +1070,7 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
+            **self.input_buffers.ngram_model_kwargs(0),
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1220,6 +1241,8 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        *,
+        ngram_inputs: NGramInputs | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1262,6 +1285,7 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
+                ngram_inputs=ngram_inputs,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"

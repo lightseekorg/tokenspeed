@@ -45,7 +45,9 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
+    engram_context_len,
     make_config,
+    ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
@@ -183,6 +185,14 @@ class EventLoop:
             self.in_flight_depth = server_args.mapping.pp_size
         else:
             self.in_flight_depth = int(self.use_overlap_schedule)
+
+        self._ngram_context_len = engram_context_len(self.model_config.hf_text_config)
+        if self._ngram_context_len and (
+            self.in_flight_depth > 1 or server_args.speculative_algorithm is not None
+        ):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and non-speculative decoding"
+            )
 
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
@@ -1008,6 +1018,11 @@ class EventLoop:
                         # KeyError on rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
+                        ngram_inputs = ngram_inputs_for_forward(
+                            forward_op,
+                            self.output_processor.rid_to_state,
+                            self._ngram_context_len,
+                        )
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
                             forward_op, grammar_inputs
@@ -1021,6 +1036,7 @@ class EventLoop:
                             sampling_params_list=sampling_params_list,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
+                            ngram_inputs=ngram_inputs,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state

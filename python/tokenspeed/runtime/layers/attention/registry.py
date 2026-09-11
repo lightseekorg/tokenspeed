@@ -36,6 +36,10 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    is_deepseek_v41_config,
+)
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -307,7 +311,9 @@ def _apply_backend_overrides(
     any ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
-    if target.is_deepseek_v4:
+    if "DeepseekV41ForCausalLM" in target.architectures:
+        server_args.attention_backend = "deepseek_v41"
+    elif target.is_deepseek_v4:
         server_args.attention_backend = "deepseek_v4"
     if draft is not None and draft.is_deepseek_v4:
         server_args.drafter_attention_backend = "deepseek_v4"
@@ -362,6 +368,8 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
+    if is_deepseek_v41_config(model_config.hf_config):
+        return "deepseek_v41"
     if profile.is_deepseek_v4:
         return "deepseek_v4"
     if profile.is_hybrid_gdn and _has_state_layers(config):
@@ -518,7 +526,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config = _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    config_cls = (
+        DeepseekV41Config
+        if is_deepseek_v41_config(model_config.hf_config)
+        else _CONFIG_CLS[arch]
+    )
+    config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).

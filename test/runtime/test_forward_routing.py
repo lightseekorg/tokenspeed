@@ -121,6 +121,7 @@ def _planned(*, num_extends=0):
         dp_metadata=None,
         grammar_inputs="GRAMMAR",
         multimodal_context="MM",
+        ngram_inputs=None,
     )
 
 

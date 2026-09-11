@@ -747,7 +747,9 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
-            state = self._all_gather_state
+            # The multicast buffer/kernel is BF16-only; retain other logits dtypes
+            # through the existing collective, including when a state is cached.
+            state = self._all_gather_state if logits.dtype == torch.bfloat16 else None
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
                 if torch.cuda.is_current_stream_capturing():

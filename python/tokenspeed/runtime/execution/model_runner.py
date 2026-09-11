@@ -191,8 +191,8 @@ class ModelRunner:
         spec_step_idx: int | None = None,
         kv_sync_event: "torch.cuda.Event | None" = None,
         pp_inbound=None,
+        **kwargs,
     ) -> LogitsProcessorOutput:
-        kwargs = {}
         if pp_inbound is not None:
             kwargs["pp_inbound"] = pp_inbound
         if not self.is_generation:

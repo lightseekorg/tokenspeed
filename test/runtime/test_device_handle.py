@@ -166,6 +166,7 @@ def _planned(*, num_extends, label=None):
         dp_metadata=None,
         grammar_inputs=None,
         multimodal_context=None,
+        ngram_inputs=None,
     )
 
 

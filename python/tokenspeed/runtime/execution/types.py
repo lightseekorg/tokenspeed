@@ -52,6 +52,20 @@ class DpForwardMetadata:
 
 
 @dataclass(frozen=True)
+class NGramInputs:
+    """Immutable, bounded raw-token windows captured on the control plane.
+
+    Each row holds the token at ``positions[row]`` followed by its predecessors,
+    newest first. Decode snapshots include one extra ID because the current
+    input may already be committed or may still live in ``future_input_map``.
+    No request objects or device tensors cross this boundary.
+    """
+
+    tokens: tuple[tuple[int, ...], ...]
+    positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
@@ -72,6 +86,7 @@ class PlannedForward:
         grammar_inputs: Per-batch grammar state, None when no request in the
             batch is constrained. A registered exception: these are the
             control plane's live matchers, see the contract's rule 5.
+        ngram_inputs: Immutable raw-token snapshots, None without Engram.
         multimodal_context: Per-batch multimodal state, None for text-only.
             Its ``mm_inputs`` are shallow copies taken at gather time; the
             items inside are the other registered exception.
@@ -82,6 +97,7 @@ class PlannedForward:
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any
     multimodal_context: Any
+    ngram_inputs: NGramInputs | None
 
 
 @dataclass

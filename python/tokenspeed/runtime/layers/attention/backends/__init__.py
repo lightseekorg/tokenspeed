@@ -26,6 +26,7 @@ platform = current_platform()
 
 from tokenspeed.runtime.layers.attention.backends.specific import (  # noqa: F401
     deepseek_v4,
+    deepseek_v41,
 )
 
 if platform.is_nvidia:

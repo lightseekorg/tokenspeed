@@ -91,11 +91,18 @@ from deep_gemm import (
     transform_sf_into_required_layout,
     transform_weights_for_mega_moe,
 )
+from tokenspeed_kernel.thirdparty.deep_gemm.mega_moe_bf16 import (
+    prepare_mega_moe_bf16_jit,
+)
 from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
     warmup_fp8_gemm_nt,
     warmup_mega_moe_jit,
     warmup_prefill_jit,
 )
+
+# DeepGEMM snapshots its compiler include path at first JIT use, not at init.
+# Set it once at the third-party boundary, before weight transforms or warmup.
+prepare_mega_moe_bf16_jit()
 
 __all__ = [
     "ceil_div",

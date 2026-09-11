@@ -24,6 +24,7 @@ from __future__ import annotations
 import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.dsv4  # noqa: F401
+import tokenspeed_kernel.ops.attention.triton.dsv41  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.kda_dispatch  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.kpool_cache  # noqa: F401
