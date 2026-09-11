@@ -259,6 +259,10 @@ class ServerArgs:
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
+    # DeepSeek V4.1 Engram: keep the two FP8 tables in pinned/shared host
+    # memory and gather through UVA. Opt-in, matching SGLang's host table.
+    engram_host_table: bool = False
+    engram_host_table_dir: str | None = None
 
     # Grammar backend
     grammar_backend: str = "none"
@@ -1715,6 +1719,27 @@ class ServerArgs:
             default=ServerArgs.deepseek_v4_prefill_chunk_size,
             help=(
                 "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.engram_host_table,
+            help=(
+                "DeepSeek V4.1 Engram: store the two FP8 n-gram tables in pinned "
+                "host memory (shared across attention-TP ranks) and gather rows "
+                "through UVA. Frees HBM for KV cache and removes the per-layer "
+                "all-reduce. Requires enough host RAM for the full tables."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-dir",
+            type=str,
+            default=ServerArgs.engram_host_table_dir,
+            help=(
+                "Directory for the shared Engram mmap files. Default: /dev/shm "
+                "when it has enough free space, otherwise /scratch or /tmp. "
+                "Docker often caps /dev/shm at 32-64 GiB, too small for V4.1."
             ),
         )
         parser.add_argument(

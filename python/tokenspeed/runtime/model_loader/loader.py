@@ -59,6 +59,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
@@ -358,6 +359,13 @@ class DefaultModelLoader(BaseModelLoader):
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
             weights_iterator = instanttensor_weights_iterator(hf_weights_files)
+        elif use_safetensors and weight_name_filter is not None:
+            weights_iterator = safetensors_filtered_weights_iterator(
+                hf_weights_files,
+                lambda name: weight_name_filter(source.prefix + name),
+                prefetch=self.load_config.weight_loader_prefetch_checkpoints,
+                prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
+            )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
@@ -379,6 +387,14 @@ class DefaultModelLoader(BaseModelLoader):
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
         weight_name_filter = getattr(model, "checkpoint_weight_name_filter", None)
+        bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
+        if callable(bind_checkpoint_dir):
+            hf_folder, _, _ = self._prepare_weights(
+                model_config.model_path,
+                model_config.revision,
+                getattr(model, "fall_back_to_pt_during_load", False),
+            )
+            bind_checkpoint_dir(hf_folder)
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,

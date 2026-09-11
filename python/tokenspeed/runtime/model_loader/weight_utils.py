@@ -42,6 +42,7 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from safetensors import safe_open
 from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
 
@@ -588,6 +589,46 @@ def safetensors_weights_iterator(
             prefetcher.wait_file(file_idx)
         result = safetensors.torch.load_file(st_file, device="cpu")
         yield from result.items()
+        if prefetcher is not None:
+            prefetcher.advance(file_idx)
+
+
+def safetensors_filtered_weights_iterator(
+    hf_weights_files: list[str],
+    accept: Callable[[str], bool],
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
+
+    Used when a model must skip huge tables (Engram embed) that share a shard
+    with ordinary weights. Rejected keys are not materialized.
+    """
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    prefetcher = None
+    if prefetch:
+        prefetcher = CheckpointPrefetcher(
+            hf_weights_files,
+            num_threads=prefetch_num_threads,
+        )
+        prefetcher.start()
+    for file_idx, st_file in enumerate(
+        tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        )
+    ):
+        if prefetcher is not None:
+            prefetcher.wait_file(file_idx)
+        with safe_open(st_file, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if not accept(key):
+                    continue
+                yield key, handle.get_tensor(key)
         if prefetcher is not None:
             prefetcher.advance(file_idx)
 

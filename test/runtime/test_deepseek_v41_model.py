@@ -67,7 +67,34 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     v41_mxfp8_config,
     v41_quantize_fp8,
 )
+from tokenspeed.runtime.models.deepseek_v41_engram import (
+    is_engram_embed_checkpoint_name,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+_ENGRAM_INDEX = "model.safetensors.index.json"
+
+
+def _bind_engram_tables(model, weights, tmp_path):
+    """Write Engram embed tensors to a sliceable safetensors dir; return the rest."""
+    embed = {
+        name: tensor
+        for name, tensor in weights.items()
+        if is_engram_embed_checkpoint_name(name)
+    }
+    rest = {name: tensor for name, tensor in weights.items() if name not in embed}
+    if embed:
+        save_file(embed, str(tmp_path / "engram.safetensors"), metadata=None)
+        (tmp_path / _ENGRAM_INDEX).write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 0},
+                    "weight_map": {name: "engram.safetensors" for name in embed},
+                }
+            )
+        )
+        model.bind_checkpoint_dir(str(tmp_path))
+    return rest
 
 
 def _config():
@@ -403,7 +430,9 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     ctx = _ctx(backend, 3, ForwardMode.EXTEND)
     torch.manual_seed(41)
     layers = [
-        DeepseekV41DecoderLayer(config, _mapping(0, 1, 1), i, None, f"layers.{i}", None)
+        DeepseekV41DecoderLayer(
+            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, False
+        )
         for i in (0, 1)
     ]
     for layer in layers:
@@ -556,7 +585,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model")
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False)
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     ids = torch.tensor([0, 3, 4, 6])
@@ -704,7 +733,7 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch):
+def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path):
     config = _config()
     config.hidden_size = 256
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
@@ -716,7 +745,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch):
         adapter = DeepseekV41ForCausalLM(
             SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant(), "", False
         )
-    adapter.load_weights(_checkpoint(config).items())
+    adapter.load_weights(
+        _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
+    )
     adapter.initialize_engram(_Tokenizer())
     model = adapter.model
     for module in model.modules():
@@ -767,7 +798,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch):
     assert decoded.shape == (1, 256) and torch.isfinite(decoded).all()
 
 
-def test_distributed_attention_tp4(monkeypatch):
+def test_distributed_attention_tp4(monkeypatch, tmp_path):
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("launch with torchrun --nproc_per_node=4")
     rank = int(os.environ["RANK"])
@@ -831,7 +862,9 @@ def test_distributed_attention_tp4(monkeypatch):
             adapter = DeepseekV41ForCausalLM(
                 SimpleNamespace(text_config=config), mapping, _quant(), "", False
             )
-        adapter.load_weights(_checkpoint(config).items())
+        adapter.load_weights(
+            _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
+        )
         adapter.initialize_engram(_Tokenizer())
         for module in adapter.modules():
             if isinstance(module, LinearBase):
@@ -1003,7 +1036,7 @@ def _checkpoint(config):
     "rank,prefixed,reverse",
     [(0, False, False), (1, True, True), (2, False, True), (3, True, False)],
 )
-def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse):
+def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tmp_path):
     config = _loader_config()
     model = _loader_model(monkeypatch, config, rank, "cpu")
     weights = _checkpoint(config)
@@ -1017,7 +1050,8 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse):
         "layers.0.ffn.gate.bias_vl",
     ):
         weights[name] = torch.empty(0)
-    items = list(weights.items())
+    rest = _bind_engram_tables(model, weights, tmp_path)
+    items = list(rest.items())
     if reverse:
         items.reverse()
     model.load_weights(
@@ -1151,13 +1185,14 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse):
         "layers.2.attn.indexer.wk.weight",
     ],
 )
-def test_checkpoint_requires_every_local_constituent(monkeypatch, missing):
+def test_checkpoint_requires_every_local_constituent(monkeypatch, missing, tmp_path):
     config = _loader_config()
     model = _loader_model(monkeypatch, config, 0, "cpu")
     weights = _checkpoint(config)
     del weights[missing]
+    rest = _bind_engram_tables(model, weights, tmp_path)
     with pytest.raises(ValueError, match=re.escape(missing)):
-        model.load_weights(weights.items())
+        model.load_weights(rest.items())
     v4.DeepseekV4MegaMoEExperts.finalize_weights.assert_not_called()
     assert not hasattr(model, "checkpoint_load_report")
 
@@ -1175,6 +1210,14 @@ def test_checkpoint_requires_every_local_constituent(monkeypatch, missing):
         "layers.0.ffn.experts.0.w1.typo",
     ],
 )
+def test_load_weights_rejects_engram_embed_in_iterator(monkeypatch):
+    config = _loader_config()
+    model = _loader_model(monkeypatch, config, 0, "cpu")
+    weights = _checkpoint(config)
+    with pytest.raises(ValueError, match="get_slice"):
+        model.load_weights(weights.items())
+
+
 def test_checkpoint_rejects_unexpected(monkeypatch, bad):
     model = _loader_model(monkeypatch, _loader_config(), 0, "cpu")
     with pytest.raises(ValueError, match="Unexpected"):
@@ -1209,7 +1252,7 @@ def test_checkpoint_rejects_duplicate_alias_and_shapes(monkeypatch):
 
 
 @pytest.mark.parametrize("with_scale", [False, True])
-def test_bf16_wo_a_checkpoint(monkeypatch, with_scale):
+def test_bf16_wo_a_checkpoint(monkeypatch, with_scale, tmp_path):
     config = _loader_config()
     model = _loader_model(monkeypatch, config, 0, "cpu")
     weights = _checkpoint(config)
@@ -1225,11 +1268,12 @@ def test_bf16_wo_a_checkpoint(monkeypatch, with_scale):
         weights[name + ".weight"] = (raw * scales).bfloat16()
         if not with_scale:
             del weights[name + ".scale"]
+    rest = _bind_engram_tables(model, weights, tmp_path)
     if with_scale:
         with pytest.raises(ValueError, match="BF16 wo_a"):
-            model.load_weights(weights.items())
+            model.load_weights(rest.items())
     else:
-        model.load_weights(weights.items())
+        model.load_weights(rest.items())
         assert model.model.layers[0].attn.wo_a.weight.dtype == torch.bfloat16
 
 
@@ -1245,11 +1289,7 @@ def test_generic_safetensors_engram_load_is_bounded(monkeypatch, tmp_path):
     config.engram_num_embeddings = [rows]
     model = _loader_model(monkeypatch, config, 2, "cpu")
     weights = _checkpoint(config)
-    path = tmp_path / "tiny.safetensors"
-    save_file(weights, str(path))
-    from tokenspeed.runtime.model_loader.weight_utils import (
-        safetensors_weights_iterator,
-    )
+    rest = _bind_engram_tables(model, weights, tmp_path)
 
     embed = model.model.layers[1].engram.embed
     copies = []
@@ -1263,15 +1303,7 @@ def test_generic_safetensors_engram_load_is_bounded(monkeypatch, tmp_path):
         original(param, rows, local_start)
 
     monkeypatch.setattr(embed, "_copy_rows", copy_rows)
-    model.load_weights(
-        safetensors_weights_iterator(
-            [str(path)],
-            is_all_weights_sharded=False,
-            decryption_key=None,
-            prefetch=False,
-            prefetch_num_threads=1,
-        )
-    )
+    model.load_weights(rest.items())
     local_rows = embed.row_end - embed.row_start
     assert (
         copies

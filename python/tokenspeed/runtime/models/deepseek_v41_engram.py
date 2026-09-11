@@ -28,10 +28,13 @@ Integration contract:
   and the current speculative branch. Refresh pointer-stable input buffers for
   eager and graph forwards alike; never put request tensors in ForwardContext.
 * Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
-  Attention TP=4 stores each table in four shards; DP/CP/PP peers are NOT reduced.
+  GPU-resident tables are row-sharded across attention TP and all-reduced.
+  ``host_table=True`` keeps one full copy in pinned/shared host memory, gathers
+  through UVA, and skips the all-reduce. Output matches the GPU-sharded path.
 * Intercept embed.weight/scale BEFORE a generic GPU weight iterator. Open the
   safetensors file on CPU, pass get_slice(name) to embed.load_sharded(), and mark
-  the corresponding runtime parameter name loaded. Only local chunks are read.
+  the corresponding runtime parameter name loaded. Only local chunks are read
+  for GPU shards; host tables copy every row on the writer rank.
   Do not cast the model wholesale to BF16: table codes/scales must stay bytes.
 * wkv uses the existing quantized ReplicatedLinear and its normal post-load
   processing. Its 32x32 scales are repeated across output rows as 1x32 MXFP8
@@ -42,6 +45,12 @@ Integration contract:
 
 from __future__ import annotations
 
+import atexit
+import ctypes
+import ctypes.util
+import os
+import shutil
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -49,6 +58,8 @@ import numpy as np
 import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
+from tokenspeed_kernel.ops.embedding import host_gather
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
@@ -57,8 +68,15 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 DEAD_TOKEN_ID = -1
+_ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
+
+
+def is_engram_embed_checkpoint_name(name: str) -> bool:
+    """True for the two huge FP8 table tensors that must not be load_file'd."""
+    return name.endswith(_ENGRAM_EMBED_SUFFIXES)
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -281,8 +299,152 @@ class EngramHashState(nn.Module):
         return torch.cat(hashes, dim=-1) + self.offsets
 
 
+def _host_table_dir(nbytes: int) -> str:
+    """Pick a writable directory with room for one Engram host-table file.
+
+    ``/dev/shm`` is preferred when it is large enough. Docker often caps it
+    at 32–64 GiB, which cannot hold a V4.1 table, so fall back to scratch.
+    """
+    explicit = global_server_args_dict.get("engram_host_table_dir")
+    if explicit:
+        return explicit
+    margin = 1 << 30
+    candidates = []
+    if os.path.isdir("/dev/shm"):
+        candidates.append("/dev/shm")
+    for path in ("/scratch", "/tmp", tempfile.gettempdir()):
+        if path not in candidates:
+            candidates.append(path)
+    for directory in candidates:
+        if not os.path.isdir(directory) or not os.access(directory, os.W_OK):
+            continue
+        if shutil.disk_usage(directory).free >= nbytes + margin:
+            return directory
+    raise OSError(
+        f"No filesystem with {nbytes + margin} free bytes for an Engram host table; "
+        "pass --engram-host-table-dir"
+    )
+
+
+_HOST_TABLE_JOB_ID: str | None = None
+_CREATED_HOST_FILES: list[str] = []
+
+
+def _host_table_job_id() -> str:
+    """Return a per-job id shared by every rank, unique across concurrent jobs."""
+    global _HOST_TABLE_JOB_ID
+    if _HOST_TABLE_JOB_ID is not None:
+        return _HOST_TABLE_JOB_ID
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        payload = [str(os.getpid())]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        _HOST_TABLE_JOB_ID = payload[0]
+    else:
+        _HOST_TABLE_JOB_ID = str(os.getpid())
+    return _HOST_TABLE_JOB_ID
+
+
+def _engram_host_table_path(layer_id: int, field: str, nbytes: int) -> str:
+    return os.path.join(
+        _host_table_dir(nbytes),
+        f"ts-engram-{_host_table_job_id()}-L{layer_id}-{field}",
+    )
+
+
+def _is_host_table_writer(mapping: Mapping) -> bool:
+    local = os.environ.get("LOCAL_RANK")
+    if local is not None:
+        return int(local) == 0
+    return mapping.rank % max(mapping.nprocs_per_node, 1) == 0
+
+
+def _cleanup_host_files() -> None:
+    while _CREATED_HOST_FILES:
+        path = _CREATED_HOST_FILES.pop()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+atexit.register(_cleanup_host_files)
+
+
+def _advise_hugepages(mmap_obj, nbytes: int) -> None:
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None or nbytes <= 0:
+        return
+    libc = ctypes.CDLL(libc_name)
+    madvise = getattr(libc, "madvise", None)
+    if madvise is None:
+        return
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    madvise.restype = ctypes.c_int
+    # Linux MADV_HUGEPAGE. Failure is ignored: THP may be disabled.
+    madvise(ctypes.c_void_p(int(mmap_obj.ctypes.data)), ctypes.c_size_t(nbytes), 14)
+
+
+def _create_host_file(path: str, nbytes: int) -> None:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.ftruncate(fd, nbytes)
+    finally:
+        os.close(fd)
+    _CREATED_HOST_FILES.append(path)
+
+
+def _unlink_host_file(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    try:
+        _CREATED_HOST_FILES.remove(path)
+    except ValueError:
+        pass
+
+
+def _allocate_host_bytes(
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    device: torch.device | str,
+    shared: bool,
+    owner: bool,
+    path: str,
+) -> tuple[torch.Tensor, object | None]:
+    """Return a host uint8/fp8 table and an optional mmap keep-alive."""
+    device = torch.device(device)
+    if device.type == "meta":
+        return torch.empty(shape, dtype=dtype, device="meta"), None
+    if not shared:
+        pin = torch.cuda.is_available()
+        return (
+            torch.empty(shape, dtype=dtype, device="cpu", pin_memory=pin),
+            None,
+        )
+    nbytes = int(shape[0] * shape[1] * torch.empty((), dtype=dtype).element_size())
+    if owner:
+        _create_host_file(path, nbytes)
+    mmap = np.memmap(path, dtype=np.uint8, mode="r+", shape=(nbytes,))
+    _advise_hugepages(mmap, nbytes)
+    tensor = torch.frombuffer(mmap, dtype=torch.uint8)
+    if dtype != torch.uint8:
+        tensor = tensor.view(dtype)
+    return tensor.view(shape), mmap
+
+
+def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    values = codes.view(torch.uint8).view(torch.float8_e4m3fn).float()
+    scale = scales.view(torch.uint8).view(torch.float8_e8m0fnu).float()
+    return (
+        (values.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1))
+        .flatten(-2)
+        .to(torch.bfloat16)
+    )
+
+
 class RowShardedEngramEmbedding(nn.Module):
-    """FP8 codes and raw E8M0 scale bytes, sharded in attention-TP row order."""
+    """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
 
     def __init__(
         self,
@@ -290,6 +452,8 @@ class RowShardedEngramEmbedding(nn.Module):
         embedding_dim: int,
         mapping: Mapping,
         device: torch.device | str,
+        host_table: bool,
+        layer_id: int,
     ):
         super().__init__()
         if (
@@ -303,36 +467,117 @@ class RowShardedEngramEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
-        self.part_num_embeddings = (
-            num_embeddings + mapping.attn.tp_size - 1
-        ) // mapping.attn.tp_size
-        self.row_start = mapping.attn.tp_rank * self.part_num_embeddings
-        self.row_end = min(self.row_start + self.part_num_embeddings, num_embeddings)
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                embedding_dim,
-                dtype=torch.float8_e4m3fn,
-                device=device,
-            ),
-            requires_grad=False,
+        self.host_table = host_table
+        self.layer_id = layer_id
+        self._mmap_keep: list[object] = []
+        self._host_gpu_registered = False
+        shared = (
+            host_table
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
         )
-        self.scale = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                embedding_dim // 32,
-                dtype=torch.uint8,
-                device=device,
-            ),
-            requires_grad=False,
-        )
+        self._shared_writer = (not shared) or _is_host_table_writer(mapping)
+        if host_table:
+            self.part_num_embeddings = num_embeddings
+            self.row_start = 0
+            self.row_end = num_embeddings
+            weight_path = ""
+            scale_path = ""
+            if shared:
+                weight_bytes = num_embeddings * embedding_dim
+                scale_bytes = num_embeddings * (embedding_dim // 32)
+                weight_path = _engram_host_table_path(layer_id, "weight", weight_bytes)
+                scale_path = _engram_host_table_path(layer_id, "scale", scale_bytes)
+                if self._shared_writer:
+                    _create_host_file(weight_path, weight_bytes)
+                    _create_host_file(scale_path, scale_bytes)
+                torch.distributed.barrier()
+            weight, weight_mmap = _allocate_host_bytes(
+                (num_embeddings, embedding_dim),
+                torch.float8_e4m3fn,
+                device,
+                shared,
+                False,
+                weight_path,
+            )
+            scale, scale_mmap = _allocate_host_bytes(
+                (num_embeddings, embedding_dim // 32),
+                torch.uint8,
+                device,
+                shared,
+                False,
+                scale_path,
+            )
+            for keep in (weight_mmap, scale_mmap):
+                if keep is not None:
+                    self._mmap_keep.append(keep)
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.scale = nn.Parameter(scale, requires_grad=False)
+            if shared:
+                torch.distributed.barrier()
+                if self._shared_writer:
+                    _unlink_host_file(weight_path)
+                    _unlink_host_file(scale_path)
+        else:
+            self.part_num_embeddings = (
+                num_embeddings + mapping.attn.tp_size - 1
+            ) // mapping.attn.tp_size
+            self.row_start = mapping.attn.tp_rank * self.part_num_embeddings
+            self.row_end = min(
+                self.row_start + self.part_num_embeddings, num_embeddings
+            )
+            self.weight = nn.Parameter(
+                torch.empty(
+                    self.part_num_embeddings,
+                    embedding_dim,
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(
+                    self.part_num_embeddings,
+                    embedding_dim // 32,
+                    dtype=torch.uint8,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
         for param in (self.weight, self.scale):
             param.weight_loader = self.weight_loader
-            param.engram_row_sharded = True
+            param.engram_row_sharded = not host_table
+            param.engram_host_table = host_table
             param.engram_row_start = self.row_start
             param.engram_row_end = self.row_end
-        self.weight.data[self.row_end - self.row_start :].zero_()
-        self.scale.data[self.row_end - self.row_start :].fill_(127)
+        local_rows = self.row_end - self.row_start
+        if torch.device(device).type != "meta":
+            self.weight.data[local_rows:].zero_()
+            self.scale.data[local_rows:].fill_(127)
+            self._register_host_for_gpu()
+
+    def _register_host_for_gpu(self) -> None:
+        """cudaHostRegister once. Gather kernels must not register."""
+        if self._host_gpu_registered or not self.host_table:
+            return
+        if (
+            torch.device(self.weight.device).type != "cpu"
+            or not torch.cuda.is_available()
+        ):
+            self._host_gpu_registered = True
+            return
+        platform = current_platform()
+        weight_bytes = self.weight.view(torch.uint8)
+        if not weight_bytes.is_pinned():
+            platform.register_host_tensor_for_gpu_access(weight_bytes)
+        if not self.scale.is_pinned():
+            platform.register_host_tensor_for_gpu_access(self.scale)
+        self._host_gpu_registered = True
+
+    def _apply(self, fn, recurse=True):
+        if self.host_table:
+            return self
+        return super()._apply(fn, recurse)
 
     def _copy_rows(
         self, param: nn.Parameter, rows: torch.Tensor, local_start: int
@@ -374,8 +619,10 @@ class RowShardedEngramEmbedding(nn.Module):
         self._copy_rows(param, loaded_weight, 0)
 
     def load_sharded(self, parameter_name: str, tensor_slice, chunk_rows: int) -> None:
-        """Copy only local rows from a CPU safetensors get_slice() in bounded chunks.
+        """Copy table rows from a CPU safetensors get_slice() in bounded chunks.
 
+        GPU-sharded tables copy only this rank's rows. Host tables copy every
+        row on the writer rank; shared followers map the same file and skip.
         Args: parameter_name is 'weight' or 'scale'; tensor_slice is the global
         checkpoint tensor's lazy CPU slice; chunk_rows bounds transient host
         storage. No full tensor, remote shard, or BF16 table is allocated.
@@ -383,6 +630,8 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if parameter_name not in ("weight", "scale") or chunk_rows < 1:
             raise ValueError("Expected weight/scale and a positive row chunk size")
+        if self.host_table and not self._shared_writer:
+            return
         param = getattr(self, parameter_name)
         if tuple(tensor_slice.get_shape()) != (self.num_embeddings, param.shape[1]):
             raise ValueError("Checkpoint Engram shape does not match the global table")
@@ -396,20 +645,21 @@ class RowShardedEngramEmbedding(nn.Module):
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
 
-        All TP peers must pass identical indices. Only selected rows are expanded
-        to FP32 for E8M0 dequantization; masked remote/padded rows contribute zero.
+        All TP peers must pass identical indices. Host tables gather the full
+        copy and skip the all-reduce. GPU shards expand only local rows and
+        reduce. Dequantization uses the same FP8/E8M0 torch casts in both paths.
         """
+        if self.host_table:
+            codes = host_gather.uint8_row_gather(
+                self.weight.view(torch.uint8), indices, None
+            )
+            scales = host_gather.uint8_row_gather(self.scale, indices, None)
+            return _dequant_fp8_e8m0(codes, scales)
         local = (indices >= self.row_start) & (indices < self.row_end)
         local_ids = (indices - self.row_start).masked_fill(~local, 0).long()
         # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
-        values = (
-            self.weight.view(torch.uint8)[local_ids].view(torch.float8_e4m3fn).float()
-        )
-        scales = self.scale[local_ids].view(torch.float8_e8m0fnu).float()
-        values = (
-            (values.unflatten(-1, (-1, 32)) * scales.unsqueeze(-1))
-            .flatten(-2)
-            .to(torch.bfloat16)
+        values = _dequant_fp8_e8m0(
+            self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
         )
         values = values.masked_fill(~local.unsqueeze(-1), 0)
         if len(self.tp_group) > 1:
@@ -445,6 +695,7 @@ class DeepseekV41Engram(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
         device: torch.device | str,
+        host_table: bool,
     ):
         """Construct from text config, attention mapping and the model's quant config.
 
@@ -507,6 +758,8 @@ class DeepseekV41Engram(nn.Module):
             layout.head_dim,
             mapping,
             device,
+            host_table,
+            layer_id,
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader

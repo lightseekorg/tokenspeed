@@ -43,8 +43,10 @@ and MoE TPxEP widths must match to keep the HC stream replicated on attention TP
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -90,8 +92,10 @@ from tokenspeed.runtime.models.deepseek_v4 import (
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    is_engram_embed_checkpoint_name,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -665,6 +669,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         quant_config,
         prefix: str,
         aux_stream,
+        host_table: bool,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -704,6 +709,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 quant_config,
                 add_prefix("engram", prefix),
                 self.attn.wq_a.weight.device,
+                host_table,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -774,6 +780,7 @@ class DeepseekV41Model(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        host_table: bool,
     ):
         super().__init__()
         if mapping.pp_size != 1 or mapping.attn.cp_size != 1:
@@ -832,6 +839,7 @@ class DeepseekV41Model(nn.Module):
                     quant_config,
                     add_prefix(f"layers.{layer_id}", prefix),
                     None,
+                    host_table,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -908,19 +916,6 @@ class DeepseekV41Model(nn.Module):
         return _norm(h, self.norm), [h] if capture else None
 
 
-class _CheckpointTensorSlice:
-    """Borrow a generic iterator's CPU tensor using Engram's lazy-slice API."""
-
-    def __init__(self, tensor: torch.Tensor):
-        self.tensor = tensor
-
-    def get_shape(self):
-        return self.tensor.shape
-
-    def __getitem__(self, index):
-        return self.tensor[index]
-
-
 class DeepseekV41ForCausalLM(BaseCausalLM):
     """Text-only runtime adapter with strict, rank-local checkpoint coverage."""
 
@@ -941,7 +936,15 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             mapping,
             quant_config,
             add_prefix("model", prefix),
+            global_server_args_dict["engram_host_table"],
         )
+
+    def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
+        self._checkpoint_dir = checkpoint_dir
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Skip Engram embed tables so the generic iterator never materializes them."""
+        return not is_engram_embed_checkpoint_name(self._checkpoint_name(name))
 
     def resolve_lm_head(self, config, quant_config, prefix):
         # The reference promotes the BF16 checkpoint head before the logits GEMM.
@@ -1113,10 +1116,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
         Args:
             weights: One-pass generic iterator of raw or model-prefixed names and
-                CPU tensors. Engram tables must be global CPU views; only local
-                rows are copied, at most 65536 rows per transfer. No whole-table
-                dtype/device conversion is performed. This is not a presharded
-                runtime-state loader.
+                CPU tensors. Engram embed.weight/scale must not appear here;
+                bind_checkpoint_dir plus safetensors get_slice loads those.
+                Other Engram parameters use this iterator. No whole-table
+                dtype/device conversion is performed.
 
         Returns:
             None. checkpoint_load_report records loaded/local and explicit skip
@@ -1218,62 +1221,56 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 if weight_name not in targets:
                     raise ValueError(f"Unexpected V4.1 checkpoint tensor: {raw_name}")
                 self._load_wo_a(name, tensor, pending)
+            elif is_engram_embed_checkpoint_name(name):
+                raise ValueError(
+                    f"{raw_name}: Engram embed tables load only via safetensors "
+                    "get_slice; omit them from the generic iterator and call "
+                    "bind_checkpoint_dir"
+                )
             elif name in targets:
                 param_name, shard_id = targets[name]
                 param = params[param_name]
-                if getattr(param, "engram_row_sharded", False):
-                    embed = self.get_submodule(param_name.rsplit(".", 1)[0])
-                    embed.load_sharded(
-                        param_name.rsplit(".", 1)[1],
-                        _CheckpointTensorSlice(tensor),
-                        65536,
+                module = self.get_submodule(param_name.rsplit(".", 1)[0])
+                expected = tuple(param.shape)
+                if isinstance(module, LinearBase):
+                    n = (
+                        module.output_size
+                        if shard_id is None
+                        else module.output_sizes[shard_id]
                     )
-                else:
-                    module = self.get_submodule(param_name.rsplit(".", 1)[0])
-                    expected = tuple(param.shape)
-                    if isinstance(module, LinearBase):
-                        n = (
-                            module.output_size
-                            if shard_id is None
-                            else module.output_sizes[shard_id]
-                        )
-                        expected = (n, module.input_size)
-                        if name.endswith(".scale"):
-                            expected = tuple((dim + 31) // 32 for dim in expected)
-                    elif isinstance(module, VocabParallelEmbedding):
-                        expected = (module.num_embeddings, module.embedding_dim)
-                    elif name.endswith(".attn_sink"):
-                        expected = (config.num_attention_heads,)
-                    if tuple(tensor.shape) != expected:
-                        raise ValueError(
-                            f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
-                        )
-                    if (
-                        param.dtype == torch.float8_e4m3fn
-                        and tensor.dtype != param.dtype
-                    ):
+                    expected = (n, module.input_size)
+                    if name.endswith(".scale"):
+                        expected = tuple((dim + 31) // 32 for dim in expected)
+                elif isinstance(module, VocabParallelEmbedding):
+                    expected = (module.num_embeddings, module.embedding_dim)
+                elif name.endswith(".attn_sink"):
+                    expected = (config.num_attention_heads,)
+                if tuple(tensor.shape) != expected:
+                    raise ValueError(
+                        f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
+                    )
+                if param.dtype == torch.float8_e4m3fn and tensor.dtype != param.dtype:
+                    raise TypeError(
+                        f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
+                    )
+                if param.dtype != torch.float8_e4m3fn and not name.endswith(".scale"):
+                    fp32 = ".hc_" in name or name.endswith(
+                        (".attn_sink", ".ffn.gate.bias")
+                    )
+                    dtype = torch.float32 if fp32 else torch.bfloat16
+                    if tensor.dtype != dtype:
                         raise TypeError(
-                            f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
+                            f"{raw_name}: expected {dtype}, got {tensor.dtype}"
                         )
-                    if param.dtype != torch.float8_e4m3fn and not name.endswith(
-                        ".scale"
-                    ):
-                        fp32 = ".hc_" in name or name.endswith(
-                            (".attn_sink", ".ffn.gate.bias")
-                        )
-                        dtype = torch.float32 if fp32 else torch.bfloat16
-                        if tensor.dtype != dtype:
-                            raise TypeError(
-                                f"{raw_name}: expected {dtype}, got {tensor.dtype}"
-                            )
-                    loader = getattr(param, "weight_loader", default_weight_loader)
-                    if shard_id is not None:
-                        loader(param, tensor, shard_id)
-                    else:
-                        loader(param, tensor)
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                if shard_id is not None:
+                    loader(param, tensor, shard_id)
+                else:
+                    loader(param, tensor)
             else:
                 raise ValueError(f"Unexpected V4.1 checkpoint tensor: {raw_name}")
             loaded.add(name)
+        self._load_missing_engram_tables(loaded)
         missing = set(targets) - loaded
         for key, pair in pending.items():
             if "weight" not in pair:
@@ -1287,6 +1284,51 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info("V4.1 checkpoint coverage: %s", self.checkpoint_load_report)
         self.post_load_weights()
+
+    def _load_missing_engram_tables(self, loaded: set[str]) -> None:
+        """Load Engram embed tables from safetensors get_slice only."""
+        pending = [
+            raw
+            for raw in self._checkpoint_targets()
+            if is_engram_embed_checkpoint_name(raw) and raw not in loaded
+        ]
+        if not pending:
+            return
+        checkpoint_dir = getattr(self, "_checkpoint_dir", None)
+        if checkpoint_dir is None:
+            return
+        from safetensors import safe_open
+        from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
+        index_path = os.path.join(checkpoint_dir, SAFE_WEIGHTS_INDEX_NAME)
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(
+                f"Engram slice load requires {SAFE_WEIGHTS_INDEX_NAME} in "
+                f"{checkpoint_dir}"
+            )
+        with open(index_path) as handle:
+            weight_map = json.load(handle)["weight_map"]
+        targets = self._checkpoint_targets()
+        for raw in pending:
+            mapped = None
+            for key in (raw, "model." + raw, raw.removeprefix("model.")):
+                if key in weight_map:
+                    mapped = key
+                    break
+            if mapped is None:
+                raise ValueError(
+                    f"Missing {raw} in {index_path} weight_map; "
+                    "Engram embed tables load only via get_slice"
+                )
+            param_name, _ = targets[raw]
+            embed = self.get_submodule(param_name.rsplit(".", 1)[0])
+            shard = os.path.join(checkpoint_dir, weight_map[mapped])
+            field = param_name.rsplit(".", 1)[1]
+            with safe_open(shard, framework="pt", device="cpu") as handle:
+                embed.load_sharded(field, handle.get_slice(mapped), 65536)
+            loaded.add(raw)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def post_load_weights(self) -> None:
         """Finalize packed MegaMoE weights; generic hooks own all other modules."""
