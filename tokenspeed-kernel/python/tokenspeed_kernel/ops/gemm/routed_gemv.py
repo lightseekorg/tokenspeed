@@ -42,7 +42,7 @@ import threading
 from types import MappingProxyType
 
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import _torch_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import _select, _torch_decode_gemv
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -904,7 +904,16 @@ ADD3_ROUTE: MappingProxyType[tuple[int, int, int], tuple[int, int, int]] = (
 
 
 def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether :data:`MEASURED_ROUTE` covers this call on this platform.
+    """Whether a measured decode kernel covers this call on this platform.
+
+    NVIDIA answers from :data:`MEASURED_ROUTE`. CDNA5 has no such table, so it
+    asks the registry, which holds the row-CTA and dense16 WMMA kernels and
+    honors each spec's own capability gate -- the sm100+ backends above are
+    filtered out there, so this cannot select a kernel ROCm does not have.
+    Which of the two a call lands on is decided by their declared traits.
+
+    CDNA4 is excluded: it has its own tuned M == 1 Triton GEMVs, which a
+    sweep has to rank against these before this may widen.
 
     Args:
         x: ``[M, K]`` activation.
@@ -923,10 +932,19 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
         or x.ndim != 2
     ):
         return False
+
     m, k = x.shape
-    return (m, weight.shape[0], k) in MEASURED_ROUTE and _is_routed_arch(
-        x.device.index or 0
-    )
+    n = weight.shape[0]
+    if (m, n, k) in MEASURED_ROUTE and _is_routed_arch(x.device.index or 0):
+        return True
+
+    from tokenspeed_kernel.platform import current_platform
+
+    # Row-CTA's measured K floor; WMMA's stricter K % 128 == 0 is a trait on
+    # its own spec.
+    if not current_platform().is_cdna5 or k < 256:
+        return False
+    return _select(m, n, k, True) is not _torch_decode_gemv
 
 
 @functools.lru_cache(maxsize=8)
