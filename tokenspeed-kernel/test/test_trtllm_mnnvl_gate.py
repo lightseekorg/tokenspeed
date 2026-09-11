@@ -124,7 +124,9 @@ def test_every_resolution_passes_the_call_width():
 
     import tokenspeed_kernel
 
-    root = pathlib.Path(tokenspeed_kernel.__file__).parent
+    # Walk the package *and* the tests beside it: a stale two-argument call in a
+    # distributed test is a TypeError that only a multi-rank run would reach.
+    root = pathlib.Path(tokenspeed_kernel.__file__).parents[2]
     sites = 0
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
