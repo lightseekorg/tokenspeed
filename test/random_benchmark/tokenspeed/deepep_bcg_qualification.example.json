@@ -1,0 +1,39 @@
+{
+  "server_argv": [
+    "ts", "serve", "--model", "Qwen/Qwen3.5-35B-A3B-FP8",
+    "--served-model-name", "bcg-qwen35",
+    "--attn-tp-size", "2", "--data-parallel-size", "2",
+    "--dense-tp-size", "4", "--moe-tp-size", "1", "--ep-size", "4",
+    "--dist-init-addr", "127.0.0.1:4000",
+    "--quantization", "fp8", "--moe-backend", "deep_gemm",
+    "--all2all-backend", "deepep", "--deepep-mode", "auto",
+    "--max-model-len", "16384", "--max-num-seqs", "16",
+    "--max-prefill-tokens", "8192", "--chunked-prefill-size", "8192",
+    "--max-cudagraph-capture-size", "16", "--max-total-tokens", "32768",
+    "--gpu-memory-utilization", "0.20", "--sampling-backend", "greedy",
+    "--disable-kvstore", "--no-enable-prefix-caching",
+    "--trust-remote-code", "--language-model-only", "--log-level", "info",
+    "--host", "127.0.0.1", "--port", "8000"
+  ],
+  "client_argv": [
+    "evalscope", "perf", "--model", "bcg-qwen35",
+    "--url", "http://127.0.0.1:8000/v1/completions", "--api", "openai",
+    "--dataset", "random", "--tokenizer-path", "Qwen/Qwen3.5-35B-A3B-FP8",
+    "--min-prompt-length", "2048", "--max-prompt-length", "2048",
+    "--prefix-length", "0", "--min-tokens", "1", "--max-tokens", "1",
+    "--parallel", "4", "--number", "200", "--warmup-num", "20",
+    "--rate", "-1", "--seed", "1", "--temperature", "0",
+    "--stream", "--no-timestamp", "--extra-args", "{\"ignore_eos\": true}"
+  ],
+  "pairs": 8,
+  "seed": 1,
+  "expected_ranks": [0, 1, 2, 3],
+  "prefill_graph_max_tokens": 8192,
+  "capture_sizes": [32, 128, 512, 2048, 8192],
+  "provenance": {
+    "tokenspeed_revision": "REPLACE_WITH_GIT_REVISION_AND_DIRTY_PATCH_HASH",
+    "model_revision": "REPLACE_WITH_MODEL_AND_TOKENIZER_SNAPSHOT_REVISIONS",
+    "dependencies": "REPLACE_WITH_CONTAINER_DIGEST_AND_PACKAGE_LOCK_VERSIONS",
+    "hardware": "REPLACE_WITH_GPU_MODEL_COUNT_TOPOLOGY_DRIVER_AND_CUDA_VERSIONS"
+  }
+}

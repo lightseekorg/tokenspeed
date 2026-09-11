@@ -123,6 +123,48 @@ class CommManager:
         result[self.mapping.moe.tp_ep_rank] = num_tokens
         return result
 
+    def moe_num_valid_rows(self, ctx: ForwardContext, valid_rows: int | None) -> int:
+        """Return the live prefix length of this rank's post-attention MoE rows.
+
+        ``ctx`` describes the physical communication layout, including any
+        graph padding. ``valid_rows`` is the real prefix length before
+        attention TP scatters that layout; ``None`` means every physical row
+        is live, as during graph warmup and startup smoke replay.
+
+        The returned count follows ``post_attn_comm``: no TP and all-reduce
+        keep full rows, while reduce-scatter partitions the padded rows. In
+        particular, five live rows in an eight-row TP2 bucket occupy physical
+        prefixes of lengths four and one, not three and two. An empty local
+        prefix still participates in the surrounding MoE collectives.
+        """
+        if not self.mapping.has_attn_tp or self.use_all_reduce(is_moe=True):
+            num_tokens = ctx.input_num_tokens
+            offset = 0
+            capacity = num_tokens
+        else:
+            if (
+                self.mapping.attn.has_dp
+                and ctx.collective_global_num_tokens is None
+                and ctx.global_num_tokens is None
+            ):
+                raise ValueError(
+                    "MoE physical rows with attention DP require global token counts"
+                )
+            scattered = self.attn_tp_group_scattered_num_tokens(ctx)
+            num_tokens = sum(scattered)
+            rank = self.mapping.attn.tp_rank
+            offset = sum(scattered[:rank])
+            capacity = scattered[rank]
+
+        if valid_rows is None:
+            return capacity
+        if not 0 <= valid_rows <= num_tokens:
+            raise ValueError(
+                f"MoE valid rows {valid_rows} exceed physical token range "
+                f"[0, {num_tokens}]"
+            )
+        return min(max(valid_rows - offset, 0), capacity)
+
     # ---- Communication patterns ----
 
     def use_all_reduce(self, is_moe: bool):

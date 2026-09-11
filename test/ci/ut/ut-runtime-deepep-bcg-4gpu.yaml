@@ -1,0 +1,24 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-deepep-bcg-4gpu
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+    - gb200-4gpu
+env:
+  CI: "true"
+  TOKENSPEED_DEEPEP_BCG_REQUIRE_4GPU: "1"
+  TOKENSPEED_DEEPEP_BCG_E2E: "1"
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest -q test/runtime/distributed/test_deepep_prefill_bcg.py
+    - python3 -m pytest -q test/runtime/models/test_deepep_prefill_bcg_e2e.py
+report:
+  github_step_summary: true

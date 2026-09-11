@@ -544,14 +544,130 @@ in which tap order — and carries no per-round state.
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
-(`init_forward_metadata`), with `PrefillGraph` as its own capture story.
+(`init_forward_metadata`), with `PrefillGraph` applying the breakable capture
+contract below to that same forward.
 The write-location kernels stay pure functions (`paged/write_locations.py`);
 unifying that math with V4's bespoke slot mapping remains the final
 mapping-owner milestone (`cache-concepts.md` Principle 5 — owners are now
 down to the router and V4).
 
+## DeepEP prefill in the same forward
+
+DeepEP normal dispatch returns per-expert receive counts to the host, and its
+packing and expert compute depend on those counts. A breakable prefill graph
+therefore captures the surrounding transformer operations and runs the complete
+MoE operation eagerly between graph segments. It uses the existing model,
+`PrefillGraph`, and `tokenspeed-kernel` dispatcher; it introduces neither a
+second executor nor a second scheduling path. Decode retains its existing
+whole-step graph and metadata contract.
+
+### Structural capture is distinct from warmup and replay
+
+`break_here` takes an explicit `capture_stub` argument. A non-`None` stub runs
+only after ending a graph segment during structural capture; the real callable
+is retained for every replay. Ordinary eager calls, eager warmup, and the
+startup smoke replay always execute the real callable. `None` preserves the
+existing attention-break behavior. The stub must initialize the same destination
+and must not initiate DeepEP communication or mutate its handles.
+
+Qwen's boundary covers `_forward_deepep` in full: routing, shared-expert callback
+creation and execution, dispatch, dynamic expert compute, combine, and the final
+shared-output merge. A break around only the expert layer would leave a captured
+merge holding the shared output's old address. Create and consume those dynamic
+objects inside one eager invocation; only direct tensors and the live forward
+context cross the boundary. Mode decisions read that live context.
+
+Each captured MoE break owns a unique destination allocated while capture is
+active. Its stub zeros that destination. Its real adapter zeros the complete
+destination and copies the merged result into its live prefix before the next
+segment runs. This keeps downstream addresses stable even when routing changes.
+Construction returns the owning destination tensor; retained replay closures
+use weak aliases so Python references do not pin intermediate pool allocations.
+Dispatch/combine handles and their completion ordering remain inside the eager
+invocation. Prefill buckets share a private pool, separate from decode's pool;
+vendor workspace pointers cached during decode must not be overwritten by a
+prefill graph.
+
+### Real rows follow the captured physical layout
+
+Attention metadata describes real tokens, while captured collectives use padded
+bucket geometry. For attention TP reduce-scatter, derive the local live prefix
+from the *padded* shard boundaries. If a DP replica has `R` real rows, its captured
+bucket has `B` rows, and attention TP has `T` ranks:
+
+```text
+capacities = scatter_count(B, T)
+start_j = sum(capacities[:j])
+live_j = clamp(R - start_j, 0, capacities[j])
+```
+
+Thus `R=5, B=8, TP2` has live prefixes `[4, 1]`, not `[3, 2]`. No attention TP
+and the MoE all-reduce layout retain the full-row prefix. Use the communication
+manager's layout decision, not a tensor-size heuristic. During startup smoke
+replay no real-row override is installed, so every physical row is valid.
+
+Only that live local prefix enters routing and shared-expert work. A zero-source
+rank still participates in dispatch/combine and may receive remote expert work.
+Clearing the complete destination is necessary: the graph-wide valid-row count
+is in attention coordinates and cannot scrub an attention-TP shard correctly.
+The following captured collectives retain their original padded sizes. Layouts
+with `collective_*` count overrides require separate qualification; do not erase
+those overrides to make a graph eligible.
+
+### Every rank takes the same capture and replay protocol
+
+DeepEP replay requires real, pure EXTEND work on every DP replica and selects a
+common bucket from replicated token counts. Mixed work, idle participation,
+missing distributed metadata, and over-capacity batches return to the existing
+dispatcher. Eligible decode continues to use its whole-step graph. No rank may
+choose a local prefill bucket or independently catch a capture failure and
+continue eagerly.
+
+For each bucket, real eager warmup finishes before a Gloo `monitored_barrier`
+over the serving world, with a five-minute timeout. The whole world participates
+because the feature excludes pipeline parallelism; an attention-TP subgroup
+would omit other DP replicas. Structural capture uses DeepEP stubs, then a
+second phase barrier precedes real smoke replay. Local completion is
+synchronized before advancing to the next bucket. Any future capture rebuild
+must use the same entry point and phase protocol. These are startup barriers,
+not per-break or steady-state barriers. The existing DeepEP decode adapter owns
+normal-to-low-latency buffer cleanup.
+
+The initial explicit opt-in is scoped to text-only Qwen3.5 block-FP8 with
+DeepGEMM, DeepEP `auto`, and no drafter. It requires one node, MoE TP1, and one EP
+group spanning the serving ranks. The validator checks the concrete kernel plan
+and that every MoE operation belongs to the complete Qwen graph-break block;
+requested backend names alone do not establish support. Static MoE restrictions
+supplement the attention backend capability tree; they do not change a backend's
+declared graph support. The multimodal DP guard uses runtime-active multimodal
+execution, so `--language-model-only` can qualify without enabling actual
+multimodal DP replay. See [the serving support contract](../serving/parallelism.md#deepep-prefill-breakable-cuda-graphs).
+
+This design draws on SGLang's [whole-MoE break and capture stub](https://github.com/sgl-project/sglang/pull/31987),
+[dummy-row masking](https://github.com/sgl-project/sglang/pull/33871),
+[per-forward sharding](https://github.com/sgl-project/sglang/pull/37546), and
+[shared DP capture geometry](https://github.com/sgl-project/sglang/pull/37933).
+TokenSpeed preserves its own pool ownership and CPU scheduler metadata rather
+than fabricating idle requests or copying another runtime's memory reserve.
+
 ## Regression gates
 
+* `test/runtime/execution/test_breakable_cuda_graph.py` — structural stubs
+  versus real eager calls and replay, live context rebinding, destination
+  ownership, nested breaks, and exception restoration.
+* `test/runtime/distributed/test_moe_physical_rows.py` and
+  `test/runtime/layers/test_moe_deepep_breakable.py` — captured physical shard
+  prefixes, local-tail clearing, stable MoE destinations, and full shared-expert
+  callback/merge behavior.
+* `test/runtime/distributed/test_deepep_prefill_bcg.py` — four-GPU TP2/DP2/EP4
+  execution with real DeepEP/DeepGEMM kernels, shared-expert work, changing
+  routes, padded and empty source shards, and normal/low-latency transitions;
+  a parent watchdog bounds collective hangs.
+* `test/runtime/models/test_deepep_prefill_bcg_e2e.py` — opt-in four-GPU
+  Qwen3.5 qualification, eager repeatability, first-token and all generated-token
+  identity, sampled-token logprobs, prefix reuse/chunking, and serving-replay
+  evidence from every rank. It compares sampled-token logprobs, not
+  full-vocabulary logits.
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live-request contents over the same
   buffers; lazy above-ladder views are pointer-stable; the graph_ptr_guard

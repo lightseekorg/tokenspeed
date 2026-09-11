@@ -117,9 +117,9 @@ The mode is chosen per forward from a value every rank agrees on, because the tw
 modes are different collectives. With DP attention that value is "every DP rank
 is decoding", so one extending rank moves the whole group to the normal legs.
 
-The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
-normal-mode dispatch reports its per-expert receive counts to the host, and a
-host sync cannot be captured. Decode graphs are unaffected.
+DeepEP prefill breakable CUDA graphs have a scoped explicit opt-in described
+below. Other all-to-all configurations keep prefill graphs disabled by default.
+Decode graphs are unaffected.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
@@ -157,6 +157,107 @@ MN-major requires `M` to be a multiple of four, so a prepared layer falls back
 to the canonical contract once padding would cost more than the transpose it
 saves — the fused padding quantizer grows with `M` while the transpose does
 not. Decode row counts stay on the prepared path.
+
+### DeepEP prefill breakable CUDA graphs
+
+DeepEP normal dispatch and expert compute stay eager because expert receive
+counts depend on routing. Breakable CUDA graphs capture the surrounding model
+work and replay it around the complete eager MoE operation. The initial opt-in
+targets `Qwen/Qwen3.5-35B-A3B-FP8` in text-only serving, with block-scale FP8
+weights, BF16 activations, `deep_gemm`, DeepEP `auto`, and no speculative decoder.
+It requires one node, MoE TP1, and a single EP group spanning all serving ranks.
+Actual multimodal execution, other MoE kernels, multi-node EP,
+pipeline/context parallelism, disaggregated serving, and speculative decoding
+are outside this support scope. Startup checks the loaded model blocks and
+resolved kernels, in addition to the requested configuration.
+
+The four-GPU attention-TP2/DP2, dense-TP4, MoE-TP1/EP4 configuration is:
+
+```bash
+tokenspeed serve Qwen/Qwen3.5-35B-A3B-FP8 \
+  --attn-tp-size 2 --data-parallel-size 2 --dense-tp-size 4 \
+  --moe-tp-size 1 --ep-size 4 \
+  --quantization fp8 --dtype bfloat16 --moe-backend deep_gemm \
+  --all2all-backend deepep --deepep-mode auto \
+  --language-model-only \
+  --max-model-len 16384 --max-num-seqs 16 \
+  --max-prefill-tokens 8192 --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --prefill-graph-capture-sizes 32 128 512 2048 8192
+```
+
+Set an explicit positive `--prefill-graph-max-tokens` to enable the feature.
+Leaving the cap unset keeps DeepEP prefill graphs off; set the cap to `0` or use
+`--disable-prefill-graph` to disable them. Unsupported static configurations with
+an explicit positive cap fail with a configuration error. The capture ladder
+must fit the prefill, chunk, and KV budgets; smaller caps reduce startup and
+graph-memory costs. Keep `auto` so prefill uses normal dispatch and decode uses
+the existing low-latency path.
+
+A replay requires pure prefill work on every attention-DP replica. All ranks
+select the same bucket from the largest replicated token count. Mixed
+prefill/decode, idle replicas, and batches above the capture cap use the existing
+dispatcher; eligible decode still uses its decode graph. Unequal prompt lengths
+can replay in a shared bucket. Padded rows never enter expert routing, including
+when attention TP leaves a rank with no real source rows; that rank still joins
+the collective.
+
+Successful startup is not proof that a workload replayed a prefill graph. Check
+the `DeepEP prefill BCG replay: rank=... bucket=... real_tokens=...` message on
+every participating rank while sending concurrent prefill requests to both DP
+replicas. This once-per-rank message is emitted after serving replay, not during
+startup smoke replay. A serialized request stream can leave one replica idle
+and legitimately use eager prefill throughout. Capture failures terminate
+startup instead of silently turning the feature off.
+See [the execution invariants](../design/unified_path.md#deepep-prefill-in-the-same-forward)
+for the capture-only stub, output lifetime, padding, and startup protocol.
+
+Measure against the same DeepEP server with only the prefill-graph flags changed;
+keep decode graphs enabled in both runs. Report TTFT and input throughput along
+with TPOT, startup time, peak/retained GPU memory, and available KV capacity.
+The complete MoE operation remains eager, so the benefit depends on how much
+launch overhead is saved relative to padding and graph-memory costs.
+
+For paired trials, copy the
+[qualification example](../../test/random_benchmark/tokenspeed/deepep_bcg_qualification.example.json)
+and fill in the actual source/model revisions, dependency versions, hardware,
+and workload. The common server command must omit prefill-graph flags and
+`--enforce-eager`; the tool adds only the selected arm's prefill-graph flags.
+Keep streaming enabled for the EvalScope client.
+
+```bash
+python3 test/random_benchmark/tokenspeed/deepep_bcg_qualification.py plan \
+  --config qualification.json --output results/deepep-bcg
+# Run each entry in results/deepep-bcg/commands.txt in order, with a fresh server.
+python3 test/random_benchmark/tokenspeed/deepep_bcg_qualification.py report \
+  results/deepep-bcg
+```
+
+`plan` writes a seeded schedule of at least eight eager/BCG pairs and does not
+launch any processes. Use `commands.txt` as a manual checklist: start a fresh
+server, wait for readiness, then run that entry's client. Save all ranks' server
+output to each run's `evidence/server.log` and retain memory/startup measurements
+alongside it. `report` reads the completed EvalScope outputs, checks per-rank
+replay markers, and writes `report.json` with paired latency reductions and
+bootstrap confidence intervals. Client TTFT
+includes queueing and transport; optional server-prefill measurements require
+separate `evidence/server_prefill.csv` samples with a `latency_ms` column and a
+`server_prefill_source.txt` description of the measured boundary and raw source.
+Missing metrics remain null and receive no comparison estimate. The report
+preserves evidence hashes and makes no automatic performance-promotion decision.
+
+Run the model correctness qualification independently of the timing trials:
+
+```bash
+TOKENSPEED_DEEPEP_BCG_E2E=1 python3 -m pytest -q \
+  test/runtime/models/test_deepep_prefill_bcg_e2e.py
+```
+
+It requires four Blackwell GPUs and compares two fresh eager-prefill engines
+with a BCG engine. The separate
+[GSM8K CI recipe](../../test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-bcg-tp2dp2ep4-evalscope-gsm8k.yaml)
+retains the existing `0.90` quality threshold. Successful graph replay,
+correctness, and a measured performance benefit are separate checks.
 
 ## Multi-Node
 

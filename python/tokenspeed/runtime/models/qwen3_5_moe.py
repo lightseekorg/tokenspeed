@@ -38,6 +38,11 @@ from torch import nn
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_here,
+    current_valid_rows,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
@@ -349,6 +354,19 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         if self.use_deepep:
+            if is_breakable_capture_active():
+                # Allocate before ending the segment: every MoE break owns a
+                # distinct graph-pool address, including when a later segment
+                # still reads this block's output as a residual or hidden tap.
+                dst = torch.empty_like(hidden_states)
+                return break_here(
+                    self._forward_deepep_bcg_into,
+                    dst,
+                    hidden_states,
+                    ctx,
+                    dst,
+                    capture_stub=self._stub_deepep_bcg_into,
+                )
             return self._forward_deepep(
                 hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
             )
@@ -420,6 +438,48 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    @staticmethod
+    def _stub_deepep_bcg_into(
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Seed the handoff without routing or communication during capture."""
+        return dst.zero_()
+
+    def _forward_deepep_bcg_into(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the complete MoE on live physical rows and fill a stable handoff.
+
+        The surrounding graph retains the padded attention-TP layout. Its
+        reduce-scatter slices the bucket, so a shard's live prefix is derived
+        from that padded layout, not by scattering the real token count again.
+        The live context is rebound by ``break_here`` on every replay; routing,
+        shared-expert callbacks, and mode decisions are rebuilt inside this
+        eager invocation rather than retained from structural capture.
+        """
+        live_rows = self.comm_manager.moe_num_valid_rows(ctx, current_valid_rows())
+        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
+            ctx
+        )
+        # Global valid_rows is expressed before attention TP. It cannot clear
+        # the local tail for us (an empty TP shard can still have global R > 0).
+        dst.zero_()
+        result = self._forward_deepep(
+            hidden_states[:live_rows],
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            ctx,
+        )
+        # Even live_rows == 0 must execute dispatch/combine: this rank can own
+        # experts selected by a remote source rank.
+        dst[:live_rows].copy_(result)
+        return dst
+
     def _forward_deepep(
         self,
         hidden_states: torch.Tensor,
@@ -437,8 +497,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Shared expert on this rank's token shard. Weights are replicated for
         # the DeepEP path (see the constructor), so the result is already
         # complete -- no tensor-parallel reduction. It only reads
-        # ``hidden_states``, so it runs inside DeepEP's dispatch window below,
-        # where its GEMMs cover the in-flight token transfer.
+        # ``hidden_states``, so it uses the dispatch callback below. Whether
+        # that callback overlaps communication is determined by the kernel's
+        # dispatch mode; normal dispatch may queue it before the transfer.
         shared_output = None
         overlap_fn = None
         if self.shared_expert is not None:

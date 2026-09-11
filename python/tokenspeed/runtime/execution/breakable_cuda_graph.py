@@ -23,9 +23,10 @@
 A *breakable* CUDA graph captures a forward as an ordered list of zero-arg
 callables -- each is either a captured ``CUDAGraph.replay`` (a "graph segment")
 or an eager Python function (a "break"). At designated break points (attention /
-KV-cache ops, whose metadata is data-dependent and cannot be captured) the
-current stream capture is ended, the op runs eagerly, and a fresh segment begins
-capturing the remainder. Replay simply calls each segment in order.
+KV-cache ops and data-dependent MoE operations) the current stream capture is
+ended, the eager body or its construction-only stub runs, and a fresh segment
+begins capturing the remainder. Replay calls each segment in order, always
+running the real eager body.
 
 This is the ``torch.compile``-free alternative to piecewise CUDA graphs. The
 design is gratefully adapted from vLLM and SGLang, who pioneered the breakable
@@ -33,8 +34,8 @@ prefill graph: vLLM's ``BreakableCUDAGraphWrapper`` (the homogeneous segment-lis
 structure + the ``set_forward_context``/``get_forward_context`` ambient pattern we
 mirror in :func:`active_forward`/:func:`current_forward_ctx`) and SGLang's
 breakable prefill graph (the eager-copy output handoff at each break). Unlike a
-full prefill graph, attention -- the only batch/length-aware op and the source of
-the host-side ``max_seq_len_q`` scalar -- stays eager, so it never enters a graph.
+full prefill graph, attention -- the source of the host-side ``max_seq_len_q``
+scalar -- stays eager, so it never enters a graph.
 Keeping all KV-cache reads/writes in the eager breaks also makes them honor the
 per-layer transfer consumer index naturally.
 
@@ -85,8 +86,8 @@ _replay_valid_rows: int | None = None
 def active_forward(ctx: Any) -> Generator[None]:
     """Publish ``ctx`` as the ambient forward context for the enclosed block.
 
-    An eager break runs once at capture and again on every replay, and the args
-    it closed over at capture are the *dummy* batch's, hence stale. Rather than
+    A break runs its real body or a stub at capture and the real body on every
+    replay. Its captured args are the *dummy* batch's, hence stale. Rather than
     thread the live context through ``replay()`` (which would conflate graph
     mechanics with forward semantics), the runner wraps capture and each replay
     in this, and breaks rebind their captured context arg to the ambient one by
@@ -249,16 +250,26 @@ class BreakableCapture:
         self._current_graph = None
         self._capturing = False
 
-    def add_eager(self, fn: Callable[[], Any]) -> Any:
-        """End the current segment, run ``fn`` eagerly, record it, start a new one.
+    def add_eager(
+        self, fn: Callable[[], Any], capture_fn: Callable[[], Any] | None
+    ) -> Any:
+        """End the segment, run its eager capture body, and record ``fn`` for replay.
 
-        ``fn`` is a zero-arg callable that performs the break-point op and writes
-        its result into a stable (pool-pinned) address. It is stored verbatim and
-        re-invoked on every :meth:`replay`.
+        Args:
+            fn: Zero-arg eager operation that writes its result to a stable
+                address. Stored verbatim and invoked on every :meth:`replay`.
+            capture_fn: Optional zero-arg substitute for this construction-time
+                invocation only. It must initialize the same output address,
+                but may skip data-dependent communication or resource mutation.
+                ``None`` invokes ``fn`` during construction too. The substitute
+                is never stored in the replay sequence.
+
+        Returns:
+            The result of the construction-time invocation.
         """
         assert self._capturing, "add_eager called outside an active capture"
         self._end_segment()
-        result = fn()
+        result = (fn if capture_fn is None else capture_fn)()
         self.segments.append(fn)
         self._begin_segment()
         return result
@@ -301,15 +312,16 @@ def _record_break(
     resolve_dst: Callable[[torch.Tensor], torch.Tensor],
     args: tuple,
     kwargs: dict,
+    capture_stub: Callable[..., torch.Tensor] | None,
 ) -> torch.Tensor:
     """Record ``fn(*args, **kwargs)`` as an eager break on ``cap`` (the one closure
     builder shared by :func:`break_here` and :func:`break_point`).
 
     Args/kwargs are bound once at capture time, with two live exceptions: (1) tensor
     args alias persistent storage (the static input buffers / pool-pinned segment
-    intermediates), so they carry live values at replay -- ``weak_ref_tensor`` is
-    the (currently identity) hook to avoid pinning their pool slots; (2) the
-    per-forward ``ForwardContext`` is rebound by identity to the live ambient
+    intermediates), so they carry live values at replay -- ``weak_ref_tensor``
+    avoids pinning their pool slots; (2) the per-forward ``ForwardContext`` is
+    rebound by identity to the live ambient
     context each replay (see :func:`active_forward`), so ``fn`` may read live
     ``ctx`` fields exactly like the eager path. **Other (loose) non-tensor scalars
     are frozen** to their capture-time value -- route per-request quantities
@@ -319,6 +331,10 @@ def _record_break(
     buffer; it is called once (on the capture-time invocation) and the buffer is
     reused verbatim on every replay, where the (possibly shorter, see
     :func:`_land_in`) live result is copied into it.
+
+    ``capture_stub``, when supplied, has the same signature as ``fn`` and runs
+    only during construction. Both invocations use the same argument binding
+    and output handoff; the retained replay closure references only ``fn``.
     """
     weak_args = tuple(weak_ref_tensor(a) for a in args)
     weak_kwargs = {k: weak_ref_tensor(v) for k, v in kwargs.items()}
@@ -326,13 +342,13 @@ def _record_break(
     captured_ctx = current_forward_ctx()
     state: dict[str, torch.Tensor] = {}
 
-    def replay_fn() -> torch.Tensor:
+    def invoke(body: Callable[..., torch.Tensor]) -> torch.Tensor:
         live_ctx = current_forward_ctx()
 
         def sub(a: Any) -> Any:
             return live_ctx if a is captured_ctx else a
 
-        result = fn(
+        result = body(
             *(sub(a) for a in weak_args),
             **{k: sub(v) for k, v in weak_kwargs.items()},
         )
@@ -344,29 +360,46 @@ def _record_break(
             scrub_padding_tail(_replay_valid_rows, dst)
         return dst
 
-    return cap.add_eager(replay_fn)
+    def replay_fn() -> torch.Tensor:
+        return invoke(fn)
+
+    capture_fn = (
+        None if capture_stub is None else functools.partial(invoke, capture_stub)
+    )
+    return cap.add_eager(replay_fn, capture_fn)
 
 
 def break_here(
     fn: Callable[..., torch.Tensor],
     dst: torch.Tensor,
     *args: Any,
+    capture_stub: Callable[..., torch.Tensor] | None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """Run ``fn(*args, **kwargs)`` as an eager break, landing its result in ``dst``.
 
     The low-level explicit-destination primitive underneath :func:`break_point`
-    (which is the decorator every model actually uses -- prefer it; this exists
-    for callers that must control the handoff buffer's placement themselves, e.g.
-    a pool-pinned ``dst`` allocated in the current captured segment, and for
-    exercising the break mechanics directly in unit tests).
+    (prefer the decorator when the real operation can run during construction).
+    This primitive serves callers that must control the handoff buffer themselves,
+    such as a pool-pinned ``dst`` allocated in the current captured segment.
 
     ``dst`` must have a replay-stable address (pool-pinned or persistently owned).
-    At capture and on every replay, ``fn`` runs eagerly and its result is copied
-    into ``dst`` (unless ``fn`` already wrote ``dst`` in place and returned it);
-    the following graph segment reads ``dst``. Outside an active capture this is
-    a transparent pass-through. Argument binding/freezing semantics are those of
+    Allocate it before the break in the captured segment when its lifetime must
+    be distinct from other same-shaped break outputs. On every replay, ``fn``
+    runs eagerly and its result lands in ``dst``; the following graph segment
+    reads that address. Outside an active capture ``fn`` always runs, including
+    during eager warmup. Argument binding/freezing semantics are those of
     :func:`_record_break`.
+
+    Args:
+        fn: Real eager operation, with tensor output.
+        dst: Stable output destination consumed by subsequent graph segments.
+        args: Positional arguments shared by ``fn`` and ``capture_stub``.
+        capture_stub: Construction-only substitute with the same signature and
+            output contract as ``fn``. It may initialize ``dst`` without running
+            data-dependent operations. It is never replayed. Pass ``None`` to
+            run the real operation during construction too.
+        kwargs: Keyword arguments shared by ``fn`` and ``capture_stub``.
 
     Returns:
         ``dst`` (the stable handoff buffer).
@@ -376,7 +409,12 @@ def break_here(
         _land_in(dst, fn(*args, **kwargs))
         return dst
     weak_dst = weak_ref_tensor(dst)
-    return _record_break(cap, fn, lambda _result: weak_dst, args, kwargs)
+    _record_break(cap, fn, lambda _result: weak_dst, args, kwargs, capture_stub)
+    # Replay closures must not pin graph-pool blocks, but the capture caller
+    # still needs the owning tensor until its downstream consumer is recorded.
+    # Returning the weak alias here could free/reuse this block while a later
+    # captured op still needs to read it (e.g. a model adapter returns directly).
+    return dst
 
 
 def break_point(method: Callable | None = None) -> Callable:
@@ -384,7 +422,7 @@ def break_point(method: Callable | None = None) -> Callable:
 
     Decorate a sequence-mixing method (attention / MLA / linear-mixer / sparse
     indexer ``forward``) and it runs as an eager break under a breakable capture --
-    the surrounding token-shaped compute (norms, MoE, projections, collectives) is
+    the surrounding token-shaped compute (norms, projections, collectives) is
     captured around it automatically, while everything inside the method stays
     eager -- or a zero-overhead direct call when not capturing. This is the one
     decorator every model uses to mark a break. Use it bare: ``@break_point``.
@@ -427,7 +465,7 @@ def break_point(method: Callable | None = None) -> Callable:
                     )
                 return dst
 
-            return _record_break(cap, method, resolve_dst, args, kwargs)
+            return _record_break(cap, method, resolve_dst, args, kwargs, None)
 
         return wrapper
 

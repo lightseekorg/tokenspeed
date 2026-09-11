@@ -600,6 +600,8 @@ class DummyGroupTablesTest(unittest.TestCase):
             model=SimpleNamespace(model=inner_model),
             is_generation=True,
             is_multimodal=False,
+            is_multimodal_active=False,
+            deepep_prefill_graph_enabled=False,
         )
         config = SimpleNamespace(
             enforce_eager=False,
@@ -732,6 +734,327 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         self.assertEqual(
             CacheGroupRouter.cache_consumer_families, frozenset({"history"})
         )
+
+
+class DeepEPPrefillProtocolTest(unittest.TestCase):
+    """DeepEP capture phases and replay eligibility use the shared DP contract."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution import breakable_cuda_graph, prefill_graph
+            from tokenspeed.runtime.execution.forward_batch_info import (
+                CaptureHiddenMode,
+                ForwardMode,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.torch = torch
+        self.mod = prefill_graph
+        self.bcg = breakable_cuda_graph
+        self.ForwardMode = ForwardMode
+        self.hidden_mode = CaptureHiddenMode.NULL
+
+    def _graph(self, dp_size):
+        pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
+        pg.disable = False
+        pg._deepep_enabled = True
+        pg.dp_size = dp_size
+        pg.capture_buckets = [8, 16]
+        pg.config = SimpleNamespace(
+            world_size=4,
+            world_group=(0, 1, 2, 3),
+            global_rank=1,
+            model_is_mrope=False,
+        )
+        pg._captures = {8: object(), 16: object()}
+        pg._outputs = {}
+        pg._captured_hidden_mode = self.hidden_mode
+        pg._pool = None
+        pg.num_warmup = 2
+        pg._engaged_logged = set()
+        pg.replay_count = 0
+        pg.replayed_tokens = 0
+        pg.replayed_padded_tokens = 0
+        return pg
+
+    def _ctx(self, num_tokens, global_counts, all_extend, mode):
+        return SimpleNamespace(
+            input_num_tokens=num_tokens,
+            global_num_tokens=global_counts,
+            global_bs=[1, 1, 1, 1] if global_counts is not None else None,
+            all_extend=all_extend,
+            num_extends=1 if mode.is_extend_or_mixed() else 0,
+            forward_mode=mode,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+            draft_narrowing=None,
+            capture_hidden_mode=self.hidden_mode,
+        )
+
+    def test_unequal_dp_rows_select_the_same_bucket(self):
+        counts = [3, 3, 9, 9]
+        buckets = []
+        for num_tokens in counts:
+            ctx = self._ctx(num_tokens, counts, True, self.ForwardMode.EXTEND)
+            buckets.append(self._graph(2)._replay_bucket(ctx))
+        self.assertEqual(buckets, [16] * 4)
+
+    def test_missing_replicated_counts_never_uses_local_bucket(self):
+        for all_extend in (True, False):
+            ctx = self._ctx(3, None, all_extend, self.ForwardMode.EXTEND)
+            self.assertIsNone(self._graph(2)._replay_bucket(ctx))
+
+    def test_idle_mixed_and_oversize_reject_uniformly(self):
+        cases = [
+            ([3, 3, 0, 0], True),
+            ([3, 3, 1, 1], False),
+            ([3, 3, 17, 17], True),
+        ]
+        for counts, all_extend in cases:
+            for num_tokens in counts:
+                ctx = self._ctx(num_tokens, counts, all_extend, self.ForwardMode.EXTEND)
+                self.assertIsNone(self._graph(2)._replay_bucket(ctx))
+
+    def test_missing_capture_does_not_silently_choose_local_eager(self):
+        pg = self._graph(2)
+        del pg._captures[8]
+        ctx = self._ctx(3, [3] * 4, True, self.ForwardMode.EXTEND)
+        with self.assertRaisesRegex(RuntimeError, "missing the captured bucket 8"):
+            pg._replay_bucket(ctx)
+
+    def test_partial_replicated_counts_fail_loudly(self):
+        ctx = self._ctx(3, [3, 9], True, self.ForwardMode.EXTEND)
+        with self.assertRaisesRegex(RuntimeError, "counts for every rank"):
+            self._graph(2)._replay_bucket(ctx)
+
+    def test_dp1_deepep_rejects_mixed_but_generic_graph_preserves_support(self):
+        ctx = self._ctx(3, None, False, self.ForwardMode.MIXED)
+        pg = self._graph(1)
+        self.assertIsNone(pg._replay_bucket(ctx))
+        pg._deepep_enabled = False
+        self.assertEqual(pg._replay_bucket(ctx), 8)
+
+    def test_local_mode_cannot_silently_disagree_with_global_extend_vote(self):
+        ctx = self._ctx(3, [3] * 4, True, self.ForwardMode.MIXED)
+        with self.assertRaisesRegex(RuntimeError, "all_extend disagrees"):
+            self._graph(2)._replay_bucket(ctx)
+
+    def test_unsupported_collective_override_cannot_choose_local_eager(self):
+        for field, value in (
+            ("collective_num_tokens", 1),
+            ("collective_global_num_tokens", [1] * 4),
+            ("draft_narrowing", object()),
+            ("capture_hidden_mode", object()),
+        ):
+            ctx = self._ctx(3, [3] * 4, True, self.ForwardMode.EXTEND)
+            setattr(ctx, field, value)
+            with self.assertRaisesRegex(RuntimeError, "changed capture layout"):
+                self._graph(2)._replay_bucket(ctx)
+            # An existing shared fallback wins before local layout assertions.
+            ctx.all_extend = False
+            self.assertIsNone(self._graph(2)._replay_bucket(ctx))
+
+    def test_capture_barrier_uses_full_world_cpu_group_and_finite_timeout(self):
+        from unittest import mock
+
+        pg = self._graph(2)
+        cpu_group = object()
+        with (
+            mock.patch.object(
+                self.mod.pg_manager, "get_process_group", return_value=cpu_group
+            ) as group,
+            mock.patch.object(self.mod.dist, "monitored_barrier") as barrier,
+        ):
+            pg._deep_ep_capture_barrier()
+        group.assert_called_once_with("gloo", (0, 1, 2, 3))
+        barrier.assert_called_once_with(
+            group=cpu_group,
+            timeout=self.mod.DEEPEP_CAPTURE_BARRIER_TIMEOUT,
+            wait_all_ranks=True,
+        )
+        self.assertEqual(self.mod.DEEPEP_CAPTURE_BARRIER_TIMEOUT.total_seconds(), 300)
+
+    def test_capture_phases_stub_then_real_smoke_and_private_pool(self):
+        from unittest import mock
+
+        pg = self._graph(2)
+        pg._captures = {}
+        events = []
+        state = SimpleNamespace(capturing=False)
+        pool = object()
+        decode_stream = object()
+        torch = self.torch
+        bcg = self.bcg
+
+        class Capture:
+            def __init__(self, pool, stream):
+                self.pool = object() if pool is None else pool
+                self.initial_pool = pool
+                self.stream = stream
+
+            def __enter__(self):
+                events.append("capture_begin")
+                state.capturing = True
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append("capture_end")
+                state.capturing = False
+
+            def replay(self):
+                events.append("smoke")
+                # Startup has no serving valid-row count; every physical row
+                # is real in the dummy batch, including after TP partitioning.
+                assert bcg.current_valid_rows() is None
+                run_inner(8)
+
+        def run_inner(bucket):
+            events.append("stub" if state.capturing else "real")
+            return torch.zeros(bucket, 2), None
+
+        pg._run_inner = run_inner
+        with (
+            mock.patch.object(self.mod, "BreakableCapture", Capture),
+            mock.patch.object(
+                self.mod.torch.cuda,
+                "synchronize",
+                side_effect=lambda: events.append("sync"),
+            ),
+            mock.patch.object(
+                pg,
+                "_deep_ep_capture_barrier",
+                side_effect=lambda: events.append("barrier"),
+            ),
+        ):
+            pg._capture_bucket(8, SimpleNamespace(pool=pool, stream=decode_stream))
+        self.assertEqual(
+            events,
+            [
+                "real",
+                "real",
+                "sync",
+                "barrier",
+                "capture_begin",
+                "stub",
+                "capture_end",
+                "barrier",
+                "smoke",
+                "real",
+                "sync",
+            ],
+        )
+        self.assertIsNone(pg._captures[8].initial_pool)
+        self.assertIsNot(pg._pool, pool)
+        self.assertIs(pg._captures[8].stream, decode_stream)
+        self.assertEqual(pg.replay_count, 0)
+
+    def test_capture_failure_restores_ambient_context(self):
+        from unittest import mock
+
+        pg = self._graph(2)
+        ctx = self._ctx(8, [8] * 4, True, self.ForwardMode.EXTEND)
+        outer = object()
+        pg.make_dummy_batch = lambda bucket: ctx
+        pg._embed_tokens = lambda tokens: tokens
+        pg._land_input_embeds = lambda embeds, bucket: None
+        pg.input_buffers = SimpleNamespace(input_ids_buf=self.torch.zeros(16))
+        cause = RuntimeError("capture failure")
+        with (
+            self.bcg.active_forward(outer),
+            mock.patch.object(pg, "_capture_bucket", side_effect=cause),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                pg._capture_all_buckets(None)
+            self.assertIs(caught.exception, cause)
+            self.assertIs(self.bcg.current_forward_ctx(), outer)
+            self.assertIsNone(pg._ctx)
+
+    def test_padded_context_restores_all_counts_even_on_failure(self):
+        pg = self._graph(2)
+        counts = [3, 3, 9, 9]
+        ctx = self._ctx(3, counts, True, self.ForwardMode.EXTEND)
+        original_bs = ctx.global_bs
+        outer = object()
+        with self.bcg.active_forward(outer):
+            with self.assertRaisesRegex(RuntimeError, "eager failed"):
+                with pg._padded_to(ctx, 16):
+                    self.assertIs(self.bcg.current_forward_ctx(), ctx)
+                    self.assertEqual(ctx.global_num_tokens, [16] * 4)
+                    self.assertEqual(ctx.input_num_tokens, 16)
+                    raise RuntimeError("eager failed")
+            self.assertIs(self.bcg.current_forward_ctx(), outer)
+        self.assertEqual(ctx.input_num_tokens, 3)
+        self.assertIs(ctx.global_num_tokens, counts)
+        self.assertIs(ctx.global_bs, original_bs)
+
+    def test_replay_proof_is_recorded_only_after_success(self):
+        from unittest import mock
+
+        pg = self._graph(2)
+        ctx = self._ctx(3, [3] * 4, True, self.ForwardMode.EXTEND)
+        pg._embed_tokens = lambda tokens: tokens
+        pg._land_input_embeds = lambda embeds, bucket: None
+        pg.input_buffers = SimpleNamespace(
+            input_ids_buf=self.torch.zeros(16),
+            positions_buf=self.torch.zeros(16),
+        )
+        replay = mock.Mock(side_effect=RuntimeError("eager break failed"))
+        pg._captures[8] = SimpleNamespace(replay=replay)
+        pg._outputs[8] = self.mod.CapturedForward(self.torch.zeros(8, 2), None)
+        pg.text_model = SimpleNamespace(
+            logits_processor=lambda *args: "logits", lm_head=object()
+        )
+        with (
+            mock.patch.object(self.mod.logger, "info") as log,
+            mock.patch.object(pg, "_deep_ep_capture_barrier") as barrier,
+            mock.patch.object(
+                self.mod.LogitsMetadata, "from_forward_context", return_value=object()
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "eager break failed"):
+                pg.replay(ctx, self.torch.zeros(3), None)
+            self.assertEqual(pg.replay_count, 0)
+            log.assert_not_called()
+            replay.side_effect = None
+            self.assertEqual(pg.replay(ctx, self.torch.zeros(3), None), "logits")
+            self.assertEqual(
+                (pg.replay_count, pg.replayed_tokens, pg.replayed_padded_tokens),
+                (1, 3, 5),
+            )
+            pg.replay(ctx, self.torch.zeros(3), None)
+            self.assertEqual(pg.replay_count, 2)
+            barrier.assert_not_called()
+            log.assert_called_once_with(
+                "DeepEP prefill BCG replay: rank=%d bucket=%d real_tokens=%d", 1, 8, 3
+            )
+        self.assertEqual(ctx.input_num_tokens, 3)
+
+    def test_language_model_only_uses_active_multimodal_fact(self):
+        from unittest import mock
+
+        inner = SimpleNamespace(embed_tokens=object())
+        runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner),
+            is_generation=True,
+            is_multimodal=True,
+            is_multimodal_active=False,
+            deepep_prefill_graph_enabled=True,
+        )
+        config = SimpleNamespace(
+            enforce_eager=False, disable_prefill_graph=False, data_parallel_size=2
+        )
+        with mock.patch.object(self.mod, "get_prefill_token_buckets", return_value=[8]):
+            graph = self.mod.PrefillGraph(
+                runner, object(), object(), object(), config, None, 3, True
+            )
+            self.assertFalse(graph.disable)
+            runner.is_multimodal_active = True
+            graph = self.mod.PrefillGraph(
+                runner, object(), object(), object(), config, None, 3, True
+            )
+            self.assertTrue(graph.disable)
 
 
 if __name__ == "__main__":

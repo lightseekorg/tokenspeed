@@ -118,10 +118,12 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
 
-    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
-    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
-    receive counts come back to the host, and a host sync cannot be captured.
+    DeepEP requires an explicit positive cap. This resolves user intent only;
+    the executor validates the loaded model and concrete kernel before any
+    graph capture. Other all-to-all backends remain disabled.
     """
+    if server_args.all2all_backend == "deepep":
+        return int(server_args.prefill_graph_max_tokens or 0)
     if server_args.all2all_backend not in (None, "none"):
         return 0
     if server_args.prefill_graph_max_tokens is not None:
@@ -132,6 +134,67 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     if server_args.max_total_tokens:
         cap = min(cap, int(server_args.max_total_tokens))
     return cap
+
+
+def _validate_deepep_prefill_graph_support(
+    config: ModelExecutorConfig,
+    model_runner: ModelRunner,
+    graph_supported: bool,
+) -> bool:
+    """Validate an explicit DeepEP prefill-graph request before capture.
+
+    Args:
+        config: Resolved executor configuration, including the requested cap.
+        model_runner: Loaded target runner and its resolved model/kernel plans.
+        graph_supported: Combined target and draft attention graph capability.
+
+    Returns:
+        Whether DeepEP prefill graphs are enabled. Unsupported explicit
+        requests raise an actionable configuration error instead of silently
+        serving eagerly.
+    """
+    if config.disable_prefill_graph or config.prefill_graph_max_tokens <= 0:
+        return False
+    server_args = model_runner.server_args
+    if server_args.all2all_backend != "deepep":
+        return False
+
+    mapping = model_runner.mapping
+    reason = None
+    if config.spec_algo is not None or model_runner.is_draft_worker:
+        reason = "speculative decoding and draft workers are not supported"
+    elif mapping.attn.cp_size != 1 or mapping.pp_size != 1:
+        reason = "context and pipeline parallelism must both be 1"
+    elif mapping.moe.tp_size != 1 or mapping.moe.dp_size != 1:
+        reason = "MoE TP must be 1 and one EP group must span the serving ranks"
+    elif mapping.nnodes != 1:
+        reason = "only single-node expert parallelism is supported"
+    elif server_args.disaggregation_mode != "null":
+        reason = "prefill/decode/encoder disaggregation is not supported"
+    elif server_args.deepep_mode != "auto":
+        reason = "--deepep-mode auto is required for normal prefill and LL decode"
+    elif model_runner.is_multimodal_active:
+        reason = "multimodal execution is active; use --language-model-only"
+    elif not model_runner.is_generation:
+        reason = "the loaded model must support text generation"
+    elif config.enforce_eager:
+        reason = "--enforce-eager disables CUDA graphs"
+    elif not graph_supported:
+        reason = "a target or draft attention backend does not support prefill graphs"
+    else:
+        reason = model_runner.deepep_prefill_graph_unsupported_reason()
+
+    if reason is not None:
+        raise ValueError(
+            "Cannot enable DeepEP prefill CUDA graphs: "
+            f"{reason}. Set --prefill-graph-max-tokens 0 to keep them disabled."
+        )
+    logger.info(
+        "Enabled explicit DeepEP prefill CUDA graph opt-in for the loaded "
+        "Qwen FP8/DeepGEMM MoE blocks (max_tokens=%s)",
+        config.prefill_graph_max_tokens,
+    )
+    return True
 
 
 def _cache_arena_attr(pool, name: str, default):
@@ -423,6 +486,11 @@ class ModelExecutor:
         # loop included). Startup-time and class-attribute-driven, so every
         # DP rank resolves the same answer.
         graph_support = resolve_cuda_graph_support(attn_backend, draft_attn_backend)
+        model_runner.deepep_prefill_graph_enabled = (
+            _validate_deepep_prefill_graph_support(
+                config, model_runner, graph_support.prefill_graph
+            )
+        )
 
         self.dp_sampling_runtime_config = setup_dp_sampling(
             model=self.model_runner.model,

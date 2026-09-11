@@ -7,9 +7,13 @@ invariants in isolation -- segment splitting, the eager break handoff, shared
 mempool address stability -- without touching the model or the hot path.
 """
 
+import gc
 import os
 import sys
 import unittest
+import weakref
+from contextlib import contextmanager
+from unittest.mock import patch
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,6 +37,159 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
     scrub_padding_tail,
     slice_to_real_tokens,
 )
+
+
+class TestCaptureStubBinding(unittest.TestCase):
+    """Exercise real break binding with CPU tensors and mocked CUDA boundaries.
+
+    These tests cover Python side effects, callable ownership, and failure
+    handling. GPU tests below separately exercise the allocator and graph replay.
+    """
+
+    @contextmanager
+    def _capture_without_cuda(self):
+        cap = object.__new__(BreakableCapture)
+        cap.segments = []
+        cap._capturing = True
+
+        def end_segment():
+            cap._capturing = False
+
+        def begin_segment():
+            cap._capturing = True
+
+        with (
+            patch.object(BreakableCapture, "_active", cap),
+            patch.object(cap, "_end_segment", side_effect=end_segment),
+            patch.object(cap, "_begin_segment", side_effect=begin_segment),
+        ):
+            yield cap
+
+    def test_inactive_break_runs_real_body_even_with_stub(self):
+        x, dst = torch.arange(4.0), torch.empty(4)
+
+        def stub(x):
+            self.fail("capture stub ran outside structural capture")
+
+        out = break_here(torch.relu, dst, x, capture_stub=stub)
+        self.assertIs(out, dst)
+        torch.testing.assert_close(out, torch.relu(x))
+
+    def test_stub_initializes_destination_but_replay_runs_real_with_live_context(self):
+        calls = []
+        x, dst = torch.arange(4.0), torch.empty(4)
+        dummy, live = SimpleNamespace(scale=2), SimpleNamespace(scale=3)
+
+        @break_point
+        def inner(x, ctx):
+            self.assertFalse(is_breakable_capture_active())
+            calls.append(("real", ctx.scale, current_valid_rows()))
+            return x * ctx.scale
+
+        def real(x, ctx, out):
+            out.copy_(inner(x, ctx))
+            return out
+
+        def stub(x, ctx, out):
+            self.assertFalse(is_breakable_capture_active())
+            calls.append(("stub", ctx.scale, current_valid_rows()))
+            return out.zero_()
+
+        with self._capture_without_cuda() as cap, active_forward(dummy):
+            out = break_here(real, dst, x, dummy, dst, capture_stub=stub)
+        self.assertIs(out, dst)
+        torch.testing.assert_close(out, torch.zeros_like(dst))
+        self.assertEqual(calls, [("stub", 2, None)])
+        self.assertEqual(len(cap.segments), 1)
+        ptr = out.data_ptr()
+
+        x.add_(1)
+        with active_forward(live):
+            cap.replay(valid_rows=3)
+        expected = x * 3
+        expected[3:].zero_()
+        torch.testing.assert_close(out, expected)
+        self.assertEqual(out.data_ptr(), ptr)
+        self.assertEqual(calls, [("stub", 2, None), ("real", 3, 3)])
+        self.assertIsNone(current_forward_ctx())
+        self.assertIsNone(current_valid_rows())
+
+    def test_capture_does_not_retain_stub(self):
+        class Stub:
+            def __call__(self, x):
+                return torch.zeros_like(x)
+
+        stub = Stub()
+        ref = weakref.ref(stub)
+        x, dst = torch.arange(4.0), torch.empty(4)
+        with self._capture_without_cuda() as cap:
+            break_here(torch.relu, dst, x, capture_stub=stub)
+        del stub
+        gc.collect()
+        self.assertIsNone(ref())
+        cap.replay(valid_rows=None)
+        torch.testing.assert_close(dst, x)
+
+    def test_capture_returns_owning_destination_not_replay_alias(self):
+        x, dst = torch.arange(4.0), torch.empty(4)
+        alias = dst.view_as(dst)
+        with (
+            self._capture_without_cuda() as cap,
+            patch(
+                "tokenspeed.runtime.execution.breakable_cuda_graph.weak_ref_tensor",
+                side_effect=lambda tensor: alias if tensor is dst else tensor,
+            ),
+        ):
+            out = break_here(torch.relu, dst, x, capture_stub=torch.zeros_like)
+        self.assertIs(out, dst)
+        self.assertIsNot(out, alias)
+        cap.replay(valid_rows=None)
+        torch.testing.assert_close(out, x)
+
+    def test_explicit_none_preserves_capture_invocation(self):
+        calls = []
+        x, dst = torch.arange(4.0), torch.empty(4)
+
+        def real(x):
+            calls.append(is_breakable_capture_active())
+            return x + 1
+
+        with self._capture_without_cuda() as cap:
+            break_here(real, dst, x, capture_stub=None)
+        cap.replay(valid_rows=None)
+        self.assertEqual(calls, [False, False])
+        torch.testing.assert_close(dst, x + 1)
+
+    def test_failed_stub_does_not_record_real_replay(self):
+        x, dst = torch.arange(4.0), torch.empty(4)
+
+        def stub(x):
+            raise RuntimeError("stub failed")
+
+        with self._capture_without_cuda() as cap:
+            with self.assertRaisesRegex(RuntimeError, "stub failed"):
+                break_here(torch.relu, dst, x, capture_stub=stub)
+            self.assertFalse(cap._capturing)
+            self.assertEqual(cap.segments, [])
+            cap._begin_segment.assert_not_called()
+        self.assertFalse(is_breakable_capture_active())
+
+    def test_replay_failure_restores_valid_rows_and_ambient_context(self):
+        x, dst = torch.arange(4.0), torch.empty(4)
+        dummy, live = SimpleNamespace(name="dummy"), SimpleNamespace(name="live")
+
+        def real(x):
+            self.assertEqual(current_valid_rows(), 2)
+            self.assertIs(current_forward_ctx(), live)
+            raise RuntimeError("real failed")
+
+        with self._capture_without_cuda() as cap, active_forward(dummy):
+            break_here(real, dst, x, capture_stub=torch.zeros_like)
+        with self.assertRaisesRegex(RuntimeError, "real failed"):
+            with active_forward(live):
+                cap.replay(valid_rows=2)
+        self.assertIsNone(current_valid_rows())
+        self.assertIsNone(current_forward_ctx())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -61,7 +218,7 @@ class TestBreakableCudaGraph(unittest.TestCase):
             h = self.x_static @ self.w1
             # Break-output buffer, allocated in-segment so it is pool-pinned.
             dst = torch.empty_like(h)
-            h = break_here(torch.relu, dst, h)
+            h = break_here(torch.relu, dst, h, capture_stub=None)
             return h @ self.w2
 
         # Warm up (cublas workspace / lazy init) before capture.
@@ -77,7 +234,7 @@ class TestBreakableCudaGraph(unittest.TestCase):
         self.assertFalse(is_breakable_capture_active())
         h = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
         dst = torch.empty_like(h)
-        out = break_here(torch.relu, dst, h)
+        out = break_here(torch.relu, dst, h, capture_stub=None)
         self.assertIs(out, dst)
         torch.testing.assert_close(out, torch.relu(h))
 
@@ -96,6 +253,82 @@ class TestBreakableCudaGraph(unittest.TestCase):
             torch.testing.assert_close(
                 captured_out, self._eager(new_x), msg=f"trial {trial}"
             )
+
+    def test_stub_with_distinct_outputs_preserves_delayed_consumer(self):
+        """Same-shaped explicit handoffs retain independent graph-pool lifetimes."""
+        calls = []
+        dummy = SimpleNamespace(scales=(2.0, 3.0))
+
+        def real(x, ctx, index, dst):
+            calls.append(("real", index, dst.data_ptr()))
+            dst.copy_(torch.relu(x) * ctx.scales[index])
+            return dst
+
+        def stub(x, ctx, index, dst):
+            calls.append(("stub", index, dst.data_ptr()))
+            return dst.zero_()
+
+        def eager_break(h, index):
+            # The caller receives only the break's result; no separate strong
+            # owner of dst may keep this graph allocation alive accidentally.
+            dst = torch.empty_like(h)
+            return break_here(real, dst, h, dummy, index, dst, capture_stub=stub)
+
+        def forward():
+            h = self.x_static @ self.w1
+            first = eager_break(h, 0)
+            second = eager_break(h, 1)
+            # Keep the first break's output alive past the second same-shaped
+            # handoff, as residuals or delayed hidden-state consumers can do.
+            return (first + second) @ self.w2
+
+        for _ in range(3):
+            with active_forward(dummy):
+                forward()
+        self.assertEqual([kind for kind, _, _ in calls], ["real"] * 6)
+        torch.cuda.synchronize()
+        calls.clear()
+        cap = BreakableCapture()
+        with active_forward(dummy), cap:
+            captured_out = forward()
+        self.assertEqual([kind for kind, _, _ in calls], ["stub", "stub"])
+        pointers = [ptr for _, _, ptr in calls]
+        self.assertNotEqual(*pointers)
+        self.assertEqual(cap.num_segments, 5)
+
+        for scales in ((1.0, 4.0), (3.0, 2.0), (2.0, 6.0)):
+            new_x = torch.randn_like(self.x_static)
+            self.x_static.copy_(new_x)
+            with active_forward(SimpleNamespace(scales=scales)):
+                cap.replay(valid_rows=None)
+            torch.cuda.synchronize()
+            expected = (torch.relu(new_x @ self.w1) * sum(scales)) @ self.w2
+            torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+            self.assertEqual([ptr for _, _, ptr in calls[-2:]], pointers)
+        self.assertEqual([kind for kind, _, _ in calls[2:]], ["real"] * 6)
+
+    def test_stub_failure_restores_capture_state(self):
+        gc_was_enabled = gc.isenabled()
+
+        def stub(x):
+            raise RuntimeError("construction failed")
+
+        cap = BreakableCapture()
+        with self.assertRaisesRegex(RuntimeError, "construction failed"):
+            with active_forward(SimpleNamespace()), cap:
+                h = self.x_static + 1
+                dst = torch.empty_like(h)
+                break_here(torch.relu, dst, h, capture_stub=stub)
+        self.assertFalse(is_breakable_capture_active())
+        self.assertIsNone(BreakableCapture.current())
+        self.assertIsNone(current_forward_ctx())
+        self.assertEqual(gc.isenabled(), gc_was_enabled)
+        # A failed stub cannot leave the stream capturing or poison the next
+        # independent capture. Capture failures remain fatal to the model runner.
+        next_cap, out = self._build_capture()
+        next_cap.replay(valid_rows=None)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, self._eager(self.x_static))
 
     def test_replay_clears_unwritten_padding_at_break_handoff(self):
         """A padded replay must not pass an eager break's undefined tail onward."""
@@ -189,7 +422,7 @@ class TestBreakableCudaGraph(unittest.TestCase):
             h = self.x_static @ ws[0]
             for i in range(depth):
                 dst = torch.empty_like(h)
-                h = break_here(torch.relu, dst, h)
+                h = break_here(torch.relu, dst, h, capture_stub=None)
                 h = h @ ws[i + 1]
             return h
 
@@ -271,7 +504,8 @@ class TestBucketedCapture(unittest.TestCase):
         h = self.x_static[:n] @ self.ws[0]
         for i in range(self.depth):
             dst = torch.empty_like(h)
-            h = break_here(torch.relu, dst, h)  # per-token "attention" break
+            # Per-token "attention" break.
+            h = break_here(torch.relu, dst, h, capture_stub=None)
             h = h @ self.ws[i + 1]
         return h
 
@@ -616,19 +850,40 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
         )
 
-    def test_all_to_all_backend_disables_the_graph(self):
+    def test_deepep_requires_an_explicit_positive_cap(self):
         from tokenspeed.runtime.execution.model_executor import (
             _resolve_prefill_graph_max_tokens,
         )
 
-        # DeepEP's normal dispatch reports per-expert receive counts to the host,
-        # and a host sync cannot be captured -- even when asked for explicitly.
+        # DeepEP is opt-in. The loaded model/kernel support is validated later;
+        # this resolver preserves an explicit positive request for that check.
         self.assertEqual(
             _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
         )
         self.assertEqual(
             _resolve_prefill_graph_max_tokens(
+                self._args(all2all_backend="deepep", prefill_graph_max_tokens=0)
+            ),
+            0,
+        )
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(
                 self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
+            ),
+            2048,
+        )
+
+    def test_unrelated_all_to_all_backend_stays_disabled(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(
+                self._args(
+                    all2all_backend="flashinfer_nvlink_two_sided",
+                    prefill_graph_max_tokens=2048,
+                )
             ),
             0,
         )
@@ -688,7 +943,7 @@ class TestPoolReuseAcrossCaptures(unittest.TestCase):
             for _ in range(depth):
                 h = x @ w1
                 dst = torch.empty_like(h)
-                h = break_here(torch.relu, dst, h)
+                h = break_here(torch.relu, dst, h, capture_stub=None)
                 x = h @ w2
             return x
 
