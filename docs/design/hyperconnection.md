@@ -126,9 +126,11 @@ All clusters have completed their DSM receives before any CTA passes the
 global handoff, preserving remote SMEM lifetime. Every epilogue reader
 acknowledges completion before TMEM reuse or deallocation.
 
-Outgoing PDL is triggered after the Down epilogue acknowledgement, before
-cluster publication and Up computation. Successors must still wait before
-consuming outputs; the trigger does not make the outputs ready.
+Outgoing PDL is triggered by warp 5 immediately after its incoming wait,
+before Down computation or epoch access. Successors can prepare throughout
+both projections but must still wait before consuming outputs. The trigger
+does not publish activation, output or workspace state; all cluster, epilogue
+and retirement acknowledgements remain necessary.
 
 ## Two-GEMM CuTe fallback
 
@@ -137,11 +139,12 @@ Both GEMMs use native Blackwell tensor-core instructions, and Down reduces
 split-K partials within the cluster in FP32. Only the HC Down/inject and Up/gate
 epilogues are implemented; the wrapper selects explicit tactics.
 
-Down waits for preceding input and weight writes in both DMA warps. It triggers
-Up after issuing its weight loads, while computation may still be running.
-Up weights can load independently because Down never writes them; its
-activation DMA warp waits for Down. Down's incoming wait also orders ancestor
-writes to the prepared up weight before Up's early loads.
+Down waits for preceding input and weight writes in both DMA warps. Each
+GEMM's activation DMA warp triggers its successor immediately after that wait,
+before issuing activation TMA. Up weights can load independently because Down
+never writes them; its activation DMA warp waits for Down. Triggering from
+the activation warp also orders ancestor writes to the prepared Up weight
+before Up's early loads, including when weights are produced inside a graph.
 
 Down writes SiLU activation for columns 0–319, optional inject logits to a
 separate output, and zero padding through rank 384. Up fuses sigmoid, branch
@@ -191,9 +194,10 @@ numbers of calls. FP32 atomic accumulation excludes deterministic dispatch.
 With PDL on SM90+, each CTA issues bounded 48 KiB bulk L2 prefetch hints for
 Down/Up weights before waiting. These are cache hints; all actual operand
 loads and workspace accesses remain after `gdc_wait`. Unaligned weight views
-skip the hint. Mix triggers successors after projection work, before the grid
-barrier and Up. Combine triggers after its incoming wait so the following
-normalization can prepare. Consumers still wait before reading outputs.
+skip the hint. Mix, projection/mix epilogues and combine trigger successors
+immediately after their incoming wait. This includes time spent in Down, the
+grid barrier and Up in the overlap window. Consumers still wait before reading
+outputs.
 See NVIDIA's [PDL execution model](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)
 and [bulk prefetch instruction](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-prefetch).
 
@@ -290,6 +294,8 @@ The MTP row selection likewise materializes its residual before its norm and
 gate selections. Normal grouped RMSNorm waits before reading its activation.
 If the kernel wrapper must copy a noncontiguous residual or weight, it disables
 preloading for that invocation so the copy's output is not read prematurely.
+Both forms trigger successors immediately after their incoming wait so the
+next mixer can preload projection weights during normalization.
 
 The MLP returns a forward-local `GatedResidualUpdate` holding the original
 residual, block output and injection logits. When the next attention has no PLE

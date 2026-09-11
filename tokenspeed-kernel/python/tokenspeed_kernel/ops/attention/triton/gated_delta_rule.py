@@ -183,6 +183,8 @@ def _fused_gdn_decode_update_kernel(
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -308,8 +310,6 @@ def _fused_gdn_decode_update_kernel(
                 + o_k[:, None]
             )
             tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _launch_fused_gdn_decode_update(
@@ -524,6 +524,8 @@ def _gdn_replay_commit_kernel(
     """Recompute accepted GDN states with one Triton program per state tile."""
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     i_k, i_v, i_lnh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_hv = i_lnh % HV
     i_ln = i_lnh // HV
@@ -605,8 +607,6 @@ def _gdn_replay_commit_kernel(
             + o_k[:, None]
         )
         tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(

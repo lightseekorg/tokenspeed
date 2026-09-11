@@ -233,6 +233,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             group_size=None,
             norm_before_gate=True,
             sigmoid_gate=False,
+            weights_independent=True,
         )
 
     # Return to false after true to exercise both upstream and private caches.
@@ -259,6 +260,7 @@ def test_gdn_chain_pdl_toggle(batch, steps, solution, state_dtype, restore_pdl):
             pdl_enabled(False)
             expected = forward().clone()
             expected_conv, expected_state = conv.clone(), state.clone()
+            projection.fill_(float("nan"))
             pdl_enabled(not enabled)
             graph.replay()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -283,7 +285,12 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
     state = torch.randn(2, 8, 128, 128, device="cuda")
     cu = torch.tensor([0, 65, 130], device="cuda", dtype=torch.int32)
 
+    query_source = q.clone()
+
     def forward():
+        _delayed_projection[(triton.cdiv(q.numel(), 1024),)](
+            query_source, q, N=q.numel(), BLOCK=1024, launch_pdl=True
+        )
         return gdn_chunk_prefill(
             q,
             k,
@@ -329,7 +336,7 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
                 assert edge_type == int(enabled), (target, edges)
                 checked += 1
         assert checked >= 2, names
-        q.normal_()
+        query_source.normal_()
         k.normal_()
         v.normal_()
         pdl_enabled(False)
@@ -339,6 +346,51 @@ def test_gdn_prefill_pdl_toggle(solution, restore_pdl):
         torch.testing.assert_close(
             result.final_state, reference.final_state, rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("weights_independent", [False, True])
+@pytest.mark.parametrize("weight_stride", [1, 2])
+@pytest.mark.parametrize("sigmoid_gate", [False, True])
+def test_gdn_norm_weight_readiness(
+    weights_independent, weight_stride, sigmoid_gate, restore_pdl
+):
+    torch.manual_seed(47)
+    dim = 128
+    source = torch.randn(3, dim * weight_stride, device="cuda", dtype=torch.bfloat16)
+    projection = torch.empty_like(source)
+    weights = (source if weights_independent else projection)[2, ::weight_stride]
+
+    def forward():
+        _delayed_projection[(1,)](
+            source,
+            projection,
+            N=source.numel(),
+            BLOCK=triton.next_power_of_2(source.numel()),
+            launch_pdl=True,
+        )
+        return rmsnorm_fn(
+            projection[0:1, :dim],
+            weights,
+            z=projection[1:2, :dim],
+            eps=1e-6,
+            group_size=None,
+            norm_before_gate=True,
+            sigmoid_gate=sigmoid_gate,
+            weights_independent=weights_independent,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for _ in range(3):
+        source.normal_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        projection.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

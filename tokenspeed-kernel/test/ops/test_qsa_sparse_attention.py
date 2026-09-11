@@ -385,6 +385,7 @@ def test_qsa_sparse_attention_blackwell_rejects_single_head_groups(device: str) 
             max_seqlen_q=1,
             k_scale=None,
             v_scale=None,
+            enable_pdl=False,
         )
 
 

@@ -21,7 +21,7 @@
 """PDL launch adapters for FlashInfer CuTe kernels without upstream PDL APIs.
 
 The original device body is inlined into a kernel that waits for predecessors
-before any global-memory access and signals launch readiness after computation.
+before any global-memory access and then releases successor setup immediately.
 Host launch geometry and runtime ABI stay with FlashInfer. Private namespaces and
 fresh caches keep PDL executors separate from the upstream non-PDL executors;
 no installed module or process-wide CuTe launch API is modified.
@@ -52,12 +52,12 @@ def _gdn_pdl_kernel(
     constant_args: cutlass.Constexpr,
     constant_positions: cutlass.Constexpr,
 ):
-    # Wait covers in-place conv/state updates and side inputs. Signal late to
-    # avoid scheduling waiting consumers throughout the recurrent computation.
+    # Order ancestor conv/state/side-input writes before releasing successors.
+    # They can prepare while the recurrent body runs, but must wait for results.
     # All CTAs signal, including those whose body skips a padding row.
     cute.arch.griddepcontrol_wait()
-    body(*_merge_arguments(dynamic_args, constant_args, constant_positions))
     cute.arch.griddepcontrol_launch_dependents()
+    body(*_merge_arguments(dynamic_args, constant_args, constant_positions))
 
 
 class _PdlLaunch:

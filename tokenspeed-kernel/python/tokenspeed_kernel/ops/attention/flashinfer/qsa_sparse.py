@@ -46,7 +46,11 @@ def _prepare_flashinfer_qsa_metadata_kernel(
     WIDTH: tl.constexpr,
     PACKED_WIDTH: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     byte_offsets = tl.program_id(1) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
     bit_offsets = tl.arange(0, 8)
@@ -112,6 +116,7 @@ def _prepare_flashinfer_qsa_metadata(
         WIDTH=width,
         PACKED_WIDTH=packed_width,
         BLOCK_BYTES=block_bytes,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=1,
         **pdl_kwargs,

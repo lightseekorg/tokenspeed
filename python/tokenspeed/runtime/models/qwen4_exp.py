@@ -172,8 +172,10 @@ class _Qwen4ExpRMSNormGated(nn.Module):
                 self.weight,
                 z=z,
                 eps=self.eps,
+                group_size=None,
                 norm_before_gate=True,
                 sigmoid_gate=True,
+                weights_independent=True,
             )
         input_dtype = x.dtype
         value = x.float()

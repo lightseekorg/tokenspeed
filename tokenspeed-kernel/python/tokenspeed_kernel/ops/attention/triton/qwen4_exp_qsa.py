@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.attention.cuda.dsa_topk import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     triton_topk_from_logits,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -65,7 +65,11 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
     COMPRESS_RATIO: tl.constexpr,
     RESET_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     request = tl.program_id(0)
     if HAS_UNIFORM:
         length = tl.full((), uniform_len, tl.int64)
@@ -221,6 +225,7 @@ def qwen4_exp_qsa_prepare_metadata(
         draft_arg = draft_logical_positions
         stride_dlp_r = draft_logical_positions.stride(0)
         stride_dlp_s = draft_logical_positions.stride(1)
+    enable_pdl = pdl_enabled()
     _qwen4_exp_qsa_prepare_metadata_kernel[(batch,)](
         seq_lens,
         lengths_arg,
@@ -244,6 +249,8 @@ def qwen4_exp_qsa_prepare_metadata(
         COMPRESS_RATIO=compress_ratio,
         RESET_BLOCK=triton.next_power_of_2(compress_ratio),
         BLOCK=128,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return outputs
 
@@ -324,6 +331,10 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     BLOCK_D: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     half = rotary_dim // 2
     half_offsets = tl.arange(0, BLOCK_HALF)
@@ -646,12 +657,10 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
             norm_pass.to(out_dtype),
             mask=pass_mask,
         )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
     if STAGE_VERIFY or STAGE_DRAFT:
         # Compression has consumed the old raw/draft ring before any staged
         # value can alias it. The PDL-dependent score kernel needs neither
-        # staging destination, so these stores remain in the producer tail.
+        # staging destination; its wait still covers these producer stores.
         if STAGE_DRAFT:
             tl.debug_barrier()
         staged_values = tl.load(
@@ -773,7 +782,7 @@ def qwen4_exp_qsa_compress_and_store(
             ``draft_raw_cache``, shaped ``[requests, compress_ratio]``.
         draft_position_cache: Group-start RoPE positions for speculative
             draft groups, shaped ``[requests, 3]``.
-        enable_pdl: Allow the follow-up raw-key write kernel to launch early
+        enable_pdl: Wait for input producers and allow the follow-up kernel to launch early
             on NVIDIA GPUs; the dependent kernel still waits for this grid.
         query: Optional raw projected queries shaped
             ``[rows, num_query_heads * head_dim]``. When present, query
@@ -1027,22 +1036,23 @@ def _qwen4_exp_qsa_recent_write_kernel(
             write &= not has_future
     if write and HAS_LIMIT:
         write &= tl.load(request_indices + row).to(tl.int64) < request_limit
+    dim_offsets = tl.arange(0, BLOCK_D)
+    dim_mask = dim_offsets < head_dim
+    values = tl.load(
+        token_k + row * stride_k_n + dim_offsets * stride_k_d,
+        mask=dim_mask & write,
+        other=0.0,
+    )
+    if ENABLE_PDL:
+        # Compression's incoming wait makes the preloaded inputs visible.
+        # Wait for its old-ring reads before overwriting cache slots. Even
+        # non-writing CTAs must order compression before releasing scoring.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if write:
         position = tl.load(logical_positions + row).to(tl.int64)
         slot = (position % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
         page = loc // recent_page_size
-        dim_offsets = tl.arange(0, BLOCK_D)
-        dim_mask = dim_offsets < head_dim
-        values = tl.load(
-            token_k + row * stride_k_n + dim_offsets * stride_k_d,
-            mask=dim_mask,
-            other=0.0,
-        )
-        if ENABLE_PDL:
-            # Only the raw-cache and position-header writes must observe the
-            # compression kernel's reads of the old ring slots; everything
-            # above already overlapped that kernel's tail.
-            tl.extra.cuda.gdc_wait()
         tl.store(
             raw_cache
             + page * stride_raw_p
@@ -1103,7 +1113,9 @@ def qwen4_exp_qsa_recent_write(
         write_mask: Optional authoritative per-row write mask.
         request_limit: Optional exclusive request-id write bound.
         enable_pdl: Wait on the compression kernel via programmatic dependent
-            launch on NVIDIA GPUs, hiding the launch gap between the two.
+            launch on NVIDIA GPUs. Compression must have waited for the producer
+            of token keys and metadata before triggering this writer, allowing
+            those inputs to preload while compression finishes its ring reads.
 
     Returns:
         None.
@@ -1415,6 +1427,8 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     BLOCK_D: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     split = tl.program_id(1)
     block_start = split * blocks_per_split
@@ -1476,10 +1490,12 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         if tl.max(packed, axis=0) > tl.min(acc, axis=0):
             padded = _qwen4_exp_qsa_pad_keys_to_topk(packed, BLOCK_TOPK, BLOCK_N)
             acc = tl.maximum(acc, tl.sort(padded, descending=True))
+    if ENABLE_PDL:
+        # Keep merge CTAs out of the resident scoring wave; release their
+        # setup before storing the completed partials.
+        tl.extra.cuda.gdc_launch_dependents()
     topk_offsets = tl.arange(0, BLOCK_TOPK)
     tl.store(partial_keys + row * stride_pk_n + split * stride_pk_s + topk_offsets, acc)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1535,9 +1551,11 @@ def _qwen4_exp_qsa_merge_block_topk_kernel(
     POW2_SPLITS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
     complete = tl.load(complete_blocks + row).to(tl.int64)
     split_ids = tl.arange(0, POW2_SPLITS)[:, None]
     entries = tl.arange(0, BLOCK_TOPK)[None, :]
@@ -1572,10 +1590,12 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
     CHUNK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    chunk = tl.program_id(1)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
     complete = tl.load(complete_blocks + row).to(tl.int64)
     split_ids = chunk * CHUNK + tl.arange(0, CHUNK)[:, None]
     entries = tl.arange(0, BLOCK_TOPK)[None, :]
@@ -1595,8 +1615,6 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
         merged_keys + row * stride_mk_n + chunk * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK),
         acc,
     )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1624,6 +1642,10 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     BLOCK_D: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     tile = tl.program_id(1)
     request = tl.load(request_indices + row).to(tl.int64)
@@ -1662,12 +1684,9 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     scores = tl.dot(q, keys, out_dtype=tl.float32)
     scores = tl.maximum(scores, 0.0)
     scores = tl.sum(tl.where(head_mask[:, None], scores, 0.0), axis=0)
-    # Invalid blocks become -inf so the downstream selection drops them;
-    # the PDL trigger lets selection launch while the tail tiles drain.
+    # Invalid blocks become -inf so the downstream selection drops them.
     scores = tl.where(valid, scores, -float("inf"))
     tl.store(logits + row * stride_l_n + block_ids, scores, mask=tile_mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _qwen4_exp_qsa_block_topk_stream(
@@ -1722,8 +1741,8 @@ def _qwen4_exp_qsa_block_topk_stream(
     partial = torch.empty(
         (rows, splits, block_topk), dtype=torch.int64, device=query.device
     )
-    # PDL overlaps the merge launch with the tail of the streaming grid on
-    # NVIDIA GPUs; the merge's gdc_wait still enforces the full dependency.
+    # PDL overlaps successor setup with scoring; each consumer waits before
+    # accessing the preceding kernel's results.
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     # Strided query reads keep the GEMM-view input copy-free.
@@ -1932,8 +1951,8 @@ def qwen4_exp_qsa_block_topk(
             of at least 1 MiB. The ``"logits"`` solution uses it for the
             length-aware persistent radix top-k when that kernel is available;
             otherwise selection falls back to portable Triton.
-        enable_pdl: Allow programmatic dependent launch between the
-            producer and selection kernels on NVIDIA GPUs.
+        enable_pdl: Wait for query/cache/metadata producers and release
+            successor setup early between scoring and selection on NVIDIA GPUs.
 
     Returns:
         Int32 block ids shaped ``[rows, block_topk]``; invalid entries are
@@ -2001,7 +2020,11 @@ def _qwen4_exp_qsa_selected_slots_kernel(
     PAGE_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = columns < WIDTH
@@ -2093,6 +2116,7 @@ def qwen4_exp_qsa_selected_slots(
         (rows, width), dtype=torch.int32, device=selected_blocks.device
     )
     if rows:
+        enable_pdl = pdl_enabled()
         _qwen4_exp_qsa_selected_slots_kernel[(rows, triton.cdiv(width, 256))](
             selected_blocks,
             complete_blocks,
@@ -2108,6 +2132,8 @@ def qwen4_exp_qsa_selected_slots(
             PAGE_SIZE=page_size,
             WIDTH=width,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return output
 

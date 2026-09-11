@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
@@ -127,6 +127,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         max_seqlen_q=max_seqlen_q,
         k_scale=k_scale,
         v_scale=v_scale,
+        enable_pdl=pdl_enabled(),
     )
 
 

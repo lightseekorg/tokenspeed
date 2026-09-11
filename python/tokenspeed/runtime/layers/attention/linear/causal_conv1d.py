@@ -79,6 +79,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
     stride_conv_state_seq = stride_istate_seq
@@ -397,8 +399,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_fn(
@@ -675,6 +675,8 @@ def _causal_conv1d_update_kernel(
     # ruff: noqa: E501
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -909,8 +911,6 @@ def _causal_conv1d_update_kernel(
                     tl.store(output_base + 1 * stride_conv_state_tok, col1, mask=mask_w)
                 if KERNEL_WIDTH >= 4:
                     tl.store(output_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_update(

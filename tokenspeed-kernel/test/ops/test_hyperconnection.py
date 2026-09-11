@@ -1220,15 +1220,17 @@ def test_prepared_hc_default_dispatch(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows", [1, 4, 16])
 def test_cute_hc_up_prefetch_waits_for_ancestor_weight_updates(
     dtype: torch.dtype,
+    rows: int,
 ) -> None:
     _require_cute_hc()
     from tokenspeed_kernel.ops.residual.cute_dsl import (
         _get_prepared_padded_up_weight,
     )
 
-    x_source, projection_source, up_source = _inputs(4, dtype, seed=163)
+    x_source, projection_source, up_source = _inputs(rows, dtype, seed=163)
     projection_source.mul_(2.0)
     up_source.mul_(4.0)
     normalized = torch.empty_like(x_source)

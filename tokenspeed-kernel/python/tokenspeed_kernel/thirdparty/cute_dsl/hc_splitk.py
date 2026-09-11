@@ -503,6 +503,10 @@ class SplitKDenseGemmKernel:
             self.use_pdl and (not is_a or self.epilogue_mode != "gate")
         ):
             cute.arch.griddepcontrol_wait()
+            # Activation DMA always waits, including Up. Trigger here so all
+            # ancestor writes are visible before a successor preloads weights.
+            if cutlass.const_expr(not is_a):
+                cute.arch.griddepcontrol_launch_dependents()
 
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -527,8 +531,6 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
         self._drain_producer(bar_empty, empty_phase, k_tile_count)
 
     @cute.experimental.jit

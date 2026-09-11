@@ -493,6 +493,7 @@ class FusedGatedResidualKernel:
             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
             if cutlass.const_expr(self.pdl):
                 cute.arch.griddepcontrol_wait()
+                cute.arch.griddepcontrol_launch_dependents()
             generation = _load_epoch_acquire(epochs.iterator + cluster) + 1
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(control_ready)
@@ -548,8 +549,6 @@ class FusedGatedResidualKernel:
             with cute.arch.elect_one():
                 tcgen05.commit(down_done, None, self.group)
             cute.arch.mbarrier_wait(epi_done, 0)
-            if cutlass.const_expr(self.pdl):
-                cute.arch.griddepcontrol_launch_dependents()
             with cute.arch.elect_one():
                 _cluster_arrive(cluster_done)
                 if split_rank == 0:
