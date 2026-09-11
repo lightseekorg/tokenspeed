@@ -89,6 +89,76 @@ def _make_cache(x, fmt):
     return cache
 
 
+def test_compressor_tail_scatter_graph_strides_and_replay(device):
+    storage = torch.zeros(5, 2, 2, 1024, device=device)
+    tail = storage[1:4, :, :, 1::2]
+    content = torch.randn(6, 1024, device=device)[:, ::2]
+    scores = torch.randn(6, 1024, device=device)[:, 1::2]
+    slot_storage = torch.tensor(
+        [-1, 99, 1, 99, 3, 99, 5, 99, 6, 99, -2, 99], device=device
+    )
+    slots = slot_storage[::2]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        dsv41.compressor_tail_scatter(content, scores, tail, slots)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            dsv41.compressor_tail_scatter(content, scores, tail, slots)
+    torch.cuda.current_stream().wait_stream(stream)
+    for values in ([-1, 1, 3, 5, 6, -2], [4, -1, 2, 0, 99, -1], [-1] * 6):
+        storage.zero_()
+        content.normal_()
+        scores.normal_()
+        slots.copy_(torch.tensor(values, device=device))
+        expected = torch.zeros_like(storage)
+        for i, slot in enumerate(values):
+            if 0 <= slot < 6:
+                expected[1 + slot // 2, slot % 2, 0, 1::2] = content[i]
+                expected[1 + slot // 2, slot % 2, 1, 1::2] = scores[i]
+        graph.replay()
+        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+    dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
+
+
+def test_index_topk_graph_full_candidates_and_reindex(device):
+    torch.manual_seed(43)
+    cache = _make_cache(
+        torch.randn(256, 128, device=device, dtype=torch.bfloat16), "index"
+    )
+    q = torch.randn(2, 2, 128, device=device, dtype=torch.bfloat16)
+    weights = torch.rand(2, 2, device=device, dtype=torch.bfloat16)
+    table = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], device=device, dtype=torch.int32)
+    visible = torch.tensor([0, 0], device=device, dtype=torch.int32)
+
+    def run():
+        full = dsv41.index_topk(
+            q, weights, cache, table, visible, None, 16, 4, 8, 2, 64, None, None
+        )
+        reindex = dsv41.index_topk(
+            q, weights, cache, table, visible, full[2], 16, 0, 8, 2, 64, None, None
+        )
+        return full + reindex
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for lengths in ([17, 130], [256, 9], [0, 0], [65, 255]):
+        q.normal_()
+        weights.uniform_()
+        visible.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+        table.copy_(table.flip(1))
+        expected = run()
+        graph.replay()
+        for got, want in zip(output, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def test_public_arguments_are_explicit():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
@@ -328,11 +398,13 @@ def test_index_scores_reference_rounding_per_head_relu_and_weights(
     torch.testing.assert_close(quantized, q_ref, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("visible", [0, 1, 7, 8, 9, 511, 512, 513, 16383, 16384, 16385])
+@pytest.mark.parametrize(
+    "visible", [0, 1, 7, 8, 9, 511, 512, 513, 16383, 16384, 16385, 262153]
+)
 def test_full_top512_and_block_candidates_boundaries(device, visible):
     # A mix of magnitudes exercises BF16 scoring ties. Compare selected score
     # multisets rather than insisting on an unspecified tie-breaking rule.
-    rows = 16448 if visible > 513 else 576
+    rows = ((visible + 63) // 64) * 64 if visible > 513 else 576
     k = torch.zeros((rows, 128), dtype=torch.bfloat16, device=device)
     ids = torch.arange(rows, device=device)
     k[:, 0] = (ids // 128).to(torch.bfloat16)
@@ -432,21 +504,13 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
     candidates = torch.tensor(
         [[32, 0, -1, 17], [0, 1, -1, -1], [1, -1, -1, -1]], device=device
     )
-    original_gather = implementation.cache_gather
-    reads = []
-
-    def tracked(cache, slots, cache_format, out):
-        reads.append(slots.clone())
-        return original_gather(cache, slots, cache_format, out)
-
-    with patch.object(implementation, "cache_gather", side_effect=tracked):
+    with patch.object(implementation, "cache_gather", side_effect=AssertionError):
         top, lengths, blocks, block_lens = dsv41.index_topk(
             q, weights, cache, table, visible, candidates, 512, 0, 8, 2, 16, None, None
         )
     assert lengths.tolist() == [23, 8, 0]
     assert blocks.shape == (3, 0) and not block_lens.any()
-    assert all(slots.shape[0] <= 2 and slots.shape[1] <= 16 for slots in reads)
-    assert sum(slots.numel() for slots in reads) == 3 * 4 * 8
+
     expected0 = torch.tensor(
         list(range(8)) + list(range(136, 144)) + list(range(256, 263)), device=device
     )
@@ -504,8 +568,10 @@ def test_full_tiles_causal_page_mask_and_output_reuse(device):
     expected = dsv41.index_score(q, weights, cache, slots, None, None).float()
     for query_chunk, score_chunk in ((1, 8), (2, 64)):
         with patch.object(
-            implementation, "_score", wraps=implementation._score
-        ) as score:
+            implementation,
+            "_index_finish_parts",
+            wraps=implementation._index_finish_parts,
+        ) as finish:
             result = dsv41.index_topk(
                 q,
                 weights,
@@ -522,10 +588,13 @@ def test_full_tiles_causal_page_mask_and_output_reuse(device):
                 outputs,
             )
         assert result is outputs
-        for call in score.call_args_list:
-            tile_q, _, _, tile_slots, _ = call.args
-            assert tile_q.shape[0] <= query_chunk
-            assert tile_slots.shape[1] <= score_chunk
+        for call in finish.call_args_list:
+            scores, ids, k, _, _ = call.args
+            assert scores.shape[0] <= query_chunk
+            assert scores.shape == ids.shape
+            assert scores.shape[1] <= 16 * max(
+                16, score_chunk, 1 << (k - 1).bit_length()
+            )
         assert result[1].tolist() == [9, 9, 0]
         for t in range(2):
             chosen = result[0][t].long()

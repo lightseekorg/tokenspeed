@@ -234,7 +234,14 @@ class _Backend:
             content[:cutoff].unflatten(0, (-1, 2))
             * scores[:cutoff].unflatten(0, (-1, 2)).softmax(1)
         ).sum(1)
-        return pooled, positions[:cutoff:2], requests[:cutoff:2]
+        output = torch.zeros_like(content)
+        output[1:cutoff:2] = pooled
+        row_positions, row_requests = torch.full_like(positions, -1), torch.full_like(
+            requests, -1
+        )
+        row_positions[1:cutoff:2] = positions[:cutoff:2]
+        row_requests[1:cutoff:2] = requests[:cutoff:2]
+        return output, row_positions, row_requests
 
     def write_global(self, owner, main, index, positions, requests, mode):
         self.global_writes[owner] = (
@@ -542,6 +549,9 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
                 .sum(1)
                 .to(torch.bfloat16)
             )
+            padded = torch.zeros_like(content, dtype=torch.bfloat16)
+            padded[1::2] = pooled
+            pooled = padded
             assert (
                 attn.compressor.wkv.weight.dtype
                 == attn.compressor.wgate.weight.dtype
@@ -563,8 +573,13 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
         torch.testing.assert_close(
             index, attn.rotary_emb(key, row_pos, False), rtol=0, atol=0
         )
-        assert row_req.tolist() == [0] * row_pos.numel()
-        assert row_pos.tolist() == list(range(0, 6, config.compress_ratios[layer_id]))
+        live = row_pos >= 0
+        assert row_req[live].tolist() == [0] * int(live.sum())
+        assert row_pos[live].tolist() == list(
+            range(0, 6, config.compress_ratios[layer_id])
+        )
+        assert (row_req[~live] == -1).all()
+        assert (main[~live] == 0).all() and (index[~live] == 0).all()
     else:
         assert not backend.global_writes and attn.compressor is None
     if layer_id in config.index_source_layer_ids:
@@ -733,7 +748,8 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path):
+@pytest.mark.parametrize("capture_decode", [False, True])
+def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode):
     config = _config()
     config.hidden_size = 256
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
@@ -755,7 +771,8 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path):
             module.quant_method.process_weights_after_loading(module)
         elif isinstance(module, MoELayer):
             module.process_weights_after_loading(module)
-    backend = _backend("cuda:0")
+    backend = _backend("cuda:0", 2)
+    backend.cache_pool.arena.buffer.zero_()
     tables = _tables("cuda:0")
     meta = _extend(backend, tables, [4], [0])
     ctx = _ctx(backend, 4, ForwardMode.EXTEND)
@@ -796,6 +813,74 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path):
         engram_token_mask=mask[:1],
     )
     assert decoded.shape == (1, 256) and torch.isfinite(decoded).all()
+    if not capture_decode:
+        return
+
+    _assert_decode_graph_matches_eager(
+        adapter, backend, tables, "cuda:0", ((6, 1), (7, 1), (8, 1), (1, 0), (9, 1))
+    )
+
+
+def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
+    ids = torch.zeros(2, dtype=torch.int64, device=device)
+    previous = torch.full((2, 3), -1, dtype=torch.int64, device=device)
+    mask = torch.zeros(2, dtype=torch.bool, device=device)
+    ctx = _ctx(backend, 2, ForwardMode.DECODE)
+    arena = backend.cache_pool.arena.buffer
+    before_capture = arena.clone()
+
+    def forward():
+        return adapter(
+            ctx=ctx,
+            input_ids=ids,
+            positions=backend.query_metadata(ForwardMode.DECODE).positions,
+            engram_previous_tokens=previous,
+            engram_token_mask=mask,
+        ).next_token_logits
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            backend.init_forward_metadata_capture_cuda_graph(
+                2,
+                torch.zeros(2, device=device, dtype=torch.int64),
+                torch.ones(2, device=device, dtype=torch.int32),
+                ForwardMode.DECODE,
+                block_tables=tables,
+            )
+            forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = forward()
+    torch.cuda.current_stream().wait_stream(stream)
+    arena.copy_(before_capture)
+    for step, (length, actual_bs) in enumerate(steps):
+        ids.fill_(7 + step)
+        previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
+        mask[0] = bool(actual_bs)
+        before = arena.clone()
+        for replay in (False, True):
+            backend.refresh_decode_metadata(
+                2,
+                actual_bs,
+                torch.tensor([0], device=device),
+                torch.tensor([length], device=device),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables,
+                num_extends=0,
+                for_graph_replay=replay,
+            )
+            if not replay:
+                expected = forward().clone()
+                expected_cache = arena.clone()
+                arena.copy_(before)
+            else:
+                graph.replay()
+                torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+                torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
+                assert captured.dtype == torch.float32
+                assert torch.isfinite(captured).all()
 
 
 def test_distributed_attention_tp4(monkeypatch, tmp_path):
@@ -873,7 +958,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
             layer.ffn.experts._processed_state is not None
             for layer in adapter.model.layers
         )
-        backend = _backend(str(device))
+        backend = _backend(str(device), 2)
         tables = _tables(str(device))
         meta = _extend(backend, tables, [4], [0])
         ids = torch.tensor([0, 3, 4, 6], device=device)
@@ -894,6 +979,9 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         torch.distributed.all_gather(gathered, result)
         for other in gathered:
             torch.testing.assert_close(result, other, rtol=0.01, atol=0.01)
+        _assert_decode_graph_matches_eager(
+            adapter, backend, tables, device, ((5, 1), (6, 1), (7, 1), (1, 0), (8, 1))
+        )
     finally:
         torch.distributed.destroy_process_group()
 
@@ -1197,6 +1285,14 @@ def test_checkpoint_requires_every_local_constituent(monkeypatch, missing, tmp_p
     assert not hasattr(model, "checkpoint_load_report")
 
 
+def test_load_weights_rejects_engram_embed_in_iterator(monkeypatch):
+    config = _loader_config()
+    model = _loader_model(monkeypatch, config, 0, "cpu")
+    weights = _checkpoint(config)
+    with pytest.raises(ValueError, match="get_slice"):
+        model.load_weights(weights.items())
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -1210,14 +1306,6 @@ def test_checkpoint_requires_every_local_constituent(monkeypatch, missing, tmp_p
         "layers.0.ffn.experts.0.w1.typo",
     ],
 )
-def test_load_weights_rejects_engram_embed_in_iterator(monkeypatch):
-    config = _loader_config()
-    model = _loader_model(monkeypatch, config, 0, "cpu")
-    weights = _checkpoint(config)
-    with pytest.raises(ValueError, match="get_slice"):
-        model.load_weights(weights.items())
-
-
 def test_checkpoint_rejects_unexpected(monkeypatch, bad):
     model = _loader_model(monkeypatch, _loader_config(), 0, "cpu")
     with pytest.raises(ValueError, match="Unexpected"):

@@ -37,8 +37,8 @@ class _Sink(Protocol):
 async def tag_stream(reader: asyncio.StreamReader, tag: str, sink: _Sink) -> None:
     """Read lines from ``reader`` until EOF, write ``[tag] <line>`` to ``sink``.
 
-    A trailing partial line (without a newline) is still emitted with a
-    synthesized newline so the last line of a crash message is not lost.
+    Flush every line even when the sink is a redirected file. A trailing
+    partial line gets a synthesized newline so crash messages are not lost.
     """
     prefix = f"[{tag}] "
     while True:
@@ -50,3 +50,4 @@ async def tag_stream(reader: asyncio.StreamReader, tag: str, sink: _Sink) -> Non
             sink.write(prefix + text)
         else:
             sink.write(prefix + text + "\n")
+        sink.flush()

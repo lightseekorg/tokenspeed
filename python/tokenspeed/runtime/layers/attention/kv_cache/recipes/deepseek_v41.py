@@ -233,4 +233,7 @@ class DeepseekV41Recipe(CacheRecipe):
         selections = queries * ((2048 + 2 * 512 + 128) * 8 + 528)
         # ponytail: reserve a 64 MiB tiled baseline workspace; replace this
         # bound with the native kernel's declared workspace when optimized.
-        return metadata + selections + (64 << 20)
+        # Ratio-2 pooling returns T FP32 rows (inactive positions are -1), not
+        # a compact T/2 result. History/softmax scratch is tiled to eight rows.
+        compressor_output = queries * V41_HEAD_DIM * 4
+        return metadata + selections + compressor_output + (64 << 20)

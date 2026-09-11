@@ -20,7 +20,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -145,7 +145,7 @@ def _layout(recipe):
     )
 
 
-def _backend(device):
+def _backend(device, max_bs):
     recipe = _recipe(device)
     arena = CacheArena(
         _layout(recipe).bind(16),
@@ -158,7 +158,9 @@ def _backend(device):
     config = recipe.attn_config
     backend = DeepseekV41AttentionBackend(config, config.component(DeepseekV41Config))
     backend.set_cache_pool(pool)
-    backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
+    backend.init_cuda_graph_state(
+        max_bs, max_tokens_per_req=1, overlap_schedule_depth=1
+    )
     return backend
 
 
@@ -198,6 +200,317 @@ def _extend(backend, tables, lengths, prefixes):
         extend_with_prefix=any(prefixes),
     )
     return backend.query_metadata(ForwardMode.EXTEND)
+
+
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+@pytest.mark.parametrize(
+    "group,message", [(SWA, "SWA prefix"), (TAIL, "compressor tail")]
+)
+def test_refresh_rejects_missing_history_before_execution(
+    for_graph_replay, group, message
+):
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    tables[group][0].zero_()
+    with pytest.raises(RuntimeError, match=message):
+        backend.refresh_decode_metadata(
+            2,
+            1,
+            torch.tensor([19]),
+            torch.tensor([4]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            num_extends=0,
+            for_graph_replay=for_graph_replay,
+        )
+
+
+def test_full_scan_is_bounded_by_table_and_physical_capacity():
+    pool = _backend("cpu", 2).cache_pool
+    config = replace(_config("cpu"), context_len=1 << 20)
+    backend = DeepseekV41AttentionBackend(config, config.component(DeepseekV41Config))
+    backend.set_cache_pool(pool)
+    backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0]),
+        torch.tensor([1]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=_tables("cpu"),
+        num_extends=0,
+        for_graph_replay=False,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    with patch("tokenspeed_kernel.ops.attention.dsv41.index_topk") as topk:
+        for layer in (2, 20):
+            backend.select_global(
+                layer,
+                torch.zeros(2, 2, 128, dtype=torch.bfloat16),
+                torch.zeros(2, 2, dtype=torch.bfloat16),
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.DECODE,
+                None,
+            )
+            assert topk.call_args.args[3].shape[1] == pool.index_k(layer).shape[0] - 1
+
+
+def test_mixed_decode_rejects_missing_history():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    tables[SWA][1].zero_()
+    with pytest.raises(RuntimeError, match="SWA prefix"):
+        backend.init_forward_metadata(
+            2,
+            1,
+            torch.tensor([23, 17]),
+            torch.tensor([2, 9]),
+            ForwardMode.MIXED,
+            block_tables=tables,
+            extend_seq_lens=torch.tensor([2]),
+            extend_seq_lens_cpu=torch.tensor([2]),
+            extend_prefix_lens=torch.tensor([0]),
+            extend_prefix_lens_cpu=torch.tensor([0]),
+            extend_with_prefix=False,
+        )
+
+
+def test_compressor_prefill_rejects_missing_history():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    tables[TAIL].zero_()
+    meta = _extend(backend, tables, [1], [3])
+    with pytest.raises(RuntimeError, match="compressor tail"):
+        backend.compress(
+            2,
+            torch.zeros(1, 512),
+            torch.zeros(1, 512),
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+        )
+
+
+def _decode_compute(backend, inputs, bs):
+    content, scores, q, swa, iq, iw, sink = inputs
+    mode = ForwardMode.DECODE
+    meta = backend.query_metadata(mode)
+    pos, req = meta.positions, meta.request_indices
+    pooled, pair_pos, pair_req = backend.compress(
+        2, content[:bs], scores[:bs], pos, req, mode
+    )
+    latent = torch.nn.functional.rms_norm(
+        pooled.to(torch.bfloat16), (512,), weight=None, eps=1e-6
+    )
+    backend.write_global(2, latent, latent[:, :128], pair_pos, pair_req, mode)
+    backend.write_global(20, swa[:bs], iq[:bs, 0], pos, req, mode)
+    outputs = [pooled, pair_pos, pair_req]
+    query_q, query_swa, query_iq, query_iw = q[:bs], swa[:bs], iq[:bs], iw[:bs]
+    for layer in (2, 3, 20, 24, 25):
+        if layer == 24:
+            order = torch.arange(bs - 1, -1, -2, device=backend.device)
+            pos, req = pos[order], req[order]
+            query_q, query_swa = query_q[order], query_swa[order]
+            query_iq, query_iw = query_iq[order], query_iw[order]
+        source = layer in (2, 20, 24)
+        outputs.append(
+            backend.forward_v41(
+                query_q,
+                query_swa,
+                layer_id=layer,
+                positions=pos,
+                request_indices=req,
+                forward_mode=mode,
+                index_q=query_iq if source else None,
+                index_weights=query_iw if source else None,
+                attn_sink=sink,
+                softmax_scale=512**-0.5,
+                index_process_group=None,
+            )
+        )
+        if layer == 20 and bs:
+            candidates = backend.sparse_topk.decode.candidates
+            outputs.extend((candidates.block_ids, candidates.lengths))
+            # Reordered/subset consumers use absolute request/position lookup,
+            # even when a formerly live row becomes graph padding on replay.
+            order = torch.arange(bs - 1, -1, -2, device=backend.device)
+            outputs.extend(
+                backend.select_global(
+                    21, None, None, pos[order], req[order], mode, None
+                )
+            )
+    return outputs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shared_pool", [False, True])
+def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
+    assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
+    torch.manual_seed(42)
+    backend = _backend("cuda", 5)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    inputs = (
+        torch.randn(5, 512, device="cuda"),
+        torch.randn(5, 512, device="cuda"),
+        torch.randn(5, 2, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(5, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(5, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.rand(5, 2, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(2, device="cuda"),
+    )
+    meta = _extend(backend, tables, [12, 12], [0, 0])
+    history = torch.randn(24, 512, device="cuda", dtype=torch.bfloat16)
+    for layer in (2, 3, 20, 24, 25):
+        dsv41.cache_scatter(
+            history, backend.cache_pool.swa(layer), meta.swa_write_slots, "swa"
+        )
+    backend.write_global(
+        20,
+        history,
+        history[:, :128],
+        meta.positions,
+        meta.request_indices,
+        ForwardMode.EXTEND,
+    )
+    pooled, pos, req = backend.compress(
+        2,
+        history.float(),
+        torch.randn(24, 512, device="cuda"),
+        meta.positions,
+        meta.request_indices,
+        ForwardMode.EXTEND,
+    )
+    backend.write_global(2, pooled, pooled[:, :128], pos, req, ForwardMode.EXTEND)
+
+    captures = {}
+    pool = torch.cuda.graph_pool_handle() if shared_pool else None
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for bs in (2, 1):
+            for _ in range(2):
+                backend.init_forward_metadata_capture_cuda_graph(
+                    bs,
+                    torch.zeros(bs, device="cuda", dtype=torch.int64),
+                    torch.ones(bs, device="cuda", dtype=torch.int32),
+                    ForwardMode.DECODE,
+                    block_tables=tables,
+                )
+                _decode_compute(backend, inputs, bs)
+            backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                torch.zeros(bs, device="cuda", dtype=torch.int64),
+                torch.ones(bs, device="cuda", dtype=torch.int32),
+                ForwardMode.DECODE,
+                block_tables=tables,
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                output = _decode_compute(backend, inputs, bs)
+            captures[bs] = graph, output
+    torch.cuda.current_stream().wait_stream(stream)
+    arena = backend.cache_pool.arena.buffer
+    pointers = {bs: backend._decode_view(bs).positions.data_ptr() for bs in (1, 2)}
+    # Alternate captures with shared or private pools and intervening eager work.
+    for step, (bs, actual, lengths) in enumerate(
+        (
+            (2, 2, [8, 5]),
+            (1, 1, [9]),
+            (2, 1, [10]),
+            (2, 0, []),
+            (2, 2, [11, 6]),
+            (1, 1, [12]),
+        )
+    ):
+        for tensor in inputs[:-1]:
+            tensor.normal_()
+        live_tables = {
+            gid: table.flip(0) if step % 2 else table for gid, table in tables.items()
+        }
+        lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        requests = torch.arange(actual, device="cuda", dtype=torch.int64) + step * 7
+        before = arena.clone()
+        backend.refresh_decode_metadata(
+            bs,
+            actual,
+            requests,
+            lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=live_tables,
+            num_extends=0,
+            for_graph_replay=False,
+        )
+        expected = [tensor.clone() for tensor in _decode_compute(backend, inputs, bs)]
+        expected_cache = arena.clone()
+        arena.copy_(before)
+        backend.refresh_decode_metadata(
+            bs,
+            actual,
+            requests,
+            lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=live_tables,
+            num_extends=0,
+            for_graph_replay=True,
+        )
+        graph, output = captures[bs]
+        graph.replay()
+        for got, want in zip(output, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert torch.equal(arena, expected_cache)
+        assert (
+            backend.query_metadata(ForwardMode.DECODE).positions.data_ptr()
+            == pointers[bs]
+        )
+        if actual == 0:
+            assert torch.equal(arena, before)
+        assert not bool(backend.cache_pool.swa(2)[0].any())
+        assert not bool(backend.cache_pool.global_kv(2)[0].any())
+        assert not bool(backend.cache_pool.compressor_tail(2)[0].any())
+
+    # Capacity is five, capture ladder ends at two; run the identical forward.
+    wide_tables = {
+        gid: torch.zeros(5, t.shape[1], device="cuda", dtype=torch.int32)
+        for gid, t in tables.items()
+    }
+    for r in range(5):
+        wide_tables[SWA][r, 0] = r + 1
+        wide_tables[R1][r, 0] = 541 + r
+        wide_tables[R2][r, 0] = 161 + r
+        wide_tables[TAIL][r, 0] = 541 + r
+    for bs in (5, 0):
+        backend.refresh_decode_metadata(
+            bs,
+            bs,
+            torch.arange(bs, device="cuda"),
+            torch.ones(bs, device="cuda", dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=wide_tables,
+            num_extends=0,
+            for_graph_replay=False,
+        )
+        output = _decode_compute(backend, inputs, bs)
+        assert output[0].shape == (bs, 512)
+        assert output[3].shape == (bs, 2, 512)
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    for layer in (20, 24, 25):
+        source = layer != 25
+        slots, lens = backend.select_global(
+            layer,
+            inputs[4][:0] if source else None,
+            inputs[5][:0] if source else None,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.DECODE,
+            None,
+        )
+        assert slots.shape == (0, backend.spec.index_topk) and lens.shape == (0,)
+    torch.cuda.synchronize()
 
 
 def test_recipe_exact_geometry_capacity_and_dispatch():
@@ -266,7 +579,7 @@ def test_owner_topology_and_reject_invalid_recipes():
 
 
 def test_pool_strides_owner_fences_and_no_redundant_fields():
-    backend = _backend("cpu")
+    backend = _backend("cpu", 2)
     pool = backend.cache_pool
     tracker = Mock()
     pool.layerwise_load_tracker = tracker
@@ -289,7 +602,7 @@ def test_pool_strides_owner_fences_and_no_redundant_fields():
 
 
 def test_refresh_pointer_stability_padding_and_mapping():
-    backend = _backend("cpu")
+    backend = _backend("cpu", 2)
     tables = _tables("cpu")
     for actual in (2, 1, 0, 2):
         backend.refresh_decode_metadata(
@@ -355,7 +668,7 @@ def test_refresh_pointer_stability_padding_and_mapping():
 
 
 def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
-    backend = _backend("cpu")
+    backend = _backend("cpu", 2)
     tables = _tables("cpu")
     req_pool_indices = torch.tensor([19, 7], dtype=torch.int64, device="cpu")
     seq_lens = torch.tensor([129, 4], dtype=torch.int32, device="cpu")
@@ -394,7 +707,7 @@ def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
 
 
 def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
-    backend = _backend("cpu")
+    backend = _backend("cpu", 2)
     tables = _tables("cpu")
     torch.manual_seed(5)
     content, scores = torch.randn(7, 512), torch.randn(7, 512)
@@ -412,8 +725,12 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
             meta.request_indices,
             ForwardMode.EXTEND,
         )
-        parts.append(pooled)
-        assert (pos % 2 == 0).all() and (req == 0).all()
+        assert pooled.shape == (count, 512)
+        active = pos >= 0
+        parts.append(pooled[active])
+        assert (pos[active] % 2 == 0).all() and (req[active] == 0).all()
+        assert not bool(pooled[~active].any())
+        assert (req[~active] == -1).all()
     torch.testing.assert_close(torch.cat(parts), expected)
     # Position-addressed history survives an uncommitted suffix; this is not
     # a claim that the gated speculative scheduler/commit path is supported.
@@ -455,7 +772,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
 def test_gpu_quantized_joint_attention_and_reindex_reuse():
     from tokenspeed_kernel.ops.attention import dsv41
 
-    backend = _backend("cuda")
+    backend = _backend("cuda", 2)
     tables = _tables("cuda")
     meta = _extend(backend, tables, [17, 3], [0, 0])
     torch.manual_seed(7)
@@ -531,7 +848,7 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
 
 
 def test_mixed_metadata_query_windows_and_capacity():
-    backend = _backend("cpu")
+    backend = _backend("cpu", 2)
     tables = _tables("cpu")
     backend.init_forward_metadata(
         2,
@@ -573,7 +890,7 @@ def test_mixed_metadata_query_windows_and_capacity():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
-    backend = _backend("cuda")
+    backend = _backend("cuda", 2)
     tables = _tables("cuda")
     torch.manual_seed(11)
     content = torch.randn(10, 512, device="cuda", dtype=torch.float32)
@@ -636,7 +953,7 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
-    backend = _backend("cuda")
+    backend = _backend("cuda", 2)
     tables = _tables("cuda")
     torch.manual_seed(8)
     q = torch.randn(140, 2, 512, device="cuda", dtype=torch.bfloat16)
