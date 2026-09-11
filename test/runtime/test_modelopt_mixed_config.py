@@ -111,7 +111,7 @@ def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
 
 def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
     from tokenspeed.runtime.layers.dense import Nvfp4W4A16LinearMethod
-    from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
 
     monkeypatch.setattr(
         tokenspeed_kernel,
@@ -133,7 +133,7 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
         prefix="",
     )
 
-    assert isinstance(lm_head, ParallelLMHead)
+    assert isinstance(lm_head, ReplicatedLinear)
     assert isinstance(lm_head.quant_method, Nvfp4W4A16LinearMethod)
     assert lm_head.weight.dtype == torch.uint8
     assert lm_head.weight.shape == (64, 16)
