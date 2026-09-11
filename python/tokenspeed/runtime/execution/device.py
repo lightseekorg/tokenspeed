@@ -690,7 +690,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import get_colorful_logger
+    from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 
     logger = get_colorful_logger(__name__)
 
@@ -767,6 +767,9 @@ def build_device_side(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
+    executor.capture_graphs()
+    # Tuning and capture draw from the generator; this is the state startup leaves.
+    set_random_seed(48)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
