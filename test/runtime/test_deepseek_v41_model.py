@@ -431,7 +431,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     torch.manual_seed(41)
     layers = [
         DeepseekV41DecoderLayer(
-            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, False
+            config, _mapping(0, 1, 1), i, None, f"layers.{i}", None, False, "gpu"
         )
         for i in (0, 1)
     ]
@@ -585,7 +585,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False)
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     ids = torch.tensor([0, 3, 4, 6])

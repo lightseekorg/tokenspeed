@@ -93,6 +93,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
     is_engram_embed_checkpoint_name,
+    resolve_engram_host_layout,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -670,6 +671,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         prefix: str,
         aux_stream,
         host_table: bool,
+        host_layout: str,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -710,6 +712,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 add_prefix("engram", prefix),
                 self.attn.wq_a.weight.device,
                 host_table,
+                host_layout,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -781,6 +784,7 @@ class DeepseekV41Model(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
         host_table: bool,
+        host_layout: str,
     ):
         super().__init__()
         if mapping.pp_size != 1 or mapping.attn.cp_size != 1:
@@ -840,6 +844,7 @@ class DeepseekV41Model(nn.Module):
                     add_prefix(f"layers.{layer_id}", prefix),
                     None,
                     host_table,
+                    host_layout,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -931,12 +936,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):
+        host_table = global_server_args_dict["engram_host_table"]
         return self.model_cls(
             getattr(config, "text_config", config),
             mapping,
             quant_config,
             add_prefix("model", prefix),
-            global_server_args_dict["engram_host_table"],
+            host_table,
+            resolve_engram_host_layout(host_table, mapping.attn.tp_size),
         )
 
     def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
