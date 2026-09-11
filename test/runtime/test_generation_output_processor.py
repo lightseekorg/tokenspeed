@@ -419,8 +419,8 @@ def test_log_request_stats_aborted_with_spec_acceptance():
 
     line = rec.lines[0]
     assert "status='aborted', reason='abort'" in line
-    # acc_rate = (acc_len - 1) / draft = (3 - 1) / 4 = 0.5
-    assert "acc_len=3.0, acc_rate=0.5" in line
+    # acc_rate = (acc_len - 1) / proposed drafts = (3 - 1) / (4 - 1)
+    assert "acc_len=3.0, acc_rate=0.6667" in line
 
 
 def test_log_request_stats_noop_without_tracker():
