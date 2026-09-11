@@ -36,7 +36,15 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_replay_commit,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
+    CAUSAL_CONV1D_BLOCK_M,
+    CausalConv1dPrefillMetadata,
+    build_causal_conv1d_prefill_metadata,
     fused_qkv_split_gdn_prefill,
+)
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    prepare_prefill_state_inputs as _prepare_cache_prefill_state_inputs,
+)
+from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
@@ -231,30 +239,6 @@ def compute_state_block_indices(
     return _gather_state_block_indices(rows, plan, validate=validate, group_id=group_id)
 
 
-def _prepare_cache_prefill_state_inputs(
-    conv_states: torch.Tensor,
-    ssm_states: torch.Tensor,
-    state_in_blocks: torch.Tensor,
-    state_out_blocks: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize logical-zero fresh state without reading physical page 0."""
-    has_initial_state = state_in_blocks > 0
-    safe_input_pages = torch.where(
-        has_initial_state, state_in_blocks, state_out_blocks
-    ).to(torch.int64)
-    state_out_blocks = state_out_blocks.to(torch.int64)
-
-    # A fresh row copies its working page to itself. Only a resumed row reads
-    # the checkpoint named by state_in_blocks.
-    conv_states[state_out_blocks] = conv_states[safe_input_pages]
-    recurrent_state = ssm_states[safe_input_pages]
-    broadcast_mask = has_initial_state.reshape(
-        (-1,) + (1,) * (recurrent_state.ndim - 1)
-    )
-    recurrent_state.masked_fill_(~broadcast_mask, 0)
-    return recurrent_state, has_initial_state
-
-
 def _prepare_gdn_decode_state_path(
     ssm_states: torch.Tensor,
     initial_state_indices: torch.Tensor,
@@ -319,6 +303,12 @@ class MambaForwardMetadata:
     # so no kernel re-reads the device boundaries (a stream-synchronizing
     # D2H per layer per chunk). Fresh per batch — never mutated in place.
     cu_extend_seq_lens_cpu: torch.Tensor | None = None
+    # Device int64 mirror for scan ABIs; keep the int32 query/conv indices.
+    # Owned by this extend/mixed forward, not cast again by every KDA layer.
+    query_start_loc_int64: torch.Tensor | None = None
+    # One read-only convolution schedule per forward, reused across layers.
+    # Never refill a previous forward's storage while its kernels are in flight.
+    conv_prefill_metadata: CausalConv1dPrefillMetadata | None = None
     # Per-state-group metadata is gathered once per group and batch;
     # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
@@ -1042,6 +1032,10 @@ class MambaAttnBackend(AttentionBackend):
             query_start_loc=query_start_loc,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+            query_start_loc_int64=query_start_loc.to(dtype=torch.int64),
+            conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
+                query_start_loc, extend_seq_lens_cpu, CAUSAL_CONV1D_BLOCK_M
+            ),
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
@@ -1763,12 +1757,11 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
                 self._layer_state(layer_id)
             )
-            state_out_long = state_out_blocks.to(torch.int64)
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,
                 ssm_states,
                 state_in_blocks,
-                state_out_long,
+                state_out_blocks,
             )
             conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
@@ -1789,7 +1782,7 @@ class MambaAttnBackend(AttentionBackend):
                 has_initial_state=has_initial_states,
                 cache_indices=conv_cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=extend_seq_lens_cpu,
+                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
             ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
@@ -1882,7 +1875,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
-            ssm_states[state_out_long] = last_recurrent_state
+            ssm_states[state_out_blocks] = last_recurrent_state
 
         return core_attn_out
 

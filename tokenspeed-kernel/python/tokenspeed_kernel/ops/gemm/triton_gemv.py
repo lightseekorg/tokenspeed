@@ -35,6 +35,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -140,6 +141,44 @@ def rowcta_gemv(
         num_warps=4,
     )
     return out
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="gluon_wmma_dense_gfx1250",
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_BF16_SIG,
+    traits={
+        "m": frozenset(range(2, 33)),
+        "k_align_128": frozenset({True}),
+        "n_align_16": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def wmma_dense_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` for small-M decode activations on CDNA5.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activation, K a multiple of 128.
+        weight: ``[N, K]`` contiguous bf16 weight, N a multiple of 16.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        gluon_wmma_tdm_dense_gfx1250,
+    )
+
+    return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out)
 
 
 @register_kernel(
