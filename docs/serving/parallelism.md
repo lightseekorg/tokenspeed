@@ -248,15 +248,6 @@ across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. This is required for layouts such as attention DP
 with dense TP or MoE EP spanning nodes.
 
-Kimi-K3's attention reduce is a narrower case of the same choice. At eight
-tokens or fewer -- where a 7168 hidden at TP8 still fits the one-shot window --
-the reduce and its residual add run on a TokenSpeed CuTe DSL Lamport collective
-rather than the vendor fused all-reduce; wider batches keep the vendor path.
-Both produce byte-identical output, so the split is a latency choice, not a
-numerical one: folding the AttnRes prefix combine into the collective's
-epilogue was measured slower than leaving it as its own kernel, because the
-combine is a row reduction and the collective's cluster is eight CTAs wide.
-
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled
 with GCC older than 10. Affected NCCL builds older than 2.29.3 can exhaust proxy
