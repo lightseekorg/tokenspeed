@@ -61,6 +61,7 @@ _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "minimax": "minimax",
     "qwen3": "qwen_3",
     "qwen3_thinking": "qwen_3",
+    "glm45": "glm_4_7",
 }
 
 
