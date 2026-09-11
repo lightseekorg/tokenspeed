@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -36,6 +37,9 @@ _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
 HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
+
+
+logger = logging.getLogger(__name__)
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -383,14 +387,17 @@ def _zero_byte_ranges_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     range_id = tl.program_id(0)
-    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     range_offset = tl.load(ranges_ptr + range_id * 2)
     range_size = tl.load(ranges_ptr + range_id * 2 + 1)
-    tl.store(
-        backing_ptr + range_offset + byte_offsets,
-        0,
-        mask=byte_offsets < range_size,
-    )
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
 
 
 def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> None:
@@ -404,8 +411,9 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
         return
     if backing.dtype != torch.uint8 or not backing.is_contiguous():
         raise ValueError("backing must be a contiguous uint8 tensor")
+    backing_size = backing.numel()
     if any(
-        offset < 0 or size <= 0 or offset + size > backing.numel()
+        offset < 0 or size <= 0 or offset + size > backing_size
         for offset, size in ranges
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
@@ -419,8 +427,14 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     block_size = 1024
     max_size = max(size for _, size in ranges)
 
-    grid = (len(ranges), triton.cdiv(max_size, block_size))
-
+    # A short range must not launch one CTA for every tile of the largest
+    # state field. Bound the rectangle and let each CTA stride its own range.
+    # Few large ranges still need enough CTAs to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, len(ranges)))
+    grid = (
+        len(ranges),
+        min(tiles_per_range, triton.cdiv(max_size, block_size)),
+    )
     _zero_byte_ranges_kernel[grid](
         backing,
         range_table,
@@ -445,6 +459,7 @@ def _copy_state_rows_kernel(
     rows_per_layer,
     ROW_I32: tl.constexpr,
     BLOCK_I32: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Copy one state row between two slabs of one layer.
 
@@ -452,6 +467,8 @@ def _copy_state_rows_kernel(
     slab views and dense scratch tensors mix freely. A negative source row id
     stores zeros instead (seed-invalid fill).
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     work_index = tl.program_id(0)
     chunk_index = tl.program_id(1)
     layer_index = work_index // rows_per_layer
@@ -474,6 +491,8 @@ def _copy_state_rows_kernel(
         other=0,
     )
     tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def copy_state_rows(
@@ -510,6 +529,7 @@ def copy_state_rows(
     Returns:
         None. Rows are copied in place in one launch.
     """
+    enable_pdl = pdl_enabled()
     total = src_rows.numel()
     if total == 0:
         return
@@ -546,6 +566,8 @@ def copy_state_rows(
         total // num_layers,
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -772,7 +794,10 @@ def _set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_loc"],
+    do_not_specialize_on_alignment=["n_loc"],
+)
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,

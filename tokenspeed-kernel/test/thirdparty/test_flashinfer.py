@@ -24,7 +24,7 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flashinfer import (
+from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
     trtllm_batch_decode_with_kv_cache_mla,

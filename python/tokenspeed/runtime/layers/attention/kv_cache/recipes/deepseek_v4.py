@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
 
-from tokenspeed_kernel import dsv4_indexer_cache_format
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_indexer_cache_format
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (

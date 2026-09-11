@@ -26,8 +26,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from tokenspeed_kernel import kpool_decode_append, kpool_prefill_write
-from tokenspeed_kernel.ops.attention import kpool_prefill_tail_write
+from tokenspeed_kernel.ops.attention.kpool import (
+    kpool_decode_append,
+    kpool_prefill_tail_write,
+    kpool_prefill_write,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

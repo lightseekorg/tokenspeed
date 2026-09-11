@@ -42,7 +42,7 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 15 || inputs.timeout_minutes }}
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
@@ -71,7 +71,7 @@ jobs:
             ~/.cache/pip
             ~/.cache/uv
             ${{ runner.temp }}/tokenspeed-mi450-sim
-          key: mi450-sim-${{ runner.os }}-rocjitsu-056c1cc3-rocm-20260812-v1
+          key: mi450-sim-${{ runner.os }}-rocjitsu-ac11b8ac-rocm-20260822-v1
 
       - name: Install pipeline dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple

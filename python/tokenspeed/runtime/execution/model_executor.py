@@ -84,7 +84,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
@@ -479,15 +479,6 @@ class ModelExecutor:
             graph_supported=graph_support.prefill_graph,
         )
 
-        self._autotune()
-
-        workspace_pool(self.device).freeze()
-
-        if not self.forward_step.disable:
-            self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
         self.encoder_graph_wrappers = getattr(
@@ -496,12 +487,12 @@ class ModelExecutor:
 
         self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
-        # own: everything the data plane enqueues outside an explicit stream
-        # context -- page zeroing, the cache ops' fences and start events --
-        # lands here. `execution_stream` carries the model launches and the
-        # runtime-state writes. Dependencies between them are placed by the
-        # consumer: each forward waits on the default stream in its prologue;
-        # zeroing and write-back wait on the execution stream themselves.
+        # own: page zeroing runs here, and the cache ops take it by name for
+        # their fences and start events. `execution_stream` carries the model
+        # launches and the runtime-state writes. Dependencies between them are
+        # placed by the consumer: each forward waits on the default stream in
+        # its prologue; zeroing and write-back wait on the execution stream
+        # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
@@ -524,9 +515,25 @@ class ModelExecutor:
             device=self.device,
         )
 
-        set_random_seed(48)
-
         logger.info("ModelExecutor initialized")
+
+    def capture_graphs(self) -> None:
+        """Tune the kernels, pin the workspace, then capture the graphs.
+
+        A step of its own, so the caller decides when the graph owners start
+        recording the pools' buffers. Construction has already read the pools
+        (validation, configure_runtime, bind_cache_groups and the runners'
+        init_cuda_graph_state), so a caller that rebinds between the two
+        re-runs those itself.
+        """
+        self._autotune()
+
+        workspace_pool(self.device).freeze()
+
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.

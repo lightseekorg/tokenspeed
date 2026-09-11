@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope,
     fused_qk_rmsnorm_rope_gate,
@@ -54,6 +55,49 @@ def test_rmsnorm_with_residual(
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(2, 7, 16, 512), (1, 2, 64, 512)])
+def test_grouped_rmsnorm_matches_per_head_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=dtype)
+    reference_input = x.clone()
+
+    actual = grouped_rmsnorm(x, shape[-1], eps, out=x)
+
+    reference_float = reference_input.float()
+    reference = reference_float * torch.rsqrt(
+        reference_float.square().mean(-1, keepdim=True) + eps
+    )
+    assert actual is x
+    torch.testing.assert_close(actual, reference.to(dtype), atol=2e-2, rtol=2e-2)
+
+
+def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
+    shape = (2, 8, 16, 512)
+    eps = 1e-6
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    grouped_rmsnorm(x, shape[-1], eps, out=x)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        grouped_rmsnorm(x, shape[-1], eps, out=x)
+
+    x.copy_(torch.randn_like(x))
+    reference_input = x.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    reference_float = reference_input.float()
+    reference = reference_float * torch.rsqrt(
+        reference_float.square().mean(-1, keepdim=True) + eps
+    )
+    torch.testing.assert_close(x, reference.to(x.dtype), atol=2e-2, rtol=2e-2)
 
 
 def _gemma_ref(

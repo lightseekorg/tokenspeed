@@ -100,6 +100,14 @@ class BaseDrafter:
             ctx: The target forward's context.
         """
 
+    def on_target_weights_updated(self) -> None:
+        """Refresh draft-side state derived from shared target weights.
+
+        Called after an in-place target weight update completes and before the
+        device thread accepts another forward. Most drafters do not cache
+        derived target weights and therefore need no action.
+        """
+
     @abstractmethod
     def run(
         self,

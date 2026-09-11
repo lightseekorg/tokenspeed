@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention as attention
+import tokenspeed_kernel.ops.attention.kpool as attention
 import torch
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -33,7 +33,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.attention.gluon import kpool_select  # isort: skip
+from tokenspeed_kernel.ops.attention.kpool import gluon as kpool_select  # isort: skip
 
 
 class _FakeSortKernel:

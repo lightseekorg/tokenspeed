@@ -33,13 +33,13 @@ if not (is_cdna4() or is_cdna5()):
     )
 
 
-import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
-from tokenspeed_kernel.ops.attn_res import (  # noqa: E402
+import tokenspeed_kernel.ops.residual as residual_ops  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
+from tokenspeed_kernel.ops.residual import (  # noqa: E402
     attn_res_fwd,
     attn_res_fwd_available,
 )
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
@@ -128,7 +128,7 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
         selected_solutions.append(kwargs["solution"])
         return lambda **kwargs: None
 
-    monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
+    monkeypatch.setattr(residual_ops, "select_kernel", capture_selection)
     cases = (
         (16384, 7168, True),
         (16385, 7168, True),
@@ -141,7 +141,7 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
         weight = torch.empty(hidden, device="meta", dtype=torch.bfloat16)
         layer = torch.empty(tokens, hidden, device="meta", dtype=torch.bfloat16)
         history = torch.empty(11, tokens, hidden, device="meta", dtype=torch.bfloat16)
-        attn_res.attn_res_fwd(
+        residual_ops.attn_res_fwd(
             layer,
             history,
             weight,

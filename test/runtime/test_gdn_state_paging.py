@@ -270,7 +270,7 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         stub_pool = _ContractPool(
             self.P,
-            {0: ("linear_attention", object(), object())},
+            {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
         )
         backend.set_kv_pool(stub_pool)
         self.assertTrue(backend.state_paging_active)
@@ -311,6 +311,8 @@ class CacheContractMetadataTest(unittest.TestCase):
         self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
         # Decode builds no host boundary tuple; only extend batches carry one.
         self.assertIsNone(md.cu_extend_seq_lens_cpu)
+        self.assertIsNone(md.query_start_loc_int64)
+        self.assertIsNone(md.conv_prefill_metadata)
 
     def test_extend_metadata(self):
         torch = self.torch
@@ -341,6 +343,11 @@ class CacheContractMetadataTest(unittest.TestCase):
         self.assertFalse(md.cu_extend_seq_lens_cpu.is_cuda)
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [8])
         self.assertEqual(md.query_start_loc.tolist(), [0, 8])
+        self.assertEqual(md.query_start_loc.dtype, torch.int32)
+        self.assertEqual(md.query_start_loc_int64.dtype, torch.int64)
+        self.assertEqual(md.query_start_loc_int64.tolist(), [0, 8])
+        self.assertEqual(md.conv_prefill_metadata.batch_indices.tolist(), [0])
+        self.assertEqual(md.conv_prefill_metadata.chunk_offsets.tolist(), [0])
 
     def test_mixed_metadata_pads_decode_rows(self):
         torch = self.torch
@@ -367,6 +374,42 @@ class CacheContractMetadataTest(unittest.TestCase):
         self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 5, 6])
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [5, 1])
         self.assertEqual(md.query_start_loc.tolist(), [0, 5, 6])
+        self.assertEqual(md.query_start_loc_int64.tolist(), [0, 5, 6])
+        self.assertEqual(md.conv_prefill_metadata.batch_indices.tolist(), [0, 1])
+        self.assertEqual(md.conv_prefill_metadata.chunk_offsets.tolist(), [0, 0])
+
+    def test_conv_metadata_is_owned_by_each_forward(self):
+        torch = self.torch
+        saved = []
+        boundaries = []
+        for lengths in ([9, 7], [7, 9]):
+            lens = torch.tensor(lengths, dtype=torch.int32)
+            self.backend.init_forward_metadata(
+                bs=2,
+                num_extends=2,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+                seq_lens=lens,
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={
+                    "linear_attention": torch.tensor(
+                        [[1, 2, 3], [4, 5, 6]], dtype=torch.int32
+                    )
+                },
+                **_extend_kwargs(torch, lens, torch.zeros(2, dtype=torch.int32), "cpu"),
+            )
+            saved.append(self.backend.forward_metadata.conv_prefill_metadata)
+            boundaries.append(self.backend.forward_metadata.query_start_loc_int64)
+        # Same total tokens/programs, different request partition. Keep the
+        # first forward alive while preparing the next, as overlap can do.
+        self.assertIsNot(saved[0], saved[1])
+        self.assertNotEqual(
+            saved[0].batch_indices.data_ptr(), saved[1].batch_indices.data_ptr()
+        )
+        self.assertEqual(saved[0].batch_indices.tolist(), [0, 0, 1])
+        self.assertEqual(saved[1].batch_indices.tolist(), [0, 1, 1])
+        self.assertNotEqual(boundaries[0].data_ptr(), boundaries[1].data_ptr())
+        self.assertEqual(boundaries[0].tolist(), [0, 9, 16])
+        self.assertEqual(boundaries[1].tolist(), [0, 7, 16])
 
     def test_capture_replay_metadata(self):
         torch = self.torch
@@ -479,6 +522,18 @@ class VerifyMetadataTest(unittest.TestCase):
             560,
         )
 
+    def test_target_verify_reuses_graph_stable_scratch_base_rows(self):
+        rows = self.backend._verify_scratch_base_rows(3, 4)
+        grid = self.backend._verify_scratch_grid(3, 4)
+
+        self.assertIs(rows, self.backend._verify_scratch_base_rows(3, 4))
+        self.assertEqual(rows.dtype, self.torch.int32)
+        self.assertEqual(rows.tolist(), [0, 5, 10])
+        self.assertEqual(
+            grid.tolist(),
+            [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]],
+        )
+
 
 class GDNStatePagingGPUTest(unittest.TestCase):
     """MambaAttnBackend state paging vs the
@@ -495,9 +550,9 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
-            from tokenspeed_kernel.ops.attention.flashinfer import (
-                gated_delta_rule as gdn,
+            from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
+            from tokenspeed_kernel.ops.attention.gdn import (
+                gdn_replay_commit_supported,
             )
 
             from tokenspeed.runtime.execution.forward_batch_info import (
@@ -584,8 +639,12 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
+        from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
             chunk_gated_delta_rule,
+        )
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
+            CAUSAL_CONV1D_BLOCK_M,
+            build_causal_conv1d_prefill_metadata,
         )
 
         from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
@@ -613,6 +672,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         ref_conv_state = torch.zeros(
             1, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
+        query_start_loc = torch.tensor([0, total], dtype=torch.int32, device="cuda")
         conv_out = causal_conv1d_fn(
             mixed_full.transpose(0, 1),
             conv_weights,
@@ -621,8 +681,12 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             conv_states=ref_conv_state,
             has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),
             cache_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
-            query_start_loc=torch.tensor([0, total], dtype=torch.int32, device="cuda"),
-            seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
+            query_start_loc=query_start_loc,
+            prefill_metadata=build_causal_conv1d_prefill_metadata(
+                query_start_loc,
+                torch.tensor([total], dtype=torch.int32),
+                CAUSAL_CONV1D_BLOCK_M,
+            ),
         ).transpose(0, 1)[:total]
         q_ref, k_ref, v_ref = torch.split(
             conv_out, [key_dim, key_dim, value_dim], dim=-1

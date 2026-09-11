@@ -209,7 +209,7 @@ class QwenGDNRecipe(CacheRecipe):
             and torch.device(self.attn_config.device).type == "cuda"
         ):
             return False
-        from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+        from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
         return bool(gdn_replay_commit_supported(self.attn_config.dtype))
 

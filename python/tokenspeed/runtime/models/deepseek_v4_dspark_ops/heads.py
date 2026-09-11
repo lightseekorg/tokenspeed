@@ -20,20 +20,6 @@ def _local_vocab_argmax(
     gathered_ids: torch.Tensor,
 ) -> torch.Tensor:
     """Return global argmax IDs for vocab-sharded logits."""
-
-    if (
-        gathered_values.ndim != 2
-        or gathered_ids.ndim != 2
-        or gathered_values.shape != gathered_ids.shape
-        or gathered_values.shape[1] < local_logits.shape[0]
-    ):
-        raise ValueError(
-            "DSpark TP gather workspaces must be matching [tp_size, capacity] "
-            "tensors with capacity for every active row."
-        )
-    if not gathered_values.is_contiguous() or not gathered_ids.is_contiguous():
-        raise ValueError("DSpark TP gather workspaces must be contiguous.")
-
     shard = lm_head.shard_indices
     num_org = int(shard.num_org_elements)
     num_org_padded = int(shard.num_org_elements_padded)
@@ -81,9 +67,23 @@ def _local_vocab_argmax(
             local_arg[~is_base] - num_org_padded
         )
 
-    tp_size = gathered_values.shape[0]
+    tp_size = int(getattr(lm_head, "tp_size", gathered_values.shape[0]))
     if tp_size == 1:
         return global_ids.to(torch.int32)
+
+    if (
+        gathered_values.ndim != 2
+        or gathered_ids.ndim != 2
+        or gathered_values.shape != gathered_ids.shape
+        or gathered_values.shape[0] != tp_size
+        or gathered_values.shape[1] < local_logits.shape[0]
+    ):
+        raise ValueError(
+            "DSpark TP gather workspaces must be matching [tp_size, capacity] "
+            "tensors with capacity for every active row."
+        )
+    if not gathered_values.is_contiguous() or not gathered_ids.is_contiguous():
+        raise ValueError("DSpark TP gather workspaces must be contiguous.")
 
     flat_values = gathered_values.reshape(-1)[: tp_size * rows]
     flat_ids = gathered_ids.reshape(-1)[: tp_size * rows]

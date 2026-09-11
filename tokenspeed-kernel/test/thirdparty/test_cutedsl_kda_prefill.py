@@ -18,12 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuteDSL KDA prefill drop-in vs the portable FLA scan.
+"""Native-layout CuteDSL KDA prefill vs the portable FLA scan.
 
-``cutedsl_kda_chunk_prefill`` mirrors ``triton.linear.kda.kda_chunk_prefill``
-(same signature, same FLA-native state convention), so every case runs both
-and compares directly — including the token-major views and the
-state-layout round trip the wrapper performs internally.
+CuteDSL uses [N, H, V, K] states while FLA uses [N, H, K, V].
+Convert the reference's states at the comparison boundary, not inside the
+native wrapper.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.cutedsl_kda import (
+from tokenspeed_kernel.ops.attention.kda.cute_dsl import (
     cutedsl_kda_chunk_prefill,
     is_cutedsl_kda_installed,
 )
@@ -75,9 +74,14 @@ def _assert_matches_portable(
     out_max_error: float = OUTPUT_MAX_ERROR,
     state_max_error: float = STATE_MAX_ERROR,
 ):
-    from tokenspeed_kernel.ops.attention.triton.linear.kda import kda_chunk_prefill
+    from tokenspeed_kernel.ops.attention.kda._triton.fla import kda_chunk_prefill
 
-    kwargs = dict(cu_seqlens=cu_seqlens, lower_bound=LOWER_BOUND, beta_is_logit=True)
+    kwargs = dict(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens.cpu().to(torch.int64),
+        lower_bound=LOWER_BOUND,
+        beta_is_logit=True,
+    )
     expected_out, expected_state = kda_chunk_prefill(
         *inputs,
         initial_state=None if initial_state is None else initial_state.clone(),
@@ -85,9 +89,14 @@ def _assert_matches_portable(
     )
     actual_out, actual_state = cutedsl_kda_chunk_prefill(
         *inputs,
-        initial_state=None if initial_state is None else initial_state.clone(),
+        initial_state=(
+            None
+            if initial_state is None
+            else initial_state.transpose(-1, -2).contiguous()
+        ),
         **kwargs,
     )
+    actual_state = actual_state.transpose(-1, -2)
     torch.cuda.synchronize()
     out_err = (actual_out.float() - expected_out.float()).abs().max().item()
     state_err = (actual_state.float() - expected_state.float()).abs().max().item()

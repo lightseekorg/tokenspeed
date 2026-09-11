@@ -440,6 +440,13 @@ def _qsa_router(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
             families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
             full_history_group_id=FULL_ATTENTION,
+            row_geometry={
+                gid: (granularity, 1)
+                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
+            },
+            retentions={
+                gid: ("full_history", None) for gid in _QSA_GROUP_GRANULARITIES
+            },
         ),
         {
             gid: leaf_factory(gid, granularity)
@@ -1274,7 +1281,7 @@ def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
         qwen4_exp_ple_conv_field(2): torch.empty((3, 16, 9), dtype=torch.bfloat16),
     }
     backend = object.__new__(Qwen4ExpMambaAttnBackend)
-    backend.kv_pool = SimpleNamespace(
+    backend.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
             plan=SimpleNamespace(fields=fields),
             field=cache_fields.__getitem__,
@@ -1366,18 +1373,6 @@ def test_qwen4_exp_selects_model_specific_gdn_backend(monkeypatch) -> None:
         ),
         attention_arch=object(),
     )
-    state_group = SimpleNamespace(
-        group_id=LINEAR_ATTENTION,
-        family="state",
-        checkpoint_granularity=128,
-    )
-    pool = SimpleNamespace(
-        arena=SimpleNamespace(
-            runtime_contract=SimpleNamespace(group_specs=(state_group,))
-        ),
-        state_group_by_layer={0: LINEAR_ATTENTION},
-        get_component=lambda layer_id, name: None,
-    )
     monkeypatch.setattr(
         attention_registry,
         "_create_attn_backend_with_name",
@@ -1388,7 +1383,6 @@ def test_qwen4_exp_selects_model_specific_gdn_backend(monkeypatch) -> None:
         SimpleNamespace(speculative_algorithm=None, kda_backend="auto"),
         model_config,
         config,
-        pool=pool,
     )
 
     assert isinstance(

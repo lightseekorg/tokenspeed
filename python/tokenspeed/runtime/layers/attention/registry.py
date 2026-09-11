@@ -578,8 +578,8 @@ def _resolve_kda_backend(kda_backend: str) -> str:
         # Named backend policies are NVIDIA-specific; let the registry decide.
         return "auto"
 
-    from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
-    from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cuda import is_flash_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
 
     if kda_backend == "auto":
         if is_cutedsl_kda_installed():
@@ -627,16 +627,14 @@ def _create_hybrid_linear_attn_backend(
     model_config: ModelConfig,
     config: AttnConfig,
     *,
-    pool,
     full_attn_backend_name: str | None = None,
     is_kda: bool = False,
 ) -> AttentionBackend:
-    """Create a hybrid backend for a linear-attention model over one pool.
+    """Create a hybrid backend for a linear-attention model.
 
     GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
-    MLA base; GLM-5.3-Flash, DSA base). ``pool`` is the model's layer-mapped
-    view over the one shared cache pool; both sub-backends consume its
-    per-group tables.
+    MLA base; GLM-5.3-Flash, DSA base). Both sub-backends bind to the one
+    shared cache pool through the wrapper's ``set_cache_pool``.
     """
     from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
@@ -703,8 +701,6 @@ def _create_hybrid_linear_attn_backend(
 
     # Recurrent state lives in the LCM arena and is addressed by the
     # per-group block tables, so no separate request-indexed Mamba pool exists.
-    linear_attn_backend.set_kv_pool(pool)
-
     backend = HybridLinearAttnBackend(
         full_attn_backend, linear_attn_backend, full_attn_layers
     )
@@ -724,7 +720,6 @@ def _wrap_inkling_backend(
     *,
     num_layers,
     is_draft,
-    conv_columns,
     enable_layerwise_cache_ready=False,
 ):
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
@@ -764,49 +759,10 @@ def _wrap_inkling_backend(
     backend = InklingAttnBackend(
         inner,
         conv_pool,
-        conv_columns=conv_columns,
         spec_num_tokens=spec_tokens,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
     return backend
-
-
-def _inkling_conv_columns(pool, text_config):
-    """Return the ShortConv checkpoint groups backed by the cache plan."""
-    layer_labels = text_config.cache_layer_types
-    prefix_granularity = pool.arena.plan.prefix_granularity
-    # The checkpoint grain belongs to the conv groups' own specs; P is only
-    # the fallback when a group is absent from the plan.
-    specs_by_id = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
-
-    def conv_grain(group_id):
-        spec = specs_by_id.get(group_id)
-        return spec.block_granularity if spec is not None else prefix_granularity
-
-    conv_columns = {
-        "block_tokens": conv_grain("kvconv"),
-        "conv_group_of_layer": ("kvconv",) * len(layer_labels),
-        "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
-        "group_block_tokens": {
-            "kvconv": conv_grain("kvconv"),
-            "hiddenconv": conv_grain("hiddenconv"),
-        },
-        "pd_endpoint_snapshots": all(
-            spec.transfer_policy == "latest_snapshot"
-            for spec in pool.arena.cache_group_specs
-            if spec.group_id in ("kvconv", "hiddenconv")
-        )
-        and any(
-            spec.group_id in ("kvconv", "hiddenconv")
-            for spec in pool.arena.cache_group_specs
-        ),
-    }
-    logger.info(
-        "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
-        prefix_granularity,
-        tuple(conv_columns["group_block_tokens"]),
-    )
-    return conv_columns
 
 
 def _create_target_components(
@@ -837,7 +793,6 @@ def _create_target_components(
             server_args,
             model_config,
             config,
-            pool=pool,
             full_attn_backend_name=full_attn_backend_name,
             is_kda=is_kda,
         )
@@ -854,7 +809,6 @@ def _create_target_components(
         config,
         num_layers=text_config.num_hidden_layers,
         is_draft=False,
-        conv_columns=_inkling_conv_columns(pool, text_config),
         enable_layerwise_cache_ready=(
             server_args.disaggregation_mode == "prefill"
             and server_args.disaggregation_layerwise_interval > 0
@@ -908,7 +862,6 @@ def _create_draft_components(
             server_args,
             model_config,
             config,
-            pool=draft_pool,
             full_attn_backend_name=full_attn_backend_name,
             is_kda=is_kda,
         )
@@ -926,7 +879,6 @@ def _create_draft_components(
             config,
             num_layers=num_layers,
             is_draft=True,
-            conv_columns=_inkling_conv_columns(draft_pool, text_config),
         )
     return backend, draft_pool
 

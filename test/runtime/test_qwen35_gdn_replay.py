@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -47,7 +48,7 @@ from test.runtime.test_gdn_state_paging import (
     _mamba_config_pair,
 )
 
-from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -411,6 +412,152 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
             atol=1e-6,
             rtol=1e-5,
         )
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_rebinding_the_pool_retargets_the_verify_copy_tables(replay):
+    """The copy tables hold the pool's data_ptrs, so a rebind must rebuild them."""
+    backend, _ = _make_backend(*_initial_pools(), replay=replay)
+    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
+    stale = backend._verify_copy_tables_get()
+
+    replacement = _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=29))})
+    backend.forward_metadata = object()
+    backend._replay_state_tapes = {1: object()}
+    backend.set_kv_pool(replacement)
+    assert backend._gdn_replay is None
+    assert backend._replay_state_tapes == {}
+    assert backend.forward_metadata is None
+    backend.init_cuda_graph_state(BATCH)
+    assert len(backend.query_start_loc_list) == BATCH
+    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
+    assert (backend._gdn_replay is not None) == replay
+    tables = backend._verify_copy_tables_get()
+    conv, ssm = backend._state_components(0)
+    assert tables["conv_comp"][0].item() == conv.data_ptr()
+    assert tables["ssm_comp"][0].item() == ssm.data_ptr()
+    assert tables["conv_comp"][0].item() != stale["conv_comp"][0].item()
+
+
+def test_rebinding_a_pool_with_other_state_component_shapes_is_rejected():
+    backend, original = _make_backend(*_initial_pools(), replay=False)
+    conv, _ = _initial_pools(seed=29)
+    recurrent = torch.zeros(
+        8,
+        NUM_V_HEADS * 2,
+        HEAD_V_DIM // 2,
+        HEAD_K_DIM,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(
+            _ContractPool(4, {0: ("linear_attention", conv, recurrent)})
+        )
+    assert backend.kv_pool is original
+
+
+def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
+    """Geometry validation must cover every layer, not only min(layer_id)."""
+    conv, recurrent = _initial_pools(seed=37)
+    original = _ContractPool(
+        4,
+        {
+            0: ("linear_attention", conv.clone(), recurrent.clone()),
+            1: ("linear_attention", conv.clone(), recurrent.clone()),
+        },
+    )
+    backend = MambaAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(original)
+
+    changed_recurrent = torch.zeros(
+        recurrent.shape[0],
+        recurrent.shape[1] * 2,
+        recurrent.shape[2] // 2,
+        recurrent.shape[3],
+        device=DEVICE,
+        dtype=recurrent.dtype,
+    )
+    changed = _ContractPool(
+        4,
+        {
+            0: ("linear_attention", conv.clone(), recurrent.clone()),
+            1: ("linear_attention", conv.clone(), changed_recurrent),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(changed)
+
+    assert backend.kv_pool is original
+
+
+def test_rebinding_a_pool_whose_state_layers_moved_is_rejected():
+    """Equal shapes on shifted layer ids are a different geometry."""
+    conv, recurrent = _initial_pools(seed=41)
+
+    def pool(*layers):
+        return _ContractPool(
+            4,
+            {
+                layer: ("linear_attention", conv.clone(), recurrent.clone())
+                for layer in layers
+            },
+        )
+
+    original = pool(0, 1)
+    backend = MambaAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(original)
+
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_kv_pool(pool(1, 2))
+
+    assert backend.kv_pool is original
+
+
+def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
+    backend, original = _make_backend(*_initial_pools(), replay=False)
+    backend.set_cache_pool(original)
+    with pytest.raises(RuntimeError, match="different state geometry"):
+        backend.set_cache_pool(
+            _ContractPool(8, {0: ("linear_attention", *_initial_pools())})
+        )
+
+    assert backend.kv_pool is original
+    assert backend.cache_pool is original
+    assert backend._checkpoint_granularity == 4
+
+
+def test_rebinding_a_state_backend_drops_registered_side_state_scratch():
+    backend, _ = _make_backend(*_initial_pools(), replay=False)
+    side = SimpleNamespace(dropped=False, commit_after_mtp_verify=lambda *a, **k: None)
+    side.drop_verify_scratch = lambda: setattr(side, "dropped", True)
+    backend.register_speculative_state_backend(side)
+
+    backend.set_cache_pool(
+        _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
+    )
+    assert side.dropped
+
+
+def test_rebinding_the_pool_drops_the_ple_verify_scratch():
+    """The PLE scratch is cut from the bound arena's fields, so a rebind must reissue it."""
+    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+        Qwen4ExpMambaAttnBackend,
+    )
+
+    backend = Qwen4ExpMambaAttnBackend.__new__(Qwen4ExpMambaAttnBackend)
+    backend._init_pool_binding()
+    layer = SimpleNamespace(dropped=False)
+    layer.drop_verify_scratch = lambda: setattr(layer, "dropped", True)
+    backend._ple_layers = (layer,)
+    backend._ple_verify_scratch = {"context": torch.zeros(2)}
+
+    pool = _ContractPool(4, {0: ("linear_attention", *_initial_pools())})
+    backend.set_kv_pool(pool)
+    assert backend.kv_pool is pool
+    assert backend._ple_verify_scratch == {}
+    assert layer.dropped
 
 
 if __name__ == "__main__":

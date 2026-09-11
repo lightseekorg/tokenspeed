@@ -26,8 +26,15 @@ import math
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
+    gluon_dsv4_sparse_prefill_gfx950,
+)
 
 __all__ = ["gluon_dsv4_prefill_gfx950"]
+
+
+def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
+    return q.shape[1] in (64, 128) and indices.shape[1] >= 128
 
 
 @gluon.jit
@@ -496,6 +503,17 @@ def gluon_dsv4_prefill_gfx950(
     if q.shape[0] == 0 or q.shape[1] == 0 or indices.shape[1] == 0:
         output.zero_()
         return output
+
+    if _use_sparse_prefill(q, indices):
+        return gluon_dsv4_sparse_prefill_gfx950(
+            q=q,
+            kv=kv,
+            indices=indices,
+            lens=lens,
+            attn_sink=attn_sink,
+            softmax_scale=scale,
+            out=output,
+        )
 
     kv_rows = kv.reshape(-1, 512)
     sink_values = attn_sink.reshape(-1)

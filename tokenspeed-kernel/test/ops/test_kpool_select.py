@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import kpool_decode_topk, kpool_prefill_topk
-from tokenspeed_kernel.ops.attention.triton.kpool_expand import (
-    expand_kpool_to_flat_kv,
+from tokenspeed_kernel.ops.attention.kpool import (
+    kpool_decode_topk,
+    kpool_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.triton.kpool_score import score_kpool_dense
-from tokenspeed_kernel.ops.attention.triton.kpool_select import (
+from tokenspeed_kernel.ops.attention.kpool.triton import (
     _prepare_kpool_decode_metadata,
+    expand_kpool_to_flat_kv,
+    score_kpool_dense,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

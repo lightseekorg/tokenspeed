@@ -67,6 +67,10 @@ class QSABackend:
                 raise RuntimeError("QSA backend cannot be rebound to another model")
         self._indexers = bound
 
+    def drop_verify_scratch(self) -> None:
+        for indexer in self._indexers:
+            indexer.drop_verify_scratch()
+
     def commit_after_mtp_verify(
         self,
         accepted_lengths: torch.Tensor,

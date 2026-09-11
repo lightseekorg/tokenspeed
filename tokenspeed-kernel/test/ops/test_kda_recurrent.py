@@ -6,11 +6,11 @@ from inspect import signature
 from types import SimpleNamespace
 
 import pytest
+import tokenspeed_kernel.ops.attention.kda as attention_ops
 import torch
 from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
-from tokenspeed_kernel.ops import attention as attention_ops
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     _attention_format_signature,
     kda_paged_decode,
@@ -172,6 +172,290 @@ def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> 
         num_warps=8,
         num_stages=5,
     ) == (32, 8, 5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
+    """The TP4 schedules match the recurrence and graph replay is stable."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+        fused_recurrent_kda_mtp_fwd_kernel,
+    )
+
+    torch.manual_seed(16)
+    dev = "cuda"
+    batch, steps, heads, key_dim, value_dim = 16, 4, 16, 128, 128
+    q = torch.randn(batch, steps, heads, key_dim, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, steps, heads, value_dim, dtype=torch.bfloat16, device=dev)
+    g = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=dev)
+    a_log = torch.randn(heads, dtype=torch.float32, device=dev)
+    dt_bias = torch.randn(heads, key_dim, dtype=torch.float32, device=dev)
+    read_indices = torch.arange(batch, dtype=torch.int32, device=dev)
+    write_indices = batch + torch.arange(
+        batch * steps, dtype=torch.int32, device=dev
+    ).view(batch, steps)
+    pages = batch * (steps + 1)
+    initial = torch.randn(
+        batch,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+
+    expected_pool = torch.zeros(
+        pages,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+    expected_pool[:batch].copy_(initial)
+    expected_output = torch.empty_like(v, dtype=torch.float32)
+    batched_reference = torch.vmap(
+        lambda q_row, k_row, v_row, g_row, beta_row, state_row: (
+            reference_kda_recurrent(
+                q_row,
+                k_row,
+                v_row,
+                g_row,
+                beta_row,
+                state_row,
+                a_log,
+                dt_bias,
+                output_dtype=torch.float32,
+                lower_bound=LOWER_BOUND,
+                eps=NORM_EPS,
+            )
+        )
+    )
+    running = initial
+    for step_idx in range(steps):
+        output, running = batched_reference(
+            q[:, step_idx : step_idx + 1],
+            k[:, step_idx : step_idx + 1],
+            v[:, step_idx : step_idx + 1],
+            g[:, step_idx : step_idx + 1],
+            beta[:, step_idx : step_idx + 1],
+            running,
+        )
+        expected_output[:, step_idx].copy_(output[:, 0])
+        expected_pool[write_indices[:, step_idx].long()] = running
+
+    grid = triton.cdiv(value_dim, 32) * batch * heads
+
+    def run_schedule(
+        pool: torch.Tensor, num_warps: int, num_stages: int
+    ) -> torch.Tensor:
+        output = torch.empty_like(v)
+        fused_recurrent_kda_mtp_fwd_kernel[(grid,)](
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            o=output,
+            h_pool=pool,
+            h_pool_out=pool,
+            read_indices=read_indices,
+            write_indices=write_indices.reshape(-1),
+            lower_bound=LOWER_BOUND,
+            stride_q_tok=q.stride(1),
+            stride_k_tok=k.stride(1),
+            stride_v_tok=v.stride(1),
+            stride_g_tok=g.stride(1),
+            stride_beta_tok=beta.stride(1),
+            scale=key_dim**-0.5,
+            N=batch,
+            T=steps,
+            H=heads,
+            HV=heads,
+            K=key_dim,
+            V=value_dim,
+            BK=key_dim,
+            BV=32,
+            stride_state_page=pool.stride(0),
+            stride_state_out_page=pool.stride(0),
+            V_MAJOR=True,
+            USE_QK_L2NORM_IN_KERNEL=True,
+            USE_GATE_IN_KERNEL=True,
+            APPLY_BETA_SIGMOID=True,
+            HAS_DT_BIAS=True,
+            USE_LOWER_BOUND=True,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return output
+
+    for num_warps, num_stages in ((4, 2), (2, 3)):
+        actual_pool = torch.zeros_like(expected_pool)
+        actual_pool[:batch].copy_(initial)
+        actual_output = run_schedule(actual_pool, num_warps, num_stages)
+        torch.testing.assert_close(
+            actual_output.float(), expected_output, atol=1e-3, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            actual_pool[batch:], expected_pool[batch:], atol=1e-4, rtol=1e-4
+        )
+
+    tuned_pool = torch.zeros_like(expected_pool)
+    tuned_pool[:batch].copy_(initial)
+
+    def run_tuned() -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            a_log,
+            dt_bias,
+            tuned_pool,
+            read_indices,
+            write_indices,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    tuned_output = run_tuned()
+    run_tuned()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = run_tuned()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, tuned_output, atol=0, rtol=0)
+    torch.testing.assert_close(
+        tuned_pool[batch:], expected_pool[batch:], atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
+    """Separate read/write pools replace the recurrent-state seed exactly."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+    )
+
+    torch.manual_seed(91)
+    device = "cuda"
+    batch, steps, heads, dim = 3, 4, 4, 128
+    pages = 7
+    row_elements = heads * dim * dim
+    page_stride = row_elements + 37
+    committed_storage = torch.randn(
+        pages * page_stride, dtype=torch.float32, device=device
+    )
+    committed = torch.as_strided(
+        committed_storage,
+        size=(pages, heads, dim, dim),
+        stride=(page_stride, dim * dim, dim, 1),
+    )
+    q = torch.randn(batch, steps, heads, dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    gate = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=device)
+    a_log = torch.randn(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(heads, dim, dtype=torch.float32, device=device)
+    read_indices = torch.tensor([-1, 4, 1], dtype=torch.int32, device=device)
+    scratch_rows = batch * (steps + 1)
+    bases = torch.arange(batch, dtype=torch.int32, device=device) * (steps + 1)
+    write_indices = bases[:, None] + torch.arange(
+        1, steps + 1, dtype=torch.int32, device=device
+    )
+
+    def run(
+        state_pool: torch.Tensor,
+        initial_rows: torch.Tensor,
+        state_out: torch.Tensor,
+    ) -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool,
+            initial_rows,
+            write_indices,
+            h_pool_out=state_out,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    def seeded_oracle(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scratch = torch.full(
+            (scratch_rows, heads, dim, dim),
+            13.0,
+            dtype=torch.float32,
+            device=device,
+        )
+        scratch[bases.long()] = 0
+        valid = indices >= 0
+        scratch[bases[valid].long()] = committed[indices[valid].long()]
+        return run(scratch, bases, scratch), scratch
+
+    expected_out, expected_scratch = seeded_oracle(read_indices)
+    direct_scratch = torch.full_like(expected_scratch, -17.0)
+    committed_before = committed_storage.clone()
+    actual_out = run(committed, read_indices, direct_scratch)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_out, expected_out)
+    assert torch.equal(
+        direct_scratch[write_indices.long()],
+        expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, committed_before)
+    assert committed.data_ptr() != direct_scratch.data_ptr()
+
+    accepted = torch.tensor([1, 4, 2], dtype=torch.int64, device=device)
+    destinations = torch.tensor([2, 3, 5], dtype=torch.int64, device=device)
+    expected_committed = committed.clone()
+    actual_committed = committed.clone()
+    rows = bases.long() + accepted
+    expected_committed[destinations] = expected_scratch[rows]
+    actual_committed[destinations] = direct_scratch[rows]
+    assert torch.equal(actual_committed, expected_committed)
+
+    stable_indices = torch.tensor([1, -1, 4], dtype=torch.int32, device=device)
+    graph_scratch = torch.empty_like(direct_scratch)
+    run(committed, stable_indices, graph_scratch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = run(committed, stable_indices, graph_scratch)
+    graph.replay()
+    torch.cuda.synchronize()
+    first_graph_out = graph_out.clone()
+
+    stable_indices.copy_(torch.tensor([-1, 3, 5], dtype=torch.int32, device=device))
+    committed[3].copy_(torch.randn_like(committed[3]))
+    committed[5].copy_(torch.randn_like(committed[5]))
+    changed_committed = committed_storage.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    replay_expected_out, replay_expected_scratch = seeded_oracle(stable_indices)
+    assert not torch.equal(graph_out, first_graph_out)
+    assert torch.equal(graph_out, replay_expected_out)
+    assert torch.equal(
+        graph_scratch[write_indices.long()],
+        replay_expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, changed_committed)
 
 
 @pytest.mark.parametrize(
@@ -399,19 +683,19 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
 
 
 @pytest.mark.parametrize(
-    "kernel_name",
+    ("kernel_name", "layout"),
     [
-        "triton_nvidia_kda_paged_prefill",
-        "flashkda_nvidia_kda_paged_prefill",
-        "cutedsl_kda_nvidia_paged_prefill",
+        ("triton_nvidia_kda_paged_prefill", "k_major"),
+        ("flashkda_nvidia_kda_paged_prefill", "k_major"),
+        ("cutedsl_kda_nvidia_paged_prefill", "v_major"),
     ],
 )
-def test_nvidia_kda_prefill_kernels_declare_k_major(kernel_name) -> None:
+def test_nvidia_kda_prefill_kernels_declare_native_layout(kernel_name, layout) -> None:
     """kda_paged_prefill relayouts only for kernels that declare a layout;
     a dropped declaration silently hands them the V-major state as-is."""
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None, kernel_name
-    assert spec.traits.get("recurrent_layout") == frozenset({"k_major"}), kernel_name
+    assert spec.traits.get("recurrent_layout") == frozenset({layout}), kernel_name
 
 
 def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> None:
@@ -579,7 +863,9 @@ def test_nvidia_kda_pool_matches_the_reference_recurrence() -> None:
             pool[row],
             a_log,
             dt_bias,
+            output_dtype=q.dtype,
             lower_bound=LOWER_BOUND,
+            eps=NORM_EPS,
         )
         for row in range(batch)
     ]
@@ -664,6 +950,9 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
         state[0],
         a_log,
         dt_bias,
+        output_dtype=q.dtype,
+        lower_bound=LOWER_BOUND,
+        eps=NORM_EPS,
     )
     result = kda_paged_prefill(
         q.unsqueeze(0),
@@ -787,7 +1076,9 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
             initial_pool[read_indices[row].long()],
             a_log,
             dt_bias,
+            output_dtype=q.dtype,
             lower_bound=lower_bound,
+            eps=NORM_EPS,
         )
         expected_out.append(out[0])
         expected_pool[write_indices[row].long()] = final_state
@@ -967,6 +1258,9 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
             initial_state_pool[read_idx],
             a_log,
             dt_bias.view(heads, head_dim),
+            output_dtype=q.dtype,
+            lower_bound=LOWER_BOUND,
+            eps=NORM_EPS,
         )
         core_out = core_out[0].float()
         inverse_rms = torch.rsqrt(core_out.square().mean(dim=-1) + norm_eps)

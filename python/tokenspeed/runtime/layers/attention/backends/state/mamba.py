@@ -29,22 +29,26 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
 )
-from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    CAUSAL_CONV1D_BLOCK_M,
+    CausalConv1dPrefillMetadata,
+    build_causal_conv1d_prefill_metadata,
     fused_qkv_split_gdn_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.linear.index import (
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    prepare_prefill_state_inputs as _prepare_cache_prefill_state_inputs,
+)
+from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
-    verify_state_blocks,
-)
+from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -69,14 +73,42 @@ from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.metadata import PrepTape
+
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
 _STATE_GROUP_ID = LINEAR_ATTENTION
+
+
+def _packed_qkv_views(
+    mixed_qkv: torch.Tensor,
+    *,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose packed Q/K/V rows without changing storage or materializing copies."""
+    seq_len = mixed_qkv.shape[0]
+    widths = (
+        num_q_heads * head_q,
+        num_k_heads * head_k,
+        num_v_heads * head_v,
+    )
+    query, key, value = mixed_qkv.split(widths, dim=-1)
+    return (
+        query.view(1, seq_len, num_q_heads, head_q),
+        key.view(1, seq_len, num_k_heads, head_k),
+        value.view(1, seq_len, num_v_heads, head_v),
+    )
 
 
 @dataclass(frozen=True)
@@ -207,30 +239,6 @@ def compute_state_block_indices(
     return _gather_state_block_indices(rows, plan, validate=validate, group_id=group_id)
 
 
-def _prepare_cache_prefill_state_inputs(
-    conv_states: torch.Tensor,
-    ssm_states: torch.Tensor,
-    state_in_blocks: torch.Tensor,
-    state_out_blocks: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize logical-zero fresh state without reading physical page 0."""
-    has_initial_state = state_in_blocks > 0
-    safe_input_pages = torch.where(
-        has_initial_state, state_in_blocks, state_out_blocks
-    ).to(torch.int64)
-    state_out_blocks = state_out_blocks.to(torch.int64)
-
-    # A fresh row copies its working page to itself. Only a resumed row reads
-    # the checkpoint named by state_in_blocks.
-    conv_states[state_out_blocks] = conv_states[safe_input_pages]
-    recurrent_state = ssm_states[safe_input_pages]
-    broadcast_mask = has_initial_state.reshape(
-        (-1,) + (1,) * (recurrent_state.ndim - 1)
-    )
-    recurrent_state.masked_fill_(~broadcast_mask, 0)
-    return recurrent_state, has_initial_state
-
-
 def _prepare_gdn_decode_state_path(
     ssm_states: torch.Tensor,
     initial_state_indices: torch.Tensor,
@@ -295,6 +303,12 @@ class MambaForwardMetadata:
     # so no kernel re-reads the device boundaries (a stream-synchronizing
     # D2H per layer per chunk). Fresh per batch — never mutated in place.
     cu_extend_seq_lens_cpu: torch.Tensor | None = None
+    # Device int64 mirror for scan ABIs; keep the int32 query/conv indices.
+    # Owned by this extend/mixed forward, not cast again by every KDA layer.
+    query_start_loc_int64: torch.Tensor | None = None
+    # One read-only convolution schedule per forward, reused across layers.
+    # Never refill a previous forward's storage while its kernels are in flight.
+    conv_prefill_metadata: CausalConv1dPrefillMetadata | None = None
     # Per-state-group metadata is gathered once per group and batch;
     # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
@@ -311,6 +325,11 @@ class _GDNReplayWorkspace:
     state_dtype: torch.dtype
 
 
+_StateLayerGeometry = tuple[
+    tuple[int, tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype], ...
+]
+
+
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
@@ -319,34 +338,56 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
+    _verify_reads_committed_recurrent_state: bool = False
+    _verify_packed_qkv_views: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
         self.pad_slot_id = -1
-        self.forward_metadata: MambaForwardMetadata = None
-        self.query_start_loc_list = []
-        self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
-        self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.forward_metadata: MambaForwardMetadata | None = None
+        self._reset_graph_state()
         self.speculative_num_draft_tokens = config.speculative_num_draft_tokens
-        self.kv_pool = None
         self.state_paging_active = False
         self._checkpoint_granularity = 1
         self._state_group_ids: tuple[str, ...] = ()
+        self._state_layer_geometry: _StateLayerGeometry = ()
+        linear_attn = config.component(LinearAttnConfig)
+        self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
+        self._gdn_replay: _GDNReplayWorkspace | None = None
+        self._verify_scratch = None
+        self._verify_commit_ctx = None
+        self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
+        self._replay_state_tapes: dict[int, PrepTape] = {}
+
+    @property
+    def kv_pool(self) -> CachePool | None:
+        return self.cache_pool
+
+    def _reset_graph_state(self) -> None:
+        """Index buffers init_cuda_graph_state rebuilds; a rebind keeps them."""
+        self.query_start_loc_list: list[torch.Tensor] = []
+        self.cached_cuda_graph_decode_query_start_loc: torch.Tensor | None = None
+        self.cached_cuda_graph_verify_query_start_loc: torch.Tensor | None = None
         # CUDA-graph buffers: one persistent dual-index (state_in/state_out)
         # [bs] buffer per state group for every bs up to max_decode_bs (the
         # runner sizes them, never the capture ladder). Values are keyed by
         # group ID and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
-        linear_attn = config.component(LinearAttnConfig)
-        self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
-        self._gdn_replay: _GDNReplayWorkspace | None = None
-        self._verify_scratch = None
-        self._verify_commit_ctx = None
+        self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._qsl_dirty: list[bool] = []
+        self._qsl_last_mode: list[tuple[ForwardMode, bool] | None] = []
 
-    def set_kv_pool(self, kv_pool) -> None:
+    def set_kv_pool(self, kv_pool: CachePool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
-        self.kv_pool = kv_pool
+        self.set_cache_pool(kv_pool)
+
+    def _state_geometry(
+        self, kv_pool: CachePool
+    ) -> tuple[tuple[str, ...], int, _StateLayerGeometry]:
+        """State group ids, checkpoint grain and per-layer state geometry, or raise."""
         contract = kv_pool.arena.runtime_contract
         if contract is None:
             raise RuntimeError(
@@ -365,8 +406,6 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MambaAttnBackend requires state_group_by_layer and get_component()"
             )
-        self._state_group_ids = state_group_ids
-        self.state_paging_active = True
         checkpoint_granularities = {
             spec.checkpoint_granularity
             for spec in contract.group_specs
@@ -377,7 +416,59 @@ class MambaAttnBackend(AttentionBackend):
                 "MambaAttnBackend requires one shared state-group "
                 f"checkpoint_granularity, got {sorted(checkpoint_granularities, key=str)}"
             )
-        self._checkpoint_granularity = int(checkpoint_granularities.pop())
+        checkpoint_granularity = int(checkpoint_granularities.pop())
+        layer_geometry = tuple(
+            (
+                layer,
+                tuple(conv.shape[1:]),
+                conv.dtype,
+                tuple(recurrent.shape[1:]),
+                recurrent.dtype,
+            )
+            for layer in sorted(kv_pool.state_group_by_layer)
+            for conv, recurrent in (
+                (
+                    kv_pool.get_component(layer, "conv_state"),
+                    kv_pool.get_component(layer, "recurrent_state"),
+                ),
+            )
+        )
+        geometry = (
+            tuple(sorted(state_group_ids)),
+            checkpoint_granularity,
+            layer_geometry,
+        )
+        if self.kv_pool is not None and geometry != (
+            tuple(sorted(self._state_group_ids)),
+            self._checkpoint_granularity,
+            self._state_layer_geometry,
+        ):
+            raise RuntimeError(
+                "MambaAttnBackend cannot rebind a pool of a different state geometry"
+            )
+        return geometry
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        self._state_geometry(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """Latch the state geometry; init and preallocate rebuild the rest."""
+        state_group_ids, checkpoint_granularity, layer_geometry = self._state_geometry(
+            cache_pool
+        )
+        super()._publish_cache_pool(cache_pool)
+        self._state_group_ids = state_group_ids
+        self.state_paging_active = True
+        self._checkpoint_granularity = checkpoint_granularity
+        self._state_layer_geometry = layer_geometry
+        # init_cuda_graph_state and preallocate_verify_workspace rebuild these for the new pool.
+        self._verify_scratch = None
+        self._verify_copy_tables = None
+        self._verify_commit_ctx = None
+        self._gdn_replay = None
+        self._replay_state_tapes = {}
+        self.forward_metadata = None
 
     @staticmethod
     def _decode_state_block_bounds(
@@ -497,12 +588,12 @@ class MambaAttnBackend(AttentionBackend):
             rows_needed
         ):
             return
-        self._verify_scratch = {}
+        scratch = {}
         self._verify_copy_tables = None
         layer_ids = tuple(self._state_layer_ids())
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
-            self._verify_scratch[layer_id] = (
+            scratch[layer_id] = (
                 torch.zeros(
                     (rows_needed, *conv.shape[1:]),
                     dtype=conv.dtype,
@@ -549,6 +640,7 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     state_dtype=ssm.dtype,
                 )
+        self._verify_scratch = scratch
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate graph-stable verify state and return its byte size."""
@@ -573,12 +665,12 @@ class MambaAttnBackend(AttentionBackend):
         """Allocate model-owned verify state and return its byte size."""
         return 0
 
-    def _verify_copy_tables_get(self) -> dict:
+    def _verify_copy_tables_get(self) -> dict[str, torch.Tensor | int | None]:
         """Pointer tables for the batched verify state copies and replay:
         per-layer base addresses, row strides, and state-group selectors.
         Rebuilt only when the scratch is reallocated so CUDA graph capture
         can record stable tensors."""
-        tables = getattr(self, "_verify_copy_tables", None)
+        tables = self._verify_copy_tables
         if tables is not None:
             return tables
         layer_ids = list(self._state_layer_ids())
@@ -651,9 +743,7 @@ class MambaAttnBackend(AttentionBackend):
         """Memoized layer-major ``[L*bs]`` scratch init-row ids (row
         ``req*(T+1)`` per request, tiled per layer). Graph replay must see the
         identical tensor, mirroring ``_verify_scratch_grid``."""
-        cache = getattr(self, "_verify_seed_dst_cache", None)
-        if cache is None:
-            cache = self._verify_seed_dst_cache = {}
+        cache = self._verify_seed_dst_cache
         tables = self._verify_copy_tables_get()
         key = (bs, draft_token_num, tables["num_layers"])
         rows = cache.get(key)
@@ -684,7 +774,7 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
         )
-        if not self.replay_ssm:
+        if not self.replay_ssm and not self._verify_reads_committed_recurrent_state:
             copy_state_rows(
                 tables["ssm_comp"],
                 tables["ssm_scratch"],
@@ -700,22 +790,31 @@ class MambaAttnBackend(AttentionBackend):
         the seeded init window, rows ``req*(T+1)+1+t`` the per-position
         outputs. Memoized per (bs, T): CUDA-graph capture records the tensor's
         storage, so replays must present the identical tensor."""
-        cache = getattr(self, "_verify_grid_cache", None)
-        if cache is None:
-            cache = self._verify_grid_cache = {}
+        cache = self._verify_grid_cache
         grid = cache.get((bs, draft_token_num))
         if grid is not None:
             return grid
-        stride = draft_token_num + 1
-        base = (
-            torch.arange(bs, dtype=torch.int32, device=self.device) * stride
-        ).unsqueeze(1)
+        base = self._verify_scratch_base_rows(bs, draft_token_num).unsqueeze(1)
         steps = torch.arange(
             1, draft_token_num + 1, dtype=torch.int32, device=self.device
         ).unsqueeze(0)
         grid = base + steps
         cache[(bs, draft_token_num)] = grid
         return grid
+
+    def _verify_scratch_base_rows(self, bs: int, draft_token_num: int) -> torch.Tensor:
+        """Graph-stable scratch initialization row for each request."""
+        cache = getattr(self, "_verify_base_cache", None)
+        if cache is None:
+            cache = self._verify_base_cache = {}
+        key = (bs, draft_token_num)
+        rows = cache.get(key)
+        if rows is None:
+            rows = torch.arange(bs, dtype=torch.int32, device=self.device) * (
+                draft_token_num + 1
+            )
+            cache[key] = rows
+        return rows
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""
@@ -933,6 +1032,10 @@ class MambaAttnBackend(AttentionBackend):
             query_start_loc=query_start_loc,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+            query_start_loc_int64=query_start_loc.to(dtype=torch.int64),
+            conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
+                query_start_loc, extend_seq_lens_cpu, CAUSAL_CONV1D_BLOCK_M
+            ),
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
@@ -940,6 +1043,8 @@ class MambaAttnBackend(AttentionBackend):
     # ---- CUDA graph state ----
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        """Rebuild the index buffers before any graph that reads them is captured."""
+        self._reset_graph_state()
         for i in range(max_bs):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
@@ -1199,9 +1304,7 @@ class MambaAttnBackend(AttentionBackend):
         if use_tape:
             from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
-            tapes = getattr(self, "_replay_state_tapes", None)
-            if tapes is None:
-                tapes = self._replay_state_tapes = {}
+            tapes = self._replay_state_tapes
             tape = tapes.get(bs)
             if tape is None:
                 tape = PrepTape(self.device)
@@ -1632,7 +1735,7 @@ class MambaAttnBackend(AttentionBackend):
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             conv_states = conv_scratch
-            conv_read = output_indices[:batch_size, 0] - 1
+            conv_read = self._verify_scratch_base_rows(batch_size, draft_token_num)
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
@@ -1654,12 +1757,11 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
                 self._layer_state(layer_id)
             )
-            state_out_long = state_out_blocks.to(torch.int64)
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,
                 ssm_states,
                 state_in_blocks,
-                state_out_long,
+                state_out_blocks,
             )
             conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
@@ -1680,7 +1782,7 @@ class MambaAttnBackend(AttentionBackend):
                 has_initial_state=has_initial_states,
                 cache_indices=conv_cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=extend_seq_lens_cpu,
+                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
             ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
@@ -1704,16 +1806,30 @@ class MambaAttnBackend(AttentionBackend):
                 b.view(seq_len, -1),
             )
 
-        query, key, value = fused_qkv_split_gdn_prefill(
-            mixed_qkv,
-            num_q_heads=num_heads,
-            num_k_heads=num_heads,
-            num_v_heads=num_value_heads,
-            head_q=head_k_dim,
-            head_k=head_k_dim,
-            head_v=head_v_dim,
-            replay=replay_inputs,
-        )
+        # KDA can consume zero-copy strided views. When recurrent-state replay is
+        # enabled, the existing split kernel must remain because it also saves the
+        # persistent inputs needed to reconstruct accepted state later.
+        if is_target_verify and self._verify_packed_qkv_views and replay_inputs is None:
+            query, key, value = _packed_qkv_views(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+            )
+        else:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+                replay=replay_inputs,
+            )
 
         if is_target_verify:
             core_attn_out = self._verify_scan(
@@ -1759,7 +1875,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
-            ssm_states[state_out_long] = last_recurrent_state
+            ssm_states[state_out_blocks] = last_recurrent_state
 
         return core_attn_out
 
@@ -1899,7 +2015,9 @@ class MambaAttnBackend(AttentionBackend):
             output_state_indices = None
         else:
             initial_state = ssm_scratch
-            initial_indices = output_indices[:batch_size, 0] - 1
+            initial_indices = self._verify_scratch_base_rows(
+                batch_size, draft_token_num
+            )
             output_state_indices = output_indices
         (
             mtp_initial_indices,
