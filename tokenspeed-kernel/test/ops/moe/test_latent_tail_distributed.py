@@ -423,6 +423,70 @@ def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix():
         ).abs().max().item() > tol
 
 
+def test_residual_from_shared_writes_the_caller_s_buffer():
+    """The returned rows must live in the override, not the instance scratch.
+
+    Reading the returned tensor alone cannot tell the two apart -- both are
+    ``latent_output[:m]`` -- so compare storage, and call twice so a kernel
+    that honours the override once but not again is caught.
+    """
+    _, dev = _setup()
+    _require_attn_collective()
+    max_m, m = 8, 2
+    kernel = _attn_collective(dev, max_m)
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+    partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+
+    seen = []
+    for _ in range(2):
+        override = torch.empty(max_m, H, dtype=torch.bfloat16, device=dev)
+        out, _ = kernel(
+            partial,
+            prefix,
+            gamma,
+            include_reduce_scatter=False,
+            include_routed=True,
+            latent_output_override=override,
+        )
+        torch.cuda.synchronize()
+        assert out.data_ptr() == override.data_ptr()
+        seen.append(override.data_ptr())
+    # Positive control: the two calls really did hand in different buffers, so
+    # the equality above is not trivially satisfied by one reused allocation.
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["rows", "dtype", "strided"],
+)
+def test_residual_from_shared_rejects_an_unusable_override(bad):
+    """The dispatch bakes a static layout, so a mis-shaped buffer must not run."""
+    _, dev = _setup()
+    _require_attn_collective()
+    max_m, m = 8, 1
+    kernel = _attn_collective(dev, max_m)
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+    partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    if bad == "rows":
+        override = torch.empty(max_m - 1, H, dtype=torch.bfloat16, device=dev)
+    elif bad == "dtype":
+        override = torch.empty(max_m, H, dtype=torch.float16, device=dev)
+    else:
+        override = torch.empty(max_m, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
+    with pytest.raises(ValueError, match="latent output buffer"):
+        kernel(
+            partial,
+            prefix,
+            gamma,
+            include_reduce_scatter=False,
+            include_routed=True,
+            latent_output_override=override,
+        )
+
+
 def test_residual_from_shared_rejects_the_reduce_scatter_role():
     """This epilogue emits reduced+residual; scattering the residual is nonsense."""
     _, dev = _setup()

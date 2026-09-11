@@ -566,3 +566,34 @@ def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
     # of two up to 16.
     for tp in (7, 12, 24, 32):
         assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
+
+
+def test_the_epilogue_variant_is_part_of_the_compile_key() -> None:
+    """Two epilogues sharing a key means one kernel is returned for the other.
+
+    ``_COMPILED`` is module-global and a K3 process holds both instances -- the
+    MoE tail's RMSNorm epilogue and the attention reduce's residual one -- so a
+    collision hands one of them the other's kernel. It runs and returns the
+    right shape.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        _compile_key,
+    )
+
+    common = dict(
+        rank=0,
+        tp_size=8,
+        latent_dim=7168,
+        hidden_dim=7168,
+        max_m=8,
+        max_token_ctas=8,
+        fp32_internal=True,
+        include_reduce_scatter=False,
+        include_routed=True,
+    )
+    residual = _compile_key(**common, residual_from_shared=True)
+    rmsnorm = _compile_key(**common, residual_from_shared=False)
+    assert residual != rmsnorm
+    # Control: everything else being equal is what makes the line above a test
+    # of this field rather than of some incidental difference.
+    assert _compile_key(**common, residual_from_shared=True) == residual
