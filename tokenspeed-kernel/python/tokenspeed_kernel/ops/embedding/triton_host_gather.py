@@ -51,9 +51,7 @@ def _host_uint8_row_gather_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < width
     valid = (idx >= 0) & (idx < n_rows)
-    host_row = tl.cast(
-        table_ptr + idx * table_stride, tl.pointer_type(tl.uint8)
-    )
+    host_row = tl.cast(table_ptr + idx * table_stride, tl.pointer_type(tl.uint8))
     values = tl.load(host_row + cols, mask=mask & valid, other=0)
     tl.store(out_ptr + row * out_stride + cols, values, mask=mask)
 
