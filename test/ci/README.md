@@ -466,4 +466,9 @@ Retries reuse the original submission scripts and source snapshot, preserving
 the tested commit, image, configuration and GPU allocation. The original
 report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
 The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
+On retry, the known PyYAML bootstrap command is updated to use the mounted pip
+cache, a 120-second socket timeout, and at most three installation attempts
+10 seconds apart. Exhausted attempts stop before evaluation. This only changes
+dependency download handling; retained files, source commit, image and test
+configuration stay unchanged.
 For workflows with one case per GitHub job, use **Re-run failed jobs**.

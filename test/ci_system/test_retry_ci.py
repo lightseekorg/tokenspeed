@@ -185,10 +185,17 @@ def test_replay_preserves_original_scripts_and_commit(
     else:
         assert len(calls) == 2
         assert "--nodes=2" in calls[1]
+        for name, original in scripts.items():
+            retained = (
+                root
+                / "scripts"
+                / f"{name}-{COMMIT[:12]}-{name.rsplit('-', 1)[1]}000.sbatch"
+            )
+            assert retained.read_text() == original
         for row in json.loads((output / "manifest.json").read_text()):
             stem = Path(row["log"]).name.removesuffix(f"-{row['job_id']}.out")
             script = (root / "scripts" / f"{stem}.sbatch").read_text()
-            assert script == scripts[row["task"]["name"]]
+            assert script == slurm.harden_bootstrap(scripts[row["task"]["name"]])
             assert COMMIT in script and IMAGE in script
         assert "#42" in (output / "summary.md").read_text()
 
