@@ -36,9 +36,9 @@ env:
     tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
     tokenspeed-kernel/test/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
     tokenspeed-kernel/test/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
+  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260822
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
-  TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
+  TORCH_VERSION: 2.13.0+rocm10.1.0a20260822
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
