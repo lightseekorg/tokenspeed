@@ -57,7 +57,11 @@ def _require_latent_tail():
     # itself, because it is also asked from dispatch where only a group is present.
     gather_fabric_map()
     ok = latent_tail_supported(
-        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+        tp_size=_world_size(),
+        hidden_size=H,
+        latent_size=L,
+        dtype=torch.bfloat16,
+        group=dist.group.WORLD,
     )
     flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)

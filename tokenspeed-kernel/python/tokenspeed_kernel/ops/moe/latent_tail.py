@@ -653,4 +653,81 @@ class KimiK3LatentTailOp:
         return self._lamport_copy(mailbox, m=m, residual=prefix).squeeze(0)
 
 
-__all__ = ["KimiK3LatentTailOp", "latent_tail_supported"]
+def attn_reduce_shape_supported(*, tp_size: int, hidden_size: int) -> bool:
+    """Whether the collective's geometry admits an attention reduce this wide.
+
+    Args:
+        tp_size: Attention tensor-parallel width.
+        hidden_size: Model hidden width. The attention reduce carries no
+            latent projection, so this is both the latent and hidden dim.
+
+    Returns:
+        ``True`` when :func:`build_attn_reduce_collective` can be built for
+        this pair, ``False`` when the cluster geometry rules it out. The
+        constructor raises rather than declining, so a caller that wants a
+        capability answer has to ask here first.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        validate_shape,
+    )
+
+    try:
+        validate_shape(tp_size=tp_size, latent_dim=hidden_size, hidden_dim=hidden_size)
+    except ValueError:
+        return False
+    return True
+
+
+def build_attn_reduce_collective(
+    *,
+    group: dist.ProcessGroup,
+    rank: int,
+    tp_size: int,
+    hidden_size: int,
+    max_tokens: int,
+) -> "CollectiveKernel":
+    """Build the collective that serves Kimi-K3's attention reduce.
+
+    The epilogue emits ``all_reduce(partial) + residual`` instead of a
+    RMSNorm, so no norm weight or epsilon reaches the kernel.
+
+    Args:
+        group: Attention tensor-parallel process group. Every rank in it must
+            call this, in lockstep: the constructor rendezvouses.
+        rank: This rank's index within ``group``.
+        tp_size: Size of ``group``.
+        hidden_size: Model hidden width; see
+            :func:`attn_reduce_shape_supported`, which must accept the pair
+            before this is called.
+        max_tokens: Widest reduce this instance will serve. The caller's
+            output buffer is validated against exactly this many rows.
+
+    Returns:
+        A ``CollectiveKernel`` to be called with
+        ``include_reduce_scatter=False, include_routed=True``.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import CollectiveKernel
+
+    return CollectiveKernel(
+        group=group,
+        rank=rank,
+        tp_size=tp_size,
+        latent_dim=hidden_size,
+        hidden_dim=hidden_size,
+        max_m=max_tokens,
+        max_token_ctas=max_tokens,
+        rms_eps=1.0,
+        fp32_internal=True,
+        scratch_allocator=None,
+        finalize_top_k=None,
+        precompile_split=True,
+        residual_from_shared=True,
+    )
+
+
+__all__ = [
+    "KimiK3LatentTailOp",
+    "attn_reduce_shape_supported",
+    "build_attn_reduce_collective",
+    "latent_tail_supported",
+]

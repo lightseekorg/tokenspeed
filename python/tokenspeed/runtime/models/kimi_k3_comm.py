@@ -59,16 +59,12 @@ from tokenspeed_kernel.ops.communication.multimem import (
 )
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
+    attn_reduce_shape_supported,
+    build_attn_reduce_collective,
     latent_tail_supported,
     multicast_backend_available,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
-    CollectiveKernel as _AttnCollective,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (
-    validate_shape as validate_attn_collective_shape,
-)
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
@@ -94,21 +90,6 @@ _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
 # One-shot window: 7168 bf16 at TP8 still fits the AR threshold at eight rows.
 ATTN_AR_MAX_TOKENS = 8
-
-
-def _attn_collective_shape_ok(tp_size: int, hidden: int) -> bool:
-    """Whether the collective's geometry admits this width at all.
-
-    The multicast probe answers capability, not shape, and the constructor
-    raises rather than declining, so ask its own validator first.
-    """
-    try:
-        validate_attn_collective_shape(
-            tp_size=tp_size, latent_dim=hidden, hidden_dim=hidden
-        )
-    except ValueError:
-        return False
-    return True
 
 
 def attn_ar_eligible(
@@ -356,29 +337,32 @@ class K3AttnCommState:
             group = _get_process_group(mapping.attn.tp_group)
             # The vendor arming bit is not this kernel's capability: the
             # collective also needs an NVLS multicast mapping.
+            # Ask the dispatch gate whether any width is admissible before
+            # paying a rendezvous the operator has already forbidden.
             local_ok = (
-                self.attn_ar_fusion_ok
+                attn_ar_eligible(
+                    armed=True,
+                    has_prefix=True,
+                    num_tokens=1,
+                    fusion_max_tokens=global_server_args_dict[
+                        "comm_fusion_max_num_tokens"
+                    ],
+                )
+                and self.attn_ar_fusion_ok
                 and multicast_backend_available(group)
-                and _attn_collective_shape_ok(mapping.attn.tp_size, hidden)
+                and attn_reduce_shape_supported(
+                    tp_size=mapping.attn.tp_size, hidden_size=hidden
+                )
             )
             vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
             dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
             if bool(vote.item()):
-                self.cute_ar = _AttnCollective(
+                self.cute_ar = build_attn_reduce_collective(
                     group=group,
                     rank=mapping.attn.tp_rank,
                     tp_size=mapping.attn.tp_size,
-                    latent_dim=hidden,
-                    hidden_dim=hidden,
-                    max_m=ATTN_AR_MAX_TOKENS,
-                    max_token_ctas=ATTN_AR_MAX_TOKENS,
-                    # Unread here: residual_from_shared compiles the RMSNorm out.
-                    rms_eps=1.0,
-                    fp32_internal=True,
-                    scratch_allocator=None,
-                    finalize_top_k=None,
-                    precompile_split=True,
-                    residual_from_shared=True,
+                    hidden_size=hidden,
+                    max_tokens=ATTN_AR_MAX_TOKENS,
                 )
         logger.info(
             "Kimi K3 attention reduce: %s",
