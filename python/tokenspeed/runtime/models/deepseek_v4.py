@@ -36,13 +36,9 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     NoKernelFoundError,
-    dsa_decode_topk,
-    dsa_prefill_topk,
-    dsv4_decode_topk,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
-    dsv4_indexer_cache_format,
 )
 from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
 from tokenspeed_kernel import (
@@ -50,21 +46,24 @@ from tokenspeed_kernel import (
     dsv4_mega_moe_plan,
     dsv4_mega_moe_process_weights,
     dsv4_mega_moe_warmup,
-    dsv4_padded_heads,
-    dsv4_plan,
-    dsv4_prefill_topk,
 )
 from tokenspeed_kernel import dsv4_select_experts as _kernel_dsv4_select_experts
-from tokenspeed_kernel import (
-    dsv4_warmup,
-)
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
 from tokenspeed_kernel import (
     pack_topk_router_logits,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsv4 import (
+    dsv4_decode_topk,
+    dsv4_indexer_cache_format,
+    dsv4_padded_heads,
+    dsv4_plan,
+    dsv4_prefill_topk,
+    dsv4_warmup,
+)
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )

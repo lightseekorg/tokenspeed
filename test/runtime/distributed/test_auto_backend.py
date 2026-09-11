@@ -143,6 +143,107 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
+def test_triton_preparation_caps_only_ordinary_staging(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=256)
+    group = (0, 1)
+    process_group = object()
+    state = SimpleNamespace(
+        max_numel=128,
+        max_bytes=1024,
+        attnres_max_numel=32,
+        max_token_num=4,
+    )
+    create = Mock(return_value=state)
+    initialize = Mock()
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    monkeypatch.setattr(
+        triton_allreduce_module.pg_manager,
+        "get_process_group",
+        lambda backend_name, requested_group: (
+            process_group
+            if (backend_name, requested_group) == ("nccl", group)
+            else None
+        ),
+    )
+    monkeypatch.setattr(triton_allreduce_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(triton_allreduce_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(triton_allreduce_module, "create_state", create)
+    monkeypatch.setattr(
+        triton_allreduce_module, "initialize_all_reduce_state", initialize
+    )
+
+    assert backend.prepare_all_reduce_buffers(
+        group,
+        staged_max_numel=512,
+        producer_direct_max_numel=512,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+        dtype=torch.bfloat16,
+    )
+    create.assert_called_once_with(
+        group=process_group,
+        rank_in_group=0,
+        max_tokens=0,
+        hidden_size=0,
+        device=torch.device("cuda:0"),
+        max_numel=128,
+        max_bytes=1024,
+        attnres_max_numel=32,
+        attnres_max_rows=4,
+    )
+    initialize.assert_called_once_with(state, torch.bfloat16)
+    assert backend._instances[group] is state
+
+
+def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024)
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_or_create",
+        Mock(side_effect=AssertionError("capacity gate must run first")),
+    )
+
+    assert not backend.can_acquire_outputs(
+        ((513,),),
+        SimpleNamespace(is_cuda=True, dtype=torch.bfloat16),
+        (0, 1),
+    )
+
+
+def test_prepared_group_uses_its_producer_capacity(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024)
+    group = (0, 1)
+    max_tokens = 8192
+    shapes = ((max_tokens, 3584), (max_tokens, 7168))
+    state = SimpleNamespace(max_bytes=max_tokens * (3584 + 7168) * 2)
+    backend._instances[group] = state
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    supported = Mock(return_value=True)
+    monkeypatch.setattr(triton_allreduce_module, "symm_outputs_can_run", supported)
+    like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
+
+    assert backend.can_acquire_outputs(shapes, like, group)
+    assert not backend.can_acquire_outputs(
+        ((max_tokens + 1, 3584), (max_tokens + 1, 7168)),
+        like,
+        group,
+    )
+    supported.assert_called_once_with(state, shapes, torch.bfloat16, op=None)
+
+
 def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)
@@ -334,6 +435,24 @@ def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch):
     assert backend.all_reduce(outputs, (0, 1)) is outputs
     backend._triton_ar.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
     backend._nccl.all_reduce.assert_not_called()
+
+
+def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    backend._triton_ar.can_reduce_outputs.return_value = True
+    outputs = (
+        torch.empty(2 * 1024 * 1024, dtype=torch.bfloat16),
+        torch.empty(2 * 1024 * 1024, dtype=torch.bfloat16),
+    )
+    backend._triton_ar.all_reduce.return_value = outputs
+
+    assert backend.all_reduce(outputs, (0, 1)) is outputs
+    backend._triton_ar.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
+    backend._nccl.all_reduce_two.assert_not_called()
 
 
 def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch):

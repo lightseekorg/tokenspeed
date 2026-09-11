@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_commit_verify_layers,
 )
 

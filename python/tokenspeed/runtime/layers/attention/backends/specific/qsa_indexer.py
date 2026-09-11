@@ -87,11 +87,8 @@ class QSAIndexerBackend(AttentionBackend):
         self._active_metadata: QSAIndexerMetadata | None = None
         self._verify_state: QSAVerifyState | None = None
 
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        if self.cache_pool is cache_pool:
-            return
-        if self.cache_pool is not None:
-            raise RuntimeError("QSA indexer backend cannot be rebound to another pool")
+    def _table_specs_for(self, cache_pool: CachePool) -> tuple[GroupTableSpec, ...]:
+        """Validate this view's indexer groups without publishing any state."""
         groups = (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
         local_groups = {
             field.group_id
@@ -104,7 +101,7 @@ class QSAIndexerBackend(AttentionBackend):
                 "QSA indexer cache view requires compressed and recent fields"
             )
         specs = {spec.group_id: spec for spec in cache_pool.arena.cache_group_specs}
-        self._table_specs = tuple(
+        return tuple(
             GroupTableSpec(
                 group_id=gid,
                 block_granularity=specs[gid].block_granularity,
@@ -114,7 +111,19 @@ class QSAIndexerBackend(AttentionBackend):
             )
             for gid in groups
         )
-        self.cache_pool = cache_pool
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        if self.cache_pool is not None and self.cache_pool is not cache_pool:
+            raise RuntimeError("QSA indexer backend cannot be rebound to another pool")
+        self._table_specs_for(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        already_bound = self.cache_pool is cache_pool
+        super()._publish_cache_pool(cache_pool)
+        if already_bound:
+            return
+        self._table_specs = self._table_specs_for(cache_pool)
         if not self.is_draft and self.spec_num_tokens > 1:
             self._verify_state = QSAVerifyState(self._config, cache_pool)
 

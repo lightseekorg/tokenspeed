@@ -169,7 +169,10 @@ def _route_u32_bits_to_f32(bits, element_ty: gl.constexpr):
         return bits.to(gl.uint16).to(element_ty, bitcast=True).to(gl.float32)
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=("M",),
+    do_not_specialize_on_alignment=("M",),
+)
 def _sigmoid_bias_topk_route_gluon_kernel(
     logits_ptr,  # (M, E)
     bias_ptr,  # (E)
@@ -182,7 +185,7 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     stride_tik,
     stride_twm,
     stride_twk,
-    M: gl.constexpr,
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     MP: gl.constexpr,
@@ -371,7 +374,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
-        M=M,
+        M,
         E=E,
         TOPK=topk,
         MP=_next_pow2(M),

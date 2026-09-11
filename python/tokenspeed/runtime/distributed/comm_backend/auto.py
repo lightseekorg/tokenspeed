@@ -138,6 +138,12 @@ class AutoBackend(CommBackend):
             use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
                 group
             )
+            if (
+                not use_nccl
+                and current_platform().is_amd
+                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
+            ):
+                return self._triton_ar.all_reduce(tensors, group, op=op)
             # Collections past the one-shot window are headed for NCCL;
             # grouping avoids the copy required to concatenate them first.
             use_nccl = use_nccl or all(
@@ -149,12 +155,6 @@ class AutoBackend(CommBackend):
                 and sum(value.numel() * value.element_size() for value in tensors)
                 > self._triton_ar.producer_direct_max_bytes
             )
-            if (
-                not use_nccl
-                and current_platform().is_amd
-                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
-            ):
-                return self._triton_ar.all_reduce(tensors, group, op=op)
             if use_nccl and len(tensors) == 2:
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
@@ -185,6 +185,32 @@ class AutoBackend(CommBackend):
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
+
+    def prepare_all_reduce_buffers(
+        self,
+        group: Group,
+        *,
+        staged_max_numel: int,
+        producer_direct_max_numel: int,
+        attnres_max_numel: int,
+        attnres_max_rows: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        if (
+            not current_platform().is_amd
+            or self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return False
+        return self._triton_ar.prepare_all_reduce_buffers(
+            group,
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            dtype=dtype,
+        )
 
     def can_acquire_all_reduce_outputs(
         self,

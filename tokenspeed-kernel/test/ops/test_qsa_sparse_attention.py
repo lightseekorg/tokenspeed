@@ -24,7 +24,7 @@ import inspect
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel

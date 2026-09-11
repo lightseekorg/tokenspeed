@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
+from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from utils import is_cdna5
 
 if not is_cdna5():

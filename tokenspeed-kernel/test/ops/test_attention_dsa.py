@@ -24,17 +24,17 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_decode_topk,
     dsa_plan,
     dsa_prefill,
     dsa_prefill_topk,
-    dsv4_plan,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_plan
 
 torch.manual_seed(42)
 

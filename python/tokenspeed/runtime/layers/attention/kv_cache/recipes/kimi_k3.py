@@ -301,7 +301,7 @@ class KimiK3Recipe(CacheRecipe):
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
-        from tokenspeed_kernel.ops.attention import (
+        from tokenspeed_kernel.ops.attention.kda import (
             kda_recurrent_layout,
             kda_replay_commit_supported,
         )
@@ -327,7 +327,7 @@ class KimiK3Recipe(CacheRecipe):
             heads, head_dim, _ = recurrent_shape
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.
-            from tokenspeed_kernel.ops.attention import (
+            from tokenspeed_kernel.ops.attention.kda import (
                 kda_batched_replay_uses_raw_gate,
             )
 

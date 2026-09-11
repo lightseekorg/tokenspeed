@@ -479,6 +479,13 @@ def _qsa_router(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
             families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
             full_history_group_id=FULL_ATTENTION,
+            row_geometry={
+                gid: (granularity, 1)
+                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
+            },
+            retentions={
+                gid: ("full_history", None) for gid in _QSA_GROUP_GRANULARITIES
+            },
         ),
         {
             gid: router._leaf_factory(gid, granularity)

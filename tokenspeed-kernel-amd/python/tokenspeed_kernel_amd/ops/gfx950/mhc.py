@@ -155,6 +155,14 @@ def _mhc_pre_reduce_apply_kernel(
         gl.store(comb_mix + token * 16 + comb_offsets, comb, mask=active)
 
 
+def _mhc_pre_reduce_apply_block_h(
+    num_tokens: int, hidden_size: int, n_splits: int
+) -> int:
+    if (num_tokens, hidden_size, n_splits) == (64, 4096, 64):
+        return 1024
+    return 512
+
+
 def gluon_mhc_pre_reduce_apply_gfx950(
     gemm_out_mul: torch.Tensor,
     gemm_out_sqrsum: torch.Tensor,
@@ -191,7 +199,8 @@ def gluon_mhc_pre_reduce_apply_gfx950(
     if not 1 <= num_tokens <= 64:
         raise ValueError("GFX950 mHC specialization requires 1-64 tokens")
 
-    _mhc_pre_reduce_apply_kernel[(num_tokens, hidden_size // 512)](
+    block_h = _mhc_pre_reduce_apply_block_h(num_tokens, hidden_size, n_splits)
+    _mhc_pre_reduce_apply_kernel[(num_tokens, hidden_size // block_h)](
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
@@ -206,6 +215,6 @@ def gluon_mhc_pre_reduce_apply_gfx950(
         HC_EPS=hc_eps,
         SINKHORN_ITERS=sinkhorn_iters,
         N_SPLITS=n_splits,
-        BLOCK_H=512,
+        BLOCK_H=block_h,
         num_warps=1,
     )

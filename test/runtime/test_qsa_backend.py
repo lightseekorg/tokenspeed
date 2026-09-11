@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -52,6 +54,12 @@ from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 from tokenspeed.runtime.layers.attention.registry import (
     create_paged_router,
 )
+
+# Executed as a script by run_ci_suite: the test dir must be importable.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
@@ -125,6 +133,9 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
                     block_granularity=granularity,
                     family="history",
                     retention="full_history",
+                    rows_per_page=granularity,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=None,
                 )
                 for gid, granularity in groups.items()
             ),
@@ -186,6 +197,42 @@ def test_qsa_indexer_workspace_cannot_be_rebound(state) -> None:
     with pytest.raises(RuntimeError, match="cannot be rebound"):
         backend.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
     assert backend._verify_state._verify_workspace is workspace
+
+
+def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
+    pool = _qsa_pool(device="cpu", layer_offset=0)
+    root, indexer = _root_with_indexer(
+        _qsa_config(max_bs=4, is_draft=False, device="cpu"), pool
+    )
+    router = root.attention_backend
+    leaves = tuple(router.leaves.values())
+    replacement = _qsa_pool(device="cpu", layer_offset=0)
+
+    with pytest.raises(RuntimeError, match="cannot be rebound"):
+        root.set_cache_pool(replacement)
+
+    for backend in (root, router, indexer, *leaves):
+        assert backend.cache_pool is pool
+
+
+def test_missing_qsa_fields_are_rejected_before_initial_binding() -> None:
+    config = _qsa_config(max_bs=4, is_draft=False, device="cpu")
+    pool = _qsa_pool(device="cpu", layer_offset=0)
+    pool.arena.plan.fields = [
+        field
+        for field in pool.arena.plan.fields
+        if field.group_id != QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+    ]
+    router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
+    indexer = QSAIndexerBackend(config, router)
+    root = Qwen4ExpBackend(config, router, None, indexer)
+
+    with pytest.raises(RuntimeError, match="compressed and recent fields"):
+        root.set_cache_pool(pool)
+
+    assert router.leaves == {}
+    for backend in (root, router, indexer):
+        assert backend.cache_pool is None
 
 
 @pytest.mark.parametrize("layer_offset", [0, 5])
@@ -564,3 +611,7 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
     assert next_layout.seq_lens.tolist() == [9, 11]
     root.fill_block_decode_seq_lens(2, torch.tensor([2, 9999], dtype=torch.int32))
     assert next_layout.seq_lens.tolist() == [4, 1024]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -42,7 +42,6 @@ if TYPE_CHECKING:
         Qwen4ExpPLEBackend,
     )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -81,11 +80,6 @@ class Qwen4ExpBackend(AttentionBackend):
         return frozenset().union(
             *(backend.cache_consumer_families for backend in self.child_backends())
         )
-
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        self.cache_pool = cache_pool
-        for backend in self.child_backends():
-            backend.set_cache_pool(cache_pool)
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Preallocate target verify consumers and return their total byte count."""

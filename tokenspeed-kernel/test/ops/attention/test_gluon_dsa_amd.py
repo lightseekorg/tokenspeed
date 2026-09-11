@@ -1630,11 +1630,23 @@ def test_dsa_decode_glm53_flash_native_fp8_mfma() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tokens", "topk", "expected_splits"),
-    ((1, 1024, 4), (16, 1024, 4), (32, 2048, 8), (64, 2048, 4)),
+    ("tokens", "topk", "is_prefill", "expected_splits"),
+    (
+        (1, 1024, False, 4),
+        (16, 1024, False, 4),
+        (32, 2048, False, 8),
+        (64, 2048, False, 4),
+        (511, 2048, True, 4),
+        (512, 2048, True, 1),
+        (512, 2048, False, 4),
+        (65488, 2051, True, 1),
+    ),
 )
 def test_dsa_native_fp8_split_schedule(
-    tokens: int, topk: int, expected_splits: int
+    tokens: int,
+    topk: int,
+    is_prefill: bool,
+    expected_splits: int,
 ) -> None:
     assert (
         gfx950_dsa_backend._select_num_kv_splits(
@@ -1644,6 +1656,7 @@ def test_dsa_native_fp8_split_schedule(
             max_seqlen_k=topk,
             is_fp8=True,
             native_fp8=True,
+            is_prefill=is_prefill,
         )
         == expected_splits
     )
@@ -1832,31 +1845,66 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
 
 @pytest.mark.skipif(
     not is_cdna4(),
-    reason="GLM-5.3-Flash BF16 prefill is specific to gfx950",
+    reason="GLM-5.3-Flash dense prefill is specific to gfx950",
 )
-def test_dsa_prefill_glm53_flash_bf16_dense_mfma(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    (
+        "q_dtype",
+        "num_tokens",
+        "num_slots",
+        "topk",
+        "valid_topk",
+        "expected_reduce_calls",
+    ),
+    [
+        pytest.param(torch.bfloat16, 1, 2051, 2051, 2048, 0, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 1, 2051, 2051, 2048, 1, id="e4m3"),
+        pytest.param(torch.float8_e5m2, 1, 2051, 2051, 2048, 1, id="e5m2"),
+        pytest.param(torch.float8_e4m3fn, 1, 256, 256, 256, 0, id="e4m3-unsplit"),
+        pytest.param(
+            torch.float8_e4m3fn,
+            512,
+            2051,
+            2051,
+            1,
+            0,
+            id="e4m3-large-prefill",
+        ),
+    ],
+)
+def test_dsa_prefill_glm53_flash_dense_mfma(
+    monkeypatch: pytest.MonkeyPatch,
+    q_dtype: torch.dtype,
+    num_tokens: int,
+    num_slots: int,
+    topk: int,
+    valid_topk: int,
+    expected_reduce_calls: int,
+) -> None:
     device = "cuda"
     num_heads = 16
-    num_slots = 2051
-    topk = 2051
-    valid_topk = 2048
     kv_lora_rank = 512
     qk_nope_head_dim = 256
     generator = _generator(device, 1202)
 
-    q = _randn_bf16((1, num_heads, kv_lora_rank), device=device, generator=generator)
+    q = _randn_bf16(
+        (num_tokens, num_heads, kv_lora_rank), device=device, generator=generator
+    ).to(q_dtype)
     kv_cache = _randn_bf16(
         (num_slots, kv_lora_rank), device=device, generator=generator
-    )
-    topk_slots = torch.full((1, topk), -1, device=device, dtype=torch.int32)
-    topk_slots[0, :valid_topk] = torch.randperm(
-        num_slots, device=device, generator=generator
-    )[:valid_topk]
-    topk_lens = torch.tensor([valid_topk], device=device, dtype=torch.int32)
+    ).to(q_dtype)
+    topk_slots = torch.full((num_tokens, topk), -1, device=device, dtype=torch.int32)
+    selected_slots = torch.randperm(num_slots, device=device, generator=generator)[
+        :valid_topk
+    ]
+    topk_slots[:, :valid_topk] = selected_slots
+    topk_lens = torch.full((num_tokens,), valid_topk, device=device, dtype=torch.int32)
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
 
     mfma_calls = 0
+    reduce_calls = 0
     mfma_kernel = gfx950_dsa_backend._dsa_dense_mfma_kv_kernel
+    reduce_kernel = gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel
 
     class _TrackedMfmaKernel:
         def __getitem__(self, grid):
@@ -1869,8 +1917,24 @@ def test_dsa_prefill_glm53_flash_bf16_dense_mfma(monkeypatch) -> None:
 
             return track_launch
 
+    class _TrackedReduceKernel:
+        def __getitem__(self, grid):
+            launch = reduce_kernel[grid]
+
+            def track_launch(*args, **kwargs):
+                nonlocal reduce_calls
+                reduce_calls += 1
+                return launch(*args, **kwargs)
+
+            return track_launch
+
     monkeypatch.setattr(
         gfx950_dsa_backend, "_dsa_dense_mfma_kv_kernel", _TrackedMfmaKernel()
+    )
+    monkeypatch.setattr(
+        gfx950_dsa_backend,
+        "_dsa_dense_mfma_reduce_kernel",
+        _TrackedReduceKernel(),
     )
     out = gluon_dsa_prefill(
         q=q,
@@ -1885,14 +1949,20 @@ def test_dsa_prefill_glm53_flash_bf16_dense_mfma(monkeypatch) -> None:
         softmax_scale=softmax_scale,
         page_size=64,
     )
-    selected = kv_cache[topk_slots[0, :valid_topk].long()].float()
-    probs = torch.softmax(q[0].float() @ selected.T * softmax_scale, dim=-1)
-    ref = probs @ selected
+    ref = _dsa_reference(
+        q,
+        kv_cache,
+        torch.empty((num_slots, 0), device=device, dtype=q_dtype),
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
 
     assert mfma_calls == 1
-    assert out.shape == (1, num_heads, kv_lora_rank)
+    assert reduce_calls == expected_reduce_calls
+    assert out.shape == (num_tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
-    torch.testing.assert_close(out[0].float(), ref, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(

@@ -67,7 +67,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
+from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -147,6 +147,7 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     K3AttnComm,
     K3AttnCommState,
     K3MoeTailComm,
+    prepare_k3_all_reduce_buffers,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
@@ -2844,6 +2845,19 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        routed_hidden_size = (
+            self.config.routed_expert_hidden_size
+            if self.config.routed_expert_hidden_size is not None
+            else self.config.hidden_size
+        )
+        return prepare_k3_all_reduce_buffers(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            max_num_tokens=max_num_tokens,
+        )
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
         num_layers = len(self.model.layers)
@@ -3305,6 +3319,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose text embeddings."
             )
         return self.language_model.model.get_input_embeddings()
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        if self.language_model is None:
+            return False
+        return self.language_model.prepare_communication_runtime(max_num_tokens)
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()

@@ -94,6 +94,36 @@ def backend():
     return _make_backend(3, False, "cpu")
 
 
+def test_ple_rebind_rejection_preserves_verify_workspace(backend):
+    pool = backend.cache_pool
+    scratch = backend._ple_verify_scratch
+    replacement = _make_backend(3, False, "cpu").cache_pool
+
+    backend.set_cache_pool(pool)
+    with pytest.raises(RuntimeError, match="cannot be rebound"):
+        backend.set_cache_pool(replacement)
+
+    assert backend.cache_pool is pool
+    assert backend._ple_verify_scratch is scratch
+
+
+def test_ple_invalid_fields_do_not_publish_a_pool(backend):
+    pool = backend.cache_pool
+    pool.arena.plan.fields = tuple(
+        field
+        for field in pool.arena.plan.fields
+        if not field.field_id.endswith(".ple.context")
+    )
+    unbound = Qwen4ExpPLEBackend.__new__(Qwen4ExpPLEBackend)
+    unbound._init_pool_binding()
+    unbound.is_draft = False
+
+    with pytest.raises(RuntimeError, match="one shared context field"):
+        unbound.set_cache_pool(pool)
+
+    assert unbound.cache_pool is None
+
+
 def _verify(backend):
     backend.refresh_decode_metadata(
         4,
@@ -225,10 +255,11 @@ def test_ple_preallocation_preserves_workspace_and_budget(backend):
 
 def test_mamba_only_claims_its_recurrent_groups():
     backend = object.__new__(MambaAttnBackend)
+    backend._init_pool_binding()
     backend.set_kv_pool(
         SimpleNamespace(
             state_group_by_layer={1: "gdn"},
-            get_component=lambda *args: None,
+            get_component=lambda *args: torch.zeros(4, 2),
             arena=SimpleNamespace(
                 runtime_contract=SimpleNamespace(
                     group_specs=(

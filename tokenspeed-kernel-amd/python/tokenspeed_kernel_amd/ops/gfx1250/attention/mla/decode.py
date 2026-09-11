@@ -727,7 +727,7 @@ def gluon_mla_decode_gfx1250(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run absorbed MLA decode over a paged cache on GFX1250.
 
-    Args follow :func:`tokenspeed_kernel.ops.attention.mla_decode_with_kvcache`.
+    Args follow :func:`tokenspeed_kernel.ops.attention.mla.mla_decode_with_kvcache`.
     This initial port supports one decode token, a single compressed KV head,
     latent rank 512, RoPE head dimension 64, and page size 64.
     """

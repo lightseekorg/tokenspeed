@@ -11,6 +11,8 @@ from types import MethodType, SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock, patch
 
+import pytest
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -19,11 +21,11 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -1581,7 +1583,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
-            from tokenspeed_kernel.ops.attention.flash_mla import (
+            from tokenspeed_kernel.ops.attention.mla.cuda import (
                 flash_mla_sparse_fwd,
                 flash_mla_with_kvcache,
                 get_mla_metadata,
@@ -4178,6 +4180,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                     retention="sliding_window",
                     rows_per_page=64,
                     entry_stride_tokens=1,
+                    block_granularity=(64) * (1),
+                    family="history",
                 ),
             ),
             cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
@@ -6791,3 +6795,184 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
     for mode in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.IDLE):
         assert backend.record_layer_cache_ready(output, mode) is output
     assert records == [True]
+
+
+def _cache_pool_with_page_counts(page_counts, rows_per_page, entry_stride_tokens):
+    specs = [
+        SimpleNamespace(
+            group_id=group_id,
+            rows_per_page=rows_per_page,
+            entry_stride_tokens=entry_stride_tokens,
+            block_granularity=rows_per_page * entry_stride_tokens,
+            family="history",
+            retention="full_history",
+        )
+        for group_id in page_counts
+    ]
+    return SimpleNamespace(
+        arena=SimpleNamespace(
+            cache_group_specs=specs, cache_group_page_counts=page_counts
+        )
+    )
+
+
+def _unbound_deepseek_v4_backend():
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
+        DeepseekV4AttentionBackend,
+    )
+
+    backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
+    backend._init_pool_binding()
+    backend._init_cache_group_latches()
+    return backend
+
+
+class DeepseekV4RebindTest(unittest.TestCase):
+    def test_rebinding_the_pool_relatches_the_cache_group_contract(self):
+        """A probe pool and the real pool share geometry but not page counts."""
+        probe = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        real = _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        rebound = _unbound_deepseek_v4_backend()
+        rebound.set_cache_pool(probe)
+        rebound.set_cache_pool(real)
+        fresh = _unbound_deepseek_v4_backend()
+        fresh.set_cache_pool(real)
+
+        assert rebound._cache_group_max_page_ids == {"swa": 63, "compressed_4": 15}
+        assert rebound._expected_cache_group_ids == fresh._expected_cache_group_ids
+        assert (
+            rebound._cache_group_raw_tokens_per_page
+            == fresh._cache_group_raw_tokens_per_page
+        )
+        assert rebound._cache_group_max_page_ids == fresh._cache_group_max_page_ids
+
+    def test_rebinding_the_pool_drops_the_runtime_state_built_for_the_old_pool(self):
+        from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
+            DeepseekV4ForwardSlotMappings,
+        )
+
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        )
+        stale = object()
+        for name in (
+            "graph",
+            "_cuda_graph_active_page_validity",
+            "_decode_q_padding_workspace",
+            "_decode_q_padding_workspace_layout",
+            "draft_rounds",
+            "forward_metadata",
+            "forward_prefill_metadata",
+            "forward_decode_metadata",
+            "slot_mappings",
+            "_prefill_workspace_buffer",
+            "_prefill_dense_compressed_indices_buffer",
+        ):
+            setattr(backend, name, stale)
+        backend._swa_window_size = backend._swa_block_size = 5
+        backend._prefill_workspace_rows = backend._prefill_workspace_head_dim = 7
+
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        )
+        for name in (
+            "graph",
+            "_cuda_graph_active_page_validity",
+            "_decode_q_padding_workspace",
+            "_decode_q_padding_workspace_layout",
+            "draft_rounds",
+            "forward_metadata",
+            "forward_prefill_metadata",
+            "forward_decode_metadata",
+            "_prefill_workspace_buffer",
+            "_prefill_dense_compressed_indices_buffer",
+        ):
+            assert getattr(backend, name) is None, name
+        assert isinstance(backend.slot_mappings, DeepseekV4ForwardSlotMappings)
+        assert (backend._swa_window_size, backend._swa_block_size) == (0, 0)
+        assert (
+            backend._prefill_workspace_rows,
+            backend._prefill_workspace_head_dim,
+        ) == (0, 0)
+
+    def test_configure_runtime_before_the_first_bind_still_allows_the_first_bind(self):
+        backend = _unbound_deepseek_v4_backend()
+        pool = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        backend.configure_runtime(
+            cache_group_specs=pool.arena.cache_group_specs,
+            cache_group_page_counts=pool.arena.cache_group_page_counts,
+        )
+
+        backend.set_cache_pool(pool)
+
+        assert backend.cache_pool is pool
+
+    def test_rebinding_a_pool_of_different_geometry_is_rejected(self):
+        backend = _unbound_deepseek_v4_backend()
+        original = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        backend.set_cache_pool(original)
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(
+                _cache_pool_with_page_counts({"swa": 4, "compressed_8": 4}, 4, 1)
+            )
+
+        assert backend.cache_pool is original
+        assert backend._expected_cache_group_ids == ("swa", "compressed_4")
+        backend.set_cache_pool(original)
+
+    def test_rebinding_a_pool_with_the_same_token_span_but_other_rows_is_rejected(self):
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(_cache_pool_with_page_counts({"swa": 4}, 4, 1))
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(_cache_pool_with_page_counts({"swa": 4}, 2, 2))
+
+    def test_rebinding_accepts_reordered_equal_cache_groups(self):
+        """Declaration order is not part of the published group geometry."""
+        probe = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        reordered = _cache_pool_with_page_counts({"compressed_4": 16, "swa": 64}, 4, 1)
+        rebound = _unbound_deepseek_v4_backend()
+        rebound.set_cache_pool(probe)
+
+        rebound.set_cache_pool(reordered)
+
+        fresh = _unbound_deepseek_v4_backend()
+        fresh.set_cache_pool(reordered)
+        self.assertEqual(rebound._cache_group_kinds, fresh._cache_group_kinds)
+        self.assertEqual(
+            rebound._cache_group_row_geometry, fresh._cache_group_row_geometry
+        )
+        self.assertEqual(
+            rebound._cache_group_max_page_ids, fresh._cache_group_max_page_ids
+        )
+
+    def test_rebinding_a_pool_with_other_block_granularity_is_rejected(self):
+        """Block granularity is published geometry even when row layout is unchanged."""
+        original = _cache_pool_with_page_counts({"swa": 4}, 4, 1)
+        replacement = _cache_pool_with_page_counts({"swa": 4}, 4, 1)
+        original.arena.cache_group_specs[0].block_granularity = 4
+        replacement.arena.cache_group_specs[0].block_granularity = 8
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(original)
+
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(replacement)
+
+        assert backend.cache_pool is original
+
+    def test_configure_runtime_after_a_rebind_checks_the_relatched_contract(self):
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        )
+        real = _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        backend.set_cache_pool(real)
+        backend.configure_runtime(
+            cache_group_specs=real.arena.cache_group_specs,
+            cache_group_page_counts=real.arena.cache_group_page_counts,
+        )
+        with pytest.raises(RuntimeError, match="contract changed after initialization"):
+            backend.configure_runtime(
+                cache_group_specs=real.arena.cache_group_specs,
+                cache_group_page_counts={"swa": 32, "compressed_4": 16},
+            )

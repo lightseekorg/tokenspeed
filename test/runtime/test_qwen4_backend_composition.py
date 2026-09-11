@@ -188,7 +188,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
 @pytest.mark.parametrize(
     "has_linear_config,has_local_state", [(False, False), (True, False), (True, True)]
 )
-def test_hybrid_factory_binds_gdn_only_for_local_state(
+def test_hybrid_factory_selects_gdn_only_for_local_state(
     monkeypatch, is_qwen4, has_linear_config, has_local_state
 ):
     # Load the subclass before replacing its base class with a constructor mock.
@@ -237,7 +237,7 @@ def test_hybrid_factory_binds_gdn_only_for_local_state(
         assert isinstance(attention, HybridLinearAttnBackend)
         assert attention.full_attn_backend is full
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
-        gdn.set_kv_pool.assert_called_once_with(pool)
+        gdn.set_kv_pool.assert_not_called()
         accepted = torch.tensor([1, 3], dtype=torch.int32)
         backend.commit_speculative_state_after_verify(accepted, num_extends=0)
         gdn.commit_verified_state.assert_called_once_with(accepted)

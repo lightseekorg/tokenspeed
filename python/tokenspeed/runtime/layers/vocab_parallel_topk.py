@@ -144,7 +144,7 @@ class VocabParallelTopK:
         Returns:
             The runner class, or None to keep ``torch.topk``.
         """
-        from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
+        from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
             has_cute_dsl_decode_topk,
         )
 

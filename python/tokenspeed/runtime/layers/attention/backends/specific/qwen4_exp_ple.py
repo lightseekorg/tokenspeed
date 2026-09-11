@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
+from tokenspeed_kernel.ops.attention.kda.triton import (
     verify_state_blocks,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -99,13 +99,12 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self._decode_committed: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
 
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        """Bind this target view's PLE fields without retaining model layers."""
-        if self.cache_pool is not None and self.cache_pool is not cache_pool:
-            raise RuntimeError("PLE backend cannot be rebound to another cache pool")
-        super().set_cache_pool(cache_pool)
+    def _cache_fields(
+        self, cache_pool: CachePool
+    ) -> tuple[str | None, tuple[str, ...], int]:
+        """Validate the local PLE fields before the backend tree publishes a pool."""
         if self.is_draft:
-            return
+            return None, (), 1
         fields = tuple(
             field
             for field in cache_pool.arena.plan.fields
@@ -118,7 +117,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             if cache_field_plane(field.field_id) == "qwen4_exp.ple.conv"
         )
         if not conv_fields:
-            return
+            return None, (), 1
         context_fields = tuple(
             field.field_id
             for field in fields
@@ -128,8 +127,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             raise RuntimeError(
                 "PLE cache view requires exactly one shared context field"
             )
-        self._context_field_id = context_fields[0]
-        self._conv_field_ids = tuple(sorted(conv_fields, key=cache_field_layer_id))
         contract = cache_pool.arena.runtime_contract
         group = next(
             (
@@ -145,7 +142,28 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             or group.checkpoint_granularity is None
         ):
             raise RuntimeError("PLE requires a checkpoint-shaped state cache group")
-        self._checkpoint_granularity = int(group.checkpoint_granularity)
+        return (
+            context_fields[0],
+            tuple(sorted(conv_fields, key=cache_field_layer_id)),
+            int(group.checkpoint_granularity),
+        )
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        if self.cache_pool is not None and self.cache_pool is not cache_pool:
+            raise RuntimeError("PLE backend cannot be rebound to another cache pool")
+        self._cache_fields(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        already_bound = self.cache_pool is cache_pool
+        super()._publish_cache_pool(cache_pool)
+        if already_bound:
+            return
+        (
+            self._context_field_id,
+            self._conv_field_ids,
+            self._checkpoint_granularity,
+        ) = self._cache_fields(cache_pool)
 
     def _block_rows(self, block_tables: Mapping[str, torch.Tensor]) -> torch.Tensor:
         rows = block_tables.get(QWEN4_EXP_PLE_CACHE_GROUP)

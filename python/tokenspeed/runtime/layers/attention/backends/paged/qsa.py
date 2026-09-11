@@ -26,7 +26,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (

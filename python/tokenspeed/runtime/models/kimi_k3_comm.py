@@ -65,6 +65,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
     all_reduce,
     can_acquire_all_reduce_outputs,
+    prepare_all_reduce_buffers,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -78,6 +79,9 @@ from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+_IRIS_MAX_TOKENS = 8192
+_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
 
 class K3MoETailTier(IntEnum):
@@ -171,6 +175,70 @@ def select_k3_moe_tail_tier(
     ):
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
+
+
+def prepare_k3_all_reduce_buffers(
+    *,
+    mapping,
+    hidden_size: int,
+    routed_hidden_size: int,
+    max_num_tokens: int,
+) -> bool:
+    """Prepare the node-local AMD all-reduce buffers used by Kimi-K3."""
+    if not current_platform().is_cdna4:
+        return False
+
+    max_num_tokens = min(max_num_tokens, _IRIS_MAX_TOKENS)
+    if max_num_tokens <= 0:
+        return False
+
+    from tokenspeed_kernel.ops.communication.triton import (
+        allreduce_residual_attnres_max_tokens,
+    )
+
+    attnres_max_rows = min(
+        max_num_tokens,
+        allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
+    )
+    groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    expand_moe_window = (
+        groups_are_equal and mapping.attn.tp_size == 8 and mapping.moe.tp_ep_size == 8
+    )
+    producer_direct_max_tokens = (
+        max_num_tokens
+        if expand_moe_window
+        else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
+    )
+    prepared = False
+    if mapping.attn.tp_size > 1:
+        prepared = prepare_all_reduce_buffers(
+            mapping.attn.tp_group,
+            staged_max_numel=max_num_tokens * hidden_size,
+            producer_direct_max_numel=(
+                producer_direct_max_tokens * (hidden_size + routed_hidden_size)
+                if groups_are_equal and mapping.moe.tp_ep_size > 1
+                else 0
+            ),
+            attnres_max_numel=attnres_max_rows * hidden_size,
+            attnres_max_rows=attnres_max_rows,
+            dtype=torch.bfloat16,
+            backend=None,
+        )
+    if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
+        prepared = (
+            prepare_all_reduce_buffers(
+                mapping.moe.tp_ep_group,
+                staged_max_numel=max_num_tokens * hidden_size,
+                producer_direct_max_numel=producer_direct_max_tokens
+                * (hidden_size + routed_hidden_size),
+                attnres_max_numel=0,
+                attnres_max_rows=0,
+                dtype=torch.bfloat16,
+                backend=None,
+            )
+            or prepared
+        )
+    return prepared
 
 
 class K3AttnCommState:

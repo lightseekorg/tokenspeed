@@ -32,10 +32,10 @@ wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention.cutedsl_kda as cutedsl_op
+import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
-from tokenspeed_kernel.ops.attention import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda.triton import (
     _nvidia_kda_prefill,
 )
 from tokenspeed_kernel.selection import SelectedKernel
@@ -173,7 +173,7 @@ def test_dispatch_always_forwards_host_boundaries():
 
 
 def test_facade_requires_host_boundaries(monkeypatch):
-    import tokenspeed_kernel.ops.attention as attn
+    import tokenspeed_kernel.ops.attention.kda as attn
 
     calls = []
 
@@ -208,7 +208,8 @@ def test_facade_requires_host_boundaries(monkeypatch):
 
 
 def test_solution_wrappers_forward_host_boundaries(monkeypatch):
-    import tokenspeed_kernel.ops.attention.triton.kda_dispatch as kd
+    import tokenspeed_kernel.ops.attention.kda.cuda as kd_cuda
+    import tokenspeed_kernel.ops.attention.kda.triton as kd_triton
 
     received = []
 
@@ -218,7 +219,8 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
             out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
         )
 
-    monkeypatch.setattr(kd, "_nvidia_kda_prefill", fake_prefill)
+    monkeypatch.setattr(kd_triton, "_nvidia_kda_prefill", fake_prefill)
+    monkeypatch.setattr(kd_cuda, "_nvidia_kda_prefill", fake_prefill)
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
@@ -236,8 +238,8 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
         cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
     )
 
-    kd.triton_nvidia_kda_paged_prefill(**dict(kwargs))
+    kd_triton.triton_nvidia_kda_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
 
-    kd.flashkda_nvidia_kda_paged_prefill(**dict(kwargs))
+    kd_cuda.flashkda_nvidia_kda_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]

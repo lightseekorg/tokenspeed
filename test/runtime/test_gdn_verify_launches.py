@@ -37,7 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from test.runtime.test_gdn_state_paging import _ContractPool, _mamba_config_pair
 
-from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn
+from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
