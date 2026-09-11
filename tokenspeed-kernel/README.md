@@ -102,6 +102,12 @@ folder.
 
 - **Triton** — in-tree; default portable JIT path for various kernels, including
   precomputed-routing MoE with unquantized or MXFP4 expert weights
+- **DeepSeek V4 on AMD** — gfx950 keeps its specialized Gluon attention and
+  indexer registrations. gfx1250 uses portable Triton selected attention,
+  MXFP4 indexer scoring/top-k, and sqrt-softplus expert routing. These use the
+  same public APIs and cache layouts; see the
+  [AMD model recipe](../docs/recipes/models.md#amd-mi350--mi450) for configuration
+  and validation scope.
 - **Gluon / CuteDSL** — in-tree; performant JIT path for key kernels
 - **gfx950 block-FP8 MoE** — direct compact-weight Gluon warp GEMVs for
   decode-shaped batches and tuned BF16 Gluon kernels for prefill. BF16 expert

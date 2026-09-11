@@ -761,11 +761,67 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
-DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
-indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
+DeepSeek V4 uses FP8 KV cache and supports MXFP4 or scaled-FP8 indexer caches.
+`tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
 and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override). Requires
+`--block-size N` with `N != 64` to override). The NVIDIA recipes below require
 `tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
+
+### AMD MI350 / MI450
+
+Both gfx950 (MI350 series) and gfx1250 (MI450 series) use the same model,
+scheduler, cache groups, and kernel APIs. Kernel registration selects the
+implementation for the device and tensor shapes:
+
+| Operation | gfx950 | gfx1250 |
+| --- | --- | --- |
+| MXFP4 indexer prefill/decode | Specialized Gluon | Portable Triton |
+| Selected attention prefill/decode | Gluon for supported shapes; Triton otherwise | Portable Triton |
+| FP8 cache insertion, compression, RoPE | Portable Triton | Portable Triton |
+| Sqrt-softplus expert routing | Gluon for small supported batches; Triton otherwise | Portable Triton |
+| MXFP4 experts with BF16 input and precomputed DSv4 routes | Gluon where registered; Triton otherwise | Portable Triton |
+
+gfx1250 already supports the scaled-FP8 indexer through the DSA kernels and
+the runtime's eager PyTorch router fallback. The portable registrations fill
+the MXFP4 prefill/decode indexer and plan gaps and provide a Triton router
+without changing the runtime's scheduling or cache ownership. The gfx950
+specializations retain higher selection priority.
+
+The portable MXFP4 indexer reads packed E2M1 values and block-32 E8M0 scales
+directly from the page-planar cache, converts tiles to BF16 for matrix
+multiplication with FP32 accumulation, and reuses the Triton top-k selector.
+It supports 32 or 64 index heads of dimension 128, 64-row indexer pages, and
+top-k 512, 1024, or 2048. Caller-owned output buffers and decode-plan refresh
+work with HIP graph capture/replay. The cache layout and quantized model
+weights remain unchanged.
+
+For functional enablement on MI450, use the Triton MoE backend and keep
+expert parallelism disabled. For example, with a local
+V4-Flash checkpoint that fits the available memory:
+
+```bash
+tokenspeed serve /path/to/DeepSeek-V4-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend triton \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 4096 \
+  --max-total-tokens 8192 \
+  --chunked-prefill-size 256 \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore
+```
+
+Increase tensor parallelism for checkpoints that require more GPU memory.
+The portable MoE implementation does not support expert parallelism; do not
+add `--enable-expert-parallel` to this recipe. `mega_moe` remains a NVIDIA
+DeepGEMM implementation. The portable route prioritizes correctness and has
+not been tuned for MI450 throughput. Full-checkpoint serving and multi-GPU
+scaling require separate validation; the MI450 regression coverage exercises
+kernel numerics, registry selection, and graph replay on physical gfx1250.
+
+### NVIDIA
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
 

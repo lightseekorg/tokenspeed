@@ -49,6 +49,7 @@ import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
 import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
+import tokenspeed_kernel.ops.attention.dsv4._triton.indexer as _attention_triton_dsv4_indexer
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
@@ -91,6 +92,7 @@ import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
 import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -173,6 +175,7 @@ _RELOAD_MODULES = [
     _attention_triton_mla_decode,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
+    _attention_triton_dsv4_indexer,
     _attention_triton_dsv4,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
@@ -219,6 +222,7 @@ _RELOAD_MODULES = [
     _moe_gluon,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_dsv4,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
     _moe_triton,
@@ -4542,6 +4546,24 @@ _CASES = [
         _sampling_argmax,
     ),
     # MoE API x architecture golden cases.
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "dsv4_select_experts",
+        "triton_dsv4_select_experts",
+        _dsv4_select_experts_bias,
+        id_suffix="bias",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "dsv4_select_experts",
+        "triton_dsv4_select_experts",
+        _dsv4_select_experts_hash,
+        id_suffix="hash",
+    ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
