@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 
-# One-shot window: 7168 bf16 at TP8 still fits the AR threshold at eight rows.
+# Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
 
 
@@ -547,10 +547,13 @@ class K3AttnComm:
         ahead of those branches and returns None for the mixed hidden even when
         ``combine`` is set, so the caller runs the combine as its own kernel.
         Measured net faster despite the extra launch at the width that
-        actually reaches it -- one token per step, where every layer arrives
-        here with a residual. Wider steps mostly take the fused AttnRes graph
-        instead, and the block-write layers that still arrive pass no prefix,
-        so on a speculative-decode deployment this window is armed and idle.
+        actually reaches it -- one token per step, where every layer but the
+        block-write ones arrives with a residual. Wider steps mostly take the
+        fused AttnRes graph instead, and the block-write layers that still
+        arrive pass no prefix: instrumented at eight tokens on a DSpark
+        deployment, this window was armed and served nothing. A layer that
+        declines the fused graph for some other reason does reach it with a
+        prefix, so that is a property of the configuration, not of the width.
 
         Like the vendor branch below it, that window does not consult
         ``force_deterministic_rsag``: the collective reduces in ascending rank

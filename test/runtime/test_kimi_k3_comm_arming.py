@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -42,6 +43,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=2, suite="runtime-1gpu")
+
+# The iris cases drive the CDNA4 branch, which imports an AMD-only package.
+needs_iris = pytest.mark.skipif(
+    find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
 
 from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
     ATTN_AR_MAX_TOKENS,
@@ -66,6 +72,7 @@ def test_arming_requires_fused_moe_ar():
     assert _tail_finalize_top_k(10, plan, False) is None
 
 
+@needs_iris
 def test_iris_preparation_deduplicates_equal_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -99,6 +106,7 @@ def test_iris_preparation_deduplicates_equal_groups(monkeypatch):
     )
 
 
+@needs_iris
 def test_iris_preparation_handles_distinct_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -144,6 +152,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     ]
 
 
+@needs_iris
 def test_iris_preparation_handles_moe_only_group(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -178,6 +187,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     )
 
 
+@needs_iris
 def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -380,3 +390,7 @@ def test_arming_declines_when_any_probe_or_peer_says_no(
     state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
     assert state.cute_ar is None
     assert rec["builder"].call_count == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

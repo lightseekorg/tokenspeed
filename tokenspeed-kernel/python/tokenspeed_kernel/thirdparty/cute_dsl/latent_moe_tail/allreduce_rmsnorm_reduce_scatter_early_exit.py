@@ -445,7 +445,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                     assumed_align=16,
                 )
                 res_values = packed_u32x4_to_bf16x8(
-                    load_global_u32x4(res_ptr, volatile=False)
+                    load_global_u32x4(res_ptr, volatile=True)
                 )
             store_global_u32x4(
                 latent_multicast_ptr + multicast_offset,
@@ -1051,6 +1051,14 @@ class CollectiveKernel:
         )
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
+        if residual_from_shared and max_token_ctas < max_m:
+            # The PDL trigger fires on the first pass of the token loop only,
+            # so a second pass would read the residual after admitting the
+            # successor. One pass means token_ctas covers max_m.
+            raise ValueError(
+                "residual_from_shared requires max_token_ctas >= max_m, got "
+                f"{max_token_ctas} and {max_m}"
+            )
         if residual_from_shared and latent_dim != hidden_dim:
             # The residual read walks shared_source with the latent row pitch,
             # so a narrower latent silently reads the wrong row, never faults.
@@ -1154,18 +1162,23 @@ class CollectiveKernel:
         dist.barrier(group=group, device_ids=[device.index])
         for owner in range(tp_size):
             if rank == owner:
-                variants = [(True, True, None)]
-                if finalize_top_k is not None:
-                    variants.append((True, True, finalize_top_k))
-                if precompile_split:
-                    variants.extend(
-                        [
-                            (True, False, None),
-                            (False, True, None),
-                        ]
-                    )
+                if residual_from_shared:
+                    # This mode refuses include_reduce_scatter, so every
+                    # variant carrying it would compile and never be callable.
+                    variants = [(False, True, None)]
+                else:
+                    variants = [(True, True, None)]
                     if finalize_top_k is not None:
-                        variants.append((False, True, finalize_top_k))
+                        variants.append((True, True, finalize_top_k))
+                    if precompile_split:
+                        variants.extend(
+                            [
+                                (True, False, None),
+                                (False, True, None),
+                            ]
+                        )
+                        if finalize_top_k is not None:
+                            variants.append((False, True, finalize_top_k))
                 for include_reduce_scatter, include_routed, variant_top_k in variants:
                     compile_kernel(
                         rank=rank,
@@ -1200,7 +1213,7 @@ class CollectiveKernel:
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         shared_output_override: torch.Tensor | None = None,
-        latent_output_override: torch.Tensor | None = None,
+        latent_output_override: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")

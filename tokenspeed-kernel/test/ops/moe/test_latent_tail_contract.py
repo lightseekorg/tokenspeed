@@ -571,10 +571,11 @@ def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
 def test_the_epilogue_variant_is_part_of_the_compile_key() -> None:
     """Two epilogues sharing a key means one kernel is returned for the other.
 
-    ``_COMPILED`` is module-global and a K3 process holds both instances -- the
-    MoE tail's RMSNorm epilogue and the attention reduce's residual one -- so a
-    collision hands one of them the other's kernel. It runs and returns the
-    right shape.
+    ``_COMPILED`` is module-global. K3's two live instances happen to differ in
+    four other key fields as well, so they cannot collide today; the field
+    still belongs in the key, because two instances of the same geometry
+    differing only in the epilogue would otherwise share a kernel that runs
+    and returns the right shape.
     """
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
         _compile_key,

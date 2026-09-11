@@ -448,6 +448,7 @@ class KimiK3LatentTailOp:
                 routed_partial,
                 shared_partial,
                 rms_weight,
+                latent_output_override=None,
             )
         else:
             self._validate_prepared_shared_shard(prepared_shared_shard)
@@ -457,6 +458,7 @@ class KimiK3LatentTailOp:
                 rms_weight,
                 include_reduce_scatter=False,
                 include_routed=True,
+                latent_output_override=None,
             )
             shared_shard = prepared_shared_shard
         return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
@@ -600,6 +602,7 @@ class KimiK3LatentTailOp:
             include_reduce_scatter=True,
             include_routed=False,
             shared_output_override=self._split_shared_output,
+            latent_output_override=None,
         )
         return shared_shard
 
@@ -689,7 +692,8 @@ def build_attn_reduce_collective(
     """Build the collective that serves Kimi-K3's attention reduce.
 
     The epilogue emits ``all_reduce(partial) + residual`` instead of a
-    RMSNorm, so no norm weight or epsilon reaches the kernel.
+    RMSNorm. The norm weight goes unread in this mode, but ``__call__`` still
+    shape-checks it, so callers must keep passing one.
 
     Args:
         group: Attention tensor-parallel process group. Every rank in it must
@@ -727,6 +731,7 @@ def build_attn_reduce_collective(
 
 __all__ = [
     "KimiK3LatentTailOp",
+    "multicast_backend_available",
     "attn_reduce_shape_supported",
     "build_attn_reduce_collective",
     "latent_tail_supported",
