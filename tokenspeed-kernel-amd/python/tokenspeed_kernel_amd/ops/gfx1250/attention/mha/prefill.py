@@ -61,6 +61,7 @@ class AttentionConfig:
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     TDM_WARP_HINT: gl.constexpr
+    REVERSE_Q_BLOCKS: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -90,6 +91,7 @@ class AttentionConfig:
         HAS_LSE,
         WINDOW_LEFT,
         TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS,
         q_strides,
         k_strides,
         v_strides,
@@ -136,6 +138,7 @@ class AttentionConfig:
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
+        self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -232,6 +235,8 @@ class AttentionProgram:
         batch = gl.program_id(0)
         q_head = gl.program_id(1)
         q_block = gl.program_id(2)
+        if cfg.REVERSE_Q_BLOCKS:
+            q_block = gl.num_programs(axis=2) - 1 - q_block
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
         seq_base = gl.load(cu_seqlens_ptr + batch)
         seq_end = gl.load(cu_seqlens_ptr + batch + 1)
@@ -658,6 +663,7 @@ def _mha_prefill_gfx1250(
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     TDM_WARP_HINT: gl.constexpr,
+    REVERSE_Q_BLOCKS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -675,6 +681,7 @@ def _mha_prefill_gfx1250(
         HAS_LSE,
         WINDOW_LEFT,
         TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -748,6 +755,17 @@ def _select_tdm_warp_hint(
         and window_left < 0
         and workgroups >= _GFX1250_NUM_CUS
     )
+
+
+def _select_reverse_q_blocks(
+    *,
+    block_m: int,
+    max_seqlen: int,
+    window_left: int,
+    workgroups: int,
+) -> bool:
+    """Schedule long causal workgroups first to minimize the dispatch tail."""
+    return window_left < 0 and workgroups >= _GFX1250_NUM_CUS and max_seqlen > block_m
 
 
 def _select_m_tile(
@@ -876,6 +894,12 @@ def gluon_mha_prefill_gfx1250(
         window_left=config.window_left,
         workgroups=math.prod(config.grid),
     )
+    reverse_q_blocks = _select_reverse_q_blocks(
+        block_m=config.block_m,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        workgroups=math.prod(config.grid),
+    )
 
     _mha_prefill_gfx1250[config.grid](
         q,
@@ -905,6 +929,7 @@ def gluon_mha_prefill_gfx1250(
         return_lse,
         config.window_left,
         tdm_warp_hint,
+        reverse_q_blocks,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,
