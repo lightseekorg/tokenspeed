@@ -115,6 +115,7 @@ from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     Mxfp4Config,
 )
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
@@ -1531,6 +1532,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         server_args = SimpleNamespace(
             mapping=None,
             speculative_algorithm="DSPARK",
+            dspark_replicate_markov_embedding=True,
             enable_prefix_caching=True,
             speculative_num_steps=5,
             speculative_num_draft_tokens=6,
@@ -1569,7 +1571,38 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         self.assertEqual(model_config.dspark_prefix_replay_tokens, 96)
         self.assertEqual(model_config.num_attention_layers, 2)
+        self.assertTrue(model_config.hf_text_config.dspark_replicate_markov_embedding)
         count_stages.assert_called_once_with("external-draft", revision=None)
+
+    def test_markov_replication_rejects_other_draft_architectures(self):
+        config = SimpleNamespace(architectures=["K3DSparkForCausalLM"])
+        args = SimpleNamespace(
+            mapping=None,
+            speculative_algorithm="DSPARK",
+            dspark_replicate_markov_embedding=True,
+            ext_yaml=None,
+        )
+        with (
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_config",
+                return_value=config,
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_generation_config",
+                return_value=SimpleNamespace(eos_token_id=None),
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_hf_text_config",
+                return_value=config,
+            ),
+            self.assertRaisesRegex(ValueError, "requires the V4 DSpark drafter"),
+        ):
+            ModelConfig(
+                "unused",
+                model_override_args="{}",
+                is_draft_worker=True,
+                server_args=args,
+            )
 
     def test_model_config_keeps_incompatible_user_quantization_error(self):
         model_config = object.__new__(ModelConfig)
@@ -2447,6 +2480,121 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(server_args.speculative_algorithm, "DSPARK")
         self.assertEqual(server_args.speculative_num_steps, 5)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_replicate_markov_embedding_cli(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        common = ["--model=unused", "--disable-kvstore"]
+        self.assertFalse(parser.parse_args(common).dspark_replicate_markov_embedding)
+        for spec in (
+            ["--speculative-algorithm=DSPARK"],
+            ['--speculative-config={"method":"dspark","num_speculative_tokens":5}'],
+        ):
+            with self.subTest(spec=spec):
+                args = ServerArgs.from_cli_args(
+                    parser.parse_args(
+                        common + spec + ["--dspark-replicate-markov-embedding"]
+                    )
+                )
+                self.assertTrue(args.dspark_replicate_markov_embedding)
+                self.assertEqual(args.speculative_algorithm, "DSPARK")
+
+    def test_dspark_replicate_markov_embedding_requires_dspark(self):
+        for algorithm in (None, "MTP", "EAGLE3", "DFLASH"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(ValueError, "requires DSPARK"),
+            ):
+                ServerArgs(
+                    model="unused",
+                    speculative_algorithm=algorithm,
+                    dspark_replicate_markov_embedding=True,
+                    disable_kvstore=True,
+                )
+
+    def test_dspark_markov_replication_keeps_other_vocab_heads_sharded(self):
+        module = "tokenspeed.runtime.models.deepseek_v4_dspark"
+        config = SimpleNamespace(
+            dspark_num_stages=1,
+            dspark_block_size=5,
+            dspark_target_layer_ids=(0,),
+            num_hidden_layers=1,
+            hidden_size=8,
+            hc_mult=4,
+            rms_norm_eps=1e-6,
+            hc_eps=1e-6,
+            dspark_noise_token_id=0,
+            dspark_markov_rank=4,
+            vocab_size=128,
+            head_dim=8,
+            num_attention_heads=4,
+            qk_rope_head_dim=4,
+            o_groups=1,
+            o_lora_rank=8,
+            max_position_embeddings=32,
+        )
+        group = object()
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_rank=2, tp_size=4, tp_group=group)
+        )
+        stage = torch.nn.Module()
+        stage.block = SimpleNamespace(attn_norm=SimpleNamespace(weight=torch.empty(1)))
+        for replicate in (False, True):
+            config.dspark_replicate_markov_embedding = replicate
+            with (
+                self.subTest(replicate=replicate),
+                patch(f"{module}._DSparkStage", return_value=stage),
+                patch(
+                    f"{module}.VocabParallelEmbedding",
+                    side_effect=lambda *a, **kw: torch.nn.Module(),
+                ) as embedding,
+                patch(
+                    f"{module}.ParallelLMHead", return_value=torch.nn.Module()
+                ) as projection,
+                patch(f"{module}.ReplicatedLinear", return_value=torch.nn.Module()),
+                patch(
+                    f"{module}.precompute_dspark_freqs_cis", return_value=torch.empty(1)
+                ),
+            ):
+                DeepseekV4DSparkModel(config, mapping, None, "model")
+                target, markov = embedding.call_args_list
+                self.assertEqual(target.kwargs["tp_size"], 4)
+                self.assertEqual(projection.call_args.kwargs["tp_size"], 4)
+                self.assertEqual(markov.kwargs["tp_size"], None if replicate else 4)
+                self.assertIs(markov.kwargs["tp_group"], None if replicate else group)
+
+    def test_dspark_replicated_markov_weights_match_sharded_lookup(self):
+        vocab_size, rank = 130, 4
+        weights = torch.arange(vocab_size * rank, dtype=torch.float32).view(
+            vocab_size, rank
+        )
+        token_ids = torch.tensor([0, 31, 63, 64, 127, 129])
+        replicated = VocabParallelEmbedding(
+            vocab_size,
+            rank,
+            params_dtype=torch.float32,
+            tp_rank=None,
+            tp_size=None,
+            tp_group=None,
+        )
+        replicated.weight_loader(replicated.weight, weights)
+        partials = []
+        for tp_rank in range(4):
+            sharded = VocabParallelEmbedding(
+                vocab_size,
+                rank,
+                params_dtype=torch.float32,
+                tp_rank=tp_rank,
+                tp_size=4,
+                tp_group=(0, 1, 2, 3),
+            )
+            sharded.weight_loader(sharded.weight, weights)
+            partials.append(sharded(token_ids, reduce_results=False))
+        expected = weights[token_ids]
+        torch.testing.assert_close(replicated(token_ids), expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            torch.stack(partials).sum(0), expected, rtol=0, atol=0
+        )
 
     def test_dspark_allows_prefix_cache_when_kvstore_is_disabled(self):
         server_args = ServerArgs(
@@ -6525,6 +6673,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6535,6 +6684,21 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights))
+
+    def test_hash_table_validation_rechecks_after_loading(self):
+        moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+        torch.nn.Module.__init__(moe)
+        moe.config = SimpleNamespace(n_routed_experts=4)
+        moe.gate = SimpleNamespace(tid2eid=torch.tensor([[0, 3]], dtype=torch.int32))
+        moe.validate_hash_routing_table()
+        self.assertTrue(moe._hash_table_values_validated)
+        moe.gate.tid2eid[0, 1] = 4
+        with self.assertRaisesRegex(ValueError, "hash_indices_table entries"):
+            moe.validate_hash_routing_table()
+        self.assertFalse(moe._hash_table_values_validated)
+        moe.gate.tid2eid = None
+        moe.validate_hash_routing_table()
+        self.assertFalse(moe._hash_table_values_validated)
 
     def test_deepseek_v4_hash_router_uses_table_ids_and_gate_scores(self):
         logits = torch.tensor(
@@ -6561,6 +6725,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            hash_table_values_validated=False,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6652,6 +6817,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            hash_table_values_validated=False,
         )
 
         expected_scores = F.softplus(logits).sqrt()

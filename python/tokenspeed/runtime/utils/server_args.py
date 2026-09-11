@@ -272,6 +272,7 @@ class ServerArgs:
     disable_capturable_grammar: bool = False
 
     # Speculative decoding
+    dspark_replicate_markov_embedding: bool = False
     draft_model_path_use_base: bool | None = False
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
@@ -461,6 +462,12 @@ class ServerArgs:
                         self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
+
+        if (
+            self.dspark_replicate_markov_embedding
+            and self.speculative_algorithm != "DSPARK"
+        ):
+            raise ValueError("--dspark-replicate-markov-embedding requires DSPARK.")
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -1767,6 +1774,13 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument(
+            "--dspark-replicate-markov-embedding",
+            action="store_true",
+            default=ServerArgs.dspark_replicate_markov_embedding,
+            help="Replicate the V4 DSpark Markov embedding on each attention TP rank "
+            "to avoid its embedding all-reduce, using additional GPU memory.",
+        )
         parser.add_argument(
             "--draft-model-path-use-base",
             action="store_true",

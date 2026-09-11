@@ -341,7 +341,11 @@ class DeepseekV4DSparkModel(nn.Module):
             self.markov_rank,
             params_dtype=torch.float32,
             prefix=add_prefix("markov_embedding", prefix),
-            **target_vocab_parallel_kwargs,
+            **(
+                {"tp_rank": None, "tp_size": None, "tp_group": None}
+                if getattr(config, "dspark_replicate_markov_embedding", False)
+                else target_vocab_parallel_kwargs
+            ),
         )
         self.markov_projection = ParallelLMHead(
             int(config.vocab_size),

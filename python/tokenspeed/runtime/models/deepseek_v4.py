@@ -1588,6 +1588,8 @@ def dsv4_select_experts(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
+    *,
+    hash_table_values_validated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
     try:
@@ -1599,6 +1601,7 @@ def dsv4_select_experts(
             hash_indices_table,
             input_ids,
             need_scores,
+            hash_table_values_validated=hash_table_values_validated,
         )
     except (NoKernelFoundError, AttributeError, RuntimeError):
         pass
@@ -1886,6 +1889,7 @@ class DeepseekV4MoE(nn.Module):
         self.mapping = mapping
         self.layer_index = layer_index
         self.n_shared_experts = config.n_shared_experts
+        self._hash_table_values_validated = False
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
         if self.scoring_func != "sqrtsoftplus":
@@ -2021,6 +2025,17 @@ class DeepseekV4MoE(nn.Module):
                 output_format=self.experts.topk_output_format,
             )
 
+    def validate_hash_routing_table(self) -> None:
+        """Validate checkpoint routing values after every weight load."""
+        self._hash_table_values_validated = False
+        table = self.gate.tid2eid
+        if table is None:
+            return
+        experts = self.config.n_routed_experts
+        if not bool(((table >= 0) & (table < experts)).all().item()):
+            raise ValueError(f"hash_indices_table entries must be in [0, {experts})")
+        self._hash_table_values_validated = True
+
     def _select_experts(
         self,
         hidden_states: torch.Tensor,
@@ -2037,6 +2052,7 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
             need_scores=need_scores,
+            hash_table_values_validated=self._hash_table_values_validated,
         )
 
     def _make_topk_output(
@@ -3862,7 +3878,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
     def post_load_weights(self):
         for module in self.modules():
-            if isinstance(module, DeepseekV4Compressor):
+            if isinstance(module, DeepseekV4MoE):
+                module.validate_hash_routing_table()
+            elif isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
             elif isinstance(module, DeepseekV4MegaMoEExperts):
                 module.finalize_weights()

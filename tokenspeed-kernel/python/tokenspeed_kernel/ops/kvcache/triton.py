@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -400,6 +401,57 @@ def _zero_byte_ranges_kernel(
         )
 
 
+class _ZeroRangeTableStager:
+    """Reuse bounded descriptor storage only after its consuming stream finishes."""
+
+    def __init__(self, capacity: int, min_rows: int) -> None:
+        self.capacity = capacity
+        self.min_rows = min_rows
+        self.lock = threading.Lock()
+        self.slots: dict[torch.device, list[tuple]] = {}
+
+    def acquire(self, ranges: list[tuple[int, int]], device: torch.device):
+        if not self.min_rows <= len(ranges) <= self.capacity:
+            return None
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            stream = torch.cuda.current_stream(device)
+            with self.lock:
+                slots = self.slots.setdefault(device, [])
+                for index, (host, table, event, reserved) in enumerate(slots):
+                    if not reserved and event.query():
+                        break
+                else:
+                    if len(slots) == 4:
+                        return None
+                    index = len(slots)
+                    host = torch.empty(
+                        (self.capacity, 2), dtype=torch.int64, pin_memory=True
+                    )
+                    table = torch.empty_like(host, device=device)
+                    event = torch.cuda.Event()
+                    slots.append((host, table, event, True))
+                slots[index] = (host, table, event, True)
+            try:
+                count = len(ranges)
+                host[:count].copy_(torch.tensor(ranges, dtype=torch.int64))
+                table[:count].copy_(host[:count], non_blocking=True)
+            except Exception:
+                self.release(device, index, stream)
+                raise
+        return table[:count], index, stream
+
+    def release(self, device: torch.device, index: int, stream: torch.cuda.Stream):
+        with self.lock:
+            host, table, event, _ = self.slots[device][index]
+            event.record(stream)
+            self.slots[device][index] = (host, table, event, False)
+
+
+_ZERO_RANGE_TABLE_STAGER = _ZeroRangeTableStager(capacity=131072, min_rows=16384)
+
+
 def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> None:
     """Zero selected byte ranges in one contiguous cache allocation.
 
@@ -418,11 +470,15 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
 
-    range_table = (
-        torch.tensor(ranges, dtype=torch.int64)
-        .pin_memory()
-        .to(backing.device, non_blocking=True)
-    )
+    staged = _ZERO_RANGE_TABLE_STAGER.acquire(ranges, backing.device)
+    if staged is None:
+        range_table = (
+            torch.tensor(ranges, dtype=torch.int64)
+            .pin_memory()
+            .to(backing.device, non_blocking=True)
+        )
+    else:
+        range_table, slot_index, stream = staged
 
     block_size = 1024
     max_size = max(size for _, size in ranges)
@@ -435,12 +491,16 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
         len(ranges),
         min(tiles_per_range, triton.cdiv(max_size, block_size)),
     )
-    _zero_byte_ranges_kernel[grid](
-        backing,
-        range_table,
-        BLOCK_SIZE=block_size,
-        num_warps=4,
-    )
+    try:
+        _zero_byte_ranges_kernel[grid](
+            backing,
+            range_table,
+            BLOCK_SIZE=block_size,
+            num_warps=4,
+        )
+    finally:
+        if staged is not None:
+            _ZERO_RANGE_TABLE_STAGER.release(backing.device, slot_index, stream)
 
 
 # -----------------------------------------------------------------------------

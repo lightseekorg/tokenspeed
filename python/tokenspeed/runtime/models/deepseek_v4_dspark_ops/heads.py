@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling import max_and_argmax
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
@@ -28,7 +29,16 @@ def _local_vocab_argmax(
     added_vocab_start = int(shard.added_vocab_start_index)
     rows = local_logits.shape[0]
 
-    if num_org > 0:
+    if (
+        num_org == local_logits.shape[1]
+        and num_org > 0
+        and local_logits.dtype == torch.float32
+        and local_logits.is_contiguous()
+    ):
+        local_max, local_arg = max_and_argmax(
+            local_logits, solution=None, override=None
+        )
+    elif num_org > 0:
         local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
     else:
         local_max = torch.full(

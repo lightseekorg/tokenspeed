@@ -389,6 +389,40 @@ def _argmax_cute(
     return out_idx
 
 
+def _max_and_argmax_cute(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        not logits.is_contiguous()
+        or logits.data_ptr() % 16 != 0
+        or not _supports_cute(logits.shape[1], logits.dtype)
+    ):
+        from tokenspeed_kernel.ops.sampling import _max_and_argmax_torch
+
+        return _max_and_argmax_torch(logits)
+    values = torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
+    indices = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+    _invoke_kernel(logits, values, indices)
+    return values, indices
+
+
+if _CUTE_AVAILABLE:
+    register_kernel(
+        "sampling",
+        "max_and_argmax",
+        name="cute_dsl_max_and_argmax",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(11, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+        ),
+        priority=Priority.SPECIALIZED,
+        tags={"latency", "determinism"},
+    )(_max_and_argmax_cute)
+
+
 def _argmax_pair_cute(
     logits: torch.Tensor,
     *,

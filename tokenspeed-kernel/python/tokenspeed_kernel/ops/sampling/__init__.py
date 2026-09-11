@@ -27,7 +27,7 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax"]
+__all__ = ["argmax", "max_and_argmax"]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
@@ -117,6 +117,63 @@ def argmax(
         "sampling", "argmax", logits.dtype, kernel_name=kernel.name, **shape_params
     ):
         return kernel(logits, out=out)
+
+
+def _max_and_argmax_torch(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    values, indices = torch.where(logits.isnan(), -torch.inf, logits).max(dim=-1)
+    return values.float(), indices
+
+
+def max_and_argmax(
+    logits: torch.Tensor,
+    *,
+    solution: str | None,
+    override: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return row-wise sampling maxima and indices without packing the outputs.
+
+    Args:
+        logits: Floating-point logits of shape ``(M, N)``, with ``N > 0``.
+            Supported dtypes are float16, bfloat16 and float32. NaNs and
+            negative infinity are ineligible candidates.
+        solution: Kernel solution to select, or None for automatic selection.
+        override: Exact kernel-name or solution override, or None.
+
+    Returns:
+        Two tensors of shape ``(M,)`` on the input device: float32 maxima
+        and int64 indices. Ties select the lowest index. Rows without an
+        eligible candidate return negative infinity and the in-range index 0,
+        matching the sampling kernel's fallback for invalid rows.
+    """
+    if logits.ndim != 2 or logits.shape[1] == 0:
+        raise ValueError("max_and_argmax requires shape (M, N) with N > 0")
+    if logits.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
+    if not logits.is_cuda or logits.shape[0] == 0:
+        return _max_and_argmax_torch(logits)
+    signature = format_signature(logits=dense_tensor_format(logits.dtype))
+    try:
+        kernel = select_kernel(
+            "sampling",
+            "max_and_argmax",
+            signature,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return _max_and_argmax_torch(logits)
+    shape_params = {"M": logits.shape[0], "N": logits.shape[1]}
+    ShapeCapture.get().record(
+        "sampling", "max_and_argmax", kernel.name, logits.dtype, shape_params
+    )
+    with kernel_scope(
+        "sampling",
+        "max_and_argmax",
+        logits.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(logits)
 
 
 # Backend registration (side-effect imports).

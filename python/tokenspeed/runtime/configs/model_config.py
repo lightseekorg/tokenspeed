@@ -434,6 +434,18 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if is_draft_worker:
+            replicate_markov = getattr(
+                server_args, "dspark_replicate_markov_embedding", False
+            )
+            if replicate_markov and (
+                getattr(server_args, "speculative_algorithm", None) != "DSPARK"
+                or resolve_architecture(self.hf_config) != "DeepseekV4ForCausalLMDSpark"
+            ):
+                raise ValueError(
+                    "--dspark-replicate-markov-embedding requires the V4 DSpark drafter."
+                )
+            self.hf_text_config.dspark_replicate_markov_embedding = replicate_markov
         self.spec_block_size: int | None = None
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(

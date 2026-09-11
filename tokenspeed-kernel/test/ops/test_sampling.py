@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling import max_and_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
@@ -34,6 +35,95 @@ from tokenspeed_kernel.platform import current_platform
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
 _TOP_K_DISABLED = 1 << 30
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("batch", [0, 1, 4, 16])
+@pytest.mark.parametrize("width", [127, 32320])
+def test_max_and_argmax_values(dtype, batch, width, device):
+    x = torch.randn(batch, width, dtype=dtype, device=device)
+    expected_values, expected_indices = x.max(dim=-1)
+    values, indices = max_and_argmax(x, solution=None, override=None)
+    assert values.dtype == torch.float32
+    assert indices.dtype == torch.int64
+    torch.testing.assert_close(values, expected_values.float(), rtol=0, atol=0)
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend_device", ["cpu", "cuda"])
+def test_max_and_argmax_invalid_rows_and_ties(backend_device):
+    x = torch.full((4, 32320), -torch.inf, device=backend_device)
+    x[0].fill_(torch.nan)
+    x[2, 3] = x[2, 77] = torch.inf
+    x[3, 3] = x[3, 77] = 1
+    x[3, 0] = torch.nan
+    values, indices = max_and_argmax(x, solution=None, override=None)
+    torch.testing.assert_close(
+        values,
+        torch.tensor([-torch.inf, -torch.inf, torch.inf, 1], device=backend_device),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        indices,
+        torch.tensor([0, 0, 3, 3], device=backend_device),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_max_and_argmax_strided_input(device):
+    x = torch.randn(4, 64640, device=device)[:, ::2]
+    values, indices = max_and_argmax(x, solution=None, override=None)
+    expected = x.max(dim=-1)
+    torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
+    torch.testing.assert_close(indices, expected.indices, rtol=0, atol=0)
+
+
+def test_max_and_argmax_uses_cute_kernel(device, monkeypatch):
+    import tokenspeed_kernel.ops.sampling.cute_dsl as sampling_cute
+
+    if not sampling_cute.is_available():
+        pytest.skip("CuTe sampling kernel is unavailable")
+    calls = []
+    invoke = sampling_cute._invoke_kernel
+
+    def record(logits, values, indices):
+        calls.append(logits.shape)
+        return invoke(logits, values, indices)
+
+    monkeypatch.setattr(sampling_cute, "_invoke_kernel", record)
+    x = torch.randn(16, 32320, device=device)
+    values, indices = max_and_argmax(
+        x, solution=None, override="cute_dsl_max_and_argmax"
+    )
+    assert calls == [x.shape]
+    expected = x.max(dim=-1)
+    torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
+    torch.testing.assert_close(indices, expected.indices, rtol=0, atol=0)
+
+
+def test_max_and_argmax_cuda_graph(device):
+    x = torch.randn(4, 32320, device=device)
+    max_and_argmax(x, solution=None, override=None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        values, indices = max_and_argmax(x, solution=None, override=None)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        expected = x.max(dim=-1)
+        torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
+        torch.testing.assert_close(indices, expected.indices, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "x", [torch.empty(3), torch.empty(2, 0), torch.ones(2, 4, dtype=torch.int64)]
+)
+def test_max_and_argmax_rejects_invalid_inputs(x):
+    with pytest.raises(ValueError):
+        max_and_argmax(x, solution=None, override=None)
+
 
 # The fused top-k + top-p kernel ships only as a CUDA build; on ROCm the
 # Python entry point resolves to a RuntimeError stub. Gate the tests instead

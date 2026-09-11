@@ -20,6 +20,16 @@ path nothing exercised routinely.
 
 ## Invariants
 
+### DSpark Markov embedding placement
+
+`--dspark-replicate-markov-embedding` stores the full V4 DSpark Markov
+embedding on every attention TP rank. It trades GPU memory for removal of
+the embedding all-reduce in each proposal position. The normal checkpoint
+weight loader handles replicated and sharded embeddings; target embeddings,
+Markov projections and LM heads retain their existing vocabulary sharding.
+The option is disabled by default and requires the V4 DSpark drafter.
+Eager and captured forwards use the same embedding implementation.
+
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
@@ -615,3 +625,29 @@ down to the router and V4).
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+# Cache Range Descriptor Staging
+
+Large cache-zero descriptor tables (16,384 to 131,072 rows) reuse at most four
+pinned-host/device buffer pairs per device. A slot stays reserved until its
+zeroing kernel has been submitted, and its CUDA event must complete before
+reuse on any stream. Smaller, oversized, busy, and graph-capture cases retain
+the allocation path. This cache is bounded to 8 MiB each of host and device
+storage per device; it never changes the byte ranges being cleared.
+
+# DSpark Local Sampling Reduction
+
+DSpark uses the registered sampling max/index operator for compact, unpadded
+FP32 vocabulary shards. Both eager execution and graph capture take the same
+path; padded or added-vocabulary shards retain their existing mapping logic.
+The operator returns separate values and indices, avoiding packed-output
+conversion. Finite logits retain exact maxima and lowest-index tie breaking.
+Like the existing CuTe sampling kernel, NaNs are ineligible; an entirely
+invalid row returns negative infinity and index zero. This is not a claim of
+equivalence to PyTorch's NaN propagation.
+
+Hash routing tables are checkpoint weights, immutable between weight loads.
+V4 validates every table value in `post_load_weights`, including on reload,
+before allowing sampling to omit repeated table-value checks. Validation is
+cleared before rechecking so a failed reload cannot retain an earlier success.
+Dynamic token ids and table shape, dtype and device remain checked per call.
+Callers with mutable or unvalidated tables must request table-value checks.
