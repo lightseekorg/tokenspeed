@@ -115,7 +115,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         max_token_ctas: int,
         fp32_internal: bool = False,
         # Swaps the epilogue: emit reduced + shared_source instead of
-        # RMSNorm(reduced). ``gamma`` and ``rms_eps`` go unread in this mode.
+        # RMSNorm(reduced). ``gamma`` and ``rms_eps`` go unread in this mode,
+        # though both are still validated. The reduce order differs from the
+        # vendor path's, so equal inputs give numerically equivalent output,
+        # not the same bits; greedy decoding turns that into different text.
         residual_from_shared: bool = False,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
