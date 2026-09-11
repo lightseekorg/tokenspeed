@@ -30,12 +30,20 @@ TAIL_FUSION request crashes the experts layer with
 
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import pytest
 import torch
 
-from tokenspeed.runtime.models.kimi_k3_comm import (
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=2, suite="runtime-1gpu")
+
+from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
     ATTN_AR_MAX_TOKENS,
     _tail_finalize_top_k,
     attn_ar_eligible,
@@ -292,3 +300,78 @@ def test_widths_the_collective_cannot_serve_are_declined_not_raised():
     # Cluster width is tp_size here, and the kernel takes powers of two <= 16.
     for tp in (7, 12, 24, 32):
         assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
+
+
+def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: bool):
+    """Stand up K3AttnCommState's collaborators so arming can be exercised."""
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    recorded = {"ops": []}
+
+    class FakeDist:
+        ReduceOp = torch.distributed.ReduceOp
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def all_reduce(tensor, op=None, group=None):
+            recorded["ops"].append(op)
+            if not peers_agree:
+                tensor.zero_()
+
+    monkeypatch.setattr(mod, "dist", FakeDist)
+    monkeypatch.setattr(mod, "prepare_all_reduce_lane", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "prepare_all_reduce_fusion", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_get_process_group", lambda g: "the-group")
+    monkeypatch.setattr(mod, "multicast_backend_available", lambda g: multicast)
+    monkeypatch.setattr(mod, "attn_reduce_shape_supported", lambda **k: shape_ok)
+    monkeypatch.setattr(
+        mod, "global_server_args_dict", {"comm_fusion_max_num_tokens": 2048}
+    )
+    monkeypatch.setattr(
+        mod, "RMSNorm", lambda h, eps: SimpleNamespace(weight=torch.ones(1))
+    )
+    builder = Mock(return_value="collective")
+    monkeypatch.setattr(mod, "build_attn_reduce_collective", builder)
+    recorded["builder"] = builder
+    return mod, recorded
+
+
+_ARMING_MAPPING = SimpleNamespace(
+    attn=SimpleNamespace(tp_size=8, tp_rank=3, tp_group=object())
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
+def test_arming_builds_only_when_every_rank_agrees(monkeypatch):
+    """A rank that armed alone would sit in a rendezvous its peers never join."""
+    mod, rec = _arming_world(
+        monkeypatch, multicast=True, shape_ok=True, peers_agree=True
+    )
+    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert state.cute_ar == "collective"
+    # MIN is what makes one dissenting rank stop all of them.
+    assert rec["ops"] == [torch.distributed.ReduceOp.MIN]
+    kwargs = rec["builder"].call_args.kwargs
+    assert kwargs["rank"] == 3 and kwargs["tp_size"] == 8  # rank is not size
+    assert kwargs["hidden_size"] == 7168
+    assert kwargs["max_tokens"] == mod.ATTN_AR_MAX_TOKENS
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
+@pytest.mark.parametrize(
+    "multicast,shape_ok,peers_agree",
+    [(False, True, True), (True, False, True), (True, True, False)],
+)
+def test_arming_declines_when_any_probe_or_peer_says_no(
+    monkeypatch, multicast, shape_ok, peers_agree
+):
+    """Each term is load-bearing: the constructor raises, it does not decline."""
+    mod, rec = _arming_world(
+        monkeypatch, multicast=multicast, shape_ok=shape_ok, peers_agree=peers_agree
+    )
+    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert state.cute_ar is None
+    assert rec["builder"].call_count == 0

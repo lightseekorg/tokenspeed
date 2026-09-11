@@ -521,3 +521,48 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
                 fabric.group_has_fabric([0, 1])
     finally:
         fabric._fabric_map = saved
+
+
+def test_the_attention_builder_asks_for_the_residual_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attention reduce emits reduced+residual; a RMSNorm here is silent.
+
+    The flag is a compile-time variant, so the wrong value produces a kernel
+    that runs, returns the right shape, and normalises the sum instead of
+    adding the residual to it. Nothing downstream would raise.
+    """
+    import tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail as tail_pkg
+    from tokenspeed_kernel.ops.moe.latent_tail import build_attn_reduce_collective
+
+    seen = {}
+
+    def fake_kernel(**kwargs):
+        seen.update(kwargs)
+        return "kernel"
+
+    monkeypatch.setattr(tail_pkg, "CollectiveKernel", fake_kernel)
+    built = build_attn_reduce_collective(
+        group="group", rank=3, tp_size=8, hidden_size=7168, max_tokens=8
+    )
+
+    assert built == "kernel"
+    assert seen["residual_from_shared"] is True
+    # A latent narrower than hidden makes the residual read walk the wrong row.
+    assert seen["latent_dim"] == 7168 and seen["hidden_dim"] == 7168
+    # Capacity has to match the caller's window, and rank is not size.
+    assert seen["max_m"] == 8 and seen["max_token_ctas"] == 8
+    assert seen["rank"] == 3 and seen["tp_size"] == 8
+    # The attention path launches one role only, which needs the split compile.
+    assert seen["precompile_split"] is True
+
+
+def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
+    """The constructor raises inside a rendezvous, so the probe answers first."""
+    from tokenspeed_kernel.ops.moe.latent_tail import attn_reduce_shape_supported
+
+    assert attn_reduce_shape_supported(tp_size=8, hidden_size=7168)
+    # Cluster width is tp_size when latent == hidden; the kernel takes powers
+    # of two up to 16.
+    for tp in (7, 12, 24, 32):
+        assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
