@@ -26,6 +26,14 @@ on:
         required: false
         default: 60
         type: number
+      comparison_base_ref:
+        description: "Optional immutable baseline revision for paired tasks"
+        required: false
+        type: string
+      comparison_candidate_ref:
+        description: "Optional immutable candidate revision for paired tasks"
+        required: false
+        type: string
     secrets:
       HF_TOKEN:
         required: false
@@ -46,6 +54,10 @@ jobs:
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
+      BASE_REF: ${{ inputs.comparison_base_ref }}
+      CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
+      PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       # Authenticate model downloads so cold runners do not hit anonymous
       # Hugging Face rate limits while starting `ts serve`.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -56,6 +68,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: ${{ matrix.workflow_stage == 'kernel-benchmark' && '0' || '1' }}
+          persist-credentials: ${{ matrix.workflow_stage != 'kernel-benchmark' }}
           path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
 
       - name: Set work directory
@@ -125,7 +139,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+          path: |
+            ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/published/
+          include-hidden-files: true
 
       - name: Upload task logs on failure
         if: failure()

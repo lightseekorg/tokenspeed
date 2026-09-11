@@ -34,6 +34,7 @@ from kernel_benchmark_comment import (
     COMMENT_MARKER,
     MAX_COMMENT_CHARS,
     MAX_COMPARISONS,
+    REPORT_ARCHIVE_PATH,
     ValidationError,
     _SafeRedirectHandler,
     download_report,
@@ -96,7 +97,7 @@ def report_bytes(value: dict[str, Any] | None = None) -> bytes:
 def artifact_zip(value: dict[str, Any] | None = None, **extra: bytes) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("comparison.json", report_bytes(value))
+        archive.writestr(REPORT_ARCHIVE_PATH, report_bytes(value))
         for name, contents in extra.items():
             archive.writestr(name, contents)
     return buffer.getvalue()
@@ -128,7 +129,10 @@ class FakeGitHub:
                 artifacts.append(
                     {
                         "id": 9001,
-                        "name": f"kernel-benchmark-amd-report-{RUN_ID}-{RUN_ATTEMPT}",
+                        "name": (
+                            "pr-test-kernel-benchmark-amd-gfx950-"
+                            f"amd-mi355-1gpu-bench-{RUN_ID}-{RUN_ATTEMPT}"
+                        ),
                         "expired": False,
                     }
                 )
@@ -227,11 +231,24 @@ def test_validate_report_enforces_entry_bound():
         validate_report_bytes(report_bytes(too_many))
 
 
-def test_extract_report_reads_only_comparison_json_from_the_artifact():
+def test_extract_report_reads_only_published_comparison_from_the_artifact():
     assert extract_report(artifact_zip())["candidate_sha"] == CANDIDATE_SHA
-    archive = artifact_zip(**{"run-me.sh": b"exit 1"})
+    archive = artifact_zip(
+        **{
+            "comparison.json": b"not the published report",
+            "run-me.sh": b"exit 1",
+        }
+    )
 
     assert extract_report(archive)["candidate_sha"] == CANDIDATE_SHA
+
+
+def test_extract_report_ignores_artifact_without_a_published_comparison():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("comparison.json", report_bytes())
+
+    assert extract_report(buffer.getvalue()) is None
 
 
 def test_artifact_redirect_does_not_forward_the_github_token():
@@ -257,7 +274,17 @@ def test_artifact_redirect_does_not_forward_the_github_token():
 def test_download_report_treats_a_missing_artifact_as_a_normal_skip():
     client = FakeGitHub()
 
-    assert download_report(client, REPOSITORY, RUN_ID, RUN_ATTEMPT) is None
+    assert download_report(client, REPOSITORY, RUN_ID, RUN_ATTEMPT) == (None, False)
+    assert client.writes == []
+
+
+def test_download_report_treats_an_artifact_without_a_report_as_a_normal_skip():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("result.json", b"{}")
+    client = FakeGitHub(report_archive=buffer.getvalue())
+
+    assert download_report(client, REPOSITORY, RUN_ID, RUN_ATTEMPT) == (None, True)
     assert client.writes == []
 
 
@@ -322,12 +349,30 @@ def test_publish_creates_a_comment_for_the_current_open_pull_request():
     assert COMMENT_MARKER in client.writes[0][2]["body"]
 
 
-def test_publish_removes_only_obsolete_comments_when_artifact_is_missing():
+def test_publish_leaves_comments_unchanged_when_the_benchmark_task_is_missing():
     client = FakeGitHub(
         comments=[
             bot_comment(10, run_id=RUN_ID - 1),
             bot_comment(20, run_id=RUN_ID + 1),
         ]
+    )
+
+    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+
+    assert result == "task_missing"
+    assert client.writes == []
+
+
+def test_publish_removes_obsolete_comments_when_task_has_no_report():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("result.json", b"{}")
+    client = FakeGitHub(
+        report_archive=buffer.getvalue(),
+        comments=[
+            bot_comment(10, run_id=RUN_ID - 1),
+            bot_comment(20, run_id=RUN_ID + 1),
+        ],
     )
 
     result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
@@ -430,7 +475,7 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
 
     assert triggers == {
         "workflow_run": {
-            "workflows": ["AMD Kernel Benchmarks"],
+            "workflows": ["PR Test AMD"],
             "types": ["completed"],
         }
     }

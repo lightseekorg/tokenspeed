@@ -116,8 +116,8 @@ case "$endpoint" in
     printf '%s\\n' "$GH_PR_FILES"
     ;;
   repos/lightseekorg/tokenspeed/pulls/*)
-    printf '{"head":{"sha":"%s"},"html_url":"https://github.com/lightseekorg/tokenspeed/pull/123"}\\n' \
-      "$GH_PR_SHA"
+    printf '{"base":{"sha":"%s"},"head":{"sha":"%s"},"html_url":"https://github.com/lightseekorg/tokenspeed/pull/123"}\\n' \
+      "$GH_PR_BASE_SHA" "$GH_PR_SHA"
     ;;
   *)
     echo "Unexpected gh call: $*" >&2
@@ -135,6 +135,7 @@ esac
         "GH_CALLS": str(calls),
         "GH_MAIN_SHA": "1" * 40,
         "GH_COMMIT_SHA": commit.strip().lower(),
+        "GH_PR_BASE_SHA": "3" * 40,
         "GH_PR_SHA": "2" * 40,
         "GH_PR_FILES": pr_files,
         "GITHUB_OUTPUT": str(output),
@@ -250,6 +251,57 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     )
 
 
+def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-amd.yml")
+    jobs = workflow["jobs"]
+
+    assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
+    expected_model_needs = ["scan", "unit-test", "kernel-benchmark"]
+    normal_model = jobs["model-test"]
+    assert normal_model["needs"] == expected_model_needs
+    assert "!cancelled()" in normal_model["if"]
+    assert "needs.unit-test.result == 'success'" in normal_model["if"]
+    assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
+    assert "needs.kernel-benchmark.result == 'success'" in normal_model["if"]
+    assert (
+        "needs.scan.outputs.kernel_benchmark_has_tasks != 'true'" in normal_model["if"]
+    )
+
+    eager_model = jobs["model-test-eager"]
+    assert eager_model["needs"] == "scan"
+    assert "needs.unit-test" not in eager_model["if"]
+    assert "needs.kernel-benchmark" not in eager_model["if"]
+    assert "kernel-benchmark" in jobs["finish"]["needs"]
+    benchmark_inputs = jobs["kernel-benchmark"]["with"]
+    assert (
+        "github.event.pull_request.base.sha" in benchmark_inputs["comparison_base_ref"]
+    )
+    assert (
+        "github.event.pull_request.head.sha"
+        in benchmark_inputs["comparison_candidate_ref"]
+    )
+    assert (
+        "kernel_benchmark:kernel-benchmark"
+        in next(
+            step
+            for step in jobs["scan"]["steps"]
+            if step.get("name") == "Build task matrix"
+        )["run"]
+    )
+
+
+def test_kernel_benchmark_task_uses_shared_ci_contract():
+    task = load_yaml(REPO_ROOT / "test/ci/perf/kernel-benchmark-amd-gfx950.yaml")
+
+    assert task["type"] == "perf"
+    assert task["workflow_stage"] == "kernel-benchmark"
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["amd-mi355-1gpu-bench"]
+    assert ".ci-artifacts/published" in task["perf"]["command"]
+    for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
+        assert variable in task["perf"]["command"]
+
+
 def test_k8s_dispatch_accepts_full_commit_sha(tmp_path):
     requested = "A" * 40
 
@@ -259,6 +311,8 @@ def test_k8s_dispatch_accepts_full_commit_sha(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'a' * 40}" in output
+    assert f"comparison_base_ref={'1' * 40}" in output
+    assert f"comparison_candidate_ref={'a' * 40}" in output
     assert "install_mla=1" in output
     assert "- Mode: commit" in summary
     assert f"api repos/lightseekorg/tokenspeed/commits/{'a' * 40}" in calls
@@ -269,6 +323,8 @@ def test_k8s_dispatch_defaults_to_latest_main(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'1' * 40}" in output
+    assert f"comparison_base_ref={'1' * 40}" in output
+    assert f"comparison_candidate_ref={'1' * 40}" in output
     assert "install_mla=0" in output
     assert "- Mode: main" in summary
     assert "api repos/lightseekorg/tokenspeed/commits/main --jq .sha" in calls
@@ -287,6 +343,8 @@ def test_k8s_dispatch_preserves_pr_resolution(tmp_path, pr_files, expected_insta
 
     assert result.returncode == 0, result.stderr
     assert f"sha={'2' * 40}" in output
+    assert f"comparison_base_ref={'3' * 40}" in output
+    assert f"comparison_candidate_ref={'2' * 40}" in output
     assert f"install_mla={expected_install_mla}" in output
     assert "- Mode: pr" in summary
     assert "api repos/lightseekorg/tokenspeed/pulls/123" in calls
@@ -323,6 +381,18 @@ def test_k8s_dispatch_commit_input_is_optional():
     assert (
         "${{ inputs.commit || inputs.pr || 'main' }}"
         in workflow["concurrency"]["group"]
+    )
+
+
+def test_k8s_dispatch_passes_comparison_revisions_to_tasks():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    run_inputs = workflow["jobs"]["run"]["with"]
+
+    assert run_inputs["comparison_base_ref"] == (
+        "${{ needs.scan.outputs.comparison_base_ref }}"
+    )
+    assert run_inputs["comparison_candidate_ref"] == (
+        "${{ needs.scan.outputs.comparison_candidate_ref }}"
     )
 
 
@@ -881,7 +951,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
     assert job["runs-on"] == "${{ matrix.runner }}"
     assert job["timeout-minutes"] == (
         "${{ matrix.runner == 'amd-mi45x-cpu-test'"
-        " && 10 || inputs.timeout_minutes }}"
+        " && 30 || inputs.timeout_minutes }}"
     )
 
 

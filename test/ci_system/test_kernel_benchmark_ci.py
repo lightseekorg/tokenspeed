@@ -518,66 +518,40 @@ def test_revision_environment_inherits_and_pins_prepared_rocm(monkeypatch, tmp_p
     assert sum("torch.cuda.is_available" in " ".join(command) for command in calls) == 2
 
 
-def test_amd_benchmark_workflow_preserves_comparison_and_security_contract():
-    path = REPO_ROOT / ".github/workflows/kernel-benchmark-amd.yml"
+def test_shared_task_runner_preserves_paired_benchmark_outputs():
+    path = REPO_ROOT / ".github/workflows/run-pr-test-stage.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     triggers = workflow.get("on") or workflow.get(True)
-    job = workflow["jobs"]["benchmark"]
+    inputs = triggers["workflow_call"]["inputs"]
+    job = workflow["jobs"]["test"]
 
-    assert workflow["env"]["PIP_BREAK_SYSTEM_PACKAGES"] == 1
-    assert set(triggers) == {"pull_request", "workflow_dispatch"}
-    assert triggers["pull_request"]["branches"] == ["main"]
-    assert (
-        "test/ci_system/cleanup_amd_gpu_state.sh" in triggers["pull_request"]["paths"]
-    )
-    assert workflow["permissions"] == {"contents": "read"}
-    assert workflow["concurrency"]["cancel-in-progress"] == (
-        "${{ github.event_name != 'workflow_dispatch' }}"
-    )
-    assert job["runs-on"] == "amd-mi355-1gpu-bench"
-    assert "github.event.pull_request.draft == false" in job["if"]
-    assert (
-        "github.event.pull_request.head.repo.full_name == github.repository"
-        in job["if"]
-    )
-    assert "secrets." not in str(job)
+    for name, environment_name in (
+        ("comparison_base_ref", "BASE_REF"),
+        ("comparison_candidate_ref", "CANDIDATE_REF"),
+    ):
+        assert inputs[name]["type"] == "string"
+        assert job["env"][environment_name] == f"${{{{ inputs.{name} }}}}"
+    assert "github.event.pull_request.number" in job["env"]["PR_NUMBER"]
+    assert "github.sha" in job["env"]["MERGE_SHA"]
 
     checkout = next(
-        step
-        for step in job["steps"]
-        if step.get("name") == "Checkout merge revision and history"
+        step for step in job["steps"] if step.get("name") == "Checkout code"
     )
-    assert checkout["with"]["fetch-depth"] == 0
-    assert checkout["with"]["persist-credentials"] is False
-
-    cleanup = next(
-        step
-        for step in job["steps"]
-        if step.get("name") == "Clear stale AMD GPU processes"
+    assert checkout["with"]["fetch-depth"] == (
+        "${{ matrix.workflow_stage == 'kernel-benchmark' && '0' || '1' }}"
     )
-    assert cleanup["run"] == "bash test/ci_system/cleanup_amd_gpu_state.sh"
-
-    benchmark = next(
-        step
-        for step in job["steps"]
-        if step.get("name") == "Run paired kernel benchmarks"
+    assert checkout["with"]["persist-credentials"] == (
+        "${{ matrix.workflow_stage != 'kernel-benchmark' }}"
     )
-    assert '--base-ref "$BASE_REF"' in benchmark["run"]
-    assert '--candidate-ref "$CANDIDATE_REF"' in benchmark["run"]
-    assert "--suite tokenspeed-kernel/benchmarks/amd/gfx950.json" in benchmark["run"]
-    assert "--environment-mode venv" in benchmark["run"]
 
     upload = next(
-        step for step in job["steps"] if step.get("name") == "Upload benchmark results"
+        step for step in job["steps"] if step.get("name") == "Upload task result"
     )
-    assert upload["if"].startswith("always()")
-    assert upload["with"]["name"] == (
-        "kernel-benchmark-amd-report-${{ github.run_id }}-${{ github.run_attempt }}"
-    )
-    decision = next(
-        step for step in job["steps"] if step.get("name") == "Apply benchmark decision"
-    )
-    assert decision["if"] == "always()"
+    assert ".ci-artifacts/result.json" in upload["with"]["path"]
+    assert ".ci-artifacts/published/" in upload["with"]["path"]
+    assert upload["with"]["include-hidden-files"] is True
+
+    assert not (REPO_ROOT / ".github/workflows/kernel-benchmark-amd.yml").exists()
 
     cancel_workflow = yaml.safe_load(
         (REPO_ROOT / ".github/workflows/cancel-pr-tests-on-close.yml").read_text(
@@ -588,9 +562,4 @@ def test_amd_benchmark_workflow_preserves_comparison_and_security_contract():
         item["group"]
         for item in cancel_workflow["jobs"]["cancel"]["strategy"]["matrix"]["include"]
     }
-    assert "kernel-benchmark-amd" in groups
-
-    installer = (
-        REPO_ROOT / "test/ci_system/install_kernel_benchmark_rocm.sh"
-    ).read_text(encoding="utf-8")
-    assert "pip install --force-reinstall" in installer
+    assert "kernel-benchmark-amd" not in groups

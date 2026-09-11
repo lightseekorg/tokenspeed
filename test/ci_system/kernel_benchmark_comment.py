@@ -38,6 +38,7 @@ import zipfile
 from typing import Any
 
 SCHEMA_VERSION = 1
+REPORT_ARCHIVE_PATH = "published/comparison.json"
 COMMENT_MARKER = "<!-- tokenspeed-kernel-benchmark-comment:v1 -->"
 COMMENT_METADATA_PREFIX = "tokenspeed-kernel-benchmark-comment-metadata:v1"
 COMMENT_METADATA_RE = re.compile(
@@ -257,8 +258,8 @@ def validate_report_bytes(raw: bytes) -> dict[str, Any]:
     return report
 
 
-def extract_report(archive: bytes) -> dict[str, Any]:
-    """Read comparison.json from an artifact ZIP without extracting any files."""
+def extract_report(archive: bytes) -> dict[str, Any] | None:
+    """Read the published comparison report without extracting artifact files."""
     if len(archive) > MAX_ARCHIVE_BYTES:
         raise ValidationError("report artifact exceeds its size limit")
     try:
@@ -266,11 +267,13 @@ def extract_report(archive: bytes) -> dict[str, Any]:
             reports = [
                 entry
                 for entry in artifact.infolist()
-                if not entry.is_dir() and entry.filename == "comparison.json"
+                if not entry.is_dir() and entry.filename == REPORT_ARCHIVE_PATH
             ]
+            if not reports:
+                return None
             if len(reports) != 1:
                 raise ValidationError(
-                    "report artifact must contain one root comparison.json file"
+                    f"report artifact must contain one {REPORT_ARCHIVE_PATH} file"
                 )
             entry = reports[0]
             if entry.flag_bits & 0x1:
@@ -285,13 +288,16 @@ def extract_report(archive: bytes) -> dict[str, Any]:
 
 
 def _artifact_name(run_id: int, run_attempt: int) -> str:
-    return f"kernel-benchmark-amd-report-{run_id}-{run_attempt}"
+    return (
+        "pr-test-kernel-benchmark-amd-gfx950-amd-mi355-1gpu-bench-"
+        f"{run_id}-{run_attempt}"
+    )
 
 
 def download_report(
     client: Any, repository: str, run_id: int, run_attempt: int
-) -> dict[str, Any] | None:
-    """Return the exact run artifact, or None when the run produced no report."""
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return the report and whether its task artifact exists for this attempt."""
     expected_name = _artifact_name(run_id, run_attempt)
     matches: list[dict[str, Any]] = []
     for page in range(1, MAX_ARTIFACT_PAGES + 1):
@@ -309,18 +315,18 @@ def download_report(
         raise GitHubError("artifact list exceeds its page limit")
 
     if not matches:
-        return None
+        return None, False
     if len(matches) != 1:
         raise ValidationError("benchmark run has duplicate report artifacts")
     artifact = matches[0]
     if artifact.get("expired") is True:
-        return None
+        return None, True
     artifact_id = artifact["id"]
     archive = client.get_bytes(
         f"/repos/{repository}/actions/artifacts/{artifact_id}/zip",
         MAX_ARCHIVE_BYTES,
     )
-    return extract_report(archive)
+    return extract_report(archive), True
 
 
 def _markdown_text(value: str) -> str:
@@ -551,8 +557,10 @@ def publish(
     pull_request_number: int,
 ) -> str:
     """Validate the run artifact and publish it only to its current open PR."""
-    report = download_report(client, repository, run_id, run_attempt)
+    report, artifact_exists = download_report(client, repository, run_id, run_attempt)
     if report is None:
+        if not artifact_exists:
+            return "task_missing"
         remove_obsolete_comments(
             client,
             repository,
@@ -631,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
 
     messages = {
         "artifact_missing": "No benchmark report artifact was produced; nothing to publish.",
+        "task_missing": "The benchmark task did not run; leaving its previous comment unchanged.",
         "pull_request_closed": "The pull request is closed; skipping benchmark comment.",
         "candidate_stale": "The pull request has a newer head commit; skipping stale results.",
         "target_stale": "The target branch has advanced; skipping stale results.",
