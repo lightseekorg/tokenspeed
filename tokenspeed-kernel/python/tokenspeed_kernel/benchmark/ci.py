@@ -323,6 +323,14 @@ def _environment_mismatch(
     return RuntimeError("benchmark environment mismatch: " + ", ".join(mismatches))
 
 
+def _create_harness(config: GraphBenchmarkConfig) -> KernelBenchmarkHarness:
+    return KernelBenchmarkHarness(
+        config,
+        timer=None,
+        platform_provider=current_platform,
+    )
+
+
 def run_suite(
     suite: BenchmarkSuite,
     revision: str,
@@ -463,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = run_suite(
             suite,
             args.revision,
-            harness_factory=KernelBenchmarkHarness,
+            harness_factory=_create_harness,
             environment_provider=_collect_environment,
         )
         _write_output(payload, args.output)

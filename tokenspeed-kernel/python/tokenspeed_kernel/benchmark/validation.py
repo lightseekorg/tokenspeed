@@ -104,7 +104,18 @@ def set_output_validator(name: str, validator: OutputValidator) -> None:
 
 
 def get_output_validator(name: str) -> OutputValidator:
-    """Return a registered output validator."""
+    """Return the output validator registered under ``name``.
+
+    Args:
+        name: Validator name from an output validation specification.
+
+    Returns:
+        Callable that receives an output specification and candidate/reference
+        data, then returns a validation outcome.
+
+    Raises:
+        KeyError: If no validator is registered under ``name``.
+    """
 
     validator = _OUTPUT_VALIDATORS.get(name)
     if validator is None:

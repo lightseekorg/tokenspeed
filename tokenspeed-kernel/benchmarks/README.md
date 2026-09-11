@@ -21,6 +21,7 @@ from tokenspeed_kernel.benchmark import (
     GraphBenchmarkConfig,
     KernelBenchmarkHarness,
 )
+from tokenspeed_kernel.platform import current_platform
 
 harness = KernelBenchmarkHarness(
     GraphBenchmarkConfig(
@@ -28,7 +29,9 @@ harness = KernelBenchmarkHarness(
         eager_warmup_iterations=5,
         replay_warmup_iterations=3,
         measurement_blocks=30,
-    )
+    ),
+    timer=None,
+    platform_provider=current_platform,
 )
 result = harness.run(
     BenchmarkRequest(

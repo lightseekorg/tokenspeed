@@ -344,6 +344,21 @@ def test_environment_mismatch_produces_complete_results_without_timing(tmp_path)
     assert "required 'amd'" in result["error_message"]
 
 
+def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypatch):
+    config = load_suite(_write_suite(tmp_path, _suite_payload())).timer
+    expected = object()
+
+    def fake_harness(config_arg, *, timer, platform_provider):
+        assert config_arg is config
+        assert timer is None
+        assert platform_provider is benchmark_ci.current_platform
+        return expected
+
+    monkeypatch.setattr(benchmark_ci, "KernelBenchmarkHarness", fake_harness)
+
+    assert benchmark_ci._create_harness(config) is expected
+
+
 @pytest.mark.parametrize(
     "mutate, match",
     [
@@ -418,7 +433,7 @@ def test_main_writes_successful_run_document(tmp_path, monkeypatch):
         harness_factory,
         environment_provider,
     ):
-        assert harness_factory is benchmark_ci.KernelBenchmarkHarness
+        assert harness_factory is benchmark_ci._create_harness
         assert environment_provider is benchmark_ci._collect_environment
         return expected
 

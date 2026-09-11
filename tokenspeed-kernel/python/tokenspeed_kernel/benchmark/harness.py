@@ -41,7 +41,7 @@ from tokenspeed_kernel.benchmark.validation import (
     get_output_validator,
     validate_output,
 )
-from tokenspeed_kernel.platform import PlatformInfo, current_platform
+from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelSpec
 
 __all__ = [
@@ -242,8 +242,8 @@ class KernelBenchmarkHarness:
         self,
         config: GraphBenchmarkConfig | None,
         *,
-        timer: GraphTimer | None = None,
-        platform_provider: Callable[[], PlatformInfo] = current_platform,
+        timer: GraphTimer | None,
+        platform_provider: Callable[[], PlatformInfo],
     ) -> None:
         if timer is not None and config is not None:
             raise ValueError("config cannot be provided with an explicit timer")

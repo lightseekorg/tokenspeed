@@ -805,7 +805,9 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
             eager_warmup_iterations=2,
             replay_warmup_iterations=1,
             measurement_blocks=7,
-        )
+        ),
+        timer=None,
+        platform_provider=current_platform,
     )
     result = harness.run(
         BenchmarkRequest(
