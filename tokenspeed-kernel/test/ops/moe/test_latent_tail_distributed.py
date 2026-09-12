@@ -492,11 +492,103 @@ def test_residual_from_shared_chains_through_its_own_latent_buffer():
 
     err = (x.float() - expected).abs().max().item()
     scale = expected.abs().max().item()
-    tol = 8e-3 * max(scale, 1.0)
-    assert err <= tol, f"depth={depth} max|err|={err} scale={scale}"
+    # One bf16 ulp per step, and the steps are dependent: the kernel sums ranks
+    # ascending in fp32 while the reference takes NCCL's order, so a divergent
+    # rounding persists. Budget the walk, not a single step.
+    tol = 8e-3 * max(scale, 1.0) * depth**0.5
+    assert err <= tol, f"depth={depth} max|err|={err} scale={scale} tol={tol}"
     # Negative control: the same comparison must reject a chain that skipped
     # its last layer, or the tolerance is wide enough to hide a broken chain.
     assert (x.float() - (expected - last_acc)).abs().max().item() > tol
+
+
+def test_residual_from_shared_chains_inside_a_cuda_graph():
+    """Production runs this chain inside the decode graph, with no host sync.
+
+    The chained version above synchronizes between calls, so on its own it
+    cannot tell a working chain from one the host happened to serialize.
+    Capture the chain instead and replay it.
+    """
+    rank, dev = _setup()
+    _require_attn_collective()
+    depth, m = 12, 8
+    kernel = _attn_collective(dev, 8)
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+
+    def partial_for(layer):
+        g = torch.Generator(device=dev).manual_seed(4000 + 7 * layer + rank)
+        return (
+            (torch.randn(m, H, generator=g, dtype=torch.float32, device=dev) * 0.1)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+
+    parts = [partial_for(i) for i in range(depth)]
+    g0 = torch.Generator(device=dev).manual_seed(11)
+    seed_residual = (
+        (torch.randn(m, H, generator=g0, dtype=torch.float32, device=dev) * 0.1)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+
+    def chain():
+        x = seed_residual
+        for part in parts:
+            x, _ = kernel(
+                part, x, gamma, include_reduce_scatter=False, include_routed=True
+            )
+        return x
+
+    eager = chain().clone()  # also warms the Lamport state before capture
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = chain()
+
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        # Bit-exact: same inputs, same kernel, and the buffer rotation has to
+        # land in the same place on every replay.
+        assert torch.equal(captured, eager)
+
+    # Positive control: the replay is not returning a stale eager result.
+    # Perturb one input and the captured chain must move.
+    parts[0].copy_(parts[0] * 2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(captured, eager)
+
+
+def test_residual_from_shared_rejects_a_build_it_could_never_dispatch():
+    """Routed-only is a split dispatch, and a split dispatch needs the compile.
+
+    Without the constructor check this builds, rendezvouses symmetric memory,
+    and only then raises -- on every call, forever.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        CollectiveKernel,
+    )
+
+    _setup()
+    with pytest.raises(ValueError, match="precompile_split"):
+        CollectiveKernel(
+            group=dist.group.WORLD,
+            rank=dist.get_rank(),
+            tp_size=_world_size(),
+            latent_dim=H,
+            hidden_dim=H,
+            max_m=8,
+            max_token_ctas=8,
+            rms_eps=1.0,
+            fp32_internal=True,
+            scratch_allocator=None,
+            finalize_top_k=None,
+            precompile_split=False,
+            residual_from_shared=True,
+        )
 
 
 def test_residual_from_shared_rejects_a_mismatched_latent_width():

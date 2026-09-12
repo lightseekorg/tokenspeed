@@ -700,12 +700,16 @@ def build_attn_reduce_collective(
         hidden_size: Model hidden width; see
             :func:`attn_reduce_shape_supported`, which must accept the pair
             before this is called.
-        max_tokens: Widest reduce this instance will serve. The caller's
-            output buffer is validated against exactly this many rows.
+        max_tokens: Widest reduce this instance will serve. The result comes
+            back as a view of the collective's own buffer, valid until the
+            next call.
 
     Returns:
         A ``CollectiveKernel`` to be called with
-        ``include_reduce_scatter=False, include_routed=True``.
+        ``include_reduce_scatter=False, include_routed=True``. Its first
+        return is a view of the instance's own latent buffer and stays valid
+        only until the next call on this instance -- which, since the runtime
+        holds one per process, means any caller's next call.
     """
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import CollectiveKernel
 

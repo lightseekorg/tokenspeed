@@ -570,9 +570,10 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # The result lives in the collective's own latent buffer; the
-            # next layer's reduce may overwrite it, by which point this layer
-            # has consumed it.
+            # The result lives in the collective's own latent buffer, and the
+            # state is a process singleton, so any later reduce -- next layer,
+            # or a draft model sharing the process -- overwrites it. This
+            # layer consumes it before then.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,

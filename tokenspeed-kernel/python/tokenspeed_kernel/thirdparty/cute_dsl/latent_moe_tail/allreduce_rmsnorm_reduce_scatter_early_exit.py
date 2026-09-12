@@ -436,8 +436,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 * 2
             )
             if cutlass.const_expr(self.residual_from_shared):
-                # Read the caller's residual before admitting the PDL successor:
-                # past launch_dependents that buffer is the successor's to write.
+                # Read the residual before admitting the PDL successor: past
+                # launch_dependents that buffer is the successor's to write.
+                # The trigger fires on the first pass only, and this mode is
+                # routed-only, so token_ctas is max_m and there is just one.
                 res_ptr = cute.make_ptr(
                     BFloat16,
                     (shared_source.iterator + element_offset).llvm_ptr,
@@ -1051,14 +1053,11 @@ class CollectiveKernel:
         )
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
-        if residual_from_shared and max_token_ctas < max_m:
-            # The PDL trigger fires on the first pass of the token loop only,
-            # so a second pass would read the residual after admitting the
-            # successor. One pass means token_ctas covers max_m.
-            raise ValueError(
-                "residual_from_shared requires max_token_ctas >= max_m, got "
-                f"{max_token_ctas} and {max_m}"
-            )
+        if residual_from_shared and not precompile_split:
+            # This mode only ever dispatches the routed role, and a split
+            # dispatch needs the split compile. Without it the object builds,
+            # rendezvouses, and then raises on every call.
+            raise ValueError("residual_from_shared requires precompile_split=True")
         if residual_from_shared and latent_dim != hidden_dim:
             # The residual read walks shared_source with the latent row pitch,
             # so a narrower latent silently reads the wrong row, never faults.
@@ -1395,6 +1394,19 @@ class CollectiveKernel:
             raise ValueError(
                 "shared_output_override must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.hidden_dim}]"
+            )
+        if self._scratch_allocator is not None and (
+            self._latent_output.shape != (self.max_m, self.latent_dim)
+            or self._latent_output.dtype != torch.bfloat16
+            or self._latent_output.device != device
+            or not self._latent_output.is_contiguous()
+        ):
+            # Only the pool can get this wrong, and to_cute's assumed_align is
+            # a promise to the compiler, not a check: a bad view here becomes
+            # misaligned 128-bit stores rather than an error.
+            raise ValueError(
+                "the pooled latent output must be contiguous CUDA BF16 "
+                f"[{self.max_m}, {self.latent_dim}]"
             )
         shard_start = self.rank * self.shard_dim
         shared_shard = shared_output[:, shard_start : shard_start + self.shard_dim]
