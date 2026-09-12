@@ -786,11 +786,6 @@ def build_device_side(
 
     l2_cache_executor = None
     if server_args.enable_kvstore:
-        if server_args.kvstore_storage_backend is not None:
-            raise NotImplementedError(
-                "the cache-group scheduler has no L3 storage tier; unset "
-                "--kvstore-storage-backend"
-            )
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(

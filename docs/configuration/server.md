@@ -39,7 +39,7 @@ For a compact compatibility table, see
 | `--host` | HTTP bind host. |
 | `--port` | HTTP bind port. |
 | `--served-model-name` | Model name returned by the OpenAI-compatible API. |
-| `--api-key` | API key required by the server. |
+| `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
@@ -162,7 +162,6 @@ with the logits output.
 | --- | --- |
 | `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
-| `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
 
 Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 `deepseek_r1`, and `deepseek_v31`. Common tool-call parser values include
@@ -228,14 +227,12 @@ widening the draft's attention to the full history.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
-| `--log-level-http` | HTTP server log level. Defaults to `--log-level` when unset. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
-| `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify

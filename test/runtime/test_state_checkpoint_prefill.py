@@ -67,7 +67,6 @@ def test_final_extent_and_decode_through_runtime_config(
         prefix_granularity=128,
         num_host_pages=0,
         disable_l2_cache=True,
-        enable_l3_storage=False,
         role="fused",
         enable_kv_cache_events=False,
         decode_input_tokens=1,

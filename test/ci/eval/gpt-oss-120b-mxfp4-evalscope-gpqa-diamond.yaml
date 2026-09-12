@@ -33,7 +33,6 @@ server:
     --trust-remote-code
     --reasoning-parser base
     --disable-kvstore
-    --enable-cache-report
     --host 127.0.0.1
     --port 8000
   ready:

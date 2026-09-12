@@ -37,7 +37,6 @@ ts serve \
     --enable-prefix-caching \
     --disable-kvstore \
     --block-size 128 \
-    --enable-cache-report \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -58,7 +57,6 @@ ts serve \
     --enable-prefix-caching \
     --disable-kvstore \
     --block-size 128 \
-    --enable-cache-report \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -859,7 +857,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-cudagraph-capture-size 80 \
   --prefill-graph-max-tokens 2048 \
   --enable-metrics \
-  --enable-cache-report \
   --host 0.0.0.0 \
   --port 8000
 ```

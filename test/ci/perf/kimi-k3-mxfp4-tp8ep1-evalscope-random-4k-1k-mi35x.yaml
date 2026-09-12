@@ -55,7 +55,6 @@ server:
     --disable-kvstore
     --kvstore-ratio 0.0
     --no-enable-prefix-caching
-    --enable-cache-report
     --host 127.0.0.1
     --port 21000
     --policy round_robin

@@ -22,7 +22,6 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
-    --enable-cache-report \
     --reasoning-parser passthrough \
     --tool-call-parser passthrough \
     --host 0.0.0.0 \
