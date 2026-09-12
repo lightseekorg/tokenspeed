@@ -506,12 +506,24 @@ The internal capacity planner behind `Admit`. It runs entirely on shadow
 occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
-empty parents fit with zero eviction; otherwise pop victims from a heap
-ordered by eviction policy (LRU access epoch, then tier: uncached
-request-only block → probationary boundary → established boundary → suffix of
-a closed prefix) until the plan fits; finally walk the victim list in reverse
-and restore every victim that is not strictly required, yielding a minimal
-eviction set.
+empty parents fit with zero eviction; otherwise select eviction candidates
+until the plan fits. Request-reclaimable candidates are collected and sorted
+once; each cache group loads and sorts one epoch of eligible candidates at a
+time, skipping epochs whose entries are all protected or already listed for
+request reclaim. Selection compares the next candidate from each group with
+the next request-reclaimable candidate using one policy: LRU access epoch,
+then tier (uncached request-only block → probationary boundary → established
+boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+reverse and restore every block that is not strictly required, yielding a
+minimal eviction set in `victims`.
+
+Each cache group uses a non-owning cursor over its tier's eviction index.
+It advances continuously, skips fully pinned epochs, and returns complete
+epochs for policy ordering. Cursors exist only during one read-only planning
+pass: their index and pool must remain alive, and entries must not be inserted,
+erased, or re-keyed during traversal. Commit-time index mutations happen after
+the planner is destroyed. A full traversal costs O(N), including pinned entries,
+without a separate tree lookup per epoch.
 
 ## The cache pipeline: layers → group → pack → bind
 
