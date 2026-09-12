@@ -96,6 +96,9 @@ class _FakeLoop:
             submit_requests=lambda specs: self.submitted.append(list(specs))
         )
 
+    def _submit_scheduler_requests(self, specs) -> None:
+        self.scheduler.submit_requests(specs)
+
 
 def _spec(rid: str):
     return SimpleNamespace(request_id=rid)

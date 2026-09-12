@@ -143,7 +143,7 @@ class EpdPrefillHooks:
                 loop.kv_transfer.register(rid, bootstrap)
             admitted_specs.append(spec)
         if admitted_specs:
-            loop.scheduler.submit_requests(admitted_specs)
+            loop._submit_scheduler_requests(admitted_specs)
         elif self._admission.has_pending():
             # Nothing advanced this cycle but requests are still receiving; yield the
             # GIL so the Python daemon transfer/recv threads run (rank-consistent:

@@ -189,7 +189,12 @@ _MESSAGES = [
     UpdateWeightFromDiskReqInput(model_path="/m"),
     UpdateWeightFromDiskReqOutput(success=True, message="m", num_paused_requests=2),
     UpdateWeightsFromDistributedReqInput(
-        names=["w"], dtype_names=["bfloat16"], shapes=[[2, 2]]
+        names=["w"],
+        dtype_names=["bfloat16"],
+        shapes=[[2, 2]],
+        group_name="weight_update_group",
+        flush_cache=True,
+        weight_version=None,
     ),
     UpdateWeightsFromDistributedReqOutput(success=True, message=""),
     UpdateWeightsFromTensorReqInput(

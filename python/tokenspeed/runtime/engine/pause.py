@@ -397,7 +397,7 @@ class PauseHooks:
                 if self._reap_or_keep_buffered_spec(spec)
             ]
             if specs:
-                loop.scheduler.submit_requests(specs)
+                loop._submit_scheduler_requests(specs)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.

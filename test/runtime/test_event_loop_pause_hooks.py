@@ -110,6 +110,9 @@ class _FakeLoop:
         self.scheduler = _Scheduler()
         self.has_dp = False
 
+    def _submit_scheduler_requests(self, specs: list) -> None:
+        self.scheduler.submit_requests(specs)
+
 
 def _hooks(
     rid_to_state: dict | None = None, device=None

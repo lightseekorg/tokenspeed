@@ -549,8 +549,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
-    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc, *, enable_pdl):
-        del enable_pdl
+    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc):
         k_buffer[loc] = cache_k
         v_buffer[loc] = cache_v
 

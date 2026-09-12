@@ -27,6 +27,9 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
+#include <iterator>
+#include <utility>
 
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
@@ -34,11 +37,12 @@
 namespace tokenspeed {
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                                   BlockPool* host_pool, bool stream_device_cache_to_host)
+                                   bool enable_l3_storage, BlockPool* host_pool, bool stream_device_cache_to_host)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
+      enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
       prefix_granularity_{prefix_granularity} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
     geometry_.reserve(groups_.size());
@@ -59,11 +63,52 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             match_order_.push_back(i);
         }
     }
+    if (enable_l3_storage_ && host_pool_ != nullptr) {
+        std::size_t capacity = 0;
+        for (const CacheGroup& group : groups_) {
+            capacity += static_cast<std::size_t>(host_pool_->NumLcmBlocks()) *
+                        static_cast<std::size_t>(group.Spec().cache_blocks_per_lcm_block);
+        }
+        storage_key_limit_ = std::max(capacity, std::size_t{1});
+    }
 }
 
 bool CacheCoordinator::HasMambaStateGroup() const {
     return std::ranges::any_of(groups_,
                                [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
+}
+
+bool CacheCoordinator::deviceCacheIsClearable() const {
+    for (const CacheGroup& group : groups_) {
+        const PrefixCacheIndex& index = group.Index();
+        if (static_cast<std::int32_t>(index.EvictableLocations(pool_).size()) != index.NumEntries(pool_)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CacheCoordinator::hostCacheIsClearable() const {
+    if (host_pool_ == nullptr) {
+        return true;
+    }
+    for (const CacheGroup& group : groups_) {
+        const PrefixCacheIndex& index = group.Index();
+        if (static_cast<std::int32_t>(index.EvictableLocations(*host_pool_).size()) != index.NumEntries(*host_pool_)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CacheCoordinator::CacheIsClearable(bool include_host) const {
+    if (!deviceCacheIsClearable()) {
+        return false;
+    }
+    if (!include_host) {
+        return true;
+    }
+    return hostCacheIsClearable();
 }
 
 bool CacheCoordinator::ClearDeviceCache() {
@@ -80,6 +125,8 @@ bool CacheCoordinator::ClearDeviceCache() {
     }
 
     pending_stores_.clear();
+    storage_keys_.clear();
+    storage_key_order_.clear();
     for (const auto& [group_id, location] : cached_locations) {
         _assert(evictCachedBlock(group_id, location), "clearable Device cache entry disappeared");
     }
@@ -228,9 +275,13 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
         match_order, groups_, num_prefix_pages * prefix_granularity_, prefix_granularity_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_granularity = geometry_[i].BlockGranularity();
+            const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr;
+            if constexpr (Tier == CacheTier::kHost) {
+                extra_hits = enable_l3_storage_ ? &storage_keys_ : nullptr;
+            }
             out.per_group[i] = groups_[i].Matcher().Probe(groups_[i].Index(), pool, group_keys[i],
                                                           floor_tokens / group_block_granularity,
-                                                          bound_tokens / group_block_granularity);
+                                                          bound_tokens / group_block_granularity, extra_hits);
         },
         [&](std::size_t i) {
             return floor_tokens +
@@ -266,6 +317,93 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
     }
     return out;
+}
+
+CoordinatorMatch CacheCoordinator::acquireHostWithKeys(std::span<const std::vector<CacheKey>> group_keys,
+                                                       std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
+                                                       std::uint64_t access_epoch) {
+    PrefixProbe::Tier working = std::move(probe);
+    for (int attempt = 0;; ++attempt) {
+        _assert(attempt < 64, "L3 host prefix clamp did not converge");
+        // Re-run SweepThenConverge at the current bound. Truncating a window
+        // or Mamba hits mask (for example [0, 1, 1] -> [0, 1]) can leave the
+        // first live lookback page as a hole; the matcher must rebuild the
+        // trailing run for the shortened resume point. A caller-clamped
+        // num_common_tokens keeps the original L3 keys out of a longer match.
+        const std::int32_t bound_tokens = std::max(working.num_common_tokens, floor_tokens);
+        working = probeTierWithKeys<CacheTier::kHost>(group_keys, match_order_, bound_tokens / prefix_granularity_,
+                                                      floor_tokens);
+
+        CoordinatorMatch out;
+        out.num_common_tokens = working.num_common_tokens;
+        out.per_group.resize(groups_.size());
+        std::int32_t shortage_tokens = -1;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
+            const GroupPrefixProbe& group_probe = working.per_group[i];
+            PrefixMatch& match = out.per_group[i];
+            const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+            const std::size_t covered_pages =
+                static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+            match.blocks.resize(std::min(group_probe.hits.size(), covered_pages));
+            PrefixCacheIndex& index = groups_[i].Index();
+            for (std::size_t hit_index = 0; hit_index < match.blocks.size(); ++hit_index) {
+                if (group_probe.hits[hit_index] == 0) {
+                    continue;
+                }
+                const CacheKey& key = group_keys[i][static_cast<std::size_t>(floor_pages) + hit_index];
+                CacheBlockRef host_block_ref = index.Find(*host_pool_, key);
+                if (host_block_ref) {
+                    PrefixMatch acquired = index.AcquireMatched(*host_pool_, group_keys[i],
+                                                                floor_pages + static_cast<std::int32_t>(hit_index),
+                                                                GroupPrefixProbe{.hits = {1}}, access_epoch);
+                    match.blocks[hit_index] = std::move(acquired.blocks.front());
+                    continue;
+                }
+                _assert(storage_keys_.contains(key), "Host probe hit without a Host or L3 entry");
+                host_block_ref = AcquireHostBlock(groups_[i].Id());
+                if (!host_block_ref) {
+                    // Host pool is pinned. Drop this attempt's pins and re-match
+                    // non-closed groups at the shortened bound instead of
+                    // treating truncated holes as computed tokens.
+                    const std::int32_t failed_at =
+                        floor_tokens + static_cast<std::int32_t>(hit_index) * geometry_[i].BlockGranularity();
+                    shortage_tokens = shortage_tokens < 0 ? failed_at : std::min(shortage_tokens, failed_at);
+                    break;
+                }
+                match.blocks[hit_index] = std::move(host_block_ref);
+            }
+        }
+        if (shortage_tokens < 0) {
+            // Shortage is counted in the failing group's block_granularity,
+            // which may be finer than prefix identity. Round down so every
+            // group keeps a reusable prefix boundary; otherwise a 64-token
+            // group is trimmed to empty while hit_tokens stays at 48.
+            out.num_common_tokens -= out.num_common_tokens % prefix_granularity_;
+            // A later group can lower the shared boundary after earlier groups
+            // have already pinned pages. Trim every group to the final
+            // boundary so those excess pins are released and no stale KV is
+            // admitted past the common prefix.
+            for (std::size_t i = 0; i < groups_.size(); ++i) {
+                const std::int32_t available_tokens = std::max(out.num_common_tokens - floor_tokens, 0);
+                const std::size_t covered_pages =
+                    static_cast<std::size_t>(available_tokens / geometry_[i].BlockGranularity());
+                if (out.per_group[i].blocks.size() > covered_pages) {
+                    out.per_group[i].blocks.resize(covered_pages);
+                }
+            }
+            return out;
+        }
+        shortage_tokens -= shortage_tokens % prefix_granularity_;
+        if (shortage_tokens >= working.num_common_tokens) {
+            shortage_tokens = working.num_common_tokens - prefix_granularity_;
+        }
+        if (shortage_tokens < floor_tokens) {
+            shortage_tokens = floor_tokens;
+        }
+        shortage_tokens -= shortage_tokens % prefix_granularity_;
+        working.num_common_tokens = shortage_tokens;
+    }
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
@@ -326,8 +464,13 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
-        out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
-                                                         std::move(probe.host), access_epoch);
+        if (enable_l3_storage_) {
+            out.host = acquireHostWithKeys(probe.group_keys, out.device.num_common_tokens, std::move(probe.host),
+                                           access_epoch);
+        } else {
+            out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
+                                                             std::move(probe.host), access_epoch);
+        }
     }
     return out;
 }
@@ -800,11 +943,128 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
+                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                           /*newly_cached=*/nullptr);
+    rememberStorageKey(key);
+}
+
+void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key) {
+    _assert(static_cast<bool>(block_ref), "CacheDeviceBlock requires a destination block");
+    _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
+    std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
+    groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, /*logical_block_index=*/-1,
+                                           CacheBoundaryKind::kChunk, &newly_cached);
+    if (!cache_mutation_sink_) {
+        return;
+    }
+    for (const auto& [cached_key, cached_block] : newly_cached) {
+        (void)cached_block;
+        cache_mutation_sink_(cached_key, CacheMutation::kStored);
+    }
+}
+
+void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
+    if (!enable_l3_storage_ || storage_key_limit_ == 0) {
+        return;
+    }
+    std::vector<CacheKey> ordered(keys.begin(), keys.end());
+    std::unordered_map<ContentHash, std::size_t> hash_index;
+    for (const CacheKey& key : ordered) {
+        hash_index.emplace(key.content_hash, hash_index.size());
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [&hash_index](const CacheKey& left, const CacheKey& right) {
+        const std::size_t left_hash = hash_index.at(left.content_hash);
+        const std::size_t right_hash = hash_index.at(right.content_hash);
+        if (left_hash != right_hash) {
+            return left_hash < right_hash;
+        }
+        if (left.page_offset != right.page_offset) {
+            return left.page_offset < right.page_offset;
+        }
+        return left.group_id < right.group_id;
+    });
+    std::unordered_set<CacheKey, CacheKeyHash> batch(ordered.begin(), ordered.end());
+    for (const CacheKey& key : ordered) {
+        _assert(key.group_id < groups_.size(), "storage key group id out of range");
+        if (storage_keys_.contains(key)) {
+            continue;
+        }
+        while (storage_keys_.size() >= storage_key_limit_) {
+            if (!evictOldestUnprotectedKey(batch)) {
+                break;
+            }
+        }
+        if (storage_keys_.size() >= storage_key_limit_) {
+            break;
+        }
+        storage_keys_.insert(key);
+        storage_key_order_.push_back(key);
+    }
+}
+
+void CacheCoordinator::UnregisterStorageKeys(std::span<const CacheKey> keys) {
+    for (const CacheKey& key : keys) {
+        storage_keys_.erase(key);
+    }
+    compactStorageKeyOrder();
+}
+
+void CacheCoordinator::rememberStorageKey(const CacheKey& key) {
+    if (!enable_l3_storage_ || storage_key_limit_ == 0) {
+        return;
+    }
+    if (!storage_keys_.insert(key).second) {
+        return;
+    }
+    storage_key_order_.push_back(key);
+    evictStorageKeysToLimit();
+}
+
+void CacheCoordinator::evictStorageKeysToLimit() {
+    compactStorageKeyOrder();
+    while (storage_keys_.size() > storage_key_limit_) {
+        if (storage_key_order_.empty()) {
+            break;
+        }
+        storage_keys_.erase(storage_key_order_.front());
+        storage_key_order_.pop_front();
+    }
+}
+
+void CacheCoordinator::compactStorageKeyOrder() {
+    std::erase_if(storage_key_order_, [this](const CacheKey& key) { return !storage_keys_.contains(key); });
+}
+
+bool CacheCoordinator::evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys) {
+    for (auto it = storage_key_order_.begin(); it != storage_key_order_.end();) {
+        if (!storage_keys_.contains(*it)) {
+            it = storage_key_order_.erase(it);
+            continue;
+        }
+        if (protected_keys.contains(*it)) {
+            ++it;
+            continue;
+        }
+        storage_keys_.erase(*it);
+        storage_key_order_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+std::vector<CacheKey> CacheCoordinator::ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
+    std::vector<CacheKey> keys;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        std::vector<CacheKey> group_keys = keysForGroup(content_hashes, groups_[i].Id());
+        keys.insert(keys.end(), std::make_move_iterator(group_keys.begin()), std::make_move_iterator(group_keys.end()));
+    }
+    return keys;
 }
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host) {
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 bool stream_device_cache_to_host) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
@@ -837,7 +1097,8 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         }
         groups.emplace_back(spec, std::move(allocator), std::move(matcher));
     }
-    return CacheCoordinator{std::move(groups), prefix_granularity, pool, host_pool, stream_device_cache_to_host};
+    return CacheCoordinator{std::move(groups), prefix_granularity, pool,
+                            enable_l3_storage, host_pool,          stream_device_cache_to_host};
 }
 
 }  // namespace tokenspeed

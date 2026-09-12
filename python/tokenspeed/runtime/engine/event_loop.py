@@ -46,6 +46,7 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
     make_config,
+    make_retract_event,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
@@ -230,6 +231,18 @@ class EventLoop:
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
         )
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
@@ -249,6 +262,10 @@ class EventLoop:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_size=self.attn_cp_size,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            pp_size=self.pp_size,
+            pp_cpu_group=self.pp_cpu_group,
             global_rank=global_rank,
         )
 
@@ -319,6 +336,7 @@ class EventLoop:
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
+            "enable_l3_storage=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
             "cache_groups=%s",
@@ -328,6 +346,7 @@ class EventLoop:
             scheduler_cfg.decode_input_tokens,
             scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
+            scheduler_cfg.enable_l3_storage,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
             self.dp_size,
@@ -336,6 +355,10 @@ class EventLoop:
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        # L3 prefix hashing / batch_exists is paid only when a storage
+        # backend is configured. --disable-kvstore perf jobs still admit
+        # through _submit_scheduler_requests; they must not hash tokens.
+        self._enable_l3_storage = scheduler_cfg.enable_l3_storage
         # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
@@ -433,7 +456,8 @@ class EventLoop:
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
-            clear_cache_fn=self.scheduler.clear_cache,
+            clear_cache_fn=self._clear_cache,
+            can_clear_cache_fn=self._can_clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -513,6 +537,273 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _submit_scheduler_requests(self, specs) -> None:
+        if self._enable_l3_storage:
+            self._register_l3_storage_hits(specs)
+        self.scheduler.submit_requests(specs)
+
+    def _revalidate_queued_l3_hits(self) -> None:
+        """Drop L3 keys that vanished while a request waited for capacity.
+
+        ``_register_l3_storage_hits`` runs at submit. A queued request can
+        sit past a later ``batch_exists`` miss (delete, eviction, lost
+        object). Re-probe admission candidates immediately before
+        ``next_execution_plan`` so Admit cannot treat a stale scheduler key
+        as a Host hit and then ``batch_get_into`` a missing object.
+        ``waiting_prefix_hashes`` is only the Submitted/Retracted work that
+        can take a batch slot and Device pages this round, so a long waiter
+        is not hashed and remotely probed on every decode step.
+        """
+
+        if not self._enable_l3_storage:
+            return
+        self._sync_l3_storage_keys(self.scheduler.waiting_prefix_hashes())
+
+    def _register_l3_storage_hits(self, specs) -> None:
+        """Tell the scheduler which prefix pages already live in L3.
+
+        Cross-instance reuse cannot see Mooncake objects through the Host
+        index. Probe them with the same content hashes the scheduler will
+        use, then register only keys every cache-owning rank in the replica
+        agrees exist.
+
+        Skipped when L3 is unset: hashing the full token list is not free,
+        and --disable-kvstore admit still goes through this helper.
+        """
+
+        if not specs or not self._enable_l3_storage:
+            return
+        hashes = []
+        seen: set[str] = set()
+        for spec in specs:
+            tokens = spec.tokens
+            if not isinstance(tokens, list):
+                tokens = list(tokens)
+            for content_hash in self.scheduler.prefix_hashes_for_tokens(tokens):
+                if content_hash in seen:
+                    continue
+                seen.add(content_hash)
+                hashes.append(content_hash)
+        self._sync_l3_storage_keys(hashes)
+
+    def _sync_l3_storage_keys(self, hashes: list[str]) -> None:
+        if not hashes:
+            return
+        group_ids, content_hashes, page_offsets = self.scheduler.expand_prefix_keys(
+            hashes
+        )
+        pages = [
+            (int(group_id), 0, content_hash, int(page_offset))
+            for group_id, content_hash, page_offset in zip(
+                group_ids, content_hashes, page_offsets
+            )
+        ]
+        local_exists = self._l3_exists_or_miss(pages, expected_len=len(group_ids))
+        local_readable = [
+            present
+            and not self._device.l3_key_is_unread(
+                group_id=int(group_id),
+                content_hash=str(content_hash),
+                page_offset=int(page_offset),
+            )
+            for group_id, content_hash, page_offset, present in zip(
+                group_ids, content_hashes, page_offsets, local_exists
+            )
+        ]
+        exists = self._converge_l3_exists(local_readable)
+        hit_groups = []
+        hit_hashes = []
+        hit_offsets = []
+        miss_groups = []
+        miss_hashes = []
+        miss_offsets = []
+        for group_id, content_hash, page_offset, present in zip(
+            group_ids, content_hashes, page_offsets, exists
+        ):
+            target = (
+                (hit_groups, hit_hashes, hit_offsets)
+                if present
+                else (miss_groups, miss_hashes, miss_offsets)
+            )
+            target[0].append(int(group_id))
+            target[1].append(content_hash)
+            target[2].append(int(page_offset))
+        if miss_groups:
+            self.scheduler.unregister_storage_keys(
+                miss_groups, miss_hashes, miss_offsets
+            )
+        if hit_groups:
+            self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
+
+    def _recover_if_l3_prefetch_failed(self, execution_plan, forward_op) -> list:
+        """Drop vanished L3 keys and retract the batch so the next admit computes.
+
+        ``batch_exists`` is not a lease. After Admit, ``batch_get_into`` can
+        still miss. Prefetch on this control-plane turn, MIN-reduce across
+        the replica, then skip H2D / skip publishing empty Host pages and
+        retract (snapshot-less) so the next admit recomputes those tokens.
+        A backend exception or malformed result is a local miss so every
+        rank still enters the MIN-reduce; raising would hang healthy peers.
+        Failed keys stay unread: a later ``batch_exists`` hit must not
+        re-register them and retry the same prefetch. Only pages whose
+        replica-converged ``batch_get_into`` missed are blacklisted;
+        successfully restored leading pages stay readable. Replica admission
+        MIN-reduces local readability so one rank cannot re-register a key
+        while a peer still blacklists it. A later Host backup forgets an
+        unread entry only when this put created a missing object. The whole
+        forward is skipped so ranks stay aligned; mixed prefill/decode
+        partners retract rather than finish with an error. D-role admit
+        rides ``plan.remote_prefill`` with no local forward: those request
+        ids retract on the same path, and the loop withholds that stream
+        from ``DeviceHandle.execute`` so the peer does not land suffix-only
+        KV on empty prefix pages.
+        """
+
+        if not self._enable_l3_storage:
+            return []
+        if not self._device.plan_has_l3_prefetch(execution_plan):
+            return []
+        groups, hashes, offsets = self._device.l3_prefetch_storage_keys(execution_plan)
+        local_ok = self._l3_prefetch_ok_or_miss(
+            execution_plan, expected_len=len(groups)
+        )
+        ok = self._converge_l3_exists(local_ok)
+        if all(ok):
+            return []
+        self._device.invalidate_l3_prefetch()
+        failed_groups = []
+        failed_hashes = []
+        failed_offsets = []
+        for group_id, content_hash, page_offset, present in zip(
+            groups, hashes, offsets, ok
+        ):
+            if present:
+                continue
+            failed_groups.append(int(group_id))
+            failed_hashes.append(str(content_hash))
+            failed_offsets.append(int(page_offset))
+        if failed_groups:
+            self._device.mark_l3_keys_unread(
+                groups=failed_groups, hashes=failed_hashes, offsets=failed_offsets
+            )
+            self.scheduler.unregister_storage_keys(
+                failed_groups, failed_hashes, failed_offsets
+            )
+        retracted = []
+        seen = set()
+
+        def _retract(request_ids) -> None:
+            for rid in request_ids:
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                retracted.append(make_retract_event(rid))
+
+        if forward_op is not None:
+            _retract(forward_op.request_ids)
+        remote_prefill = execution_plan.remote_prefill
+        if remote_prefill is not None:
+            _retract(remote_prefill.request_ids)
+        logger.warning(
+            "L3 prefetch missed after admit; unregistered %s key(s) and "
+            "retracted %s request(s) for recompute",
+            len(failed_groups),
+            len(retracted),
+        )
+        return retracted
+
+    def _l3_exists_or_miss(self, pages, *, expected_len: int) -> list[bool]:
+        """Probe L3 without skipping the replica MIN-reduce on a local fault.
+
+        A backend exception or a malformed result becomes an all-miss vector
+        of ``expected_len`` so every cache-owning rank still enters
+        ``_converge_l3_exists``. Raising here would leave peers blocked in
+        that collective.
+        """
+
+        try:
+            exists = self._device.query_l3_storage(pages)
+        except Exception:
+            logger.exception(
+                "L3 existence probe failed; treating keys as misses so replica "
+                "ranks can converge"
+            )
+            return [False] * expected_len
+        if exists is None or len(exists) != expected_len:
+            if exists is not None:
+                logger.error(
+                    "L3 existence result is not aligned with cache keys: "
+                    "ok_flags=%s keys=%s",
+                    len(exists),
+                    expected_len,
+                )
+            return [False] * expected_len
+        return exists
+
+    def _l3_prefetch_ok_or_miss(
+        self, execution_plan, *, expected_len: int
+    ) -> list[bool]:
+        """Prefetch Host pages from L3, or miss every key if the RPC faults.
+
+        Peers must still enter ``_converge_l3_exists``. A raised
+        ``batch_get_into`` on one rank would otherwise hang the replica.
+        A malformed per-page vector becomes an all-miss of ``expected_len``.
+        """
+
+        try:
+            flags = self._device.prefetch_l3_load_backs(execution_plan)
+        except Exception:
+            logger.exception(
+                "L3 prefetch RPC failed; treating as a miss so replica ranks "
+                "can converge"
+            )
+            return [False] * expected_len
+        if flags is None or len(flags) != expected_len:
+            if flags is not None:
+                logger.error(
+                    "L3 prefetch result is not aligned with cache keys: "
+                    "ok_flags=%s keys=%s",
+                    len(flags),
+                    expected_len,
+                )
+            return [False] * expected_len
+        return [bool(flag) for flag in flags]
+
+    def _can_clear_cache(self) -> bool:
+        return self.scheduler.can_clear_cache()
+
+    def _delete_l3_namespace(self) -> bool:
+        return self._device.delete_l3_namespace()
+
+    def _clear_cache(self) -> bool:
+        return self.scheduler.clear_cache()
+
+    def _converge_l3_exists(self, exists: list[bool]) -> list[bool]:
+        """MIN-reduce L3 exists across every cache-owning rank in this replica.
+
+        Cache-owning ranks share a DP replica (attention TP × CP × PP). They
+        must admit the same prefix pages or later PP/CP collectives hang.
+        DP ranks hold different sequences and are not reduced. Order is
+        TP, then CP, then PP so every rank enters the same sequence of
+        groups.
+        """
+
+        groups = []
+        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
+            groups.append(self.attn_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if not groups:
+            return exists
+        flags = torch.tensor(
+            [1 if present else 0 for present in exists], dtype=torch.int32
+        )
+        for group in groups:
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
+        return [bool(flag) for flag in flags.tolist()]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -715,7 +1006,7 @@ class EventLoop:
             return
 
         if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+            self._submit_scheduler_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
     def _pp_broadcast_output_tokens(self, forward_op, results) -> None:
@@ -965,6 +1256,7 @@ class EventLoop:
                 # An idle round (freeze or DP idle) runs no dispatch and no
                 # kv-transfer event poll.
                 idle_round = False
+                l3_prefetch_retracts = []
 
                 if self._pause.forward_blocked:
                     # Freeze: dispatched forwards can't be un-launched; commit them
@@ -973,10 +1265,21 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     idle_round = True
                 else:
+                    self._revalidate_queued_l3_hits()
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
 
                     forward_op = self._get_forward_op(execution_plan)
+                    l3_prefetch_retracts = self._recover_if_l3_prefetch_failed(
+                        execution_plan, forward_op
+                    )
+                    if l3_prefetch_retracts:
+                        # Replica-wide miss: skip the model forward so ranks
+                        # do not attend over empty dest pages. Cache ops still
+                        # run so LoadBackDone can unpin without publishing.
+                        # D-role ``plan.remote_prefill`` is withheld below so
+                        # the peer does not land suffix-only KV on those pages.
+                        forward_op = None
                     stats = self._get_scheduler_stats()
                     self.load_reporter.observe(stats, self._num_running())
                     num_iter_tokens = (
@@ -1040,7 +1343,11 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan,
+                        planned,
+                        submit_remote_prefill=not l3_prefetch_retracts,
+                    )
                     if idle_round:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
@@ -1057,6 +1364,13 @@ class EventLoop:
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
+
+                # Vanished-L3 retract events must reach the scheduler even when
+                # DP idled the model forward: the load-backs still ran.
+                # Skipping this round's forward already set effective_depth to
+                # 0, so overlap partners in ``in_flight`` committed above
+                # before these retracts.
+                request_changes.extend(l3_prefetch_retracts)
 
                 # The forward-result feedback point: everything this round
                 # committed reaches the scheduler here, before the next round
@@ -1141,6 +1455,7 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
+        self._device.shutdown_cache()
 
 
 def run_event_loop(

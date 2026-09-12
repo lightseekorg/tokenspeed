@@ -62,6 +62,9 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
+    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
+    // updates MIN-reduce this across the replica before any rank clears.
+    bool CanClearCache() const;
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -83,8 +86,27 @@ public:
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
+    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
+    // backend for existing objects, then registers the matching CacheKeys so
+    // ProbePrefix can treat them as Host hits that require prefetch.
+    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    // Prefix hashes of Submitted/Retracted requests the scheduler can admit
+    // this round. The event loop revalidates these against L3 immediately
+    // before NextExecutionPlan so a queued hit cannot survive deletion.
+    // Requests that cannot take a batch slot (full decode batch, HOL
+    // incomplete prefill) or cannot obtain Device pages (pool exhausted)
+    // are skipped so a long waiter is not rehashed and remotely probed on
+    // every decode step.
+    std::vector<std::string> WaitingPrefixHashes() const;
+    std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
+        return coordinator_.ExpandPrefixKeys(content_hashes);
+    }
+    void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
+    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
+
 private:
     bool clearCache(bool include_host);
+    bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_prefix_hashes;
@@ -158,6 +180,7 @@ private:
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
+    void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 

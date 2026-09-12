@@ -149,12 +149,23 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     }
 }
 
+void Scheduler::handleEvent(const forward::Retract& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
+        return;
+    }
+    // Snapshot-less: dest pages were not filled. Publishing would cache empty
+    // KV. The request re-prefills through ordinary admission.
+    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
+                                     request->HasGeneratedOutput()});
+}
+
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     tier_transfers_.CompleteWriteBack(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id);
+    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 
 }  // namespace tokenspeed

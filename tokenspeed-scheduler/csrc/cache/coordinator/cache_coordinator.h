@@ -21,10 +21,12 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -56,8 +58,11 @@ public:
 
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
+    // enable_l3_storage, host_pool, and stream_device_cache_to_host have no
+    // defaults: a four-argument call would convert a Host-pool pointer to
+    // bool and silently disable L2 instead of failing to compile.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     bool enable_l3_storage, BlockPool* host_pool, bool stream_device_cache_to_host);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -175,6 +180,9 @@ public:
     // Clears both Device and Host prefix indexes. Returns false without
     // mutation when either tier still has a pinned cached block.
     bool ClearCache();
+    // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
+    // include_host selects both tiers (Host is a no-op without a host pool).
+    bool CacheIsClearable(bool include_host) const;
 
     struct StoreCandidate {
         CacheKey key;
@@ -208,6 +216,25 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Publishes a filled Device destination after a successful L3 prefetch
+    // ACK. First-chunk admit must not CacheFullBlocks those pages: they are
+    // empty until LoadBackDone.success, and a vanished object must not leave
+    // Device prefix hits for the next admit to reuse.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key);
+
+    // L3 storage sits below Host: a bounded shadow of keys known to exist in
+    // the remote store, with no local Host block. Probe treats them as Host
+    // hits that require prefetch. Capacity tracks Host pages so the set
+    // cannot grow with every historical writeback. A single registration
+    // keeps the earliest contiguous prefix keys so prefix-closed matchers
+    // still hit; later unrelated keys LRU-evict older prompts. Admit-time
+    // revalidation re-inserts keys that were dropped from the shadow.
+    bool EnablesL3Storage() const { return enable_l3_storage_; }
+    void RegisterStorageKeys(std::span<const CacheKey> keys);
+    void UnregisterStorageKeys(std::span<const CacheKey> keys);
+    bool ContainsStorageKey(const CacheKey& key) const { return storage_keys_.contains(key); }
+    std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const;
+    std::int32_t NumStorageKeys() const { return static_cast<std::int32_t>(storage_keys_.size()); }
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -222,6 +249,10 @@ private:
     };
 
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
+    void rememberStorageKey(const CacheKey& key);
+    void evictStorageKeysToLimit();
+    void compactStorageKeyOrder();
+    bool evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys);
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();
@@ -234,6 +265,8 @@ private:
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
+    CoordinatorMatch acquireHostWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
+                                         PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
@@ -244,6 +277,8 @@ private:
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                             std::uint64_t access_epoch);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    bool deviceCacheIsClearable() const;
+    bool hostCacheIsClearable() const;
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);
@@ -256,16 +291,20 @@ private:
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
+    bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
+    std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
+    std::deque<CacheKey> storage_key_order_;
+    std::size_t storage_key_limit_{0};
     CacheMutationSink cache_mutation_sink_;
 };
 
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, BlockPool* host_pool = nullptr,
-                                 bool stream_device_cache_to_host = true);
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 bool stream_device_cache_to_host);
 
 }  // namespace tokenspeed

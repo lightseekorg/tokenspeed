@@ -34,6 +34,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/token_container.h"
 #include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
 #include "scheduler/operations/forward.h"
@@ -78,7 +79,7 @@ Scheduler::Scheduler(SchedulerConfig config)
       block_pool_{config_.device_allocator.NumUsableBlocks()},
       host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
-                                   hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
+                                   config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
@@ -239,6 +240,19 @@ bool Scheduler::ClearL1Cache() {
 
 bool Scheduler::ClearCache() {
     return clearCache(true);
+}
+
+bool Scheduler::CanClearCache() const {
+    return cacheIsClearable(true);
+}
+
+bool Scheduler::cacheIsClearable(bool include_host) const {
+    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_pd_transfers || has_tier_transfers) {
+        return false;
+    }
+    return coordinator_.CacheIsClearable(include_host);
 }
 
 bool Scheduler::clearCache(bool include_host) {
@@ -414,6 +428,84 @@ std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const 
 
 std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) const {
     return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
+}
+
+std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const {
+    TokenContainer container(tokens);
+    std::vector<std::span<const std::int32_t>> prefix_pages =
+        container.FullPrefixPages(config_.prefix_granularity, false);
+    // The last prompt token is always recomputed. Admission probes the same
+    // (n - 1) / prefix_granularity candidate pages.
+    const std::int32_t candidate_prefix_pages =
+        std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
+    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+    return ComputePrefixHashes(prefix_pages, "");
+}
+
+std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
+    std::vector<Request*> candidates;
+    candidates.reserve(requests_.size());
+    for (const auto& request : requests_) {
+        candidates.push_back(request.get());
+    }
+    Request* readmission = nextReadmission(candidates);
+
+    bool hol_blocks_new_prompts = false;
+    for (const auto& request : requests_) {
+        const auto* prefilling = request->GetIf<fsm::Prefilling>();
+        if (prefilling != nullptr && !prefilling->TailCheckpointReserved()) {
+            hol_blocks_new_prompts = true;
+            break;
+        }
+    }
+    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
+    const std::int32_t free_slots = config_.max_batch_size - occupied;
+    if (free_slots <= 0 && readmission == nullptr) {
+        return {};
+    }
+
+    std::vector<std::string> hashes;
+    std::unordered_set<std::string> seen;
+    const auto append_hashes = [&](const Request& request) {
+        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
+        const std::int32_t candidate_prefix_pages =
+            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
+        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
+            if (seen.insert(content_hash).second) {
+                hashes.push_back(std::move(content_hash));
+            }
+        }
+    };
+    if (readmission != nullptr) {
+        append_hashes(*readmission);
+    }
+    if (free_slots <= 0 || hol_blocks_new_prompts || PoolFreeBlocks() <= 0) {
+        return hashes;
+    }
+    std::int32_t remaining = free_slots;
+    if (readmission != nullptr) {
+        remaining = std::max(remaining - 1, 0);
+    }
+    for (Request* request : candidates) {
+        if (remaining <= 0) {
+            break;
+        }
+        if (request == readmission) {
+            continue;
+        }
+        if (request->Is<fsm::Submitted>()) {
+            append_hashes(*request);
+            --remaining;
+            continue;
+        }
+        const auto* retracted = request->GetIf<fsm::Retracted>();
+        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
+            append_hashes(*request);
+            --remaining;
+        }
+    }
+    return hashes;
 }
 
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {

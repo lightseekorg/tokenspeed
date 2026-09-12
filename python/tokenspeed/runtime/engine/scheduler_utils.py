@@ -347,6 +347,17 @@ def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     return fe
 
 
+def make_retract_event(request_id: str) -> "ForwardEvent.Retract":
+    """Release pages and requeue as prefill without finishing the client.
+
+    Snapshot-less: dest pages were not filled. The next admit recomputes
+    missing prefix tokens from Device/Host plus remaining L3 keys.
+    """
+    fe = ForwardEvent.Retract()
+    fe.request_id = request_id
+    return fe
+
+
 def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: int):
     fe = ForwardEvent.UpdateReserveNumTokens()
     fe.request_id = request_id
@@ -396,16 +407,21 @@ def cache_event_to_payload(event) -> dict:
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
-    return {
+    payload = {
         "kind": kind,
         "op_id": int(event.op_id),
     }
+    if kind == "LoadBackDoneEvent":
+        payload["success"] = bool(event.success)
+    return payload
 
 
 def cache_event_from_payload(payload: dict):
     kind = payload["kind"]
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
+    if kind == "LoadBackDoneEvent":
+        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]), bool(payload["success"]))
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event

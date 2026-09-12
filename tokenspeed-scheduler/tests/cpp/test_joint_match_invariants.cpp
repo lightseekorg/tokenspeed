@@ -85,8 +85,9 @@ std::int32_t GroupPrefixBlocks(const CacheCoordinator& coordinator, const BlockP
     for (const std::string& hash : hashes) {
         keys.push_back(KeyFor(hash, group_id));
     }
-    const GroupPrefixProbe probe = coordinator.GroupMatcher(group_index)
-                                       .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks);
+    const GroupPrefixProbe probe =
+        coordinator.GroupMatcher(group_index)
+            .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks, /*extra_hits=*/nullptr);
     return static_cast<std::int32_t>(probe.hits.size());
 }
 
@@ -112,7 +113,9 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64);
         {
-            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                /*stream_device_cache_to_host=*/false);
 
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -186,7 +189,8 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64);
-    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

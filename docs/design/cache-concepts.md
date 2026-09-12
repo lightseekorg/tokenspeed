@@ -268,6 +268,9 @@ freshly acquired pages. The scheduler asserts both when batching a plan's ops
 and the runtime refuses an op with nothing to copy; neither side dedups or
 invents an acknowledgement, because an op that never completes a copy would
 hold its tickets forever.
+An L3 prefetch failure is an explicit unsuccessful completion: it skips H2D
+and releases the failed load through `LoadBackDone(success=False)` so the
+request can recompute. It never acknowledges or publishes a successful copy.
 
 ## block vs. page
 
@@ -345,7 +348,9 @@ Perception rules per directory:
   left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
   right-to-left for a run backing a resumable boundary (non-closed). Mamba
   needs no matcher of its own: it is `SwaMatcher` at window 2 — "keep the
-  live state page plus its snapshot". A matcher only *reads* the group's
+  live state page plus its snapshot". `Probe` takes the L3 hit set as a
+  required argument (`nullptr` when storage is unset) so Host-only matching
+  cannot be selected by omitting it. A matcher only *reads* the group's
   index; it never touches allocation or physical placement.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
@@ -399,6 +404,14 @@ Its responsibilities:
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
+  An L3 Host-prefetch shortage is different: `Admit` may return a shorter
+  `host_prefix_tokens` than the probe, rounded down to `prefix_granularity`
+  so every group keeps a reusable identity boundary. A finer
+  `block_granularity` group that runs out of Host pages mid-prefix must not
+  leave `hit_tokens` between grains — a 64-token group would then be
+  trimmed empty while the forward skipped 48 tokens. `schedulePrefillFirstChunk`
+  retries from that clamped boundary rather than forwarding a window that
+  skips the discarded prefix.
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
@@ -406,6 +419,14 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  Host-warm first-chunk extensions call `CacheFullBlocks` at admit.
+  L3 prefetch destinations wait for `LoadBackDone.success` and
+  `CacheDeviceBlock`; publishing them earlier would cache empty KV.
+  When one prefix hash is mixed (Host-warm in one group, L3 in another),
+  admit skips `CacheFullBlocks` for that hash and `CompleteLoadBack`
+  publishes every keyed filled Device destination. Host-only L2 load-backs
+  leave `BlockTransfer.key` empty and stay on the admit-time
+  `CacheFullBlocks` path.
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
@@ -423,16 +444,194 @@ Its responsibilities:
   retraction's snapshot pins its Device sources until the ACK; the snapshot
   store is stream-ordered instead, because its sources are re-granted in the
   same round (`scheduler.md` §2).
+  always stream when published.
+* **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
+  CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
+  beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
+  Host CacheBlock. That L3 backup is asynchronous, so `WriteBackDone` /
+  `LoadBackDone` are intersected across every cache-owning rank
+  (attention TP, then CP, then PP; not DP) before `CompleteWriteBack`: a
+  finished local backup must not `CacheHostBlock` on one mirrored
+  scheduler while a CP/PP peer still has the op pending. A truncated
+  `batch_is_exist` reply is a failed put, not an implicit success:
+  `WriteBackDone` follows only a completed backup. A backup future that
+  fails is MAX-reduced with the replica idle/work flag before the
+  completion gather so every rank raises together. Every rank
+  stays in every replica-group gather even when an earlier intersection
+  is empty, so a peer that is ready on CP/PP is not left unmatched. A later Host
+  miss that is known to exist in L3 allocates
+  a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
+  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
+  The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
+  (`model` + resolved immutable revision + `--weight-version`), the packed
+  Host CacheBlock layout (dtype and field payload geometry, not device
+  arena offsets that follow GPU cache capacity), the effective
+  cache-quantization config (`quantization` plus the
+  `quantization_param_path` scale-file digest, and
+  `--speculative-draft-model-quantization` when a draft pool is present), `--hf-overrides` as applied
+  to the HF text config (rope_theta, rope_scaling, and other architecture
+  fields that change cached keys), the pipeline stage, the
+  context-parallel width (`cp_size`), the resolved attention-TP width
+  (`attn.tp_size`), the speculative
+  draft checkpoint when a separate draft pool is present, and
+  `L3_RUNTIME_COMPAT` (a required namespace epoch bumped when built-in
+  model code, positional encoding, or a cache-producing kernel changes
+  KV without touching checkpoint, layout, or listed options). A git SHA
+  or package version is not used: those would split L3 on unrelated
+  rolling upgrades while remaining `0.1.0` across cache-affecting edits.
+  An unpinned
+  Hugging Face branch or local path is identified from a Hugging Face
+  hub cache snapshot
+  (`hub/.../(models|datasets|spaces)--<repo>/snapshots/<commit>` with a
+  sibling `refs` directory) or fingerprinted from the contents of the
+  local checkpoint actually loaded. A copied config's inherited
+  `_commit_hash` is not trusted. A 40-character hex folder whose parent
+  is named `snapshots` is not treated as a commit unless that hub layout
+  is present, so two hosts cannot share an L3 namespace from
+  `/models/snapshots/<same-hash>` while serving different fine-tuned
+  bytes. Local
+  fingerprints include `hf_quant_config.json` (ModelOpt
+  mixed-precision maps and KV quantization live there, not in the
+  weight tensors), local `*.py` including imported package
+  subdirectories (`--trust-remote-code` configuration, modeling modules,
+  and helpers such as `model_helpers/attention.py` can derive
+  architecture fields that change KV without touching JSON or weights),
+  plus only the weight files `--load-format` selects
+  (`auto` prefers `*.safetensors`, then `*.bin`, then `*.pt`;
+  `sharded_state` hashes the files `model_loader_extra_config["pattern"]`
+  selects, defaulting to `model-rank-*-part-*.safetensors`; each rank
+  fingerprints the files it can read and the replica all-gathers those
+  digests so a rank-local shard change still rotates the namespace;
+  `npcache` hashes `np/weight_names.json` and the listed NumPy files
+  when that cache exists, because the loader then skips `*.bin`). Mistral
+  fingerprints include `consolidated.safetensors.index.json` so two dumps
+  with the same `consolidated*.safetensors` candidates but different shard
+  maps cannot share a namespace. The
+  returned checkpoint id also records that load format, so two
+  deployments that share a directory or commit cannot restore KV
+  produced by a different encoding. Zigzag CP assigns
+  different token blocks to the same `cp_rank` under different widths, so
+  `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
+  object key. GQA with TP above the KV-head count keeps one local KV
+  head per rank, so packed Host geometry is unchanged, while
+  `tp_rank // num_kv_head_replicas` assigns different heads to the same
+  `r{tp_rank}`; `attn_tp_size` is therefore part of the namespace. Use
+  the resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone. A live weight
+  load flushes Device/Host first so new parameters cannot reuse the
+  previous checkpoint.   `ClearCache` rejects in-flight Host writebacks
+  (pause drain does not wait for those). Weight-update `flush_cache` and
+  standalone `/flush_cache` first MIN-reduce a non-mutating
+  `CanClearCache` / `CacheIsClearable` probe across cache-owning ranks
+  (attention TP, then CP, then PP) and then across attention DP so no
+  rank mutates Device/Host until every replica that shares the Mooncake
+  namespace agrees the indexes are clearable. Exists, prefetch, and
+  `WriteBackDone` stay TP/CP/PP: DP ranks hold different sequences.
+  Flush includes DP because object keys omit DP rank. Remote L3 deletion
+  is then an error-returning phase (no
+  raise into the event loop): each rank waits in-flight Host-to-store
+  backups, `remove_by_prefix`, and MIN-reduces that result. Only then
+  does each rank call `ClearCache`. A failed probe, a failed delete, or
+  a failed clear keeps Device/Host (and the previous checkpoint, on a
+  weight update) intact and the caller retries; a split flush would
+  leave mirrored schedulers selecting different prefix boundaries.
+  The frontend ANDs every DP worker's `/flush_cache` reply; returning
+  only replica 0 would hide a peer that rejected after the shared
+  namespace was already deleted. Successful weight-update ranks must not enter the NCCL broadcasts
+  while a peer is still flushing or has died on a Mooncake error. After a
+  successful flush and GPU
+  load, the hashed prefix is rebuilt so new KV is not published under
+  the previous checkpoint. An explicit new `weight_version` with
+  `flush_cache=False` is rejected before the GPU load when L3 is on:
+  Device/Host still hold the previous checkpoint, and D2H copies not yet
+  in `_backup_futures` would later be stored under the new namespace.
+  Flushed L3 updates require an explicit `weight_version`. Minting
+  `{current}-uN` from the old label is not checkpoint-specific: two
+  servers that start at `default` and load different weights would both
+  publish under `default-u1`, and the second flush would leave the first
+  server's objects in place. After a successful RPC the Engine facade
+  stamps the supplied version into `server_args.weight_version`.
+  `ENABLE_CP` workers share `attn_tp_rank==0`
+  and are distinguished by `c{cp_rank}` and `cp_size`. Mooncake
+  `global_segment_size` is divided by attention TP × CP × PP; passing
+  `server_args.attn_tp_size` when `ENABLE_CP` inferred `cp_size` would
+  over-mount the store. Host eviction does
+  **not** drop the L3 key. A `clear_cache` in this process group deletes
+  objects under that stable prefix rather than minting a process-local
+  generation, so a restarted rank still probes the same keys. Independent
+  TokenSpeed jobs that share a tenant are not in the TP/CP/PP/DP MIN: a
+  fleet-wide wipe is an operator flush of every instance. A later
+  `batch_exists` miss is not a lease; vanished-L3 prefetch recovers if
+  another client republishes or this delete races a peer PUT.
+  Cross-instance reuse probes `batch_exists` before `submit_requests`, then
+  MIN-reduces existence across every cache-owning rank in the DP replica
+  (attention TP, then CP, then PP; not across DP) and
+  `register_storage_keys` / `unregister_storage_keys`. Immediately before
+  `next_execution_plan`, the event loop re-probes prefix hashes of waiting
+  requests that can take a batch slot and Device pages this round so a
+  queued hit cannot survive deletion, eviction, or a lost object. Waiting
+  work that cannot be admitted (full decode batch, head-of-line incomplete
+  prefill, exhausted Device pages) is not rehashed or remotely probed. The
+  scheduler's L3 key shadow is bounded to Host page capacity. A single
+  registration keeps the earliest contiguous prefix keys so prefix-closed
+  matchers still hit; later unrelated keys LRU-evict older prompts.
+  Unregister removes keys from both the live set and the LRU order deque
+  so vanished-object recovery cannot accumulate tombstones while the live
+  set stays below capacity. Admit-time registration restores keys that
+  were dropped from the shadow.
+  That probe is not a lease: after Admit
+  allocates Host pages, `batch_get_into` can still miss. Prefetch runs
+  on the control plane (CPU, same as `batch_exists`), is MIN-reduced
+  across the replica, and a miss unregisters the keys, skips H2D /
+  skips publishing empty Host pages (`LoadBackDone.success=false`),
+  skips Device prefix publication for those prefetch destinations,
+  skips the model forward, and retracts the batch snapshot-less so the
+  next admit recomputes those tokens. D-role admit rides
+  `plan.remote_prefill` with no local forward: those request ids retract
+  on the same path, and the loop withholds that stream from execute so
+  the peer does not land suffix-only KV on empty prefix pages. A backend exception or malformed
+  result is converted to a local miss before that MIN-reduce so a
+  faulted rank cannot skip the collective and hang healthy peers. Only
+  pages whose replica-converged `batch_get_into` missed stay
+  unread: a later `batch_exists` hit must not re-register them and retry
+  the same prefetch. Successfully restored pages in a mixed prefetch
+  stay readable. Replica admission MIN-reduces local readability
+  (exists and not unread) so one rank cannot re-register a key while a
+  peer still blacklists it. A later Host backup forgets an unread entry
+  only when the object was absent and this put created it; a create-only
+  skip of an unreadable object keeps the blacklist. That pre-PUT existence
+  probe covers only a snapshot of unread keys in the backup batch; ordinary
+  backups use the backend's create-only PUT without a duplicate existence
+  RPC. Keys marked unread after the snapshot remain unread conservatively.
+  The unread set is
+  also bounded to Host CacheBlock capacity (LCM parents times each
+  group's `cache_blocks_per_lcm_block`). Clients are not failed; mixed
+  prefill/decode partners in the same forward retract together so ranks
+  stay aligned. Existence and prefetch are skipped when L3 is unset:
+  Host-only and
+  `--disable-kvstore` admission must not hash prefixes or copy
+  `group_keys` for a storage index that does not exist. CI covers this path
+  with the in-process `memory` backend (scheduler tests register keys /
+  evict Host then assert `prefetch_from_storage`, and the CUDA runtime suite
+  round-trips packed Host bytes through `batch_put_from` / Host wipe /
+  `batch_get_into`) plus a live `mooncake_master` job that drives
+  `MooncakeKvStore` over TCP / `P2PHANDSHAKE`, matching SGLang HiCache /
+  vLLM `MooncakeStoreConnector` on packed CacheBlocks rather than split
+  K/V pages.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event.
+For L3 write-through, each lane carries only its own hashed Host destinations.
+Its CUDA completion starts those backups, and its scheduler ACK waits until
+those puts finish; a different lane completing cannot release its pages.
 
 `MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
 (group_id = index), all sharing one scheduler-level `prefix_granularity`
 while each manager may use a smaller cache-page token count.
+`enable_l3_storage` is a required argument so Host-hit tagging of L3 keys
+cannot be skipped by a silent default.
 
 ### `AdmissionPlanner` (`cache_admission.cpp`, anonymous namespace)
 

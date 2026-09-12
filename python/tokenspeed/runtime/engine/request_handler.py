@@ -36,6 +36,10 @@ from tokenspeed_kernel.profiling import (
 )
 from viztracer import VizTracer
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -107,6 +111,7 @@ class RequestHandler:
         vocab_size: int,
         recv_func,
         send_func,
+        can_clear_cache_fn,
         clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
@@ -146,6 +151,37 @@ class RequestHandler:
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        # Cache-owning ranks in this DP replica (attention TP × CP × PP).
+        # Distinct from attn_tp_* above: with PP those become WORLD so the
+        # request stream is identical across stages, which would also pull
+        # DP ranks into the TP MIN. Exists uses these replica groups;
+        # flush appends attention DP as its own group afterwards.
+        self._replica_tp_size = mapping.attn.tp_size
+        self._replica_tp_cpu_group = pg_manager.get_process_group(
+            "gloo", mapping.attn.tp_group
+        )
+        self.attn_cp_size = mapping.attn.cp_size
+        self.attn_cp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
+            if mapping.has_attn_cp
+            else None
+        )
+        self.pp_size = mapping.pp_size
+        self.pp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.pp_group)
+            if mapping.has_pp
+            else None
+        )
+        # Flush MIN includes attention DP after TP/CP/PP: object keys omit
+        # DP rank, so DP replicas share the Mooncake namespace. Exists,
+        # prefetch, and WriteBackDone stay TP/CP/PP only (EventLoop /
+        # L2CacheHooks); those ranks hold different sequences.
+        self.attn_dp_size = mapping.attn.dp_size
+        self.attn_dp_cpu_group = (
+            pg_manager.get_process_group("gloo", mapping.attn.dp_group)
+            if mapping.has_attn_dp
+            else None
+        )
         self.req_broadcaster = (
             PipelinedPyobjBroadcaster(
                 self.attn_global_rank,
@@ -160,11 +196,14 @@ class RequestHandler:
         # transitions run on the control-plane thread, where allocating is what
         # Principle 1 forbids -- see _profile_sync.
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
+        self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
+        self.can_clear_cache_fn = can_clear_cache_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -238,7 +277,7 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                success = self.clear_cache_fn is not None and self.clear_cache_fn()
+                success = self._try_clear_replica_cache()
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
@@ -269,7 +308,15 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self._device.update_weights(recv_req)
+                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                if ok:
+                    ok, msg = self._require_flush_for_l3_version_switch(recv_req)
+                if ok:
+                    ok, msg = self._flush_cache_before_weight_load(recv_req)
+                if ok:
+                    ok, msg = self._device.update_weights(recv_req)
+                    if ok:
+                        ok, msg = self._commit_l3_weight_version(recv_req, msg)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
@@ -282,6 +329,171 @@ class RequestHandler:
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
+        """Reject a flushed L3 update that has no checkpoint identity.
+
+        Minting ``{current}-uN`` from the old label is not checkpoint
+        specific: two servers that start at ``default`` and load different
+        weights would both publish under ``default-u1``. The second flush
+        only deletes the old ``default`` prefix, so the first server's
+        objects remain and can be restored for incompatible weights.
+        """
+
+        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        if (
+            storage_backend is None
+            or not recv_req.flush_cache
+            or recv_req.weight_version is not None
+        ):
+            return True, ""
+        return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
+
+    def _require_flush_for_l3_version_switch(self, recv_req) -> tuple[bool, str]:
+        """Reject an L3 namespace change that would skip cache invalidation.
+
+        Device/Host still hold KV from the previous checkpoint until a
+        successful ``flush_cache``. Switching the Mooncake prefix first
+        lets later D2H copies (not yet in ``_backup_futures``) land under
+        the new namespace, and lets Admit reuse the stale local indexes
+        as if they belonged to the new weights.
+        """
+
+        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        if storage_backend is None or recv_req.flush_cache:
+            return True, ""
+        version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            recv_req.weight_version,
+            flush_cache=False,
+            storage_backend=storage_backend,
+        )
+        if version is None or str(version) == str(self.server_args.weight_version):
+            return True, ""
+        return (
+            False,
+            "L3 weight_version cannot change without flush_cache; "
+            "retry the update with flush_cache=True so Device/Host KV "
+            "and in-flight writebacks cannot land in the new namespace",
+        )
+
+    def _flush_cache_before_weight_load(self, recv_req) -> tuple[bool, str]:
+        """Invalidate Device/Host (and L3 objects) before replacing GPU weights.
+
+        ``ClearCache`` rejects in-flight Host writebacks. Doing this after
+        ``update_weights`` would leave new parameters on the old prefix
+        indexes with no rollback. A failed flush keeps the previous
+        checkpoint intact so the caller can retry.
+
+        Rank-local ``ClearCache`` is all-or-nothing, but a replica can still
+        split: one rank with no in-flight writebacks would clear Device/Host
+        while a peer rejects. ``_try_clear_replica_cache`` MIN-reduces the
+        probe, then MIN-reduces L3 deletion, then clears. An L3 writeback
+        can still be in flight on one TP/CP/PP/DP rank after it has completed
+        on the others; those successful ranks must not enter
+        ``update_weights_from_distributed`` (ordered NCCL broadcasts)
+        while a peer skips it.
+        """
+
+        if not recv_req.flush_cache:
+            return True, ""
+        if not self._try_clear_replica_cache():
+            return (
+                False,
+                "cache flush failed; retry the update after in-flight "
+                "Host writebacks drain",
+            )
+        return True, ""
+
+    def _try_clear_replica_cache(self) -> bool:
+        """MIN-reduce clearability, delete L3, then mutate Device/Host.
+
+        Mirrored schedulers must keep the same prefix indexes. A rank whose
+        Host writebacks have drained must not ``ClearCache`` while a TP, CP,
+        PP, or DP peer still rejects. Remote L3 deletion is its own
+        error-returning phase: it runs after the probe agrees and before
+        the irreversible local clear, then MIN-reduces so a Mooncake
+        failure cannot leave one rank cleared and another in NCCL.
+        Exists uses attention TP, then CP, then PP. Flush appends DP
+        because DP replicas share Mooncake objects.
+        """
+
+        if not self._converge_replica_decision(self.can_clear_cache_fn()):
+            return False
+        if not self._converge_replica_decision(self._delete_l3_namespace()):
+            return False
+        return self.clear_cache_fn is not None and self.clear_cache_fn()
+
+    def _delete_l3_namespace(self) -> bool:
+        device = self._device
+        if device is None:
+            return True
+        return bool(device.delete_l3_namespace())
+
+    def _converge_replica_decision(self, local_ok: bool) -> bool:
+        """MIN-reduce a yes/no across every rank that shares this flush.
+
+        Attention TP, then CP, then PP (same order as
+        ``EventLoop._converge_l3_exists``), then attention DP. Exists and
+        WriteBackDone omit DP because those ranks hold different sequences.
+        Flush includes DP: ``storage_object_key`` has no DP rank, so a
+        replica that is clearable must not ``remove_by_prefix`` while
+        another DP replica still has in-flight Host-to-store backups.
+        CPU-tensor gloo all_reduce, not a barrier: see ``_profile_sync``.
+        """
+
+        groups = []
+        if self._replica_tp_size > 1 and self._replica_tp_cpu_group is not None:
+            groups.append(self._replica_tp_cpu_group)
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            groups.append(self.attn_cp_cpu_group)
+        if self.pp_size > 1 and self.pp_cpu_group is not None:
+            groups.append(self.pp_cpu_group)
+        if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
+            groups.append(self.attn_dp_cpu_group)
+        if not groups:
+            return local_ok
+        buf = self._replica_decision_buf
+        buf[0] = 1 if local_ok else 0
+        for group in groups:
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        return bool(buf.item())
+
+    def converge_replica_decision(self, local_ok: bool) -> bool:
+        """Public replica MIN-reduce for control-plane yes/no decisions."""
+
+        return self._converge_replica_decision(local_ok)
+
+    def _commit_l3_weight_version(self, recv_req, msg: str) -> tuple[bool, str]:
+        """Publish under the new checkpoint after a successful GPU load.
+
+        Device/Host have already been flushed when ``flush_cache`` was
+        requested. The prefix is rebuilt here so newly computed KV cannot
+        land in a peer still serving the previous ``weight_version``.
+        Flushed L3 updates require an explicit ``weight_version``. An
+        explicit new version with ``flush_cache=False`` is rejected
+        before the GPU load.
+        """
+
+        ok, err = self._require_weight_version_for_l3_flush(recv_req)
+        if not ok:
+            return False, err
+        ok, err = self._require_flush_for_l3_version_switch(recv_req)
+        if not ok:
+            return False, err
+        version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            recv_req.weight_version,
+            flush_cache=recv_req.flush_cache,
+            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+        )
+        if version is None:
+            return True, msg
+        self.server_args.weight_version = str(version)
+        self._device.set_l3_weight_version(str(version))
+        return True, msg
 
     def handle_generate_request(
         self,

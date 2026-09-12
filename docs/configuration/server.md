@@ -53,8 +53,13 @@ policy version that produced a sample.
 
 The SGLang-compatible `update_weights_from_distributed`,
 `update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
-optional `weight_version`. The version changes only after the update succeeds;
-omitting it preserves the current value.
+optional `weight_version`. The version changes only after the update succeeds.
+`Engine.update_weights_from_distributed` requires `weight_version`; pass
+`None` to keep the current value on an intermediate update. Flushed L3
+updates must pass a caller-supplied identity so independent checkpoints
+cannot share a minted successor. When L3 is on, a
+new `weight_version` requires `flush_cache=True`; intermediate updates may
+pass `None` until the last call flushes.
 
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
@@ -314,3 +319,127 @@ features directly:
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+
+### Host L2 and Mooncake Store L3
+
+Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
+buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
+adds Mooncake Store as L3 under that buffer, following SGLang HiCache /
+vLLM `MooncakeStoreConnector`:
+
+```
+GPU Device KV (L1)
+  ↕ D2H / H2D
+Host pinned buffer (L2 / flat KV)
+  ↕ batch_put_from / batch_get_into
+Mooncake Store (L3)
+```
+
+Each packed Host CacheBlock is one Mooncake object, keyed as
+`{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
+The hashed prefix includes the loaded checkpoint (`--model`, the resolved
+immutable revision or a local fingerprint of selected weights, metadata,
+and local `*.py` including imported package subdirectories — never an inherited
+config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
+`(models|datasets|spaces)--*/snapshots/<commit>` cache path with a sibling
+`refs` directory (a directory merely named `snapshots` is fingerprinted)
+— plus `--load-format` so a directory that contains
+more than one weight encoding cannot share objects across loaders
+(`sharded_state` combines every rank's local files matching the
+configured shard pattern, default `model-rank-*-part-*`, not only rank
+0's; `npcache` fingerprints the NumPy cache when present), and
+`--weight-version`), `--hf-overrides` (the effective
+HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
+fields), the packed Host layout (field payloads, not GPU-capacity
+device arena offsets), the
+cache-quantization config (including `quantization_param_path` scale-file
+bytes and `--speculative-draft-model-quantization` when a draft pool is
+present), the pipeline stage, the context-parallel
+width (`cp_size`), any
+speculative draft checkpoint, and `L3_RUNTIME_COMPAT` (bumped when
+built-in model code, RoPE, or a cache-producing kernel changes KV for
+the same checkpoint and layout). Live weight updates flush Device/Host
+before the GPU load, then rebuild that prefix. A requested `flush_cache`
+must succeed first: in-flight Host writebacks cause `ClearCache` to
+reject. Weight-update `flush_cache` and standalone `/flush_cache`
+MIN-reduce a non-mutating `can_clear_cache` probe across cache-owning
+ranks (attention TP, then CP, then PP) and then across attention DP
+before any rank clears. Exists, prefetch, and `WriteBackDone` stay
+TP/CP/PP because DP ranks hold different sequences; flush includes DP
+because object keys omit DP rank. Remote L3 deletion is the next
+replica-then-DP phase: it
+returns success/failure instead of raising, is MIN-reduced, and only
+then does `ClearCache` destroy Device/Host. A rank whose writebacks have
+drained cannot rotate L3 or drop local indexes while a peer still
+rejects or while Mooncake `remove_by_regex` failed on another rank. The
+frontend ANDs every DP worker's `/flush_cache` reply. A
+split flush would leave mirrored
+schedulers with different prefix indexes. The weight-update RPC then
+fails so the caller retries instead of serving new weights against the
+previous checkpoint or entering NCCL weight broadcasts alone. A
+`batch_exists` hit is not a lease: if
+`batch_get_into` misses after Admit, the runtime unregisters the key,
+skips publishing empty Host pages, and retracts the batch snapshot-less
+so the next admit recomputes those tokens. Failed `batch_get_into` pages
+stay unread so a later `batch_exists` hit cannot re-register them and
+retry the same prefetch; only replica-converged misses are blacklisted.
+Replica admission MIN-reduces local readability (exists and not unread).
+A later Host backup forgets an unread entry only when it created a
+missing object; a create-only skip of an unreadable object keeps the
+blacklist. The unread set is bounded to Host CacheBlock capacity (LCM
+parents times each group's `cache_blocks_per_lcm_block`).
+A backend exception or malformed result is a
+local miss so every replica rank still enters the MIN-reduce. Clients
+are not failed.
+L2 write-back ACKs use the same replica groups: `WriteBackDone` is
+emitted only after every cache-owning rank holds the completion, so an
+ENABLE_CP worker cannot publish Host while a CP peer's Mooncake put is
+still in flight. A truncated `batch_is_exist` reply is a failed put, not
+an implicit success.
+Supplying a new
+`weight_version` with `flush_cache=False` is rejected when L3 is on so
+stale Device/Host KV and in-flight D2H copies cannot be treated as the
+new checkpoint. Flushed L3 updates require an explicit `weight_version`;
+minting `{current}-uN` would let independent checkpoints collide.
+A successful Engine update stamps that version into
+frontend `server_args`.
+Context-parallel workers (`ENABLE_CP`) share
+`attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
+in the hashed namespace. GQA with TP above the KV-head count assigns
+different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
+`mapping.attn.tp_size`) is also in the namespace.
+`global_segment_size` is split across
+attention-TP × context-parallel × pipeline-parallel ranks so the
+mounted total matches the configured size. Use the resolved mapping
+(`mapping.attn.tp_size` and `mapping.attn.cp_size`), not `--attn-tp-size`
+alone: `ENABLE_CP` with an omitted `--attn-tp-size` infers `cp_size = N`
+and `tp_size = 1`. L3 requires Host L2 (do not pass `--disable-kvstore`).
+Pass Mooncake client settings as JSON
+in `--kvstore-storage-backend-extra-config`, for example:
+
+```json
+{
+  "master_server_address": "10.0.0.1:50051",
+  "local_hostname": "localhost",
+  "metadata_server": "P2PHANDSHAKE",
+  "global_segment_size": "16gb",
+  "protocol": "tcp"
+}
+```
+
+Constructing `MooncakeKvStore` requires `extra_config`; pass `None` to
+use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
+Queued requests that can take a batch slot and Device pages this round
+re-probe L3 immediately before admission so a hit that waited for capacity
+cannot keep a deleted or evicted object as a Host hit. A full decode batch
+or exhausted Device pool does not rehash the rest of the wait queue.
+`--kvstore-storage-backend memory` is an in-process dict for tests only.
+CI exercises that Mooncake-compatible contract end-to-end (scheduler
+prefetch after `register_storage_keys` / Host eviction, and a CUDA
+D2H → store → Host wipe → prefetch → H2D round trip). A separate
+ubuntu job boots `mooncake_master` and runs
+`test/test_l3_mooncake_master.py` against the real TCP client
+(`P2PHANDSHAKE`). Reuse an already-running master with
+`MOONCAKE_MASTER=host:port`.
+Mooncake Store is the offload backend; PD KV transfer still uses the
+separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).

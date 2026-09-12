@@ -264,7 +264,11 @@ class DeviceHandle:
     # ------------------------------------------------------------------
 
     def execute(
-        self, execution_plan, planned: "PlannedForward | None"
+        self,
+        execution_plan,
+        planned: "PlannedForward | None",
+        *,
+        submit_remote_prefill: bool,
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
@@ -278,7 +282,9 @@ class DeviceHandle:
         page zeroing (the new owner's sanitization), then load-backs (they
         target zeroed pages), the transfer peer's remote streams, and finally
         the ``ForwardBatch``. The loop hands the round over and does not
-        branch on it.
+        branch on it, except withholding ``plan.remote_prefill`` after
+        vanished-L3 recovery -- the same snapshot-less retract that skips
+        the model forward.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
@@ -292,6 +298,11 @@ class DeviceHandle:
                 collective. Either way the plan's page zeroing and cache
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
+            submit_remote_prefill: Whether to submit ``plan.remote_prefill``.
+                False after vanished-L3 recovery: those requests retract
+                snapshot-less, and pulling suffix-only KV onto empty prefix
+                pages would land invalid cache on the decode node. Cache
+                ops still run so LoadBackDone can unpin without publishing.
 
         Returns:
             The submitted forward's ``PendingExecution``, or None on rounds
@@ -355,7 +366,7 @@ class DeviceHandle:
                 self._thread.submit(lambda: peer.execute(remote_decode))
             )
         remote_prefill = execution_plan.remote_prefill
-        if remote_prefill is not None:
+        if remote_prefill is not None and submit_remote_prefill:
             # D role: the prompt prefills on the peer; pull its KV into the
             # pages this plan admitted (and may be zeroing).
             self._transfer_submissions.append(
@@ -450,6 +461,144 @@ class DeviceHandle:
             "no completion events and would hang their cache-gated requests",
         )
         return l2.poll_results()
+
+    def consume_l3_backup_poll_failure(self) -> bool:
+        """Whether an L3 backup future failed since the last consume.
+
+        ``poll_cache_results`` must not raise that failure:
+        ``L2CacheHooks.poll_ready_events`` still has to enter replica
+        collectives. A rank-local raise hangs peers in those waits.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        consume = getattr(l2, "consume_backup_poll_failure", None)
+        if consume is None:
+            return False
+        return bool(consume())
+
+    def query_l3_storage(self, pages) -> list[bool] | None:
+        """Probe immutable L3 objects without exposing the Host-cache tier."""
+
+        l2 = self._l2
+        if l2 is None:
+            return None
+        return l2.l3_exists(pages)
+
+    def plan_has_l3_prefetch(self, execution_plan) -> bool:
+        """True when this plan's load-backs need ``batch_get_into``."""
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        return l2.plan_has_l3_prefetch(execution_plan)
+
+    def prefetch_l3_load_backs(self, execution_plan) -> list[bool]:
+        """Fill Host pages from L3 on the control plane. CPU-only.
+
+        Returns per-page ``batch_get_into`` success, aligned with
+        ``l3_prefetch_storage_keys``. Existence is not a lease; the event
+        loop MIN-reduces this vector across the replica before H2D.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return []
+        return l2.prefetch_l3_load_backs(execution_plan)
+
+    def invalidate_l3_prefetch(self) -> None:
+        """Skip H2D for this plan's L3 sources after a replica-wide miss."""
+
+        if self._l2 is not None:
+            self._l2.invalidate_l3_prefetch()
+
+    def l3_prefetch_storage_keys(
+        self, execution_plan
+    ) -> tuple[list[int], list[str], list[int]]:
+        """Content hashes this plan would restore from L3, for unregister."""
+
+        l2 = self._l2
+        if l2 is None:
+            return [], [], []
+        return l2.l3_prefetch_storage_keys(execution_plan)
+
+    def mark_l3_keys_unread(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Remember keys whose ``batch_get_into`` failed after Admit.
+
+        ``batch_exists`` can still report these present. The next admit
+        MIN-reduces local readability (exists and not unread) so every
+        replica rank admits the same prefix. A later Host backup forgets
+        the entry only when the object was absent and this put created it;
+        a create-only skip of an unreadable object keeps the blacklist.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return
+        l2.mark_l3_keys_unread(groups=groups, hashes=hashes, offsets=offsets)
+
+    def l3_key_is_unread(
+        self, group_id: int, content_hash: str, page_offset: int
+    ) -> bool:
+        """True when this key already failed ``batch_get_into``."""
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        return l2.l3_key_is_unread(
+            group_id=int(group_id),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+
+    def forget_l3_unread_keys(
+        self, groups: list[int], hashes: list[str], offsets: list[int]
+    ) -> None:
+        """Allow a key to hit L3 again after this put created a missing object."""
+
+        l2 = self._l2
+        if l2 is None:
+            return
+        l2.forget_l3_unread_keys(groups=groups, hashes=hashes, offsets=offsets)
+
+    def delete_l3_namespace(self) -> bool:
+        """Delete L3 objects under the current prefix. Device/Host stay intact.
+
+        Returns True when L2/L3 is unset or the store reports the prefix
+        is gone. Call this before ``ClearCache``; a False must leave
+        every rank's Device/Host indexes untouched. A successful delete
+        also forgets unread prefetch keys so a new namespace can restore
+        the same content hashes.
+        """
+
+        if self._l2 is None:
+            return True
+        return self._l2.delete_l3_namespace()
+
+    def set_l3_weight_version(self, weight_version: str) -> None:
+        """Publish subsequent Host pages under the new checkpoint identity."""
+
+        if self._l2 is not None:
+            self._l2.set_l3_weight_version(weight_version)
+
+    def shutdown_cache(self) -> None:
+        """Join queued cache submissions, then close L2/L3 on the data plane."""
+
+        if self._l2 is None:
+            return
+        errors = []
+        while self._l2_submissions:
+            future = self._l2_submissions.popleft()
+            try:
+                future.result()
+            except BaseException as exc:  # noqa: BLE001 — surface after close
+                errors.append(exc)
+        self._thread.run(self._l2.shutdown)
+        if errors:
+            raise errors[0]
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
@@ -786,11 +935,6 @@ def build_device_side(
 
     l2_cache_executor = None
     if server_args.enable_kvstore:
-        if server_args.kvstore_storage_backend is not None:
-            raise NotImplementedError(
-                "the cache-group scheduler has no L3 storage tier; unset "
-                "--kvstore-storage-backend"
-            )
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(
@@ -799,7 +943,115 @@ def build_device_side(
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             io_backend=server_args.kvstore_io_backend,
+            attn_tp_rank=attn_tp_rank,
         )
+        if server_args.kvstore_storage_backend is not None:
+            from tokenspeed.runtime.cache.l3.backend import (
+                L3_RUNTIME_COMPAT,
+                cache_layout_signature,
+                l3_cache_quantization_id,
+                l3_checkpoint_id,
+                share_l3_checkpoint_ids,
+                storage_key_prefix,
+            )
+            from tokenspeed.runtime.cache.l3.factory import (
+                create_kvstore_storage_backend,
+            )
+
+            storage_backend = create_kvstore_storage_backend(
+                server_args.kvstore_storage_backend,
+                server_args.kvstore_storage_backend_extra_config,
+                host_buffer=l2_cache_executor.host_storage.host_buffer,
+                tp_size=server_args.mapping.attn.tp_size,
+                cp_size=server_args.mapping.attn.cp_size,
+                pp_size=(
+                    server_args.mapping.pp_size if server_args.mapping.has_pp else 1
+                ),
+            )
+            cache_signature = cache_layout_signature(
+                l2_cache_executor.layout,
+                cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+            )
+            import torch.distributed as dist
+
+            world_size = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+            rank = dist.get_rank() if world_size > 1 else 0
+            checkpoint_id = l3_checkpoint_id(
+                model_config.model_path,
+                hf_config=model_config.hf_config,
+                revision=str(model_config.revision or ""),
+                load_format=str(server_args.load_format),
+                # LoadConfig currently gets the same empty extra-config;
+                # both must stay aligned if a shard pattern is wired through.
+                model_loader_extra_config={},
+            )
+            if draft_model_config is not None:
+                draft_revision = l3_checkpoint_id(
+                    draft_model_config.model_path,
+                    hf_config=draft_model_config.hf_config,
+                    revision=str(draft_model_config.revision or ""),
+                    load_format=str(server_args.load_format),
+                    model_loader_extra_config={},
+                )
+            else:
+                draft_revision = ""
+
+            def gather_checkpoint_ids(payload: list) -> list:
+                gathered = [None] * world_size
+                dist.all_gather_object(gathered, payload)
+                return gathered
+
+            checkpoint_id, draft_revision = share_l3_checkpoint_ids(
+                [checkpoint_id, draft_revision],
+                rank=rank,
+                world_size=world_size,
+                gather=gather_checkpoint_ids,
+            )
+            pipeline_rank = (
+                server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
+            )
+            if draft_model_config is not None:
+                draft_model = str(draft_model_config.model_path)
+                draft_quantization = str(draft_model_config.quantization or "")
+            else:
+                draft_model = ""
+                draft_quantization = ""
+            cache_quantization = l3_cache_quantization_id(
+                quantization=str(model_config.quantization or ""),
+                quantization_param_path=str(server_args.quantization_param_path or ""),
+                draft_quantization=draft_quantization,
+            )
+            attn_tp_size = int(server_args.mapping.attn.tp_size)
+            cp_size = int(server_args.mapping.attn.cp_size)
+
+            def prefix_for_weight_version(weight_version: str) -> str:
+                return storage_key_prefix(
+                    server_args.model,
+                    revision=checkpoint_id,
+                    weight_version=weight_version,
+                    model_overrides=dict(model_config.model_override_args),
+                    cache_signature=cache_signature,
+                    pipeline_rank=pipeline_rank,
+                    attn_tp_size=attn_tp_size,
+                    cp_size=cp_size,
+                    draft_model=draft_model,
+                    draft_revision=draft_revision,
+                    draft_weight_version=weight_version if draft_model else "",
+                    cache_quantization=cache_quantization,
+                    runtime_compat=L3_RUNTIME_COMPAT,
+                )
+
+            l2_cache_executor.attach_l3_storage(
+                storage_backend,
+                key_prefix=prefix_for_weight_version(server_args.weight_version),
+                rank=attn_tp_rank,
+                cp_rank=server_args.mapping.attn.cp_rank,
+                prefix_for_weight_version=prefix_for_weight_version,
+            )
 
     kv_transfer = _build_kv_transfer(
         server_args,

@@ -268,7 +268,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
         ("zero", tuple(pages))
     )
 
-    handle.execute(plan, None)
+    handle.execute(plan, None, submit_remote_prefill=True)
 
     assert trace == [
         "submit",
@@ -283,11 +283,23 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     assert trace[-1] != "submit"
 
 
+def test_page_zeroing_without_l2_submits_only_zeroing():
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
+    )
+
+    handle.execute(_plan(pages_to_zero=[3, 4]), None, submit_remote_prefill=True)
+
+    assert trace == ["submit", ("zero", (3, 4))]
+
+
 def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
     handle = _handle(trace, l2_cache_executor=SimpleNamespace())
 
-    handle.execute(_plan(), None)
+    handle.execute(_plan(), None, submit_remote_prefill=True)
 
     assert trace == []
 
@@ -310,11 +322,31 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=["op"]), None)
+    handle.execute(_plan(cache=["op"]), None, submit_remote_prefill=True)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
     assert isinstance(info.value.__cause__, ValueError)
+
+
+def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
+    from concurrent.futures import Future
+
+    trace: list = []
+    handle = _handle(
+        trace,
+        l2_cache_executor=SimpleNamespace(
+            shutdown=lambda: trace.append("l2_shutdown"),
+        ),
+    )
+    pending = Future()
+    pending.set_result(None)
+    handle._l2_submissions.append(pending)
+
+    handle.shutdown_cache()
+
+    assert list(handle._l2_submissions) == []
+    assert trace == ["run", "l2_shutdown"]
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():
@@ -344,10 +376,11 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     chunk = _planned(num_extends=1, label="CHUNK")
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    handle.execute(_plan(), chunk)
+    handle.execute(_plan(), chunk, submit_remote_prefill=True)
     handle.execute(
         _plan(remote_decode=remote_decode),
         None,
+        submit_remote_prefill=True,
     )
 
     # Arming is enqueued before the forward it arms; the send follows the
@@ -673,13 +706,34 @@ def test_the_event_loop_stores_only_the_running_handle():
 def test_the_handle_stays_a_closed_list_of_named_operations():
     """A god object forms one convenience method at a time.
 
-    The bound is not sacred, but pushing past it should be a deliberate
-    change — and every entry should be a named operation, not a "run this
-    closure" slot. Exactly one such slot is registered (EPD admission's
-    device half is a state machine; see run_multimodal_work).
+    Pin the operation names so even a same-size substitution needs review.
+    L3 control operations keep the Host tier behind the handle, as documented
+    in docs/design/event-loop.md. Exactly one generic work slot is registered
+    (EPD admission's device half; see run_multimodal_work).
     """
     public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    assert len(public) <= 10, sorted(public)
+    assert public == {
+        "execute",
+        "role",
+        "poll_cache_results",
+        "consume_l3_backup_poll_failure",
+        "query_l3_storage",
+        "plan_has_l3_prefetch",
+        "prefetch_l3_load_backs",
+        "invalidate_l3_prefetch",
+        "l3_prefetch_storage_keys",
+        "mark_l3_keys_unread",
+        "l3_key_is_unread",
+        "forget_l3_unread_keys",
+        "delete_l3_namespace",
+        "set_l3_weight_version",
+        "shutdown_cache",
+        "run_idle_forward",
+        "run_multimodal_work",
+        "run_kv_repair",
+        "run_remote_prefill_landing",
+        "update_weights",
+    }
     assert {name for name in public if name.endswith("_work")} == {
         "run_multimodal_work"
     }

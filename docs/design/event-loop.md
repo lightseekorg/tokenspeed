@@ -43,7 +43,10 @@ the admitted prompt's KV in), `plan.remote_decode` the peer's on a P node
 (the completed prompt decodes over there, so its KV goes out). The remote
 streams ride beside whatever forward work the round schedules, occupy no
 batch slot, and go out even on rounds with no batch at all — everything
-dispatchable dispatches in one round. The transfer moves
+dispatchable dispatches in one round. Vanished-L3 recovery is the one
+withhold: it retracts `plan.remote_prefill` request ids with the local
+forward and does not submit that stream, so the peer cannot land
+suffix-only KV on empty prefix pages. The transfer moves
 KV-pool device memory over RDMA rather than through a CUDA kernel, but it
 needs the same ordering against forwards and page zeroing — so its execution
 face lives behind the handle too, attached once at startup. Its control face
@@ -66,6 +69,13 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
+  The architecture test pins the exact public operation names, not a numeric
+  size limit. L3 adds named Host-tier operations for existence/readability
+  probes, prefetch planning/results, failed-read invalidation, namespace and
+  weight-version changes, and cache shutdown. These keep the executor and
+  Host buffer hidden; they do not introduce another generic work slot.
+  Changing this surface requires updating both this contract and the explicit
+  operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of
@@ -255,10 +265,10 @@ For orientation, one iteration of `event_loop`:
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
-   record metrics, DP-sync, and gather per-batch state (draining the
-   in-flight queue first if the dispatch depends on a pending commit,
-   Principle 4).
+   step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
+   derive the forward op, record metrics, DP-sync, and gather per-batch state
+   (draining the in-flight queue first if the dispatch depends on a pending
+   commit, Principle 4).
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache write-backs first (a retraction's snapshot copy must read the
@@ -293,3 +303,53 @@ For orientation, one iteration of `event_loop`:
 * Never call `scheduler.advance`, `advance_scheduler`, or the KV event
   publisher from a helper or hooks class.
 * Never issue CUDA work, or hold something that can, from the control plane.
+* L3 `batch_exists` registration is on the admit path, but only when
+  `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
+  default (`--disable-kvstore`) path is a control-plane cost the loop must
+  not pay: a round is microseconds, and agentic history is tens of thousands
+  of tokens. When L3 is on, existence is MIN-reduced across every
+  cache-owning rank in the replica (attention TP, then CP, then PP) so
+  those ranks admit the same prefix pages. L2 ``WriteBackDone`` /
+  ``LoadBackDone`` completions are intersected the same way before
+  ``CompleteWriteBack``: L3 Host backups finish asynchronously, so a
+  rank-local ACK would publish a Host block on one mirrored scheduler
+  while a CP/PP peer still has the op pending. A backup future that
+  fails is MAX-reduced on the same replica all_reduce that agrees
+  whether any rank has cache work; every rank raises after that
+  collective instead of one rank raising out of ``poll_results`` while
+  peers wait in ``all_gather_object``. Every rank stays in every
+  replica-group gather, even when an earlier TP/CP intersection is empty;
+  breaking out leaves a peer unmatched on the next ``all_gather_object``. Weight-update `flush_cache`
+  and standalone `/flush_cache` MIN-reduce a non-mutating
+  `can_clear_cache` probe across the replica (attention TP, then CP,
+  then PP) and then across attention DP — DP replicas share Mooncake
+  objects — then MIN-reduce an error-returning L3 `remove_by_prefix`,
+  before any rank mutates Device/Host. The frontend ANDs every DP
+  worker's reply. Independent TokenSpeed jobs that share a tenant are
+  not in those groups. Queued Submitted/Retracted
+  hashes of requests that can take a batch slot and Device pages this
+  round are re-probed immediately before `next_execution_plan` so a hit
+  registered at submit cannot be admitted after the object is gone. A
+  full decode batch, a head-of-line incomplete prefill, or an exhausted
+  Device pool skips the rest of the wait queue so a long prompt is not
+  hashed and remotely probed on every token step.
+  After Admit, vanished L3 objects are recovered on the same path:
+  control-plane `batch_get_into`, replica MIN, skip H2D / skip
+  publishing empty Host pages and empty Device prefetch destinations,
+  snapshot-less retract of the batch so the next admit recomputes.
+  D-role admit rides `plan.remote_prefill` with no local forward: those
+  request ids retract with the same events, and the loop withholds that
+  stream from `DeviceHandle.execute` so the peer does not land
+  suffix-only KV on empty prefix pages. Cache ops still run so
+  LoadBackDone can unpin without publishing.
+  Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
+  cannot re-register them; only the replica-converged misses are
+  blacklisted, so a restored prefix page stays readable. Replica
+  admission MIN-reduces local readability (exists and not unread). A
+  later Host backup forgets an unread entry only when it created a
+  missing object; a create-only skip of an unreadable object keeps the
+  blacklist. The unread set is bounded to Host CacheBlock capacity
+  (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
+  exception or malformed existence / prefetch result is a local miss so
+  every cache-owning rank still enters the replica MIN; raising would
+  hang healthy peers. Clients are not failed.

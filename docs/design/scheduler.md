@@ -18,6 +18,22 @@ scheduled, never for the whole prompt**: `schedulePrefill` /
 this chunk's tokens, and the coordinator either grants the pages or the
 request stays put.
 
+When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
+`host_prefix_tokens` and rounds that length down to `prefix_granularity`
+(the identity boundary every group's `block_granularity` divides).
+`acquireHostWithKeys` re-runs the non-prefix-closed matcher at that bound
+and reconverges the groups: truncating a sliding-window or Mamba hits
+mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
+two-token blocks requiring two lookback pages) can leave the first live
+lookback page as a hole, and a full re-probe would see the same L3 keys
+as a complete hit again. `schedulePrefillFirstChunk` then frees that
+attempt — including the discarded `AdmissionResult`, whose `load_pairs`
+pin Host sources and Device destinations independently of the tables —
+and retries from the shortened probe so `hit_tokens` / `tokens_this_round`
+match the tables. Each retry recomputes the reserve from the cache group's
+declared `block_granularity`, using the same reservation interface as later
+prefill chunks.
+
 Two adjustments ride on top of the raw chunk size:
 
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
@@ -330,9 +346,15 @@ Prefilling again, but its generated tokens still exist (an earlier
 retraction rebased them into its prefill window), and its standing survives.
 A store-less fused retraction is not in this ordering at all — it has no L2
 pages to load back, so it re-prefills through the ordinary admission path
-(`admitsLikeNewPrompt`). There is no queue to keep in step with the FSM: a
-request that finishes or aborts while retracted simply stops qualifying,
-with no bookkeeping to prune.
+(`admitsLikeNewPrompt`). The runtime can also emit `forward::Retract` without
+a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
+not filled, so publishing would cache empty KV; the request re-prefills
+the same way. Mixed partners in that forward retract together so ranks
+stay aligned, and a D-role `plan.remote_prefill` admission retracts with
+them — the peer pull is withheld so suffix-only KV cannot land on empty
+prefix pages. The client is not failed. There is no queue to keep in
+step with the FSM: a request that finishes or aborts while retracted
+simply stops qualifying, with no bookkeeping to prune.
 
 **A readmission that does not fit, waits.** Its failed admission never
 triggers retraction (it is never recorded as the capacity blocker): when the

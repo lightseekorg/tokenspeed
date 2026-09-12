@@ -49,7 +49,7 @@ public:
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     void CompleteWriteBack(std::uint32_t op_id);
-    void CompleteLoadBack(std::uint32_t op_id);
+    void CompleteLoadBack(std::uint32_t op_id, bool success);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     // Pinned stores hold Device capacity that returns by itself at the ACK;

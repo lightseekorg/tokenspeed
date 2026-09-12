@@ -126,7 +126,7 @@ def _planned(*, num_extends=0):
 
 def test_plain_engine_forwards_with_the_batch_grammar():
     trace = []
-    pending = _handle(trace).execute(_plan(), _planned())
+    pending = _handle(trace).execute(_plan(), _planned(), submit_remote_prefill=True)
 
     assert trace[0] == "submit"
     assert trace[1][1] == "GRAMMAR"
@@ -150,7 +150,9 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
     pending = handle.execute(
-        _plan(pages_to_zero=[7], remote_prefill=remote_prefill), None
+        _plan(pages_to_zero=[7], remote_prefill=remote_prefill),
+        None,
+        submit_remote_prefill=True,
     )
     trace.remove("submit")  # the zeroing submission itself
     trace.remove("submit")  # the receive submission itself
@@ -158,7 +160,37 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     # No model output this round, and the whole path ran as one unit on the
     # data plane, with the zeroing barrier before the manifest is published.
     assert pending is None
-    assert trace == [("slots", [3]), "seed-lengths", "zero-sync", "rdma"]
+    assert trace == [
+        ("slots", [3]),
+        "seed-lengths",
+        "zero-sync",
+        "rdma",
+    ]
+
+
+def test_vanished_l3_recovery_does_not_submit_remote_prefill():
+    """D-role vanished-L3 retracts skip the peer pull.
+
+    Suffix-only KV on empty prefix pages would land a RemotePrefillDone
+    with invalid cache. Page zeroing still runs so LoadBackDone can unpin.
+    """
+    trace = []
+    handle = _handle(trace, _DecodePeer(trace))
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
+    )
+    remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
+
+    pending = handle.execute(
+        _plan(pages_to_zero=[7], remote_prefill=remote_prefill),
+        None,
+        submit_remote_prefill=False,
+    )
+
+    assert pending is None
+    assert "rdma" not in trace
+    assert "seed-lengths" not in trace
+    assert trace == ["submit", ("zero", (7,))]
 
 
 def test_decode_node_masks_local_batches_with_the_batch_grammar():
@@ -166,7 +198,7 @@ def test_decode_node_masks_local_batches_with_the_batch_grammar():
     RemotePrefillDoneEvent landed, so decode masks from the right state."""
     trace = []
     pending = _handle(trace, _DecodePeer(trace)).execute(
-        _plan(), _planned(num_extends=0)
+        _plan(), _planned(num_extends=0), submit_remote_prefill=True
     )
 
     assert pending is not None
@@ -180,7 +212,9 @@ def test_prefill_node_sends_remote_decodes_from_the_plan_stream():
     remote_decode = SimpleNamespace(request_ids=["done"])
 
     pending = _handle(trace, _PrefillPeer(trace)).execute(
-        _plan(remote_decode=remote_decode), _planned(num_extends=1)
+        _plan(remote_decode=remote_decode),
+        _planned(num_extends=1),
+        submit_remote_prefill=True,
     )
 
     # The send reads KV that earlier forwards wrote, so it rides the FIFO
@@ -200,7 +234,7 @@ def test_remote_decodes_go_out_even_on_an_idle_round():
     remote_decode = SimpleNamespace(request_ids=["done"])
 
     result = _handle(trace, _PrefillPeer(trace)).execute(
-        _plan(remote_decode=remote_decode), None
+        _plan(remote_decode=remote_decode), None, submit_remote_prefill=True
     )
 
     assert result is None
@@ -211,7 +245,9 @@ def test_prefill_node_captures_next_input_ids_for_the_bootstrap_payload():
     trace = []
     peer = _PrefillPeer(trace)
 
-    pending = _handle(trace, peer).execute(_plan(), _planned(num_extends=1))
+    pending = _handle(trace, peer).execute(
+        _plan(), _planned(num_extends=1), submit_remote_prefill=True
+    )
 
     assert pending is not None
     # The layerwise arming is enqueued BEFORE the forward it arms — and
@@ -233,10 +269,14 @@ def test_a_failed_transfer_submission_surfaces_at_the_next_round():
 
     peer.execute = _boom
     handle = _handle(trace, peer)
-    handle.execute(_plan(remote_decode=SimpleNamespace(request_ids=["x"])), None)
+    handle.execute(
+        _plan(remote_decode=SimpleNamespace(request_ids=["x"])),
+        None,
+        submit_remote_prefill=True,
+    )
 
     with pytest.raises(RuntimeError, match="transfer submission failed"):
-        handle.execute(_plan(), None)
+        handle.execute(_plan(), None, submit_remote_prefill=True)
 
 
 def test_role_values_are_the_disaggregation_modes():

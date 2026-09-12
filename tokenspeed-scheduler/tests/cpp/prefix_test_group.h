@@ -103,9 +103,9 @@ public:
                            std::int32_t max_blocks) const {
         if (sliding_window_ > 0) {
             return SwaMatcher(geometry_.BlockGranularity(), sliding_window_)
-                .Probe(index_, pool, keys, begin_blocks, max_blocks);
+                .Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
         }
-        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks);
+        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
     }
 
     PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
