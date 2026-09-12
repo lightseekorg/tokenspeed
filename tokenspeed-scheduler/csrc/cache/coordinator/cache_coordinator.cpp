@@ -70,12 +70,12 @@ bool CacheCoordinator::ClearDeviceCache() {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
-        std::vector<CacheBlockLocation> group_locations = index.EvictableLocations(pool_);
-        if (static_cast<std::int32_t>(group_locations.size()) != index.NumEntries(pool_)) {
+        const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(pool_);
+        if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(pool_)) {
             return false;
         }
-        for (CacheBlockLocation location : group_locations) {
-            cached_locations.emplace_back(group.Id(), location);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
+            cached_locations.emplace_back(group.Id(), entry.location);
         }
     }
 
@@ -94,12 +94,12 @@ bool CacheCoordinator::ClearCache() {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> host_locations;
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
-        std::vector<CacheBlockLocation> group_locations = index.EvictableLocations(*host_pool_);
-        if (static_cast<std::int32_t>(group_locations.size()) != index.NumEntries(*host_pool_)) {
+        const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(*host_pool_);
+        if (static_cast<std::int32_t>(group_entries.size()) != index.NumEntries(*host_pool_)) {
             return false;
         }
-        for (CacheBlockLocation location : group_locations) {
-            host_locations.emplace_back(group.Id(), location);
+        for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
+            host_locations.emplace_back(group.Id(), entry.location);
         }
     }
 
@@ -332,6 +332,11 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     return out;
 }
 
+// A full-pool census, and deliberately so: whether a parent is reclaimable
+// depends on whether a request still owns one of its children, and a reference
+// being dropped is not an event the pool or the index can observe. This is an
+// observability call, not part of admission or placement; those answer their
+// capacity questions from the pool's own counters.
 std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
     for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
@@ -374,13 +379,8 @@ std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) con
             "cache group index out of range");
     const std::int32_t slots_per_parent =
         groups_[static_cast<std::size_t>(group_index)].Allocator().CacheBlocksPerLcmBlock();
-    std::int32_t available = pool_.NumEmptyLcmBlocks() * slots_per_parent;
-    for (std::int32_t id = 1; id <= pool_.NumLcmBlocks(); ++id) {
-        if (pool_.BoundGroup(id) == static_cast<std::uint32_t>(group_index)) {
-            available += slots_per_parent - pool_.OccupiedCount(id);
-        }
-    }
-    return available;
+    return pool_.NumEmptyLcmBlocks() * slots_per_parent +
+           pool_.NumFreeSlotsInGroup(static_cast<std::uint32_t>(group_index));
 }
 
 std::int32_t CacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const {
@@ -583,13 +583,19 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             unresolved_by_group[group_ids[i]].push_back(i);
         }
     }
-    const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
-        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
-        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
-        return std::tuple{metadata->was_acquired, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
+    // Retention value of one Host cache entry: keep what a request has already
+    // proven useful, then the most recently accessed, then a stable tie-break.
+    const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
+                          const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+        return std::tuple{metadata.was_acquired, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
                           location.slot_index};
     };
-    using HostCacheValue = decltype(value(std::uint32_t{}, CacheBlockLocation{}));
+    const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
+        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
+        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
+        return value(candidate_group, location, *metadata);
+    };
+    using HostCacheValue = decltype(lookup_value(std::uint32_t{}, CacheBlockLocation{}));
 
     for (std::uint32_t group_id : group_order) {
         std::vector<std::size_t>& unresolved = unresolved_by_group[group_id];
@@ -597,11 +603,17 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             continue;
         }
         ++batch.stats.same_group_scans;
-        std::vector<CacheBlockLocation> local_victims = groups_[group_id].Index().EvictableLocations(*host_pool_);
-        std::ranges::sort(local_victims, {}, [&](CacheBlockLocation location) { return value(group_id, location); });
+        std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
+            groups_[group_id].Index().EvictableCandidates(*host_pool_);
         const std::size_t victim_count = std::min(unresolved.size(), local_victims.size());
+        // Only the entries actually evicted have to be ordered, and the batch
+        // asks for far fewer than the tier holds.
+        std::ranges::partial_sort(local_victims, local_victims.begin() + static_cast<std::ptrdiff_t>(victim_count), {},
+                                  [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
+                                      return value(group_id, candidate.location, candidate.metadata);
+                                  });
         for (std::size_t i = 0; i < victim_count; ++i) {
-            _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i]).has_value(),
+            _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i].location).has_value(),
                     "selected Host child is not evictable");
         }
         const std::int32_t packing = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
@@ -629,7 +641,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 if (!host_pool_->IsOccupied(location)) {
                     continue;
                 }
-                const auto child_value = value(*bound_group, location);
+                const auto child_value = lookup_value(*bound_group, location);
                 parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
             }
             _assert(parent_value.has_value(), "evictable Host parent has no children");

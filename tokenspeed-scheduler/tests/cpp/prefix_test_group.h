@@ -140,7 +140,11 @@ public:
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const { return index_.NumEntries(pool); }
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
-        return index_.EvictableLocations(pool);
+        std::vector<CacheBlockLocation> locations;
+        for (const PrefixCacheIndex::EvictionCandidate& candidate : index_.EvictableCandidates(pool)) {
+            locations.push_back(candidate.location);
+        }
+        return locations;
     }
     std::optional<PrefixCacheIndex::CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
                                                                                 CacheBlockLocation location) const {
