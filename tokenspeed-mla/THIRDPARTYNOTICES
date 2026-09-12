@@ -22,6 +22,27 @@ Copyright contributors to the FlashInfer project
 Licensed under the Apache License, Version 2.0, whose full license text is
 available below.
 
+The nonempty split-KV selection and adaptive D512 reducer topology in
+python/tokenspeed_mla/mla_decode.py are adapted from FlashInfer PR #4178
+(commit 4890932dd0e479758c5bf7dbd607504da55f8077),
+flashinfer/cute_dsl/attention/monolithic/mla_decode.py.
+Copyright (c) 2026 by FlashInfer team. Licensed under Apache License, Version 2.0.
+
+The corresponding output-band indexing in python/tokenspeed_mla/mla_decode_fp8.py
+is adapted to TokenSpeed's folded-query layout from that commit's
+flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py.
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+These portions are covered by the BSD 3-Clause License reproduced below.
+
+The opt-in continuous query/head tiling helper in
+python/tokenspeed_mla/mla_helpers.py and the packed Q, mask, workspace and
+reducer indexing in python/tokenspeed_mla/mla_decode_fp8.py and
+python/tokenspeed_mla/mla_decode_fp16.py are adapted from
+the same PR's mla_helpers.py and mla_decode_fp8.py, retaining TokenSpeed's
+existing four-dimensional loader, pipeline and base-2 LSE interfaces.
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+These portions are covered by the BSD 3-Clause License reproduced below.
+
 ================================================================================
                               BSD 3-Clause License
 ================================================================================
