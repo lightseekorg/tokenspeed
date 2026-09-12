@@ -213,6 +213,7 @@ def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
         assert loaded.vision_config == raw["vision_config"]
         assert loaded.image_token_id == 129264
         assert loaded.quantization_config == raw["quantization_config"]
+        assert loaded.text_config.expert_dtype == "fp4"
         assert str(loaded.dtype).removeprefix("torch.") == "bfloat16"
         assert str(loaded.text_config.dtype).removeprefix("torch.") == "bfloat16"
         for key, expected in (

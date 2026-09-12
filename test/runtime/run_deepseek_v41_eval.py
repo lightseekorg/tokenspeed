@@ -21,7 +21,7 @@
 """Bounded real-checkpoint smoke/GSM8K run; cleans up only its own server tree.
 
 Activate the development venv and explicitly select available GPUs before use.
-All paths/ports/time limits, --execution-mode eager|graph, --batch-size,
+All paths/ports/time limits, --execution-mode eager|graph, --moe-backend, --batch-size,
 --max-total-tokens, --max-model-len and --chunked-prefill-size are explicit;
 the supplied snapshot is never modified.
 Batch size controls server admission, decode capture and EvalScope concurrency.
@@ -131,6 +131,7 @@ def main():
     for name in ("model", "output-dir", "port", "server-timeout", "eval-timeout"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--execution-mode", choices=("eager", "graph"), required=True)
+    parser.add_argument("--moe-backend", required=True)
     for name in (
         "batch-size",
         "max-total-tokens",
@@ -169,7 +170,7 @@ def main():
         "4",
         "--enable-expert-parallel",
         "--moe-backend",
-        "mega_moe",
+        args.moe_backend,
         "--dtype",
         "bfloat16",
         "--max-model-len",

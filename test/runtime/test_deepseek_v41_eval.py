@@ -258,6 +258,8 @@ def main_env(tmp_path, report, monkeypatch):
             "7200",
             "--execution-mode",
             "eager",
+            "--moe-backend",
+            "mega_moe",
             "--batch-size",
             "16",
             "--max-total-tokens",
@@ -347,6 +349,7 @@ def test_full_eval_writes_result_only_after_completion(
     assert server_command[server_command.index("--max-total-tokens") + 1] == str(
         max_total_tokens
     )
+    assert server_command[server_command.index("--moe-backend") + 1] == "mega_moe"
     if execution_mode == "graph":
         assert server_command[
             server_command.index("--max-cudagraph-capture-size") + 1

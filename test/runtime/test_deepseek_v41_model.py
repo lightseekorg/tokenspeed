@@ -778,6 +778,7 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, capture_decode):
     config = _config()
     config.hidden_size = 256
+    config.moe_intermediate_size = 256
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
     config.head_dim, config.index_head_dim = 512, 128
     config.qk_rope_head_dim, config.q_lora_rank = 64, 128
