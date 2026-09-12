@@ -1236,6 +1236,50 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     assert all(e["optional"] is False for e in matrix["include"])
 
 
+def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "kernel-benchmark.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: kernel-benchmark
+        type: perf
+        workflow_stage: kernel-benchmark
+        triggers: [per-commit]
+        runner:
+          labels: [amd-mi355-1gpu-bench]
+        perf:
+          command: run benchmark
+        """,
+    )
+    _write_task_yaml(
+        tmp_path,
+        "model.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: model
+        type: perf
+        workflow_stage: model-test
+        triggers: [per-commit]
+        runner:
+          labels: [amd-mi355-1gpu-bench]
+        perf:
+          command: run model
+        """,
+    )
+
+    matrix = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="amd",
+        workflow_stage="kernel-benchmark",
+    )
+
+    assert [entry["name"] for entry in matrix["include"]] == ["kernel-benchmark"]
+    assert matrix["include"][0]["workflow_stage"] == "kernel-benchmark"
+
+
 def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
     _write_task_yaml(
         tmp_path,

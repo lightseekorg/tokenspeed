@@ -636,6 +636,48 @@ round can never be armed on one side and drained on the other. Model-side
 capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
 in which tap order — and carries no per-round state.
 
+## Shared prefill convolution preparation
+
+Mamba/KDA extend metadata owns one immutable `CausalConv1dPrefillMetadata`
+per forward. Its two int32 maps associate convolution programs with request
+rows and local token chunks. The builder sizes them from the existing host
+length mirror and fills both directly from device query boundaries in one
+Triton launch. Every layer reads the same tensors and block size; the conv
+wrapper neither rebuilds them nor initializes/uploads per-layer scratch.
+This is transient execution metadata, not a new cache group or model state.
+
+The same extend/mixed metadata owns a device int64 mirror of the int32
+query boundaries. KDA layers share it for scan ABIs instead of casting
+per layer; the host int64 mirror still supplies launch planning without
+D2H. Decode refresh/capture does not allocate this prefill-only mirror.
+
+Each metadata build allocates fresh index storage, including when two
+forwards have the same total token count but different request partitions.
+No subsequent forward refills a buffer an earlier forward may still read.
+Mixed batches include the decode rows' verify-token lengths in this same
+builder. Decode-only refresh/capture remains unchanged and carries no
+prefill convolution schedule. Breakable prefill graphs consume the live
+metadata in the eager attention break, as ordinary eager forwards do.
+
+Prefill state staging fuses resumed conv-window copying, recurrent-state
+gather/zero, and history flags in one kernel. It preserves scheduler-owned
+block ids and arbitrary cache strides. Fresh rows never read null or stale
+recurrent state; their conv working windows remain unchanged. Shared input
+snapshots are read-only, output blocks are unique, and a private in-place
+source/destination is legal. This changes neither scan arithmetic nor cache
+allocation, retention, or checkpoint identity.
+
+The NVIDIA CuteDSL prefill adapter declares its native `v_major`
+(`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
+with another layout; the wrapper must not round-trip native state through
+FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
+layout for both initial and final state. Gate conversion to FP32 and beta
+packing retain their ordinary PyTorch operations. The native wrapper allocates
+the scan output; breakable graph replay copies it into the graph-owned stable
+handoff buffer. No output-buffer extension to the native wrapper is required.
+These preparation changes modify neither the native scan, its gate math, nor
+GEMM arithmetic.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path

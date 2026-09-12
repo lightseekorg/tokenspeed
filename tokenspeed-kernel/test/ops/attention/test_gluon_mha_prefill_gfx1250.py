@@ -167,6 +167,50 @@ def test_select_tdm_warp_hint():
         assert not prefill._select_tdm_warp_hint(**(kwargs | override))
 
 
+def test_select_reverse_q_blocks():
+    kwargs = {
+        "block_m": 256,
+        "max_seqlen": 4096,
+        "window_left": -1,
+        "workgroups": 256,
+    }
+    assert prefill._select_reverse_q_blocks(**kwargs)
+
+    for override in (
+        {"max_seqlen": 256},
+        {"window_left": 64},
+        {"workgroups": 255},
+    ):
+        assert not prefill._select_reverse_q_blocks(**(kwargs | override))
+
+
+def test_mha_prefill_reverse_counts_live_ragged_workgroups():
+    device, dtype = "cuda", torch.bfloat16
+    seqlens = [4096] + [1] * 31
+    n_q_heads, n_kv_heads, head_dim = 1, 1, 64
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    assert len(seqlens) * n_q_heads * prefill.triton_cdiv(max_seqlen, 256) == 512
+
+    original_order = prefill._select_reverse_q_blocks
+    observed_workgroups = []
+
+    def capture_workgroups(**kwargs):
+        observed_workgroups.append(kwargs["workgroups"])
+        return False
+
+    prefill._select_reverse_q_blocks = capture_workgroups
+    try:
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill._select_reverse_q_blocks = original_order
+
+    assert observed_workgroups == [47]
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+
+
 def test_mha_prefill_tdm_warp_hint_remainder():
     device, dtype = "cuda", torch.bfloat16
     n_q_heads, n_kv_heads, head_dim = 8, 2, 128
@@ -198,6 +242,43 @@ def test_mha_prefill_tdm_warp_hint_remainder():
     finally:
         prefill.get_config = original_config
         prefill._select_tdm_warp_hint = original_hint
+
+    assert torch.equal(out, control)
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_mha_prefill_reverse_q_blocks_ragged():
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads, head_dim = 8, 2, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+    original_order = prefill._select_reverse_q_blocks
+
+    def forced_config(**kwargs):
+        cfg = original_config(**kwargs)
+        return cfg._replace(
+            block_m=256,
+            num_warps=8,
+            grid=(
+                cfg.batch_size,
+                cfg.n_heads,
+                (cfg.max_seqlen + 255) // 256,
+            ),
+        )
+
+    prefill.get_config = forced_config
+    try:
+        prefill._select_reverse_q_blocks = lambda **_kwargs: False
+        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        prefill._select_reverse_q_blocks = lambda **_kwargs: True
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+        prefill._select_reverse_q_blocks = original_order
 
     assert torch.equal(out, control)
     expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)

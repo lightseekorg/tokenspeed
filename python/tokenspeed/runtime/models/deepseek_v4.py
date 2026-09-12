@@ -3733,6 +3733,18 @@ class DeepseekV4Model(nn.Module):
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
 
+    def resolve_lm_head(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.Module:
+        # V4 checkpoints store the LM head as BF16 without FP8 scales even when
+        # the rest of the model declares serialized FP8 quantization.
+        if self.mapping.attn.has_dp and isinstance(quant_config, Fp8Config):
+            quant_config = None
+        return super().resolve_lm_head(config, quant_config, prefix)
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.capture_aux_hidden_states = True
         self.model.set_dspark_layers_to_capture(layer_ids)

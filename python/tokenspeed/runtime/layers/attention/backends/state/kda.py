@@ -950,6 +950,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
+        scan_boundaries = self.forward_metadata.query_start_loc_int64
+        if scan_boundaries is None:
+            raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -959,7 +962,7 @@ class KdaAttnBackend(MambaAttnBackend):
             A_log,
             dt_bias,
             initial_state=recurrent_state,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=scan_boundaries,
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,

@@ -43,6 +43,11 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
+from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
+    CAUSAL_CONV1D_BLOCK_M,
+    CausalConv1dPrefillMetadata,
+    build_causal_conv1d_prefill_metadata,
+)
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
     chunk_gated_delta_rule,
 )
@@ -51,6 +56,9 @@ from tokenspeed_kernel.ops.attention.gdn._triton.index import (
     prepare_chunk_indices,
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
+)
+from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
+    prepare_prefill_state_inputs,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,

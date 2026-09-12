@@ -2033,6 +2033,75 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
         )
 
+    def test_sparse_prefill_combine_topk_swa_indices_compacts_invalid_topk(self):
+        device = torch.device("cuda")
+        topk_indices = torch.tensor(
+            [
+                [0, -1, 2, -1],
+                [-1, 3, -1, 4],
+                [5, -1, -1, -1],
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        query_start_loc = torch.tensor([0, 3], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([18], device=device, dtype=torch.int32)
+        gather_lens = torch.tensor([6], device=device, dtype=torch.int32)
+        window_size = 4
+        compress_ratio = 4
+        compressed_base = 8
+        workspace_width = 16
+
+        actual, actual_lens = dsv4_combine_topk_swa_indices(
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            topk=topk_indices.shape[-1],
+            workspace_width=workspace_width,
+            compressed_base=compressed_base,
+        )
+        torch.cuda.synchronize()
+
+        expected = torch.full_like(actual, -1)
+        expected_lens = torch.empty_like(actual_lens)
+        seq_len = int(seq_lens[0].item())
+        query_len = int(query_start_loc[1].item() - query_start_loc[0].item())
+        start_pos = seq_len - query_len
+        gather_start = seq_len - int(gather_lens[0].item())
+        request_base = 0
+        for token_idx in range(topk_indices.shape[0]):
+            pos = start_pos + token_idx
+            topk_len = min((pos + 1) // compress_ratio, topk_indices.shape[-1])
+            valid_topk = [
+                int(value)
+                for value in topk_indices[token_idx, :topk_len].cpu().tolist()
+                if int(value) >= 0
+            ]
+            cursor = 0
+            for value in valid_topk:
+                expected[token_idx, cursor] = request_base + value
+                cursor += 1
+            swa_len = min(pos + 1, window_size)
+            for offset in range(swa_len):
+                expected[token_idx, cursor + offset] = (
+                    request_base
+                    + compressed_base
+                    + offset
+                    + pos
+                    - swa_len
+                    + 1
+                    - gather_start
+                )
+            expected_lens[token_idx] = cursor + swa_len
+
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
+        )
+
     def test_sparse_prefill_combine_dense_swa_indices_matches_reference(self):
         device = torch.device("cuda")
         positions = torch.tensor([4, 5, 5, 6, 7], device=device, dtype=torch.int64)

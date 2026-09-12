@@ -1409,6 +1409,22 @@ def _attention_dsv4_selected_short() -> object:
     return _attention_dsv4_selected(128)
 
 
+def _attention_dsv4_selected_h64() -> object:
+    q = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    kv = torch.empty((640, 512), dtype=torch.bfloat16)
+    indices = torch.arange(640, dtype=torch.int32).unsqueeze(0)
+    lens = torch.tensor([640], dtype=torch.int32)
+    attn_sink = torch.empty((64,), dtype=torch.float32)
+    return _attention_dsv4_pkg.dsv4_prefill(
+        q,
+        kv,
+        indices,
+        lens,
+        attn_sink,
+        512**-0.5,
+    )
+
+
 def _attention_dsv4_selected_i64() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv = torch.empty((640, 512), dtype=torch.bfloat16)
@@ -3833,6 +3849,15 @@ _CASES = [
         "gluon_dsv4_prefill_gfx950",
         _attention_dsv4_selected,
         id_suffix="width640",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx950",
+        _attention_dsv4_selected_h64,
+        id_suffix="width640-h64",
     ),
     _case(
         _is_cdna4,

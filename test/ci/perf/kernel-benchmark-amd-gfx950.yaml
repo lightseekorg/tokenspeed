@@ -1,0 +1,50 @@
+api_version: ci.tokenspeed.io/v1
+name: kernel-benchmark-amd-gfx950
+type: perf
+workflow_stage: kernel-benchmark
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi355-1gpu-bench
+env:
+  CI: "true"
+  CUDA_VISIBLE_DEVICES: "0"
+install:
+  - bash test/ci_system/install_kernel_benchmark_rocm.sh
+perf:
+  command: |
+    set -eu
+    output_dir="$PWD/.ci-artifacts/published"
+    work_dir="${RUNNER_TEMP:-/tmp}/kernel-benchmark-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}"
+    mkdir -p "$output_dir"
+    set -- \
+      --repo "$PWD" \
+      --base-ref "$BASE_REF" \
+      --candidate-ref "$CANDIDATE_REF" \
+      --suite tokenspeed-kernel/benchmarks/amd/gfx950.json \
+      --output-dir "$output_dir" \
+      --work-dir "$work_dir" \
+      --environment-mode venv \
+      --repository "${GITHUB_REPOSITORY:-}"
+    if [ -n "${PR_NUMBER:-}" ]; then
+      set -- "$@" --pull-request-number "$PR_NUMBER"
+    fi
+    if [ -n "${MERGE_SHA:-}" ]; then
+      set -- "$@" --merge-sha "$MERGE_SHA"
+    fi
+    if [ -n "${GITHUB_RUN_ID:-}" ]; then
+      set -- "$@" --github-run-id "$GITHUB_RUN_ID"
+    fi
+    if [ -n "${GITHUB_RUN_ATTEMPT:-}" ]; then
+      set -- "$@" --github-run-attempt "$GITHUB_RUN_ATTEMPT"
+    fi
+    set +e
+    python3 test/ci_system/kernel_benchmark_ci.py "$@"
+    status=$?
+    set -e
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$output_dir/summary.md" ]; then
+      cat "$output_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exit "$status"

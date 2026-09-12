@@ -36,7 +36,7 @@ if not is_amd():
     )
 
 from tokenspeed_kernel_amd._triton import gl  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common, fused  # noqa: E402
 
 # Read sources from the tree the import resolved to, not the repo layout.
 MXFP4_ROOT = Path(_common.__file__).parent
@@ -118,3 +118,60 @@ def test_consumers_slice_the_dimension_that_leaves_rows_distributed(
     assert index_ownership(base, slice_dim) == IndexOwnership(
         warps=num_warps, rows_covered=num_indices
     )
+
+
+# ---------------------------------------------------------------------------
+# Index width: how many row indices one TDM instruction carries
+# ---------------------------------------------------------------------------
+
+
+# A gather's largest index is source rows minus one, so 65536 rows still fit.
+@pytest.mark.parametrize(
+    ("gather_input_rows", "expected_bits"),
+    [(1, 16), (65_536, 16), (65_537, 32)],
+)
+def test_gather_narrows_up_to_the_last_representable_source_row(
+    gather_input_rows: int, expected_bits: int
+) -> None:
+    bits = fused.select_tdm_index_width_bits(
+        gather_input_rows=gather_input_rows, scatter_writeback_rows=None
+    )
+    assert bits == expected_bits
+
+
+# Masked-off scatter lanes store the row count itself as an out-of-bounds
+# sentinel, so the count must fit, not the count minus one.
+@pytest.mark.parametrize(
+    ("scatter_writeback_rows", "expected_bits"),
+    [(1, 16), (65_535, 16), (65_536, 32)],
+)
+def test_scatter_reserves_room_for_the_masked_off_sentinel(
+    scatter_writeback_rows: int, expected_bits: int
+) -> None:
+    bits = fused.select_tdm_index_width_bits(
+        gather_input_rows=None, scatter_writeback_rows=scatter_writeback_rows
+    )
+    assert bits == expected_bits
+
+
+@pytest.mark.parametrize(
+    ("gather_input_rows", "scatter_writeback_rows", "expected_bits"),
+    [
+        (65_536, 65_535, 16),
+        (65_537, 65_535, 32),
+        (65_536, 65_536, 32),
+        (65_537, 65_536, 32),
+        # No index is emitted at all, so keep the conservative width.
+        (None, None, 32),
+    ],
+)
+def test_either_direction_alone_can_force_the_wide_index(
+    gather_input_rows: int | None,
+    scatter_writeback_rows: int | None,
+    expected_bits: int,
+) -> None:
+    bits = fused.select_tdm_index_width_bits(
+        gather_input_rows=gather_input_rows,
+        scatter_writeback_rows=scatter_writeback_rows,
+    )
+    assert bits == expected_bits

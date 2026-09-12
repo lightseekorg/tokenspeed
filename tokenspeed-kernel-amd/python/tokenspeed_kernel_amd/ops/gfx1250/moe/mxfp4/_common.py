@@ -337,6 +337,7 @@ class MoEConfig:
 
     acc_layout: gl.constexpr
 
+    # TDM descriptor row-index width, not the width of pointer arithmetic.
     index_type: gl.constexpr
 
     @gluon.constexpr_function
@@ -538,7 +539,7 @@ def create_descriptor(
             GatherIndx_ptr + offs_m_gather,
             mask=start_m + offs_m_gather < M,
             other=0,
-        ).to(gl.int32)
+        ).to(cfg.index_type)
 
         x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=x_ptr,
