@@ -68,6 +68,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             attn_tp_size=1,
             head_dim=16,
             backend_name="mha",
+            skip_softmax_threshold=0.0,
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 

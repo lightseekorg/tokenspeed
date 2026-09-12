@@ -34,7 +34,10 @@ import sys
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm.routed_gemv import MEASURED_ROUTE
+from tokenspeed_kernel.ops.gemm.routed_gemv import (
+    MEASURED_ROUTE,
+    decode_gemv_routed,
+)
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
 from tokenspeed_kernel.platform import current_platform
 
@@ -342,7 +345,8 @@ def test_route_predicate_admits_the_registered_arch_floor():
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
-    nvidia = type("P", (), {"vendor": "nvidia"})()
+    # The predicate also consults the CDNA arm once the route misses.
+    nvidia = type("P", (), {"vendor": "nvidia", "is_cdna5": False})()
     for capability, expected in (((10, 0), True), ((9, 0), False)):
         routed_gemv._is_routed_arch.cache_clear()
         with (
@@ -642,3 +646,65 @@ def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset
     )
     got = routed_gemv.skinny_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna5,
+    reason="CDNA5 required",
+)
+@pytest.mark.parametrize("m", [1, 2, 16, 17, 32])
+@pytest.mark.parametrize("n,k", [(7168, 1536), (7168, 3584)])
+def test_cdna5_route_admits_decode_shapes(m, n, k):
+    """K3 decode shapes must route on CDNA5, which has no sm100 route table.
+
+    The unquantized Linear path relies on this: o_proj is 93 calls a forward
+    and reached the vendor GEMM. M == 1 lands on row-CTA and the rest on the
+    dense16 WMMA kernel; 17 and 32 cross into a second 16-row chunk, where
+    the launcher masks the tail.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+    assert decode_gemv_routed(x, w)
+
+    got = decode_gemv(x, w).float()
+    ref = (x @ w.t()).float()
+    assert torch.allclose(
+        got, ref, atol=0.5, rtol=2e-2
+    ), f"M={m} N={n} K={k}: max abs err {(got - ref).abs().max().item():.4f}"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna5,
+    reason="CDNA5 required",
+)
+def test_cdna5_route_declines_unregistered_calls():
+    """Anything the registry has no specialized kernel for keeps its caller's path."""
+    w_bf16 = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16)
+
+    x_fp16 = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
+    assert not decode_gemv_routed(x_fp16, w_bf16.half())
+
+    strided = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    assert not decode_gemv_routed(strided, w_bf16)
+
+    # K=128 is registered but measured slower than the vendor GEMM at wide N.
+    thin = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    thin_w = torch.randn(8448, 128, device="cuda", dtype=torch.bfloat16)
+    assert not decode_gemv_routed(thin, thin_w)
+
+    # Past the WMMA band nothing is registered: each 16-row chunk re-reads the
+    # whole weight, and by this M rocBLAS is measured faster.
+    wide = torch.randn(64, 1536, device="cuda", dtype=torch.bfloat16)
+    assert not decode_gemv_routed(wide, w_bf16)
+
+    # In-band M, but the WMMA kernel tiles K by 128 and N by its output tile.
+    unaligned_k = torch.randn(16, 1600, device="cuda", dtype=torch.bfloat16)
+    assert not decode_gemv_routed(
+        unaligned_k, torch.randn(7168, 1600, device="cuda", dtype=torch.bfloat16)
+    )
+    unaligned_n = torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16)
+    assert not decode_gemv_routed(
+        unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
+    )

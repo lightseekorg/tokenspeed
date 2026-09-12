@@ -25,7 +25,6 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
-        enable_l3_storage=False,
         role="fused",
         **kwargs,
     )

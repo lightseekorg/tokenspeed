@@ -28,7 +28,6 @@ exec ts serve \
     --policy round_robin \
     --dp-aware \
     --sticky-sessions \
-    --enable-cache-report \
     --reasoning-parser passthrough \
     --tool-call-parser passthrough \
     --host 0.0.0.0 \

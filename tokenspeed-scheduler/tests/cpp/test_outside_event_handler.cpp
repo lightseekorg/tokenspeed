@@ -836,10 +836,10 @@ protected:
 
 TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
     // Full KV uses ceil(tokens / 4) parents. Non-overlap sparse local recovery
-    // of a chunked prompt needs three State parents: input checkpoint, final
-    // output and the banked growth block. Eight usable parents therefore admit
-    // at most 20 total tokens.
-    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 20);
+    // of a chunked prompt needs four State parents: input checkpoint, aligned
+    // checkpoint, final output and the banked growth block. Eight usable parents
+    // therefore admit at most 16 total tokens.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 16);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {

@@ -418,7 +418,15 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                # Snapshot state rolls between two pages per live request.
-                child_pages = 2 * max_live_requests
+                # A finishing off-page prefill holds its input snapshot and
+                # aligned checkpoint, plus the final tail AND banked decode
+                # growth. Overlap protects one more decode reservation. With
+                # ordinary decode this is four state blocks per live request.
+                growth_tokens = max(
+                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
+                )
+                child_pages = max_live_requests * (
+                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
+                )
             parents += math.ceil(child_pages / packing)
         return parents

@@ -71,28 +71,52 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
-def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
+@pytest.mark.parametrize("lengths", [(4, 2), (1,)])
+def test_prefill_hands_the_stored_state_to_the_op_untouched(
+    lengths, monkeypatch
+) -> None:
     backend = object.__new__(KdaAttnBackend)
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
     backend._kda_gate = lambda g_raw, *_args: g_raw
-    stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
-    final = torch.empty(1, 2, 3, 4)
+    # Prepare boundaries once; repeated preparation must preserve their identity.
+    boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
+    scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
+    assert scan_boundaries.dtype == torch.int64
+    assert torch.equal(scan_boundaries, boundaries)
+    assert (
+        backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
+        is scan_boundaries
+    )
+    # The body and tail have their own boundaries; neither may use the full
+    # forward's cached boundaries, even when those have the same row count.
+    full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
+    full_scan_boundaries = full_boundaries.to(torch.int64)
+    backend.forward_metadata = mamba.MambaForwardMetadata(
+        query_start_loc=full_boundaries,
+        scan_query_start_loc=full_scan_boundaries,
+        query_start_loc_int64=full_scan_boundaries,
+    )
+    num_tokens = sum(lengths)
+    stored = torch.arange(len(lengths) * 24, dtype=torch.float32).view(
+        len(lengths), 2, 3, 4
+    )
+    final = torch.empty_like(stored)
     captured = {}
 
     def fake_prefill(*_args, **kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(out=torch.empty(1, 1, 2, 4), final_state=final)
+        return SimpleNamespace(out=torch.empty(1, num_tokens, 2, 4), final_state=final)
 
     monkeypatch.setattr(kda, "kda_paged_prefill", fake_prefill)
-    query = torch.empty(1, 1, 2, 3)
-    value = torch.empty(1, 1, 2, 4)
+    query = torch.empty(1, num_tokens, 2, 3)
+    value = torch.empty(1, num_tokens, 2, 4)
     _, final_state = backend._prefill_scan(
         query,
         query,
         value,
         stored,
-        torch.tensor([0, 1]),
+        scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
         a=None,
@@ -100,15 +124,17 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         g_raw=torch.empty_like(query),
         f_a_out=None,
         f_b_weight=None,
-        beta_raw=torch.empty(1, 1, 2),
-        seq_len=1,
-        num_real_tokens=1,
+        beta_raw=torch.empty(1, num_tokens, 2),
+        seq_len=num_tokens,
+        num_real_tokens=num_tokens,
         lower_bound=-5.0,
-        cu_seqlens_cpu=(0, 1),
+        cu_seqlens_cpu=boundaries.to(torch.int64),
     )
     assert captured["initial_state"] is stored
+    assert captured["cu_seqlens"] is scan_boundaries
     assert captured["recurrent_layout"] == "v_major"
     assert final_state is final
+    assert "out" not in captured
 
 
 def _backend_config(device: str, *, spec_tokens: int = 1):
@@ -589,6 +615,10 @@ class _KDAHarness:
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
         sequence starting from the zero state."""
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
+            CAUSAL_CONV1D_BLOCK_M,
+            build_causal_conv1d_prefill_metadata,
+        )
         from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
@@ -606,6 +636,9 @@ class _KDAHarness:
             device=self.device,
             dtype=torch.bfloat16,
         )
+        query_start_loc = torch.tensor(
+            [0, total], dtype=torch.int32, device=self.device
+        )
         conv_out = causal_conv1d_fn(
             mixed.transpose(0, 1),
             p["conv_weights"],
@@ -614,10 +647,12 @@ class _KDAHarness:
             conv_states=conv_state,
             has_initial_state=torch.zeros(1, dtype=torch.bool, device=self.device),
             cache_indices=torch.zeros(1, dtype=torch.int32, device=self.device),
-            query_start_loc=torch.tensor(
-                [0, total], dtype=torch.int32, device=self.device
+            query_start_loc=query_start_loc,
+            prefill_metadata=build_causal_conv1d_prefill_metadata(
+                query_start_loc,
+                torch.tensor([total], dtype=torch.int32),
+                CAUSAL_CONV1D_BLOCK_M,
             ),
-            seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
         ).transpose(0, 1)[:total]
         q, k, v = torch.split(
             conv_out, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -1023,6 +1058,67 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
     assert (conv_states[3] == 2.0).all()
     assert (conv_states[1] == 1.0).all() and (conv_states[4] == 4.0).all()
     assert (conv_states[0] == 0.0).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("prefix", [0, 1024])
+def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
+    """Native KDA outputs and persistent state match the old staging ops."""
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+
+    if not is_cutedsl_kda_installed():
+        pytest.skip("requires the native CuteDSL KDA prefill package")
+
+    contract = _stub_contract(prefix_granularity=1024, usable_pages=8)
+    pools = [
+        _StubContractPool(
+            contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
+        )
+        for _ in range(2)
+    ]
+    for layer_id in range(3):
+        for component in ("conv_state", "recurrent_state"):
+            before = pools[0].get_component(layer_id, component)
+            before.normal_(0, 0.1)
+            pools[1].get_component(layer_id, component).copy_(before)
+    harnesses = [
+        _KDAHarness(pool, contract, layer_ids=[0, 1, 2], device="cuda", seed=42)
+        for pool in pools
+    ]
+    tables = {
+        gid: [[2 * row + 1, 2 * row + 2]] for row, gid in enumerate(_STATE_GROUPS)
+    }
+    for harness in harnesses:
+        harness.backend.kda_backend = "cutedsl_kda"
+        harness.extend_metadata(
+            tables, seq_lens=[prefix + 868], extend_prefix_lens=[prefix]
+        )
+
+    def pytorch_staging(conv, state, sources, destinations):
+        history = sources > 0
+        safe = torch.where(history, sources, destinations).long()
+        conv[destinations.long()] = conv[safe]
+        recurrent = state[safe]
+        recurrent.masked_fill_(~history[:, None, None, None], 0)
+        return recurrent, history
+
+    before, after = harnesses
+    for layer_id in range(3):
+        stream = before.token_stream(868)
+        with monkeypatch.context() as patch:
+            patch.setattr(mamba, "_prepare_cache_prefill_state_inputs", pytorch_staging)
+            expected = before.extend(
+                layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+            )
+        actual = after.extend(
+            layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+        )
+        assert torch.equal(actual, expected)
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                pools[0].get_component(layer_id, component),
+                pools[1].get_component(layer_id, component),
+            )
 
 
 if __name__ == "__main__":

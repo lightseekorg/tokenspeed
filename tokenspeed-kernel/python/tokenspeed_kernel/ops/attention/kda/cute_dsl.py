@@ -18,17 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuteDSL KDA drop-in for the chunked KDA prefill scan.
+"""CuteDSL KDA adapter for the chunked KDA prefill scan.
 
-Mirrors ``triton.linear.kda.kda_chunk_prefill``'s signature and state
-convention (FLA-native ``[N, HV, K, V]`` states) so the runtime can swap the
-calls behind the same policy flag as FlashKDA. The **native
-token-major** build reads the runtime's ``[B, T, H, D]`` activations and the
-``[1, T, H]`` beta directly, so the only per-call data movement is the FP32
-gate cast and one 128x128 state transpose per sequence (the state is the sole
-canonical-layout operand). Sigmoid(beta), the safe gate, and QK L2
-normalization run in-kernel, like the FLA and FlashKDA paths. The safe-gate
-lower bound is baked into the CUBIN and validated on every call.
+States use the native ``[N, HV, V, K]`` convention, matching the NVIDIA
+cache and the CuteDSL ABI. The dispatch facade adapts other cache layouts;
+this wrapper must not transpose the state a second time. The native
+token-major build reads ``[B, T, H, D]`` activations directly. PyTorch casts
+the gate to FP32 and packs strided beta logits into contiguous storage.
+Sigmoid(beta), the safe gate, and QK L2 normalization run in-kernel, like the
+FLA and FlashKDA paths. The safe-gate lower bound is baked into the CUBIN
+and validated on every call.
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ __all__ = ["cutedsl_kda_chunk_prefill", "is_cutedsl_kda_installed"]
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={"recurrent_layout": frozenset({"v_major"})},
     tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
@@ -94,7 +93,7 @@ def cutedsl_kda_chunk_prefill(
         A_log: Per-head FP32 decay parameter ``[HV]``.
         dt_bias: FP32 gate bias with ``HV * K`` elements.
         initial_state: Optional FP32 recurrent state per packed sequence in
-            the FLA-native ``[N, HV, K, V]`` convention; ``None`` starts from
+            the native ``[N, HV, V, K]`` convention; ``None`` starts from
             zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
             be 1); ``None`` treats each batch row as one sequence.
@@ -103,16 +102,15 @@ def cutedsl_kda_chunk_prefill(
             kernel wrapper plans launch grids, routing, and workspace
             partitioning on the host from the boundary values; reading them
             back instead would be a stream-synchronizing D2H copy on every
-            call (the per-call ``.to(int64)`` below allocates a fresh
-            boundaries tensor, so the wrapper's identity memo never hits
-            across layers).
+            call. Runtime callers share a device int64 boundary tensor across
+            layers, making the conversion below a no-op. Standalone callers
+            may still supply int32 boundaries.
         lower_bound: Safe-gate lower bound; required, and must match the
             value baked into the CUBIN (validated).
         beta_is_logit: Must be True; the kernel always applies sigmoid.
 
     Returns:
-        ``(o [B, T, HV, V], final_state [N, HV, K, V])`` matching the FLA
-        wrapper's convention.
+        ``(o [B, T, HV, V], final_state [N, HV, V, K])`` in native layout.
     """
     if not beta_is_logit:
         raise ValueError("cutedsl_kda_chunk_prefill requires raw beta logits")
@@ -153,10 +151,9 @@ def cutedsl_kda_chunk_prefill(
         q, k, v = (t.reshape(1, batch * tokens, -1, t.shape[-1]) for t in (q, k, v))
         g_raw = g_raw.reshape(1, batch * tokens, num_value_heads, key_dim)
         beta = beta.reshape(1, batch * tokens, num_value_heads)
-    # Native token-major ABI: q/k/v/gate stay [1, T, H, D] and beta stays
-    # [1, T, H]; the kernel reads them directly (no head-major re-layout, no
-    # beta copy). gate must be fp32; contiguous() pins the token-major memory
-    # the TMA descriptors index.
+    # Native token-major ABI: no head-major re-layout. Gate must be FP32
+    # and beta may be a strided slice of the merged projection; contiguous()
+    # pins the token-major memory the kernel descriptors index.
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -164,9 +161,10 @@ def cutedsl_kda_chunk_prefill(
     beta = beta.contiguous()
     dt_bias = dt_bias.reshape(num_value_heads, key_dim).contiguous()
     A_log = A_log.contiguous()
-    # States: FLA-native [N, HV, K, V] -> canonical [N, HV, V, K].
+    # The dispatch layout trait already matches the native [N, HV, V, K]
+    # ABI. A second transpose here would undo the dispatcher's conversion.
     if initial_state is not None:
-        state_in = initial_state.transpose(-1, -2).contiguous()
+        state_in = initial_state.contiguous()
     else:
         state_in = torch.zeros(
             num_sequences,
@@ -198,7 +196,4 @@ def cutedsl_kda_chunk_prefill(
         workspace=workspace,
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
-    # out is token-major [1, T, HV, V] already; state VK -> FLA-native KV.
-    return out.view(batch, tokens, num_value_heads, value_dim), final_state.transpose(
-        -1, -2
-    )
+    return out.view(batch, tokens, num_value_heads, value_dim), final_state

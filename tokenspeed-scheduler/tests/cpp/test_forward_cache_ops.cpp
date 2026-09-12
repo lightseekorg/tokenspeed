@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -68,47 +69,55 @@ TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
 }
 
-TEST(AlignPrefillChunkTest, StopsAtPromotionBoundary) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/24,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              16);
+TEST(AlignPrefillChunkTest, RespectsBudgetPromotionAndFinalExtent) {
+    const struct {
+        const char* name;
+        std::int32_t first_pos;
+        std::int32_t unscheduled;
+        std::int32_t token_budget;
+        std::int32_t prefix_granularity;
+        std::int32_t promotion_boundary;
+        std::int32_t expected_tokens;
+    } cases[] = {
+        {"first chunk reaches promotion", 16, 24, 24, 4, 32, 16},
+        {"budget precedes promotion", 16, 24, 8, 4, 32, 8},
+        {"later chunk reaches promotion", 24, 16, 16, 4, 32, 8},
+        {"prompt ends before promotion", 24, 4, 16, 4, 32, 4},
+        {"promotion already reached", 32, 16, 10, 4, 32, 8},
+        {"final extent crosses checkpoint", 50432, 868, 868, 128, 0, 868},
+        {"budget truncates final extent", 50432, 868, 800, 128, 0, 768},
+        {"aligned final extent", 51200, 768, 868, 128, 0, 768},
+        {"final extent has no internal checkpoint", 51200, 100, 868, 128, 0, 100},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        EXPECT_EQ(
+            AlignPrefillChunk(c.first_pos, c.unscheduled, c.token_budget, c.prefix_granularity, c.promotion_boundary),
+            c.expected_tokens);
+    }
 }
 
-TEST(AlignPrefillChunkTest, KeepsFuturePromotionWhenBudgetFallsShort) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/8,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
+TEST(StateCheckpointMaterializationStartTest, SelectsLatestBoundaryOrEndpoint) {
+    const struct {
+        const char* name;
+        std::int32_t before_tokens;
+        std::int32_t after_tokens;
+        std::int32_t expected_start;
+    } cases[] = {
+        {"internal checkpoint and continuation", 50432, 51300, 51200},
+        {"continuation without internal checkpoint", 51200, 51300, 51300},
+        {"checkpoint coincides with endpoint", 50432, 51200, 51200},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        EXPECT_EQ(StateCheckpointMaterializationStart(c.before_tokens, c.after_tokens, /*prefix_granularity=*/128),
+                  c.expected_start);
+    }
 }
 
-TEST(AlignPrefillChunkTest, LaterChunkStopsAtPromotionBoundary) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/16, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
-}
-
-TEST(AlignPrefillChunkTest, EndpointBeforePromotionWins) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/4, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              4);
-}
-
-TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/32, /*unscheduled=*/16, /*token_budget=*/10,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/32),
-              8);
-}
-
-TEST(FinalAlignedTailTokensTest, FindsSubPageTailAfterAlignedBody) {
-    const std::optional<std::int32_t> tail =
-        FinalAlignedTailTokens(/*first_pos=*/16, /*unscheduled=*/11, /*token_budget=*/16,
-                               /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0);
-    EXPECT_EQ(tail, 3);
-}
-
-TEST(FinalAlignedTailTokensTest, LeavesAStandaloneSubPageWhole) {
-    EXPECT_EQ(FinalAlignedTailTokens(/*first_pos=*/24, /*unscheduled=*/3, /*token_budget=*/16,
-                                     /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0),
-              std::nullopt);
+TEST(SnapshotStateReserveTokensTest, CoversGrowthAndDecodeWidth) {
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/128, /*decode_tokens=*/1), 128);
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/2, /*decode_tokens=*/3), 3);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {

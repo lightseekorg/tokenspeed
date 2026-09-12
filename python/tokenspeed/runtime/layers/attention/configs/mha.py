@@ -42,6 +42,10 @@ class MHAConfig(SoftmaxAttnConfig):
     # per-layer cache_layer_types/window vectors; the per-layer kv-head counts
     # live on the cache-pool spec (``CachePoolSpec.layer_kv_head_counts``).
 
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950); see
+    # ServerArgs.skip_softmax_threshold.
+    skip_softmax_threshold: float = 0.0
+
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
@@ -77,6 +81,7 @@ class MHAConfig(SoftmaxAttnConfig):
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
+            skip_softmax_threshold=server_args.skip_softmax_threshold,
         )
         return AttnConfig(
             components=(spec,),

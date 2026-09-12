@@ -63,10 +63,10 @@ def _wmma_tdm_dense_m16_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    K: gl.constexpr,
 ):
-    """Fixed-M/K CDNA5 dense projection candidate."""
+    """Fixed-M CDNA5 dense projection candidate."""
     M: gl.constexpr = 16
-    K: gl.constexpr = 7168
     pid_n = gl.program_id(0)
 
     gl.static_assert(
@@ -75,6 +75,7 @@ def _wmma_tdm_dense_m16_kernel(
     )
     gl.static_assert(0 < ACTUAL_M and ACTUAL_M <= M)
     gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
+    gl.static_assert(K % BLOCK_K == 0, "K must tile exactly into BLOCK_K")
     gl.static_assert(NUM_BUFFERS == 3, "candidate uses a triple-buffer TDM pipeline")
 
     warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1], [0, 2]]
@@ -195,10 +196,67 @@ def _launch_wmma_tdm_dense_tiles(
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             NUM_BUFFERS=num_buffers,
+            K=A.shape[1],
             num_warps=num_warps,
             num_stages=1,
             waves_per_eu=1,
         )
+
+
+def use_gluon_wmma_dense_gfx1250(m: int, k: int, n: int) -> bool:
+    """Return whether CDNA5 dense16 WMMA accepts this K3 projection shape.
+
+    M is tiled in 16-row chunks and each chunk re-reads all of B, so the
+    advantage shrinks with every chunk added and rocBLAS wins past the
+    ceiling. Preferring this over the M == 1 row-CTA GEMV is the registry's
+    choice, not this predicate's.
+    """
+
+    return 1 <= m <= 32 and k % 128 == 0 and n % 16 == 0
+
+
+def gluon_wmma_tdm_dense_gfx1250(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the CDNA5 dense projection candidate on any accepted shape."""
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("A and B must be 2D")
+    m, k = A.shape
+    n = B.shape[0]
+    if B.shape[1] != k:
+        raise ValueError(f"B must be [N, {k}], got {tuple(B.shape)}")
+    for name, tensor in (("A", A), ("B", B)):
+        if (
+            tensor.dtype != torch.bfloat16
+            or not tensor.is_cuda
+            or not tensor.is_contiguous()
+            or tensor.device != A.device
+        ):
+            raise ValueError(f"{name} must be contiguous GPU BF16 colocated with A")
+    if not use_gluon_wmma_dense_gfx1250(m, k, n):
+        raise ValueError(
+            f"dense16 WMMA needs 1 <= M <= 32, K % 128 == 0 and N % 16 == 0, "
+            f"got M={m}, K={k}, N={n}"
+        )
+
+    if out is None:
+        out = A.new_empty((m, n))
+    elif (
+        tuple(out.shape) != (m, n)
+        or out.dtype != torch.bfloat16
+        or not out.is_cuda
+        or not out.is_contiguous()
+        or out.device != A.device
+    ):
+        raise ValueError(f"out must be contiguous GPU BF16 ({m}, {n}) colocated with A")
+
+    # BLOCK_N selects the WMMA warp bases, so the warp count follows from it.
+    block_n, num_warps = (64, 4) if n % 64 == 0 else (16, 1)
+    _launch_wmma_tdm_dense_tiles(A, B, out, block_n=block_n, num_warps=num_warps)
+    return out
 
 
 def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
@@ -831,7 +889,9 @@ def gluon_mm_a16w16_largem_gfx1250(
 
 __all__ = [
     "use_gluon_largem_gfx1250",
+    "use_gluon_wmma_dense_gfx1250",
     "gluon_mm_a16w16_largem_gfx1250",
+    "gluon_wmma_tdm_dense_gfx1250",
     "gluon_wmma_tdm_kda_qkvfab_gfx1250",
     "gluon_wmma_tdm_mla_qkv_gate_gfx1250",
     "gluon_wmma_tdm_add3_m16_gfx1250",

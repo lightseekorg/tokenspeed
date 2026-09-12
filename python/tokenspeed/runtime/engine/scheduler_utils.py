@@ -157,7 +157,6 @@ def make_config(
     prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
-    enable_l3_storage: bool,
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -179,7 +178,8 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
-    cfg.enable_l3_storage = enable_l3_storage
+    # The runtime cache executor supports device and host tiers only.
+    cfg.enable_l3_storage = False
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":

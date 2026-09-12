@@ -469,6 +469,7 @@ def prefill_attention_fwd(
         "support_sinks": frozenset({False, True}),
         "support_logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "support_skip_softmax": frozenset({False}),
     },
     tags={"portability"},
 )
