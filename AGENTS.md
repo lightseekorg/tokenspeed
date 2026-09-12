@@ -5,7 +5,12 @@
 
 ## Collaboration principle
 
-Core features will be designed and implemented by the TokenSpeed core team. This isn't a matter of distrust in external contributions — writing code has gotten cheaper, but reviewing it, validating it, and deploying it safely at production scale hasn't. If anything, that cost has gone up. As Steve Jobs put it, A players want to work with A players. We believe the gap between the best people and average people is more than tenfold.
+Core features will be designed and implemented by the TokenSpeed core team.
+This isn't a matter of distrust in external contributions — writing code has
+gotten cheaper, but reviewing it, validating it, and deploying it safely at
+production scale hasn't. If anything, that cost has gone up. As Steve Jobs
+put it, A players want to work with A players. We believe the gap between the
+best people and average people is more than tenfold.
 
 ## Development environment
 
@@ -92,15 +97,9 @@ Inside the root `tokenspeed-kernel/` directory:
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
-* Tests under `test/` are split by the vendor they can run on: `test/nvidia/`
-  for tests that need CUDA-only stacks (CuTe DSL, FlashInfer, DeepEP,
-  DeepGEMM, TRT-LLM, FA3/FA4, FlashMLA, Marlin, MNNVL, `tokenspeed-mla`),
-  `test/amd/` for tests gated on `is_cdna4()`/`is_cdna5()`/`is_amd()` or
-  importing `tokenspeed_kernel_amd`, and the top level for portable Triton
-  kernels, registry/selection logic, and tests that cover both vendors. The
-  CI path filter (`test/ci_system/ci_path_filter.py`) skips the other
-  vendor's GPU CI for changes confined to a vendor subtree, so a mixed test
-  must stay at the top level.
+* Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
+  Tests for common infra and covering multi-vendors reside under `test/`
+  directly.
 
 ## tokenspeed-kernel-amd
 

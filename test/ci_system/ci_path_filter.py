@@ -28,10 +28,7 @@ SHARED_FILES = frozenset(
 )
 
 # Paths owned by a single vendor. A change here requires only that vendor's
-# runner groups, even when the path sits inside a shared directory: the
-# vendor subtrees of ``tokenspeed-kernel/test`` hold tests whose module-level
-# gate skips them on every other vendor, so running the other vendor's CI for
-# them would only re-verify the skip.
+# runner groups, even when the path sits inside a shared directory.
 VENDOR_DIRECTORIES = {
     "amd": (
         "tokenspeed-kernel-amd",
