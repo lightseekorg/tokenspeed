@@ -311,7 +311,7 @@ def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: 
     """Stand up K3AttnCommState's collaborators so arming can be exercised."""
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
-    recorded = {"ops": []}
+    recorded = {"ops": [], "groups": []}
 
     class FakeDist:
         ReduceOp = torch.distributed.ReduceOp
@@ -321,8 +321,10 @@ def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: 
             return True
 
         @staticmethod
-        def all_reduce(tensor, op=None, group=None):
+        def all_reduce(tensor, *, op, group):
+            # Required, not defaulted: dropping either in production must fail here.
             recorded["ops"].append(op)
+            recorded["groups"].append(group)
             if not peers_agree:
                 tensor.zero_()
 
@@ -359,6 +361,7 @@ def test_arming_builds_only_when_every_rank_agrees(monkeypatch):
     assert state.cute_ar == "collective"
     # MIN is what makes one dissenting rank stop all of them.
     assert rec["ops"] == [torch.distributed.ReduceOp.MIN]
+    assert rec["groups"] == ["the-group"]
     kwargs = rec["builder"].call_args.kwargs
     assert kwargs["rank"] == 3 and kwargs["tp_size"] == 8  # rank is not size
     assert kwargs["hidden_size"] == 7168

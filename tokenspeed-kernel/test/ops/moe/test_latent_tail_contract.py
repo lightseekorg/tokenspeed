@@ -29,6 +29,12 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     _allocator_identity,
     _tail_pool_slot,
 )
+from tokenspeed_kernel.platform import current_platform
+
+# The CuteDSL collective imports cuda.bindings at module scope; ROCm has none.
+needs_nvidia = pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="the CuteDSL collective is NVIDIA-only"
+)
 
 
 def test_initialize_constructs_a_fresh_op(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -523,6 +529,7 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
         fabric._fabric_map = saved
 
 
+@needs_nvidia
 def test_the_attention_builder_asks_for_the_residual_epilogue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -557,6 +564,7 @@ def test_the_attention_builder_asks_for_the_residual_epilogue(
     assert seen["precompile_split"] is True
 
 
+@needs_nvidia
 def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
     """The constructor raises inside a rendezvous, so the probe answers first."""
     from tokenspeed_kernel.ops.moe.latent_tail import attn_reduce_shape_supported
@@ -567,6 +575,7 @@ def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
         assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
 
 
+@needs_nvidia
 def test_the_epilogue_variant_is_part_of_the_compile_key() -> None:
     """Two epilogues sharing a key means one kernel is returned for the other.
 
