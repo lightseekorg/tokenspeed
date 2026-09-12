@@ -303,7 +303,16 @@ class OutputProcessor:
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.engine.server_args.speculative_algorithm:
-                    meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                    verify_ct = recv_obj.spec_verify_ct[i]
+                    meta_info["spec_verify_ct"] = verify_ct
+                    if verify_ct > 0:
+                        # Prefill emits 1 token and each verify step 1 more;
+                        # the rest are accepted drafts.
+                        n = self.engine.server_args.speculative_num_draft_tokens
+                        meta_info["spec_accepted_tokens"] = (
+                            recv_obj.completion_tokens[i] - 1 - verify_ct
+                        )
+                        meta_info["spec_draft_tokens"] = verify_ct * (n - 1)
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 

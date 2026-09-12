@@ -419,8 +419,8 @@ def test_log_request_stats_aborted_with_spec_acceptance():
 
     line = rec.lines[0]
     assert "status='aborted', reason='abort'" in line
-    # acc_rate = (acc_len - 1) / draft = (3 - 1) / 4 = 0.5
-    assert "acc_len=3.0, acc_rate=0.5" in line
+    # acc_rate = (acc_len - 1) / proposed drafts = (3 - 1) / (4 - 1)
+    assert "acc_len=3.0, acc_rate=0.6667" in line
 
 
 def test_log_request_stats_noop_without_tracker():
@@ -735,3 +735,38 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     assert processor.rid_to_state["decode"] is state
     assert events == []
     assert sender.items == []
+
+
+class _SpecMetrics:
+    enabled = True
+
+    def __init__(self):
+        self.steps = []
+
+    def record_spec_decode_step(
+        self, *, num_decode_slots, accepted_draft_tokens, draft_width
+    ):
+        self.steps.append((num_decode_slots, accepted_draft_tokens, draft_width))
+
+
+def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
+    """A mixed prefill/decode round still records its decode slot, and 3/4
+    proposes 3 drafts per verify step because slot 0 is the accepted root."""
+    metrics = _SpecMetrics()
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="eagle",
+        spec_num_tokens=4,
+        metrics=metrics,
+    )
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+
+    class _SpecResult(_ExecutionResult):
+        output_lengths = torch.tensor([1, 3], dtype=torch.int32)
+
+    processor._emit_spec_decode_metrics(
+        forward_op=_ForwardOp(), model_execution_results=_SpecResult()
+    )
+    assert metrics.steps == [(1, 2, 3)]
