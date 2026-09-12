@@ -276,6 +276,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
+        # Split-KV partials are written to the workspace already divided by the
+        # row sum, i.e. as convex combinations of cache values (|v| <= 448 for
+        # e4m3), so fp16 holds them exactly enough (11-bit mantissa against the
+        # bf16 output's 8) at half the workspace traffic. output_scale is
+        # applied by the reduction kernel, after the combine, so it cannot push
+        # a partial out of fp16 range.
+        self.partial_dtype = cutlass.Float16
         self.mma_qk_tiler_mn = mma_qk_tiler_mn
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
@@ -1067,6 +1074,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
+                output_scale,
             ).launch(
                 grid=(
                     o_reduction.shape[0] * self.reducer_d_tiles,
@@ -1762,6 +1770,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        output_scale: cutlass.Float32,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
@@ -1867,12 +1876,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if tidx == 0 and d_tile_idx == 0:
                 if cutlass.const_expr(not self.skip_lse):
                     mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
-            # store the scale to shared memory
+            # store the scale to shared memory; the split partials are stored
+            # unscaled, so output_scale is folded into the per-split weight
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 if cute.elem_less(split_kv_idx, local_split_kv):
-                    smem_lse_scale[split_kv_idx] = cute.math.exp2(
-                        local_lse[i] - global_lse, fastmath=True
+                    smem_lse_scale[split_kv_idx] = (
+                        cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                        * output_scale
                     )
 
         pipeline.sync(barrier_id=4)
@@ -1893,7 +1904,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     + tidx
                     + j * self.threads_per_warp * self.num_compute_warps
                 )
-                rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                rAccO[j] += (
+                    gAccO[i, element_idx].to(self.acc_dtype) * smem_lse_scale[i]
+                )
         rO.store(rAccO.load().to(self.o_dtype))
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = (
@@ -4096,7 +4109,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Pre-compute the output scale factor once to avoid redundant MUFU.RCP
         # instructions inside the per-element loop (rcp_approx generates MUFU.RCP
         # which has 8-cycle throughput; hoisting it saves up to ~500 cycles).
-        epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+        # Split-KV partials are stored normalized only (a convex combination of
+        # cache values, so they fit self.partial_dtype); output_scale is applied
+        # once by the reduction kernel.
+        if cutlass.const_expr(common_params.mAccO is None):
+            epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+            store_dtype = self.o_dtype
+        else:
+            epi_scale = cute.arch.rcp_approx(row_sum)
+            store_dtype = self.partial_dtype
 
         # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
@@ -4114,19 +4135,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if cutlass.const_expr(self.use_m64_ws):
                 num_epi_subtiles = cute.size(tTR_rAcc, mode=[2])
                 vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
-                if cutlass.const_expr(common_params.mAccO is None):
-                    tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                else:
-                    tR2G_rO_src = tTR_rAcc
+                tR2G_rO_src = cute.make_fragment_like(tTR_gO, store_dtype)
 
                 for d_sub in cutlass.range_constexpr(num_epi_subtiles):
                     for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
                         tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
 
-                    if cutlass.const_expr(common_params.mAccO is None):
-                        tR2G_rO_src[None, None, d_sub].store(
-                            tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
-                        )
+                    tR2G_rO_src[None, None, d_sub].store(
+                        tTR_rAcc[None, None, d_sub].load().to(store_dtype)
+                    )
 
                     if cute.elem_less(tTR_cO[0][0] % 64, common_params.H):
                         cute.autovec_copy(
@@ -4143,12 +4160,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
 
                 # Prepare output fragment for type conversion
-                tR2G_rO_src = None
+                tR2G_rO_src = cute.make_fragment_like(tTR_gO, store_dtype)
                 tR2G_rO_dst = tTR_gO
-                if cutlass.const_expr(common_params.mAccO is None):
-                    tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                else:
-                    tR2G_rO_src = tTR_rAcc
 
                 for d_sub in cutlass.range_constexpr(num_epi_subtiles):
                     # Elementwise: scale and normalize (using pre-computed epi_scale)
@@ -4157,10 +4170,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
                     # Type convert per subtile using vectorized load/to/store
                     # (scalar f32→fp8 cvt is not supported by hardware)
-                    if cutlass.const_expr(common_params.mAccO is None):
-                        tR2G_rO_src[None, None, d_sub].store(
-                            tTR_rAcc[None, None, d_sub].load().to(self.o_dtype)
-                        )
+                    tR2G_rO_src[None, None, d_sub].store(
+                        tTR_rAcc[None, None, d_sub].load().to(store_dtype)
+                    )
 
                     # Store this subtile to global memory using autovec_copy
                     # for vectorized stores (STG.128).
@@ -4530,14 +4542,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cute.assume(H * split_kv * S * D, align),
                 ),
             )
-            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
+            # Partials are stored in self.partial_dtype; the LSE partials stay in
+            # acc_dtype. get_workspace_size still sizes the buffer for acc_dtype
+            # partials, so the layout below uses less than the caller provides.
+            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=self.partial_dtype)
             acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
             acc_lse_layout = cute.make_layout(
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                workspace.iterator
+                + cute.cosize(acc_o_layout) * self.partial_dtype.width // 8,
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
