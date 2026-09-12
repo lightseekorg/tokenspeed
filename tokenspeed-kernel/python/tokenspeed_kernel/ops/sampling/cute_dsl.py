@@ -150,7 +150,7 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
         import cutlass.cute as cute
         from cutlass._mlir.dialects import llvm
         from cutlass.cute.runtime import from_dlpack
-        from cutlass.cute.typing import Float32, Int32
+        from cutlass.cute.typing import Int32
         from cutlass.cutlass_dsl import T, dsl_user_op
         from tokenspeed_kernel.thirdparty.cute_dsl.argmax import (
             ArgmaxKernel,
