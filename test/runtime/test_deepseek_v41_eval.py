@@ -260,6 +260,8 @@ def main_env(tmp_path, report, monkeypatch):
             "eager",
             "--moe-backend",
             "mega_moe",
+            "--reasoning-parser",
+            "deepseek_v31",
             "--batch-size",
             "16",
             "--max-total-tokens",
@@ -350,6 +352,10 @@ def test_full_eval_writes_result_only_after_completion(
         max_total_tokens
     )
     assert server_command[server_command.index("--moe-backend") + 1] == "mega_moe"
+    assert (
+        server_command[server_command.index("--reasoning-parser") + 1]
+        == "deepseek_v31"
+    )
     if execution_mode == "graph":
         assert server_command[
             server_command.index("--max-cudagraph-capture-size") + 1

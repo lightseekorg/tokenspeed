@@ -21,8 +21,9 @@
 """Bounded real-checkpoint smoke/GSM8K run; cleans up only its own server tree.
 
 Activate the development venv and explicitly select available GPUs before use.
-All paths/ports/time limits, --execution-mode eager|graph, --moe-backend, --batch-size,
---max-total-tokens, --max-model-len and --chunked-prefill-size are explicit;
+All paths/ports/time limits, --execution-mode eager|graph, --moe-backend,
+--reasoning-parser, --batch-size, --max-total-tokens, --max-model-len and
+--chunked-prefill-size are explicit;
 the supplied snapshot is never modified.
 Batch size controls server admission, decode capture and EvalScope concurrency.
 Graph mode enables decode capture only. --dspark enables the checkpoint-local
@@ -132,6 +133,7 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--execution-mode", choices=("eager", "graph"), required=True)
     parser.add_argument("--moe-backend", required=True)
+    parser.add_argument("--reasoning-parser", required=True)
     for name in (
         "batch-size",
         "max-total-tokens",
@@ -186,6 +188,8 @@ def main():
         "--disable-kvstore",
         "--disable-prefill-graph",
         "--trust-remote-code",
+        "--reasoning-parser",
+        args.reasoning_parser,
         "--host",
         "127.0.0.1",
         "--port",
