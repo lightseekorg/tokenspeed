@@ -18,30 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
-from dataclasses import dataclass
+"""Optional Petit kernel dependency boundary."""
 
 
-@dataclass(frozen=True)
-class MoELayerSpec:
-    top_k: int
-    num_experts: int
-    num_local_experts: int
-    hidden_size: int
-    intermediate_size: int
-    activation: str
-    tp_rank: int
-    tp_size: int
-    ep_rank: int
-    ep_size: int
-    prefix: str = ""
-    a2a_backend: str = "none"
+def import_petit_kernel():
+    """Import and return the optional :mod:`petit_kernel` module.
 
-    @property
-    def use_deepep(self) -> bool:
-        return self.a2a_backend == "deepep"
+    Returns:
+        The imported ``petit_kernel`` module.
 
-    @property
-    def use_petit(self) -> bool:
-        return self.a2a_backend == "petit"
+    Raises:
+        RuntimeError: If ``petit_kernel`` is not installed.
+    """
+    try:
+        import petit_kernel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Petit MegaMoE was selected, but petit_kernel is not installed. "
+            "Install a petit_kernel build with MegaMoeConfig support in this environment."
+        ) from exc
+    return petit_kernel
+
+
+__all__ = ["import_petit_kernel"]

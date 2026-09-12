@@ -885,6 +885,87 @@ class ServerArgs:
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
 
+        petit_all2all = self.all2all_backend == "petit"
+        active_moe_backends = [("target", self.moe_backend)]
+        if self.speculative_algorithm is not None:
+            active_moe_backends.append(
+                ("draft", self.draft_moe_backend or self.moe_backend)
+            )
+        petit_roles = [
+            role for role, backend in active_moe_backends if backend == "petit"
+        ]
+        non_petit_roles = [
+            f"{role}={backend}"
+            for role, backend in active_moe_backends
+            if backend != "petit"
+        ]
+        if petit_all2all and non_petit_roles:
+            raise ValueError(
+                "Petit MegaMoE requires every active MoE backend to be petit "
+                "when --all2all-backend petit is selected; incompatible "
+                + ", ".join(non_petit_roles)
+            )
+        if not petit_all2all and petit_roles:
+            raise ValueError(
+                "Petit MegaMoE requires --all2all-backend petit for the active "
+                f"{', '.join(petit_roles)} MoE backend"
+            )
+        if petit_roles:
+            if self.dtype != "bfloat16":
+                raise ValueError(
+                    "Petit MegaMoE requires --dtype bfloat16; "
+                    f"configured dtype={self.dtype}"
+                )
+            platform = current_platform()
+            if not platform.is_cdna4:
+                raise ValueError("Petit MegaMoE currently requires AMD CDNA4 (gfx950)")
+            if self.mapping.nnodes != 1:
+                raise ValueError("Petit MegaMoE currently supports one node only")
+            if self.mapping.world_size != 8 or self.mapping.moe.ep_size != 8:
+                raise ValueError("Petit MegaMoE requires world_size=ep_size=8")
+            if self.mapping.moe.tp_size != 1:
+                raise ValueError("Petit MegaMoE requires MoE tensor parallel size 1")
+            if (
+                self.mapping.attn.tp_size != 1
+                or self.mapping.attn.cp_size != 1
+                or self.mapping.dense.tp_size != 1
+            ):
+                raise ValueError(
+                    "Petit MegaMoE requires attention TP1, CP1, and dense TP1"
+                )
+            if (
+                self.enable_eplb
+                or self.ep_num_redundant_experts
+                or self.init_expert_location not in (None, "trivial")
+            ):
+                raise ValueError(
+                    "Petit MegaMoE requires trivial expert placement without EPLB or redundant experts"
+                )
+            decode_tokens_per_request = (
+                self.speculative_num_draft_tokens
+                if self.speculative_algorithm is not None
+                else 1
+            )
+            decode_tokens_per_rank = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+            ) * decode_tokens_per_request
+            if decode_tokens_per_rank > 1024:
+                raise ValueError(
+                    "Petit MegaMoE supports at most 1024 decode tokens per rank; "
+                    "reduce --max-num-seqs or the speculative draft token count "
+                    f"(configured {decode_tokens_per_rank} tokens per rank)"
+                )
+            if (
+                self.chunked_prefill_size <= 0
+                or self.chunked_prefill_size > 1024
+                or self.max_prefill_tokens > 1024
+            ):
+                raise ValueError(
+                    "Petit MegaMoE supports at most 1024 prefill tokens per rank; "
+                    "set --chunked-prefill-size to a positive value no greater "
+                    "than 1024 and --max-prefill-tokens no greater than 1024"
+                )
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1443,7 +1524,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, petit",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1457,7 +1538,7 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            help="MoE all-to-all backend: none, deepep, etc.",
+            help="MoE all-to-all backend: none, deepep, petit, etc.",
         )
         parser.add_argument(
             "--deepep-mode",

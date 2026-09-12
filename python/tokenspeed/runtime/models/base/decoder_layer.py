@@ -304,6 +304,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
         skip_on_idle: bool = False,
     ) -> ModuleSpec:
         return ModuleSpec.from_kind(
+            runs_on_empty_input=False,
             kind=ModuleKind.NORM,
             supports_fused_reduce_norm=True,
             captures_aux=captures_aux,
@@ -313,6 +314,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
     def attn_spec(self) -> ModuleSpec:
         input_placement = Replicate(ParallelGroup.ATTN_TP)
         return ModuleSpec.from_kind(
+            runs_on_empty_input=False,
             input_placement=input_placement,
             output_placement=_default_compute_output_placement(
                 self.mapping, ParallelGroup.ATTN_TP
@@ -327,6 +329,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
         )
         kind = ModuleKind.MOE if self.is_moe_layer else ModuleKind.DENSE_MLP
         return ModuleSpec.from_kind(
+            runs_on_empty_input=False,
             input_placement=Replicate(mlp_group),
             output_placement=_default_compute_output_placement(self.mapping, mlp_group),
             kind=kind,

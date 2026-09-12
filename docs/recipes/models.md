@@ -759,6 +759,46 @@ tokenspeed serve openai/gpt-oss-120b \
   --port 8000
 ```
 
+### Petit MegaMoE on AMD CDNA4
+
+Petit provides a fused expert communication-and-compute path for serialized
+MXFP4 GPT-OSS 120B and DeepSeek V3 checkpoints. It requires an optional
+`petit_kernel` build that provides `MegaMoeConfig`, and currently supports one
+8-GPU AMD CDNA4 (`gfx950`) node only. Select Petit for both backend roles:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+tokenspeed serve <serialized-mxfp4-model-path> \
+  --dist-init-addr 127.0.0.1:4000 \
+  --world-size 8 \
+  --nprocs-per-node 8 \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --expert-parallel-size 8 \
+  --dense-tp-size 1 \
+  --moe-tp-size 1 \
+  --dtype bfloat16 \
+  --moe-backend petit \
+  --all2all-backend petit \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --disable-kvstore
+```
+
+The supported expert shapes are GPT-OSS 120B (128 experts, top-4, hidden size
+2880, biased OpenAI SwiGLU with alpha 1.702, clamp limit 7.0, and beta 1.0) and
+DeepSeek V3 (256 experts, top-8, hidden size 7168, intermediate size 2048,
+bias-free SiLU). Attention TP, MoE TP, context parallelism, and dense TP must
+all be 1; world size and expert parallel size must both be 8. Petit requires
+BF16 model activations (`--dtype bfloat16`). Use trivial
+expert placement without EPLB or redundant experts. Each rank is limited to
+1024 tokens in prefill and decode, and chunked prefill must remain enabled with
+a positive chunk size; speculative draft tokens count toward the decode limit.
+When speculative decoding is active, the target and draft MoE
+backends must both be Petit because they share one all-to-all backend. DeepSeek
+V3 activation clamps, nonstandard SiLU alpha, and expert biases are not
+supported.
+
 ## DeepSeek V4-Flash / V4-Pro
 
 DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
