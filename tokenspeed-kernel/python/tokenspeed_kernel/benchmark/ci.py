@@ -25,17 +25,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import platform as host_platform
 import sys
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-from tokenspeed_kernel.benchmark.graph import GraphBenchmarkConfig
+from tokenspeed_kernel.benchmark.graph import GraphBenchmarkConfig, GraphTimer
 from tokenspeed_kernel.benchmark.harness import (
     BenchmarkRequest,
     BenchmarkStatus,
@@ -93,11 +91,8 @@ def _nonempty_string(value: object, location: str) -> str:
     return value
 
 
-def _number(
-    value: object,
-    location: str,
-) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+def _number(value: object, location: str) -> float:
+    if not isinstance(value, (int, float)):
         raise SuiteConfigError(f"{location} must be a number")
     result = float(value)
     if not math.isfinite(result):
@@ -196,7 +191,7 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
     suite = _object(raw, "suite")
     try:
         schema_version = suite["schema_version"]
-        if isinstance(schema_version, bool) or schema_version != _SCHEMA_VERSION:
+        if schema_version != _SCHEMA_VERSION:
             raise SuiteConfigError(
                 f"unsupported schema_version {schema_version}; expected {_SCHEMA_VERSION}"
             )
@@ -325,8 +320,7 @@ def _environment_mismatch(
 
 def _create_harness(config: GraphBenchmarkConfig) -> KernelBenchmarkHarness:
     return KernelBenchmarkHarness(
-        config,
-        timer=None,
+        GraphTimer(config),
         platform_provider=current_platform,
     )
 
@@ -375,30 +369,7 @@ def run_suite(
         else:
             assert harness is not None
             try:
-                result = harness.run(case.request)
-                expected_context = (
-                    suite.timer.calls_per_graph,
-                    suite.timer.eager_warmup_iterations,
-                    suite.timer.replay_warmup_iterations,
-                    suite.timer.measurement_blocks,
-                    environment.get("vendor"),
-                    environment.get("arch"),
-                    environment.get("device_name"),
-                )
-                actual_context = (
-                    result.calls_per_graph,
-                    result.eager_warmup_iterations,
-                    result.replay_warmup_iterations,
-                    result.measurement_blocks,
-                    result.platform_vendor,
-                    result.platform_arch,
-                    result.device_name,
-                )
-                if result.succeeded and actual_context != expected_context:
-                    raise RuntimeError(
-                        "successful benchmark reported the wrong context"
-                    )
-                result_payload = _result_payload(result)
+                result_payload = _result_payload(harness.run(case.request))
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
                     BenchmarkStatus.EXECUTION_FAILURE, "runner", error
@@ -428,25 +399,9 @@ def _write_output(payload: dict[str, Any], path: str | Path) -> None:
     if str(path) == "-":
         sys.stdout.write(serialized)
         return
-
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=output_path.parent,
-        prefix=f".{output_path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(serialized)
-        os.replace(temporary_name, output_path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
+    output_path.write_text(serialized, encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:

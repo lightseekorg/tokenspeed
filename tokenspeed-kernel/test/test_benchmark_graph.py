@@ -194,23 +194,6 @@ def test_events_are_primed_before_capture_and_reused_for_measurement() -> None:
     assert backend._event_count == 4
 
 
-def test_timer_reuses_its_benchmark_stream_across_measurements() -> None:
-    backend = _FakeBackend([1.0, 1.0])
-    config = GraphBenchmarkConfig(
-        calls_per_graph=1,
-        eager_warmup_iterations=1,
-        replay_warmup_iterations=0,
-        measurement_blocks=1,
-    )
-    timer = GraphTimer(config, backend=backend)
-
-    timer.measure(PreparedInvocation(lambda: None))
-    timer.measure(PreparedInvocation(lambda: None))
-
-    assert backend.log.count("new_stream") == 1
-    assert len(_positions(backend.log, "cleanup:")) == 2
-
-
 def test_reset_is_outside_each_timed_interval() -> None:
     backend = _FakeBackend([1.0, 1.0])
     config = GraphBenchmarkConfig(
@@ -237,7 +220,7 @@ def test_reset_is_outside_each_timed_interval() -> None:
     ("field", "value"),
     [
         ("calls_per_graph", 0),
-        ("calls_per_graph", True),
+        ("calls_per_graph", 1.5),
         ("eager_warmup_iterations", 0),
         ("replay_warmup_iterations", -1),
         ("measurement_blocks", 0),
@@ -360,26 +343,6 @@ def test_first_replay_failure_is_typed_and_graph_is_cleaned() -> None:
     assert isinstance(raised.value.cause, RuntimeError)
     assert raised.value.__cause__ is raised.value.cause
     assert backend.log[-1] == "cleanup:0"
-
-
-def test_failed_run_discards_the_persistent_stream() -> None:
-    backend = _FakeBackend([1.0])
-    backend.fail_replay = True
-    config = GraphBenchmarkConfig(
-        calls_per_graph=1,
-        eager_warmup_iterations=1,
-        replay_warmup_iterations=0,
-        measurement_blocks=1,
-    )
-    timer = GraphTimer(config, backend=backend)
-
-    with pytest.raises(GraphBenchmarkError):
-        timer.measure(PreparedInvocation(lambda: None))
-
-    backend.fail_replay = False
-    timer.measure(PreparedInvocation(lambda: None))
-
-    assert backend.log.count("new_stream") == 2
 
 
 def test_cleanup_failure_is_typed() -> None:

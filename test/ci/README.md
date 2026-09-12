@@ -213,11 +213,11 @@ finishes. It validates the untrusted artifact and source revision before
 creating or replacing one bot-owned comment. Runs where the benchmark task was
 not selected have no report and are ignored.
 
-The first pull request introducing the benchmark can run only a candidate
-bootstrap because its merge base has no suite. It also cannot trigger its own
-comment publisher because GitHub requires the receiving `workflow_run` workflow
-to exist on the default branch. Manual runs produce summaries and artifacts but
-not pull request comments.
+A merge base that does not contain the suite yields a candidate-only
+bootstrap instead of a comparison. Changes to the comment workflow take effect
+only after they merge, since `workflow_run` workflows execute from the default
+branch. Manual runs produce summaries and artifacts but not pull request
+comments.
 
 `CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The

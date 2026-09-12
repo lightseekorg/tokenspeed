@@ -34,10 +34,7 @@ from tokenspeed_kernel.benchmark.harness import (
     PreparedValidation,
     ValidationInvocation,
 )
-from tokenspeed_kernel.benchmark.validation import (
-    MAX_VALIDATION_RUNS,
-    OutputValidationSpec,
-)
+from tokenspeed_kernel.benchmark.validation import OutputValidationSpec
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import get_family_tolerance
 from tokenspeed_kernel.platform import PlatformInfo
@@ -70,9 +67,8 @@ _DTYPE_NAMES = {
 _DEFAULT_VALIDATION_RUNS = 5
 
 
-def _positive_dimension(parameters: dict[str, Any], name: str) -> int:
-    value = parameters.get(name)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+def _positive_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or value <= 0:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"gemm.bmm parameter {name!r} must be a positive integer",
@@ -81,11 +77,8 @@ def _positive_dimension(parameters: dict[str, Any], name: str) -> int:
 
 
 def _parse_dtype(value: object) -> torch.dtype:
-    if isinstance(value, str):
-        dtype = _DTYPE_NAMES.get(value.lower())
-    else:
-        dtype = value if isinstance(value, torch.dtype) else None
-    if dtype is not torch.bfloat16:
+    dtype = _DTYPE_NAMES.get(value) if isinstance(value, str) else None
+    if dtype is None:
         supported = ", ".join(sorted(_DTYPE_NAMES))
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
@@ -94,19 +87,13 @@ def _parse_dtype(value: object) -> torch.dtype:
     return dtype
 
 
-def _nonnegative_finite_number(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"gemm.bmm validation parameter {name!r} must be a number",
-        )
-    converted = float(value)
-    if not math.isfinite(converted) or converted < 0.0:
+def _tolerance(value: object, name: str) -> float:
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"gemm.bmm validation parameter {name!r} must be finite and nonnegative",
         )
-    return converted
+    return float(value)
 
 
 def _parse_validation(
@@ -124,21 +111,12 @@ def _parse_validation(
             f"Unknown gemm.bmm validation parameters: {', '.join(unknown)}",
         )
 
-    runs = value.get("runs", _DEFAULT_VALIDATION_RUNS)
-    if (
-        isinstance(runs, bool)
-        or not isinstance(runs, int)
-        or not 0 < runs <= MAX_VALIDATION_RUNS
-    ):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "gemm.bmm validation parameter 'runs' must be an integer between "
-            f"1 and {MAX_VALIDATION_RUNS}",
-        )
     tolerance = get_family_tolerance("gemm")(dtype, K=K)
-    atol = _nonnegative_finite_number(value.get("atol", tolerance.atol), "atol")
-    rtol = _nonnegative_finite_number(value.get("rtol", tolerance.rtol), "rtol")
-    return {"runs": runs, "atol": atol, "rtol": rtol}
+    return {
+        "runs": _positive_int(value.get("runs", _DEFAULT_VALIDATION_RUNS), "runs"),
+        "atol": _tolerance(value.get("atol", tolerance.atol), "atol"),
+        "rtol": _tolerance(value.get("rtol", tolerance.rtol), "rtol"),
+    }
 
 
 def _bmm_traits(
@@ -200,9 +178,7 @@ def _validate_exact_registration(
             BenchmarkStatus.INVALID_CASE,
             f"Registration {spec.name!r} does not support dense BF16 inputs",
         )
-    if not spec_matches_shape_traits(spec, shape) or not spec_matches_traits(
-        spec, traits
-    ):
+    if not spec_matches_traits(spec, traits):
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"Registration {spec.name!r} does not support parameters {shape}",
@@ -236,8 +212,7 @@ def _select_registration(
             solution=request.solution,
         )
     except NoKernelFoundError as exc:
-        status = _selection_miss_status(request, platform)
-        raise BenchmarkCaseError(status, str(exc)) from exc
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(exc)) from exc
 
     registry = KernelRegistry.get()
     spec = registry.get_by_name(selected.name)
@@ -280,26 +255,6 @@ def _select_reference_registration(
     )
 
 
-def _selection_miss_status(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-) -> BenchmarkStatus:
-    if request.solution is None:
-        return BenchmarkStatus.NOT_APPLICABLE
-
-    registry = KernelRegistry.get()
-    solution_specs = registry.get_for_operator(
-        request.family,
-        request.mode,
-        solution=request.solution,
-    )
-    if not solution_specs:
-        return BenchmarkStatus.BACKEND_UNAVAILABLE
-    if not any(spec.capability.satisfied_by(platform) for spec in solution_specs):
-        return BenchmarkStatus.NOT_APPLICABLE
-    return BenchmarkStatus.INVALID_CASE
-
-
 def prepare_dense_bmm(
     request: BenchmarkRequest,
     platform: PlatformInfo,
@@ -314,10 +269,10 @@ def prepare_dense_bmm(
             f"Unknown dense gemm.bmm parameters: {', '.join(unknown)}",
         )
 
-    batch = _positive_dimension(request.parameters, "batch")
-    M = _positive_dimension(request.parameters, "M")
-    N = _positive_dimension(request.parameters, "N")
-    K = _positive_dimension(request.parameters, "K")
+    batch = _positive_int(request.parameters.get("batch"), "batch")
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
     dtype = _parse_dtype(request.parameters.get("dtype", "bfloat16"))
     validation_config = _parse_validation(
         request.parameters.get("validation"),
@@ -363,24 +318,8 @@ def prepare_dense_bmm(
         inputs: dict[str, Any],
         kernel: Callable[..., object],
         kernel_spec: KernelSpec,
-        *,
-        validate_layout: bool,
     ) -> Callable[[], torch.Tensor]:
-        A = inputs["A"]
-        B = inputs["B"]
-        out = torch.empty((batch, M, N), dtype=dtype, device=A.device)
-        if validate_layout:
-            actual_traits = _bmm_traits(batch, M, N, K, dtype)
-            actual_traits["a_inner_stride_one"] = A.stride(-1) == 1
-            actual_traits["b_n_stride_one"] = B.stride(1) == 1
-            actual_traits["out_inner_stride_one"] = out.stride(-1) == 1
-            if not spec_matches_traits(kernel_spec, actual_traits):
-                raise BenchmarkCaseError(
-                    BenchmarkStatus.INVALID_CASE,
-                    "Generated tensor layouts do not satisfy registration "
-                    f"{kernel_spec.name!r}",
-                )
-
+        out = torch.empty((batch, M, N), dtype=dtype, device=inputs["A"].device)
         call_kwargs = dict(inputs)
         call_kwargs["out"] = out
 
@@ -396,12 +335,7 @@ def prepare_dense_bmm(
         return invoke
 
     performance_inputs = generate_inputs(request.seed)
-    performance_invoke = prepare_invocation(
-        performance_inputs,
-        selected,
-        spec,
-        validate_layout=True,
-    )
+    performance_invoke = prepare_invocation(performance_inputs, selected, spec)
 
     validation: PreparedValidation | None = None
     if validation_config is not None:
@@ -411,42 +345,27 @@ def prepare_dense_bmm(
             shape,
             platform,
         )
-        validation_runs = int(validation_config["runs"])
-        validation_kwargs = {
-            "atol": float(validation_config["atol"]),
-            "rtol": float(validation_config["rtol"]),
-        }
-
-        def output_specs() -> tuple[OutputValidationSpec]:
-            return (
-                OutputValidationSpec(
-                    "close",
-                    validation_runs,
-                    validation_kwargs,
-                ),
-            )
 
         def prepare_validation_run(run_index: int) -> ValidationInvocation:
             inputs = generate_inputs(request.seed + run_index + 1)
-            candidate = prepare_invocation(
-                inputs,
-                selected,
-                spec,
-                validate_layout=True,
-            )
-            expected = prepare_invocation(
-                inputs,
-                reference,
-                reference_spec,
-                validate_layout=False,
-            )
+            candidate = prepare_invocation(inputs, selected, spec)
+            expected = prepare_invocation(inputs, reference, reference_spec)
             return ValidationInvocation(
                 candidate=lambda: (candidate(),),
                 reference=lambda: (expected(),),
             )
 
         validation = PreparedValidation(
-            output_specs=output_specs,
+            output_specs=(
+                OutputValidationSpec(
+                    "close",
+                    {
+                        "atol": validation_config["atol"],
+                        "rtol": validation_config["rtol"],
+                    },
+                ),
+            ),
+            runs=validation_config["runs"],
             prepare_run=prepare_validation_run,
         )
 

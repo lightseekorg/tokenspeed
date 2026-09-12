@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import statistics
 import time
@@ -217,7 +218,6 @@ class GraphTimer:
     ) -> None:
         self.config = config
         self._backend = backend or _TorchCudaBackend()
-        self._stream: object | None = None
 
     def measure(self, prepared: PreparedInvocation) -> GraphMeasurement:
         """Capture and measure one prepared invocation."""
@@ -242,8 +242,6 @@ class GraphTimer:
             ) from error
 
         graph: object | None = None
-        active_error: BaseException | None = None
-
         try:
             with torch.no_grad():
                 warmup_started = backend.monotonic()
@@ -266,48 +264,32 @@ class GraphTimer:
                     event_pairs,
                 )
                 measurement_time_ms = _elapsed_wall_ms(backend, measurement_started)
-
-                return _summarize(
-                    samples_us,
-                    calls_per_graph=self.config.calls_per_graph,
-                    eager_warmup_iterations=self.config.eager_warmup_iterations,
-                    replay_warmup_iterations=self.config.replay_warmup_iterations,
-                    warmup_time_ms=warmup_time_ms,
-                    capture_time_ms=capture_time_ms,
-                    first_replay_time_ms=first_replay_time_ms,
-                    measurement_time_ms=measurement_time_ms,
-                )
-        except GraphBenchmarkError as error:
-            active_error = error
+        except BaseException:
+            # The phase error is the interesting one; graph release is best effort.
+            if graph is not None:
+                with contextlib.suppress(Exception):
+                    backend.cleanup_graph(graph)
             raise
+
+        try:
+            backend.cleanup_graph(graph)
         except Exception as error:
-            active_error = error
             raise GraphBenchmarkError(
-                "warmup",
-                "failed to initialize the graph benchmark",
+                "cleanup",
+                "failed to release the captured graph",
                 cause=error,
             ) from error
-        finally:
-            if active_error is not None and self._stream is not None:
-                failed_stream = self._stream
-                self._stream = None
-                try:
-                    backend.synchronize_stream(failed_stream)
-                except Exception as error:  # noqa: BLE001
-                    active_error.add_note(f"failed stream drain also failed: {error}")
-            if graph is not None:
-                try:
-                    backend.cleanup_graph(graph)
-                except Exception as error:
-                    self._stream = None
-                    if active_error is not None:
-                        active_error.add_note(f"graph cleanup also failed: {error}")
-                    else:
-                        raise GraphBenchmarkError(
-                            "cleanup",
-                            "failed to release the captured graph",
-                            cause=error,
-                        ) from error
+
+        return _summarize(
+            samples_us,
+            calls_per_graph=self.config.calls_per_graph,
+            eager_warmup_iterations=self.config.eager_warmup_iterations,
+            replay_warmup_iterations=self.config.replay_warmup_iterations,
+            warmup_time_ms=warmup_time_ms,
+            capture_time_ms=capture_time_ms,
+            first_replay_time_ms=first_replay_time_ms,
+            measurement_time_ms=measurement_time_ms,
+        )
 
     def _warm_up(
         self,
@@ -315,11 +297,8 @@ class GraphTimer:
     ) -> tuple[object, list[tuple[object, object]]]:
         backend = self._backend
         try:
-            source_stream = backend.current_stream()
-            if self._stream is None:
-                self._stream = backend.new_stream()
-            stream = self._stream
-            backend.wait_stream(stream, source_stream)
+            stream = backend.new_stream()
+            backend.wait_stream(stream, backend.current_stream())
             event_pairs = [
                 (backend.new_event(), backend.new_event())
                 for _ in range(self.config.measurement_blocks)
@@ -370,17 +349,8 @@ class GraphTimer:
             return graph
         except Exception as error:
             if graph is not None:
-                try:
-                    backend.synchronize_stream(stream)
-                except Exception as synchronize_error:  # noqa: BLE001
-                    error.add_note(
-                        f"partial graph stream drain failed: {synchronize_error}"
-                    )
-                self._stream = None
-                try:
+                with contextlib.suppress(Exception):
                     backend.cleanup_graph(graph)
-                except Exception as cleanup_error:  # noqa: BLE001
-                    error.add_note(f"partial graph cleanup failed: {cleanup_error}")
             raise GraphBenchmarkError(
                 "capture",
                 "process-wide graph capture failed",
@@ -455,12 +425,12 @@ def _reset(prepared: PreparedInvocation) -> None:
 
 
 def _validate_positive_int(name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
 
 
 def _validate_nonnegative_int(name: str, value: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
 
 

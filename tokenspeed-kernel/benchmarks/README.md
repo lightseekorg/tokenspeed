@@ -4,33 +4,39 @@ This directory contains versioned suites for measuring exact TokenSpeed kernel
 registrations. The benchmark harness separates operation-specific input and
 correctness logic from shared device timing and result reporting.
 
-The first suite, [`amd/gfx950.json`](amd/gfx950.json), covers one dense BF16
-batched GEMM registration. Additional operations add their own benchmark
-generator and suite entries while reusing the same harness.
+Suites are organized as `<vendor>/<arch>.json`, one per target platform. Each
+operation family and mode owns one benchmark generator under
+`tokenspeed_kernel/benchmark/generators/`; built-in generators are loaded by
+the harness, and additional ones are registered with
+`set_benchmark_generator`. Suites reference generators by family, mode, and
+parameters, and every generator reuses the same harness, timer, and validators.
 
 ## Benchmark Requests
 
 Each request identifies an operation family and mode, supplies parameters for
 that operation's generator, and may select a solution or exact registration.
 The generator interprets parameters such as shapes and data types and returns
-the callable, arguments, and correctness work needed by the harness.
+the callable, arguments, and correctness work needed by the harness. For
+example, a dense BF16 batched GEMM request against one exact registration:
 
 ```python
 from tokenspeed_kernel.benchmark import (
     BenchmarkRequest,
     GraphBenchmarkConfig,
+    GraphTimer,
     KernelBenchmarkHarness,
 )
 from tokenspeed_kernel.platform import current_platform
 
 harness = KernelBenchmarkHarness(
-    GraphBenchmarkConfig(
-        calls_per_graph=100,
-        eager_warmup_iterations=5,
-        replay_warmup_iterations=3,
-        measurement_blocks=30,
+    GraphTimer(
+        GraphBenchmarkConfig(
+            calls_per_graph=100,
+            eager_warmup_iterations=5,
+            replay_warmup_iterations=3,
+            measurement_blocks=30,
+        )
     ),
-    timer=None,
     platform_provider=current_platform,
 )
 result = harness.run(
@@ -84,11 +90,12 @@ selects a registered reference solution, constructs candidate and reference
 calls over the same fresh inputs, and declares a validator for each output that
 needs checking. Outputs that do not require validation use no validator.
 
-Each validator declares how many fresh input sets it needs and accepts
-validator-specific options. The harness runs the maximum requested count and
-gives each validator only its requested output pairs. The initial `close`
-validator accepts absolute and relative tolerances; dense batched GEMM uses the
-registered `torch_bmm` reference.
+The generator declares how many fresh input sets to run, and each validator
+receives every run's candidate/reference pair for its output along with
+validator-specific options. The built-in `close` validator accepts absolute
+and relative tolerances; additional validators are registered with
+`set_output_validator`. Generators typically compare against the operation's
+registered `reference` solution.
 
 Correctness runs before timing. A failure prevents the case from producing a
 successful measurement. Correctness remains within the revision-local process,
@@ -140,9 +147,9 @@ the two revisions and installs each revision's ROCm kernel requirements. Use
 local development.
 
 The output directory contains revision-local JSON results and logs, setup logs,
-the structured comparison, and a Markdown summary. The first change introducing
-a runner and suite performs a candidate-only bootstrap because no compatible
-baseline exists yet.
+the structured comparison, and a Markdown summary. When the merge base does not
+contain the suite, the comparison degrades to a candidate-only bootstrap
+because no compatible baseline exists.
 
 See the [CI documentation](../../test/ci/README.md#registration-level-kernel-benchmarks)
 for GitHub Actions triggers, artifacts, pull request comments, and runner setup.

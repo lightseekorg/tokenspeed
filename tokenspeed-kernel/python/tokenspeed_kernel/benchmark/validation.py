@@ -30,7 +30,6 @@ from tokenspeed_kernel.numerics.comparison import compare_outputs
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 
 __all__ = [
-    "MAX_VALIDATION_RUNS",
     "OutputValidationSpec",
     "ValidationDatum",
     "ValidationOutcome",
@@ -39,25 +38,15 @@ __all__ = [
     "validate_output",
 ]
 
-MAX_VALIDATION_RUNS = 100
-_CLOSE_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
-
 
 @dataclass(frozen=True)
 class OutputValidationSpec:
-    """Select a validator and the data it needs for one logical output."""
+    """Select a validator and its options for one logical output."""
 
     validator: str
-    runs: int
     kwargs: dict[str, Any]
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.runs, bool)
-            or not isinstance(self.runs, int)
-            or not 0 < self.runs <= MAX_VALIDATION_RUNS
-        ):
-            raise ValueError(f"runs must be between 1 and {MAX_VALIDATION_RUNS}")
         object.__setattr__(self, "kwargs", dict(self.kwargs))
 
 
@@ -75,10 +64,6 @@ class ValidationOutcome:
 
     passed: bool
     diagnostic: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.passed, bool):
-            raise TypeError("passed must be a bool")
 
 
 OutputValidator = Callable[
@@ -128,25 +113,9 @@ def validate_output(
     spec: OutputValidationSpec,
     data: Sequence[ValidationDatum],
 ) -> ValidationOutcome:
-    """Validate exactly the number of candidate/reference pairs in ``spec``."""
+    """Validate every candidate/reference pair of one output with ``spec``."""
 
-    pairs = tuple(data)
-    if len(pairs) != spec.runs:
-        raise ValueError(
-            f"validation data has {len(pairs)} run(s), but spec requires {spec.runs}"
-        )
-    return get_output_validator(spec.validator)(spec, pairs)
-
-
-def _finite_nonnegative_number(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be a number")
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise ValueError(f"{name} must be finite")
-    if converted < 0.0:
-        raise ValueError(f"{name} must be nonnegative")
-    return converted
+    return get_output_validator(spec.validator)(spec, tuple(data))
 
 
 def _max_metric(current: float, value: float) -> float:
@@ -159,20 +128,9 @@ def _validate_close(
     spec: OutputValidationSpec,
     data: tuple[ValidationDatum, ...],
 ) -> ValidationOutcome:
-    expected_kwargs = {"atol", "rtol"}
-    if set(spec.kwargs) != expected_kwargs:
-        missing = sorted(expected_kwargs - spec.kwargs.keys())
-        unknown = sorted(spec.kwargs.keys() - expected_kwargs)
-        details = []
-        if missing:
-            details.append("missing " + ", ".join(missing))
-        if unknown:
-            details.append("unknown " + ", ".join(unknown))
-        raise ValueError("close validator kwargs: " + "; ".join(details))
-
     tolerance = Tolerance(
-        atol=_finite_nonnegative_number(spec.kwargs["atol"], "atol"),
-        rtol=_finite_nonnegative_number(spec.kwargs["rtol"], "rtol"),
+        atol=float(spec.kwargs["atol"]),
+        rtol=float(spec.kwargs["rtol"]),
     )
     total_elements = 0
     total_mismatches = 0
@@ -195,12 +153,6 @@ def _validate_close(
                 False,
                 f"run={run_index} requires matching dtypes, got "
                 f"actual={datum.actual.dtype} expected={datum.expected.dtype}",
-            )
-        if datum.actual.dtype not in _CLOSE_DTYPES:
-            return ValidationOutcome(
-                False,
-                f"run={run_index} close validation does not support "
-                f"dtype={datum.actual.dtype}",
             )
 
         try:

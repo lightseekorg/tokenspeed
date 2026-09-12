@@ -29,7 +29,6 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.benchmark.graph import (
-    GraphBenchmarkConfig,
     GraphBenchmarkError,
     GraphMeasurement,
     GraphTimer,
@@ -62,7 +61,6 @@ class BenchmarkStatus(str, Enum):
 
     SUCCESS = "success"
     NOT_APPLICABLE = "not_applicable"
-    BACKEND_UNAVAILABLE = "backend_unavailable"
     REGISTRATION_MISSING = "registration_missing"
     INVALID_CASE = "invalid_case"
     ENVIRONMENT_INVALID = "environment_invalid"
@@ -116,10 +114,23 @@ class ValidationInvocation:
 
 @dataclass(frozen=True)
 class PreparedValidation:
-    """Operation-owned correctness specification and fresh-input factory."""
+    """Operation-owned correctness specification and fresh-input factory.
 
-    output_specs: Callable[[], Sequence[OutputValidationSpec | None]]
+    ``output_specs`` holds one entry per logical output; ``None`` skips that
+    output. ``prepare_run`` is called ``runs`` times with fresh inputs.
+    """
+
+    output_specs: Sequence[OutputValidationSpec | None]
+    runs: int
     prepare_run: Callable[[int], ValidationInvocation]
+
+    def __post_init__(self) -> None:
+        specs = tuple(self.output_specs)
+        if not any(spec is not None for spec in specs):
+            raise ValueError("output_specs must select at least one output")
+        if self.runs <= 0:
+            raise ValueError("runs must be positive")
+        object.__setattr__(self, "output_specs", specs)
 
 
 @dataclass(frozen=True)
@@ -240,17 +251,10 @@ class KernelBenchmarkHarness:
 
     def __init__(
         self,
-        config: GraphBenchmarkConfig | None,
+        timer: GraphTimer,
         *,
-        timer: GraphTimer | None,
         platform_provider: Callable[[], PlatformInfo],
     ) -> None:
-        if timer is not None and config is not None:
-            raise ValueError("config cannot be provided with an explicit timer")
-        if timer is None:
-            if config is None:
-                raise ValueError("config is required when no timer is provided")
-            timer = GraphTimer(config)
         self._timer = timer
         self._platform_provider = platform_provider
 
@@ -287,7 +291,6 @@ class KernelBenchmarkHarness:
 
         try:
             prepared = generator(request, platform)
-            self._validate_prepared(request, prepared)
         except BenchmarkCaseError as exc:
             return self._failure_result(
                 request,
@@ -330,7 +333,6 @@ class KernelBenchmarkHarness:
                     correctness_time_ms=correctness_time_ms,
                 )
             correctness_time_ms = (time.perf_counter() - correctness_started) * 1000.0
-            assert correctness is not None
             if not correctness["passed"]:
                 error = RuntimeError(self._correctness_failure_message(correctness))
                 return self._failure_result(
@@ -389,88 +391,42 @@ class KernelBenchmarkHarness:
             started,
         )
 
-    @classmethod
-    def _run_validation(
-        cls,
-        validation: PreparedValidation | None,
-    ) -> dict[str, Any] | None:
-        specs = cls._resolve_validation_specs(validation)
-        if not specs:
-            return None
-        assert validation is not None
+    @staticmethod
+    def _run_validation(validation: PreparedValidation) -> dict[str, Any]:
+        specs = validation.output_specs
+        for spec in specs:
+            if spec is not None:
+                get_output_validator(spec.validator)
 
-        maximum_runs = max(spec.runs for spec in specs if spec is not None)
         output_data: list[list[ValidationDatum]] = [[] for _ in specs]
         with torch.no_grad():
-            for run_index in range(maximum_runs):
+            for run_index in range(validation.runs):
                 invocation = validation.prepare_run(run_index)
-
-                expected = cls._require_output_tuple(
-                    invocation.reference(),
-                    f"reference correctness run {run_index}",
-                )
-                actual = cls._require_output_tuple(
-                    invocation.candidate(),
-                    f"candidate correctness run {run_index}",
-                )
+                expected = tuple(invocation.reference())
+                actual = tuple(invocation.candidate())
                 if len(expected) != len(specs) or len(actual) != len(specs):
                     raise ValueError(
                         f"correctness run {run_index} returned candidate/reference "
                         f"output counts {len(actual)}/{len(expected)}; "
                         f"expected {len(specs)}"
                     )
-
                 for output_index, spec in enumerate(specs):
-                    if spec is None or run_index >= spec.runs:
-                        continue
-                    output_data[output_index].append(
-                        ValidationDatum(
-                            actual=actual[output_index],
-                            expected=expected[output_index],
+                    if spec is not None:
+                        output_data[output_index].append(
+                            ValidationDatum(
+                                actual=actual[output_index],
+                                expected=expected[output_index],
+                            )
                         )
-                    )
 
-        return cls._evaluate_validation(
-            specs,
-            tuple(tuple(data) for data in output_data),
-        )
-
-    @staticmethod
-    def _resolve_validation_specs(
-        validation: PreparedValidation | None,
-    ) -> tuple[OutputValidationSpec | None, ...]:
-        if validation is None:
-            return ()
-        specs = tuple(validation.output_specs())
-        if not specs or not any(spec is not None for spec in specs):
-            raise ValueError("output_specs must select at least one output")
-        for spec in specs:
-            if spec is None:
-                continue
-            get_output_validator(spec.validator)
-        return specs
-
-    @staticmethod
-    def _require_output_tuple(value: object, context: str) -> tuple[object, ...]:
-        if not isinstance(value, tuple):
-            raise TypeError(f"{context} must return an output tuple")
-        return value
-
-    @staticmethod
-    def _evaluate_validation(
-        specs: tuple[OutputValidationSpec | None, ...],
-        output_data: tuple[tuple[ValidationDatum, ...], ...],
-    ) -> dict[str, Any]:
         outputs: list[dict[str, Any]] = []
         passed = True
-        maximum_runs = max(spec.runs for spec in specs if spec is not None)
         for index, spec in enumerate(specs):
             if spec is None:
                 outputs.append(
                     {
                         "index": index,
                         "validator": None,
-                        "runs": 0,
                         "kwargs": {},
                         "passed": None,
                         "diagnostic": None,
@@ -483,13 +439,12 @@ class KernelBenchmarkHarness:
                 {
                     "index": index,
                     "validator": spec.validator,
-                    "runs": spec.runs,
                     "kwargs": dict(spec.kwargs),
                     "passed": outcome.passed,
                     "diagnostic": outcome.diagnostic,
                 }
             )
-        return {"passed": passed, "runs": maximum_runs, "outputs": outputs}
+        return {"passed": passed, "runs": validation.runs, "outputs": outputs}
 
     @staticmethod
     def _correctness_failure_message(correctness: dict[str, Any]) -> str:
@@ -500,31 +455,6 @@ class KernelBenchmarkHarness:
             if output["passed"] is False
         ]
         return "; ".join(failures) or "correctness validation failed"
-
-    @staticmethod
-    def _validate_prepared(
-        request: BenchmarkRequest,
-        prepared: PreparedBenchmark,
-    ) -> None:
-        spec = prepared.registration
-        if (spec.family, spec.mode) != (request.family, request.mode):
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                f"Generator prepared {spec.family}.{spec.mode} for "
-                f"{request.family}.{request.mode}",
-            )
-        if request.solution is not None and spec.solution != request.solution:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                f"Generator selected solution {spec.solution!r}; "
-                f"requested {request.solution!r}",
-            )
-        if request.registration is not None and spec.name != request.registration:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.INVALID_CASE,
-                f"Generator selected registration {spec.name!r}; "
-                f"requested {request.registration!r}",
-            )
 
     @staticmethod
     def _base_fields(

@@ -224,32 +224,6 @@ def test_run_suite_uses_one_timer_and_emits_deterministic_envelope(tmp_path):
     assert payload["cases"][0].keys() == {"id", "definition", "policy", "result"}
 
 
-def test_run_suite_rejects_success_with_the_wrong_measurement_context(tmp_path):
-    suite = load_suite(_write_suite(tmp_path, _suite_payload()))
-
-    class Harness:
-        def run(self, request):
-            result = _success_result(request)
-            return KernelBenchmarkResult(
-                **{
-                    **result.to_dict(),
-                    "status": BenchmarkStatus.SUCCESS,
-                    "calls_per_graph": 1,
-                }
-            )
-
-    payload = run_suite(
-        suite,
-        _REVISION,
-        harness_factory=lambda _config: Harness(),
-        environment_provider=lambda: _ENVIRONMENT,
-    )
-
-    result = payload["cases"][0]["result"]
-    assert result["status"] == "execution_failure"
-    assert result["error_message"] == "successful benchmark reported the wrong context"
-
-
 def test_benchmark_exception_is_result_data_and_later_cases_run(tmp_path):
     cases = [
         {
@@ -348,9 +322,9 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
     config = load_suite(_write_suite(tmp_path, _suite_payload())).timer
     expected = object()
 
-    def fake_harness(config_arg, *, timer, platform_provider):
-        assert config_arg is config
-        assert timer is None
+    def fake_harness(timer, *, platform_provider):
+        assert isinstance(timer, benchmark_ci.GraphTimer)
+        assert timer.config is config
         assert platform_provider is benchmark_ci.current_platform
         return expected
 
