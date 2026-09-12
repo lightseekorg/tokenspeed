@@ -177,8 +177,8 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
 }
 
 TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
-    BlockPool device_pool{2};
-    BlockPool host_pool{1};
+    BlockPool device_pool{2, {1}};
+    BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
@@ -210,8 +210,8 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
 }
 
 TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
-    BlockPool device_pool{1};
-    BlockPool host_pool{1};
+    BlockPool device_pool{1, {1}};
+    BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
@@ -250,8 +250,8 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
 }
 
 TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
-    BlockPool device_pool{2};
-    BlockPool host_pool{1};
+    BlockPool device_pool{2, {1}};
+    BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
@@ -261,7 +261,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
                                                    /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
     const auto cache_device = [&](const CacheKey& key) {
-        CacheBlockRef block = device_pool.AcquireBlock(key.group_id, /*packing=*/1);
+        CacheBlockRef block = device_pool.AcquireBlock(key.group_id);
         ASSERT_TRUE(block);
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
             .Register(device_pool, block, key, /*access_epoch=*/1);
@@ -292,8 +292,8 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
 }
 
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
-    BlockPool device_pool{2};
-    BlockPool host_pool{1};
+    BlockPool device_pool{2, {1}};
+    BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
@@ -303,7 +303,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
                                                    /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
-    CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(host_pin);
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
@@ -319,8 +319,8 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
 }
 
 TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
-    BlockPool device_pool{3};
-    BlockPool host_pool{1};
+    BlockPool device_pool{3, {2, 1}};
+    BlockPool host_pool{1, {2, 1}};
     const std::array specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull,
@@ -339,7 +339,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
 
     const auto cache_block = [&](BlockPool& pool, const CacheKey& key) {
         GroupAllocator& allocator = coordinator.Allocator(static_cast<std::int32_t>(key.group_id));
-        CacheBlockRef block = pool.AcquireBlock(key.group_id, allocator.CacheBlocksPerLcmBlock());
+        CacheBlockRef block = pool.AcquireBlock(key.group_id);
         EXPECT_TRUE(block);
         const std::int32_t page = allocator.ResolveCacheBlockId(block->Location());
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
@@ -379,7 +379,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
 }
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {
-    BlockPool device_pool{2};
+    BlockPool device_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,

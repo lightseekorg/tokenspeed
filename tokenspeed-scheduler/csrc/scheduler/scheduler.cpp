@@ -53,6 +53,15 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
+std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
+    std::vector<std::int32_t> slots_per_group;
+    slots_per_group.reserve(config.cache_groups.size());
+    for (const CacheGroupConfig& group : config.cache_groups) {
+        slots_per_group.push_back(group.cache_blocks_per_lcm_block);
+    }
+    return slots_per_group;
+}
+
 // config_ is the first member, so routing it through this helper validates the
 // configuration before any pool or the coordinator is built off it.
 SchedulerConfig validated(SchedulerConfig config) {
@@ -75,8 +84,8 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
-      block_pool_{config_.device_allocator.NumUsableBlocks()},
-      host_pool_{hostPoolBlocks(config_)},
+      block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
+      host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},

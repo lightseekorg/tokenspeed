@@ -52,7 +52,7 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.
 std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& key) {
-    CacheBlockRef got = pool.AcquireBlock(manager.Id(), manager.CacheBlocksPerLcmBlock());
+    CacheBlockRef got = pool.AcquireBlock(manager.Id());
     const std::int32_t id = got->Location().lcm_block_id;
     manager.RegisterCachedBlock(pool, got, key);
     got.reset();
@@ -60,14 +60,14 @@ std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& 
 }
 
 TEST(SwaManagerTest, ConstructsWithWindow) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(/*block_granularity=*/4, /*sliding_window=*/10);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
 }
 
 TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 10);
     std::vector<CacheKey> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
     PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
@@ -78,7 +78,7 @@ TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
 
 TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
     // block_granularity 4, window 10 -> pages_needed = ceil(9/4) = 3.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 10);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -104,7 +104,7 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
 TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
     // Tail 3-run {2,3,4}. Bounded to 4 the run {2,3} < pages_needed 3 with
     // holes at 0,1 -> the bounded overload re-scans and returns empty.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 10);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -127,7 +127,7 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
 
 TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
     // pages_needed = ceil((4-1)/4) = 1 -> any single hit (from the right) suffices.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 4);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -148,7 +148,7 @@ TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
 
 TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
     // window 10 -> pages_needed 3, but prompt is only 2 pages, both cached.
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 10);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -167,7 +167,7 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
 TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     // h2 miss splits runs {h3,h4} and {h0,h1}; neither reaches 3, so the
     // surviving run is the LEFT one: keep [0..1] = [b0, b1].
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 10);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -188,7 +188,7 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
 }
 
 TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
-    BlockPool pool(7);
+    BlockPool pool(7, {1});
     SwaManager mgr(4, 10);  // pages_needed = 3
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -217,7 +217,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
 // so the match covers the full bounded range with holes and claims no real page.
 TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheOnePage(mgr, pool, h0);  // a real cached page must NOT shrink or anchor the match
@@ -229,7 +229,7 @@ TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
 }
 
 TEST(SwaManagerTest, MatchPinsUntilResultDies) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 4);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
@@ -245,7 +245,7 @@ TEST(SwaManagerTest, MatchPinsUntilResultDies) {
 }
 
 TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
-    BlockPool pool(16);
+    BlockPool pool(16, {1});
     SwaManager mgr(4, 10);  // pages_needed = 3
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
@@ -275,7 +275,7 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
 }
 
 TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 10);
     BlockTable table;
 
@@ -289,7 +289,7 @@ TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
 }
 
 TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 4);  // pages_needed = 1
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
 
@@ -304,7 +304,7 @@ TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
 }
 
 TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 real pages
@@ -318,7 +318,7 @@ TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
 }
 
 TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
-    BlockPool pool(8);
+    BlockPool pool(8, {1});
     SwaManager mgr(4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // 1 real page
@@ -331,7 +331,7 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     // Mirrors vLLM test_sliding_window_remove_skipped_blocks.
     // skipped = max(0, n - 4 + 1); skipped_blocks = skipped / 2.
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     SwaManager mgr(/*block_granularity=*/2, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 5 real pages (10 tokens / page 2)
@@ -386,7 +386,7 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
 }
 
 TEST(SwaManagerTest, ReclaimExpiredEarlyReturnInsideWindow) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     SwaManager mgr(4, 16);  // big window
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages, 8 tokens <= window
@@ -397,7 +397,7 @@ TEST(SwaManagerTest, ReclaimExpiredEarlyReturnInsideWindow) {
 }
 
 TEST(SwaManagerTest, ReclaimExpiredCapsToAllocatedBlocks) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     SwaManager mgr(4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
@@ -409,7 +409,7 @@ TEST(SwaManagerTest, ReclaimExpiredCapsToAllocatedBlocks) {
 }
 
 TEST(SwaManagerTest, ReclaimExpiredReleasesEverySlidOutBlock) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     SwaManager mgr(2, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 4 pages
@@ -422,11 +422,11 @@ TEST(SwaManagerTest, ReclaimExpiredReleasesEverySlidOutBlock) {
     EXPECT_TRUE(table.Blocks()[2]);
     EXPECT_TRUE(table.Blocks()[3]);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
-    EXPECT_EQ(pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/2).size(), 2u);
+    EXPECT_EQ(pool.AcquireBlocks(/*group_id=*/0, /*num=*/2).size(), 2u);
 }
 
 TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     SwaManager mgr(2, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 4 pages
@@ -442,7 +442,7 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
 }
 
 TEST(SwaManagerTest, DroppingAnExtraPinMakesSlidCachedPageReclaimable) {
-    BlockPool pool(2);
+    BlockPool pool(2, {1});
     SwaManager mgr(/*block_granularity=*/4, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
@@ -456,7 +456,7 @@ TEST(SwaManagerTest, DroppingAnExtraPinMakesSlidCachedPageReclaimable) {
 }
 
 TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
-    BlockPool pool(32);
+    BlockPool pool(32, {1});
     SwaManager mgr(4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 3 pages, last partial: tail_avail = 2
@@ -468,7 +468,7 @@ TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
 
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
     // Steady state: active pages stay bounded near ceil(window/block_granularity) = 2.
-    BlockPool pool(64);
+    BlockPool pool(64, {1});
     SwaManager mgr(2, 4);
     BlockTable table;
     std::int32_t n = 0;

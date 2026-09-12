@@ -91,7 +91,7 @@ public:
         const std::int32_t old_num_blocks = table.NumBlocks();
         std::vector<CacheBlockRef> block_refs;
         if (plan.num_blocks > 0) {
-            block_refs = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, plan.num_blocks);
+            block_refs = pool.AcquireBlocks(group_id_, plan.num_blocks);
             if (static_cast<std::int32_t>(block_refs.size()) < plan.num_blocks) {
                 return false;
             }
@@ -123,8 +123,7 @@ public:
         const std::int32_t num_pages = static_cast<std::int32_t>(std::ranges::count_if(
             host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
         table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
-        std::vector<CacheBlockRef> destination_refs =
-            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
+        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocks(group_id_, num_pages);
         FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
                    "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();

@@ -33,19 +33,44 @@ CacheBlock::~CacheBlock() noexcept {
     pool_->Release(location_);
 }
 
+void CacheBlock::SetReclaimable(bool reclaimable) noexcept {
+    FatalCheck(pool_ != nullptr, "CacheBlock requires a live BlockPool");
+    pool_->SetReclaimable(location_, reclaimable);
+}
+
 namespace internal_cache_block_ref {
 
 void CacheBlockControl::retain() noexcept {
     FatalCheck(strong_count_ != 0 && strong_count_ != std::numeric_limits<std::uint32_t>::max(),
                "cannot retain a destroyed or saturated CacheBlockControl");
+    const bool was_reclaimable = isReclaimable();
     ++strong_count_;
+    if (was_reclaimable != isReclaimable()) {
+        object_.SetReclaimable(isReclaimable());
+    }
 }
 
 void CacheBlockControl::release() noexcept {
     FatalCheck(strong_count_ != 0, "CacheBlockControl release requires a live reference");
-    --strong_count_;
-    if (strong_count_ == 0) {
+    if (strong_count_ == 1) {
+        FatalCheck(!cache_owned_, "cache owner must be cleared before its final reference is released");
+        --strong_count_;
         delete this;
+        return;
+    }
+    const bool was_reclaimable = isReclaimable();
+    --strong_count_;
+    if (was_reclaimable != isReclaimable()) {
+        object_.SetReclaimable(isReclaimable());
+    }
+}
+
+void CacheBlockControl::setCacheOwned(bool cache_owned) noexcept {
+    FatalCheck(cache_owned_ != cache_owned, "cache ownership transition must change state");
+    const bool was_reclaimable = isReclaimable();
+    cache_owned_ = cache_owned;
+    if (was_reclaimable != isReclaimable()) {
+        object_.SetReclaimable(isReclaimable());
     }
 }
 
@@ -97,6 +122,11 @@ std::uint32_t CacheBlockRef::use_count() const noexcept {
 
 bool CacheBlockRef::IsOwnedBy(const BlockPool& pool) const noexcept {
     return control_ != nullptr && control_->isOwnedBy(pool);
+}
+
+void CacheBlockRef::setCacheOwned(bool cache_owned) noexcept {
+    FatalCheck(control_ != nullptr, "cache ownership requires a live reference");
+    control_->setCacheOwned(cache_owned);
 }
 
 void CacheBlockRef::reset() noexcept {

@@ -64,7 +64,7 @@ std::uint64_t g_epoch = 0;
 std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
                            std::uint32_t group_id) {
     const std::int32_t group_index = static_cast<std::int32_t>(group_id);
-    CacheBlockRef block_ref = pool.AcquireBlock(group_id, coordinator.Allocator(group_index).CacheBlocksPerLcmBlock());
+    CacheBlockRef block_ref = pool.AcquireBlock(group_id);
     if (!block_ref) {
         return -1;
     }
@@ -110,7 +110,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     for (int round = 0; round < 200; ++round) {
-        BlockPool pool(64);
+        BlockPool pool(64, {1, 1});
         {
             CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
 
@@ -185,7 +185,7 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
     };
-    BlockPool pool(64);
+    BlockPool pool(64, {1, 2, 1});
     CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
