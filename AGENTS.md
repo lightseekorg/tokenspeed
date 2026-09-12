@@ -92,11 +92,20 @@ Inside the root `tokenspeed-kernel/` directory:
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
+* Tests under `test/` are split by the vendor they can run on: `test/nvidia/`
+  for tests that need CUDA-only stacks (CuTe DSL, FlashInfer, DeepEP,
+  DeepGEMM, TRT-LLM, FA3/FA4, FlashMLA, Marlin, MNNVL, `tokenspeed-mla`),
+  `test/amd/` for tests gated on `is_cdna4()`/`is_cdna5()`/`is_amd()` or
+  importing `tokenspeed_kernel_amd`, and the top level for portable Triton
+  kernels, registry/selection logic, and tests that cover both vendors. The
+  CI path filter (`test/ci_system/ci_path_filter.py`) skips the other
+  vendor's GPU CI for changes confined to a vendor subtree, so a mixed test
+  must stay at the top level.
 
 ## tokenspeed-kernel-amd
 
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
-* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
