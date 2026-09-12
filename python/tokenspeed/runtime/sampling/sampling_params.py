@@ -196,6 +196,16 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
 
+    @property
+    def has_grammar(self) -> bool:
+        """Whether the request carries a structured-output constraint."""
+        return (
+            self.json_schema is not None
+            or self.regex is not None
+            or self.ebnf is not None
+            or self.structural_tag is not None
+        )
+
     def requested_features(self) -> "set[str]":
         """Return the set of backend-facing feature names this request needs.
 
