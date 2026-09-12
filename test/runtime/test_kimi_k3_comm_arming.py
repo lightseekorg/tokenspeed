@@ -222,23 +222,20 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
 
 
 def test_attention_collective_gate():
-    # Literals, not ATTN_AR_MAX_TOKENS: asserting the constant against itself
-    # passes for every value and pins nothing.
+    # Literals: asserting the constant against itself would pin nothing.
     assert ATTN_AR_MAX_TOKENS == 8
     # An unarmed group never takes the collective; shape cannot override that.
     assert not attn_ar_eligible(
         armed=False, has_prefix=True, num_tokens=1, fusion_max_tokens=2048
     )
-    # The vendor AR owns everything wider than the one-shot window, and the
-    # window edge itself belongs to us.
+    # The window edge is ours; anything wider is the vendor's.
     assert attn_ar_eligible(
         armed=True, has_prefix=True, num_tokens=8, fusion_max_tokens=2048
     )
     assert not attn_ar_eligible(
         armed=True, has_prefix=True, num_tokens=9, fusion_max_tokens=2048
     )
-    # Block-write layers hand the prefix to the snapshot, so there is no
-    # residual left for the collective to fold in.
+    # Block-write layers keep no residual for this epilogue to fold in.
     assert not attn_ar_eligible(
         armed=True, has_prefix=False, num_tokens=1, fusion_max_tokens=2048
     )
@@ -267,8 +264,7 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
     out, mixed = comm.attn_reduce(partial, prefix, None, mlp_wp=None)
 
-    # Operand order is not observable from shapes -- both are [m, hidden] bf16 --
-    # so assert identity, not just that the kernel was reached.
+    # Both operands are [m, hidden] bf16, so assert identity, not arrival.
     args, kwargs = collective.call_args
     assert args[0] is partial and args[1] is prefix
     assert kwargs["include_reduce_scatter"] is False
@@ -276,8 +272,7 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     assert collective.call_count == 1
     assert out is reduced and mixed is None
 
-    # Nine tokens belong to the vendor. Assert it took over, not merely that we
-    # did not: an exception on the way there would satisfy a call_count of zero.
+    # Assert the vendor took over: an exception would also give call_count zero.
     collective.reset_mock()
     wide = torch.zeros(9, 8)
     comm.attn_reduce(wide, wide, None, mlp_wp=None)

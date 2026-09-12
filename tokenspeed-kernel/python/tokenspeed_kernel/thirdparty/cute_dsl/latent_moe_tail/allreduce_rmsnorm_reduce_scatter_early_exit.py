@@ -114,13 +114,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         max_m: int,
         max_token_ctas: int,
         fp32_internal: bool = False,
-        # Swaps the epilogue: emit reduced + shared_source instead of
-        # RMSNorm(reduced). ``gamma`` is unread here but still shape-checked;
-        # ``rms_eps`` is unread and unchecked. This accumulates ranks in fp32
-        # where the vendor all-reduce does not, so against it roughly 40% of
-        # output elements differ (measured, tp4/7168) while being ~3x closer
-        # to an fp32 reference. Greedy decoding turns that into different
-        # text, and any sampled accuracy gate will move.
+        # Emit reduced + shared_source, not RMSNorm(reduced); not bit-compatible.
         residual_from_shared: bool,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
@@ -436,10 +430,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 * 2
             )
             if cutlass.const_expr(self.residual_from_shared):
-                # Read the residual before admitting the PDL successor: past
-                # launch_dependents that buffer is the successor's to write.
-                # The trigger fires on the first pass only, and this mode is
-                # routed-only, so token_ctas is max_m and there is just one.
+                # Past launch_dependents below, this buffer is the successor's.
                 res_ptr = cute.make_ptr(
                     BFloat16,
                     (shared_source.iterator + element_offset).llvm_ptr,
@@ -1054,13 +1045,10 @@ class CollectiveKernel:
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
         if residual_from_shared and not precompile_split:
-            # This mode only ever dispatches the routed role, and a split
-            # dispatch needs the split compile. Without it the object builds,
-            # rendezvouses, and then raises on every call.
+            # Routed-only is a split dispatch; without this it raises on every call.
             raise ValueError("residual_from_shared requires precompile_split=True")
         if residual_from_shared and latent_dim != hidden_dim:
-            # The residual read walks shared_source with the latent row pitch,
-            # so a narrower latent silently reads the wrong row, never faults.
+            # The residual read uses the latent pitch: a narrower one reads the wrong row.
             raise ValueError(
                 "residual_from_shared requires latent_dim == hidden_dim, got "
                 f"{latent_dim} and {hidden_dim}"
@@ -1162,8 +1150,7 @@ class CollectiveKernel:
         for owner in range(tp_size):
             if rank == owner:
                 if residual_from_shared:
-                    # This mode refuses include_reduce_scatter, so every
-                    # variant carrying it would compile and never be callable.
+                    # The refused variants would compile and never be callable.
                     variants = [(False, True, None)]
                 else:
                     variants = [(True, True, None)]
@@ -1216,8 +1203,7 @@ class CollectiveKernel:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")
         if include_reduce_scatter and self.residual_from_shared:
-            # This epilogue emits reduced+residual, so a reduce-scatter of the
-            # residual alongside it has no meaning.
+            # Scattering the residual alongside an output that folded it in is meaningless.
             raise ValueError(
                 "residual_from_shared cannot be combined with include_reduce_scatter"
             )
@@ -1401,9 +1387,7 @@ class CollectiveKernel:
             or self._latent_output.device != device
             or not self._latent_output.is_contiguous()
         ):
-            # Only the pool can get this wrong, and to_cute's assumed_align is
-            # a promise to the compiler, not a check: a bad view here becomes
-            # misaligned 128-bit stores rather than an error.
+            # assumed_align promises rather than checks, so a bad pool view stores misaligned.
             raise ValueError(
                 "the pooled latent output must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.latent_dim}]"

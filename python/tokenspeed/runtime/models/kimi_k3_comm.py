@@ -330,15 +330,11 @@ class K3AttnCommState:
         )
         self.dummy_norm.weight.requires_grad_(False)
 
-        # Build collectively or not at all: a rank that skipped the build
-        # would strand its peers inside the rendezvous.
+        # A rank that skipped the build would strand its peers in the rendezvous.
         self.cute_ar = None
         if dist.is_initialized() and mapping.attn.tp_size > 1:
             group = _get_process_group(mapping.attn.tp_group)
-            # The vendor arming bit is not this kernel's capability: the
-            # collective also needs an NVLS multicast mapping.
-            # Ask the dispatch gate whether any width is admissible before
-            # paying a rendezvous the operator has already forbidden.
+            # Gate first: a forbidden window should not pay the rendezvous.
             local_ok = (
                 attn_ar_eligible(
                     armed=True,
@@ -524,8 +520,7 @@ class K3AttnComm:
         self.mapping = state.mapping
 
     # ------------------------------------------------------------------
-    # Attention-side reduction (hoisted from
-    # KimiLinearDecoderLayer._reduce_attn_accumulate).
+    # Attention-side reduction, hoisted from KimiLinearDecoderLayer.
     # ------------------------------------------------------------------
     def attn_reduce(
         self,
@@ -570,10 +565,7 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # The result lives in the collective's own latent buffer, and the
-            # state is a process singleton, so any later reduce -- next layer,
-            # or a draft model sharing the process -- overwrites it. This
-            # layer consumes it before then.
+            # Any later reduce in this process overwrites it; this layer is done by then.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,

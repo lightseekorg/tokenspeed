@@ -553,8 +553,7 @@ def test_the_attention_builder_asks_for_the_residual_epilogue(
     # Capacity has to match the caller's window, and rank is not size.
     assert seen["max_m"] == 8 and seen["max_token_ctas"] == 8
     assert seen["rank"] == 3 and seen["tp_size"] == 8
-    # Routed-only dispatch is a split dispatch, which __call__ refuses without
-    # this; in this mode it no longer adds a compile.
+    # __call__ refuses a split dispatch without it.
     assert seen["precompile_split"] is True
 
 
@@ -563,8 +562,7 @@ def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
     from tokenspeed_kernel.ops.moe.latent_tail import attn_reduce_shape_supported
 
     assert attn_reduce_shape_supported(tp_size=8, hidden_size=7168)
-    # Cluster width is tp_size when latent == hidden; the kernel takes powers
-    # of two up to 16.
+    # Cluster width is tp_size here, and the kernel takes powers of two up to 16.
     for tp in (7, 12, 24, 32):
         assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
 
@@ -596,8 +594,7 @@ def test_the_epilogue_variant_is_part_of_the_compile_key() -> None:
     residual = _compile_key(**common, residual_from_shared=True)
     rmsnorm = _compile_key(**common, residual_from_shared=False)
     assert residual != rmsnorm
-    # Control: the key must still separate on the fields it always separated
-    # on, or the inequality above could come from a key that rejects nothing.
+    # Control: a key that separated on nothing would satisfy the line above too.
     assert (
         _compile_key(**{**common, "max_m": 64}, residual_from_shared=True) != residual
     )

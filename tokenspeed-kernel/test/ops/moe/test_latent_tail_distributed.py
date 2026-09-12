@@ -340,8 +340,7 @@ def _require_attn_collective():
     from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
     from tokenspeed_kernel.ops.moe.latent_tail import multicast_backend_available
 
-    # The probe refuses to gather the fabric map itself; a server does it at
-    # distributed init, so a standalone test has to stand in for that.
+    # The probe will not gather the fabric map; a server does it at init.
     gather_fabric_map()
     ok = multicast_backend_available(dist.group.WORLD)
     flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
@@ -413,8 +412,7 @@ def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix():
         tol = 8e-3 * max(scale, 1.0)  # one bf16 ulp; reduce order differs
         assert err <= tol, f"call={call} m={m} max|err|={err} scale={scale}"
 
-        # Negative control: the same comparison must reject a missing residual,
-        # or it cannot tell a correct epilogue from one that drops the prefix.
+        # Negative control: the comparison must reject a dropped residual.
         assert (
             out.float() - prefix.float() - expected.float()
         ).abs().max().item() > tol
@@ -437,8 +435,7 @@ def test_residual_from_shared_rejects_the_reduce_scatter_role():
             include_reduce_scatter=True,
             include_routed=True,
         )
-    # Positive control: the same call with the role off must go through, or the
-    # test would pass on a kernel that rejects everything.
+    # Positive control: a kernel that rejected everything would pass the line above.
     out, _ = kernel(
         partial,
         prefix,
@@ -492,18 +489,14 @@ def test_residual_from_shared_chains_through_its_own_latent_buffer():
         seen_ptrs.append(x.data_ptr())
         torch.cuda.synchronize()
 
-    # The chain is only a chain if it is the same storage every time: values
-    # alone cannot tell reuse from a fresh buffer allocated per call.
+    # Values alone cannot tell reuse from a fresh buffer per call.
     assert len(set(seen_ptrs)) == 1, f"buffer moved across calls: {seen_ptrs}"
     err = (x.float() - expected).abs().max().item()
     scale = expected.abs().max().item()
-    # One bf16 ulp per step, and the steps are dependent: the kernel sums ranks
-    # ascending in fp32 while the reference takes NCCL's order, so a divergent
-    # rounding persists. Budget the walk, not a single step.
+    # The steps are dependent and the reduce orders differ: budget the walk.
     tol = 8e-3 * max(scale, 1.0) * depth**0.5
     assert err <= tol, f"depth={depth} max|err|={err} scale={scale} tol={tol}"
-    # Negative control: the same comparison must reject a chain that skipped
-    # its last layer, or the tolerance is wide enough to hide a broken chain.
+    # Negative control: a chain missing its last layer must fail this.
     assert (x.float() - (expected - last_acc)).abs().max().item() > tol
 
 
@@ -555,12 +548,10 @@ def test_residual_from_shared_chains_inside_a_cuda_graph():
     for _ in range(3):
         graph.replay()
         torch.cuda.synchronize()
-        # Bit-exact: same inputs, same kernel, and the buffer rotation has to
-        # land in the same place on every replay.
+        # Bit-exact: the buffer rotation must land in the same place every replay.
         assert torch.equal(captured, eager)
 
-    # Positive control: the replay is not returning a stale eager result.
-    # Perturb one input and the captured chain must move.
+    # Positive control: perturbing an input must move the captured chain.
     parts[0].copy_(parts[0] * 2)
     graph.replay()
     torch.cuda.synchronize()
@@ -588,8 +579,7 @@ def test_residual_from_shared_refuses_a_width_past_its_buffer():
                 include_reduce_scatter=False,
                 include_routed=True,
             )
-    # Positive control: max_m itself must go through, or the bound rejects
-    # everything and the check above proves nothing.
+    # Positive control: a bound that rejected everything would pass the loop above.
     ok = torch.zeros(max_m, H, dtype=torch.bfloat16, device=dev).contiguous()
     out, _ = kernel(ok, ok, gamma, include_reduce_scatter=False, include_routed=True)
     torch.cuda.synchronize()
@@ -625,8 +615,7 @@ def test_residual_from_shared_precompiles_the_variant_it_dispatches():
         finalize_top_k=None,
     )
     assert key in _COMPILED
-    # Positive control: a key the builder never asks for must be absent, or
-    # membership above says nothing about what was precompiled.
+    # Positive control: without this, membership above would say nothing.
     other = _compile_key(
         rank=dist.get_rank(),
         tp_size=_world_size(),
