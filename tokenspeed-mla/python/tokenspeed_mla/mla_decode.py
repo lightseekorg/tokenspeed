@@ -676,7 +676,12 @@ def tokenspeed_mla_decode(
 
     is_var_split_kv = False
     block_split_kvs = None
-    skip_correction_threshold = 0.0
+    # FP8 kernel: a tile whose row max grows by at most this many log2 units
+    # keeps the previous reference max and skips the accumulator rescale
+    # (see BlackwellMultiHeadLatentAttentionForwardFP8.softmax). P values are
+    # then bounded by 2**8 = 256, inside e4m3's 448, and the math is exact.
+    # The fp16 kernel keeps the exact-equality skip.
+    skip_correction_threshold = 8.0 if is_fp8 else 0.0
 
     # For fixed-length input, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
