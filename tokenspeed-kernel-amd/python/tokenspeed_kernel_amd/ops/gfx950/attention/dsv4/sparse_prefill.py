@@ -481,8 +481,8 @@ def _sparse_attn_k32_kernel(
         [8, 32 // num_warps], [64, 1], [1, num_warps], [0, 1]
     )
     # The 32-wide async index layout does not lower cleanly. K32 loads
-    # indices directly into the KV-column distribution instead.
-    slot_load_layout: gl.constexpr = gl.SliceLayout(0, kv_load_layout)
+    # indices directly into the KV-column distributions (sl_k_kv, sl_k_mma)
+    # instead of staging them through shared memory.
 
     gl.static_assert(num_warps == 4)
     gl.static_assert(BLOCK_H == 64)
@@ -531,7 +531,6 @@ def _sparse_attn_k32_kernel(
         cga_layout=[],
         shape=[BLOCK_D, BLOCK_K],
     )
-    slot_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
     sl_h_q: gl.constexpr = gl.SliceLayout(1, q_load_layout)
     sl_d_q: gl.constexpr = gl.SliceLayout(0, q_load_layout)
@@ -574,13 +573,9 @@ def _sparse_attn_k32_kernel(
 
     k_pos = gl.arange(0, BLOCK_K, layout=sl_k_kv)
     k_pos_mfma = gl.arange(0, BLOCK_K, layout=sl_k_mma)
-    slot_off = gl.arange(0, BLOCK_K, layout=slot_load_layout)
     dim_kv = gl.arange(0, BLOCK_D, layout=sl_d_kv)
     topk_base = topk_idxs + query_idx * stride_topk_m
 
-    index_smem = gl.allocate_shared_memory(
-        topk_idxs.dtype.element_ty, [2, BLOCK_K], slot_smem_layout
-    )
     cdna4_async.wait_group(0)
     q_dot = cdna4_async.load_shared_relaxed(q_smem, qk_a)
 
@@ -629,7 +624,6 @@ def _sparse_attn_k32_kernel(
         next_index = gl.load(
             topk_base + next_pos * stride_topk_k,
         )
-        next_pos = (i + 1) * BLOCK_K + k_pos
         next_mfma_pos = (i + 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
         next_index_mfma = gl.load(
             topk_base + next_mfma_pos * stride_topk_k,
