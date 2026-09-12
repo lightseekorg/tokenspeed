@@ -1820,6 +1820,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
         )
 
+        # Let the next grid (the following decode call's split kernel) be
+        # scheduled as soon as every reduction CTA is resident. Its own
+        # griddepcontrol_wait still blocks until this grid has fully completed,
+        # so this only overlaps its prologue (barrier init, TMEM allocation,
+        # tile plan) with the reduction tail on SMs the reduction has left.
+        cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
 
         gLSE = mAccLSE[acc_row, None, acc_tile, blk_coord[2]]
@@ -1896,7 +1902,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 + j * self.threads_per_warp * self.num_compute_warps
             )
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
-        cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod
