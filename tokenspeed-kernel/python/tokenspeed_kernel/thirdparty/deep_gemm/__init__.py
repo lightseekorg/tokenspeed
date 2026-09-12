@@ -97,6 +97,7 @@ from tokenspeed_kernel.thirdparty.deep_gemm.mega_moe_bf16 import (
 from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
     warmup_fp8_gemm_nt,
     warmup_mega_moe_jit,
+    warmup_mqa_logits,
     warmup_prefill_jit,
 )
 
@@ -127,5 +128,6 @@ __all__ = [
     "fp8_mqa_logits",
     "warmup_fp8_gemm_nt",
     "warmup_mega_moe_jit",
+    "warmup_mqa_logits",
     "warmup_prefill_jit",
 ]

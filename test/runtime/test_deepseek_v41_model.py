@@ -45,6 +45,9 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
@@ -100,6 +103,7 @@ def _bind_engram_tables(model, weights, tmp_path):
 def _config():
     return SimpleNamespace(
         vocab_size=128,
+        max_position_embeddings=131072,
         hidden_size=128,
         num_hidden_layers=40,
         num_attention_heads=4,
@@ -226,7 +230,9 @@ class _Backend:
     def query_metadata(self, mode):
         return self.meta
 
-    def compress(self, owner, content, scores, positions, requests, mode):
+    def compress(
+        self, owner, content, scores, positions, requests, mode, norm_weight, norm_eps
+    ):
         assert content.dtype == scores.dtype == torch.float32
         self.projections[owner] = (content.clone(), scores.clone())
         cutoff = content.shape[0] // 2 * 2
@@ -241,6 +247,8 @@ class _Backend:
         )
         row_positions[1:cutoff:2] = positions[:cutoff:2]
         row_requests[1:cutoff:2] = requests[:cutoff:2]
+        if norm_weight is not None:
+            output = _norm(output.to(torch.bfloat16), norm_weight, norm_eps)
         return output, row_positions, row_requests
 
     def write_global(self, owner, main, index, positions, requests, mode):
@@ -265,6 +273,7 @@ class _Backend:
         attn_sink,
         softmax_scale,
         index_process_group,
+        swa_rope_cache,
     ):
         self.calls.append(
             (
@@ -365,8 +374,10 @@ def test_scale_expansion_then_tp_and_merged_sharding():
     quant = v41_mxfp8_config(_quant())
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
-        attn = DeepseekV41Attention(config, mapping, 2, quant, "model.layers.2.attn")
-        for linear in (attn.wq_a, attn.wq_b, attn.wo_b, attn.indexer.wq_b):
+        attn = DeepseekV41Attention(
+            config, mapping, 2, quant, "model.layers.2.attn", aux_stream=None
+        )
+        for linear in (attn.wq_a_wkv, attn.wq_b, attn.wo_b, attn.indexer.wq_b):
             shape = (linear.output_size // 32, linear.input_size // 32)
             scales = (torch.arange(math.prod(shape)).reshape(shape) % 7 + 123).to(
                 torch.uint8
@@ -376,7 +387,7 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             )
             expected = scales.repeat_interleave(32, dim=0)
             if isinstance(linear, v41.ColumnParallelLinear):
-                expected = expected.chunk(4, dim=0)[rank]
+                expected = expected.chunk(linear.tp_size, dim=0)[linear.tp_rank]
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
@@ -507,7 +518,12 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     torch.manual_seed(100 + layer_id)
     config = _config()
     attn = DeepseekV41Attention(
-        config, _mapping(0, 1, 1), layer_id, None, f"layers.{layer_id}.attn"
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
     )
     _initialize(attn)
     positions = torch.arange(6)
@@ -516,14 +532,22 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
     actual = attn(positions, x, ctx)
-    qr = _norm(F.linear(x, attn.wq_a.weight), attn.q_norm.weight, config.rms_norm_eps)
+    qr = _norm(
+        F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
+        attn.q_norm.weight,
+        config.rms_norm_eps,
+    )
     unrotated_q = F.linear(qr, attn.wq_b.weight).reshape(6, 4, 64)
     expected_q = attn.rotary_emb(unrotated_q, positions, False)
     _, q, swa, iq, iw, group = backend.calls[-1]
     torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
     assert not torch.allclose(q.float().square().mean(-1), torch.ones(6, 4))
     expected_swa = attn.rotary_emb(
-        _norm(F.linear(x, attn.wkv.weight), attn.kv_norm.weight, config.rms_norm_eps),
+        _norm(
+            F.linear(x, attn.wq_a_wkv.weight[config.q_lora_rank :]),
+            attn.kv_norm.weight,
+            config.rms_norm_eps,
+        ),
         positions,
         False,
     )
@@ -552,15 +576,12 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
             padded = torch.zeros_like(content, dtype=torch.bfloat16)
             padded[1::2] = pooled
             pooled = padded
-            assert (
-                attn.compressor.wkv.weight.dtype
-                == attn.compressor.wgate.weight.dtype
-                == torch.float32
-            )
+            assert attn.compressor.wkv_wgate.weight.dtype == torch.bfloat16
+            assert content.dtype == score.dtype == torch.float32
         else:
             pooled = F.linear(x, attn.compressor.wkv.weight)
             assert attn.compressor.wkv.weight.dtype == torch.bfloat16
-            assert attn.compressor.wgate is None
+            assert not hasattr(attn.compressor, "wkv_wgate")
         latent = _norm(pooled, attn.compressor.norm.weight, config.rms_norm_eps)
         torch.testing.assert_close(
             main, attn.rotary_emb(latent, row_pos, False), rtol=0, atol=0
@@ -715,14 +736,16 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     quant = v41_mxfp8_config(_quant())
     with torch.device("cuda:0"):
         attn = DeepseekV41Attention(
-            config, _mapping(0, 1, 1), 0, quant, "layers.0.attn"
+            config, _mapping(0, 1, 1), 0, quant, "layers.0.attn", aux_stream=None
         )
-    linear = attn.wq_a
+    linear = attn.wq_a_wkv
     weight = torch.randn_like(linear.weight, dtype=torch.float32).to(
         torch.float8_e4m3fn
     )
     linear.weight.data.copy_(weight)
-    scales = torch.full((1, 4), 121, dtype=torch.uint8, device="cuda:0")
+    scales = torch.full(
+        (linear.output_size // 32, 4), 121, dtype=torch.uint8, device="cuda:0"
+    )
     linear.weight_scale_inv.weight_loader(linear.weight_scale_inv, scales)
     linear.quant_method.process_weights_after_loading(linear)
     x = torch.randn(5, 128, dtype=torch.bfloat16, device="cuda:0")
@@ -890,19 +913,23 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     torch.cuda.set_device(device)
     mapping = _mapping(rank, 4, 4)
-    v41.pg_manager.init_distributed(
+    pg_manager.init_distributed(
         mapping,
         distributed_init_method="env://",
         backend="nccl",
         timeout=60,
         device_id=device,
     )
-    v41.pg_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
+    pg_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
     try:
         config = _config()
         with torch.device(device):
-            sharded = DeepseekV41Attention(config, mapping, 2, None, "attn")
-            full = DeepseekV41Attention(config, _mapping(0, 1, 1), 2, None, "attn")
+            sharded = DeepseekV41Attention(
+                config, mapping, 2, None, "attn", aux_stream=None
+            )
+            full = DeepseekV41Attention(
+                config, _mapping(0, 1, 1), 2, None, "attn", aux_stream=None
+            )
         torch.manual_seed(41)
         _initialize(full)
         full_params = dict(full.named_parameters())
@@ -913,7 +940,10 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
                 "wq_a.weight",
                 "wkv.weight",
                 "compressor.wkv.weight",
-                "compressor.wgate.weight",
+                "compressor.wkv_wgate.weight",
+                "wq_a_wkv.weight",
+                "indexer.wq_b.weight",
+                "indexer.weights_proj.weight",
                 "indexer.wk.weight",
             ):
                 loader(param, source, shard_id=None, begin_size=None)
@@ -923,9 +953,8 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
         out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND))
-        assert backend.calls[-1][-1] is v41.pg_manager.get_device_process_group(
-            mapping.attn.tp_group
-        )
+        assert backend.calls[-1][-1] is None
+        assert sharded.indexer.n_local_heads == config.index_n_heads
         expected = full(
             pos, x, _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND)
         )
@@ -1001,7 +1030,7 @@ def _loader_model(monkeypatch, config, rank, device):
     monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(v4, "dsv4_mega_moe_plan", lambda **kwargs: object())
-    monkeypatch.setattr(v41.pg_manager, "get_device_process_group", lambda group: None)
+    monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
     monkeypatch.setattr(v4.DeepseekV4MegaMoEExperts, "finalize_weights", Mock())
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     wrapper = SimpleNamespace(text_config=config)
@@ -1238,10 +1267,17 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         torch.testing.assert_close(
             getattr(embed, field).view(torch.uint8), expected, rtol=0, atol=0
         )
-    assert model.model.layers[2].attn.compressor.wkv.weight.dtype == torch.float32
+    assert (
+        model.model.layers[2].attn.compressor.wkv_wgate.weight.dtype == torch.bfloat16
+    )
     torch.testing.assert_close(
-        model.model.layers[2].attn.compressor.wkv.weight,
-        weights["layers.2.attn.compressor.wkv.weight"].float(),
+        model.model.layers[2].attn.compressor.wkv_wgate.weight,
+        torch.cat(
+            (
+                weights["layers.2.attn.compressor.wkv.weight"],
+                weights["layers.2.attn.compressor.wgate.weight"],
+            )
+        ),
         rtol=0,
         atol=0,
     )

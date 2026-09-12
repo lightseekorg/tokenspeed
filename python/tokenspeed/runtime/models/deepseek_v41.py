@@ -51,24 +51,29 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from copy import copy
+from weakref import WeakValueDictionary
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.dsv41 import (
+    rope_inplace,
+    rope_pad_query,
+)
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from torch import nn
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -96,9 +101,11 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     resolve_engram_host_layout,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
+_ROPE_TABLES = WeakValueDictionary()
 
 
 def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,6 +118,16 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % 32:
         raise ValueError(
             "V4.1 FP8 activations require a last dimension divisible by 32"
+        )
+    if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
+        return quantize_fp8_with_scale(
+            x.reshape(-1, x.shape[-1]),
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override="triton_quantize_fp8_group32_ue8m0",
+            solution=None,
         )
     grouped = x.float().unflatten(-1, (-1, 32))
     unrounded = grouped.abs().amax(-1).clamp_min(1e-4) * (1.0 / 448.0)
@@ -154,7 +171,19 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
-        codes, scales = v41_quantize_fp8(x)
+        plan = getattr(layer, "_prepared_fp8_linear", None)
+        if (
+            x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and plan is not None
+        ):
+            from tokenspeed_kernel.ops.gemm import quantize_fp8_group32_for_linear
+
+            codes, scales = quantize_fp8_group32_for_linear(
+                plan, x.reshape(-1, x.shape[-1])
+            )
+        else:
+            codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
     def apply_with_activation(
@@ -249,6 +278,31 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     return (norm.weight.float() * values).to(x.dtype)
 
 
+def _attention_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    return norm(x, residual=None, out=None) if x.is_cuda else _norm(x, norm)
+
+
+def _merged(input_size, output_sizes, dtype, quant_config, prefix):
+    layer = MergedColumnParallelLinear(
+        input_size,
+        output_sizes,
+        bias=False,
+        gather_output=False,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=quant_config,
+        prefix=prefix,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=None,
+        use_presharded_weights=False,
+        override_kernel_name=None,
+        interleave_linear_and_gate=False,
+    )
+    configure_v41_fp8_linear(layer, True)
+    return layer
+
+
 class DeepseekV41RotaryEmbedding(nn.Module):
     """Adjacent-pair RoPE, with YaRN for BOTH ratio-1 and ratio-2 global layers."""
 
@@ -289,21 +343,76 @@ class DeepseekV41RotaryEmbedding(nn.Module):
             smooth = 1 - ramp
             freqs = freqs / factor * (1 - smooth) + freqs * smooth
         self.register_buffer("inv_freq", freqs, persistent=False)
+        self.max_positions = config.max_position_embeddings
+        self._table_key = (
+            self.dim,
+            base,
+            self.max_positions,
+            tuple(sorted(config.rope_scaling.items())) if compress_ratio else None,
+        )
+        self.register_buffer("cos_sin_cache", None, persistent=False)
+        self.register_buffer("inverse_cos_sin_cache", None, persistent=False)
+
+    def _apply(self, fn, *args, **kwargs):
+        frequencies = self.inv_freq
+        self.inv_freq = frequencies.new_empty(0)
+        self.cos_sin_cache = self.inverse_cos_sin_cache = None
+        self._shared_table = None
+        super()._apply(fn, *args, **kwargs)
+        self.inv_freq = frequencies.to(device=self.inv_freq.device, dtype=torch.float32)
+        return self
+
+    def _prepare_cache(self, device: torch.device) -> None:
+        if self.cos_sin_cache is None or self.cos_sin_cache.device != device:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up V4.1 RoPE before graph capture")
+            key = (self._table_key, device)
+            table = _ROPE_TABLES.get(key)
+            if table is None:
+                angles = torch.arange(
+                    self.max_positions, device=device, dtype=torch.float32
+                )[:, None] * self.inv_freq.to(device)
+                cosine, sine = angles.cos(), angles.sin()
+                table = torch.stack(
+                    (
+                        torch.cat((cosine, sine), dim=-1),
+                        torch.cat((cosine, -sine), dim=-1),
+                    )
+                )
+                _ROPE_TABLES[key] = table
+            self._shared_table = table
+            self.cos_sin_cache, self.inverse_cos_sin_cache = table.unbind(0)
 
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate only x's trailing RoPE dimensions at absolute token positions."""
-        angles = positions.clamp_min(0).float().unsqueeze(-1) * self.inv_freq
-        freqs = torch.polar(torch.ones_like(angles), angles)
-        if inverse:
-            freqs = freqs.conj()
-        freqs = freqs.reshape(positions.numel(), *([1] * (x.ndim - 2)), self.dim // 2)
-        tail = torch.view_as_complex(
-            x[..., -self.dim :].float().contiguous().unflatten(-1, (-1, 2))
-        )
-        rotated = torch.view_as_real(tail * freqs).flatten(-2).to(x.dtype)
-        return torch.cat((x[..., : -self.dim], rotated), dim=-1)
+        if not x.is_cuda:
+            angles = positions.clamp_min(0).float().unsqueeze(-1) * self.inv_freq
+            freqs = torch.polar(torch.ones_like(angles), angles)
+            if inverse:
+                freqs = freqs.conj()
+            freqs = freqs.reshape(
+                positions.numel(), *([1] * (x.ndim - 2)), self.dim // 2
+            )
+            tail = torch.view_as_complex(
+                x[..., -self.dim :].float().contiguous().unflatten(-1, (-1, 2))
+            )
+            rotated = torch.view_as_real(tail * freqs).flatten(-2).to(x.dtype)
+            return torch.cat((x[..., : -self.dim], rotated), dim=-1)
+        self._prepare_cache(x.device)
+        cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
+        return rope_inplace(x.clone(), positions, cache, None)
+
+    def apply_owned(
+        self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
+    ) -> torch.Tensor:
+        """Rotate a fresh projection/output in place; never pass shared latents before index K reads them."""
+        if not x.is_cuda:
+            return self(x, positions, inverse)
+        self._prepare_cache(x.device)
+        cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
+        return rope_inplace(x, positions, cache, None)
 
 
 def v41_hc_mixes(
@@ -352,39 +461,52 @@ class DeepseekV41Compressor(nn.Module):
         self.ratio = config.compress_ratios[layer_id]
         if self.ratio not in (1, 2):
             raise ValueError("V4.1 KV owners require ratio 1 or 2")
-        self.wkv = _replicated(
-            config.hidden_size,
-            config.head_dim,
-            torch.float32 if self.ratio == 2 else torch.bfloat16,
-            None,
-            add_prefix("wkv", prefix),
-        )
-        self.wgate = (
-            _replicated(
+        if self.ratio == 1:
+            self.wkv = _replicated(
                 config.hidden_size,
                 config.head_dim,
-                torch.float32,
+                torch.bfloat16,
                 None,
-                add_prefix("wgate", prefix),
+                add_prefix("wkv", prefix),
             )
-            if self.ratio == 2
-            else None
+        else:
+            # The checkpoint loader requires BF16 compressor operands. Keep a
+            # single merged parameter and accumulate directly into FP32 tails.
+            self.wkv_wgate = _merged(
+                config.hidden_size,
+                [config.head_dim, config.head_dim],
+                torch.bfloat16,
+                None,
+                add_prefix("wkv_wgate", prefix),
+            )
+        self.norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
         )
-        self.norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, x, owner, positions, requests, backend, mode):
         if self.ratio == 1:
             content, _ = self.wkv(x, block_scale=None, output_dtype=None)
         else:
-            content, _ = self.wkv(x.float(), block_scale=None, output_dtype=None)
-            scores, _ = self.wgate(x.float(), block_scale=None, output_dtype=None)
-            content, positions, requests = backend.compress(
-                owner, content, scores, positions, requests, mode
+            projected = (
+                dsv4_linear_fp32(
+                    x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
+                )
+                if x.is_cuda
+                else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
-            # Fixed-capacity pooled rows retain -1 positions through norm/RoPE;
-            # cache writers mask them, so odd/even replay never changes shape.
-            content = content.to(x.dtype)
-        return _norm(content, self.norm), positions, requests
+            content, scores = projected.chunk(2, dim=-1)
+            content, positions, requests = backend.compress(
+                owner,
+                content,
+                scores,
+                positions,
+                requests,
+                mode,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+            )
+            return content, positions, requests
+        return _attention_norm(content, self.norm), positions, requests
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -392,24 +514,22 @@ class DeepseekV41Indexer(nn.Module):
         self, config, mapping: Mapping, owns_k: bool, quant_config, prefix: str
     ):
         super().__init__()
-        self.n_local_heads = config.index_n_heads // mapping.attn.tp_size
+        self.n_local_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.scale = self.head_dim**-0.5 * config.index_n_heads**-0.5
-        self.wq_b = _column(
+        self.wq_b = _replicated(
             config.q_lora_rank,
             config.index_n_heads * self.head_dim,
             torch.bfloat16,
             quant_config,
             add_prefix("wq_b", prefix),
-            mapping,
         )
-        self.weights_proj = _column(
+        self.weights_proj = _replicated(
             config.hidden_size,
             config.index_n_heads,
             torch.bfloat16,
             None,
             add_prefix("weights_proj", prefix),
-            mapping,
         )
         self.wk = (
             _replicated(
@@ -423,7 +543,9 @@ class DeepseekV41Indexer(nn.Module):
             else None
         )
         self.k_norm = (
-            RMSNorm(self.head_dim, eps=config.rms_norm_eps) if owns_k else None
+            RMSNorm(self.head_dim, eps=config.rms_norm_eps).to(dtype=torch.bfloat16)
+            if owns_k
+            else None
         )
 
     def forward(
@@ -434,7 +556,7 @@ class DeepseekV41Indexer(nn.Module):
         rotary: DeepseekV41RotaryEmbedding,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
-        q = rotary(
+        q = rotary.apply_owned(
             q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
         )
         weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
@@ -449,14 +571,22 @@ class DeepseekV41Indexer(nn.Module):
         if self.wk is None:
             raise RuntimeError("Only a KV owner can project index keys")
         key, _ = self.wk(latent, block_scale=None, output_dtype=None)
-        return rotary(_norm(key, self.k_norm), positions, False)
+        return rotary.apply_owned(_attention_norm(key, self.k_norm), positions, False)
 
 
 class DeepseekV41Attention(nn.Module):
     def __init__(
-        self, config, mapping: Mapping, layer_id: int, quant_config, prefix: str
+        self,
+        config,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config,
+        prefix: str,
+        *,
+        aux_stream: torch.cuda.Stream | None,
     ):
         super().__init__()
+        self.stream_fork = StreamFork(aux_stream)
         self.layer_id = layer_id
         self.mapping = mapping
         self.head_dim = config.head_dim
@@ -472,14 +602,17 @@ class DeepseekV41Attention(nn.Module):
             torch.empty(self.n_local_heads, dtype=torch.float32), requires_grad=False
         )
         self.attn_sink.weight_loader = self.load_sink
-        self.wq_a = _replicated(
+        self.register_buffer("_padded_attn_sink", None, persistent=False)
+        self.wq_a_wkv = _merged(
             config.hidden_size,
-            config.q_lora_rank,
+            [config.q_lora_rank, config.head_dim],
             torch.bfloat16,
             quant_config,
-            add_prefix("wq_a", prefix),
+            add_prefix("wq_a_wkv", prefix),
         )
-        self.q_norm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
+        )
         self.wq_b = _column(
             config.q_lora_rank,
             config.num_attention_heads * config.head_dim,
@@ -488,14 +621,9 @@ class DeepseekV41Attention(nn.Module):
             add_prefix("wq_b", prefix),
             mapping,
         )
-        self.wkv = _replicated(
-            config.hidden_size,
-            config.head_dim,
-            torch.bfloat16,
-            quant_config,
-            add_prefix("wkv", prefix),
+        self.kv_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps).to(
+            dtype=torch.bfloat16
         )
-        self.kv_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = _column(
             config.num_attention_heads * config.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
@@ -543,6 +671,20 @@ class DeepseekV41Attention(nn.Module):
     def load_sink(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         start = self.mapping.attn.tp_rank * self.n_local_heads
         default_weight_loader(param, loaded_weight[start : start + self.n_local_heads])
+        if self._padded_attn_sink is not None:
+            self._padded_attn_sink[: self.n_local_heads].copy_(param)
+
+    def _kernel_attn_sink(self):
+        padded = 64 if self.n_local_heads <= 64 else 128
+        if not self.attn_sink.is_cuda or padded == self.n_local_heads:
+            return self.attn_sink
+        if self._padded_attn_sink is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up attention sink before graph capture")
+            self._padded_attn_sink = F.pad(
+                self.attn_sink, (0, padded - self.n_local_heads), value=-float("inf")
+            )
+        return self._padded_attn_sink
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor, ctx: ForwardContext
@@ -558,33 +700,84 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = meta.positions, meta.request_indices
-        qr, _ = self.wq_a(hidden_states, block_scale=None, output_dtype=None)
-        qr = _norm(qr, self.q_norm)
-        q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
-        q = self.rotary_emb(
-            q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
+        qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        qr = _attention_norm(qr, self.q_norm)
+        if hidden_states.is_cuda:
+            # Lazy shared constants are produced before the fork event, so both
+            # branches observe them even on the first eager decode after loading.
+            self.rotary_emb._prepare_cache(hidden_states.device)
+        overlap = (
+            mode.is_decode()
+            and self.is_index_source
+            and hidden_states.is_cuda
+            and hidden_states.numel() > 0
+            and self.stream_fork.aux_stream is not None
+            and self.stream_fork.aux_stream.device == hidden_states.device
         )
-        swa, _ = self.wkv(hidden_states, block_scale=None, output_dtype=None)
-        swa = self.rotary_emb(_norm(swa, self.kv_norm), positions, False)
-        if self.compressor is not None:
-            latent, row_positions, row_requests = self.compressor(
-                hidden_states, self.layer_id, positions, requests, backend, mode
-            )
-            # Never rotate the shared latent in place before index K consumes it.
-            index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
-            main_k = self.rotary_emb(latent, row_positions, False)
-            backend.write_global(
-                self.layer_id, main_k, index_k, row_positions, row_requests, mode
-            )
-        index_q, index_weights, index_group = None, None, None
-        if self.indexer is not None:
-            index_q, index_weights = self.indexer(
-                hidden_states, qr, positions, self.rotary_emb
-            )
-            if self.mapping.attn.has_tp:
-                index_group = pg_manager.get_device_process_group(
-                    self.mapping.attn.tp_group
-                )
+        consumer = torch.cuda.current_stream() if overlap else None
+        if overlap:
+            for tensor in (hidden_states, qr, positions, requests):
+                tensor.record_stream(self.stream_fork.aux_stream)
+        index_q, index_weights, index_group, prepared = None, None, None, None
+        with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
+            # Submit the longer compressor/index branch first. Serial eager and
+            # captured decode execute these identical operations and dependency joins.
+            with fork.branch():
+                if self.compressor is not None:
+                    latent, row_positions, row_requests = self.compressor(
+                        hidden_states, self.layer_id, positions, requests, backend, mode
+                    )
+                    index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
+                    main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
+                    backend.write_global(
+                        self.layer_id,
+                        main_k,
+                        index_k,
+                        row_positions,
+                        row_requests,
+                        mode,
+                    )
+                if self.indexer is not None:
+                    index_q, index_weights = self.indexer(
+                        hidden_states, qr, positions, self.rotary_emb
+                    )
+                    if mode.is_decode():
+                        prepared = backend.prepare_global_selection(
+                            self.layer_id,
+                            index_q,
+                            index_weights,
+                            positions,
+                            requests,
+                            mode,
+                            index_group,
+                        )
+                        index_q = index_weights = None
+            q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
+            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+            if q.is_cuda and mode.is_decode() and self.head_dim == 512:
+                q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
+            else:
+                q = self.rotary_emb.apply_owned(q, positions, False)
+            swa = _attention_norm(swa, self.kv_norm)
+            swa_rope_cache = None
+            if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
+                self.rotary_emb._prepare_cache(swa.device)
+                swa_rope_cache = self.rotary_emb.cos_sin_cache
+            else:
+                swa = self.rotary_emb.apply_owned(swa, positions, False)
+        if overlap:
+            # Aux-owned scratch can outlive this layer through source/reuse
+            # records. Main consumers and allocator reuse both follow the join.
+            for tensor in prepared:
+                if tensor is not None:
+                    tensor.record_stream(consumer)
+            record = backend.sparse_topk.decode
+            for tensor in (record.logical_rows, record.lengths):
+                tensor.record_stream(consumer)
+            if record.candidates is not None:
+                for tensor in (record.candidates.block_ids, record.candidates.lengths):
+                    tensor.record_stream(consumer)
         out = backend.forward_v41(
             q,
             swa,
@@ -594,14 +787,15 @@ class DeepseekV41Attention(nn.Module):
             forward_mode=mode,
             index_q=index_q,
             index_weights=index_weights,
-            attn_sink=self.attn_sink,
+            attn_sink=self._kernel_attn_sink(),
             softmax_scale=self.head_dim**-0.5,
             index_process_group=index_group,
+            swa_rope_cache=swa_rope_cache,
         )
-        out = self.rotary_emb(out, positions, True)
+        out = self.rotary_emb.apply_owned(out[:, : self.n_local_heads], positions, True)
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-        out = torch.einsum("tgd,grd->tgr", grouped, weight).flatten(1)
+        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
         out, _ = self.wo_b(out, scale=None)
         if self.mapping.attn.has_tp:
             out = all_reduce(
@@ -681,7 +875,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         dense_quant = v41_mxfp8_config(quant_config)
         self.attn = DeepseekV41Attention(
-            config, mapping, layer_id, dense_quant, add_prefix("attn", prefix)
+            config,
+            mapping,
+            layer_id,
+            dense_quant,
+            add_prefix("attn", prefix),
+            aux_stream=aux_stream,
         )
         self.ffn = DeepseekV41MoE(
             config,
@@ -712,7 +911,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 mapping,
                 quant_config,
                 add_prefix("engram", prefix),
-                self.attn.wq_a.weight.device,
+                self.attn.wq_a_wkv.weight.device,
                 host_table,
                 host_layout,
             )
@@ -836,6 +1035,10 @@ class DeepseekV41Model(nn.Module):
             tp_group=mapping.attn.tp_group,
             use_presharded_weights=False,
         )
+        device = self.embed_tokens.weight.device
+        self.aux_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self.layers = nn.ModuleList(
             [
                 DeepseekV41DecoderLayer(
@@ -844,7 +1047,7 @@ class DeepseekV41Model(nn.Module):
                     layer_id,
                     quant_config,
                     add_prefix(f"layers.{layer_id}", prefix),
-                    None,
+                    self.aux_stream,
                     host_table,
                     host_layout,
                 )
@@ -1043,6 +1246,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         name,
                         shard_id,
                     )
+            elif ".wq_a_wkv." in raw or ".wkv_wgate." in raw:
+                merged, shards = (
+                    ("wq_a_wkv", ("wq_a", "wkv"))
+                    if ".wq_a_wkv." in raw
+                    else ("wkv_wgate", ("wkv", "wgate"))
+                )
+                for shard_id, shard in enumerate(shards):
+                    targets[raw.replace(f".{merged}.", f".{shard}.")] = (name, shard_id)
             elif ".engram." not in raw:
                 targets[
                     raw.replace(".shared_experts.down_proj.", ".shared_experts.w2.")

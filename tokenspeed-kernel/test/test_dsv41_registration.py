@@ -41,7 +41,18 @@ family = "tokenspeed_kernel.ops.attention.dsv41"
 operations = (
     "cache_pack", "cache_unpack", "cache_scatter", "cache_gather",
     "index_q_quantize", "selected_attention", "index_score", "index_topk",
+    "compressor_tail_scatter", "compressor_pool", "swa_rope_scatter",
+    "rope_inplace", "rope_pad_query",
 )
+registrations = [
+    ("triton_dsv41_" + op, "dsv41_" + op, "triton", "triton")
+    for op in operations
+] + [
+    ("flashmla_dsv41_selected_attention", "dsv41_selected_attention", "flashmla", "flash_mla"),
+    ("deep_gemm_dsv41_index_topk", "dsv41_index_topk", "deep_gemm", "deep_gemm"),
+    ("deepselect_dsv41_select_candidates", "dsv41_select_candidates", "deepselect", "deep_select"),
+    ("deepselect_dsv41_select_topk", "dsv41_select_topk", "deepselect", "deep_select"),
+]
 for _ in range(2):
     KernelRegistry.reset()
     assert not KernelRegistry.get().list_kernels(family=None, mode=None)
@@ -53,16 +64,23 @@ for _ in range(2):
     else:
         load_builtin_kernels()
     registry = KernelRegistry.get()
-    for operation in operations:
-        name = "triton_dsv41_" + operation
+    for name, mode, solution, module in registrations:
         spec = registry.get_by_name(name)
         assert spec is not None, name
         assert (spec.family, spec.mode, spec.solution) == (
-            "attention", "dsv41_" + operation, "triton"
+            "attention", mode, solution
         )
         implementation = registry.get_impl(name)
         assert callable(implementation), name
-        assert implementation.__module__ == family + ".triton"
+        assert implementation.__module__ == family + "." + module
+
+adapter = importlib.import_module("tokenspeed_kernel.thirdparty.flash_mla")
+for name in (
+    "flash_mla_sparse_fwd", "flash_mla_with_kvcache", "get_mla_metadata",
+    "flash_mla_api", "is_flash_mla_v41_available",
+):
+    assert name in adapter.__all__, name
+    assert callable(getattr(adapter, name)), name
 """
     result = subprocess.run(
         [

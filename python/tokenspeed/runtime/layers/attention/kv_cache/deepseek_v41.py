@@ -33,7 +33,9 @@ class DeepseekV41CachePool(CachePool):
 
     Field pages are not contiguous across owners or groups. In particular,
     flattening page and row with reshape can copy an entire cache. Kernels
-    must index page/row using the returned tensor's actual strides.
+    must preserve the page stride and interpret each page as all value rows
+    followed by all scale rows. The field shape carries its byte budget, not
+    separately addressable packed rows.
     """
 
     requires_page_zeroing = True
@@ -68,18 +70,18 @@ class DeepseekV41CachePool(CachePool):
         return view
 
     def swa(self, layer: int) -> torch.Tensor:
-        """Return layer's uint8 [pages, 64, 528] FP8-value/E8M0-scale rows."""
+        """Return layer's uint8 [pages, 64, 528] page-planar FP8 values/E8M0 scales."""
         return self._field(layer, "swa")
 
     def global_kv(self, owner: int) -> torch.Tensor:
-        """Return owner's uint8 [pages, 64, 288] FP4-value/E4M3-scale rows.
+        """Return owner's uint8 [pages, 64, 288] page-planar FP4 values/E4M3 scales.
 
         Pass the KV source layer, not a Reuse/Reindex consumer layer.
         """
         return self._field(owner, "global_kv")
 
     def index_k(self, owner: int) -> torch.Tensor:
-        """Return owner's uint8 [pages, 64, 68] FP4-value/E8M0-scale rows.
+        """Return owner's uint8 [pages, 64, 68] page-planar FP4 values/E8M0 scales.
 
         Main KV and index K share logical rows and page ids, not byte offsets.
         """

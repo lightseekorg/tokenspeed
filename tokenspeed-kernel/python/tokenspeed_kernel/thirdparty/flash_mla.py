@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Optional FlashMLA exports and lazy V4.1 API, provided by tokenspeed-flashmla."""
+
 from __future__ import annotations
 
 import importlib.util
+from functools import lru_cache
+from types import ModuleType
 
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
@@ -46,8 +50,39 @@ if (
         pass
 
 
+@lru_cache(maxsize=1)
+def flash_mla_api() -> ModuleType:
+    """Return the optional FlashMLA API, or raise an actionable import error.
+
+    The import is lazy so unrelated kernel families require no FlashMLA.
+    Only Python API references are cached; attention schedules are not.
+    """
+    try:
+        import flash_mla.flash_mla_interface as api
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "FlashMLA requires the optional tokenspeed-flashmla package "
+            "including its native CUDA extension."
+        ) from exc
+    return api
+
+
+def is_flash_mla_v41_available() -> bool:
+    """Return whether the optional V4.1 Python API and extension import."""
+    try:
+        flash_mla_api()
+        # This API was introduced with the V4.1 packed-cache formats. Older
+        # FlashMLA releases can still serve other attention implementations.
+        from flash_mla import fused_norm_rope_attn_rope_cast  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
 __all__ = [
     "flash_mla_sparse_fwd",
     "flash_mla_with_kvcache",
     "get_mla_metadata",
+    "flash_mla_api",
+    "is_flash_mla_v41_available",
 ]

@@ -30,6 +30,7 @@ from collections.abc import Mapping, Sequence
 
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID,
     V41_GLOBAL_R1_GROUP_ID,
@@ -40,6 +41,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_HEAD_DIM,
     V41_INDEX_HEAD_DIM,
     V41_INDEX_ROW_BYTES,
+    V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
     V41_SWA_ROW_BYTES,
     V41_WINDOW_SIZE,
@@ -129,7 +131,7 @@ class DeepseekV41Recipe(CacheRecipe):
                     shape=shape,
                     dtype=dtype,
                     exact_page_stride=False,
-                    page_stride_alignment_bytes=256,
+                    page_stride_alignment_bytes=512 if name == "swa" else 256,
                 )
             )
 
@@ -227,13 +229,47 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # Request ids, positions, starts, lengths, four write-location vectors;
         # two generations allow an extend followed by a decode metadata view.
-        metadata = 2 * (tables + max_bs * 96 + 4)
+        metadata = 2 * (tables + max_bs * (96 + 128 * 4 + 4) + 4)
         # Both MIXED windows together are bounded by queries. Include the
         # packed current SWA rows and two generations of selection records.
         selections = queries * ((2048 + 2 * 512 + 128) * 8 + 528)
-        # ponytail: reserve a 64 MiB tiled baseline workspace; replace this
-        # bound with the native kernel's declared workspace when optimized.
-        # Ratio-2 pooling returns T FP32 rows (inactive positions are -1), not
-        # a compact T/2 result. History/softmax scratch is tiled to eight rows.
+        spec = self.attn_config.component(DeepseekV41Config)
+        local_heads = spec.num_attention_heads // spec.attn_tp_size
+        padded_heads = 64 if local_heads <= 64 else 128
+        query_tile = min(queries, V41_PREFILL_QUERY_TILE)
+        # Native Q and output coexist for one tile. Previous tiles release the
+        # padded result after copying their real heads into the final output.
+        native_attention = 2 * query_tile * padded_heads * V41_HEAD_DIM * 2
+        real_output = queries * local_heads * V41_HEAD_DIM * 2
+        # One request at a time shares its prefix/current/global BF16 workspace.
+        # The ratio-1 group is the upper bound for any compressed history.
+        compact_kv = (
+            (self.attn_config.context_len + queries + max_bs * V41_WINDOW_SIZE)
+            * V41_HEAD_DIM
+            * 2
+        )
+        # BF16 current SWA and compact [T,128+512] indices coexist with that KV.
+        compact_metadata = queries * (V41_HEAD_DIM * 2 + (128 + 512) * 4)
+        # Packed index Q (32 global heads, 64 value + 4 scale bytes) and a
+        # 32-MiB logits tile plus selection copies; score/selection is bounded
+        # independently of the complete context or the prefill query count.
+        index_queries = queries * 32 * (128 * 2 + 68)
+        score_columns = (self.attn_config.context_len + 63) // 64 * 64
+        score_scratch = min(128 << 20, min(queries, 1024) * score_columns * 4)
+        block_k = max(32, 1 << (min(2048, max(1, score_columns // 8)) - 1).bit_length())
+        # Sixteen portable partitions plus bounded TopK merge temporaries.
+        portable_scratch = min(queries, 256) * 24 * (512 + block_k) * 12
+        index_selection = max(3 * score_scratch, portable_scratch) + score_columns * 68
+        # Ratio-2 pooling returns T FP32 rows, including inactive (-1) positions.
         compressor_output = queries * V41_HEAD_DIM * 4
-        return metadata + selections + compressor_output + (64 << 20)
+        return (
+            metadata
+            + selections
+            + compressor_output
+            + native_attention
+            + real_output
+            + compact_kv
+            + compact_metadata
+            + index_queries
+            + index_selection
+        )

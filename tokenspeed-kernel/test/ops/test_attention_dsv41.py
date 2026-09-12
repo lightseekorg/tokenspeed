@@ -224,7 +224,7 @@ def test_fp4_midpoints_signed_zero_and_saturation(device, fmt):
 @pytest.mark.parametrize("fmt", _LAYOUTS)
 def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     torch.manual_seed(42)
-    dim, _, _, width = _LAYOUTS[fmt]
+    dim, _, values, width = _LAYOUTS[fmt]
     backing = torch.full((4, 67, 2 * width + 19), 173, dtype=torch.uint8, device=device)
     cache = backing[:, :64, 7 : 7 + width * 2 : 2]
     rows = torch.randn((7, dim * 2), dtype=torch.float32, device=device)[:, ::2]
@@ -237,7 +237,14 @@ def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     expected_backing = torch.full_like(backing.cpu(), 173)
     for i, slot in enumerate(slots.cpu().tolist()):
         if 0 <= slot < 256:
-            expected_backing[slot // 64, slot % 64, 7 : 7 + width * 2 : 2] = packed[i]
+            for byte in range(width):
+                offset = (
+                    (slot % 64) * values + byte
+                    if byte < values
+                    else 64 * values + (slot % 64) * (width - values) + byte - values
+                )
+                row, column = divmod(offset, width)
+                expected_backing[slot // 64, row, 7 + 2 * column] = packed[i, byte]
     torch.testing.assert_close(backing.cpu(), expected_backing, rtol=0, atol=0)
     requested = slots.unsqueeze(0).expand(2, -1)
     out = torch.empty((2, 7, dim), dtype=torch.float32, device=device)
@@ -246,8 +253,12 @@ def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     torch.testing.assert_close(
         out.cpu(), decoded.unsqueeze(0).expand(2, -1, -1), rtol=0, atol=0
     )
-    # The row-matrix reader must honor strides as well, not flatten the arena.
-    direct = dsv41.cache_unpack(cache[2, 63:64], fmt, None)
+    # Standalone packed rows retain their row layout; a page-planar field slice
+    # is deliberately not a packed row. The row codec still honors byte strides.
+    packed_storage = torch.empty((1, width * 2 + 19), dtype=torch.uint8, device=device)
+    packed_row = packed_storage[:, 7 : 7 + width * 2 : 2]
+    packed_row.copy_(packed[:1].to(device))
+    direct = dsv41.cache_unpack(packed_row, fmt, None)
     torch.testing.assert_close(direct.cpu(), decoded[:1].bfloat16(), rtol=0, atol=0)
 
 
@@ -308,6 +319,9 @@ def test_selected_attention_joint_sink_masking_and_chunking(device, heads, with_
             512**-0.5,
             out,
             chunk,
+            None,
+            None,
+            None,
         )
         assert result is out
         torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
@@ -336,6 +350,9 @@ def test_selected_attention_full_width_online_stability(device):
         512**-0.5,
         None,
         1,
+        None,
+        None,
+        None,
     )
     _, swa_ref = _reference_quantize(swa_x, "swa")
     _, global_ref = _reference_quantize(global_x, "global")
@@ -359,7 +376,20 @@ def test_sink_counted_once_and_representations_not_deduplicated(device):
     lens = torch.ones((1,), dtype=torch.int32, device=device)
     sink = torch.zeros((1,), device=device)
     out = dsv41.selected_attention(
-        q, swa, slots, lens, glob, slots, lens, sink, 512**-0.5, None, 1
+        q,
+        swa,
+        slots,
+        lens,
+        glob,
+        slots,
+        lens,
+        sink,
+        512**-0.5,
+        None,
+        1,
+        None,
+        None,
+        None,
     )
     values = (
         dsv41.cache_gather(swa, slots, "swa", None).float()
@@ -654,6 +684,9 @@ def test_empty_cache_and_zero_width_attention(device):
         512**-0.5,
         None,
         1,
+        None,
+        None,
+        None,
     )
     assert not result.any()
 
@@ -695,3 +728,197 @@ def test_optional_snapshot_quantization_oracle(device):
         torch.testing.assert_close(
             dsv41.cache_pack(x, fmt, None), expected, rtol=0, atol=0
         )
+
+
+def test_fused_swa_matches_rope_quantization_and_page_bytes(device):
+    from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+
+    torch.manual_seed(419)
+    values = torch.randn(257, 512, device=device, dtype=torch.bfloat16)
+    positions = torch.arange(257, device=device, dtype=torch.int64)
+    angles = (
+        torch.arange(512, device=device)[:, None].float()
+        * torch.arange(32, device=device)[None, :]
+        / 1000
+    )
+    rope = torch.cat((angles.cos(), angles.sin()), -1)
+    slots = torch.arange(64, 321, device=device, dtype=torch.int32)
+    slots[0] = -1
+    storage = torch.zeros((6, 64 * 528 + 512), device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * 528].view(6, 64, 528)
+    expected = storage.clone()[:, : 64 * 528].view(6, 64, 528)
+    rotated = rope_inplace(values.clone(), positions, rope, None)
+    dsv41.cache_scatter(rotated, expected, slots, "swa")
+    out = torch.empty_like(values)
+    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, out)
+    reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, "swa", None), "swa", None)
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
+    torch.manual_seed(420)
+    projection = torch.randn(17, 1024, device=device)
+    content, scores = projection[:, :512], projection[:, 512:]
+    previous = torch.arange(17, device=device) - 1
+    slots = torch.full((17,), 2, device=device, dtype=torch.int32)
+    active = torch.arange(17, device=device) % 2 == 1
+    tail = torch.randn(5, 2, 2, 512, device=device)
+    weight = torch.randn(512, device=device, dtype=torch.bfloat16)
+    raw = dsv41.compressor_pool(
+        content, scores, previous, tail, slots, active, None, None, 0.0
+    )
+    rounded = raw.bfloat16().float()
+    expected = (
+        rounded
+        * torch.rsqrt(rounded.square().mean(-1, keepdim=True) + 1e-20)
+        * weight.float()
+    ).bfloat16()
+    actual = dsv41.compressor_pool(
+        content, scores, previous, tail, slots, active, None, weight, 1e-20
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.004)
+    assert not torch.any(actual[~active])
+
+
+def _native_available():
+    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and is_flash_mla_v41_available()
+    )
+
+
+def _native_cache(rows, fmt):
+    width = {"swa": 528, "global": 288}[fmt]
+    backing = torch.zeros(
+        (rows // 64 + 1, 64 * width + 512), device="cuda", dtype=torch.uint8
+    )
+    field = backing[:, : 64 * width].as_strided(
+        (rows // 64 + 1, 64, width), (backing.stride(0), width, 1)
+    )
+    values = torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16)
+    slots = torch.arange(64, rows + 64, device="cuda", dtype=torch.int32)
+    dsv41.cache_scatter(values, field, slots, fmt)
+    return backing, field
+
+
+@pytest.mark.skipif(
+    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+)
+@pytest.mark.parametrize("batch", [1, 16, 17])
+@pytest.mark.parametrize("extra_width", [0, 512, 768])
+def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
+    torch.manual_seed(741)
+    sa, swa = _native_cache(256, "swa")
+    ga, glob = _native_cache(1024, "global")
+    before_s, before_g = sa.clone(), ga.clone()
+    q = torch.randn(batch, 16, 512, dtype=torch.bfloat16, device="cuda") * 0.3
+    ss = (
+        torch.arange(64, 192, dtype=torch.int32, device="cuda")
+        .expand(batch, -1)
+        .clone()
+    )
+    gs = (
+        torch.arange(64, 64 + extra_width, dtype=torch.int32, device="cuda")
+        .expand(batch, -1)
+        .clone()
+    )
+    sl = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    gl = torch.zeros_like(sl)
+    sink = torch.linspace(-2, 2, 16, device="cuda")
+
+    def run(schedule):
+        return dsv41.selected_attention(
+            q,
+            swa,
+            ss,
+            sl,
+            glob if extra_width else None,
+            gs if extra_width else None,
+            gl if extra_width else None,
+            sink,
+            512**-0.5,
+            None,
+            256,
+            schedule,
+            None,
+            None,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(dsv41.new_attention_schedule())
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(dsv41.new_attention_schedule())
+    for step in range(4):
+        sl.fill_(128 if step != 3 else 0)
+        gl.fill_(min(extra_width, (1, 255, 512, 0)[step]))
+        ss.copy_(ss.roll(1, dims=1))
+        gs.copy_(gs.roll(7, dims=1))
+        if batch > 1:
+            sl[-1] = 0
+            gl[-1] = 0
+        graph.replay()
+        eager = run(dsv41.new_attention_schedule())
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+        parts = [dsv41.cache_gather(swa, ss, "swa", None).float()]
+        masks = [torch.arange(128, device="cuda")[None, :] < sl[:, None]]
+        if extra_width:
+            parts.append(dsv41.cache_gather(glob, gs, "global", None).float())
+            masks.append(
+                torch.arange(extra_width, device="cuda")[None, :] < gl[:, None]
+            )
+        kv = torch.cat(parts, 1)
+        valid = torch.cat(masks, 1)
+        logits = torch.bmm(q.float(), kv.transpose(1, 2)) * 512**-0.5
+        logits.masked_fill_(~valid[:, None, :], -torch.inf)
+        probs = torch.cat(
+            (logits, sink[None, :, None].expand(batch, -1, 1)), -1
+        ).softmax(-1)[..., :-1]
+        expected = torch.bmm(probs, kv).bfloat16()
+        torch.testing.assert_close(captured, expected, rtol=0.02, atol=0.004)
+    assert torch.equal(sa, before_s) and torch.equal(ga, before_g)
+
+
+@pytest.mark.skipif(
+    not _native_available(), reason="FlashMLA V4.1 on Blackwell required"
+)
+@pytest.mark.parametrize("query_chunk_size", [16, 256])
+def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
+    torch.manual_seed(742)
+    q = torch.randn(33, 16, 512, dtype=torch.bfloat16, device="cuda") * 0.3
+    kv = torch.randn(1024, 1, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(0, 1024, (33, 640), dtype=torch.int32, device="cuda")
+    indices[0] = -1
+    indices[1, 127:] = -1
+    sink = torch.linspace(-2, 2, 16, device="cuda")
+    out = dsv41.selected_attention(
+        q,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        sink,
+        512**-0.5,
+        None,
+        query_chunk_size,
+        None,
+        kv,
+        indices,
+    )
+    selected = kv[indices.clamp_min(0).long(), 0].float()
+    logits = torch.bmm(q.float(), selected.transpose(1, 2)) * 512**-0.5
+    logits.masked_fill_(indices[:, None, :] < 0, -torch.inf)
+    probs = torch.cat((logits, sink[None, :, None].expand(33, -1, 1)), -1).softmax(-1)[
+        ..., :-1
+    ]
+    expected = torch.bmm(probs, selected).bfloat16()
+    torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
