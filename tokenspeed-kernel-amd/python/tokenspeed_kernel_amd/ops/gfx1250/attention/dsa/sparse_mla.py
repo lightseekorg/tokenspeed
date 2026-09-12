@@ -805,7 +805,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         )
     if index_k_cache is None:
         raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q,
         q_scales,
         weights,
@@ -882,7 +882,6 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         max_candidates,
         q_len_per_req,
         PAGE_SIZE=int(page_size),
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
@@ -932,7 +931,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError("standard-cache DSA scorer requires cache and page_size")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q,
         q_scales,
         weights,
@@ -1021,7 +1020,6 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
             float(softmax_scale),
             workspace_rows,
             PAGE_SIZE=int(page_size),
-            ROW_BYTES=row_bytes,
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
             HEAD_DIM=q.shape[2],
