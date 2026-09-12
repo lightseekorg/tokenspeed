@@ -481,6 +481,7 @@ def test_residual_from_shared_chains_through_its_own_latent_buffer():
     expected = x.float()
 
     last_acc = None
+    seen_ptrs = []
     for layer in range(depth):
         part = partial_for(layer)
         acc = part.float().clone()
@@ -488,8 +489,12 @@ def test_residual_from_shared_chains_through_its_own_latent_buffer():
         last_acc = acc
         expected = (expected + acc).to(torch.bfloat16).float()
         x, _ = kernel(part, x, gamma, include_reduce_scatter=False, include_routed=True)
+        seen_ptrs.append(x.data_ptr())
         torch.cuda.synchronize()
 
+    # The chain is only a chain if it is the same storage every time: values
+    # alone cannot tell reuse from a fresh buffer allocated per call.
+    assert len(set(seen_ptrs)) == 1, f"buffer moved across calls: {seen_ptrs}"
     err = (x.float() - expected).abs().max().item()
     scale = expected.abs().max().item()
     # One bf16 ulp per step, and the steps are dependent: the kernel sums ranks
@@ -560,6 +565,82 @@ def test_residual_from_shared_chains_inside_a_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert not torch.equal(captured, eager)
+
+
+def test_residual_from_shared_refuses_a_width_past_its_buffer():
+    """With no caller buffer left to validate, this bound is the only guard.
+
+    The internal latent output is exactly max_m rows, so an over-wide launch
+    would write past it.
+    """
+    _, dev = _setup()
+    _require_attn_collective()
+    max_m = 8
+    kernel = _attn_collective(dev, max_m)
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+    for bad_m in (max_m + 1, max_m * 2):
+        part = torch.zeros(bad_m, H, dtype=torch.bfloat16, device=dev).contiguous()
+        with pytest.raises(ValueError, match="runtime M"):
+            kernel(
+                part,
+                part,
+                gamma,
+                include_reduce_scatter=False,
+                include_routed=True,
+            )
+    # Positive control: max_m itself must go through, or the bound rejects
+    # everything and the check above proves nothing.
+    ok = torch.zeros(max_m, H, dtype=torch.bfloat16, device=dev).contiguous()
+    out, _ = kernel(ok, ok, gamma, include_reduce_scatter=False, include_routed=True)
+    torch.cuda.synchronize()
+    assert out.shape == (max_m, H)
+
+
+def test_residual_from_shared_precompiles_the_variant_it_dispatches():
+    """Lazy compilation inside a graph capture is what precompile prevents.
+
+    Narrowing the variant list to the callable one is only safe if that one
+    is still compiled up front; ``launch`` would otherwise JIT on first use.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+        _COMPILED,
+        _compile_key,
+    )
+
+    _, dev = _setup()
+    _require_attn_collective()
+    max_m = 8
+    _attn_collective(dev, max_m)
+    key = _compile_key(
+        rank=dist.get_rank(),
+        tp_size=_world_size(),
+        latent_dim=H,
+        hidden_dim=H,
+        max_m=max_m,
+        max_token_ctas=max_m,
+        fp32_internal=True,
+        residual_from_shared=True,
+        include_reduce_scatter=False,
+        include_routed=True,
+        finalize_top_k=None,
+    )
+    assert key in _COMPILED
+    # Positive control: a key the builder never asks for must be absent, or
+    # membership above says nothing about what was precompiled.
+    other = _compile_key(
+        rank=dist.get_rank(),
+        tp_size=_world_size(),
+        latent_dim=H,
+        hidden_dim=H,
+        max_m=max_m,
+        max_token_ctas=max_m,
+        fp32_internal=True,
+        residual_from_shared=True,
+        include_reduce_scatter=True,
+        include_routed=True,
+        finalize_top_k=None,
+    )
+    assert other not in _COMPILED
 
 
 def test_residual_from_shared_rejects_a_build_it_could_never_dispatch():
