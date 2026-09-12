@@ -48,7 +48,9 @@ package installs as a pure-Python stub.
 """
 
 import ctypes
+import hashlib
 import importlib
+import json
 import os
 import shutil
 import site
@@ -58,7 +60,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from setuptools import Command, find_packages, setup
+from setuptools import Command, Distribution, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
@@ -874,6 +876,42 @@ class CudaKernelBuilder:
             subprocess.check_call(link_cmd)
 
 
+def _build_sampling_metadata(verbose):
+    """Build the host extension without executing a CUDA program."""
+    import torch
+    from torch.utils.cpp_extension import load
+
+    output_dir = CUDA_OBJS_DIR / "sampling_metadata"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    build_dir = ROOT / "build" / "sampling_metadata"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    module = load(
+        name="_sampling_metadata",
+        sources=[str(CUDA_CSRC_DIR / "sampling_metadata.cpp")],
+        build_directory=str(build_dir),
+        extra_cflags=["-O3", "-g0"],
+        extra_include_paths=[str(Path(CUDA_HOME) / "include")],
+        extra_ldflags=["-ldl"],
+        with_cuda=False,
+        verbose=verbose,
+    )
+    destination = output_dir / "_sampling_metadata.so"
+    shutil.copy2(module.__file__, destination)
+    record = {
+        "torch": torch.__version__,
+        "python": list(sys.version_info[:2]),
+        "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    }
+    (output_dir / "build.json").write_text(json.dumps(record, sort_keys=True) + "\n")
+
+
+class KernelDistribution(Distribution):
+    """CUDA wheels include a CPython extension and require platform/ABI tags."""
+
+    def has_ext_modules(self):
+        return _selected_backend() == "cuda"
+
+
 class BuildKernels(build_ext):
     """Compile CUDA kernels into .so files for the CUDA backend."""
 
@@ -887,6 +925,7 @@ class BuildKernels(build_ext):
 
         _ensure_cuda_compiler()
         verbose = bool(getattr(self, "verbose", False))
+        _build_sampling_metadata(verbose)
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
 
 
@@ -935,6 +974,7 @@ class BuildPyWithBuild(build_py):
 
 
 setup(
+    distclass=KernelDistribution,
     name="tokenspeed_kernel",
     version=_package_version(),
     install_requires=_selected_install_requires(),
@@ -942,7 +982,10 @@ setup(
     package_data={
         # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
         "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel.thirdparty.cuda": [
+            "objs/**/*.so",
+            "objs/sampling_metadata/build.json",
+        ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
         "tokenspeed_kernel.thirdparty.msa": [

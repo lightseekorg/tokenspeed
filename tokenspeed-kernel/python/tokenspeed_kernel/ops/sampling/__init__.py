@@ -23,11 +23,15 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling.bias_argmax import (
+    create_bias_argmax_workspace,
+    try_bias_argmax,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax"]
+__all__ = ["argmax", "create_bias_argmax_workspace", "try_bias_argmax"]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
@@ -122,3 +126,4 @@ def argmax(
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.bias_argmax  # noqa: E402,F401

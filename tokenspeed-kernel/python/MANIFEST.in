@@ -1,1 +1,2 @@
 recursive-include requirements *.txt
+include tokenspeed_kernel/thirdparty/cuda/csrc/sampling_metadata.cpp

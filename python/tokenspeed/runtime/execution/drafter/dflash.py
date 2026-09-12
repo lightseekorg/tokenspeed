@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+from tokenspeed_kernel.ops.sampling import (
+    create_bias_argmax_workspace,
+    try_bias_argmax,
+)
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
@@ -238,6 +242,8 @@ class DFlash(BaseDrafter):
         )
         # None means probed-and-unavailable; unset means not probed yet.
         self._dist_argmax_state: object = _UNSET
+        # The target head is not bound until wire_target; allocate there.
+        self._bias_argmax_workspace = None
         self.draft_input_lengths_buf = torch.full(
             (max_bs,),
             self.draft_query_width,
@@ -291,6 +297,26 @@ class DFlash(BaseDrafter):
             )
         target_model.set_dflash_layers_to_capture(self.target_layer_ids)
         self._wire_aux_hidden_stream(target_model)
+        self._bias_argmax_workspace = None
+        # Only DSpark supplies Markov bias. Bind full-capacity scratch after
+        # the actual target head and all wiring checks, before graph capture.
+        if (
+            self.spec_algorithm == "DSPARK"
+            and hasattr(self.lm_head, "shard_indices")
+            and hasattr(self.lm_head, "weight")
+        ):
+            shard = self.lm_head.shard_indices
+            num_org = int(shard.num_org_elements)
+            if (
+                int(self.logits_processor.tp_size) == 1
+                and int(shard.num_added_elements) == 0
+                and num_org > 0
+            ):
+                self._bias_argmax_workspace = create_bias_argmax_workspace(
+                    max_rows=self.input_buffers.max_bs,
+                    vocab_size=num_org,
+                    device=self.lm_head.weight.device,
+                )
 
     def _wire_aux_hidden_stream(self, target_model) -> None:
         """Tell the target which residual stream the draft was trained on."""
@@ -439,9 +465,26 @@ class DFlash(BaseDrafter):
             if base_logits is None:
                 base_logits = torch.matmul(hidden_states, weight[:num_org].T)
             if bias_fn is not None:
-                base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
-                    base_logits.dtype
-                )
+                bias = bias_fn(org_vocab_start, num_org)
+                workspace = getattr(self, "_bias_argmax_workspace", None)
+                if (
+                    workspace is not None
+                    and out is not None
+                    and dist_state is None
+                    and num_added == 0
+                    and int(self.logits_processor.tp_size) == 1
+                    and try_bias_argmax(
+                        logits=base_logits,
+                        bias=bias,
+                        out=out,
+                        workspace=workspace,
+                        global_offset=org_vocab_start,
+                    )
+                ):
+                    return out
+                # A rejected candidate consumes the already-computed bias;
+                # never repeat the Markov projection on the fallback path.
+                base_logits = base_logits + bias.to(base_logits.dtype)
             if dist_state is not None:
                 # Without padding the rank-major index IS the global id.
                 _, idx = _dist_argmax(dist_state, base_logits)
