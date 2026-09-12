@@ -98,6 +98,16 @@ def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
         expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
     expected_weights *= scale
 
+    # Each scale/normalization pair is a distinct Triton specialization.
+    # Keep its JIT and module initialization outside graph capture.
+    moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        16,
+        routed_scaling_factor=scale,
+        normalize_topk_weights=normalize,
+    )
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         weights, ids = moe_sigmoid_bias_topk(

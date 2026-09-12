@@ -262,6 +262,7 @@ def test_mamba_only_claims_its_recurrent_groups():
             get_component=lambda *args: torch.zeros(4, 2),
             arena=SimpleNamespace(
                 runtime_contract=SimpleNamespace(
+                    prefix_granularity=16,
                     group_specs=(
                         SimpleNamespace(
                             group_id="ple", family="state", checkpoint_granularity=4
@@ -269,7 +270,7 @@ def test_mamba_only_claims_its_recurrent_groups():
                         SimpleNamespace(
                             group_id="gdn", family="state", checkpoint_granularity=8
                         ),
-                    )
+                    ),
                 )
             ),
         )

@@ -125,6 +125,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
 
+        self.skip_softmax_threshold = spec.skip_softmax_threshold
+
         self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.qkv_dtype = config.dtype
@@ -399,6 +401,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
+            skip_softmax_threshold=self.skip_softmax_threshold,
             solution=self.kernel_solution,
         )
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

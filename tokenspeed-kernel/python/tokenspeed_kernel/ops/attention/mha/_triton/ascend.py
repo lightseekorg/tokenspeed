@@ -40,6 +40,7 @@ if current_platform().is_npu:
         "sliding_window": frozenset({False}),
         "support_sinks": frozenset({False}),
         "support_logit_cap": frozenset({False}),
+        "support_skip_softmax": frozenset({False}),
         "return_lse": frozenset({False}),
     }
 

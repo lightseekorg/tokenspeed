@@ -20,7 +20,7 @@
 
 """Metadata-side ``cu_extend_seq_lens_cpu`` construction for linear attention.
 
-The tuple must equal the contents of ``query_start_loc`` (a wrong hint
+The tensor must equal the contents of ``query_start_loc`` (a wrong hint
 silently corrupts the CuteDSL host chunk plan). Both are built together by
 ``init_forward_metadata`` once per extend batch — mirroring MHA's
 ``cu_extend_seq_lens_cpu`` — so the builder raises on absence or length
@@ -50,7 +50,9 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
 
 def test_prefix_sum_matches_query_start_loc_contents() -> None:
     lens = torch.tensor([3, 5, 2], dtype=torch.int32)
-    assert _build_cu_extend_seq_lens_cpu(lens, expected_len=4) == (0, 3, 8, 10)
+    boundaries = _build_cu_extend_seq_lens_cpu(lens, expected_len=4)
+    assert boundaries.dtype == torch.int64
+    assert boundaries.tolist() == [0, 3, 8, 10]
 
 
 def test_absent_lens_raise() -> None:
@@ -70,4 +72,4 @@ def test_length_misalignment_raises() -> None:
 
 def test_single_sequence() -> None:
     lens = torch.tensor([129104], dtype=torch.int32)
-    assert _build_cu_extend_seq_lens_cpu(lens, expected_len=2) == (0, 129104)
+    assert _build_cu_extend_seq_lens_cpu(lens, expected_len=2).tolist() == [0, 129104]

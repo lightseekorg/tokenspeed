@@ -381,6 +381,12 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
+`Retry Failed Latest Main CI` also covers `GB300 Slurm Per Commit`. Its hourly
+or manual scan retries failed jobs from completed, failed push runs on the
+latest `main` commit, using the original run and commit. The retry workflow
+stops after three total attempts (the original plus two retries); older
+commits are skipped.
+
 The `GB300 Slurm Nightly` workflow runs every day at 18:17 UTC and can also be
 started manually from `main`. It selects only multi-node model tests with the
 `nightly` trigger, then restricts the generated matrix to `slurm-gb300-*`

@@ -71,33 +71,52 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
-def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
+@pytest.mark.parametrize("lengths", [(4, 2), (1,)])
+def test_prefill_hands_the_stored_state_to_the_op_untouched(
+    lengths, monkeypatch
+) -> None:
     backend = object.__new__(KdaAttnBackend)
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
     backend._kda_gate = lambda g_raw, *_args: g_raw
-    bounds = torch.tensor([0, 1], dtype=torch.int32)
-    bounds64 = bounds.to(torch.int64)
-    backend.forward_metadata = mamba.MambaForwardMetadata(
-        query_start_loc=bounds, query_start_loc_int64=bounds64
+    # Prepare boundaries once; repeated preparation must preserve their identity.
+    boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
+    scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
+    assert scan_boundaries.dtype == torch.int64
+    assert torch.equal(scan_boundaries, boundaries)
+    assert (
+        backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
+        is scan_boundaries
     )
-    stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
-    final = torch.empty(1, 2, 3, 4)
+    # The body and tail have their own boundaries; neither may use the full
+    # forward's cached boundaries, even when those have the same row count.
+    full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
+    full_scan_boundaries = full_boundaries.to(torch.int64)
+    backend.forward_metadata = mamba.MambaForwardMetadata(
+        query_start_loc=full_boundaries,
+        scan_query_start_loc=full_scan_boundaries,
+        query_start_loc_int64=full_scan_boundaries,
+    )
+    num_tokens = sum(lengths)
+    stored = torch.arange(len(lengths) * 24, dtype=torch.float32).view(
+        len(lengths), 2, 3, 4
+    )
+    final = torch.empty_like(stored)
     captured = {}
 
     def fake_prefill(*_args, **kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(out=torch.empty(1, 1, 2, 4), final_state=final)
+        return SimpleNamespace(out=torch.empty(1, num_tokens, 2, 4), final_state=final)
 
     monkeypatch.setattr(kda, "kda_paged_prefill", fake_prefill)
-    query = torch.empty(1, 1, 2, 3)
-    value = torch.empty(1, 1, 2, 4)
+    query = torch.empty(1, num_tokens, 2, 3)
+    value = torch.empty(1, num_tokens, 2, 4)
     _, final_state = backend._prefill_scan(
         query,
         query,
         value,
         stored,
-        bounds,
+        scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
         a=None,
@@ -105,15 +124,15 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         g_raw=torch.empty_like(query),
         f_a_out=None,
         f_b_weight=None,
-        beta_raw=torch.empty(1, 1, 2),
-        seq_len=1,
-        num_real_tokens=1,
+        beta_raw=torch.empty(1, num_tokens, 2),
+        seq_len=num_tokens,
+        num_real_tokens=num_tokens,
         lower_bound=-5.0,
-        cu_seqlens_cpu=(0, 1),
+        cu_seqlens_cpu=boundaries.to(torch.int64),
     )
     assert captured["initial_state"] is stored
+    assert captured["cu_seqlens"] is scan_boundaries
     assert captured["recurrent_layout"] == "v_major"
-    assert captured["cu_seqlens"] is bounds64
     assert final_state is final
     assert "out" not in captured
 

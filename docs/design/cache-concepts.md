@@ -151,18 +151,82 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+#### Snapshot-state prefill checkpoints
+
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
-full-history snapshot-state prefill normally needs only its input and final
-output checkpoints. With prefix caching and an off-page final tail, the aligned
-body materializes its endpoint and atomically reserves the tail storage; the
-tail consumes that reservation instead of materializing another sparse input
-checkpoint. The next decode admission allocates its destination after prefill
-scheduling and rolls the expired input page forward, including under overlap
+full-history snapshot-state prefill normally needs only its input, aligned
+prefix output, and final continuation checkpoints. When the extent contains an
+internal checkpoint, one forward materializes it and the final output, with
+capacity for both secured at admission. A completing forward on a decoding
+role also reserves growth storage, which is not an additional computed state
+([Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)). The next
+decode admission rolls the expired input block forward, including under overlap
 scheduling. The table keeps absolute slot positions while representing other
-skipped intermediate checkpoints as null holes (`0`). State consumers may
-gather only the declared input/output slots; compacting the row or publishing an
-unwritten intermediate checkpoint would break position identity.
+skipped intermediate checkpoints as null holes (`0`). State consumers may gather only the declared
+input/output slots; compacting the row or publishing an unwritten intermediate
+checkpoint would break position identity.
+
+Publication requires provenance, not just an allocated block or completed hash.
+The request's cache progress records the last aligned boundary materialized by
+local prefill, carried through the same ordered-forward contract as its token
+progress. Decode does not advance that record: verification commits only the
+accepted endpoint and may skip an aligned boundary. Admission, finish and
+retraction pass this provenance to the coordinator. A snapshot is publishable
+only when the exact accepted endpoint equals the hashed boundary, or that exact
+boundary has prefill materialization provenance. The conservative admission
+frontier (which subtracts the verify width) is not an exact state endpoint.
+Remote endpoint-only landings
+do not claim an internal prefill checkpoint.
+
+Snapshot selection and slot addressing are distinct even within this mapping:
+the last internal reusable checkpoint is at
+`floor(after / prefix_granularity) * prefix_granularity`, strictly between
+`before` and `after`. Its slot is `(checkpoint - 1) / block_granularity`.
+The two granularities need not be equal. Selecting the snapshot by a smaller
+state-group span would leave the prefix-boundary state unwritten while the
+coordinator publishes it. With smaller state blocks, admission also accounts
+for the whole materialized suffix through the endpoint and its reserve.
+
+When an extend materializes internal state checkpoints, convolution windows
+are assembled directly into their destination blocks by the kernel package.
+The prefill path calls that batched write before causal convolution updates
+the final continuation state; no write is needed without an internal checkpoint.
+At most one internal checkpoint per eligible request is selected. Its token
+position and packed-prefix metadata are computed once on the host; the GPU
+views share one immutable, pinned asynchronous upload. The reusable
+`runtime.utils.tensor.upload_packed` helper aligns each typed view and owns a
+fresh staging buffer per call, so preparing the next forward cannot overwrite
+an upload still in flight. Checkpoint writers widen page IDs to int64 before
+multiplying by pool strides; an int32 page ID can address an element offset
+beyond the int32 range. Decode has no such batch
+and does not compute checkpoint indices. Recurrent execution partitions the
+batch into a body scan and a tail scan when an internal checkpoint is needed.
+Otherwise the ordinary prefill scan runs once. `_run_prefill_recurrent` owns
+both cases and always returns outputs and final states; its caller writes the
+final states to the continuation blocks. Target verification remains separate.
+Every request in a checkpoint
+batch participates in the body: rows crossing a checkpoint stop at that
+boundary, while other rows run to completion. Only crossing rows enter the
+packed tail scan, initialized directly
+from their body final states. Body and tail outputs are scattered back to
+original token order, so every token is evaluated exactly once while the aligned
+and final states are both retained. Batch size one uses zero-copy body/tail
+views; larger batches use the same batched pack/scatter contract. This split
+does not change cache ownership or scheduler metadata.
+
+The body/tail split uses the existing prefill-op state-layout contract. KDA
+solutions may retain their original K-major Python adapters; the kernel facade
+converts between that layout and the runtime's V-major state slab on both scans.
+Native-layout adapter entry points are not required for checkpoint continuation.
+KDA's int64 sequence boundaries are still prepared once in runtime metadata and
+reused by the original adapters. Preparation uses `Tensor.to(torch.int64)`;
+an already-int64 boundary is returned unchanged without allocating a copy.
+
+Scan results may be transposed views in that public state layout. The batched
+input packer addresses recurrent-state rows and features using their actual
+strides, including on CUDA graph replay; it does not require an extra
+contiguous copy or a different kernel adapter.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
@@ -189,9 +253,11 @@ Provenance discipline: each quantity is sourced from its own domain and never
 laundered through another's name. The contract's `prefix_granularity` comes
 from the memory plan, not read back out of pool state. The arena carries
 **two** scalars with distinct roles: `CacheArena.prefix_granularity` is the
-identity grain, used only for contract publication and plan-consistency
-checks — `prefix_granularity` exists to compute prefix hits, and runtime
-arithmetic must not reach for it; `CacheArena.kv_page_size` is the KV arena
+identity grain, used for contract publication and plan-consistency checks.
+The state-checkpoint mapping point additionally uses the contract's identity
+grain to select the snapshot required for prefix reuse; this is not kernel
+geometry. Other runtime arithmetic must not reach for it.
+`CacheArena.kv_page_size` is the KV arena
 page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
@@ -813,9 +879,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
-  plan checks only) and `CacheArena.kv_page_size` (KV arena geometry, read by
-  row/slot/tile math in the paged pools and their consumers). Prefix-hit
-  computation is the only computational consumer of `prefix_granularity`. ✓
+  plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
+  row/slot/tile math in the paged pools and their consumers). Prefix reuse
+  also requires the state-checkpoint mapping point to select the snapshot
+  at the contract's prefix boundary, independently of its state-block span. ✓
 * Cache geometry has one owner and no mirrors. `CacheArena` holds the
   allocation, the field views, the plan, the contract and the geometry
   scalars; `CachePool` is a typed layer window that forwards nothing, so

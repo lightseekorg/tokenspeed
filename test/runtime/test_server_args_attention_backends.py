@@ -293,6 +293,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
+            skip_softmax_threshold=0.0,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),

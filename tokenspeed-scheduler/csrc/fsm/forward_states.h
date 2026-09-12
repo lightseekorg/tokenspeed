@@ -44,8 +44,10 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Whether cache storage for the final state-checkpoint tail was reserved.
-    bool state_checkpoint_tail_reserved{false};
+    // Last aligned state boundary produced by scheduled local prefill. The
+    // ordered forward stream materializes it before subsequent publication.
+    // Decode must not advance this: verify commits only its accepted endpoint.
+    std::int32_t materialized_state_boundary_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -153,10 +155,6 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    // The final mamba state checkpoint's pages are already reserved, so this
-    // request's remaining prompt is capacity-safe.
-    bool TailCheckpointReserved() const { return CacheProgressRef().state_checkpoint_tail_reserved; }
-
     TokenContainer::Window window{};
 
 private:

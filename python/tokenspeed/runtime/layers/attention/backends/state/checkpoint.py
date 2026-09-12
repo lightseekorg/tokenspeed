@@ -139,7 +139,8 @@ def compute_state_block_indices(
 
     Args:
         rows: ``[bs, max_slots]`` int32 page-id table of one state group.
-        checkpoint_granularity: Tokens between two state checkpoints (``P``).
+        checkpoint_granularity: Token span of a state-block slot (``g``),
+            independent of the prefix identity granularity.
         seq_lens_before: Per-request token count before this forward.
         seq_lens_after: Per-request token count after this forward.
         validate: Run the host-synchronizing write-side checks.

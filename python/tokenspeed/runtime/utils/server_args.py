@@ -247,6 +247,9 @@ class ServerArgs:
     attention_backend: str | None = None
     kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
+    # (default) is exact dense attention; see --skip-softmax-threshold help.
+    skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -1627,6 +1630,27 @@ class ServerArgs:
             choices=attention_backend_choices,
             help="Attention backend for drafter model in speculative decoding. "
             "If not specified, uses the same backend as the main model (attention_backend).",
+        )
+        parser.add_argument(
+            "--skip-softmax-threshold",
+            type=float,
+            default=ServerArgs.skip_softmax_threshold,
+            help="BLASST skip-softmax sparsity threshold for the gluon MHA "
+            "prefill kernel (gfx950 only). A K/V block is skipped only when "
+            "every row in the query tile has exp(block_max_score - "
+            "running_max) below this threshold. 0.0 (default) is exact "
+            "dense attention; the skip rate for a given threshold must be "
+            "calibrated per model and sequence length. Only takes effect "
+            "when every request in the batch has a zero-length cached "
+            "prefix and the planner routes the batch to prefill; if any "
+            "request in the batch has a cache hit, or the backend's "
+            "registered prefill kernel does not clear the planner's "
+            "performance cutoff (as with FP8/MXFP8 KV cache and the triton "
+            "backend), the whole batch falls through to the KV-cache-extend "
+            "path, which never reaches this kernel and silently ignores the "
+            "threshold. Backends that do reach kernel selection raise an "
+            "error there if they lack gluon skip-softmax support, rather "
+            "than silently ignoring it.",
         )
         parser.add_argument(
             "--sampling-backend",

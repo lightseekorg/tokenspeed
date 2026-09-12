@@ -950,8 +950,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
-        scan_boundaries = self.forward_metadata.query_start_loc_int64
-        if scan_boundaries is None:
+        if query_start_loc.dtype != torch.int64:
             raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
         kda_result = kda_paged_prefill(
             query,
@@ -962,7 +961,7 @@ class KdaAttnBackend(MambaAttnBackend):
             A_log,
             dt_bias,
             initial_state=recurrent_state,
-            cu_seqlens=scan_boundaries,
+            cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
@@ -970,3 +969,10 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state
+
+    @override
+    def _prepare_prefill_scan_query_start_loc(
+        self, query_start_loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Prepare reusable int64 boundaries for each full, body or tail scan."""
+        return query_start_loc.to(torch.int64)
