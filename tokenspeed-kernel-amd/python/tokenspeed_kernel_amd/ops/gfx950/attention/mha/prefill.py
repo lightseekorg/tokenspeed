@@ -762,11 +762,7 @@ class ProgramScheduler:
 
 
 @gluon.jit
-def process_single_attention_tile(
-    program: AttentionProgram,
-    k_smem: gl.shared_memory_descriptor,
-    v_smem: gl.shared_memory_descriptor,
-):
+def process_single_attention_tile(program: AttentionProgram):
     cfg = program.cfg
     q = program.load_q(other=0.0)
 
@@ -1074,7 +1070,7 @@ def _mha_prefill(
         if active:
             if program.seq_len < cfg.BLOCK_N:
                 if program.q_start == 0:
-                    process_single_attention_tile(program, k_smem, v_smem)
+                    process_single_attention_tile(program)
             else:
                 process_attention_tile(
                     program, k_smem, v_smem, boundary_mask0, boundary_mask1
@@ -1168,7 +1164,7 @@ def _mha_prefill_sliding(
         if active:
             if program.seq_len < cfg.BLOCK_N:
                 if program.q_start == 0:
-                    process_single_attention_tile(program, k_smem, v_smem)
+                    process_single_attention_tile(program)
             else:
                 process_sliding_attention_tile(program, k_smem, v_smem)
         scheduler = scheduler.advance()
