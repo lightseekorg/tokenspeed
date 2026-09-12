@@ -67,8 +67,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
+from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -88,8 +87,10 @@ from tokenspeed_kernel.ops.moe import (
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
+from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
@@ -116,6 +117,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
+    DOWN_MAILBOX_MAX_TOKENS,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
@@ -145,6 +147,7 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     K3AttnComm,
     K3AttnCommState,
     K3MoeTailComm,
+    prepare_k3_all_reduce_buffers,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
@@ -779,10 +782,42 @@ def _assemble_fp8_fused_qkv_a(
     return fused_w, fused_s
 
 
-def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
-    """Whether to column-shard K3's routed up projection on NVIDIA."""
+def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
+    """MoE blocks this pipeline stage runs, which is what the rotation sees.
+
+    Only the base model's blocks rotate. The draft builds one block and runs it
+    every step, so it states its own count rather than deriving one from the
+    target checkpoint's layers.
+    """
+    if mapping.pp_size > 1:
+        start, end = pp_layer_window(config.num_hidden_layers, mapping)
+    else:
+        start, end = 0, config.num_hidden_layers
+    freq = config.moe_layer_freq
+    return sum(
+        1
+        for layer in range(start, end)
+        if layer >= config.first_k_dense_replace and layer % freq == 0
+    )
+
+
+def _shard_k3_latent_projection(mapping: Mapping, hidden_size: int) -> bool:
+    """Whether to shard K3's routed latent projections across NVIDIA ranks.
+
+    The platform test is what keeps a shard away from the packed input
+    projection: that path exists only under ``execution_plan.use_native``,
+    which follows ``native_latent_moe_available()`` and so is AMD-only. The two
+    are mutually exclusive by platform, not by any condition visible at the
+    call site. It asks the platform rather than ``torch.version.hip``, which
+    answers only about AMD and so admits NPU, where the multicast op's device
+    is not addressable at all.
+
+    True on an NVIDIA generation without the fabric: the multicast op declines
+    at construction and the projection stays replicated, so the width decision
+    is made downstream rather than here.
+    """
     return (
-        torch.version.hip is None
+        current_platform().is_nvidia
         and mapping.moe.tp_ep_size > 1
         and hidden_size % mapping.moe.tp_ep_size == 0
     )
@@ -1261,6 +1296,7 @@ class KimiLinearKDA(nn.Module):
                 self.o_norm.variance_epsilon,
                 hn,
                 hd,
+                enable_pdl=pdl_enabled(),
             )
         output, _ = self.o_proj(core_out)
         return output
@@ -1363,6 +1399,7 @@ class KimiLinearMoE(nn.Module):
         mapping: Mapping,
         layer_index: int,
         model_scope: str,
+        moe_block_count: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
@@ -1508,19 +1545,53 @@ class KimiLinearMoE(nn.Module):
             ),
         )
 
+        # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
+        self._shard_latent_projections = _shard_k3_latent_projection(
+            mapping, config.hidden_size
+        )
+        # Every captured decode width takes the column shard when the fabric has one.
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        multicast_down = (
+            KimiK3LatentDownOp.initialize(
+                group=pg_manager.get_device_process_group(mapping.moe.tp_ep_group),
+                hidden_size=config.hidden_size,
+                latent_size=self.routed_hidden,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                block_index=layer_index // config.moe_layer_freq,
+                layer_count=moe_block_count,
+                model_scope=model_scope,
+                # The gate itself, so mailbox and gather meet by construction.
+                max_m=DOWN_MAILBOX_MAX_TOKENS,
+            )
+            # The mailbox and both producers are bf16; another activation dtype
+            # keeps the replica rather than failing at the first forward.
+            if self._shard_latent_projections
+            and torch.get_default_dtype() is torch.bfloat16
+            else None
+        )
+        # Past the mailbox's ceiling the same columns split over the group again.
+        column_down = (
+            self._shard_latent_projections
+            and self.routed_hidden % mapping.moe.tp_ep_size == 0
+        )
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
+            multicast_down=multicast_down,
+            column_group=(mapping.moe.tp_ep_group if column_down else None),
+            shard_rank=mapping.moe.tp_ep_rank,
+            shard_size=mapping.moe.tp_ep_size,
         )
-        # AMD keeps replicated weights because Iris cannot use the folded AR→GEMM→AR order.
-        self._shard_up_projection = _shard_k3_up_projection(mapping, config.hidden_size)
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
             shard_group=(
-                mapping.moe.tp_ep_group if self._shard_up_projection else None
+                mapping.moe.tp_ep_group if self._shard_latent_projections else None
             ),
             shard_rank=mapping.moe.tp_ep_rank,
             shard_size=mapping.moe.tp_ep_size,
@@ -1538,7 +1609,7 @@ class KimiLinearMoE(nn.Module):
                 int(global_server_args_dict["comm_fusion_max_num_tokens"]),
                 1,
             ),
-            shard_up_projection=self._shard_up_projection,
+            shard_up_projection=self._shard_latent_projections,
         )
 
         self._topk_ready = (
@@ -1666,10 +1737,16 @@ class KimiLinearMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
-        Returns ``None`` before the projection weights are concatenated, which
-        leaves the caller on the separate per-module projections.
+        Returns ``None`` before the projection weights are concatenated, and
+        whenever the routed projection narrowed its storage: this path reads that
+        weight directly, so it would hand the experts one rank's columns instead
+        of the gathered latent. The caller then takes the projection's own
+        forward, which gathers.
         """
-        if self.packed_input_projection_weight is None:
+        if (
+            self.packed_input_projection_weight is None
+            or self.routed_expert_down_proj.narrowed
+        ):
             return None
         router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
@@ -2046,6 +2123,7 @@ class KimiLinearDecoderLayer(nn.Module):
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
             self.block_sparse_moe = KimiLinearMoE(
+                moe_block_count=_k3_local_moe_blocks(config, mapping),
                 config=config,
                 mapping=mapping,
                 layer_index=layer_id,
@@ -2767,6 +2845,19 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        routed_hidden_size = (
+            self.config.routed_expert_hidden_size
+            if self.config.routed_expert_hidden_size is not None
+            else self.config.hidden_size
+        )
+        return prepare_k3_all_reduce_buffers(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            max_num_tokens=max_num_tokens,
+        )
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
         num_layers = len(self.model.layers)
@@ -3228,6 +3319,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose text embeddings."
             )
         return self.language_model.model.get_input_embeddings()
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        if self.language_model is None:
+            return False
+        return self.language_model.prepare_communication_runtime(max_num_tokens)
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()

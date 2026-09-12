@@ -34,6 +34,7 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
+    "kernel-benchmark": {"perf"},
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
@@ -1620,7 +1621,8 @@ def poll_readiness(
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
+            # Restarting servers can reset or stall an accepted HTTP connection.
             pass
         sleep_deadline = min(deadline, time.time() + interval_seconds)
         while time.time() < sleep_deadline:

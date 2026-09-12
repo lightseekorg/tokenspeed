@@ -113,7 +113,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         std::vector<CacheKey> event_keys =
             registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.prefix_hashes, progress.access_epoch,
-                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+                                          first_new_prefix_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint,
+                                          /*stream_completed_to_host=*/false,
+                                          request.MaterializedStateBoundaryTokens());
         discardUncachedKvEventPages(event_keys);
     }
     if (!config_.StreamsDeviceCacheToHost()) {
@@ -121,7 +123,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
     coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
-    return tier_transfers_.StartPendingStores();
+    // The request's pages are released right after this (FinishEvent); the
+    // pinned ticket keeps them cached and unevictable until the copy ACKs.
+    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

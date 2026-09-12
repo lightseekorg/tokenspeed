@@ -27,24 +27,24 @@ matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
-once per round (`PrefillReserve`: split tail, decode width, prompt headroom,
+once per round (`PrefillReserve`: decode width, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
 group's page demand by `reservePrefillDemands` — the only writer of
 `GroupDemand::reserve_tokens`. `groupReserveTokens` picks the rule by the
 group's retention, never by call site:
 
-- *Full-history* groups hold the tail and decode slot — the chunk that
+- *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
   is guaranteed a slot; intermediate chunks reserve nothing, they are not about
   to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
-- *Sliding-window* groups (either family) recycle slid-out pages, so the rest
-  of the prompt costs them nothing: they hold only the tail and decode slot.
+- *Sliding-window* groups recycle slid-out pages, so the rest
+  of the prompt costs them nothing: they hold only the decode slot.
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
-- *Snapshot-state* groups bank one growth block at the admission that finishes
-  shaping them and nothing on any other round (§1.2).
+- *Snapshot-state* groups reserve at least one growth block on a decoding
+  role's completing chunk or remote landing, and nothing on other rounds (§1.2).
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -81,61 +81,95 @@ Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
-### 1.2 The one lookahead: the state-checkpoint tail
+### 1.2 State checkpoints: one forward
 
-The single place capacity is reserved beyond the current chunk. For mamba /
-state-checkpoint architectures, a prompt's **final** state checkpoint must land
-on an aligned boundary; without a reservation the pages for that tail may not
-be available when the prompt reaches it, and the checkpoint can never assemble.
+A stateful prompt may finish off a prefix boundary. Its final state is needed
+to continue decode, while the preceding aligned state is needed to publish the
+last reusable prefix page. The scheduler schedules the whole final extent in
+one forward, materializing both the aligned checkpoint and the final,
+request-local continuation state. This applies when the remaining extent fits
+the round's token budget and has no pending prefix-promotion boundary inside it.
+`AlignPrefillChunk` still enforces those limits; checkpoint output alone never
+creates an extra forward.
 
-So `FinalAlignedTailTokens` splits the last stretch into *body* + *aligned
-tail*, and the body's admission also banks the tail's pages
-(`state_checkpoint_tail_reserved`). The next round spends the reservation —
-`schedulePrefill` reads-and-clears the flag on entry, asserts the tail
-completes in one round, and skips re-shaping the sparse state demand.
+For example, after a 50,432-token cache hit with an 868-token extent and
+128-token prefix granularity, the scheduler submits `[868]`. This produces an
+aligned checkpoint at token 51,200 and a final state at token 51,300. With only
+800 tokens of budget left, the same request instead schedules 768 tokens and
+leaves 100 for a later round: ordinary chunking is still required.
 
-Consequences worth knowing:
+Admission allocates the sparse state suffix beginning at the aligned checkpoint
+when one falls inside the chunk. It includes the final state block and any
+role-appropriate decode reserve atomically. Only the latest internal aligned
+checkpoint is materialized, not every prefix boundary traversed by the chunk.
+An aligned endpoint is itself the checkpoint; an extent crossing no boundary
+needs only its final output. Only materialized aligned checkpoints are cached;
+an off-boundary endpoint is never keyed as a complete prefix.
 
-- **A banked tail is exempt from head-of-line.** Its remaining pages are
-  already held, so nobody behind it can starve it, and the queue may move on.
-- **In hybrid architectures the tail is banked in every cache group, not just
-  the state group.** `groupReserveTokens` gives the history/KV and
-  sliding-window groups `tail + decode` (a decoding role's first chunk raises
-  the history group's to the prompt headroom) and the state groups
-  `max(block_granularity, tail, decode)` — never less than the tail, never a
-  headroom-sized token reserve.
-- **Bound to state groups.** `shouldSplitFinalStateCheckpoint` requires
-  `HasMambaStateGroup()`, so a pure-KV model never banks a tail and is
-  head-of-line pinned until its final chunk. Extending the mechanism there is
-  an open optimization (it would lower `MaxSingleRequestTokens`, so it needs
-  its own capacity baseline).
+`CacheProgress::materialized_state_boundary_tokens` records the aligned
+boundary produced by the admitted local prefill. Publication of the preceding
+forward uses the old record before the next prefill advances it. Speculative
+decode preserves the record rather than claiming every crossed token boundary.
+The coordinator checks this exact boundary on admission, finish and retraction;
+an aligned accepted endpoint remains publishable without an internal snapshot.
+`Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
+accepted feedback, not the conservative admission frontier. Capacity and
+retention continue to use their existing conservative token progress.
 
-- **Every state group banks one growth block at the admission that finishes
-  shaping it** (completing chunk, split body, or remote landing):
-  `groupReserveTokens` reserves `max(block_granularity, tail,
-  decode_input_tokens)`, one block beyond the endpoint for every prompt length.
-  Without it an endpoint that lands alone in its block (aligned prompt, remote
-  landing, `disable_prefix_cache`) needs a fresh **empty** parent per state
-  group at its first boundary crossing, and a full pool deadlocks because
-  residents are retraction-exempt. Invariant: *no request needs an empty parent
-  for its first crossing* — it either owns the block or recycles its expired
-  body checkpoint (split-tail path). Later crossings re-acquire from the shared
-  pool, so steady-state deadlock freedom rests on two state blocks per live
-  request (three under overlap when `2 * decode_input_tokens >
-  block_granularity`) plus admission back-pressure. The P role banks only the
-  split tail; intermediate chunks and the tail-spending round reserve nothing
-  (the next sparse re-shaping requires `AvailableTokens() == 0`).
+One forward means one model dispatch, not one kernel launch. The state backend
+handles checkpoint outputs within it: the example's recurrent scan evaluates
+768 body tokens and then the remaining 100 tokens from the body state. These
+are not two scheduler requests or repeated full-model forwards. The batched
+conv/state writes and scan continuation contract are described in
+[Cache concepts](cache-concepts.md#snapshot-state-prefill-checkpoints); the scheduler
+only supplies the full extent and block tables, not a body/tail execution plan.
+
+An incomplete prefill holds the head of line; a completing prefill releases
+it within the same plan build. The same rule applies with prefix caching
+disabled and during local recovery on a decode node. Remote decode-role
+admission keeps its endpoint-only landing layout.
+
+The capacity guarantees are retention-specific:
+
+- **History and sliding-window groups reserve decode tokens.** A decoding
+  role's first chunk additionally raises full-history reserve to the remaining
+  prompt plus admission headroom; sliding-window groups do not hold headroom.
+- **Snapshot-state groups on decoding roles reserve growth at the admission
+  that finishes shaping them** (completing chunk or remote landing):
+  `groupReserveTokens` reserves `max(block_granularity, decode_input_tokens)`,
+  at least one block beyond the endpoint for every prompt length.
+  Without it an endpoint with no spare block needs a fresh **empty** parent
+  per state group at its first boundary crossing. A full pool can deadlock
+  when residents are retraction-exempt because their generation is covered by
+  admission headroom (§4). Invariant: *no request needs an empty parent
+  for its first crossing* — it already owns the block. Later crossings
+  re-acquire from the shared pool and depend on the capacity bound (§1.3) and
+  admission back-pressure.
+  The P role and intermediate local chunks reserve no growth block (the next
+  sparse re-shaping requires `AvailableTokens() == 0`).
 
 ### 1.3 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
-set — aligned body + tail, decode reserve, overlap-depth protection, the
-state growth block, and for chunked sparse local recovery the retained input
-checkpoint (and, with the prefix cache on, a first chunk's cached one) — fits
-the pool. It is not a live
+set — aligned checkpoint + final continuation state, decode reserve,
+overlap-depth protection, the state growth block, and for chunked sparse local
+recovery the retained input checkpoint (and, with the prefix cache on, a first
+chunk's cached one) — fits the pool. It is not a live
 check against currently free capacity; a prompt within the bound can still fail
 admission right now and simply waits.
+
+For an internal checkpoint followed by `tail` tokens, the forward holds
+both the tail and the ordinary growth reserve: the output working set is
+`1 + ceil((tail + reserve) / block_granularity)` blocks. Admission and the
+capacity bound share `SnapshotStateReserveTokens` for the growth reservation.
+The retained input is additional. With ordinary decode and equal prefix/state
+grains, an unaligned finishing chunk can therefore need four state blocks,
+not three. This also applies to local recovery on a decode node, and to
+single-forward execution with prefix caching disabled. Narrower state blocks
+must count the entire materialized suffix, not assume that two outputs always
+occupy two adjacent slots. Tests cover small pools that must reject an oversized
+request instead of accepting a request that can never produce a forward.
 
 ## 2. Retraction: when admission fails
 
@@ -165,21 +199,40 @@ required a cross-round capacity barrier. Two edges of the loop:
   order (§3) tries the blocker before any other claim.
 
 **The victim's pages are released — and grantable — immediately**, even though
-its L2 snapshot has not been copied yet. The runtime enqueues the D2H snapshot
-copy on the **forward thread's stream** ahead of everything else the plan does
-to those pages — the same stream carries the zeroing, fences the forwards, and
-gates a granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
-`event-loop.md`) — so the copy reads the old bytes whatever the scheduler does
-with the pages. Store tickets consequently pin only their Host destinations;
-the ack's one job is publishing the Host entry.
+its L2 snapshot has not been copied yet. The snapshot store is issued with
+`StoreSourceGuard::kStreamOrdered`: its ticket pins only the Host destination,
+and the runtime fences the **forward thread's stream** on the D2H copy's
+completion ahead of everything else the plan does to those pages — that
+stream carries the zeroing, fences the forwards, and gates a granted remote
+prefill's RDMA trigger (see `DeviceHandle.execute` and `event-loop.md`) — so
+the copy reads the old bytes whatever the scheduler does with the pages. This
+is the one store that pays for its ordering on the forward's critical path,
+and it has to: the pages are gone in the same round.
+
+**Every other store pins its Device sources until the ack.** Boundary
+publications of a live request and the finish-time flush are issued with
+`StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
+each source, so the block stays cached and unevictable — the admission planner
+cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does
+not count it — until `CompleteWriteBack` publishes the Host entry and drops the
+pin. Nothing else needs to know the copy is in flight, so the runtime copies
+on its own stream and no forward waits. A cached block is never written again
+by its owner (prefix reuse already depends on that), so the pin alone makes
+the copy race-free. Both guards are one path — `StartPendingStores(guard)` —
+and the op carries `source_pinned` to the runtime, which branches on the guard
+and never on the reason.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns —
 and one whose pages a PD transfer still pins must not be either. Both are
 checked on the chosen victim; if it is not quiescent, retraction waits for it
-rather than sacrificing a worse-ranked request. The one remaining global gate
-is an in-flight load-back: it is writing pages its readmission owns, and the
-victim policy cannot see that write. In-flight *stores* gate nothing anymore.
+rather than sacrificing a worse-ranked request. Two global gates remain. An
+in-flight load-back: it is writing pages its readmission owns, and the victim
+policy cannot see that write. And an in-flight *pinned* store: it holds Device
+capacity the ack returns by itself, so retracting anyone for that capacity
+would be the thrash of §4 — the blocked admission retries against the
+released pins next round instead. Stream-ordered stores hold nothing and gate
+nothing.
 
 The forward-out check is a count on `fsm::ForwardState`, incremented when a
 forward is scheduled and cleared when its result lands. It lives on the base
@@ -332,7 +385,7 @@ each retraction raises the decode headroom the next admission must secure:
 
 ```
 Request::AdmissionHeadroom(safe_steps)
-    = min(max_new_tokens, safe_steps * (1 + retraction_count))
+    = min(RemainingNewTokens(), safe_steps * (1 + retraction_count))
 ```
 
 with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
@@ -345,33 +398,50 @@ victim policy and it **cannot be retracted again**. This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
 over-optimistic, and never makes anyone else wait.
 
+The exemption compares the windows the admission secured against the budget
+that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`
+— recoverable from the prefill window, because every retraction rebases and
+nothing else moves it), never against the current remaining budget. Decode
+spends the prepaid headroom exactly as fast as it shrinks that budget, so
+judging the window against today's remainder would count spent headroom as
+still held: a request that outgrew a partial reserve would look covered the
+moment its remainder dipped under the window — exactly when it needs a new
+page — and once every resident request looked covered, retraction would have
+no victim and nothing could free that page.
+
 ## 5. Invariants a change must preserve
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
-  except the state-checkpoint tail (1.2), which is banked for exactly one round
-  and asserted against nesting, the snapshot-state growth block banked by the
-  admission that finishes shaping a state group (1.2), and the admission
-  headroom (4) — which only full-history groups hold.
+  except the decode reserve on the completing chunk (1), the snapshot-state
+  growth block banked by the admission that finishes shaping a state group
+  (1.2), and the admission headroom (4) — which only full-history groups hold.
 - A prefill demand's reserve is decided once per group, by retention, in
   `reservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.
-- An incomplete local prefill is not overtaken (1.1) — unless its tail is
-  already banked. Decodes are never hostage to it: they consume no fresh
-  capacity within their reserve, so they keep running beside a stalled
-  prefill.
+- An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
+  to it: they consume no fresh capacity within their reserve, so they keep
+  running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD pin on its pages — and an in-flight load-back defers all retraction;
-  in-flight stores defer nothing.
+  no PD pin on its pages — and an in-flight load-back or an in-flight pinned
+  store defers all retraction; stream-ordered stores defer nothing.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the write-back →
   zero → load → forward order on the forward thread's stream is what makes
   the immediate release safe, and changing `DeviceHandle.execute`'s ordering
   breaks it.
+- A store either pins its Device sources until the ack or is stream-ordered;
+  never neither (2). Only `retractVictim` issues a stream-ordered store — its
+  sources are granted away in the same round — and only such an op may be
+  fenced ahead of the plan's page reuse by the runtime. A new store site
+  chooses its guard explicitly (`StartPendingStores` has no default).
 - Only computed tokens are published as a prefix — `retractVictim` reads the
   window of an incomplete prefill rather than its whole token count.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
-- A request whose reserve covers its remaining generation is never a victim
-  (2); with the fresh-admission prepay this bounds retraction to requests
-  whose `max_new_tokens` exceeds one safe-step window (or is undeclared).
+- A request whose admission prepaid the generation budget open at that
+  admission is never a victim (2); with the fresh-admission prepay this bounds
+  retraction to requests whose `max_new_tokens` exceeds one safe-step window
+  (or is undeclared). Spending a partial reserve never makes it qualify: the
+  exemption is judged against the budget open at admission, not the current
+  remainder (4).

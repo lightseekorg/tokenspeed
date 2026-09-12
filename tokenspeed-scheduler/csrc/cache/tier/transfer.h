@@ -30,6 +30,8 @@
 #include <variant>
 #include <vector>
 
+#include "utils.h"
+
 namespace tokenspeed {
 
 struct CacheTransfer {
@@ -53,35 +55,61 @@ struct CacheTransferHash {
     }
 };
 
+// How a store's Device source is protected while its D2H copy is in flight.
+enum class StoreSourceGuard : std::uint8_t {
+    // The scheduler pins the Device block until the runtime acknowledges the
+    // copy: it stays cached and unevictable, so the runtime may copy it on
+    // any stream, off the forward's critical path. Ordinary publication.
+    kPinnedUntilAck,
+    // The Device block is released -- and may be re-granted -- the moment the
+    // store issues; the runtime must order the copy on the forward thread's
+    // stream ahead of the plan's page reuse. A retraction's snapshot: the
+    // victim's pages are granted away in the same round.
+    kStreamOrdered,
+};
+
 struct WriteBackOperation {
     std::uint32_t op_id{0};
     std::vector<CacheTransfer> transfers;  // DEVICE→HOST.
+    // False is the safe reading: the runtime orders the copy ahead of reuse.
+    bool source_pinned{false};
 };
 
+// Every op on the wire carries at least one transfer, and no (group, source,
+// destination) repeats within one plan: a store skips keys already in flight
+// and a load targets freshly acquired pages. The runtime relies on both -- an
+// op is acknowledged by its copy's completion event, so an empty op would
+// never be acknowledged and its tickets would leak. A violation is a
+// scheduler bug and fails here rather than being papered over.
 struct WriteBackBatch {
     std::vector<std::uint32_t> op_ids;
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
+    // Per op: whether the scheduler holds the Device sources until the ACK
+    // (see StoreSourceGuard). The runtime must order an unpinned op's copy
+    // ahead of the plan's page zeroing; a pinned op may ride any stream.
+    std::vector<bool> source_pinned;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            _assert(!op.transfers.empty(), "write-back op carries no transfers");
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                }
+                _assert(seen.insert(transfer).second, "duplicate write-back transfer within one plan");
+                operation_groups.push_back(transfer.group_id);
+                operation_sources.push_back(transfer.source_page);
+                operation_destinations.push_back(transfer.destination_page);
             }
 
             op_ids.push_back(op.op_id);
             group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
+            source_pinned.push_back(op.source_pinned);
         }
     }
 };
@@ -100,15 +128,15 @@ struct LoadBackBatch {
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            _assert(!op.transfers.empty(), "load-back op carries no transfers");
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                }
+                _assert(seen.insert(transfer).second, "duplicate load-back transfer within one plan");
+                operation_groups.push_back(transfer.group_id);
+                operation_sources.push_back(transfer.source_page);
+                operation_destinations.push_back(transfer.destination_page);
             }
 
             op_ids.push_back(op.op_id);

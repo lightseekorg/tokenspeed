@@ -60,6 +60,8 @@ class AttentionConfig:
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    TDM_WARP_HINT: gl.constexpr
+    REVERSE_Q_BLOCKS: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -88,6 +90,8 @@ class AttentionConfig:
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS,
         q_strides,
         k_strides,
         v_strides,
@@ -133,6 +137,8 @@ class AttentionConfig:
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
+        self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -229,6 +235,8 @@ class AttentionProgram:
         batch = gl.program_id(0)
         q_head = gl.program_id(1)
         q_block = gl.program_id(2)
+        if cfg.REVERSE_Q_BLOCKS:
+            q_block = gl.num_programs(axis=2) - 1 - q_block
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
         seq_base = gl.load(cu_seqlens_ptr + batch)
         seq_end = gl.load(cu_seqlens_ptr + batch + 1)
@@ -318,14 +326,22 @@ class AttentionProgram:
 
     @gluon.jit
     def tdm_load_global_to_shared_k(self, kv_start, buffer_index):
+        warp_used_hint: gl.constexpr = 0x0F if self.cfg.TDM_WARP_HINT else None
         cdna5.tdm.async_load(
-            self.k_desc, [kv_start, 0], self.k_buffer.index(buffer_index)
+            self.k_desc,
+            [kv_start, 0],
+            self.k_buffer.index(buffer_index),
+            warp_used_hint=warp_used_hint,
         )
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, kv_start, buffer_index):
+        warp_used_hint: gl.constexpr = 0x0F if self.cfg.TDM_WARP_HINT else None
         cdna5.tdm.async_load(
-            self.v_desc, [kv_start, 0], self.v_buffer.index(buffer_index)
+            self.v_desc,
+            [kv_start, 0],
+            self.v_buffer.index(buffer_index),
+            warp_used_hint=warp_used_hint,
         )
 
     @gluon.jit
@@ -646,6 +662,8 @@ def _mha_prefill_gfx1250(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    TDM_WARP_HINT: gl.constexpr,
+    REVERSE_Q_BLOCKS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -662,6 +680,8 @@ def _mha_prefill_gfx1250(
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -702,6 +722,50 @@ class LaunchConfig(NamedTuple):
     max_seqlen: int
     window_left: int
     grid: tuple[int, ...]
+
+
+def _select_llvm_fn_attrs(*, head_dim: int, max_seqlen: int, window_left: int) -> str:
+    """Use max-ILP where it reduces scheduler overhead without regressions.
+
+    It wins for full D=128 attention once fixed scheduling overhead is amortized.
+    D=64, very short sequences, and medium/large sliding windows regress.
+    """
+    use_max_ilp = head_dim == 128 and max_seqlen >= 512 and window_left < 0
+    return "amdgpu-sched-strategy=max-ilp" if use_max_ilp else ""
+
+
+def _select_tdm_warp_hint(
+    *,
+    block_m: int,
+    block_n: int,
+    num_warps: int,
+    window_left: int,
+    workgroups: int,
+) -> bool:
+    """Use four TDM producer warps for the fully occupied eight-warp tile.
+
+    Without the hint all eight warps participate in each descriptor load.
+    Sliding-window and underfilled launches do not amortize this specialization
+    and retain the original all-warp behavior.
+    """
+    return (
+        block_m == 256
+        and block_n == 64
+        and num_warps == 8
+        and window_left < 0
+        and workgroups >= _GFX1250_NUM_CUS
+    )
+
+
+def _select_reverse_q_blocks(
+    *,
+    block_m: int,
+    max_seqlen: int,
+    window_left: int,
+    workgroups: int,
+) -> bool:
+    """Schedule long causal workgroups first to minimize the dispatch tail."""
+    return window_left < 0 and workgroups >= _GFX1250_NUM_CUS and max_seqlen > block_m
 
 
 def _select_m_tile(
@@ -776,6 +840,15 @@ def triton_cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _count_live_workgroups(
+    *, cu_seqlens_cpu: list[int], n_heads: int, block_m: int
+) -> int:
+    return n_heads * sum(
+        triton_cdiv(seq_end - seq_start, block_m)
+        for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
+    )
+
+
 def gluon_mha_prefill_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -823,6 +896,23 @@ def gluon_mha_prefill_gfx1250(
     )
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
+    tdm_warp_hint = _select_tdm_warp_hint(
+        block_m=config.block_m,
+        block_n=config.block_n,
+        num_warps=config.num_warps,
+        window_left=config.window_left,
+        workgroups=math.prod(config.grid),
+    )
+    reverse_q_blocks = _select_reverse_q_blocks(
+        block_m=config.block_m,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        workgroups=_count_live_workgroups(
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            n_heads=config.n_heads,
+            block_m=config.block_m,
+        ),
+    )
 
     _mha_prefill_gfx1250[config.grid](
         q,
@@ -851,10 +941,17 @@ def gluon_mha_prefill_gfx1250(
         sinks is not None,
         return_lse,
         config.window_left,
+        tdm_warp_hint,
+        reverse_q_blocks,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,
         waves_per_eu=config.waves_per_eu,
+        llvm_fn_attrs=_select_llvm_fn_attrs(
+            head_dim=config.head_dim,
+            max_seqlen=config.max_seqlen,
+            window_left=config.window_left,
+        ),
     )
     if return_lse:
         return output, lse

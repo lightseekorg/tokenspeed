@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
     from tokenspeed.runtime.layers.qwen4_exp_ple import Qwen4ExpPLELayer
 
@@ -77,6 +79,13 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
     ) -> int:
         self._ensure_ple_verify_scratch(max_bs, draft_token_num)
         return sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
+
+    @override
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._ple_verify_scratch = {}
+        for layer in self._ple_layers:
+            layer.drop_verify_scratch()
 
     def _ensure_ple_verify_scratch(self, max_bs: int, draft_token_num: int) -> None:
         """Allocate graph-stable PLE context and convolution rollback rows."""

@@ -30,6 +30,7 @@ the gate. Inference only (no backward)."""
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
@@ -48,8 +49,11 @@ def _rms_norm_fwd_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     group = tl.program_id(1)
     X += row * stride_x_row + group * N
@@ -72,6 +76,8 @@ def _rms_norm_fwd_kernel(
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
         y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
     tl.store(Y + cols, y, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def rmsnorm_fn(
@@ -87,6 +93,7 @@ def rmsnorm_fn(
     norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z). With
     ``group_size`` set, each group of that many features is normalized on its
     own (``None`` means one group over the whole last dim)."""
+    enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
     if x.stride(-1) != 1:
@@ -128,6 +135,8 @@ def rmsnorm_fn(
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=num_warps,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out.reshape(x_shape_og)
 

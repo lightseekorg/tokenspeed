@@ -295,15 +295,16 @@ def load_packaged_flashinfer_tuning_cache(
                 "different FlashInfer or cuDNN version "
                 f"(installed: flashinfer={fi_version}, cudnn={cudnn_version}) "
                 "and will not be loaded. Re-sweep with "
-                "benchmark/moe_tactic_sweep to restore pinned tactics; until "
-                "then the startup autotune window tunes these shapes."
+                "python -m tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep "
+                "to restore pinned tactics; until then the startup autotune window "
+                "tunes these shapes."
             )
         else:
             logger.info(
                 f"no packaged flashinfer tuning cache for this environment "
                 f"(looked for {name}); the startup autotune window will tune "
-                "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
-                "tactics."
+                "instead. Sweep one with python -m tokenspeed_kernel.ops.moe."
+                "flashinfer.moe_tactic_sweep to pin tactics."
             )
         return False
     return load_flashinfer_tuning_cache(path)

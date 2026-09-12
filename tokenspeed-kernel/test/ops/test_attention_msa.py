@@ -9,12 +9,12 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
-from tokenspeed_kernel.ops.attention.triton.minimax_indexer import minimax_indexer
-from tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention import (
+from tokenspeed_kernel.ops.attention.msa._triton.indexer import minimax_indexer
+from tokenspeed_kernel.ops.attention.msa.triton import (
     minimax_sparse_attention,
 )
 
@@ -733,7 +733,7 @@ def _cutedsl_decode_score_available() -> bool:
     if not current_platform().is_blackwell:
         return False
     try:
-        from tokenspeed_kernel.ops.attention.cute_dsl import (  # noqa: F401
+        from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (  # noqa: F401
             minimax_index_decode_score,
         )
     except ImportError:
@@ -756,9 +756,9 @@ def _cutedsl_decode_score_available() -> bool:
 def test_cutedsl_decode_score_matches_triton(
     decode_query_len: int, seq_list: list[int]
 ) -> None:
-    import tokenspeed_kernel.ops.attention.triton.minimax_indexer as mi
+    import tokenspeed_kernel.ops.attention.msa._triton.indexer as mi
     import triton
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (
         decode_score_supported,
         minimax_index_decode_score,
     )
@@ -849,7 +849,7 @@ def test_cutedsl_decode_score_matches_triton(
     reason="CuteDSL index decode score requires SM100 and cutlass-dsl",
 )
 def test_cutedsl_decode_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa._cute_dsl.decode_score import (
         decode_score_supported,
     )
 
@@ -968,7 +968,7 @@ def _prefill_indexer_case(
 def test_fmha_prefill_score_matches_triton(
     qo_lens: list[int], kv_lens: list[int]
 ) -> None:
-    from tokenspeed_kernel.ops.attention import msa_score
+    from tokenspeed_kernel.ops.attention.msa import cuda as msa_score
 
     if not msa_score.ensure_prefill_score_ready(None):
         pytest.skip("fmha OnlyScore JIT compilation failed (nvcc unavailable?)")
@@ -991,7 +991,7 @@ def test_fmha_prefill_score_matches_triton(
 
 @requires_fmha_prefill_score
 def test_fmha_prefill_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.msa_score import prefill_score_supported
+    from tokenspeed_kernel.ops.attention.msa.cuda import prefill_score_supported
 
     device = "cuda"
     index_q = torch.randn(8, 4, 128, device=device, dtype=torch.bfloat16)

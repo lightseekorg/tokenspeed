@@ -20,13 +20,14 @@
 
 #include "cache/tier/transfer_manager.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "utils.h"
 
 namespace tokenspeed {
 
-std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
+std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard) {
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
@@ -37,7 +38,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             continue;
         }
 
-        const CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
+        CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
         if (!device_block_ref) {
             continue;
         }
@@ -54,6 +55,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
     CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
 
+    const bool pin_source = guard == StoreSourceGuard::kPinnedUntilAck;
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
     transfers.reserve(host_allocation.stats.allocated);
@@ -63,16 +65,18 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!host_block_ref) {
             continue;
         }
-        // The source page id is resolved here and not pinned: the forward
-        // thread's stream orders the copy ahead of any later reuse.
         const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
         transfers.push_back(CacheTransfer{
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
             .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
         });
+        // A stream-ordered store resolves the source page id and lets the
+        // reference go: the forward thread's stream orders the copy ahead of
+        // any later reuse. A pinned store keeps it until the ACK.
         tickets.push_back(StoreTicket{
             std::move(keys[i]),
+            pin_source ? std::move(device_block_refs[i]) : CacheBlockRef{},
             std::move(host_block_ref),
         });
     }
@@ -84,9 +88,18 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
     for (const StoreTicket& ticket : tickets) {
         store_keys_.insert(ticket.key);
     }
-    const bool inserted = write_backs_.emplace(op_id, std::move(tickets)).second;
+    const bool inserted = write_backs_.emplace(op_id, InFlightWriteBack{guard, std::move(tickets)}).second;
     _assert(inserted, "duplicate store op id");
-    return WriteBackOperation{op_id, std::move(transfers)};
+    return WriteBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .source_pinned = pin_source,
+    };
+}
+
+bool TierTransferManager::HasPinnedStoresInFlight() const {
+    return std::ranges::any_of(
+        write_backs_, [](const auto& entry) { return entry.second.guard == StoreSourceGuard::kPinnedUntilAck; });
 }
 
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
@@ -113,11 +126,13 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     if (it == write_backs_.end()) {
         return;
     }
-    std::vector<StoreTicket> stores = std::move(it->second);
+    std::vector<StoreTicket> stores = std::move(it->second.tickets);
     write_backs_.erase(it);
     for (const StoreTicket& ticket : stores) {
         store_keys_.erase(ticket.key);
     }
+    // Publishing the Host entry also drops the tickets' Device pins (if any)
+    // when `stores` goes out of scope: the source is evictable again.
     for (StoreTicket& ticket : stores) {
         coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
     }

@@ -52,21 +52,30 @@ class CacheGroupGeometry:
             ``retention="full_history"`` — the table the router's draft
             write locations ride — or None when the pool publishes no such
             group (a single-group pool's sole group then serves as the
-            history).
+            history). Chosen from the pool at every bind, so it takes no
+            part in geometry equality.
+        row_geometry: ``group_id -> (rows_per_page, entry_stride_tokens)``
+            for every non-state group: the physical row layout the leaves'
+            kernels read, so a rebind keeps it.
+        retentions: ``group_id -> (retention, sliding_window_tokens)`` for
+            every non-state group: the scheduler's retention contract, and the
+            fact ``full_history_group_id`` is chosen from.
     """
 
     granularities: dict[str, int] = field(default_factory=dict)
     families: dict[str, str] = field(default_factory=dict)
-    full_history_group_id: str | None = None
+    full_history_group_id: str | None = field(default=None, compare=False)
+    row_geometry: dict[str, tuple[int | None, int | None]] = field(kw_only=True)
+    retentions: dict[str, tuple[str, int | None]] = field(kw_only=True)
 
     def granularity_of(self, group_id: str) -> int:
         """This group's block granularity; an unknown id is a contract bug.
 
         Every id reaching here must name a learned row-geometry group —
-        layer group ids are validated against the pool's published specs at
-        startup (``validate_cache_group_ids``), and table dicts are keyed by
-        contract ids. No fallback: a miss means the geometry was never
-        learned (pool not bound) or the id belongs to a state group.
+        layer group ids are bound from the pool's plan at startup
+        (``bind_cache_groups``), and table dicts are keyed by contract ids.
+        No fallback: a miss means the geometry was never learned (pool not
+        bound) or the id belongs to a state group.
         """
         try:
             return self.granularities[group_id]
@@ -104,4 +113,14 @@ def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
         full_history_group_id=(
             str(full_history.group_id) if full_history is not None else None
         ),
+        row_geometry={
+            str(spec.group_id): (spec.rows_per_page, spec.entry_stride_tokens)
+            for spec in cache_group_specs
+            if spec.family != "state"
+        },
+        retentions={
+            str(spec.group_id): (str(spec.retention), spec.sliding_window_tokens)
+            for spec in cache_group_specs
+            if spec.family != "state"
+        },
     )

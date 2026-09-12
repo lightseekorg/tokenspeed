@@ -1,0 +1,305 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+from utils import is_cdna5
+
+if not is_cdna5():
+    pytest.skip(
+        "AMD CDNA5 is required for gfx1250 Gluon MHA tests", allow_module_level=True
+    )
+
+
+from tokenspeed_kernel_amd.ops.gfx1250.attention.mha import prefill  # noqa: E402
+
+
+def _inputs(seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype):
+    cu_cpu = [0]
+    for s in seqlens:
+        cu_cpu.append(cu_cpu[-1] + s)
+    cu = torch.tensor(cu_cpu, device=device, dtype=torch.int32)
+    total = cu_cpu[-1]
+    q = torch.randn((total, n_q_heads, head_dim), device=device, dtype=dtype)
+    k = torch.randn((total, n_kv_heads, head_dim), device=device, dtype=dtype)
+    v = torch.randn((total, n_kv_heads, head_dim), device=device, dtype=dtype)
+    return q, k, v, cu, cu_cpu, max(seqlens)
+
+
+def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1):
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    group = n_q_heads // n_kv_heads
+    outs = []
+    for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
+        q_i = q[start:end].float()
+        k_exp = k[start:end].float().repeat_interleave(group, dim=1)
+        v_exp = v[start:end].float().repeat_interleave(group, dim=1)
+        n = end - start
+        scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
+        pos = torch.arange(n, device=q.device)
+        mask = pos[:, None] >= pos[None, :]
+        if window_left >= 0:
+            mask &= (pos[:, None] - pos[None, :]) <= window_left
+        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
+        outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v_exp))
+    return torch.cat(outs, dim=0)
+
+
+@pytest.mark.parametrize(
+    "block_m,num_warps", [(128, 4), (256, 8)], ids=["narrow", "wide"]
+)
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+@pytest.mark.parametrize("window_left", [-1, 64], ids=["full", "sliding"])
+def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
+    """Compile and check both prefill tile shapes.
+
+    get_config() picks between these by shape, and the wide tile only triggers
+    on a grid large enough to fill the device, which is more work than a compute
+    simulator can run. So force each configuration on a small shape instead: the
+    point is to exercise the distinct WMMA and store layouts and the launch
+    arguments, which is where a layout regression would show up.
+    """
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads = 4, 1
+    # D=128 full attention crosses the max-ILP scheduler's minimum sequence
+    # length, so this matrix compiles both scheduler policies as well.
+    seqlen = 512 if head_dim == 128 and window_left < 0 else 320
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [seqlen], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original = prefill.get_config
+    used = []
+
+    def forced(**kwargs):
+        cfg = original(**kwargs)
+        forced_cfg = cfg._replace(
+            block_m=block_m,
+            num_warps=num_warps,
+            grid=(
+                cfg.batch_size,
+                cfg.n_heads,
+                (cfg.max_seqlen + block_m - 1) // block_m,
+            ),
+        )
+        used.append(forced_cfg)
+        return forced_cfg
+
+    prefill.get_config = forced
+    try:
+        out = prefill.gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen, window_left=window_left
+        )
+    finally:
+        prefill.get_config = original
+
+    # Without this the test would still pass if the override silently missed and
+    # the kernel ran the other tile, reporting coverage it does not have.
+    assert used, "get_config was not called; the tile override did not take effect"
+    assert (used[-1].block_m, used[-1].num_warps) == (block_m, num_warps)
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_select_llvm_fn_attrs():
+    max_ilp = "amdgpu-sched-strategy=max-ilp"
+
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=512, window_left=-1)
+        == max_ilp
+    )
+
+    # Each guard has a measured regression when max-ILP is used.
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=64, max_seqlen=512, window_left=-1) == ""
+    )
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=256, window_left=-1)
+        == ""
+    )
+    assert (
+        prefill._select_llvm_fn_attrs(head_dim=128, max_seqlen=4096, window_left=512)
+        == ""
+    )
+
+
+def test_select_tdm_warp_hint():
+    kwargs = {
+        "block_m": 256,
+        "block_n": 64,
+        "num_warps": 8,
+        "window_left": -1,
+        "workgroups": 256,
+    }
+    assert prefill._select_tdm_warp_hint(**kwargs)
+
+    for override in (
+        {"block_m": 128},
+        {"block_n": 128},
+        {"num_warps": 4},
+        {"window_left": 64},
+        {"workgroups": 255},
+    ):
+        assert not prefill._select_tdm_warp_hint(**(kwargs | override))
+
+
+def test_select_reverse_q_blocks():
+    kwargs = {
+        "block_m": 256,
+        "max_seqlen": 4096,
+        "window_left": -1,
+        "workgroups": 256,
+    }
+    assert prefill._select_reverse_q_blocks(**kwargs)
+
+    for override in (
+        {"max_seqlen": 256},
+        {"window_left": 64},
+        {"workgroups": 255},
+    ):
+        assert not prefill._select_reverse_q_blocks(**(kwargs | override))
+
+
+def test_mha_prefill_reverse_counts_live_ragged_workgroups():
+    device, dtype = "cuda", torch.bfloat16
+    seqlens = [4096] + [1] * 31
+    n_q_heads, n_kv_heads, head_dim = 1, 1, 64
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    assert len(seqlens) * n_q_heads * prefill.triton_cdiv(max_seqlen, 256) == 512
+
+    original_order = prefill._select_reverse_q_blocks
+    observed_workgroups = []
+
+    def capture_workgroups(**kwargs):
+        observed_workgroups.append(kwargs["workgroups"])
+        return False
+
+    prefill._select_reverse_q_blocks = capture_workgroups
+    try:
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill._select_reverse_q_blocks = original_order
+
+    assert observed_workgroups == [47]
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+
+
+def test_mha_prefill_tdm_warp_hint_remainder():
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads, head_dim = 8, 2, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+    original_hint = prefill._select_tdm_warp_hint
+
+    def forced_config(**kwargs):
+        cfg = original_config(**kwargs)
+        return cfg._replace(
+            block_m=256,
+            num_warps=8,
+            grid=(
+                cfg.batch_size,
+                cfg.n_heads,
+                (cfg.max_seqlen + 255) // 256,
+            ),
+        )
+
+    prefill.get_config = forced_config
+    try:
+        prefill._select_tdm_warp_hint = lambda **_kwargs: False
+        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        prefill._select_tdm_warp_hint = lambda **_kwargs: True
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+        prefill._select_tdm_warp_hint = original_hint
+
+    assert torch.equal(out, control)
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_mha_prefill_reverse_q_blocks_ragged():
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads, head_dim = 8, 2, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+    original_order = prefill._select_reverse_q_blocks
+
+    def forced_config(**kwargs):
+        cfg = original_config(**kwargs)
+        return cfg._replace(
+            block_m=256,
+            num_warps=8,
+            grid=(
+                cfg.batch_size,
+                cfg.n_heads,
+                (cfg.max_seqlen + 255) // 256,
+            ),
+        )
+
+    prefill.get_config = forced_config
+    try:
+        prefill._select_reverse_q_blocks = lambda **_kwargs: False
+        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        prefill._select_reverse_q_blocks = lambda **_kwargs: True
+        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+        prefill._select_reverse_q_blocks = original_order
+
+    assert torch.equal(out, control)
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_select_m_tile_gates():
+    """Both gates on the wide tile are load-bearing.
+
+    Measured on gfx1250, taking the 256-row tile when either gate fails costs up
+    to 1.2x, so pin the behaviour at each boundary.
+    """
+    wide = (256, 8)
+    narrow = (128, 4)
+
+    # Sequence too short: the causally-masked half of the diagonal block is a
+    # large fraction of the work, even though this grid fills the device.
+    assert prefill._select_m_tile(batch_size=8, n_heads=32, max_seqlen=512) == narrow
+
+    # Long enough, but 128 workgroups underfills the 256 CUs.
+    assert prefill._select_m_tile(batch_size=1, n_heads=8, max_seqlen=4096) == narrow
+
+    # Both satisfied.
+    assert prefill._select_m_tile(batch_size=4, n_heads=32, max_seqlen=4096) == wide

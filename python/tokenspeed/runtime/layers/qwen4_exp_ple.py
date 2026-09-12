@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -60,13 +61,17 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.utils import add_prefix
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
 _IndexBundle = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # Uniform-batch index bundles captured into a CUDA graph. During capture the
 # (bs, max_len) pair is fixed per bucket, so entries are bounded by the capture
 # set. Entries are never evicted: a replay reads the addresses its capture
 # recorded, so freeing one would let the allocator hand that memory to someone
-# else and feed a replay another tensor's bytes. Eager calls compute fresh
-# tensors instead of caching, so varied prefill lengths cannot grow this dict.
+# else and feed a replay another tensor's bytes. Other graphs sharing the
+# capture pool can overwrite their contents, so eager calls neither read nor
+# populate this cache. They compute fresh tensors instead.
 _UNIFORM_INDEX_CACHE: dict[tuple[int, int, torch.device], _IndexBundle] = {}
 
 
@@ -451,6 +456,7 @@ class Qwen4ExpPLELayer(nn.Module):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._active_verify_key: tuple[int, int] | None = None
+        self._last_pool: CachePool | None = None
 
     def _load_kv_proj_shard(
         self,
@@ -604,7 +610,10 @@ class Qwen4ExpPLELayer(nn.Module):
         max_len = max(lengths) if lengths else 0
         if bs and max_len > 0 and max_len * bs == total:
             key = (bs, max_len, device)
-            bundle = _UNIFORM_INDEX_CACHE.get(key)
+            capturing = (
+                device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+            )
+            bundle = _UNIFORM_INDEX_CACHE.get(key) if capturing else None
             if bundle is None:
                 positions = torch.arange(total, device=device, dtype=torch.long)
                 req = positions // max_len
@@ -612,7 +621,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 lengths_t = torch.full((bs,), max_len, device=device, dtype=torch.long)
                 starts = torch.arange(bs, device=device, dtype=torch.long) * max_len
                 bundle = (req, col, lengths_t, starts)
-                if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                if capturing:
                     _UNIFORM_INDEX_CACHE[key] = bundle
             req, col, lengths_t, starts = bundle
         else:
@@ -845,6 +854,12 @@ class Qwen4ExpPLELayer(nn.Module):
         scratch = (external[0][:rows], external[1][:rows])
         self._verify_scratch[key] = scratch
         return scratch
+
+    def drop_verify_scratch(self) -> None:
+        """Forget the workspace views; the backend reissues them for a rebound pool."""
+        self._verify_scratch.clear()
+        self._active_verify_key = None
+        self._last_pool = None
 
     def commit_verified(
         self,

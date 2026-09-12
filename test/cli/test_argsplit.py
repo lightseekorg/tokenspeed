@@ -66,10 +66,15 @@ def test_user_host_port_go_to_gateway_only():
 
 
 def test_chat_template_overrides_to_gateway_only():
-    """Both prepare_server_args and smg accept this flag; spec says gateway."""
     r = _split(["--chat-template", "/some/template.jinja"])
     assert r.engine == []
     assert r.gateway == ["--chat-template", "/some/template.jinja"]
+
+
+def test_api_key_routes_to_gateway():
+    r = _split(["--model", "test/model", "--api-key", "test-key"])
+    assert r.engine == ["--model", "test/model"]
+    assert r.gateway == ["--model", "test/model", "--api-key", "test-key"]
 
 
 def test_tool_call_parser_overrides_to_gateway_only():

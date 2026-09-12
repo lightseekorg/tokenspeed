@@ -69,12 +69,14 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
-    validate_cache_group_ids,
+    bind_cache_groups,
+    check_block_drafter_storage,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -82,7 +84,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
@@ -391,7 +393,6 @@ class ModelExecutor:
         )
 
         attn_backend.configure_runtime(
-            sliding_window_size=model_runner.sliding_window_size,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 token_to_kv_pool, "cache_group_page_counts", None
@@ -399,7 +400,6 @@ class ModelExecutor:
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
-                sliding_window_size=model_runner.sliding_window_size,
                 cache_group_specs=tuple(
                     _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
                 ),
@@ -408,15 +408,15 @@ class ModelExecutor:
                 ),
             )
 
-        validate_cache_group_ids(
-            model_runner.model,
-            token_to_kv_pool.arena.cache_group_specs,
-        )
+        # Storage is the plan's decision: stamp each attention layer's cache
+        # group from the pool and check the group retains what the layer's
+        # mask can see. A block drafter additionally borrows the target's
+        # full-history group -- it writes at the target's cache locations.
+        bind_cache_groups(model_runner.model, token_to_kv_pool)
         if draft_model_runner is not None and draft_token_to_kv_pool is not None:
-            validate_cache_group_ids(
-                draft_model_runner.model,
-                draft_token_to_kv_pool.arena.cache_group_specs,
-            )
+            bind_cache_groups(draft_model_runner.model, draft_token_to_kv_pool)
+            if is_block_drafter(config.spec_algo, is_draft=True):
+                check_block_drafter_storage(draft_model_runner.model, token_to_kv_pool)
 
         # Backend-declared CUDA-graph support, AND-composed over the target
         # and draft trees (the decode graph records the whole step, drafter
@@ -479,15 +479,6 @@ class ModelExecutor:
             graph_supported=graph_support.prefill_graph,
         )
 
-        self._autotune()
-
-        workspace_pool(self.device).freeze()
-
-        if not self.forward_step.disable:
-            self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
         self.encoder_graph_wrappers = getattr(
@@ -495,6 +486,14 @@ class ModelExecutor:
         )
 
         self.device_module = torch.get_device_module(self.device)
+        # Two streams, named once. `default_stream` is the forward thread's
+        # own: page zeroing runs here, and the cache ops take it by name for
+        # their fences and start events. `execution_stream` carries the model
+        # launches and the runtime-state writes. Dependencies between them are
+        # placed by the consumer: each forward waits on the default stream in
+        # its prologue; zeroing and write-back wait on the execution stream
+        # themselves.
+        self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
@@ -516,9 +515,25 @@ class ModelExecutor:
             device=self.device,
         )
 
-        set_random_seed(48)
-
         logger.info("ModelExecutor initialized")
+
+    def capture_graphs(self) -> None:
+        """Tune the kernels, pin the workspace, then capture the graphs.
+
+        A step of its own, so the caller decides when the graph owners start
+        recording the pools' buffers. Construction has already read the pools
+        (validation, configure_runtime, bind_cache_groups and the runners'
+        init_cuda_graph_state), so a caller that rebinds between the two
+        re-runs those itself.
+        """
+        self._autotune()
+
+        workspace_pool(self.device).freeze()
+
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
@@ -1081,9 +1096,18 @@ class ModelExecutor:
                 )
 
     def zero_cache_pages(self, pages):
-        """Clear newly owned pages and return a CUDA completion event when needed."""
+        """Clear newly owned pages and return a CUDA completion event when needed.
+
+        Runs on ``default_stream``, ordered behind the forwards in flight on
+        ``execution_stream``: the pages' previous owner may still be writing
+        them. The plan's later work on the default stream (the load-backs'
+        start event, the remote prefill's fence) inherits the order; the next
+        forward's prologue waits on the default stream and so runs after the
+        zeroing.
+        """
         if not pages:
             return None
+        self.default_stream.wait_stream(self.execution_stream)
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
@@ -1140,7 +1164,7 @@ class ModelExecutor:
         if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
         done = self.device_module.Event()
-        done.record(self.device_module.current_stream(self.device))
+        done.record(self.default_stream)
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
@@ -1179,7 +1203,7 @@ class ModelExecutor:
 
     def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
-        self.execution_stream.wait_stream(self.device_module.current_stream())
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
                 pool_indices,
@@ -1221,11 +1245,11 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            # Wait for previous iteration's runtime state updates
-            # (future_input_map, valid_cache_lengths) on execution_stream to
-            # complete before reading them.
-            self.device_module.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(self.device_module.current_stream())
+            # Behind the default-stream work the plan enqueued ahead of this
+            # forward: the page zeroing, the retraction write-back's fence,
+            # the multimodal features. The runtime-state reads below need no
+            # cross-stream wait -- their writers ran on execution_stream too.
+            self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.

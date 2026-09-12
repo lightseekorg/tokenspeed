@@ -948,19 +948,26 @@ def _rmsnorm_gated_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
     idx = token * num_heads * head_dim + offs_h[:, None] * head_dim + offs_d[None, :]
-    x = tl.load(x_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=1) / head_dim
-    rsig = tl.math.rsqrt(var + eps)
     w = tl.load(weight_ptr + offs_d).to(tl.float32)
     gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
     g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    if ENABLE_PDL:
+        # Gate and norm weight are independent of the KDA primary. Delay only
+        # the attention-output read until every primary CTA has completed.
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / head_dim
+    rsig = tl.math.rsqrt(var + eps)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
@@ -971,6 +978,8 @@ def rmsnorm_gated_sigmoid(
     eps: float,
     num_heads: int,
     head_dim: int,
+    *,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Per-head RMSNorm fused with a sigmoid output gate: ``rmsnorm(x)*w*sigmoid(g)``.
 
@@ -980,12 +989,15 @@ def rmsnorm_gated_sigmoid(
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
+        enable_pdl: Whether to prefetch gate/weight before waiting for the
+            immediately preceding programmatic-launch primary.
 
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
     """
     assert x.is_contiguous() and gate.shape == x.shape and gate.stride(-1) == 1
     out = torch.empty_like(x)
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _rmsnorm_gated_kernel[(x.shape[0],)](
         x,
         gate,
@@ -996,7 +1008,9 @@ def rmsnorm_gated_sigmoid(
         num_heads=num_heads,
         head_dim=head_dim,
         BLOCK_H=triton.next_power_of_2(num_heads),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     return out
 

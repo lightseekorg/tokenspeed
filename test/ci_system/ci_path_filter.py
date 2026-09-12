@@ -6,6 +6,15 @@ from pathlib import Path
 
 RUNNER_GROUPS = ("amd", "nvidia-arm", "nvidia-gb300-slurm", "nvidia-x86")
 
+# Every runner group belongs to one vendor; vendor-owned paths below are
+# expressed per vendor so a new NVIDIA runner group needs no new path list.
+RUNNER_GROUP_VENDORS = {
+    "amd": "amd",
+    "nvidia-arm": "nvidia",
+    "nvidia-gb300-slurm": "nvidia",
+    "nvidia-x86": "nvidia",
+}
+
 SHARED_DIRECTORIES = (
     "python",
     "test",
@@ -18,11 +27,17 @@ SHARED_FILES = frozenset(
     }
 )
 
+# Paths owned by a single vendor. A change here requires only that vendor's
+# runner groups, even when the path sits inside a shared directory.
 VENDOR_DIRECTORIES = {
-    "amd": ("tokenspeed-kernel-amd",),
-    "nvidia-arm": ("tokenspeed-mla",),
-    "nvidia-gb300-slurm": ("tokenspeed-mla",),
-    "nvidia-x86": ("tokenspeed-mla",),
+    "amd": (
+        "tokenspeed-kernel-amd",
+        "tokenspeed-kernel/test/amd",
+    ),
+    "nvidia": (
+        "tokenspeed-mla",
+        "tokenspeed-kernel/test/nvidia",
+    ),
 }
 VENDOR_WORKFLOWS = {
     "amd": ".github/workflows/pr-test-amd.yml",
@@ -40,20 +55,29 @@ def touches_directory(paths: set[str], directory: str) -> bool:
     return any(is_in_directory(path, directory) for path in paths)
 
 
+def path_vendor(path: str) -> str | None:
+    """Return the vendor that owns ``path``, or ``None`` when it is shared."""
+    for vendor, directories in VENDOR_DIRECTORIES.items():
+        if any(is_in_directory(path, directory) for directory in directories):
+            return vendor
+    return None
+
+
+def path_requires_group(path: str, runner_group: str) -> bool:
+    vendor = path_vendor(path)
+    if vendor is not None:
+        return vendor == RUNNER_GROUP_VENDORS[runner_group]
+    if path in SHARED_FILES:
+        return True
+    if any(is_in_directory(path, directory) for directory in SHARED_DIRECTORIES):
+        return True
+    return path == VENDOR_WORKFLOWS[runner_group]
+
+
 def should_run(paths: set[str], runner_group: str, event_name: str) -> bool:
     if event_name == "workflow_dispatch":
         return True
-
-    if paths & SHARED_FILES:
-        return True
-    if any(touches_directory(paths, directory) for directory in SHARED_DIRECTORIES):
-        return True
-    if VENDOR_WORKFLOWS[runner_group] in paths:
-        return True
-    return any(
-        touches_directory(paths, directory)
-        for directory in VENDOR_DIRECTORIES[runner_group]
-    )
+    return any(path_requires_group(path, runner_group) for path in paths)
 
 
 def parse_args() -> argparse.Namespace:

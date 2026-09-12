@@ -152,23 +152,16 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     num_tokens_post_padded_ptr,
     sorted_weights_ptr,
     N,
-    K,
     EM,
-    num_valid_tokens,
     token_num,
     top_k,
     stride_am,
     stride_ak,
     stride_be,
-    stride_bn,
-    stride_bk,
     stride_cm,
     stride_cn,
-    stride_ase_m,
-    stride_ase_k,
     stride_bse_e,
     stride_bse_n,
-    stride_bse_k,
     stride_se_n_pad,
     K_PACKED_TOTAL: gl.constexpr,
     N_PHYS: gl.constexpr,
@@ -176,13 +169,11 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     SORT_BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    GROUP_SIZE_M: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     B_GDOT128: gl.constexpr = False,
     USE_REDUCE: gl.constexpr = False,
     MFMA_STORE_LAYOUT: gl.constexpr = False,
     PERSISTENT: gl.constexpr = True,
-    CU_NUM: gl.constexpr = 256,
     COALESCE_SCALES: gl.constexpr = False,
     DIRECT_SCALE_LAYOUT: gl.constexpr = False,
     DEFER_EPILOGUE: gl.constexpr = True,
@@ -199,11 +190,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     ``stride_cn`` describe that shape (``stride_cm = N``).
 
     When ``PERSISTENT`` is True, the kernel is launched with
-    ``grid = (CU_NUM,)`` and each CTA walks a contiguous-M slice of the
-    ``num_pid_m * num_pid_n`` tile space. ``flat_tile = cta_id *
-    tiles_per_block + tile_iter``; ``pid_m = flat_tile % num_pid_m``,
-    ``pid_n = flat_tile // num_pid_m``. Iterating M-fast within a
-    fixed N means consecutive iters share the same expert
+    ``grid = (num_pid_n, workers)``: grid axis 0 owns a fixed N tile and
+    each worker on axis 1 walks a contiguous floor/ceil slice of the
+    ``num_pid_m`` M tiles, sized from ``gl.num_programs(axis=1)``.
+    Iterating M-fast within a fixed N means consecutive iters share the same expert
     (``sorted_expert_ids`` is monotone in M), so that expert's B
     weight stays L2-resident across iters. ``PERSISTENT=False``
     (the default for this wrapper) launches the per-tile grid
@@ -1456,7 +1446,6 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     out_ptr,  # bf16, shape [token_num, N]
     token_num,
     N,
-    top_k,
     stride_pt,  # partials: stride for token dim = topk * N
     stride_ps,  # partials: stride for slot  dim = N
     stride_pn,  # partials: stride for col   dim = 1
@@ -1465,7 +1454,6 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     TOP_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
 ):
     """Sum per-(token, slot) partials over the topk dim.
 
@@ -1675,16 +1663,13 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     assert sorted_weights.shape[0] == EM
 
     # The kernel reads the valid extent from ``num_valid_ids_ptr`` on-device
-    # (``num_tokens_post_padded = gl.load(...)``), so the ``num_valid_tokens``
-    # scalar arg is vestigial. Avoid a device-to-host ``.item()`` sync here and
-    # pass a placeholder; the device pointer is the single source of truth.
+    # (``num_tokens_post_padded = gl.load(...)``); the device pointer is the
+    # single source of truth, so a tensor input needs no host sync.
     if torch.is_tensor(num_valid_ids):
-        num_valid_tokens = 0
         num_valid_ids_ptr = num_valid_ids
     else:
-        num_valid_tokens = int(num_valid_ids)
         num_valid_ids_ptr = torch.tensor(
-            [num_valid_tokens], dtype=torch.int32, device=inter_states.device
+            [int(num_valid_ids)], dtype=torch.int32, device=inter_states.device
         )
 
     BLOCK_M = 128 if block_m is None else int(block_m)
@@ -1700,7 +1685,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         )
     BLOCK_N = 256
     BLOCK_K = 128
-    GROUP_SIZE_M = 1
     NUM_WARPS = 4
     assert K % BLOCK_K == 0, f"K ({K}) must be divisible by BLOCK_K ({BLOCK_K})"
 
@@ -1713,8 +1697,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     # iter of each CTA is still cold; at small M it wastes most CTAs
     # on no-op iterations. Re-enabled when a follow-up adds actual
     # next-tile load overlap inside the per-tile body.
-    CU_NUM = 256
-    PERSISTENT_BLOCKS = CU_NUM
+    PERSISTENT_BLOCKS = 256
     total_tiles_host = num_pid_m * num_pid_n
     PERSISTENT = False
     grid = (num_pid_n, PERSISTENT_BLOCKS) if PERSISTENT else (total_tiles_host,)
@@ -1758,13 +1741,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     stride_am = kernel_inter.stride(0)
     stride_ak = kernel_inter.stride(1)
     stride_be = w2.stride(0)
-    stride_bn = w2.stride(1)
-    stride_bk = w2.stride(2)
-    stride_ase_m = a2_scale.stride(0)
-    stride_ase_k = a2_scale.stride(1)
     stride_bse_e = w2_scale.stride(0)
     stride_bse_n = w2_scale.stride(1)
-    stride_bse_k = w2_scale.stride(2)
     stride_se_n_pad = a2_scale.shape[1]
     K_packed_total = K // 2
 
@@ -1804,23 +1782,16 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         num_valid_ids_ptr,
         sorted_weights,
         N,
-        K,
         EM,
-        num_valid_tokens,
         token_num,
         topk,
         stride_am,
         stride_ak,
         stride_be,
-        stride_bn,
-        stride_bk,
         c_stride_m,
         c_stride_n,
-        stride_ase_m,
-        stride_ase_k,
         stride_bse_e,
         stride_bse_n,
-        stride_bse_k,
         stride_se_n_pad,
         K_PACKED_TOTAL=K_packed_total,
         N_PHYS=N,
@@ -1828,7 +1799,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         SORT_BLOCK_M=SORT_BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
         NUM_WARPS=NUM_WARPS,
         B_GDOT128=bool(b_gdot128),
         USE_REDUCE=_use_reduce,
@@ -1839,12 +1809,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
-        # ``CU_NUM`` is the divisor for ``tiles_per_block`` in the
-        # persistent path. When PERSISTENT=False it is unused inside
-        # the kernel (branch is constexpr-pruned), so we keep it at the
-        # historical 256 in that case to avoid invalidating the cached
-        # binary for the small-M atomic dispatch.
-        CU_NUM=PERSISTENT_BLOCKS if PERSISTENT else 256,
         num_warps=NUM_WARPS,
     )
 
@@ -1861,7 +1825,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             out,
             token_num,
             N,
-            topk,
             partials.stride(0),
             partials.stride(1),
             partials.stride(2),
@@ -1870,7 +1833,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             BLOCK_M=BLOCK_M_R,
             BLOCK_N=BLOCK_N_R,
             TOP_K=topk,
-            NUM_WARPS=NUM_WARPS_R,
             num_warps=NUM_WARPS_R,
         )
     if _USES_FP32_ATOMIC is None:

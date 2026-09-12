@@ -24,42 +24,46 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_batched_replay_uses_raw_gate,
+    kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
 )
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout as kda_recurrent_layout_default,
 )
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.triton.capture_payload import (
+from tokenspeed_kernel.ops.attention.kda.triton import (
     capture_replay_payload,
-)
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
@@ -96,6 +100,9 @@ class KdaAttnBackend(MambaAttnBackend):
     the conv, the gate GEMV and the recurrence into a single launch.
     """
 
+    _verify_reads_committed_recurrent_state = True
+    _verify_packed_qkv_views = True
+
     def __init__(
         self,
         config: AttnConfig,
@@ -110,13 +117,8 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_active = False
         self._batched_replay_kernel = None
         self._replay_uses_raw_gate = False
-        self._replay_payloads: tuple[torch.Tensor, ...] | None = None
-        self._replay_weights: dict[int, tuple] = {}
-        self._replay_descriptors = None
-        self._replay_group_indices = None
-        self._batched_replay_launch = None
-        self._batched_replay_ready = False
-        self._replay_descriptor_bound: set[int] = set()
+        self._verify_split_producers = False
+        self._reset_replay_state()
         self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
             raise ValueError(
@@ -129,13 +131,66 @@ class KdaAttnBackend(MambaAttnBackend):
             self.kda_backend,
         )
 
+    def _reset_replay_state(self) -> None:
+        self._verify_producer_stream: torch.cuda.Stream | None = None
+        self._verify_producer_forks: dict[int, StreamFork] = {}
+        self._replay_payloads: tuple[torch.Tensor, ...] | None = None
+        self._replay_weights: dict[
+            int,
+            tuple[
+                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, float
+            ],
+        ] = {}
+        self._replay_descriptors: torch.Tensor | None = None
+        self._replay_group_indices: torch.Tensor | None = None
+        self._batched_replay_launch: (
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None
+        ) = None
+        self._batched_replay_ready = False
+        self._replay_descriptor_bound: set[int] = set()
+        self._descriptor_row_by_layer: dict[int, int] = {}
+        self._replay_group_ids: tuple[str, ...] = ()
+        self._replay_group_rows: dict[str, int] = {}
+
+    @staticmethod
+    def _replay_shape(kv_pool: CachePool) -> dict[str, int]:
+        first_layer = min(kv_pool.state_group_by_layer)
+        num_heads, head_dim = kv_pool.get_component(
+            first_layer, "recurrent_state"
+        ).shape[1:3]
+        return {"num_heads": num_heads, "head_dim": head_dim}
+
+    @staticmethod
+    def _layer_pools_are_uniform(kv_pool: CachePool) -> bool:
+        shapes = {
+            (
+                tuple(kv_pool.get_component(layer_id, "conv_state").shape[1:]),
+                tuple(kv_pool.get_component(layer_id, "recurrent_state").shape[1:]),
+            )
+            for layer_id in kv_pool.state_group_by_layer
+        }
+        return len(shapes) == 1
+
     @override
-    def set_kv_pool(self, kv_pool) -> None:
-        super().set_kv_pool(kv_pool)
-        first_layer = self._state_layer_ids()[0]
-        _, first_state = self._state_components(first_layer)
-        num_heads, head_dim = first_state.shape[1:3]
-        shape = {"num_heads": num_heads, "head_dim": head_dim}
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        replay_active = kda_replay_commit_supported(
+            self.dtype,
+            recurrent_layout=self.kda_recurrent_layout,
+            **self._replay_shape(cache_pool),
+        )
+        if (
+            replay_active
+            and self.speculative_num_draft_tokens > 1
+            and not self._layer_pools_are_uniform(cache_pool)
+        ):
+            raise RuntimeError("batched KDA replay requires uniform layer pools")
+
+    @override
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._reset_replay_state()
+        shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(
             self.dtype,
             recurrent_layout=self.kda_recurrent_layout,
@@ -148,6 +203,14 @@ class KdaAttnBackend(MambaAttnBackend):
         )
         self._replay_uses_raw_gate = self._replay_active and (
             kda_batched_replay_uses_raw_gate(self.dtype, **shape)
+        )
+        self._verify_split_producers = self._replay_active and (
+            kda_fused_paged_verify_uses_split_producers(
+                self.dtype,
+                store_states=False,
+                recurrent_layout=self.kda_recurrent_layout,
+                **shape,
+            )
         )
         if self._replay_active and self.speculative_num_draft_tokens > 1:
             rows = self.max_bs * self.speculative_num_draft_tokens
@@ -172,16 +235,15 @@ class KdaAttnBackend(MambaAttnBackend):
                     device=self.device,
                 )
                 first_conv, first_ssm = self._state_components(layer_ids[0])
+                if self._verify_split_producers and first_conv.is_cuda:
+                    self._verify_producer_stream = torch.cuda.Stream(
+                        device=first_conv.device, priority=-1
+                    )
+                    self._verify_producer_forks = {
+                        layer_id: StreamFork(self._verify_producer_stream)
+                        for layer_id in layer_ids
+                    }
                 hv, head_dim = first_ssm.shape[1:3]
-                for layer_id in layer_ids[1:]:
-                    conv, ssm = self._state_components(layer_id)
-                    if (
-                        conv.shape[1:] != first_conv.shape[1:]
-                        or ssm.shape[1:] != first_ssm.shape[1:]
-                    ):
-                        raise RuntimeError(
-                            "batched KDA replay requires uniform layer pools"
-                        )
                 payload_shape = (len(layer_ids), rows)
                 self._replay_payloads = (
                     torch.empty(
@@ -207,10 +269,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 )
                 self._replay_descriptors = addresses
                 self._replay_group_indices = group_indices
-                self._replay_descriptor_bound.clear()
-                self._replay_weights.clear()
-                self._batched_replay_launch = None
-                self._batched_replay_ready = False
 
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer row from the stacked replay workspaces."""
@@ -344,10 +402,15 @@ class KdaAttnBackend(MambaAttnBackend):
                     f"preallocated scratch holds {capacity}"
                 )
             return
-        self._verify_scratch = {}
+        scratch = {}
         for layer_id in self._state_layer_ids():
             conv, _ = self._state_components(layer_id)
-            self._verify_scratch[layer_id] = (
+            if self._replay_uses_raw_gate and conv.shape[0] < rows:
+                raise RuntimeError(
+                    f"KDA verify needs {rows} transient conv rows but the "
+                    f"bound pool's conv slab holds {conv.shape[0]}"
+                )
+            scratch[layer_id] = (
                 (
                     conv
                     if self._replay_uses_raw_gate
@@ -357,6 +420,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 ),
                 None,
             )
+        self._verify_scratch = scratch
 
     @override
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
@@ -458,6 +522,7 @@ class KdaAttnBackend(MambaAttnBackend):
             norm_eps,
             num_value_heads,
             head_v_dim,
+            enable_pdl=pdl_enabled(),
         ).view(1, -1, num_value_heads, head_v_dim)
 
     @override
@@ -520,6 +585,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 norm_eps,
                 num_value_heads,
                 head_v_dim,
+                enable_pdl=pdl_enabled(),
             ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
 
@@ -557,6 +623,7 @@ class KdaAttnBackend(MambaAttnBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             replay_payload = {}
+            split_producers = {}
             if self._replay_uses_raw_gate:
                 # Fused verify writes QKV, raw-g, and beta directly into the
                 # persistent replay payload, avoiding a separate capture launch.
@@ -565,6 +632,39 @@ class KdaAttnBackend(MambaAttnBackend):
                     "replay_gate": gate[:rows],
                     "replay_beta": beta[:rows, : beta_raw.shape[-1]],
                 }
+            elif self._verify_split_producers:
+                fork = self._verify_producer_forks[layer_id]
+                with fork.scope(enable=True) as producer_fork:
+                    with producer_fork.branch():
+                        capture_replay_payload(
+                            (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
+                            (
+                                qkv[:rows, : mixed_qkv.shape[-1]],
+                                f_a[:rows, : f_a_out.shape[-1]],
+                                beta[:rows, : beta_raw.shape[-1]],
+                            ),
+                            rows,
+                        )
+                        g_raw = torch.nn.functional.linear(f_a_out[:rows], f_b_weight)
+                    conv_qkv = kda_verify_conv_update(
+                        mixed_qkv[:rows],
+                        conv_weights,
+                        conv_comp,
+                        state_in_blocks[:batch_size],
+                        num_heads=value_dim // attn_tp_size // head_v_dim,
+                        head_dim=head_v_dim,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout=self.kda_recurrent_layout,
+                    )
+                # The graph capture pool owns captured allocations. In eager
+                # mode the producer tensors outlive this Python scope while
+                # verify runs on the main stream, so register that use with
+                # the caching allocator before launching its consumer.
+                if not torch.cuda.is_current_stream_capturing():
+                    consumer_stream = torch.cuda.current_stream()
+                    g_raw.record_stream(consumer_stream)
+                    conv_qkv.record_stream(consumer_stream)
+                split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
             else:
                 capture_replay_payload(
                     (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
@@ -610,6 +710,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 **replay_payload,
+                **split_producers,
             )
             if fused_out is None:
                 raise RuntimeError(
@@ -685,8 +786,10 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
-        initial_pool = ssm_scratch
-        initial_rows = output_indices[:batch_size, 0] - 1
+        # The recurrence has independent read and write pools: committed pages
+        # provide the initial state while every speculative checkpoint lands in scratch.
+        initial_pool = ssm_comp
+        initial_rows = state_in_blocks[:batch_size]
         write_rows = output_indices[:batch_size]
         state_out = ssm_scratch
 
@@ -714,7 +817,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+        from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
@@ -847,6 +950,8 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
+        if query_start_loc.dtype != torch.int64:
+            raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -864,3 +969,10 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state
+
+    @override
+    def _prepare_prefill_scan_query_start_loc(
+        self, query_start_loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Prepare reusable int64 boundaries for each full, body or tail scan."""
+        return query_start_loc.to(torch.int64)

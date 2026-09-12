@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel import mhc_post, mhc_pre
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid, silu_and_mul
 from tokenspeed_kernel.ops.transform import hadamard_transform
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.glm53_flash_config import (
@@ -57,7 +58,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -770,6 +770,7 @@ class Glm53FlashKDA(nn.Module):
                 self.o_norm.variance_epsilon,
                 self.local_num_heads,
                 self.head_dim,
+                enable_pdl=pdl_enabled(),
             )
         return self.o_proj(core_output)[0]
 
@@ -927,10 +928,6 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
             alt_stream=alt_stream,
             skip_rope=True,
         )
-        # DSA uses the same latent-history cache group as K3 MLA. The inherited
-        # PagedAttention modules are created without a group id.
-        self.attn_mqa.group_id = FULL_ATTENTION
-        self.attn_mha.group_id = FULL_ATTENTION
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=1e-6)
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=1e-6)
         self.fused_qk_layernorm = FusedRMSNorm(
@@ -1181,15 +1178,18 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         topk: int,
     ) -> GlmDsaDecodeTopK:
         del topk
+        writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             "_decode_topk_indices_buffer",
             num_tokens,
             self.index_topk + self.index_kpool - 1,
             indexer_output.query.device,
+            fill_value=None if writes_full_workspace else -1,
         )
         topk_lens = self._get_decode_topk_lens_workspace(
             num_tokens,
             indexer_output.query.device,
+            fill=not writes_full_workspace,
         )
         ctx.attn_backend.require_kpool_runtime().select_decode(
             query=indexer_output.query,
@@ -1371,6 +1371,8 @@ class Glm53FlashDecoderLayer(nn.Module):
                 self.config.rms_norm_eps,
                 self.config.hc_eps,
                 self.config.hc_sinkhorn_iters,
+                norm_weight=None,
+                norm_eps=None,
             )
             hidden_states = self.input_layernorm(hidden_states)
             if self.is_kda_layer:
@@ -1405,6 +1407,8 @@ class Glm53FlashDecoderLayer(nn.Module):
                 self.config.rms_norm_eps,
                 self.config.hc_eps,
                 self.config.hc_sinkhorn_iters,
+                norm_weight=None,
+                norm_eps=None,
             )
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)

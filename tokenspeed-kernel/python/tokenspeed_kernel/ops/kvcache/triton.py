@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -35,7 +36,10 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
-_HOST_CACHE_BLOCK_SIZE = 4096
+HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
+
+
+logger = logging.getLogger(__name__)
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -45,17 +49,20 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 
 __all__ = [
+    "HOST_CACHE_TRANSFER_CHUNK_BYTES",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
+    "mla_latent_norm_rope_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
     "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_sf_interleaved",
-    "transfer_cache_ranges",
+    "transfer_cache_blocks",
+    "wait_layer_ready",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
@@ -70,92 +77,300 @@ __all__ = [
 
 
 @triton.jit
-def _transfer_cache_ranges_kernel(
+def _copy_geometry_slice(
     buffer_addresses_ptr,
-    ranges_ptr,
-    num_ranges,
-    num_chunks,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    geometry_offset,
+    num_geometry_rows,
+    host_lcm_block_bytes,
+    pid,
+    nprogs,
     NUM_DEVICE_BUFFERS: tl.constexpr,
     DIRECTION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    work_items = num_ranges * num_chunks
+    host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
+    for row_delta in tl.range(0, num_geometry_rows):
+        row_offset = (geometry_offset + row_delta) * 8
+        group_index = tl.load(geometry_ptr + row_offset)
+        device_buffer_index = tl.load(geometry_ptr + row_offset + 1)
+        device_zero = tl.load(geometry_ptr + row_offset + 2)
+        device_stride = tl.load(geometry_ptr + row_offset + 3)
+        host_block_bytes = tl.load(geometry_ptr + row_offset + 4)
+        host_field_offset = tl.load(geometry_ptr + row_offset + 5)
+        packing = tl.load(geometry_ptr + row_offset + 6)
+        payload_bytes = tl.load(geometry_ptr + row_offset + 7)
+
+        group_start = tl.load(group_offsets_ptr + group_index)
+        group_end = tl.load(group_offsets_ptr + group_index + 1)
+        num_chunks = (payload_bytes + BLOCK_SIZE - 1) // BLOCK_SIZE
+        group_work_items = (group_end - group_start) * num_chunks
+        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
+
+        for work_id in tl.range(pid, group_work_items, nprogs):
+            pair_index = group_start + work_id // num_chunks
+            chunk_index = work_id % num_chunks
+            device_block_id = tl.load(block_pairs_ptr + pair_index * 2)
+            host_block_id = tl.load(block_pairs_ptr + pair_index * 2 + 1)
+            host_zero_based = host_block_id - 1
+            host_parent = host_zero_based // packing
+            host_child = host_zero_based % packing
+            device_offset = device_zero + device_block_id * device_stride
+            host_offset = (
+                host_parent * host_lcm_block_bytes
+                + host_child * host_block_bytes
+                + host_field_offset
+            )
+            byte_offsets = chunk_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = byte_offsets < payload_bytes
+            device_ptr = tl.cast(
+                device_address + device_offset,
+                tl.pointer_type(tl.uint8),
+            )
+            host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
+            if DIRECTION == 0:
+                values = tl.load(
+                    device_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(
+                    host_ptr + byte_offsets,
+                    values,
+                    mask=mask,
+                    cache_modifier=".cs",
+                )
+            else:
+                values = tl.load(
+                    host_ptr + byte_offsets,
+                    mask=mask,
+                    cache_modifier=".cg",
+                )
+                tl.store(device_ptr + byte_offsets, values, mask=mask)
+
+
+@triton.jit
+def _gpu_acq_rel_fence(dummy_ptr):
+    tl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; mov.s32 $0, 0;",
+        "=r,l",
+        [dummy_ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _arrive_and_signal_layer(count_ptr, flag_ptr, last_cta_index):
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %pleader;
+            .reg .pred %plast;
+            .reg .b32 %tidx;
+            .reg .s32 %old;
+            mov.u32 %tidx, %tid.x;
+            setp.eq.u32 %pleader, %tidx, 0;
+            mov.s32 %old, -1;
+            @%pleader atom.acq_rel.gpu.global.add.s32 %old, [$1], 1;
+            setp.eq.s32 %plast, %old, $3;
+            and.pred %plast, %plast, %pleader;
+            @%plast st.release.gpu.global.s32 [$2], 1;
+            mov.s32 $0, 0;
+        }
+        """,
+        "=r,l,l,r",
+        [count_ptr, flag_ptr, last_cta_index],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
+    tl.debug_barrier()
+    _gpu_acq_rel_fence(count_ptr)
+    _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
+
+
+@triton.jit
+def _transfer_cache_blocks_kernel(
+    buffer_addresses_ptr,
+    geometry_ptr,
+    block_pairs_ptr,
+    group_offsets_ptr,
+    num_geometry_rows,
+    geometry_offset,
+    host_lcm_block_bytes,
+    layer_slices_ptr,
+    layer_ready_flags_ptr,
+    layer_cta_counts_ptr,
+    num_layers,
+    NUM_DEVICE_BUFFERS: tl.constexpr,
+    DIRECTION: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SIGNAL_LAYERS: tl.constexpr,
+):
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
-    for work_id in tl.range(pid, work_items, nprogs):
-        range_id = work_id // num_chunks
-        chunk_id = work_id - range_id * num_chunks
-        range_offset = range_id * 4
-        device_buffer_index = tl.load(ranges_ptr + range_offset)
-        device_offset = tl.load(ranges_ptr + range_offset + 1)
-        host_offset = tl.load(ranges_ptr + range_offset + 2)
-        num_bytes = tl.load(ranges_ptr + range_offset + 3)
-        byte_offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-        device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
-        host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
-        device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
-        host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
-        mask = byte_offsets < num_bytes
-        if DIRECTION == 0:
-            values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(
-                host_ptr + byte_offsets,
-                values,
-                mask=mask,
-                cache_modifier=".cs",
+    if SIGNAL_LAYERS:
+        for layer_index in tl.range(0, num_layers):
+            slice_offset = tl.load(layer_slices_ptr + layer_index * 2)
+            slice_rows = tl.load(layer_slices_ptr + layer_index * 2 + 1)
+            _copy_geometry_slice(
+                buffer_addresses_ptr,
+                geometry_ptr,
+                block_pairs_ptr,
+                group_offsets_ptr,
+                slice_offset,
+                slice_rows,
+                host_lcm_block_bytes,
+                pid,
+                nprogs,
+                NUM_DEVICE_BUFFERS,
+                DIRECTION,
+                BLOCK_SIZE,
             )
-        else:
-            values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
-            tl.store(device_ptr + byte_offsets, values, mask=mask)
+            _signal_layer_ready(
+                layer_cta_counts_ptr + layer_index,
+                layer_ready_flags_ptr + layer_index,
+                nprogs,
+            )
+        return
+    _copy_geometry_slice(
+        buffer_addresses_ptr,
+        geometry_ptr,
+        block_pairs_ptr,
+        group_offsets_ptr,
+        geometry_offset,
+        num_geometry_rows,
+        host_lcm_block_bytes,
+        pid,
+        nprogs,
+        NUM_DEVICE_BUFFERS,
+        DIRECTION,
+        BLOCK_SIZE,
+    )
 
 
-def transfer_cache_ranges(
-    address_table: torch.Tensor,
-    range_table: torch.Tensor,
-    direction: int,
-    *,
-    num_ranges: int,
-    max_bytes: int,
-    num_device_buffers: int,
-    grid_cap: int | None = None,
-) -> None:
-    """Copy prepared Host-cache ranges with a capped grid-stride launch.
+@triton.jit
+def _ld_acquire_i32(ptr):
+    return tl.inline_asm_elementwise(
+        "ld.acquire.gpu.global.s32 $0, [$1];",
+        "=r,l",
+        [ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_layer_ready_kernel(flag_ptr, layer_index):
+    pending = _ld_acquire_i32(flag_ptr + layer_index)
+    while pending == 0:
+        pending = _ld_acquire_i32(flag_ptr + layer_index)
+
+
+def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
+    """Spin on the current stream until ``flags[layer_index]`` is released.
 
     Args:
-        address_table: Device ``uint64`` table of device-buffer pointers
-            followed by the mapped Host pointer.
-        range_table: Device ``int64`` rows
-            ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
-        direction: ``0`` for device-to-Host and ``1`` for Host-to-device.
-        num_ranges: Valid leading rows in ``range_table``.
-        max_bytes: Largest ``num_bytes`` among those rows.
-        num_device_buffers: Count of device pointers in ``address_table``.
-        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP`` (64).
+        flags: Device int32 per-layer completion flags.
+        layer_index: Consumer-local layer to wait for.
+    """
+
+    if flags.dtype != torch.int32 or flags.ndim != 1:
+        raise ValueError("flags must be a 1-D int32 tensor")
+    if not 0 <= int(layer_index) < flags.numel():
+        raise IndexError(f"layer_index {layer_index} outside [0, {flags.numel()})")
+    _wait_layer_ready_kernel[(1,)](flags, int(layer_index), num_warps=1)
+
+
+def transfer_cache_blocks(
+    address_table: torch.Tensor,
+    geometry_table: torch.Tensor,
+    block_pairs: torch.Tensor,
+    group_offsets: torch.Tensor,
+    direction: int,
+    *,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    host_lcm_block_bytes: int,
+    work_items: int,
+    num_device_buffers: int,
+    grid_cap: int | None,
+    layer_ready_flags: torch.Tensor | None,
+    layer_slices: torch.Tensor | None,
+    layer_cta_counts: torch.Tensor | None,
+) -> None:
+    """Copy compact Host blocks using prepared static and dynamic metadata.
+
+    Args:
+        address_table: Device pointers followed by the mapped Host pointer.
+        geometry_table: Static int64 field rows.
+        block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
+        group_offsets: Valid group bucket offsets, with ``num_groups + 1`` entries.
+        direction: ``0`` for Device-to-Host and ``1`` for Host-to-Device.
+        geometry_offset: First static field row for this layer.
+        num_geometry_rows: Number of field rows for this layer.
+        host_lcm_block_bytes: Byte stride between compact Host LCM blocks.
+        work_items: Largest block/chunk work count among this layer's fields.
+        num_device_buffers: Count of Device pointers in ``address_table``.
+        grid_cap: Max CTAs. Defaults to ``TOKENSPEED_HOST_CACHE_GRID_CAP``.
+        layer_ready_flags: Optional per-layer completion flags. When set, one
+            grid copies every ``layer_slices`` row and release-stores each flag.
+        layer_slices: Device ``(offset, num_rows)`` table matching ``flags``.
+        layer_cta_counts: Device arrival counters, one int32 per layer.
 
     Returns:
-        None; the copy is enqueued on the current device stream.
+        None; copies are enqueued on the current device stream.
     """
 
     if direction not in (0, 1):
         raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
-    if num_ranges <= 0:
+    signal_layers = layer_ready_flags is not None
+    if signal_layers:
+        if layer_slices is None or layer_cta_counts is None:
+            raise ValueError("layered transfer requires layer slices and CTA counts")
+        if layer_ready_flags.dtype != torch.int32 or layer_ready_flags.ndim != 1:
+            raise ValueError("layer_ready_flags must be a 1-D int32 tensor")
+        if layer_slices.ndim != 2 or layer_slices.shape[1] != 2:
+            raise ValueError("layer_slices must have shape (num_layers, 2)")
+        if layer_cta_counts.dtype != torch.int32 or layer_cta_counts.ndim != 1:
+            raise ValueError("layer_cta_counts must be a 1-D int32 tensor")
+        if (
+            layer_ready_flags.numel() != layer_slices.shape[0]
+            or layer_cta_counts.numel() != layer_slices.shape[0]
+        ):
+            raise ValueError("layer ready tables must cover the same layers")
+    elif work_items <= 0 or num_geometry_rows <= 0:
         return
-    block_size = _HOST_CACHE_BLOCK_SIZE
-    num_chunks = triton.cdiv(max_bytes, block_size)
-    work_items = num_ranges * num_chunks
     cap = _HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
     if cap <= 0:
         raise ValueError("grid_cap must be positive")
-    grid = (min(cap, work_items),)
-    _transfer_cache_ranges_kernel[grid](
+    grid = (max(1, min(cap, work_items if work_items > 0 else 1)),)
+    unused = geometry_table
+    _transfer_cache_blocks_kernel[grid](
         address_table,
-        range_table,
-        num_ranges,
-        num_chunks,
+        geometry_table,
+        block_pairs,
+        group_offsets,
+        num_geometry_rows,
+        geometry_offset,
+        host_lcm_block_bytes,
+        layer_slices if signal_layers else unused,
+        layer_ready_flags if signal_layers else unused,
+        layer_cta_counts if signal_layers else unused,
+        int(layer_slices.shape[0]) if signal_layers else 0,
         NUM_DEVICE_BUFFERS=num_device_buffers,
         DIRECTION=direction,
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
+        SIGNAL_LAYERS=signal_layers,
         num_warps=8,
     )
 
@@ -172,14 +387,17 @@ def _zero_byte_ranges_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     range_id = tl.program_id(0)
-    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     range_offset = tl.load(ranges_ptr + range_id * 2)
     range_size = tl.load(ranges_ptr + range_id * 2 + 1)
-    tl.store(
-        backing_ptr + range_offset + byte_offsets,
-        0,
-        mask=byte_offsets < range_size,
-    )
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
 
 
 def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> None:
@@ -193,8 +411,9 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
         return
     if backing.dtype != torch.uint8 or not backing.is_contiguous():
         raise ValueError("backing must be a contiguous uint8 tensor")
+    backing_size = backing.numel()
     if any(
-        offset < 0 or size <= 0 or offset + size > backing.numel()
+        offset < 0 or size <= 0 or offset + size > backing_size
         for offset, size in ranges
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
@@ -208,8 +427,14 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     block_size = 1024
     max_size = max(size for _, size in ranges)
 
-    grid = (len(ranges), triton.cdiv(max_size, block_size))
-
+    # A short range must not launch one CTA for every tile of the largest
+    # state field. Bound the rectangle and let each CTA stride its own range.
+    # Few large ranges still need enough CTAs to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, len(ranges)))
+    grid = (
+        len(ranges),
+        min(tiles_per_range, triton.cdiv(max_size, block_size)),
+    )
     _zero_byte_ranges_kernel[grid](
         backing,
         range_table,
@@ -234,6 +459,7 @@ def _copy_state_rows_kernel(
     rows_per_layer,
     ROW_I32: tl.constexpr,
     BLOCK_I32: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Copy one state row between two slabs of one layer.
 
@@ -241,6 +467,8 @@ def _copy_state_rows_kernel(
     slab views and dense scratch tensors mix freely. A negative source row id
     stores zeros instead (seed-invalid fill).
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     work_index = tl.program_id(0)
     chunk_index = tl.program_id(1)
     layer_index = work_index // rows_per_layer
@@ -263,6 +491,8 @@ def _copy_state_rows_kernel(
         other=0,
     )
     tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def copy_state_rows(
@@ -299,6 +529,7 @@ def copy_state_rows(
     Returns:
         None. Rows are copied in place in one launch.
     """
+    enable_pdl = pdl_enabled()
     total = src_rows.numel()
     if total == 0:
         return
@@ -335,6 +566,8 @@ def copy_state_rows(
         total // num_layers,
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -561,7 +794,10 @@ def _set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_loc"],
+    do_not_specialize_on_alignment=["n_loc"],
+)
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
@@ -716,6 +952,184 @@ def set_mla_kv_buffer_triton(
             MAX_FINITE=max_finite,
             **extra_kwargs,
         )
+
+
+@triton.jit
+def _sanitize(x, MAX_FINITE: tl.constexpr):
+    """Replace NaN with zero and infinities with the widest storable value."""
+    x = tl.where(x != x, 0.0, x)
+    x = tl.where(x == float("inf"), MAX_FINITE, x)
+    return tl.where(x == -float("inf"), -MAX_FINITE, x)
+
+
+@triton.jit
+def _mla_latent_norm_rope_scatter_kernel(
+    latent_ptr,  # [total_ctx, n_layers, kv_lora_rank + rope_dim]
+    norm_weight_ptr,  # [n_layers, kv_lora_rank]
+    eps_ptr,  # [n_layers]
+    cos_sin_cache_ptr,  # [max_pos, rope_dim]
+    positions_ptr,  # [total_ctx]
+    loc_ptr,  # [total_ctx]
+    buf_ptrs_ptr,  # [n_layers] — one latent plane data_ptr per layer
+    latent_stride_ctx,
+    latent_stride_layer,
+    norm_weight_stride_layer,
+    cos_sin_stride_pos,
+    dst_row_stride,
+    kv_lora_rank: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_LORA: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+):
+    """One latent row of one layer per CTA. Grid: (total_ctx, n_layers)."""
+    ctx_id = tl.program_id(0)
+    layer_id = tl.program_id(1)
+
+    src = latent_ptr + ctx_id * latent_stride_ctx + layer_id * latent_stride_layer
+    dst_slot = tl.load(loc_ptr + ctx_id).to(tl.int64)
+    if IS_FP8:
+        dst = tl.load(buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        dst = tl.load(buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
+    dst = dst + dst_slot * dst_row_stride
+
+    offs = tl.arange(0, BLOCK_LORA)
+    mask = offs < kv_lora_rank
+    nope = tl.load(src + offs, mask=mask, other=0.0).to(tl.float32)
+    eps = tl.load(eps_ptr + layer_id).to(tl.float32)
+    weight = tl.load(
+        norm_weight_ptr + layer_id * norm_weight_stride_layer + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    nope = nope * tl.rsqrt(tl.sum(nope * nope) / kv_lora_rank + eps) * weight
+
+    half = tl.arange(0, HALF_ROPE)
+    cos_sin = cos_sin_cache_ptr + tl.load(positions_ptr + ctx_id) * cos_sin_stride_pos
+    cos = tl.load(cos_sin + half).to(tl.float32)
+    sin = tl.load(cos_sin + HALF_ROPE + half).to(tl.float32)
+    if IS_NEOX:
+        first, second = half, HALF_ROPE + half
+    else:
+        first, second = 2 * half, 2 * half + 1
+    rope = src + kv_lora_rank
+    x1 = tl.load(rope + first).to(tl.float32)
+    x2 = tl.load(rope + second).to(tl.float32)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+
+    if SANITIZE:
+        nope = _sanitize(nope, MAX_FINITE)
+        o1 = _sanitize(o1, MAX_FINITE)
+        o2 = _sanitize(o2, MAX_FINITE)
+
+    if IS_FP8:
+        tl.store(dst + offs, nope.to(tl.float8e4nv), mask=mask)
+        tl.store(dst + kv_lora_rank + first, o1.to(tl.float8e4nv))
+        tl.store(dst + kv_lora_rank + second, o2.to(tl.float8e4nv))
+    else:
+        tl.store(dst + offs, nope.to(tl.bfloat16), mask=mask)
+        tl.store(dst + kv_lora_rank + first, o1.to(tl.bfloat16))
+        tl.store(dst + kv_lora_rank + second, o2.to(tl.bfloat16))
+
+
+def mla_latent_norm_rope_scatter(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    loc: torch.Tensor,
+    kv_buffer_ptrs: torch.Tensor,
+    kv_buffer_row_stride: int,
+    kv_buffer_dtype: torch.dtype,
+    *,
+    is_neox: bool,
+    sanitize: bool,
+) -> None:
+    """Normalize, rotate and scatter every layer's latent KV in one launch.
+
+    Each ``[kv_lora_rank + rope_dim]`` row is RMSNormed over its latent half
+    with that layer's weight and epsilon, rotated over its RoPE tail, and
+    stored into that layer's latent cache plane at ``loc``. This is the whole
+    context-injection write for an MLA draft: no intermediate K tensor is
+    materialized.
+
+    Args:
+        latent: Stacked projection output ``[total_ctx, n_layers,
+            kv_lora_rank + rope_dim]``, pre-norm and pre-RoPE.
+        norm_weight: Per-layer RMSNorm weight ``[n_layers, kv_lora_rank]``.
+        eps: Per-layer RMSNorm epsilon ``[n_layers]``, float32.
+        cos_sin_cache: ``[max_position, rope_dim]`` packed as concat(cos, sin).
+        positions: Token position per row ``[total_ctx]``.
+        loc: Destination cache slot per row ``[total_ctx]``.
+        kv_buffer_ptrs: ``[n_layers]`` int64 ``data_ptr()`` of each layer's
+            latent plane, in the same layer order as ``latent``.
+        kv_buffer_row_stride: Elements between consecutive cache slots; the
+            same for every layer.
+        kv_buffer_dtype: Element type of the latent planes; ``bfloat16`` or
+            ``float8_e4m3fn``.
+        is_neox: Half-split rotation. False uses GPT-J interleaved pairs.
+        sanitize: Replace NaN and infinity before storing.
+
+    Returns:
+        None. The cache writes are enqueued on the current device stream.
+
+    Raises:
+        ValueError: The operands are not the shape or dtype the kernel
+            indexes with.
+    """
+    if latent.ndim != 3:
+        raise ValueError(
+            f"latent must be [total_ctx, n_layers, width], got {tuple(latent.shape)}"
+        )
+    total_ctx, n_layers, width = latent.shape
+    kv_lora_rank = norm_weight.shape[-1]
+    rope_dim = width - kv_lora_rank
+    if norm_weight.shape[0] != n_layers or eps.shape[0] != n_layers:
+        raise ValueError(
+            f"norm_weight/eps must cover {n_layers} layers, got "
+            f"{tuple(norm_weight.shape)} and {tuple(eps.shape)}"
+        )
+    if rope_dim <= 0 or cos_sin_cache.shape[-1] != rope_dim:
+        raise ValueError(
+            f"cos_sin_cache last dim {cos_sin_cache.shape[-1]} must equal the "
+            f"{rope_dim}-wide RoPE tail"
+        )
+    if rope_dim // 2 != triton.next_power_of_2(rope_dim // 2):
+        raise ValueError(f"rope_dim/2 must be a power of two, got {rope_dim // 2}")
+    if kv_buffer_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(f"unsupported latent cache dtype {kv_buffer_dtype}")
+    if total_ctx == 0:
+        return
+
+    max_finite = min(torch.finfo(latent.dtype).max, torch.finfo(kv_buffer_dtype).max)
+    _mla_latent_norm_rope_scatter_kernel[(total_ctx, n_layers)](
+        latent,
+        norm_weight,
+        eps,
+        cos_sin_cache,
+        positions,
+        loc,
+        kv_buffer_ptrs,
+        latent.stride(0),
+        latent.stride(1),
+        norm_weight.stride(0),
+        cos_sin_cache.stride(0),
+        kv_buffer_row_stride,
+        kv_lora_rank,
+        rope_dim,
+        BLOCK_LORA=triton.next_power_of_2(kv_lora_rank),
+        HALF_ROPE=rope_dim // 2,
+        IS_NEOX=bool(is_neox),
+        IS_FP8=kv_buffer_dtype == torch.float8_e4m3fn,
+        SANITIZE=bool(sanitize),
+        MAX_FINITE=max_finite,
+    )
 
 
 @triton.jit
@@ -1388,10 +1802,10 @@ def gather_page_table_with_padding(
 def _kv_transfer_per_layer_capped_kernel(
     k_cache_dst_ptr,
     v_cache_dst_ptr,
-    indices_dst_ptr,
+    indices_dst_ptr: tl.const,
     k_cache_src_ptr,
     v_cache_src_ptr,
-    indices_src_ptr,
+    indices_src_ptr: tl.const,
     kv_cache_src_stride,
     kv_cache_dst_stride,
     length,
@@ -1452,12 +1866,12 @@ def _kv_transfer_per_layer_kernel(
 
 @triton.jit
 def _kv_transfer_all_layer_kernel(
-    k_ptr_dst_ptr,
-    v_ptr_dst_ptr,
-    indices_dst_ptr,
-    k_ptr_src_ptr,
-    v_ptr_src_ptr,
-    indices_src_ptr,
+    k_ptr_dst_ptr: tl.const,
+    v_ptr_dst_ptr: tl.const,
+    indices_dst_ptr: tl.const,
+    k_ptr_src_ptr: tl.const,
+    v_ptr_src_ptr: tl.const,
+    indices_src_ptr: tl.const,
     length,
     num_layers: tl.constexpr,
     kv_cache_src_stride_words,
@@ -1730,10 +2144,10 @@ def _kv_transfer_per_layer_mla_kernel(
 
 @triton.jit
 def _kv_transfer_all_layer_mla_kernel(
-    ptr_dst_ptr,
-    indices_dst_ptr,
-    ptr_src_ptr,
-    indices_src_ptr,
+    ptr_dst_ptr: tl.const,
+    indices_dst_ptr: tl.const,
+    ptr_src_ptr: tl.const,
+    indices_src_ptr: tl.const,
     length,
     num_layers: tl.constexpr,
     cache_src_stride_words,

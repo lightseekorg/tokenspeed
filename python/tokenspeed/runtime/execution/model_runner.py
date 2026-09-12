@@ -93,9 +93,6 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
-        self.sliding_window_size = getattr(
-            model_config.hf_config, "sliding_window", None
-        )
 
         draft_moe_override = (
             self.is_draft_worker
@@ -173,6 +170,13 @@ class ModelRunner:
             self.model,
             device=warmup_device,
         )
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Allocate model communication buffers before cache planning."""
+        prepare = getattr(self.model, "prepare_communication_runtime", None)
+        if prepare is None:
+            return False
+        return bool(prepare(max_num_tokens))
 
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:

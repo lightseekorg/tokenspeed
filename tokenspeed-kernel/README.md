@@ -34,7 +34,7 @@ choices (still evolving; subject to change):
 ### Layered system
 
 ```
-                       public API  (mha_prefill, mm, moe_fused, ...)
+                       public API  (attention.mha.mha_prefill, mm, ...)
                                        │
                            ┌───────────┴───────────┐
                            │     select_kernel     │  (family, mode, format_signature, traits, ...)
@@ -78,7 +78,7 @@ tokenspeed_kernel/
   _triton.py             # Single import point for the vendored Triton fork
 
   ops/
-    attention/   { triton/, flash_attn/, ... }
+    attention/   { mha/, mla/, dsa/, ... }
     gemm/        { triton.py, trtllm.py, ... }
     moe/         { triton.py, deepep.py, triton_kernels.py, ... }
     ...
@@ -90,9 +90,10 @@ tokenspeed_kernel/
   thirdparty/            # Vendored / wrapped third-party kernel sources
 ```
 
-Each `ops/<family>/` directory holds peer subdirectories — one per
-solution. A solution is either an in-tree JIT kernel (Triton/Gluon/CuteDSL),
-or a thin wrapper around an external library.
+Each `ops/<family>/` directory groups implementations by operator variant and
+then solution. For example, attention uses `attention/<variant>/<solution>.py`
+such as `attention/mha/triton.py`. A solution is either an in-tree JIT kernel
+(Triton/Gluon/CuteDSL), or a thin wrapper around an external library.
 All of them register through the same decorator and are scored by the same
 selection logic, so adding a backend is one new file in the right family
 folder.
@@ -122,6 +123,10 @@ iteration.
   kernel against the reference impl.
 - `python -m tokenspeed_kernel.benchmark` — unified timing, throughput
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
+- `KernelBenchmarkHarness` — registration-level device timing through warmed
+  graph replay, with raw samples, resolved registration metadata, and explicit
+  failure outcomes. The first operation-owned generator covers dense BF16
+  batched GEMM.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
 - End-to-end serving: POST `/start_profile` with
@@ -137,6 +142,13 @@ iteration.
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
 
+Registration-level benchmarks combine operation-owned input and correctness
+logic with graph-replay device timing. Pull request CI can compare compatible
+cases from the merge base and candidate revision. See the
+[benchmark documentation](benchmarks/README.md) for the harness and suite
+contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
+for workflow behavior and runner requirements.
+
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.
@@ -148,14 +160,20 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 
 ```python
 from tokenspeed_kernel import (
-    mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
-    msa_extend_with_kvcache, msa_decode_with_kvcache,
-    gdn_chunk_prefill,
     gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
     mm,
     moe_softmax_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
+)
+from tokenspeed_kernel.ops.attention.gdn import gdn_chunk_prefill
+from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_with_kvcache,
+    mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.msa import (
+    msa_decode_with_kvcache,
+    msa_extend_with_kvcache,
 )
 ```
 

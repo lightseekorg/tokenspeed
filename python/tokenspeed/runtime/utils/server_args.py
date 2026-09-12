@@ -28,9 +28,7 @@ import random
 import socket
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
+from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
@@ -44,6 +42,10 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed.runtime.utils.spec_block_geometry import (
+    BLOCK_SPEC_ALGORITHMS,
+    BLOCK_SPEC_RULES,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -115,8 +117,7 @@ class ServerArgs:
     # output sockets) over the msgpack wire. Default OFF;
     # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
     zmq_msgpack: bool = False
-    # The frontend handshake endpoint the scheduler dials; becomes the
-    # data-parallel rendezvous when DP is supported.
+    # The frontend handshake endpoint dialed by each scheduler DP rank.
     data_parallel_address: str = "127.0.0.1"
     # Default chosen to avoid the 20000-29999 range used for derived
     # per-worker handshake ports and common rendezvous defaults of
@@ -124,7 +125,7 @@ class ServerArgs:
     data_parallel_rpc_port: int = 30500
     zmq_engine_index: int = 0
 
-    # Port for the HTTP server
+    # Engine host and base port for derived control-plane endpoints.
     host: str = "127.0.0.1"
     port: int = 8000
 
@@ -135,8 +136,7 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
-    # Kernel page size. Scheduler prefix pages come from the LCM
-    # runtime contract and must not overwrite this value.
+    # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -157,7 +157,6 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    log_level_http: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
@@ -166,9 +165,7 @@ class ServerArgs:
     metrics_reporters: list[str] | None = None
     app_key: str | None = None
 
-    # API related
-    api_key: str | None = None
-    enable_cache_report: bool = False
+    # Cache events
     kv_events_config: str | None = None
 
     # Port for the in-engine SGLang-compatible RL control app (weight sync,
@@ -227,9 +224,6 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
-    kvstore_mem_layout: str = "layer_first"
-    kvstore_storage_backend: str | None = None
-    kvstore_storage_backend_extra_config: str | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -245,6 +239,9 @@ class ServerArgs:
     attention_backend: str | None = None
     kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
+    # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
+    # (default) is exact dense attention; see --skip-softmax-threshold help.
+    skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -309,15 +306,10 @@ class ServerArgs:
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
-    enable_p2p_check: bool = False
-    triton_attention_reduce_in_fp32: bool = False
-    delete_ckpt_after_loading: bool = False
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
-    enable_custom_logit_processor: bool = False
     mla_disable_ragged: bool = False
-    warmups: str | None = None
 
     # parallel strategy
     nprocs_per_node: int | None = None
@@ -338,8 +330,6 @@ class ServerArgs:
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
     pdlb_url: str | None = None
-
-    skip_server_warmup: bool = False
 
     # For communication + norm fusion
     comm_fusion_max_num_tokens: int = 2048
@@ -395,6 +385,12 @@ class ServerArgs:
             self.seed = random.randint(0, 1 << 30)
 
     def resolve_config_aliases(self):
+        # Whether the block-drafter widths were given rather than defaulted.
+        self._speculative_widths_explicit = (
+            self.speculative_num_steps != ServerArgs.speculative_num_steps
+            or self.speculative_num_draft_tokens is not None
+        )
+
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
@@ -439,6 +435,7 @@ class ServerArgs:
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
+                self._speculative_widths_explicit = True
                 if self.speculative_algorithm == "DFLASH" or (
                     self.speculative_algorithm == "DSPARK"
                     and not dspark_uses_base_model
@@ -505,10 +502,6 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
-        # Choose kernel backends
-        # attention_backend default is NOT set here — deferred to
-        # AttnInitializer.modify_args where both hardware and model arch are known.
-
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -720,7 +713,7 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
@@ -730,7 +723,8 @@ class ServerArgs:
                     "speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
-                    f"{self.speculative_num_draft_tokens=}."
+                    f"{self.speculative_num_draft_tokens=}. "
+                    f"{BLOCK_SPEC_RULES}"
                 )
 
         if self.eagle3_layers_to_capture is not None:
@@ -738,7 +732,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode topk == 1 check to startup.
+        # Only chain speculative decoding is supported.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -834,9 +828,6 @@ class ServerArgs:
                 )
             self.enable_prefix_caching = False
 
-        # Prefill graph disable logic is handled by AttnInitializer.modify_args
-        # after the attention backend is resolved.
-
         if (
             self.disaggregation_mode == "prefill"
             and self.load_balance_method != "round_robin"
@@ -857,20 +848,6 @@ class ServerArgs:
             )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
-
-        if self.kvstore_storage_backend == "mooncake":
-            if self.kvstore_mem_layout == "layer_first":
-                self.kvstore_mem_layout = "page_first"
-                logger.warning(
-                    "Mooncake storage backend does not support layer_first layout, switching to %s layout",
-                    self.kvstore_mem_layout,
-                )
-
-            if self.kvstore_io_backend == "direct":
-                self.kvstore_io_backend = "kernel"
-                logger.warning(
-                    "Mooncake storage backend uses page_first layout, which requires kernel io backend"
-                )
 
     def validate_cache_options(self):
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
@@ -1229,33 +1206,6 @@ class ServerArgs:
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
-        parser.add_argument(
-            "--kvstore-mem-layout",
-            type=str,
-            choices=[
-                "layer_first",
-                "page_first",
-                "page_head",
-            ],
-            default=ServerArgs.kvstore_mem_layout,
-            help="The layout of the KVStore host memory pool.",
-        )
-        parser.add_argument(
-            "--kvstore-storage-backend",
-            type=str,
-            choices=["mooncake"],
-            default=ServerArgs.kvstore_storage_backend,
-            help="The storage backend for KVStore. "
-            "Built-in backends: mooncake. "
-            "For dynamic backend, use --kvstore-storage-backend-extra-config to specify: "
-            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
-        )
-        parser.add_argument(
-            "--kvstore-storage-backend-extra-config",
-            type=str,
-            default=ServerArgs.kvstore_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
-        )
         # Mamba Cache
         parser.add_argument(
             "--mamba-ssm-dtype",
@@ -1328,12 +1278,6 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
-            "--log-level-http",
-            type=str,
-            default=ServerArgs.log_level_http,
-            help="The logging level of HTTP server. If not set, reuse --log-level by default.",
-        )
-        parser.add_argument(
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
@@ -1383,18 +1327,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
-        )
-        # API related
-        parser.add_argument(
-            "--api-key",
-            type=str,
-            default=ServerArgs.api_key,
-            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
-        )
-        parser.add_argument(
-            "--enable-cache-report",
-            action="store_true",
-            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
         parser.add_argument(
             "--kv-events-config",
@@ -1571,7 +1503,7 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /get_model_info",
+            help="Default sampling settings as JSON for SMG's gRPC GetModelInfo response.",
         )
 
         # Kernel backend
@@ -1617,6 +1549,27 @@ class ServerArgs:
             choices=attention_backend_choices,
             help="Attention backend for drafter model in speculative decoding. "
             "If not specified, uses the same backend as the main model (attention_backend).",
+        )
+        parser.add_argument(
+            "--skip-softmax-threshold",
+            type=float,
+            default=ServerArgs.skip_softmax_threshold,
+            help="BLASST skip-softmax sparsity threshold for the gluon MHA "
+            "prefill kernel (gfx950 only). A K/V block is skipped only when "
+            "every row in the query tile has exp(block_max_score - "
+            "running_max) below this threshold. 0.0 (default) is exact "
+            "dense attention; the skip rate for a given threshold must be "
+            "calibrated per model and sequence length. Only takes effect "
+            "when every request in the batch has a zero-length cached "
+            "prefix and the planner routes the batch to prefill; if any "
+            "request in the batch has a cache hit, or the backend's "
+            "registered prefill kernel does not clear the planner's "
+            "performance cutoff (as with FP8/MXFP8 KV cache and the triton "
+            "backend), the whole batch falls through to the KV-cache-extend "
+            "path, which never reaches this kernel and silently ignores the "
+            "threshold. Backends that do reach kernel selection raise an "
+            "error there if they lack gluon skip-softmax support, rather "
+            "than silently ignoring it.",
         )
         parser.add_argument(
             "--sampling-backend",
@@ -1942,22 +1895,6 @@ class ServerArgs:
             "TOKENSPEED_NVTX=1.",
         )
         parser.add_argument(
-            "--enable-p2p-check",
-            action="store_true",
-            help="Enable the full GPU P2P access check, otherwise trust the driver's P2P report.",
-        )
-        parser.add_argument(
-            "--triton-attention-reduce-in-fp32",
-            action="store_true",
-            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels.",
-        )
-        parser.add_argument(
-            "--delete-ckpt-after-loading",
-            action="store_true",
-            help="Delete the model checkpoint after loading the model.",
-        )
-        parser.add_argument(
             "--disable-weight-loader-prefetch-checkpoints",
             dest="weight_loader_prefetch_checkpoints",
             action="store_false",
@@ -1982,25 +1919,6 @@ class ServerArgs:
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
-        parser.add_argument(
-            "--enable-custom-logit-processor",
-            action="store_true",
-            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
-        )
-        # Server warmups
-        parser.add_argument(
-            "--skip-server-warmup",
-            action="store_true",
-            help="If set, skip warmup.",
-        )
-        parser.add_argument(
-            "--warmups",
-            type=str,
-            required=False,
-            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
-        )
-
         parser.add_argument(
             "--tensor-parallel-size",
             "--tp",

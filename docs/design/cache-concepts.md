@@ -26,21 +26,27 @@ Two quantities anchor the vocabulary:
   addresses the cache.
 
 `block_granularity` is the generic quantity; a group *declares* it through
-one of two family-specific shapes (Python
-`CacheGroupSpec`):
+one of two shapes (Python `CacheGroupSpec`), and the group's **family** is
+the name of that shape:
 
 * **Row geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
-  **`page_size`**) — for paged KV-cache consumers, whose blocks physically
-  hold rows of entries (per-token KV, sliding windows, compressed entries).
-  "Page" vocabulary is *only* legal here.
-* **`checkpoint_granularity`** — for snapshot-style state groups
-  (recurrent/conv state), whose blocks each hold one state snapshot taken
+  **`page_size`**) — the `history` family: paged KV-cache consumers whose
+  blocks physically hold rows of entries (per-token KV, sliding windows,
+  compressed entries, compressor input tails). "Page" vocabulary is *only*
+  legal here. Retention is `full_history` or `sliding_window`.
+* **`checkpoint_granularity`** — the `state` family: snapshot-style groups
+  (recurrent/conv state) whose blocks each hold one state snapshot taken
   every this-many tokens. Such a group has no rows and no pages; declaring
-  fictional row geometry for it is a bug, not a convention.
+  fictional row geometry for it is a bug, not a convention. A checkpoint
+  summarizes everything before it, so nothing in it ever slides out:
+  retention is always `full_history`.
 
-The two shapes are mutually exclusive, and the split is by *shape*, not by
-family: V4's sliding-window tail and compressor buffers are state-family yet
-have real row geometry, so they declare rows.
+The two shapes are mutually exclusive and `CacheGroupSpec.__post_init__`
+holds each family to its shape, so exactly three `(family, retention)`
+combinations exist — the C++ `AttnKind { kFull, kSlidingWindow,
+kMambaState }`. A trailing window of token rows (DeepSeek V4's SWA kv and
+compressor tails) is a sliding `history` group whatever a kernel calls its
+buffer; `state` is not a routing label for "some backend owns this table".
 
 None of these say anything about storage. A slot of `block_granularity = 64`
 tokens may be backed by only 16 units of physical storage under compression —
@@ -112,25 +118,26 @@ Python  CacheGroupSpec     declaration shape (rows | checkpoint) + policy
   ↓     pool_to_cache_groups                      the single folding point
 C++     CacheGroupConfig   boundary config, nanobind-exposed (SchedulerConfig.cache_groups)
   ↓     MakeSpecsFromConfig
-C++     CacheGroupSpec     folded scheduling form (block_granularity only)
+C++     CacheGroupSpec     scheduling form (block_granularity + kind)
 ```
 
 The first and third share a name and differ in fields, so always qualify
 which side you mean; `CacheGroupConfig` in between is the only one visible
 from both.
 
-The same boundary holds for `checkpoint_granularity`: the identifier never
-enters `tokenspeed-scheduler` at all. It is a Python-side *declaration
-shape* on `CacheGroupSpec`, and the bridge
-(`scheduler_utils.pool_to_cache_groups`) is the single folding point:
-a snapshot declaration folds to `(rows = checkpoint_granularity,
-stride = 1)` and crosses into C++ as `CacheGroupSpec.block_granularity` — so
-a snapshot group's `block_granularity` equals its `checkpoint_granularity`
-numerically, and the scheduler has no "checkpoint" word, only "how many
-tokens one block-table slot covers". The row-geometry shape
-(`rows_per_page`, `entry_stride_tokens`) folds away at the same point.
 Declaration-shape vocabulary stops at the bridge; only the generic span
-crosses it.
+crosses it. Neither `checkpoint_granularity` nor `rows_per_page` /
+`entry_stride_tokens` enters `tokenspeed-scheduler` at all: they are
+Python-side *declaration shapes* on `CacheGroupSpec`, and the bridge
+(`scheduler_utils.pool_to_cache_groups`) folds both to
+`CacheGroupSpec.block_granularity` before constructing the C++
+`CacheGroupConfig`, whose only span field is `block_granularity`. So a
+snapshot group's `block_granularity` equals its `checkpoint_granularity`
+numerically, a paged group's equals `rows_per_page × entry_stride_tokens`,
+and the scheduler has no "checkpoint", "row" or "stride" word — only "how
+many tokens one block-table slot covers". Carrying a fictional
+`(rows = P, stride = 1)` across the bridge for a snapshot group would be a
+claim its contents contradict, the same way a `Paged` type name would.
 
 `CacheGroupSpec.block_granularity` is **required and explicit**: a positive
 divisor of `prefix_granularity`, rejected by `SchedulerConfig::Validate()`
@@ -144,18 +151,82 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+#### Snapshot-state prefill checkpoints
+
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
-full-history snapshot-state prefill normally needs only its input and final
-output checkpoints. With prefix caching and an off-page final tail, the aligned
-body materializes its endpoint and atomically reserves the tail storage; the
-tail consumes that reservation instead of materializing another sparse input
-checkpoint. The next decode admission allocates its destination after prefill
-scheduling and rolls the expired input page forward, including under overlap
+full-history snapshot-state prefill normally needs only its input, aligned
+prefix output, and final continuation checkpoints. When the extent contains an
+internal checkpoint, one forward materializes it and the final output, with
+capacity for both secured at admission. A completing forward on a decoding
+role also reserves growth storage, which is not an additional computed state
+([Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)). The next
+decode admission rolls the expired input block forward, including under overlap
 scheduling. The table keeps absolute slot positions while representing other
-skipped intermediate checkpoints as null holes (`0`). State consumers may
-gather only the declared input/output slots; compacting the row or publishing an
-unwritten intermediate checkpoint would break position identity.
+skipped intermediate checkpoints as null holes (`0`). State consumers may gather only the declared
+input/output slots; compacting the row or publishing an unwritten intermediate
+checkpoint would break position identity.
+
+Publication requires provenance, not just an allocated block or completed hash.
+The request's cache progress records the last aligned boundary materialized by
+local prefill, carried through the same ordered-forward contract as its token
+progress. Decode does not advance that record: verification commits only the
+accepted endpoint and may skip an aligned boundary. Admission, finish and
+retraction pass this provenance to the coordinator. A snapshot is publishable
+only when the exact accepted endpoint equals the hashed boundary, or that exact
+boundary has prefill materialization provenance. The conservative admission
+frontier (which subtracts the verify width) is not an exact state endpoint.
+Remote endpoint-only landings
+do not claim an internal prefill checkpoint.
+
+Snapshot selection and slot addressing are distinct even within this mapping:
+the last internal reusable checkpoint is at
+`floor(after / prefix_granularity) * prefix_granularity`, strictly between
+`before` and `after`. Its slot is `(checkpoint - 1) / block_granularity`.
+The two granularities need not be equal. Selecting the snapshot by a smaller
+state-group span would leave the prefix-boundary state unwritten while the
+coordinator publishes it. With smaller state blocks, admission also accounts
+for the whole materialized suffix through the endpoint and its reserve.
+
+When an extend materializes internal state checkpoints, convolution windows
+are assembled directly into their destination blocks by the kernel package.
+The prefill path calls that batched write before causal convolution updates
+the final continuation state; no write is needed without an internal checkpoint.
+At most one internal checkpoint per eligible request is selected. Its token
+position and packed-prefix metadata are computed once on the host; the GPU
+views share one immutable, pinned asynchronous upload. The reusable
+`runtime.utils.tensor.upload_packed` helper aligns each typed view and owns a
+fresh staging buffer per call, so preparing the next forward cannot overwrite
+an upload still in flight. Checkpoint writers widen page IDs to int64 before
+multiplying by pool strides; an int32 page ID can address an element offset
+beyond the int32 range. Decode has no such batch
+and does not compute checkpoint indices. Recurrent execution partitions the
+batch into a body scan and a tail scan when an internal checkpoint is needed.
+Otherwise the ordinary prefill scan runs once. `_run_prefill_recurrent` owns
+both cases and always returns outputs and final states; its caller writes the
+final states to the continuation blocks. Target verification remains separate.
+Every request in a checkpoint
+batch participates in the body: rows crossing a checkpoint stop at that
+boundary, while other rows run to completion. Only crossing rows enter the
+packed tail scan, initialized directly
+from their body final states. Body and tail outputs are scattered back to
+original token order, so every token is evaluated exactly once while the aligned
+and final states are both retained. Batch size one uses zero-copy body/tail
+views; larger batches use the same batched pack/scatter contract. This split
+does not change cache ownership or scheduler metadata.
+
+The body/tail split uses the existing prefill-op state-layout contract. KDA
+solutions may retain their original K-major Python adapters; the kernel facade
+converts between that layout and the runtime's V-major state slab on both scans.
+Native-layout adapter entry points are not required for checkpoint continuation.
+KDA's int64 sequence boundaries are still prepared once in runtime metadata and
+reused by the original adapters. Preparation uses `Tensor.to(torch.int64)`;
+an already-int64 boundary is returned unchanged without allocating a copy.
+
+Scan results may be transposed views in that public state layout. The batched
+input packer addresses recurrent-state rows and features using their actual
+strides, including on CUDA graph replay; it does not require an extra
+contiguous copy or a different kernel adapter.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
@@ -182,9 +253,11 @@ Provenance discipline: each quantity is sourced from its own domain and never
 laundered through another's name. The contract's `prefix_granularity` comes
 from the memory plan, not read back out of pool state. The arena carries
 **two** scalars with distinct roles: `CacheArena.prefix_granularity` is the
-identity grain, used only for contract publication and plan-consistency
-checks — `prefix_granularity` exists to compute prefix hits, and runtime
-arithmetic must not reach for it; `CacheArena.kv_page_size` is the KV arena
+identity grain, used for contract publication and plan-consistency checks.
+The state-checkpoint mapping point additionally uses the contract's identity
+grain to select the snapshot required for prefix reuse; this is not kernel
+geometry. Other runtime arithmetic must not reach for it.
+`CacheArena.kv_page_size` is the KV arena
 page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
@@ -203,6 +276,64 @@ later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
+
+The Host-transfer workspace resolves transport capability for its buffer
+binding before publishing consumer waits. NVIDIA mapped-Host transfers can
+use a single full-geometry H2D launch with per-layer ready flags; other paths
+publish per-layer events. Device-resident geometry is metadata, not evidence
+that a particular completion protocol is supported. Automatic DMA fallback
+is limited to unavailable Host-pointer mapping, scoped to that workspace and
+buffer binding; validation, allocation, and kernel-launch failures propagate.
+Transfer callers explicitly select the backend, staging synchronization,
+grid cap, and optional layer flags. For an unflagged layer with no matching
+blocks, the transfer boundary validates the loaded block count and returns
+before mapping Host pointers or touching the accelerator runtime. Flagged
+loads still publish readiness for empty consumers.
+
+Every L2 copy is ordered after the prerequisite stream the caller names per
+submission: the stream whose completed work the copy must observe. Writeback
+runs on the executor's write stream, ordered after the model executor's
+execution stream, where the forwards wrote the source pages. (Page zeroing
+likewise orders itself behind that stream inside `zero_cache_pages`; there is
+no caller-side fence to remember.)
+Each op says how the scheduler guards its Device sources
+(`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
+and unevictable until the ACK, so its copy overlaps whatever the round does
+next and nobody waits on it. An unpinned op's sources may be re-granted in the
+same plan, so it is launched first and the fence stream the caller names --
+the default stream, where the plan's page zeroing runs -- waits on its
+completion event before the zeroing is enqueued — the zeroing, load-backs,
+forwards and RDMA triggers behind it inherit the fence (the forward by
+waiting on the default stream in its prologue; that wait is one-way, the
+zeroing's and the writeback's own waits are what order the default and write
+streams behind the forwards). A load-back's prerequisite stream is the
+default stream that zeroed its destinations; its start event is recorded
+there rather than on whatever stream is current. Every stream the L2
+executor orders against is an argument, never ambient thread state. The
+two kinds use separate staging lanes: each lane uploads block metadata
+asynchronously and records an event after both metadata copies to protect its
+pinned CPU staging tables — before refilling them, the next submission on
+that lane waits only if that event is incomplete. This does not wait for the
+payload transfer or publish a writeback ACK. Device metadata reuse stays
+ordered after the previous payload by write-stream FIFO. Even a partially
+submitted metadata upload records its retirement event before propagating a
+staging failure.
+
+Ready flags are valid only for a full-geometry H2D transfer. Consumers first
+wait for the current generation's flag initialization event, then its layer
+flag. Workspace reuse also waits for the previous transfer's completion;
+layer readiness alone does not retire metadata still read by the transfer.
+On submission failure, retirement fences protect reuse without publishing a
+successful load ACK. If neither event publication nor stream synchronization
+can establish retirement, the executor must reject further loads.
+
+An op is acknowledged only by its copy's completion event, so every op on the
+wire carries at least one transfer, and no (group, source, destination)
+repeats within one plan: a store skips keys already in flight, a load targets
+freshly acquired pages. The scheduler asserts both when batching a plan's ops
+and the runtime refuses an op with nothing to copy; neither side dedups or
+invents an acknowledgement, because an op that never completes a copy would
+hold its tickets forever.
 
 ## block vs. page
 
@@ -353,7 +484,11 @@ Its responsibilities:
   Host. At finish or retraction, all eligible Device-resident non-state pages
   and only the newest Device-resident checkpoint per state group are queued
   before request ownership is released. Ordinary sliding-window entries
-  always stream when published.
+  always stream when published. The queue is drained by
+  `TierTransferManager::StartPendingStores(guard)`: every store but a
+  retraction's snapshot pins its Device sources until the ACK; the snapshot
+  store is stream-ordered instead, because its sources are re-granted in the
+  same round (`scheduler.md` §2).
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
@@ -388,7 +523,12 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
 ```
 
 * **layers** — the family's layer vocabulary: a `layer_types` label and a
-  `group_ids` assignment per layer, target layers then draft layers.
+  `group_ids` assignment per layer, target layers then draft layers. The
+  labels are the *storage* vocabulary (`AttnConfig`'s `cache_layer_types`,
+  resolved once by `configs/base.py:resolve_cache_layer_types`), never the
+  checkpoint's compute labels: a label names what the scheduler retains, and
+  a layer's compute mask is a separate contract (see *Storage vs.
+  visibility* below).
 * **`group`** (`recipes/spec.py`) walks those layers **once** and returns
   `(CacheGroupSpec, fields)` pairs — one per distinct group. The pairing is
   the point: a group id is spelled exactly once, in its spec, next to the
@@ -425,6 +565,41 @@ would otherwise need cross-checking cannot differ:
 
 If you find yourself writing a check that two derived views agree, the
 design is wrong: make one of them the source.
+
+### Storage vs. visibility
+
+An attention layer has two contracts that a single `layer_types` string used
+to carry at once, and they are kept apart on purpose:
+
+* **Storage** — which cache group the layer's KV rides, hence how long the
+  scheduler retains it (`CacheGroupSpec.retention`, `sliding_window_tokens`).
+  Owned by the cache plan: the recipe assigns `group_ids` per layer, `pack`
+  places the fields, and the model never spells a group id. At executor
+  startup `bind_cache_groups` (`layers/paged_attention.py`) reads
+  layer → group back from the planned KV fields
+  (`CachePool.history_group_by_layer`) and stamps it onto each
+  `PagedAttention`; before that the layer's `group_id` is unbound and any read
+  raises.
+* **Visibility** — how far back the kernel may look. Owned by the layer
+  (`PagedAttention.sliding_window_size`, a `window_left` mask the model derives
+  from its own config) and read by the backends only as a kernel argument;
+  it never influences tables or write locations.
+
+The one relation between them is an inequality, not an equality: **a group
+must retain every token its layers can see.** `bind_cache_groups` enforces it —
+a full-visibility layer cannot ride a sliding group, and a sliding mask must
+fit inside the group's retention window (`window_left + 1 <=
+sliding_window_tokens`, matching `GroupGeometry::ExpiredBlocksAt`). Everything
+off the diagonal is therefore legal by construction rather than by special
+case: a sliding-masked layer on a full-history group (a block drafter, DSA's
+sparse compute over a fully retained cache) simply retains more than it reads.
+
+Block drafters (DFLASH / DSPARK) write their KV at the target's cache
+locations, so their storage *is* the target's full-history group whatever mask
+their layers apply. `resolve_cache_layer_types` labels every block-draft layer
+full-history, and `check_block_drafter_storage` verifies at startup that the
+group the draft bound is one the target's own layers share — a target without
+a full-history group has nothing for a block drafter to borrow.
 
 Capacity has exactly two shapes, both on the base class. The default is the
 flat product (`parents × tightest packing × P`). Families whose per-group
@@ -503,9 +678,11 @@ cache layer enumerates LCM block ids.
 
 Enforced:
 
-* the identifier `page_size` is grep-zero across `tokenspeed-scheduler`
+* the identifiers `page_size`, `rows_per_page`, `entry_stride_tokens` and
+  `checkpoint_granularity` are grep-zero across `tokenspeed-scheduler`
   (csrc, tests, python bindings) — the slot span is spelled
-  `block_granularity` everywhere;
+  `block_granularity` everywhere, and `CacheGroupConfig` carries it as its
+  only span field;
 * `CacheGroupSpec.block_granularity` is required and explicit: every group
   states its span, with no zero-means-default fallback, and the coordinator
   asserts a positive divisor of P at construction;
@@ -578,14 +755,19 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   — asking such a group for `page_size` is a `TypeError`, since it has no
   rows.
 * Spec geometry is shape-checked at construction: row geometry and
-  `checkpoint_granularity` are mutually exclusive, both positive, and
-  family-gated (`CacheGroupSpec.__post_init__`).
+  `checkpoint_granularity` are mutually exclusive, both positive, and each
+  family is held to its shape and retention — `state` declares
+  `checkpoint_granularity` and `full_history`, `history` declares rows
+  (`CacheGroupSpec.__post_init__`; the C++ `CacheGroupConfig::Validate`
+  refuses a sliding `State` group at the bridge).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
   groups it serves — the router builds one leaf per paged (history-family)
   group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv, V4) index the dict by their own
-  group ids. `cache_consumer_families` remains the boot-time coverage
+  state consumers (Mamba/KDA, Inkling conv) index the dict by their own
+  group ids, as does the V4 backend for the several history groups one V4
+  layer reads at once (its pool view reports no `PagedAttention` binding
+  and no router leaf). `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -648,9 +830,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
-  plan checks only) and `CacheArena.kv_page_size` (KV arena geometry, read by
-  row/slot/tile math in the paged pools and their consumers). Prefix-hit
-  computation is the only computational consumer of `prefix_granularity`. ✓
+  plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
+  row/slot/tile math in the paged pools and their consumers). Prefix reuse
+  also requires the state-checkpoint mapping point to select the snapshot
+  at the contract's prefix boundary, independently of its state-block span. ✓
 * Cache geometry has one owner and no mirrors. `CacheArena` holds the
   allocation, the field views, the plan, the contract and the geometry
   scalars; `CachePool` is a typed layer window that forwards nothing, so
@@ -672,15 +855,13 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
   packing: the declaring group is positional, and packing is the layout's
   answer, so neither can be stated twice and disagree. ✓
-* The model side names the same ids: every `PagedAttention` layer carries a
-  mandatory `group_id`, checked against the pool's published specs at startup
-  (`validate_cache_group_ids`, single-group pools included), and backends
-  index their learned geometry by it with no fallback
-  (`CacheGroupGeometry.granularity_of` raises on unknown ids).
-  Block drafters that write at target cache locations therefore use the
-  target's `full_attention` storage group even when a draft layer applies a
-  sliding-window compute mask; visibility and cache retention are separate
-  contracts. ✓
+* The model side names no ids: a `PagedAttention` layer declares only its
+  compute mask, and `bind_cache_groups` stamps its group from the pool's plan
+  at startup, checking that the group's retention covers the mask (see
+  *Storage vs. visibility*). Backends index their learned geometry by the
+  bound id with no fallback (`CacheGroupGeometry.granularity_of` raises on
+  unknown ids). Block drafters ride the target's full-history group whatever
+  mask their layers apply (`check_block_drafter_storage`). ✓
 * Capacity has two shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte

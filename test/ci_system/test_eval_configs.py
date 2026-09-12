@@ -35,7 +35,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 11,
+        "count": 12,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -168,7 +168,7 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert "--disable-kvstore" not in server_tokens
     assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
     assert flag_value(eval_tokens, "--datasets") == "gsm8k"
-    assert task["score_threshold"] == 0.90
+    assert task["score_threshold"] == 0.96
 
 
 def test_kimi_k3_amd_gates_use_eagle3():

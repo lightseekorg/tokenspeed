@@ -23,11 +23,11 @@ runtime requires TokenSpeed's own built DeepSeek V4 attention op.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_csa_indexer_fp8_cache_insert,
     dsv4_swa_cache_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_fused_csa_indexer_mxfp4_cache_insert,
     dsv4_fused_indexer_q_rope_hadamard_mxfp4,
     dsv4_fused_sparse_compress_cache_insert,
@@ -82,6 +82,8 @@ def fused_qnorm_rope_kv_insert(
     rms_norm_eps: float,
     block_size: int,
     q_out: torch.Tensor | None = None,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Run the DeepSeek V4 fused SWA cache insert op.
 
@@ -104,6 +106,7 @@ def fused_qnorm_rope_kv_insert(
         rms_norm_eps=rms_norm_eps,
         page_size=block_size,
         q_out=q_out,
+        validate_positions=validate_positions,
     )
 
 
@@ -174,6 +177,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         weights=weights,
         softmax_scale=softmax_scale,
         head_scale=head_scale,
+        prefer_serial_four_block=True,
     )
 
 

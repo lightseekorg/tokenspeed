@@ -88,6 +88,10 @@ Consequences:
   but each is a low-rate path whose caller cannot proceed without the result
   (the landing's failure must surface BEFORE the scheduler advances the
   request into decode). A new blocking method on the per-round path is a bug.
+* Keep per-forward state resets asynchronous on the execution stream too.
+  Use device-side scalar fills for indexed flags: assigning a Python scalar
+  through tensor indexing can stage a CPU tensor and introduce a hidden
+  synchronous H2D copy, blocking further forward launches.
 
 The rule is also mechanically enforced, on by default: a thread-local
 dispatch mode over the loop raises on any CUDA tensor op run from the
@@ -262,11 +266,14 @@ For orientation, one iteration of `event_loop`:
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache write-backs first (a retraction's snapshot copy must read the
-   reused pages' old bytes), then page zeroing (the new owner's
+   reused pages' old bytes, so its op is stream-ordered and fences the
+   forward thread's stream on its completion here; an ordinary store's
+   sources are pinned by the scheduler until the ACK, so its copy rides the
+   write stream and fences nothing), then page zeroing (the new owner's
    sanitization), then load-backs (they target zeroed pages), then the
    plan's remote streams to the transfer peer (a D-node remote prefill
    waits on the zeroing fence inside its submission, which the FIFO orders
-   after the write-backs), then the plan's batch to the model. `planned` is
+   after the write-back fence), then the plan's batch to the model. `planned` is
    None on idle and empty rounds; the plan's own work (hygiene, the remote
    streams) still runs. Then commit from the queue head down to the
    effective depth and poll PD transfer events.

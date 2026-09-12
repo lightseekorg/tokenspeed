@@ -63,6 +63,60 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Rebinding a cache pool
+
+`set_cache_pool` may run more than once on the same backend tree: a memory
+probe binds a small pool, captures into a throwaway graph pool, then binds
+the real pool. The contract is that a rebound backend is indistinguishable
+from one first bound to that pool:
+
+* Every node first answers `validate_cache_pool` for the whole subtree, and
+  only then do the children and the node publish, without a second
+  validation, so a rejected rebind moves nothing (a router's leaves exist
+  only from its first bind on, so the first bind builds and binds them
+  inside its own publish); `set_cache_pool` is that sequence, shared by
+  every node through `CachePoolBinding` and never overridden; a node does
+  its own work in `_publish_cache_pool` (`set_kv_pool` on the state backends
+  is a retained alias). Atomicity covers rejections only: a failure inside a
+  node's own binding work propagates, and the caller rebuilds the tree. A
+  node rejects a pool that changes the geometry it owns: the router its
+  group geometry (granularities, families, retentions and the row layout the
+  leaves' kernels read), the state backends the state group ids, checkpoint
+  grain and the state layers' ids and shapes, DeepSeek V4 the group ids and
+  row geometry, Inkling the ShortConv geometry. Page counts and transfer
+  policy may change. Paged leaves own kernel geometry only; the router
+  validates group geometry for them.
+* Binding drops every pool-derived latch: pointer tables, scratch and views,
+  per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
+  ring and pending remote restores, and side-state verify caches. The state
+  backends keep their pool-independent index buffers, so a same-geometry
+  replacement stays usable without re-initialisation of those buffers (a
+  router in the same tree still needs `init_cuda_graph_state` before any
+  metadata call); the caller still runs `configure_runtime` (with the new
+  pool's specs and page counts), `init_cuda_graph_state`,
+  `init_prefill_graph_state` and `preallocate_verify_workspace` again after
+  a rebind, as after a first bind. A probe pool must still hold `max_bs`
+  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
+  slab. The backend tree covers only itself: the executor's own pool
+  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  pool) and the layer-to-group stamps `bind_cache_groups` writes on the
+  model are the caller's to re-publish, as are the graph owners' own pool
+  references and the placeholder tables the decode runner sizes from the
+  arena. Of the sequence above only `init_prefill_graph_state` runs inside
+  `capture_graphs()`: `configure_runtime`, `init_cuda_graph_state` and
+  `preallocate_verify_workspace` all ran before the executor was returned,
+  so the orchestrator re-runs them itself.
+* A rebind is an operation between the executor's construction and
+  `ModelExecutor.capture_graphs()`, owned by the orchestrator a later change
+  adds; nothing in the backend tree guards against a rebind at another time.
+  That orchestrator releases both graph owners' captures first (the captured
+  graphs record the buffers a publish drops, and eager kernels cache
+  pointers they allocated inside a capture, such as flashinfer's trtllm-gen
+  MoE runner and Qwen4-Exp's uniform index bundles), unfreezes the device-
+  global workspace pool the executor froze before capturing, rebinds the
+  trees, re-runs `bind_cache_groups` and the initialisation sequence above,
+  freezes the workspace again and captures again.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under
@@ -81,6 +135,25 @@ by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
+
+Helpers that memoize tensors created inside capture must not return those
+tensors to eager callers. Keeping a Python reference preserves the allocation,
+but an earlier graph sharing the same private pool can overwrite its contents
+on replay. PLE's uniform index bundles are reused during capture only; eager
+prefill and decode construct their indices through the same builder outside
+the capture pool.
+
+GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
+and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
+use uninitialized output and a placeholder for a disabled intermediate cache:
+live rows are fully written, while negative padding rows skip state access
+and leave output undefined. Consumers must ignore padded output; enabled
+intermediate caches always require real storage.
+
+GDN prefill, decode and verify follow `pdl_enabled()`. Kernels wait before
+reading inputs and signal after computation; FlashInfer adapters preserve the
+upstream CuTe body and isolate PDL compilation caches. Graphs retain their
+capture-time PDL setting and must be recaptured to change it.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -446,7 +519,10 @@ buffer; `fill_input_buffers` takes no table.
   write. A model path that writes multiple mode windows in one shot (the
   MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
   DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. V4 composes the shared token-shaped resolve
+  graph. The router performs the same composition when a draft step-0
+  forward locally dispatches as DECODE while retaining the round's full K/V
+  rows; target MIXED decode halves and later draft steps keep their ordinary
+  decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
@@ -469,6 +545,48 @@ the target's remaining layers. The arming gate is the same
 round can never be armed on one side and drained on the other. Model-side
 capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
 in which tap order — and carries no per-round state.
+
+## Shared prefill convolution preparation
+
+Mamba/KDA extend metadata owns one immutable `CausalConv1dPrefillMetadata`
+per forward. Its two int32 maps associate convolution programs with request
+rows and local token chunks. The builder sizes them from the existing host
+length mirror and fills both directly from device query boundaries in one
+Triton launch. Every layer reads the same tensors and block size; the conv
+wrapper neither rebuilds them nor initializes/uploads per-layer scratch.
+This is transient execution metadata, not a new cache group or model state.
+
+The same extend/mixed metadata owns a device int64 mirror of the int32
+query boundaries. KDA layers share it for scan ABIs instead of casting
+per layer; the host int64 mirror still supplies launch planning without
+D2H. Decode refresh/capture does not allocate this prefill-only mirror.
+
+Each metadata build allocates fresh index storage, including when two
+forwards have the same total token count but different request partitions.
+No subsequent forward refills a buffer an earlier forward may still read.
+Mixed batches include the decode rows' verify-token lengths in this same
+builder. Decode-only refresh/capture remains unchanged and carries no
+prefill convolution schedule. Breakable prefill graphs consume the live
+metadata in the eager attention break, as ordinary eager forwards do.
+
+Prefill state staging fuses resumed conv-window copying, recurrent-state
+gather/zero, and history flags in one kernel. It preserves scheduler-owned
+block ids and arbitrary cache strides. Fresh rows never read null or stale
+recurrent state; their conv working windows remain unchanged. Shared input
+snapshots are read-only, output blocks are unique, and a private in-place
+source/destination is legal. This changes neither scan arithmetic nor cache
+allocation, retention, or checkpoint identity.
+
+The NVIDIA CuteDSL prefill adapter declares its native `v_major`
+(`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
+with another layout; the wrapper must not round-trip native state through
+FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
+layout for both initial and final state. Gate conversion to FP32 and beta
+packing retain their ordinary PyTorch operations. The native wrapper allocates
+the scan output; breakable graph replay copies it into the graph-owned stable
+handoff buffer. No output-buffer extension to the native wrapper is required.
+These preparation changes modify neither the native scan, its gate math, nor
+GEMM arithmetic.
 
 ## Non-goals
 

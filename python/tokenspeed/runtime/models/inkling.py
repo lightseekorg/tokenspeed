@@ -81,7 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.triton.log_scaling import (
+from tokenspeed_kernel.ops.attention.rmha.triton import (
     log_scaling_tau as compute_log_scaling_tau,
 )
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
@@ -115,7 +115,10 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -554,9 +557,11 @@ class InklingAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_tp_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=(config.sliding_window_size - 1) if is_local else -1,
-            # Group ids == config.cache_layer_types labels (sliding sub-groups included).
-            group_id=config.cache_layer_types[layer_id],
+            sliding_window_size=(
+                hf_sliding_window_to_window_left(config.sliding_window_size)
+                if is_local
+                else -1
+            ),
         )
 
         self.q_size = self.head_dim * self.num_tp_heads

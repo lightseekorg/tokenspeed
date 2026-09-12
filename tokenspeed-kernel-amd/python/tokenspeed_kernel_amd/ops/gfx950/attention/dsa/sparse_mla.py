@@ -2213,7 +2213,6 @@ def gluon_dsa_kpool_prefill_logits_gfx950(
         max_candidates,
         pool_offset,
         PAGE_SIZE=page_size,
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
         NUM_HEADS=q.shape[1],
@@ -2394,7 +2393,6 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
         int(pool_workspace_slots.numel()),
         pool_offset,
         PAGE_SIZE=page_size,
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
         NUM_HEADS=q.shape[1],
@@ -2437,7 +2435,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         )
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+    _, page_stride_bytes = _check_packed_fp8_inputs(
         q, index_k_cache, weights, int(page_size)
     )
     if not weights.is_contiguous():
@@ -2498,7 +2496,6 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         block_table.stride(0),
         logits.stride(0),
         page_size=int(page_size),
-        row_bytes=row_bytes,
         page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
@@ -2547,7 +2544,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         raise RuntimeError(
             "Gluon DSA top-k requires an FP8 index_k_cache and page_size"
         )
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+    _, page_stride_bytes = _check_packed_fp8_inputs(
         q, index_k_cache, weights, int(page_size)
     )
     if not weights.is_contiguous():
@@ -2619,7 +2616,6 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             logits.stride(0),
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
-            row_bytes=row_bytes,
             page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
@@ -2743,7 +2739,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
         raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if seq_lens.dtype != torch.int32 or block_table.dtype != torch.int32:
@@ -2803,7 +2799,6 @@ def gluon_dsa_decode_topk_standard_gfx950(
         max_candidates,
         q_len_per_req,
         PAGE_SIZE=int(page_size),
-        ROW_BYTES=row_bytes,
         PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
@@ -2857,7 +2852,7 @@ def gluon_dsa_prefill_topk_standard_gfx950(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError("standard-cache DSA scorer requires cache and page_size")
-    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if (
@@ -2929,7 +2924,6 @@ def gluon_dsa_prefill_topk_standard_gfx950(
             float(softmax_scale),
             workspace_rows,
             PAGE_SIZE=int(page_size),
-            ROW_BYTES=row_bytes,
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
             HEAD_DIM=q.shape[2],

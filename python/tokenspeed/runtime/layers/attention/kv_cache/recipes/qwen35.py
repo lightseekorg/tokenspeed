@@ -57,7 +57,7 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def target_layer_types(self) -> tuple[str, ...]:
-        return tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
+        return tuple(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
@@ -209,7 +209,7 @@ class QwenGDNRecipe(CacheRecipe):
             and torch.device(self.attn_config.device).type == "cuda"
         ):
             return False
-        from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+        from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
         return bool(gdn_replay_commit_supported(self.attn_config.dtype))
 

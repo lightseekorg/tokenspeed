@@ -39,7 +39,7 @@ For a compact compatibility table, see
 | `--host` | HTTP bind host. |
 | `--port` | HTTP bind port. |
 | `--served-model-name` | Model name returned by the OpenAI-compatible API. |
-| `--api-key` | API key required by the server. |
+| `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
@@ -162,7 +162,6 @@ with the logits output.
 | --- | --- |
 | `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
-| `--enable-custom-logit-processor` | Allow custom logit processors. Keep disabled unless the deployment needs it. |
 
 Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 `deepseek_r1`, and `deepseek_v31`. Common tool-call parser values include
@@ -191,35 +190,49 @@ block instead of one token per step, so their two token counts are coupled.
 `--speculative-num-draft-tokens` is the verify width -- one anchor row plus one
 row per drafted token -- and `--speculative-num-steps` must be one less. The
 draft checkpoint's `block_size` fixes both, and a mismatch is rejected at
-startup rather than silently drafting a wrong-width block. A checkpoint with
-`block_size: 8` therefore wants `--speculative-num-draft-tokens 8
---speculative-num-steps 7`.
+startup rather than silently drafting a wrong-width block. The two families
+spell that `block_size` differently:
+
+- DSpark checkpoints store the drafted token count, so `block_size`
+  (`dspark_block_size` on same-checkpoint DSpark) equals
+  `--speculative-num-steps`. `block_size: 8` wants `--speculative-num-steps 8
+  --speculative-num-draft-tokens 9`.
+- DFlash and DFlash2 checkpoints store the verify width, so `block_size` equals
+  `--speculative-num-steps + 1`. `block_size: 8` wants
+  `--speculative-num-steps 7 --speculative-num-draft-tokens 8`.
+
+A checkpoint that declares no `block_size` leaves both flags as given.
 
 A checkpoint whose architecture is `DFlash2DraftModel` uses the same `DFLASH`
 launch method. TokenSpeed selects its grouped-convolution and candidate-selector
 runtime from the checkpoint architecture; no separate algorithm flag is needed.
 Draft proposals greedily follow the selector's transition-conditioned path,
-independent of the target sampling backend.
+walked by one Triton kernel per verify step. A request's `temperature`,
+`top_k` and `top_p` are applied by the target's verification step, never by
+the proposal, so the served distribution is the target's whatever the drafter
+proposed.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft
 follows it. Any sliding window the draft checkpoint declares is an attention
 mask applied by the draft's own layers, never a cache-retention policy of its
-own.
+own. Only the backends that forward that mask to their kernels can serve such a
+draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
+`mha`/`fa3`/`fa4`/`triton`/`flashinfer`/`trtllm_mha` for GQA drafts. Any other
+`--drafter-attention-backend` is rejected at startup rather than quietly
+widening the draft's attention to the full history.
 
 ## Observability
 
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
-| `--log-level-http` | HTTP server log level. Defaults to `--log-level` when unset. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
-| `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify

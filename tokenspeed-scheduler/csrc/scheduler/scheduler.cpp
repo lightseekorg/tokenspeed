@@ -85,7 +85,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.prefix_granularity / group.BlockGranularity();
+        const std::int32_t child_entries = config_.prefix_granularity / group.block_granularity;
         if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
             throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
         }
@@ -118,15 +118,12 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t prefix_granularity = config_.prefix_granularity;
     // A final sub-page tail can follow the first aligned body, or a later body
     // that also retains an input checkpoint. Bound both cases independently.
-    const bool splits_final_state_checkpoint = config_.role != Role::kD && !config_.disable_prefix_cache;
-    const auto max_split_tail_after = [&](std::int64_t minimum_body_end) {
-        return splits_final_state_checkpoint
-                   ? std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
-                                                         max_prompt_tokens - minimum_body_end}))
-                   : 0;
+    const auto max_tail_after = [&](std::int64_t minimum_body_end) {
+        return std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
+                                                   max_prompt_tokens - minimum_body_end}));
     };
-    const std::int64_t max_first_chunk_tail_tokens = max_split_tail_after(prefix_granularity);
-    const std::int64_t max_later_chunk_tail_tokens = max_split_tail_after(2 * prefix_granularity);
+    const std::int64_t max_first_chunk_tail_tokens = max_tail_after(prefix_granularity);
+    const std::int64_t max_later_chunk_tail_tokens = max_tail_after(2 * prefix_granularity);
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
@@ -136,22 +133,22 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             if (group.IsSnapshotStateGroup()) {
                 if (token_limit == 0) return std::int64_t{0};
                 // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
-                // + endpoint + max(growth, tail). P banks no growth; overlap keeps one more
-                // decode step live. A rebased recovery prompt may exceed max_prompt_tokens.
-                const std::int64_t growth_blocks =
-                    config_.role == Role::kP
-                        ? 0
-                        : ceilDiv(std::max<std::int64_t>(block_granularity, decode_width + protected_tokens),
-                                  block_granularity);
+                // + aligned checkpoint + its materialized suffix/reserve. The
+                // forward holds both the final continuation and growth storage.
+                // P banks no decode growth; overlap keeps one more decode step live.
+                // A rebased recovery prompt may exceed max_prompt_tokens.
+                const auto output_blocks = [&](std::int64_t tail_tokens) {
+                    const std::int64_t reserve_tokens =
+                        config_.role == Role::kP
+                            ? 0
+                            : SnapshotStateReserveTokens(block_granularity, decode_width + protected_tokens);
+                    return 1 + ceilDiv(tail_tokens + reserve_tokens, block_granularity);
+                };
                 const std::int64_t lookback = coordinator_.GroupBoundaryLookbackPages(i);
                 const std::int64_t first_chunk_peak =
-                    (config_.disable_prefix_cache ? 0 : lookback) + 1 +
-                    std::max(growth_blocks, ceilDiv(max_first_chunk_tail_tokens, block_granularity));
+                    (config_.disable_prefix_cache ? 0 : lookback) + output_blocks(max_first_chunk_tail_tokens);
                 const std::int64_t later_chunk_peak =
-                    max_prompt_tokens > chunk_tokens
-                        ? lookback + 1 +
-                              std::max(growth_blocks, ceilDiv(max_later_chunk_tail_tokens, block_granularity))
-                        : 0;
+                    max_prompt_tokens > chunk_tokens ? lookback + output_blocks(max_later_chunk_tail_tokens) : 0;
                 return std::max(first_chunk_peak, later_chunk_peak);
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
@@ -447,7 +444,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     plan.With(ForwardBatch{std::move(forward_operations)});
 
     if (config_.StreamsDeviceCacheToHost()) {
-        if (auto store = tier_transfers_.StartPendingStores()) {
+        // Boundary publications of live requests: their owners hold the pages,
+        // and the ticket pins them until the ACK, so the copy stays off the
+        // forward's critical path.
+        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

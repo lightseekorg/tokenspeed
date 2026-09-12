@@ -9,7 +9,9 @@ from dataclasses import replace
 from io import StringIO
 from types import MethodType, SimpleNamespace
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,11 +21,11 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -82,6 +84,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_history_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
@@ -104,6 +109,7 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
     Fp8Config,
@@ -147,7 +153,9 @@ from tokenspeed.runtime.models.deepseek_v4_dspark import (
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     _dspark_output_projection,
+    _normalize_query_per_head,
     _quantize_dspark_non_rope,
+    _rmsnorm,
     dspark_fp8_quant_dequant,
     get_dspark_topk_idxs_batched,
 )
@@ -647,7 +655,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             setattr(moe, name, MethodType(getattr(DeepseekV4MoE, name), moe))
         return moe
 
-    def _make_fake_deepseek_v4_moe(self, hidden_states, input_ids, stream_fork, calls):
+    def _make_fake_deepseek_v4_moe(
+        self,
+        hidden_states,
+        input_ids,
+        stream_fork,
+        calls,
+        *,
+        bypassed_topk_output,
+        norm_topk_prob,
+    ):
         def select_experts(states, ids):
             calls.append("select")
             self.assertIs(states, hidden_states)
@@ -662,7 +679,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         def make_topk_output(states, weights, ids, scores):
             del weights, ids, scores
             calls.append("topk")
-            return states
+            return SimpleNamespace(
+                hidden_states=states,
+                format=SimpleNamespace(
+                    is_bypassed=lambda: bypassed_topk_output,
+                ),
+            )
 
         def routed_experts(**kwargs):
             calls.append("routed")
@@ -680,6 +702,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             shared_experts=shared_experts,
             stream_fork=stream_fork,
             routed_scaling_factor=2.0,
+            config=SimpleNamespace(norm_topk_prob=norm_topk_prob),
             experts=routed_experts,
             _select_experts=select_experts,
             _make_topk_output=make_topk_output,
@@ -691,7 +714,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(None), calls
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         actual = DeepseekV4MoE.forward(
@@ -706,6 +734,92 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
+
+    def test_deepseek_v4_moe_preserves_unnormalized_kernel_route_weights(self):
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+
+        for bypassed_topk_output, norm_topk_prob, routed_multiplier in (
+            (True, False, 4),
+            (True, True, 2),
+            (False, False, 2),
+        ):
+            with self.subTest(
+                bypassed_topk_output=bypassed_topk_output,
+                norm_topk_prob=norm_topk_prob,
+            ):
+                calls = []
+                moe = self._make_fake_deepseek_v4_moe(
+                    hidden_states,
+                    input_ids,
+                    StreamFork(None),
+                    calls,
+                    bypassed_topk_output=bypassed_topk_output,
+                    norm_topk_prob=norm_topk_prob,
+                )
+
+                actual = DeepseekV4MoE.forward(
+                    moe,
+                    hidden_states,
+                    input_ids,
+                    num_global_tokens=2,
+                    max_num_tokens_per_gpu=2,
+                )
+
+                expected = (hidden_states + 1) * routed_multiplier + hidden_states + 3
+                self.assertEqual(calls, ["select", "topk", "routed", "shared"])
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_deepseek_v4_moe_kernel_does_not_repeat_output_scaling(self):
+        captured = {}
+
+        class FakeExperts:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.topk_output_format = object()
+
+        backend = SimpleNamespace(
+            is_mega_moe=lambda: False,
+            is_flashinfer_trtllm=lambda: True,
+        )
+        config = SimpleNamespace(
+            n_shared_experts=None,
+            routed_scaling_factor=2.5,
+            scoring_func="sqrtsoftplus",
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            hidden_size=256,
+            moe_intermediate_size=128,
+            hidden_act="silu",
+            norm_topk_prob=True,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=1),
+            moe=SimpleNamespace(
+                ep_size=1,
+                tp_size=1,
+                tp_ep_size=1,
+                tp_rank=0,
+                ep_rank=0,
+            ),
+        )
+        gate = SimpleNamespace(e_score_correction_bias=None)
+
+        with (
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", return_value=gate),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_routed_expert_quant_config",
+                return_value=(None, False),
+            ),
+            patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK"),
+        ):
+            moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
+
+        self.assertEqual(moe.routed_scaling_factor, 2.5)
+        self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -866,7 +980,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         hidden_states = torch.ones(2, 3, device="cuda")
         input_ids = torch.arange(2, device="cuda")
         moe = self._make_fake_deepseek_v4_moe(
-            hidden_states, input_ids, StreamFork(torch.cuda.Stream()), calls
+            hidden_states,
+            input_ids,
+            StreamFork(torch.cuda.Stream()),
+            calls,
+            bypassed_topk_output=False,
+            norm_topk_prob=True,
         )
 
         with patch.object(deepseek_v4_model, "get_is_capture_mode", return_value=True):
@@ -1413,6 +1532,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             mapping=None,
             speculative_algorithm="DSPARK",
             enable_prefix_caching=True,
+            speculative_num_steps=5,
             speculative_num_draft_tokens=6,
             prefix_granularity=256,
             load_format="auto",
@@ -1463,7 +1583,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
-            from tokenspeed_kernel.ops.attention.flash_mla import (
+            from tokenspeed_kernel.ops.attention.mla.cuda import (
                 flash_mla_sparse_fwd,
                 flash_mla_with_kvcache,
                 get_mla_metadata,
@@ -1963,6 +2083,51 @@ class TestDeepseekV4Config(unittest.TestCase):
                 gathered_ids[:, :1],
             )
 
+    def test_dspark_single_rank_argmax_bypasses_collective_workspaces(self):
+        local_logits = torch.tensor([[1.0, 7.0, 3.0, 4.0]])
+        lm_head = SimpleNamespace(
+            tp_size=1,
+            shard_indices=SimpleNamespace(
+                num_org_elements=4,
+                num_org_elements_padded=4,
+                num_added_elements=0,
+                org_vocab_start_index=0,
+                added_vocab_start_index=4,
+            ),
+        )
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_into_tensor"
+        ) as gather:
+            token_ids = _local_vocab_argmax(
+                local_logits,
+                lm_head,
+                object(),
+                torch.empty(0),
+                torch.empty(0, dtype=torch.int64),
+            )
+
+        gather.assert_not_called()
+        self.assertTrue(torch.equal(token_ids, torch.tensor([1], dtype=torch.int32)))
+
+    def test_dspark_wire_target_uses_draft_head(self):
+        draft_head = SimpleNamespace(weight=torch.ones(8, 3), tp_size=1)
+        target_head = SimpleNamespace(weight=torch.ones(4, 3), tp_size=2)
+        drafter = object.__new__(DeepseekV4DSpark)
+        drafter.draft_model = SimpleNamespace(lm_head=draft_head)
+        drafter.target_layer_ids = [1, 3]
+        target_model = SimpleNamespace(
+            lm_head=target_head,
+            logits_processor=SimpleNamespace(tp_group=(0, 1)),
+            set_dspark_layers_to_capture=Mock(),
+        )
+
+        drafter.wire_target(target_model)
+
+        self.assertIs(drafter.lm_head, draft_head)
+        self.assertEqual(drafter.tp_group, (0, 1))
+        target_model.set_dspark_layers_to_capture.assert_called_once_with([1, 3])
+
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
         mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
@@ -1979,6 +2144,11 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
         drafter.device = torch.device("cpu")
+        drafter.lm_head = SimpleNamespace(weight=torch.ones(2, 2))
+        refresh_head = Mock(return_value=False)
+        drafter.model = SimpleNamespace(
+            refresh_local_base_logits_head=refresh_head,
+        )
         drafter.first_padding_slot = 3
         drafter.padding_slots = torch.arange(3, 7, dtype=torch.int64)
         drafter.slot_indices_buf = drafter.padding_slots.clone()
@@ -2035,6 +2205,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.zeros_like(drafter.context_lengths[3:]),
             )
         )
+        self.assertEqual(refresh_head.call_count, 11)
+        refresh_head.assert_called_with(drafter.lm_head.weight, force=False)
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
         values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
@@ -2055,6 +2227,46 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(actual, expected))
         with self.assertRaisesRegex(ValueError, "must be divisible"):
             dspark_fp8_quant_dequant(values[:, :-1], 64)
+
+    def test_dspark_rmsnorm_cpu_matches_reference(self):
+        values = torch.linspace(-7.0, 7.0, 1024, dtype=torch.bfloat16).reshape(2, 512)
+        weight = torch.linspace(-0.5, 0.5, 512, dtype=torch.bfloat16)
+
+        actual = _rmsnorm(values, weight, 1e-6)
+        normalized = values.float()
+        normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
+        expected = (weight.float() * normalized).to(values.dtype)
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_dspark_query_per_head_norm_cpu_matches_reference(self):
+        values = torch.linspace(-7.0, 7.0, 2 * 3 * 4 * 8).reshape(2, 3, 4, 8)
+        expected = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+
+        actual = _normalize_query_per_head(values.clone(), head_dim=8, eps=1e-6)
+
+        self.assertTrue(torch.equal(actual, expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_rmsnorm_cuda_graph_replays_exact_reference(self):
+        torch.manual_seed(7)
+        values = torch.randn((8, 5, 512), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((512,), device="cuda", dtype=torch.bfloat16)
+
+        _rmsnorm(values, weight, 1e-6)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = _rmsnorm(values, weight, 1e-6)
+
+        values.copy_(torch.randn_like(values))
+        graph.replay()
+        torch.cuda.synchronize()
+        normalized = values.float()
+        normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
+        expected = (weight.float() * normalized).to(values.dtype)
+
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_dspark_kv_quantizes_only_non_rope_channels(self):
         tensor = torch.linspace(-8.0, 8.0, 512, dtype=torch.float32).reshape(1, 1, 512)
@@ -2128,6 +2340,99 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.equal(logits, hidden.float() @ head.weight.float().T))
+
+    def test_dspark_base_logits_reuse_and_refresh_stable_fp32_head(self):
+        model = object.__new__(DeepseekV4DSparkModel)
+        torch.nn.Module.__init__(model)
+        model.register_buffer("_local_base_head_fp32", None, persistent=False)
+        model._local_base_head_source_ptr = None
+        model._local_base_head_source_version = None
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        head = torch.tensor(
+            [[0.5, 0.25], [-1.0, 2.0]],
+            dtype=torch.bfloat16,
+        )
+
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
+        cached_ptr = model._local_base_head_fp32.data_ptr()
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ head.float().T,
+            )
+        )
+
+        head.add_(1)
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=False))
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ head.float().T,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "shape or device changed"):
+            model.refresh_local_base_logits_head(torch.ones(3, 2), force=False)
+
+        original_version = int(head._version)
+        replacement = torch.full_like(head, 3)
+        head.data.copy_(replacement)
+        self.assertEqual(int(head._version), original_version)
+        self.assertFalse(model.refresh_local_base_logits_head(head, force=False))
+        self.assertTrue(model.refresh_local_base_logits_head(head, force=True))
+        self.assertTrue(
+            torch.equal(
+                model.local_base_logits(hidden, None),
+                hidden.float() @ replacement.float().T,
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dspark_cached_base_logits_survive_cuda_graph_refresh(self):
+        model = object.__new__(DeepseekV4DSparkModel)
+        torch.nn.Module.__init__(model)
+        model.register_buffer("_local_base_head_fp32", None, persistent=False)
+        model._local_base_head_source_ptr = None
+        model._local_base_head_source_version = None
+        hidden = torch.tensor(
+            [[1.0, -2.0]],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        head = torch.tensor(
+            [[0.5, 0.25], [-1.0, 2.0]],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        model.refresh_local_base_logits_head(head, force=False)
+        cached_ptr = model._local_base_head_fp32.data_ptr()
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                model.local_base_logits(hidden, None)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = model.local_base_logits(hidden, None)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(logits, hidden.float() @ head.float().T),
+        )
+
+        head.add_(1)
+        model.refresh_local_base_logits_head(head, force=False)
+        self.assertEqual(model._local_base_head_fp32.data_ptr(), cached_ptr)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(logits, hidden.float() @ head.float().T),
+        )
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
@@ -2412,6 +2717,39 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
+    def test_deepseek_v4_kv_pool_binds_no_paged_attention_layer(self):
+        # Every V4 group stores rows of token history, and a layer's fused
+        # attention reads several of them at once (its SWA window beside its
+        # compressed chain), so the generic per-layer derivation has no single
+        # group to hand PagedAttention -- the view says so instead of raising.
+        config = SimpleNamespace(
+            compress_ratios=[1, 4, 128],
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=64,
+            use_fp4_indexer_cache=True,
+        )
+        pool, _ = _make_planned_deepseek_v4_pool(layout, config)
+
+        self.assertEqual(
+            {spec.family for spec in pool.arena.cache_group_specs}, {"history"}
+        )
+        with self.assertRaisesRegex(ValueError, "more than one history"):
+            derive_history_groups_by_layer(
+                pool.arena,
+                first_layer=0,
+                num_layers=len(layout.layer_ratio),
+                kv_planes=pool.layer_plane_bindings,
+            )
+        self.assertEqual(pool.history_group_by_layer(), {})
+        self.assertEqual(pool.paged_group_ids, ())
+        bind_cache_groups(torch.nn.Module(), pool)
+
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
         config = SimpleNamespace(
             compress_ratios=[1, 4, 128],
@@ -2466,6 +2804,106 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
         )
+
+    def test_deepseek_v4_decode_query_padding_reuses_zero_tailed_workspace(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=32,
+                num_kv_heads=1,
+                attn_tp_size=4,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=4,
+                context_len=4096,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=2)
+        self.assertIsNotNone(backend._decode_q_padding_workspace)
+        self.assertEqual(
+            tuple(backend._decode_q_padding_workspace.shape),
+            (8, 64, 4),
+        )
+        first_q = torch.arange(2 * 8 * 4, dtype=torch.bfloat16).view(2, 8, 4)
+        with patch.object(
+            torch,
+            "zeros",
+            side_effect=AssertionError("decode query padding allocated after init"),
+        ):
+            first_padded = backend._pad_decode_query(first_q, padded_heads=64)
+
+        self.assertEqual(first_padded.shape, (2, 64, 4))
+        self.assertTrue(torch.equal(first_padded[:, :8], first_q))
+        self.assertTrue(torch.count_nonzero(first_padded[:, 8:]) == 0)
+
+        second_q = torch.full_like(first_q, 7)
+        second_padded = backend._pad_decode_query(second_q, padded_heads=64)
+
+        self.assertEqual(second_padded.data_ptr(), first_padded.data_ptr())
+        self.assertTrue(torch.equal(second_padded[:, :8], second_q))
+        self.assertTrue(torch.count_nonzero(second_padded[:, 8:]) == 0)
+
+        different_shape = backend._pad_decode_query(first_q[:1], padded_heads=64)
+        self.assertEqual(different_shape.data_ptr(), first_padded.data_ptr())
+        self.assertEqual(
+            tuple(backend._decode_q_padding_workspace.shape),
+            (8, 64, 4),
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds.*workspace"):
+            backend._pad_decode_query(
+                torch.empty(9, 8, 4, dtype=torch.bfloat16),
+                padded_heads=64,
+            )
+
+    def test_deepseek_v4_decode_query_padding_validates_shape_and_head_width(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=4,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            backend._pad_decode_query(torch.empty(16, 4), padded_heads=64)
+        with self.assertRaisesRegex(ValueError, "must cover all local heads"):
+            backend._pad_decode_query(torch.empty(1, 65, 4), padded_heads=64)
+
+    def test_deepseek_v4_decode_query_padding_keeps_native_width_contiguous(self):
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        q = torch.empty(2, 64, 4, dtype=torch.bfloat16)
+
+        padded = backend._pad_decode_query(q, padded_heads=64)
+
+        self.assertEqual(padded.data_ptr(), q.data_ptr())
+        self.assertTrue(padded.is_contiguous())
+        self.assertIsNone(backend._decode_q_padding_workspace)
 
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
         backend = _v4_backend(
@@ -3742,6 +4180,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                     retention="sliding_window",
                     rows_per_page=64,
                     entry_stride_tokens=1,
+                    block_granularity=(64) * (1),
+                    family="history",
                 ),
             ),
             cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
@@ -4991,6 +5431,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             (2, 1),
             dtype=torch.int32,
         )
+        metadata.indexer.decode_schedule_metadata_refreshed_keys.add((8, 8, 8))
 
         with patch.object(deepseek_v4_backend, "dsv4_plan", side_effect=fake_dsv4_plan):
             deepseek_v4_backend._refresh_decode_indexer_schedule_metadata(metadata)
@@ -5010,6 +5451,36 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.full((2, 1), 9, dtype=torch.int32),
             )
         )
+        self.assertEqual(
+            metadata.indexer.decode_schedule_metadata_refreshed_keys,
+            {key},
+        )
+
+    def test_deepseek_v4_indexer_schedule_metadata_reuses_refreshed_cache(self):
+        key = (4, 4, 2)
+        metadata = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            page_table=torch.tensor([[0], [0]], dtype=torch.int32),
+            seq_lens=torch.tensor([5, 1], dtype=torch.int32),
+            query_lens=torch.tensor([1, 1], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
+        )
+        cached = torch.full((2, 1), 7, dtype=torch.int32)
+        metadata.indexer.decode_schedule_metadata_cache[key] = cached
+        metadata.indexer.decode_schedule_metadata_refreshed_keys.add(key)
+
+        with patch.object(deepseek_v4_model, "dsv4_plan") as plan:
+            actual = deepseek_v4_model._deepseek_v4_indexer_decode_schedule_metadata(
+                positions=torch.tensor([4, 0], dtype=torch.int64),
+                cache_block_size=4,
+                compress_ratio=4,
+                metadata=metadata,
+                context_lens=torch.tensor([[1], [0]], dtype=torch.int32),
+            )
+
+        self.assertIs(actual, cached)
+        plan.assert_not_called()
 
     def test_deepseek_v4_cuda_graph_decode_uses_packed_metadata(self):
         backend = _v4_backend(
@@ -6022,6 +6493,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 rms_eps=1e-6,
                 hc_eps=1e-6,
                 sinkhorn_iters=2,
+                norm_weight=None,
+                norm_eps=None,
             )
         with self.assertRaises(RuntimeError):
             mhc_post(hidden_states, residual, post, comb)
@@ -6322,3 +6795,184 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
     for mode in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.IDLE):
         assert backend.record_layer_cache_ready(output, mode) is output
     assert records == [True]
+
+
+def _cache_pool_with_page_counts(page_counts, rows_per_page, entry_stride_tokens):
+    specs = [
+        SimpleNamespace(
+            group_id=group_id,
+            rows_per_page=rows_per_page,
+            entry_stride_tokens=entry_stride_tokens,
+            block_granularity=rows_per_page * entry_stride_tokens,
+            family="history",
+            retention="full_history",
+        )
+        for group_id in page_counts
+    ]
+    return SimpleNamespace(
+        arena=SimpleNamespace(
+            cache_group_specs=specs, cache_group_page_counts=page_counts
+        )
+    )
+
+
+def _unbound_deepseek_v4_backend():
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
+        DeepseekV4AttentionBackend,
+    )
+
+    backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
+    backend._init_pool_binding()
+    backend._init_cache_group_latches()
+    return backend
+
+
+class DeepseekV4RebindTest(unittest.TestCase):
+    def test_rebinding_the_pool_relatches_the_cache_group_contract(self):
+        """A probe pool and the real pool share geometry but not page counts."""
+        probe = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        real = _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        rebound = _unbound_deepseek_v4_backend()
+        rebound.set_cache_pool(probe)
+        rebound.set_cache_pool(real)
+        fresh = _unbound_deepseek_v4_backend()
+        fresh.set_cache_pool(real)
+
+        assert rebound._cache_group_max_page_ids == {"swa": 63, "compressed_4": 15}
+        assert rebound._expected_cache_group_ids == fresh._expected_cache_group_ids
+        assert (
+            rebound._cache_group_raw_tokens_per_page
+            == fresh._cache_group_raw_tokens_per_page
+        )
+        assert rebound._cache_group_max_page_ids == fresh._cache_group_max_page_ids
+
+    def test_rebinding_the_pool_drops_the_runtime_state_built_for_the_old_pool(self):
+        from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
+            DeepseekV4ForwardSlotMappings,
+        )
+
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        )
+        stale = object()
+        for name in (
+            "graph",
+            "_cuda_graph_active_page_validity",
+            "_decode_q_padding_workspace",
+            "_decode_q_padding_workspace_layout",
+            "draft_rounds",
+            "forward_metadata",
+            "forward_prefill_metadata",
+            "forward_decode_metadata",
+            "slot_mappings",
+            "_prefill_workspace_buffer",
+            "_prefill_dense_compressed_indices_buffer",
+        ):
+            setattr(backend, name, stale)
+        backend._swa_window_size = backend._swa_block_size = 5
+        backend._prefill_workspace_rows = backend._prefill_workspace_head_dim = 7
+
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        )
+        for name in (
+            "graph",
+            "_cuda_graph_active_page_validity",
+            "_decode_q_padding_workspace",
+            "_decode_q_padding_workspace_layout",
+            "draft_rounds",
+            "forward_metadata",
+            "forward_prefill_metadata",
+            "forward_decode_metadata",
+            "_prefill_workspace_buffer",
+            "_prefill_dense_compressed_indices_buffer",
+        ):
+            assert getattr(backend, name) is None, name
+        assert isinstance(backend.slot_mappings, DeepseekV4ForwardSlotMappings)
+        assert (backend._swa_window_size, backend._swa_block_size) == (0, 0)
+        assert (
+            backend._prefill_workspace_rows,
+            backend._prefill_workspace_head_dim,
+        ) == (0, 0)
+
+    def test_configure_runtime_before_the_first_bind_still_allows_the_first_bind(self):
+        backend = _unbound_deepseek_v4_backend()
+        pool = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        backend.configure_runtime(
+            cache_group_specs=pool.arena.cache_group_specs,
+            cache_group_page_counts=pool.arena.cache_group_page_counts,
+        )
+
+        backend.set_cache_pool(pool)
+
+        assert backend.cache_pool is pool
+
+    def test_rebinding_a_pool_of_different_geometry_is_rejected(self):
+        backend = _unbound_deepseek_v4_backend()
+        original = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        backend.set_cache_pool(original)
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(
+                _cache_pool_with_page_counts({"swa": 4, "compressed_8": 4}, 4, 1)
+            )
+
+        assert backend.cache_pool is original
+        assert backend._expected_cache_group_ids == ("swa", "compressed_4")
+        backend.set_cache_pool(original)
+
+    def test_rebinding_a_pool_with_the_same_token_span_but_other_rows_is_rejected(self):
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(_cache_pool_with_page_counts({"swa": 4}, 4, 1))
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(_cache_pool_with_page_counts({"swa": 4}, 2, 2))
+
+    def test_rebinding_accepts_reordered_equal_cache_groups(self):
+        """Declaration order is not part of the published group geometry."""
+        probe = _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        reordered = _cache_pool_with_page_counts({"compressed_4": 16, "swa": 64}, 4, 1)
+        rebound = _unbound_deepseek_v4_backend()
+        rebound.set_cache_pool(probe)
+
+        rebound.set_cache_pool(reordered)
+
+        fresh = _unbound_deepseek_v4_backend()
+        fresh.set_cache_pool(reordered)
+        self.assertEqual(rebound._cache_group_kinds, fresh._cache_group_kinds)
+        self.assertEqual(
+            rebound._cache_group_row_geometry, fresh._cache_group_row_geometry
+        )
+        self.assertEqual(
+            rebound._cache_group_max_page_ids, fresh._cache_group_max_page_ids
+        )
+
+    def test_rebinding_a_pool_with_other_block_granularity_is_rejected(self):
+        """Block granularity is published geometry even when row layout is unchanged."""
+        original = _cache_pool_with_page_counts({"swa": 4}, 4, 1)
+        replacement = _cache_pool_with_page_counts({"swa": 4}, 4, 1)
+        original.arena.cache_group_specs[0].block_granularity = 4
+        replacement.arena.cache_group_specs[0].block_granularity = 8
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(original)
+
+        with pytest.raises(RuntimeError, match="geometry changed on rebind"):
+            backend.set_cache_pool(replacement)
+
+        assert backend.cache_pool is original
+
+    def test_configure_runtime_after_a_rebind_checks_the_relatched_contract(self):
+        backend = _unbound_deepseek_v4_backend()
+        backend.set_cache_pool(
+            _cache_pool_with_page_counts({"swa": 4, "compressed_4": 4}, 4, 1)
+        )
+        real = _cache_pool_with_page_counts({"swa": 64, "compressed_4": 16}, 4, 1)
+        backend.set_cache_pool(real)
+        backend.configure_runtime(
+            cache_group_specs=real.arena.cache_group_specs,
+            cache_group_page_counts=real.arena.cache_group_page_counts,
+        )
+        with pytest.raises(RuntimeError, match="contract changed after initialization"):
+            backend.configure_runtime(
+                cache_group_specs=real.arena.cache_group_specs,
+                cache_group_page_counts={"swa": 32, "compressed_4": 16},
+            )

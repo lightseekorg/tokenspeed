@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
@@ -33,29 +34,29 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
 
 class DFlashAttention(nn.Module):
-    # Block drafters share the target's cache locations. A sliding window is
-    # their compute mask, not a separate cache-retention group.
-    cache_group_id = FULL_ATTENTION
-
     def __init__(
         self,
         config,
@@ -137,7 +138,6 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
-            group_id=self.cache_group_id,
         )
 
     def _apply_qk_norm(
@@ -229,9 +229,13 @@ class DFlashAttention(nn.Module):
         return self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        dummy_q = k.new_empty(k.shape)
-        _, k = self.rotary_emb(positions, dummy_q, k)
-        return k
+        return _apply_k_rope(
+            positions,
+            k,
+            self.head_dim,
+            self.rotary_emb.cos_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+        )
 
 
 class DFlashMLP(nn.Module):
@@ -390,16 +394,19 @@ class DFlashDraftModel(nn.Module):
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
-        self.fc = nn.Linear(
+        self.fc = ReplicatedLinear(
             self.num_context_features * int(config.hidden_size),
             int(config.hidden_size),
             bias=False,
+            prefix=add_prefix("fc", prefix),
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
-        self.block_size = int(getattr(config, "block_size", 8))
+        # Name the DFlash drafter reads off the draft model.
+        self.block_size = read_checkpoint_block_size(config)
+        self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden))
+        return self.hidden_norm(self.fc(target_hidden)[0])
 
     # ------------------------------------------------------------------
     # Context-injection contract
@@ -412,7 +419,7 @@ class DFlashDraftModel(nn.Module):
 
     @property
     def context_in_features(self) -> int:
-        return int(self.fc.in_features)
+        return int(self.fc.input_size)
 
     @property
     def context_dtype(self) -> torch.dtype:
@@ -441,6 +448,31 @@ class DFlashDraftModel(nn.Module):
                 attn.attn.v_scale,
             )
 
+    def _zeroed_residual(self, template: torch.Tensor) -> torch.Tensor:
+        """The residual stream the layers accumulate into, cleared in place.
+
+        The layers write through it, so it may not be shared with anything
+        that outlives one forward; nothing does. Growing it during CUDA graph
+        capture would hand a later graph memory owned by an earlier graph's
+        private pool, so capture allocates instead of resizing.
+        """
+        buffer = self._residual_buffer
+        rows = int(template.shape[0])
+        if (
+            buffer is None
+            or buffer.shape[0] < rows
+            or buffer.shape[1:] != template.shape[1:]
+            or buffer.dtype != template.dtype
+            or buffer.device != template.device
+        ):
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                return torch.zeros_like(template)
+            self._residual_buffer = torch.zeros_like(template)
+            return self._residual_buffer
+        residual = buffer[:rows]
+        residual.zero_()
+        return residual
+
     @torch.no_grad()
     def forward(
         self,
@@ -459,7 +491,7 @@ class DFlashDraftModel(nn.Module):
             residual = None
         else:
             hidden_states = input_embeds
-            residual = torch.zeros_like(input_embeds)
+            residual = self._zeroed_residual(input_embeds)
 
         if kv_sync_event is not None:
             torch.cuda.current_stream().wait_event(kv_sync_event)
@@ -472,14 +504,23 @@ class DFlashDraftModel(nn.Module):
                 residual=residual,
             )
 
-        if residual is None:
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.final_norm(hidden_states, residual)
 
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=hidden_states
         )
+
+    def final_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Norm the last layer's output.
+
+        A draft whose layers hand back a shard-local partial overrides this to
+        reduce first.
+        """
+        if residual is None:
+            return self.norm(hidden_states)
+        return self.norm(hidden_states, residual)[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -570,8 +611,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
             "DFLASH sliding_attention layers require config.sliding_window."
         )
 
-    # HF sliding windows include the current token; TokenSpeed stores window_left.
-    return int(sliding_window) - 1
+    return hf_sliding_window_to_window_left(sliding_window)
 
 
 def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:

@@ -64,3 +64,36 @@ def test_layerwise_load_waits_for_the_selected_event_set(monkeypatch):
     tracker.wait_for_layer(1)
 
     assert stream.waited_events == [tracker.event_sets[load_index].layer_done_events[1]]
+
+
+def test_layerwise_load_waits_for_bound_flags(monkeypatch):
+    module_name = "tokenspeed.runtime.cache.l2.layerwise_load"
+    package = importlib.import_module("tokenspeed.runtime.cache.l2")
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.delattr(package, "layerwise_load", raising=False)
+    stream = _Stream()
+    device_module = SimpleNamespace(Event=_Event, current_stream=lambda: stream)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed.runtime.utils",
+        SimpleNamespace(
+            get_device_module=lambda: device_module,
+        ),
+    )
+
+    module = importlib.import_module(module_name)
+    tracker = module.LayerwiseLoadTracker(num_layers=2)
+    load_index = tracker.begin_load()
+    tracker.set_consumers(load_index)
+    flags = object()
+    waiter = []
+    events = tracker.event_sets[load_index]
+    events.layer_ready_flags = flags
+    events.wait_layer_ready = lambda tensor, layer_index: waiter.append(
+        (tensor, layer_index)
+    )
+
+    tracker.wait_for_layer(1)
+
+    assert waiter == [(flags, 1)]
+    assert stream.waited_events == [events.layer_ready_init_event]

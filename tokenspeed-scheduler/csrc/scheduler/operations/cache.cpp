@@ -44,21 +44,16 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
     return chunk_size - chunk_size % prefix_granularity;
 }
 
-std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
-                                                   std::int32_t token_budget, std::int32_t prefix_granularity,
-                                                   std::int32_t promotion_boundary_tokens) {
-    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
+                                                 std::int32_t prefix_granularity) {
+    _assert(before_tokens >= 0 && after_tokens > before_tokens, "state checkpoint extent must advance");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    std::int32_t chunk_size = std::min(unscheduled, token_budget);
-    if (promotion_boundary_tokens > first_pos) {
-        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
-    }
-    if (chunk_size != unscheduled) {
-        return std::nullopt;
-    }
+    const std::int32_t completed_boundary = after_tokens - after_tokens % prefix_granularity;
+    return completed_boundary > before_tokens ? completed_boundary : after_tokens;
+}
 
-    const std::int32_t tail_tokens = (first_pos + chunk_size) % prefix_granularity;
-    return tail_tokens != 0 && chunk_size - tail_tokens > 0 ? std::optional{tail_tokens} : std::nullopt;
+std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t decode_tokens) {
+    return std::max(block_granularity, decode_tokens);
 }
 
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
@@ -70,18 +65,16 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-                .block_granularity = group.BlockGranularity(),
+                .block_granularity = group.block_granularity,
             });
             continue;
         }
-        // family=State also covers linear-attention groups with a trailing
-        // window; those translate like any other sliding group.
         const bool is_swa = group.retention == CacheGroupConfig::Retention::SlidingWindow;
         specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-            .block_granularity = group.BlockGranularity(),
+            .block_granularity = group.block_granularity,
         });
     }
     return specs;

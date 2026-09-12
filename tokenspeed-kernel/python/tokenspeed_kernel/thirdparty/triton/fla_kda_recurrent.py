@@ -23,6 +23,7 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import Platform
 
 
 @triton.jit
@@ -394,6 +395,30 @@ def fused_recurrent_kda_mtp_fwd_kernel(
         p_beta += stride_beta_tok
 
 
+def _kda_mtp_launch_config(
+    batch_size: int,
+    draft_tokens: int,
+    num_heads: int,
+    num_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    recurrent_layout: str,
+    is_amd: bool,
+) -> tuple[int, int]:
+    """Route the AMD-measured GLM-5.3-Flash schedule or the direct default."""
+    if is_amd and (
+        batch_size,
+        draft_tokens,
+        num_heads,
+        num_value_heads,
+        key_dim,
+        value_dim,
+        recurrent_layout,
+    ) == (16, 4, 16, 16, 128, 128, "v_major"):
+        return 2, 3
+    return 4, 2
+
+
 def fused_recurrent_kda_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -443,6 +468,16 @@ def fused_recurrent_kda_mtp(
     for t, d in ((q, K), (k, K), (v, V), (g, K)):
         assert t.stride(-1) == 1 and t.stride(-2) == d, "inner dims must be dense"
     out = torch.empty(B, T, HV, V, dtype=v.dtype, device=v.device)
+    num_warps, num_stages = _kda_mtp_launch_config(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        recurrent_layout,
+        Platform.get().is_amd,
+    )
     grid = (triton.cdiv(V, 32) * B * HV,)
     fused_recurrent_kda_mtp_fwd_kernel[grid](
         q=q,
@@ -480,8 +515,8 @@ def fused_recurrent_kda_mtp(
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         HAS_DT_BIAS=dt_bias is not None,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out
 
@@ -732,6 +767,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     HAS_PRECOMPUTED_CONV: tl.constexpr,
     STORE_STATES: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Run target verify, optionally storing each position's rollback state."""
     pid = tl.program_id(0)
@@ -807,6 +843,13 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         b_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(
             tl.float32
         )
+
+    if ENABLE_PDL:
+        # The state and weights above do not depend on the split producers.
+        # Fence before reading conv_qkv/g_raw, then release gated RMSNorm so
+        # it can prefetch its independent gate and weight during recurrence.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i_t in range(T):
         tok = bos + i_t
@@ -1102,6 +1145,7 @@ def fused_recurrent_kda_verify_megafuse(
     conv_qkv: torch.Tensor | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Run target-verify recurrence with inline or precomputed producers.
 
@@ -1122,6 +1166,8 @@ def fused_recurrent_kda_verify_megafuse(
             128-wide heads and avoids wide V-major tiles when storing tapes.
         num_warps/num_stages: Optional launch overrides. Defaults route to
             1/3 for the fully split producer path and 4/2 otherwise.
+        enable_pdl: Whether this grid releases a programmatic-launch dependent
+            after its producer-independent prologue.
 
     Returns:
         o: ``[N*T, HV, V]`` attention output in ``qkv_raw``'s dtype.
@@ -1172,6 +1218,7 @@ def fused_recurrent_kda_verify_megafuse(
         raise ValueError(f"bv={bv} must be a positive power of two")
     BV = bv
     grid = (triton.cdiv(V, BV) * N * HV,)
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     fused_recurrent_kda_verify_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
@@ -1213,8 +1260,10 @@ def fused_recurrent_kda_verify_megafuse(
         HAS_PRECOMPUTED_GATE=g_raw is not None,
         HAS_PRECOMPUTED_CONV=conv_qkv is not None,
         STORE_STATES=store_states,
+        ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     return out
 

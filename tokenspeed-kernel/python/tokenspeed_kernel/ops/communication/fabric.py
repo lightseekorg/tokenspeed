@@ -32,9 +32,21 @@ allocation, so the probe lives here instead of being duplicated per consumer.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import logging
+import socket
+from collections.abc import Sequence
+from pathlib import Path
 
-__all__ = ["fabric_allocation_supported"]
+import torch
+from tokenspeed_kernel.platform import current_platform
+
+__all__ = [
+    "fabric_allocation_supported",
+    "gather_fabric_map",
+    "group_has_fabric",
+    "group_host_span",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +58,8 @@ _CU_MEM_LOCATION_TYPE_DEVICE = 1
 _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 
 _probe_cache: dict[int, bool] = {}
+_fabric_map: list[bool] | None = None
+_host_map: list[int] | None = None
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -170,3 +184,108 @@ def fabric_allocation_supported(device_index: int) -> bool:
         _probe_cache[device_index] = cached
         logger.info("fabric allocation on device %s: %s", device_index, cached)
     return cached
+
+
+def _host_identity() -> int:
+    """An id every rank on one host computes identically, and no other host does.
+
+    The boot id is the host's, not the container's: a launcher that gives each
+    worker its own UTS namespace hands them all the same hostname, so hostnames
+    would merge two machines into one and skip the fabric test that keeps a
+    group off a rendezvous it cannot complete. Hostname is the last resort.
+    """
+    name = ""
+    for path in ("/proc/sys/kernel/random/boot_id", "/etc/machine-id"):
+        try:
+            name = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if name:
+            break
+    if not name:
+        name = socket.gethostname()
+    digest = hashlib.blake2b(name.encode(), digest_size=8).digest()
+    # Signed 64-bit, because the gather carries it in an int64 tensor.
+    return int.from_bytes(digest, "big") >> 1
+
+
+def gather_fabric_map() -> list[bool]:
+    """Gather and cache every world rank's fabric-allocation verdict and host.
+
+    Fabric handles are an NVIDIA concept, so off NVIDIA the answer is no for
+    every rank and is filled in without a collective. Deciding that here rather
+    than at the call site keeps the collective out of a lazy path: a caller
+    that skipped this on the wrong platform would otherwise trigger the gather
+    from a gate, which is the dispatch-time collective this map exists to
+    remove.
+
+    That branch is the one thing here the ranks do not agree on by
+    construction. ``is_nvidia`` is detected locally, so a job mixing CUDA and
+    non-CUDA ranks would have some enter the all_gather and others return, and
+    the ones that entered would wait out the NCCL timeout. The caller it
+    replaced read a server argument, which was uniform; this reads the machine.
+    """
+    global _fabric_map, _host_map
+
+    if _fabric_map is not None:
+        return _fabric_map
+
+    world_size = torch.distributed.get_world_size()
+    if not current_platform().is_nvidia:
+        # No fabric to map, so every rank is its own host and every span declines.
+        _fabric_map = [False] * world_size
+        _host_map = list(range(world_size))
+        return _fabric_map
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    local = torch.tensor(
+        [int(fabric_allocation_supported(device.index)), _host_identity()],
+        dtype=torch.int64,
+        device=device,
+    )
+    gathered = [torch.empty_like(local) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, local, group=torch.distributed.group.WORLD)
+    _fabric_map = [bool(value[0].item()) for value in gathered]
+    _host_map = [int(value[1].item()) for value in gathered]
+    logger.info(
+        "fabric allocation available on %s/%s ranks across %s hosts",
+        sum(_fabric_map),
+        len(_fabric_map),
+        len(set(_host_map)),
+    )
+    return _fabric_map
+
+
+def group_has_fabric(ranks: Sequence[int]) -> bool:
+    """Return whether every rank in ``ranks`` reported fabric support.
+
+    Raises if the map has not been gathered, rather than gathering it here.
+    This is asked from dispatch, where the ranks present are the group's and
+    not the world's, so a lazy gather would run a world collective from a
+    stage or a data-parallel subset and hang the ranks that never arrive. A
+    missing map means the initialization hook did not run, which is a wiring
+    bug; callers outside a server must gather it themselves.
+    """
+    if _fabric_map is None:
+        raise RuntimeError(
+            "fabric map was never gathered; call gather_fabric_map() at "
+            "distributed initialization before any reachability gate"
+        )
+    return all(_fabric_map[rank] for rank in ranks)
+
+
+def group_host_span(ranks: Sequence[int]) -> int | None:
+    """How many distinct hosts ``ranks`` occupy, or ``None`` if never gathered.
+
+    Placement is read from the map rather than divided out of the visible device
+    count: a job running fewer workers than a host has GPUs puts two hosts inside
+    one ``rank // device_count`` window, and a group called node-local that way
+    skips the fabric test and hangs in the rendezvous instead of declining.
+
+    ``None`` rather than a raise, because the caller is a gate that declines what
+    it cannot establish. ``group_has_fabric`` raises because by the time it is
+    asked, the decision to consult the map has already been taken.
+    """
+    if _host_map is None:
+        return None
+    return len({_host_map[rank] for rank in ranks})

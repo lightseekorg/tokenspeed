@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton import dsv4 as ops
+from tokenspeed_kernel.ops.attention.dsv4 import triton as ops
 
 
 @pytest.fixture(autouse=True)

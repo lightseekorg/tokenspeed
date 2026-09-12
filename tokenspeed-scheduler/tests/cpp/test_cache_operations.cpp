@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 
 #include "cache/core/block_pool.h"
@@ -16,19 +17,16 @@ namespace tokenspeed::test {
 static_assert(std::is_aggregate_v<WriteBackOperation>);
 static_assert(std::is_aggregate_v<LoadBackOperation>);
 
-TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
+TEST(CacheOperationTest, WriteBackFlattensOpsInOrderWithPerOpGuard) {
     WriteBackOperation op;
     op.op_id = 7;
-    op.transfers = {
-        CacheTransfer{0, 1, 11},
-        CacheTransfer{0, 2, 22},
-        CacheTransfer{0, 1, 11},
-    };
-    WriteBackOperation duplicate;
-    duplicate.op_id = 8;
-    duplicate.transfers = {CacheTransfer{0, 2, 22}, CacheTransfer{0, 3, 33}};
+    op.transfers = {CacheTransfer{0, 1, 11}, CacheTransfer{0, 2, 22}};
+    WriteBackOperation pinned;
+    pinned.op_id = 8;
+    pinned.transfers = {CacheTransfer{0, 3, 33}};
+    pinned.source_pinned = true;
 
-    WriteBackBatch batch({op, duplicate});
+    WriteBackBatch batch({op, pinned});
 
     ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({7, 8}));
     EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 0}));
@@ -36,6 +34,43 @@ TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({11, 22}));
     EXPECT_EQ(batch.src_pages[1], std::vector<std::int32_t>({3}));
     EXPECT_EQ(batch.dst_pages[1], std::vector<std::int32_t>({33}));
+    EXPECT_EQ(batch.source_pinned, std::vector<bool>({false, true}))
+        << "the guard travels per op; an unset op reads as stream-ordered";
+}
+
+TEST(CacheOperationTest, RepeatedTransferWithinOnePlanIsASchedulerBug) {
+    // A store skips keys already in flight and a load targets freshly acquired
+    // pages, so the same (group, source, destination) cannot legitimately
+    // appear twice in one plan -- neither within an op nor across ops. The
+    // wire type refuses it instead of silently dropping the repeat, which
+    // would hand the runtime an op it can never acknowledge.
+    WriteBackOperation within;
+    within.op_id = 7;
+    within.transfers = {CacheTransfer{0, 1, 11}, CacheTransfer{0, 1, 11}};
+    EXPECT_THROW(WriteBackBatch{{within}}, std::runtime_error);
+
+    WriteBackOperation first;
+    first.op_id = 7;
+    first.transfers = {CacheTransfer{0, 2, 22}};
+    WriteBackOperation second;
+    second.op_id = 8;
+    second.transfers = {CacheTransfer{0, 2, 22}};
+    EXPECT_THROW(WriteBackBatch({first, second}), std::runtime_error);
+
+    LoadBackOperation load;
+    load.op_id = 9;
+    load.transfers = {CacheTransfer{0, 10, 20}, CacheTransfer{0, 10, 20}};
+    EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
+}
+
+TEST(CacheOperationTest, OpWithoutTransfersIsASchedulerBug) {
+    WriteBackOperation store;
+    store.op_id = 7;
+    EXPECT_THROW(WriteBackBatch{{store}}, std::runtime_error);
+
+    LoadBackOperation load;
+    load.op_id = 9;
+    EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
 }
 
 TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {
@@ -97,8 +132,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
-            .rows_per_page = 2,
-            .entry_stride_tokens = 1,
+            .block_granularity = 2,
             .total_pages = 4,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -127,8 +161,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
-            .rows_per_page = 2,
-            .entry_stride_tokens = 1,
+            .block_granularity = 2,
             .total_pages = 9,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
@@ -143,7 +176,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
     EXPECT_EQ(small_host.MaxSingleRequestTokens(), large_host.MaxSingleRequestTokens());
 }
 
-TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins) {
+TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     BlockPool device_pool{2};
     BlockPool host_pool{1};
     const std::array specs{CacheGroupSpec{
@@ -163,8 +196,10 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    auto write_back = transfers.StartPendingStores();
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered);
     ASSERT_TRUE(write_back);
+    EXPECT_FALSE(write_back->source_pinned);
+    EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
     coordinator.Free(tables);
     // The ticket pins no Device source: the runtime orders the D2H copy on
     // the forward thread's stream ahead of any reuse, so the cache stays clearable.
@@ -172,6 +207,46 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+}
+
+TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
+    BlockPool device_pool{1};
+    BlockPool host_pool{1};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(admission);
+    const std::array<std::string, 1> hashes{"h0"};
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch);
+
+    coordinator.QueueCachedBlocksForStore(hashes);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    ASSERT_TRUE(write_back);
+    EXPECT_TRUE(write_back->source_pinned);
+    EXPECT_TRUE(transfers.HasPinnedStoresInFlight());
+    coordinator.Free(tables);
+    // The owner is gone, but the ticket still holds the Device source: it is
+    // neither evictable nor clearable until the runtime acknowledges the copy.
+    EXPECT_FALSE(coordinator.ClearDeviceCache());
+    std::vector<BlockTable> newcomer(1);
+    std::vector<GroupDemand> newcomer_demands{{.table = &newcomer[0], .num_tokens = 2}};
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands))
+        << "the only Device block is pinned by the in-flight store";
+
+    transfers.CompleteWriteBack(write_back->op_id);
+    EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+    EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands))
+        << "the ACK released the pin; the block is evictable again";
 }
 
 TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
@@ -196,7 +271,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(first_key);
     const std::array first_hashes{first_key.content_hash};
     coordinator.QueueCachedBlocksForStore(first_hashes);
-    auto first = transfers.StartPendingStores();
+    auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
     ASSERT_TRUE(first);
     ASSERT_EQ(first->transfers.size(), 1u);
     const std::int32_t destination = first->transfers.front().destination_page;
@@ -205,11 +280,11 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(second_key);
     const std::array second_hashes{second_key.content_hash};
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    EXPECT_FALSE(transfers.StartPendingStores());
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck));
 
     transfers.CompleteWriteBack(first->op_id);
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    auto second = transfers.StartPendingStores();
+    auto second = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
     ASSERT_TRUE(second);
     ASSERT_EQ(second->transfers.size(), 1u);
     EXPECT_EQ(second->transfers.front().destination_page, destination);
@@ -238,7 +313,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    EXPECT_FALSE(transfers.StartPendingStores());
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck));
     coordinator.Free(tables);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
 }
@@ -288,7 +363,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
-    auto write_back = transfers.StartPendingStores();
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 
     ASSERT_TRUE(write_back);
     ASSERT_EQ(write_back->transfers.size(), 2u);
@@ -336,8 +411,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     config.role = Role::kD;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
@@ -364,8 +438,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.role = Role::kP;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
-        .rows_per_page = 2,
-        .entry_stride_tokens = 1,
+        .block_granularity = 2,
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,

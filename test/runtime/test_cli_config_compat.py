@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import BLOCK_SPEC_RULES
 
 
 class TestCLIConfigCompat(unittest.TestCase):
@@ -262,12 +263,6 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
         self.assertEqual(args.max_num_seqs, 256)
 
-    def test_dp_sampling_backend_arg_removed(self):
-        with self.assertRaises(SystemExit):
-            self._parse_args(
-                ["--model", "test/model", "--dp-sampling-backend", "onesided"]
-            )
-
     def test_max_prefill_tokens_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--max-prefill-tokens", "4096"]
@@ -422,6 +417,39 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--kv-events-config", config])
         sa = self._from_cli_args_no_init(args)
         self.assertEqual(sa.kv_events_config, config)
+
+    def test_l2_cache_options_across_engine_roles(self):
+        for role in ("null", "prefill", "decode", "encode"):
+            for io_backend in ("direct", "kernel"):
+                for disabled in (False, True):
+                    with self.subTest(
+                        role=role, io_backend=io_backend, disabled=disabled
+                    ):
+                        argv = [
+                            "--model",
+                            "test/model",
+                            "--disaggregation-mode",
+                            role,
+                            "--kvstore-io-backend",
+                            io_backend,
+                            "--kvstore-ratio",
+                            "3",
+                            "--kvstore-size",
+                            "8",
+                        ]
+                        if disabled:
+                            argv.append("--disable-kvstore")
+                        if role == "decode":
+                            argv.append("--no-enable-prefix-caching")
+                        sa = self._from_cli_args_no_init(self._parse_args(argv))
+                        sa.resolve_cache()
+
+                        self.assertEqual(
+                            sa.enable_kvstore, not disabled and role != "encode"
+                        )
+                        self.assertEqual(sa.kvstore_io_backend, io_backend)
+                        self.assertEqual(sa.kvstore_ratio, 3)
+                        self.assertEqual(sa.kvstore_size, 8)
 
     def test_speculative_draft_quantization_defaults_to_unquant(self):
         args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])
@@ -623,6 +651,50 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(server_args.speculative_draft_model_path, "draft-checkpoint")
         self.assertEqual(server_args.speculative_num_steps, 5)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_block_spec_widths_record_whether_they_were_asked_for(self):
+        """ModelConfig only overwrites the widths the user left defaulted."""
+        for extra, explicit in (
+            ([], False),
+            (["--speculative-num-steps", "7"], True),
+            (["--speculative-num-draft-tokens", "8"], True),
+            (
+                [
+                    "--speculative-config",
+                    '{"method":"dflash","num_speculative_tokens":8}',
+                ],
+                True,
+            ),
+        ):
+            with self.subTest(extra=extra):
+                args = self._parse_args(
+                    ["--model", "test/model", "--speculative-algorithm", "DFLASH"]
+                    + extra
+                )
+                sa = self._from_cli_args_no_init(args)
+                sa.resolve_basic_defaults()
+
+                self.assertEqual(sa._speculative_widths_explicit, explicit)
+
+    def test_block_spec_step_mismatch_states_the_family_rules(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--speculative-num-steps",
+                "7",
+                "--speculative-num-draft-tokens",
+                "7",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+
+        with self.assertRaises(ValueError) as ctx:
+            sa.resolve_speculative_decoding()
+        self.assertIn(BLOCK_SPEC_RULES, str(ctx.exception))
 
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])

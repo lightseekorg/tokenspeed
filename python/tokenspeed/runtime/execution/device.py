@@ -268,13 +268,17 @@ class DeviceHandle:
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
-        The whole plan on the FIFO -- one thread, one stream -- in an order
+        The whole plan on the FIFO -- one thread, explicitly ordered streams -- in an order
         that IS the correctness argument for same-round page reuse:
-        retraction write-backs first (they must read the reused pages' old
-        bytes), then page zeroing (the new owner's sanitization), then
-        load-backs (they target zeroed pages), the transfer peer's remote
-        streams, and finally the ``ForwardBatch``. The loop hands the round
-        over and does not branch on it.
+        write-backs first (a stream-ordered one -- a retraction's snapshot,
+        whose sources this plan may re-grant -- fences the caller's stream
+        on its completion so it reads the reused pages' old bytes; a pinned
+        one -- an ordinary publication, whose sources the scheduler holds
+        until the ACK -- rides the write stream and fences nothing), then
+        page zeroing (the new owner's sanitization), then load-backs (they
+        target zeroed pages), the transfer peer's remote streams, and finally
+        the ``ForwardBatch``. The loop hands the round over and does not
+        branch on it.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
@@ -304,10 +308,19 @@ class DeviceHandle:
         executor = self._executor
         l2 = self._l2 if execution_plan.cache else None
         if l2 is not None:
-            # Ahead of the zeroing: a retraction's snapshot sources may be
-            # this very plan's pages_to_zero.
+            # Ahead of the zeroing: a stream-ordered store's sources may be
+            # this very plan's pages_to_zero, and its fence lands on the
+            # default stream the zeroing runs on, before the zeroing is
+            # enqueued. The copies themselves order behind the execution
+            # stream, where the forwards wrote the pages.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_write_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_write_backs(
+                        execution_plan,
+                        prerequisite_stream=executor.execution_stream,
+                        fence_stream=executor.default_stream,
+                    )
+                )
             )
         pages = execution_plan.pages_to_zero
         zero_future = (
@@ -316,8 +329,14 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # Behind the zeroing: the loads' destinations were zeroed on the
+            # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_load_backs(
+                        execution_plan, prerequisite_stream=executor.default_stream
+                    )
+                )
             )
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
@@ -449,10 +468,10 @@ class DeviceHandle:
         pages, so it must follow them and the zeroing fence (Mooncake and
         GPUDirect writes are not ordered by the zeroing stream, so the
         destination pages must be published from sanitized memory). The same
-        fence covers a retraction write-back reading pages this admission was
-        granted: the zero event is recorded on the forward thread's stream
-        AFTER the write-back copies, so waiting on it waits on them too. One
-        ordered
+        fence covers a retraction's stream-ordered write-back reading pages
+        this admission was granted: the zero event is recorded on the forward
+        thread's stream AFTER that stream waited on the write-back's
+        completion, so waiting on it waits on the copy too. One ordered
         unit, so one submission — asynchronous like every other: completion
         arrives through the transfer events, and a submission failure
         surfaces from the settle at the next round's execute.
@@ -593,7 +612,18 @@ class DeviceHandle:
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
-        return self._thread.run(lambda: handler(req))
+
+        def _apply_update():
+            result = handler(req)
+            if (
+                type(req) is UpdateWeightsFromDistributedReqInput
+                and result[0]
+                and self._executor.drafter is not None
+            ):
+                self._executor.drafter.on_target_weights_updated()
+            return result
+
+        return self._thread.run(_apply_update)
 
 
 def build_device_side(
@@ -617,11 +647,11 @@ def build_device_side(
     control face and the encoder-facts callable it consumes at startup, and
     the handle it runs with.
 
-    The chain is linear and the order is load-bearing: the multimodal
-    runtime must be prepared after weights are loaded and before
-    ``create_attn_components`` profiles memory for the KV budget, and the
-    chunked-prefill limit must be aligned to the cache groups before
-    ``ModelExecutorConfig`` sizes the input buffers from it.
+    The chain is linear and the order is load-bearing: the multimodal runtime
+    and persistent communication buffers must be prepared after weights are
+    loaded and before ``create_attn_components`` profiles memory for the KV
+    budget, and the chunked-prefill limit must be aligned to the cache groups
+    before ``ModelExecutorConfig`` sizes the input buffers from it.
 
     Args:
         server_args: Parsed server arguments. ``chunked_prefill_size`` may
@@ -660,7 +690,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import get_colorful_logger
+    from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 
     logger = get_colorful_logger(__name__)
 
@@ -669,6 +699,18 @@ def build_device_side(
     )
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
+    max_forward_tokens = (
+        server_args.chunked_prefill_size
+        if server_args.chunked_prefill_size > 0
+        else server_args.max_prefill_tokens + server_args.max_model_len
+    )
+    max_forward_tokens = max(
+        max_forward_tokens,
+        max_batch_size * decode_input_tokens,
+    )
+    target.prepare_communication_runtime(max_forward_tokens)
+    if draft is not None:
+        draft.prepare_communication_runtime(max_forward_tokens)
 
     (
         attn_backend,
@@ -725,6 +767,9 @@ def build_device_side(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
+    executor.capture_graphs()
+    # Tuning and capture draw from the generator; this is the state startup leaves.
+    set_random_seed(48)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
@@ -741,11 +786,6 @@ def build_device_side(
 
     l2_cache_executor = None
     if server_args.enable_kvstore:
-        if server_args.kvstore_storage_backend is not None:
-            raise NotImplementedError(
-                "the cache-group scheduler has no L3 storage tier; unset "
-                "--kvstore-storage-backend"
-            )
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(

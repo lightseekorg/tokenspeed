@@ -30,7 +30,28 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
+    zero_byte_ranges,
 )
+
+
+@pytest.mark.parametrize("extra_ranges", [0, 60])
+def test_zero_byte_ranges_strides_and_preserves_neighbors(
+    device: str, extra_ranges: int
+) -> None:
+    # Four ranges use a 256-CTA Y cap; 64 ranges use the 32-CTA cap.
+    # The largest payload extends three bytes past three 256-KiB spans,
+    # exercising repeated loop iterations and a partial final tile.
+    ranges = [(3, 7), (31, 27648), (30003, 73729), (110001, 786435)]
+    ranges.extend((900001 + i * 16, 3) for i in range(extra_ranges))
+    backing = torch.full((901025,), 173, dtype=torch.uint8, device=device)
+    expected = torch.full((901025,), 173, dtype=torch.uint8, device="cpu")
+    for offset, size in ranges:
+        expected[offset : offset + size] = 0
+
+    zero_byte_ranges(backing, ranges)
+
+    # Compare every byte, including leading/trailing guards and inter-range gaps.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 32])

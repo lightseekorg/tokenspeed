@@ -21,14 +21,15 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
     dsa_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -50,6 +51,9 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.attention.registry import register_backend
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 def _make_dense_leaf(
@@ -189,9 +193,11 @@ class DSABackend(PagedAttentionBackend):
     def child_backends(self):
         return (self._dense_backend,)
 
-    def set_cache_pool(self, cache_pool) -> None:
-        super().set_cache_pool(cache_pool)
-        self._dense_backend.set_cache_pool(cache_pool)
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._prefill_page_table = None
+        if self.kpool_runtime is not None:
+            self.kpool_runtime.reset_forward(None)
 
     def register_step_counter(self, step_counter):
         self.step_counter = step_counter
