@@ -6,9 +6,6 @@ TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workl
 
 Core components:
 
-- **Modeling layer**: local-SPMD design with a static compiler that generates
-  collective communication from module-boundary placement annotations, so users
-  do not hand-write parallelism logic.
 - **Scheduler**: C++ control plane and Python execution plane. Request
   lifecycle, KV cache ownership, and overlap timing are encoded as a
   finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
