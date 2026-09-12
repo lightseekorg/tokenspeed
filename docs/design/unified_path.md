@@ -437,7 +437,9 @@ with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
-dense attention. Draft step zero still preserves the dense decode-context
+dense attention. Sparse QSA requires `save_kv_cache=True` because it always
+writes the full KV cache; the dense fallback honors the caller's flag.
+Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 

@@ -25,6 +25,7 @@ import sys
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +33,8 @@ import torch
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.graph_ptr_guard import snapshot_graph_metadata
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
     QSAIndexerBackend,
 )
@@ -60,6 +63,49 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+
+@pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
+@pytest.mark.parametrize("save_kv_cache", [False, True])
+def test_qsa_sparse_requires_cache_write(monkeypatch, forward_name, save_kv_cache):
+    backend = object.__new__(QSAAttnBackend)
+    sparse = Mock(return_value=object())
+    monkeypatch.setattr(backend, "_sparse_attention", sparse)
+    args = tuple(object() for _ in range(6))
+    topk, ctx = object(), object()
+    forward = partial(
+        getattr(backend, forward_name),
+        *args,
+        bs=1,
+        save_kv_cache=save_kv_cache,
+        topk_indices=topk,
+        ctx=ctx,
+    )
+    if save_kv_cache:
+        assert forward() is sparse.return_value
+        sparse.assert_called_once_with(*args, topk, ctx)
+    else:
+        with pytest.raises(AssertionError, match="QSA.*requires save_kv_cache=True"):
+            forward()
+        sparse.assert_not_called()
+
+
+@pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
+@pytest.mark.parametrize("save_kv_cache", [False, True])
+def test_qsa_dense_forwards_cache_write_flag(monkeypatch, forward_name, save_kv_cache):
+    backend = object.__new__(QSAAttnBackend)
+    dense = Mock(return_value=object())
+    monkeypatch.setattr(MHAAttnBackend, forward_name, dense)
+    args = tuple(object() for _ in range(6))
+    output = getattr(backend, forward_name)(
+        *args,
+        bs=1,
+        save_kv_cache=save_kv_cache,
+        topk_indices=None,
+        ctx=object(),
+    )
+    assert output is dense.return_value
+    dense.assert_called_once_with(*args, 1, save_kv_cache=save_kv_cache)
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:

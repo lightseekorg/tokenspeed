@@ -236,6 +236,7 @@ class _AttnSideProfile:
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
     is_dsa_kda: bool
+    is_qwen4_exp: bool
     is_qsa: bool
     is_inkling: bool
     is_deepseek_v4: bool
@@ -255,6 +256,7 @@ def _resolve_attn_side(
     hf_config = model_config.hf_config
     architectures = getattr(hf_config, "architectures", None) or []
     text_config = getattr(hf_config, "text_config", hf_config)
+    qwen4_exp = is_qwen4_exp(hf_config)
     is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     return _AttnSideProfile(
@@ -264,8 +266,8 @@ def _resolve_attn_side(
         is_kda=is_dsa_kda
         or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
         is_dsa_kda=is_dsa_kda,
-        is_qsa=is_qwen4_exp(hf_config)
-        and getattr(text_config, "indexer_n_heads", None) is not None,
+        is_qwen4_exp=qwen4_exp,
+        is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
         # The DSpark draft resolves as a V4 architecture but has no paged
         # attention config of its own; it must not take the V4 branches.
@@ -364,14 +366,13 @@ def _has_state_layers(config: AttnConfig) -> bool:
 
 def _resolve_cache_family(
     profile: _AttnSideProfile,
-    model_config: ModelConfig,
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.is_deepseek_v4:
         return "deepseek_v4"
     # PLE and QSA are cache consumers even in a view without GDN layers.
-    if is_qwen4_exp(model_config.hf_config):
+    if profile.is_qwen4_exp:
         return "qwen4_exp"
     if profile.is_hybrid_gdn and _has_state_layers(config):
         return "qwen_gdn"
@@ -1029,7 +1030,7 @@ def create_attn_components(
     softmax_attn = config.component(SoftmaxAttnConfig)
     if target.is_deepseek_v4:
         softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
-    cache_family = _resolve_cache_family(target, model_config, config)
+    cache_family = _resolve_cache_family(target, config)
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )

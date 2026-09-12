@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
@@ -45,6 +46,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
     CacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.registry import (
+    _resolve_attn_side,
+    _resolve_cache_family,
 )
 
 
@@ -121,6 +126,56 @@ def _recipe(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
+        "Qwen3_5ForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("indexer_n_heads", [None, 1])
+@pytest.mark.parametrize("has_gdn", [False, True])
+def test_cache_family_preserves_qwen4_without_indexer_or_gdn(
+    architecture, indexer_n_heads, has_gdn
+) -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=[architecture],
+            text_config=SimpleNamespace(indexer_n_heads=indexer_n_heads),
+        )
+    )
+    profile = _resolve_attn_side(model_config, None)
+    config = _recipe(
+        layer_types=(FULL_ATTENTION,), speculative=False, width=1
+    ).attn_config
+    if has_gdn:
+        config = replace(
+            config,
+            components=(
+                replace(
+                    config.component(MHAConfig),
+                    cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+                ),
+                LinearAttnConfig(
+                    num_k_heads=1,
+                    num_v_heads=1,
+                    head_k_dim=2,
+                    head_v_dim=2,
+                    conv_kernel_size=4,
+                    layer_ids=(0,),
+                    tp_size=1,
+                ),
+            ),
+        )
+    is_qwen4 = architecture.startswith("Qwen4Exp")
+    assert profile.is_qwen4_exp is is_qwen4
+    assert profile.is_qsa is (is_qwen4 and indexer_n_heads is not None)
+    expected_family = "qwen4_exp" if is_qwen4 else "qwen_gdn" if has_gdn else "mha"
+    assert _resolve_cache_family(profile, config) == expected_family
 
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])

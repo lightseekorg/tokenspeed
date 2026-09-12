@@ -158,6 +158,7 @@ class QSAAttnBackend(MHAAttnBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        assert save_kv_cache, "QSA sparse attention requires save_kv_cache=True"
         return self._sparse_attention(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, topk_indices, ctx
         )
@@ -190,6 +191,7 @@ class QSAAttnBackend(MHAAttnBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        assert save_kv_cache, "QSA sparse attention requires save_kv_cache=True"
         return self._sparse_attention(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, topk_indices, ctx
         )

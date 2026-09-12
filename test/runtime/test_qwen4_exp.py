@@ -567,12 +567,11 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
 
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize(
-    ("mode", "query_width", "save_kv_cache"),
+    ("mode", "query_width"),
     [
-        (ForwardMode.EXTEND, 1, False),
-        (ForwardMode.EXTEND, 1, True),
-        (ForwardMode.DECODE, 4, True),
-        (ForwardMode.DECODE, 1, True),
+        (ForwardMode.EXTEND, 1),
+        (ForwardMode.DECODE, 4),
+        (ForwardMode.DECODE, 1),
     ],
 )
 def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
@@ -580,7 +579,6 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     hybrid: bool,
     mode: ForwardMode,
     query_width: int,
-    save_kv_cache: bool,
 ) -> None:
     router = _qsa_router(kernel_page_size=64, max_bs=4, spec=4)
     raw = torch.tensor([[3], [5]], dtype=torch.int32)
@@ -656,14 +654,14 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
         keys,
         keys,
         ctx,
-        save_kv_cache=save_kv_cache,
+        save_kv_cache=True,
         record_kv_cache=None,
         topk_indices=topk,
     )
     assert output.shape == queries.shape
     expected_events = ["attention"]
     if mode.is_extend():
-        expected_events.insert(1 if save_kv_cache else 0, "cache_step")
+        expected_events.append("cache_step")
     assert events == expected_events
 
 
