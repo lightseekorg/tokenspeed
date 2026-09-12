@@ -31,6 +31,13 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     attn_reduce_shape_supported,
     build_attn_reduce_collective,
 )
+from tokenspeed_kernel.platform import current_platform
+
+# CI runs this subtree on every runner, so the file guards itself, as its
+# neighbours here do.
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="the CuteDSL collective is NVIDIA-only"
+)
 
 
 def test_the_attention_builder_asks_for_the_residual_epilogue(

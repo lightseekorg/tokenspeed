@@ -296,17 +296,6 @@ def test_the_operator_can_forbid_the_fused_attention_reduce():
     )
 
 
-def test_widths_the_collective_cannot_serve_are_declined_not_raised():
-    """The constructor raises; the gate has to answer before it is reached."""
-    from tokenspeed_kernel.ops.moe.latent_tail import attn_reduce_shape_supported
-
-    assert attn_reduce_shape_supported(tp_size=8, hidden_size=7168)
-    assert attn_reduce_shape_supported(tp_size=16, hidden_size=7168)
-    # Cluster width is tp_size here, and the kernel takes powers of two <= 16.
-    for tp in (7, 12, 24, 32):
-        assert not attn_reduce_shape_supported(tp_size=tp, hidden_size=7168)
-
-
 def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: bool):
     """Stand up K3AttnCommState's collaborators so arming can be exercised."""
     from tokenspeed.runtime.models import kimi_k3_comm as mod
