@@ -84,6 +84,7 @@ class AttnResTests(unittest.TestCase):
         group = object()
         state = SimpleNamespace(
             attn_ar_fusion_ok=False,
+            cute_ar=None,
             mapping=SimpleNamespace(
                 nprocs_per_node=8,
                 attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
@@ -135,6 +136,7 @@ class AttnResTests(unittest.TestCase):
         group = object()
         state = SimpleNamespace(
             attn_ar_fusion_ok=False,
+            cute_ar=None,
             mapping=SimpleNamespace(
                 nprocs_per_node=8,
                 attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),

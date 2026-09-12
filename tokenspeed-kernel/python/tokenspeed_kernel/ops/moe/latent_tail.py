@@ -348,6 +348,7 @@ class KimiK3LatentTailOp:
                         scratch_allocator=effective_scratch_allocator,
                         finalize_top_k=contract.finalize_top_k,
                         precompile_split=contract.split_collective,
+                        residual_from_shared=False,
                     ),
                     up_projection=AdaptiveUpProjectionKernel(
                         group=group,
@@ -652,4 +653,89 @@ class KimiK3LatentTailOp:
         return self._lamport_copy(mailbox, m=m, residual=prefix).squeeze(0)
 
 
-__all__ = ["KimiK3LatentTailOp", "latent_tail_supported"]
+def attn_reduce_shape_supported(*, tp_size: int, hidden_size: int) -> bool:
+    """Whether the collective's geometry admits an attention reduce this wide.
+
+    Args:
+        tp_size: Attention tensor-parallel width.
+        hidden_size: Model hidden width. The attention reduce carries no
+            latent projection, so this is both the latent and hidden dim.
+
+    Returns:
+        ``True`` when :func:`build_attn_reduce_collective` can be built for
+        this pair; ``False`` when the cluster geometry rules it out or the
+        platform cannot import the collective at all. The constructor raises
+        rather than declining, so a caller wanting a capability answer asks
+        here first.
+    """
+    try:
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+            validate_shape,
+        )
+
+        validate_shape(tp_size=tp_size, latent_dim=hidden_size, hidden_dim=hidden_size)
+    except (ImportError, ValueError):
+        # The collective needs cuda bindings; a platform without them declines.
+        return False
+    return True
+
+
+def build_attn_reduce_collective(
+    *,
+    group: dist.ProcessGroup,
+    rank: int,
+    tp_size: int,
+    hidden_size: int,
+    max_tokens: int,
+) -> "CollectiveKernel":
+    """Build the collective that serves Kimi-K3's attention reduce.
+
+    The epilogue emits ``all_reduce(partial) + residual`` instead of a
+    RMSNorm. The norm weight goes unread in this mode, but ``__call__`` still
+    shape-checks it, so callers must keep passing one.
+
+    Args:
+        group: Attention tensor-parallel process group. Every rank in it must
+            call this, in lockstep: the constructor rendezvouses.
+        rank: This rank's index within ``group``.
+        tp_size: Size of ``group``.
+        hidden_size: Model hidden width; see
+            :func:`attn_reduce_shape_supported`, which must accept the pair
+            before this is called.
+        max_tokens: Widest reduce this instance will serve. The result comes
+            back as a view of the collective's own buffer, valid until the
+            next call.
+
+    Returns:
+        A ``CollectiveKernel`` to be called with
+        ``include_reduce_scatter=False, include_routed=True``. Its first
+        return is a view of the instance's own latent buffer and stays valid
+        only until the next call on this instance -- which, since the runtime
+        holds one per process, means any caller's next call.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import CollectiveKernel
+
+    return CollectiveKernel(
+        group=group,
+        rank=rank,
+        tp_size=tp_size,
+        latent_dim=hidden_size,
+        hidden_dim=hidden_size,
+        max_m=max_tokens,
+        max_token_ctas=max_tokens,
+        rms_eps=1.0,
+        fp32_internal=True,
+        scratch_allocator=None,
+        finalize_top_k=None,
+        precompile_split=True,
+        residual_from_shared=True,
+    )
+
+
+__all__ = [
+    "KimiK3LatentTailOp",
+    "multicast_backend_available",
+    "attn_reduce_shape_supported",
+    "build_attn_reduce_collective",
+    "latent_tail_supported",
+]

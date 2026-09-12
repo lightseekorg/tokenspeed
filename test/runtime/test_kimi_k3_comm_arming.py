@@ -30,12 +30,30 @@ TAIL_FUSION request crashes the experts layer with
 
 from __future__ import annotations
 
+import os
+import sys
+from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import pytest
 import torch
 
-from tokenspeed.runtime.models.kimi_k3_comm import _tail_finalize_top_k
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=2, suite="runtime-1gpu")
+
+# The iris cases drive the CDNA4 branch, which imports an AMD-only package.
+needs_iris = pytest.mark.skipif(
+    find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
+
+from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
+    ATTN_AR_MAX_TOKENS,
+    _tail_finalize_top_k,
+    attn_ar_eligible,
+)
 
 
 def test_arming_requires_experts_capability_bit():
@@ -54,6 +72,7 @@ def test_arming_requires_fused_moe_ar():
     assert _tail_finalize_top_k(10, plan, False) is None
 
 
+@needs_iris
 def test_iris_preparation_deduplicates_equal_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -87,6 +106,7 @@ def test_iris_preparation_deduplicates_equal_groups(monkeypatch):
     )
 
 
+@needs_iris
 def test_iris_preparation_handles_distinct_groups(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -132,6 +152,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     ]
 
 
+@needs_iris
 def test_iris_preparation_handles_moe_only_group(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -166,6 +187,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     )
 
 
+@needs_iris
 def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm
 
@@ -197,3 +219,160 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         dtype=torch.bfloat16,
         backend=None,
     )
+
+
+def test_attention_collective_gate():
+    # Literals: asserting the constant against itself would pin nothing.
+    assert ATTN_AR_MAX_TOKENS == 8
+    # An unarmed group never takes the collective; shape cannot override that.
+    assert not attn_ar_eligible(
+        armed=False, has_prefix=True, num_tokens=1, fusion_max_tokens=2048
+    )
+    # The window edge is ours; anything wider is the vendor's.
+    assert attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=8, fusion_max_tokens=2048
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=9, fusion_max_tokens=2048
+    )
+    # Block-write layers keep no residual for this epilogue to fold in.
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=False, num_tokens=1, fusion_max_tokens=2048
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=0, fusion_max_tokens=2048
+    )
+
+
+def test_the_collective_is_what_serves_an_eligible_reduce():
+    """The predicate is half the contract; the branch must hand it the operands."""
+    from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
+
+    reduced = torch.zeros(1, 8)
+    collective = Mock(return_value=(reduced, "shared"))
+    vendor = Mock(return_value=(None, "vendor-residual", None))
+    comm = K3AttnComm.__new__(K3AttnComm)
+    comm.state = SimpleNamespace(
+        cute_ar=collective,
+        dummy_norm=SimpleNamespace(
+            weight="gamma", forward_with_allreduce_fusion=vendor
+        ),
+        attn_ar_fusion_ok=True,
+    )
+    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1)))
+
+    partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
+    out, mixed = comm.attn_reduce(partial, prefix, None, mlp_wp=None)
+
+    # Both operands are [m, hidden] bf16, so assert identity, not arrival.
+    args, kwargs = collective.call_args
+    assert args[0] is partial and args[1] is prefix
+    assert kwargs["include_reduce_scatter"] is False
+    assert kwargs["include_routed"] is True
+    assert collective.call_count == 1
+    assert out is reduced and mixed is None
+
+    # Assert the vendor took over: an exception would also give call_count zero.
+    collective.reset_mock()
+    wide = torch.zeros(9, 8)
+    comm.attn_reduce(wide, wide, None, mlp_wp=None)
+    assert collective.call_count == 0
+    assert vendor.call_count == 1
+
+
+def test_the_operator_can_forbid_the_fused_attention_reduce():
+    """A negative window is how a server forbids fusing this reduce at all."""
+    # server_args sets -1 when attn and dense TP disagree; 0 is reachable too.
+    for window in (-1, 0):
+        assert not attn_ar_eligible(
+            armed=True, has_prefix=True, num_tokens=1, fusion_max_tokens=window
+        )
+    # A window narrower than the kernel's own ceiling still binds.
+    assert attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=4, fusion_max_tokens=4
+    )
+    assert not attn_ar_eligible(
+        armed=True, has_prefix=True, num_tokens=5, fusion_max_tokens=4
+    )
+
+
+def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: bool):
+    """Stand up K3AttnCommState's collaborators so arming can be exercised."""
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    recorded = {"ops": [], "groups": []}
+
+    class FakeDist:
+        ReduceOp = torch.distributed.ReduceOp
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def all_reduce(tensor, *, op, group):
+            # Required, not defaulted: dropping either in production must fail here.
+            recorded["ops"].append(op)
+            recorded["groups"].append(group)
+            if not peers_agree:
+                tensor.zero_()
+
+    monkeypatch.setattr(mod, "dist", FakeDist)
+    monkeypatch.setattr(mod, "prepare_all_reduce_lane", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "prepare_all_reduce_fusion", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_get_process_group", lambda g: "the-group")
+    monkeypatch.setattr(mod, "multicast_backend_available", lambda g: multicast)
+    monkeypatch.setattr(mod, "attn_reduce_shape_supported", lambda **k: shape_ok)
+    monkeypatch.setattr(
+        mod, "global_server_args_dict", {"comm_fusion_max_num_tokens": 2048}
+    )
+    monkeypatch.setattr(
+        mod, "RMSNorm", lambda h, eps: SimpleNamespace(weight=torch.ones(1))
+    )
+    builder = Mock(return_value="collective")
+    monkeypatch.setattr(mod, "build_attn_reduce_collective", builder)
+    recorded["builder"] = builder
+    return mod, recorded
+
+
+_ARMING_MAPPING = SimpleNamespace(
+    attn=SimpleNamespace(tp_size=8, tp_rank=3, tp_group=object())
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
+def test_arming_builds_only_when_every_rank_agrees(monkeypatch):
+    """A rank that armed alone would sit in a rendezvous its peers never join."""
+    mod, rec = _arming_world(
+        monkeypatch, multicast=True, shape_ok=True, peers_agree=True
+    )
+    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert state.cute_ar == "collective"
+    # MIN is what makes one dissenting rank stop all of them.
+    assert rec["ops"] == [torch.distributed.ReduceOp.MIN]
+    assert rec["groups"] == ["the-group"]
+    kwargs = rec["builder"].call_args.kwargs
+    assert kwargs["rank"] == 3 and kwargs["tp_size"] == 8  # rank is not size
+    assert kwargs["hidden_size"] == 7168
+    assert kwargs["max_tokens"] == mod.ATTN_AR_MAX_TOKENS
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
+@pytest.mark.parametrize(
+    "multicast,shape_ok,peers_agree",
+    [(False, True, True), (True, False, True), (True, True, False)],
+)
+def test_arming_declines_when_any_probe_or_peer_says_no(
+    monkeypatch, multicast, shape_ok, peers_agree
+):
+    """Each term is load-bearing: the constructor raises, it does not decline."""
+    mod, rec = _arming_world(
+        monkeypatch, multicast=multicast, shape_ok=shape_ok, peers_agree=peers_agree
+    )
+    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert state.cute_ar is None
+    assert rec["builder"].call_count == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

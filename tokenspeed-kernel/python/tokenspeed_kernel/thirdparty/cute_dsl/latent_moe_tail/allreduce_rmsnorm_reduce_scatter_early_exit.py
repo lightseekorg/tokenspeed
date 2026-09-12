@@ -114,6 +114,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         max_m: int,
         max_token_ctas: int,
         fp32_internal: bool = False,
+        # Emit reduced + shared_source, not RMSNorm(reduced); not bit-compatible.
+        residual_from_shared: bool,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         use_pdl: bool | None = None,
@@ -177,6 +179,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             min(max_m, max_token_ctas) if include_reduce_scatter else max_m
         )
         self.fp32_internal = fp32_internal
+        self.residual_from_shared = residual_from_shared
         self.include_reduce_scatter = include_reduce_scatter
         self.include_routed = include_routed
 
@@ -426,13 +429,25 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 )
                 * 2
             )
+            if cutlass.const_expr(self.residual_from_shared):
+                # Past launch_dependents below, this buffer is the successor's.
+                res_ptr = cute.make_ptr(
+                    BFloat16,
+                    (shared_source.iterator + element_offset).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                res_values = packed_u32x4_to_bf16x8(
+                    load_global_u32x4(res_ptr, volatile=True)
+                )
             store_global_u32x4(
                 latent_multicast_ptr + multicast_offset,
                 local_packed,
                 volatile=False,
             )
-            if token == token_cta:
-                cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.residual_from_shared):
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
 
             cute.arch.cluster_arrive()
             # All CTAs must complete this handshake before the st.shared::cluster exchange: a partial wait skews barrier phases and the pre-DSM wait can match a stale phase, losing the peer-entered guarantee.
@@ -502,62 +517,78 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             if cutlass.const_expr(self.fp32_internal):
                 # High-precision fused mode: keep the rank reduction in FP32 through the RMS square.
                 norm_input = accum.load()
-                norm_square = norm_input * norm_input
             else:
                 norm_input_bf16 = accum.load().to(BFloat16)
                 norm_input = norm_input_bf16.to(Float32)
-                # Upstream-compatible mode: BF16 * BF16 first, then promote the rounded square to FP32.
-                norm_square = (norm_input_bf16 * norm_input_bf16).to(Float32)
-            thread_sum = norm_square.reduce(
-                cute.ReductionOp.ADD,
-                init_val=Float32(0.0),
-                reduction_profile=0,
-            )
-            smem = cutlass.utils.SmemAllocator()
-            warp_sums = smem.allocate_tensor(
-                Float32, cute.make_layout((self.warps,)), byte_alignment=4
-            )
-            cluster_sums = smem.allocate_tensor(
-                Float32,
-                cute.make_layout((self.cluster_ctas,)),
-                byte_alignment=4,
-            )
-            block_sum = block_sum_specialized(
-                thread_sum,
-                warp_sums,
-                tidx,
-                self.warps,
-                self.last_warp_lanes,
-                self.last_warp_mask,
-            )
-            if tidx < self.cluster_ctas:
-                local_slot = cluster_sums.iterator + cluster_rank
-                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-                store_shared_cluster_f32(remote_slot, block_sum)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            if cutlass.const_expr(self.residual_from_shared):
+                # Attention reduce: emit reduced+residual, not RMSNorm(reduced).
+                prefix = (norm_input + res_values.to(Float32)).to(BFloat16)
+                store_global_u32x4(
+                    Int64((latent_output.iterator + element_offset).toint()),
+                    bf16x8_to_packed_u32x4(prefix),
+                    volatile=False,
+                )
+                # gdc_wait only waits for the trigger, and the successor reads
+                # this buffer right after it: release the store before signalling.
+                cute.arch.fence_acq_rel_gpu()
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
+            else:
+                if cutlass.const_expr(self.fp32_internal):
+                    norm_square = norm_input * norm_input
+                else:
+                    # Upstream-compatible mode: BF16 * BF16 first, then promote the rounded square to FP32.
+                    norm_square = (norm_input_bf16 * norm_input_bf16).to(Float32)
+                thread_sum = norm_square.reduce(
+                    cute.ReductionOp.ADD,
+                    init_val=Float32(0.0),
+                    reduction_profile=0,
+                )
+                smem = cutlass.utils.SmemAllocator()
+                warp_sums = smem.allocate_tensor(
+                    Float32, cute.make_layout((self.warps,)), byte_alignment=4
+                )
+                cluster_sums = smem.allocate_tensor(
+                    Float32,
+                    cute.make_layout((self.cluster_ctas,)),
+                    byte_alignment=4,
+                )
+                block_sum = block_sum_specialized(
+                    thread_sum,
+                    warp_sums,
+                    tidx,
+                    self.warps,
+                    self.last_warp_lanes,
+                    self.last_warp_mask,
+                )
+                if tidx < self.cluster_ctas:
+                    local_slot = cluster_sums.iterator + cluster_rank
+                    remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                    store_shared_cluster_f32(remote_slot, block_sum)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
 
-            full_sum = Float32(0.0)
-            for peer in cutlass.range_constexpr(self.cluster_ctas):
-                full_sum = full_sum + cluster_sums[peer]
-            inv_rms = cute.math.rsqrt(
-                full_sum / Float32(self.latent_dim) + epsilon, fastmath=True
-            )
-            gamma_ptr = cute.make_ptr(
-                BFloat16,
-                (gamma.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            gamma_values = packed_u32x4_to_bf16x8(
-                load_global_u32x4(gamma_ptr, volatile=False)
-            )
-            result = (norm_input * inv_rms * gamma_values.to(Float32)).to(BFloat16)
-            store_global_u32x4(
-                Int64((latent_output.iterator + element_offset).toint()),
-                bf16x8_to_packed_u32x4(result),
-                volatile=False,
-            )
+                full_sum = Float32(0.0)
+                for peer in cutlass.range_constexpr(self.cluster_ctas):
+                    full_sum = full_sum + cluster_sums[peer]
+                inv_rms = cute.math.rsqrt(
+                    full_sum / Float32(self.latent_dim) + epsilon, fastmath=True
+                )
+                gamma_ptr = cute.make_ptr(
+                    BFloat16,
+                    (gamma.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                gamma_values = packed_u32x4_to_bf16x8(
+                    load_global_u32x4(gamma_ptr, volatile=False)
+                )
+                result = (norm_input * inv_rms * gamma_values.to(Float32)).to(BFloat16)
+                store_global_u32x4(
+                    Int64((latent_output.iterator + element_offset).toint()),
+                    bf16x8_to_packed_u32x4(result),
+                    volatile=False,
+                )
 
             # The x=0 CTA rotates only on its final token wave: waiting for all M arrivals guarantees every token-wave CTA loaded the current generation before the metadata advances.
             if (
@@ -758,6 +789,7 @@ def _compile_key(
     max_m: int,
     max_token_ctas: int,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool,
     include_routed: bool,
     finalize_top_k: int | None = None,
@@ -771,6 +803,7 @@ def _compile_key(
         max_m,
         max_token_ctas,
         fp32_internal,
+        residual_from_shared,
         include_reduce_scatter,
         include_routed,
         finalize_top_k,
@@ -837,6 +870,7 @@ def compile_kernel(
     shared_peer_ptrs: torch.Tensor,
     rms_eps: float,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
     finalize_top_k: int | None = None,
@@ -851,6 +885,7 @@ def compile_kernel(
         max_m,
         max_token_ctas,
         fp32_internal,
+        residual_from_shared,
         include_reduce_scatter,
         include_routed,
         finalize_top_k,
@@ -875,6 +910,7 @@ def compile_kernel(
         max_m=max_m,
         max_token_ctas=max_token_ctas,
         fp32_internal=fp32_internal,
+        residual_from_shared=residual_from_shared,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
         finalize_top_k=finalize_top_k,
@@ -925,6 +961,7 @@ def launch(
     max_m: int,
     max_token_ctas: int,
     fp32_internal: bool,
+    residual_from_shared: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
     finalize_top_k: int | None = None,
@@ -946,6 +983,7 @@ def launch(
         shared_peer_ptrs=shared_peer_ptrs,
         rms_eps=rms_eps,
         fp32_internal=fp32_internal,
+        residual_from_shared=residual_from_shared,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
         finalize_top_k=finalize_top_k,
@@ -959,6 +997,7 @@ def launch(
             max_m,
             max_token_ctas,
             fp32_internal,
+            residual_from_shared,
             include_reduce_scatter,
             include_routed,
             finalize_top_k,
@@ -999,6 +1038,7 @@ class CollectiveKernel:
         max_token_ctas: int,
         rms_eps: float,
         fp32_internal: bool,
+        residual_from_shared: bool,
         scratch_allocator=None,
         finalize_top_k: int | None = None,
         precompile_split: bool = False,
@@ -1010,6 +1050,15 @@ class CollectiveKernel:
         )
         if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
             raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
+        if residual_from_shared and not precompile_split:
+            # Routed-only is a split dispatch; without this it raises on every call.
+            raise ValueError("residual_from_shared requires precompile_split=True")
+        if residual_from_shared and latent_dim != hidden_dim:
+            # The residual read uses the latent pitch: a narrower one reads the wrong row.
+            raise ValueError(
+                "residual_from_shared requires latent_dim == hidden_dim, got "
+                f"{latent_dim} and {hidden_dim}"
+            )
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -1019,6 +1068,7 @@ class CollectiveKernel:
         self.max_token_ctas = max_token_ctas
         self.rms_eps = float(rms_eps)
         self.fp32_internal = fp32_internal
+        self.residual_from_shared = residual_from_shared
         self.precompile_split = precompile_split
         # When set, ``call_deferred`` additionally accepts the MoE kernel's
         # deferred-finalize triple; the standard materialized-input mode
@@ -1105,18 +1155,22 @@ class CollectiveKernel:
         dist.barrier(group=group, device_ids=[device.index])
         for owner in range(tp_size):
             if rank == owner:
-                variants = [(True, True, None)]
-                if finalize_top_k is not None:
-                    variants.append((True, True, finalize_top_k))
-                if precompile_split:
-                    variants.extend(
-                        [
-                            (True, False, None),
-                            (False, True, None),
-                        ]
-                    )
+                if residual_from_shared:
+                    # The refused variants would compile and never be callable.
+                    variants = [(False, True, None)]
+                else:
+                    variants = [(True, True, None)]
                     if finalize_top_k is not None:
-                        variants.append((False, True, finalize_top_k))
+                        variants.append((True, True, finalize_top_k))
+                    if precompile_split:
+                        variants.extend(
+                            [
+                                (True, False, None),
+                                (False, True, None),
+                            ]
+                        )
+                        if finalize_top_k is not None:
+                            variants.append((False, True, finalize_top_k))
                 for include_reduce_scatter, include_routed, variant_top_k in variants:
                     compile_kernel(
                         rank=rank,
@@ -1135,6 +1189,7 @@ class CollectiveKernel:
                         shared_peer_ptrs=self._shared_peer_ptrs,
                         rms_eps=self.rms_eps,
                         fp32_internal=fp32_internal,
+                        residual_from_shared=residual_from_shared,
                         include_reduce_scatter=include_reduce_scatter,
                         include_routed=include_routed,
                         finalize_top_k=variant_top_k,
@@ -1153,6 +1208,11 @@ class CollectiveKernel:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")
+        if include_reduce_scatter and self.residual_from_shared:
+            # Scattering the residual alongside an output that folded it in is meaningless.
+            raise ValueError(
+                "residual_from_shared cannot be combined with include_reduce_scatter"
+            )
         if include_reduce_scatter != include_routed and not self.precompile_split:
             raise RuntimeError("split collective roles require precompile_split=True")
         if latent_source.ndim != 2 or shared_source.ndim != 2:
@@ -1220,6 +1280,10 @@ class CollectiveKernel:
             raise RuntimeError(
                 "CollectiveKernel was constructed without finalize_top_k; "
                 "the deferred-finalize variant is not compiled"
+            )
+        if include_reduce_scatter and self.residual_from_shared:
+            raise ValueError(
+                "residual_from_shared cannot be combined with include_reduce_scatter"
             )
         if not include_reduce_scatter and not self.precompile_split:
             raise RuntimeError("split collective roles require precompile_split=True")
@@ -1323,6 +1387,17 @@ class CollectiveKernel:
                 "shared_output_override must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.hidden_dim}]"
             )
+        if self._scratch_allocator is not None and (
+            self._latent_output.shape != (self.max_m, self.latent_dim)
+            or self._latent_output.dtype != torch.bfloat16
+            or self._latent_output.device != device
+            or not self._latent_output.is_contiguous()
+        ):
+            # assumed_align promises rather than checks, so a bad pool view stores misaligned.
+            raise ValueError(
+                "the pooled latent output must be contiguous CUDA BF16 "
+                f"[{self.max_m}, {self.latent_dim}]"
+            )
         shard_start = self.rank * self.shard_dim
         shared_shard = shared_output[:, shard_start : shard_start + self.shard_dim]
 
@@ -1350,6 +1425,7 @@ class CollectiveKernel:
                 max_m=self.max_m,
                 max_token_ctas=self.max_token_ctas,
                 fp32_internal=self.fp32_internal,
+                residual_from_shared=self.residual_from_shared,
                 include_reduce_scatter=include_reduce_scatter,
                 include_routed=include_routed,
                 finalize_top_k=finalize_top_k,
