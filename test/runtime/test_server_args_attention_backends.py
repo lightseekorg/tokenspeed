@@ -98,14 +98,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
             ):
                 parser.parse_args(["--model", "x", flag, "bogus"])
 
-    def test_inline_detokenizer_flag_removed_from_cli(self):
-        parser = self._build_parser()
-        with (
-            contextlib.redirect_stderr(io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
-
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
         self.assertTrue(args.enable_inline_detokenizer)
@@ -373,8 +365,6 @@ class TestDecodeHostL2(unittest.TestCase):
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = False
-        args.kvstore_storage_backend = None
-        args.kvstore_mem_layout = "layer_first"
         args.kvstore_io_backend = "kernel"
 
         args._handle_kvstore()

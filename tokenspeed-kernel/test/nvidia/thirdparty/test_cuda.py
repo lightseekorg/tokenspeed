@@ -21,7 +21,7 @@
 """
 Unit tests for tokenspeed_kernel CUDA kernels.
 
-Run: pytest tokenspeed-kernel/test/thirdparty/test_cuda.py -v
+Run: pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v
 """
 
 import pytest

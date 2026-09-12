@@ -32,7 +32,6 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --enable-cache-report
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1800

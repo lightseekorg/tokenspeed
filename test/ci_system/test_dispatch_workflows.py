@@ -1014,7 +1014,7 @@ def test_mi450_sim_uses_bounded_smoke_suite():
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "330"
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
-    assert "tokenspeed-kernel/test/ops/attention" in task["env"]["MI450_SIM_TESTS"]
+    assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 
 
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():

@@ -5,7 +5,12 @@
 
 ## Collaboration principle
 
-Core features will be designed and implemented by the TokenSpeed core team. This isn't a matter of distrust in external contributions — writing code has gotten cheaper, but reviewing it, validating it, and deploying it safely at production scale hasn't. If anything, that cost has gone up. As Steve Jobs put it, A players want to work with A players. We believe the gap between the best people and average people is more than tenfold.
+Core features will be designed and implemented by the TokenSpeed core team.
+This isn't a matter of distrust in external contributions — writing code has
+gotten cheaper, but reviewing it, validating it, and deploying it safely at
+production scale hasn't. If anything, that cost has gone up. As Steve Jobs
+put it, A players want to work with A players. We believe the gap between the
+best people and average people is more than tenfold.
 
 ## Development environment
 
@@ -92,11 +97,14 @@ Inside the root `tokenspeed-kernel/` directory:
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
+* Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
+  Tests for common infra and covering multi-vendors reside under `test/`
+  directly.
 
 ## tokenspeed-kernel-amd
 
 Inside the root `tokenspeed-kernel-amd/` directory:
 
 * There should be no dependency on `tokenspeed-kernel`.
-* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
