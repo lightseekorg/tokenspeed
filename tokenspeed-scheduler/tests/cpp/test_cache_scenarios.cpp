@@ -2063,7 +2063,7 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
     // the request already sits in PrefillAwaitingResult. Only the final
     // chunk's result carries a token; an empty arrival must keep waiting,
     // or the handoff batch goes out before the bootstrap token is real.
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2096,7 +2096,7 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
     // with generated output a client is reading resumes ahead of one that
     // had produced nothing, whatever their retraction epochs say
     // (nextReadmission reads resumes_generation first, then the epoch).
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2150,7 +2150,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     // demand prompt + generated + max_new -- more than the request can ever
     // write, and near the single-request limit more than the pool holds,
     // leaving it Retracted forever.
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2198,7 +2198,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
     // remainder dipped under 4096 -- exactly when the spent window forces it
     // to ask for a new page. With every resident request misjudged that way
     // retraction has no victim and the pool never frees.
-    BlockPool pool(/*num_lcm_blocks=*/16);
+    BlockPool pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2629,7 +2629,7 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
 }
 
 TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2720,7 +2720,7 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
 }
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2751,7 +2751,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 }
 
 TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
-    BlockPool device_pool(/*num_lcm_blocks=*/12);
+    BlockPool device_pool(/*num_lcm_blocks=*/12, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2806,7 +2806,7 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
 
 // Drive the FSM directly to pin the PrefillDone retract overload.
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
-    BlockPool pool(/*num_lcm_blocks=*/8);
+    BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2887,7 +2887,7 @@ TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 // Admission owns the prepared refs before the event. If the independent request
 // slot allocation fails, event destruction releases those refs through RAII.
 TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
-    BlockPool pool(/*num_lcm_blocks=*/31);  // Pages are not the constraint.
+    BlockPool pool(/*num_lcm_blocks=*/31, {1, 1});  // Pages are not the constraint.
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -2927,7 +2927,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 // computed before the pending query.
 // ---------------------------------------------------------------------------
 TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
-    BlockPool pool(/*num_lcm_blocks=*/32);
+    BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},

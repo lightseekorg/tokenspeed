@@ -44,10 +44,10 @@ static_assert(std::is_nothrow_move_constructible_v<CacheBlockRef>);
 static_assert(std::is_same_v<decltype(std::declval<const CacheBlockRef&>().operator->()), const CacheBlock*>);
 
 TEST(CacheBlockRefTest, AcquireReturnsUniqueOwningHandle) {
-    BlockPool pool(/*num_lcm_blocks=*/4);
+    BlockPool pool(/*num_lcm_blocks=*/4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
-    CacheBlockRef ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef ref = pool.AcquireBlock(/*group_id=*/0);
 
     ASSERT_TRUE(ref);
     EXPECT_TRUE(ref);
@@ -57,9 +57,9 @@ TEST(CacheBlockRefTest, AcquireReturnsUniqueOwningHandle) {
 }
 
 TEST(CacheBlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
-    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t block_id = first->Location().lcm_block_id;
 
     {
@@ -80,10 +80,10 @@ TEST(CacheBlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
 }
 
 TEST(CacheBlockRefTest, CopyAssignmentReleasesPreviousBlock) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
-    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    CacheBlockRef second = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0);
+    CacheBlockRef second = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t first_id = first->Location().lcm_block_id;
 
     second = first;
@@ -95,8 +95,8 @@ TEST(CacheBlockRefTest, CopyAssignmentReleasesPreviousBlock) {
 }
 
 TEST(CacheBlockRefTest, MoveTransfersWithoutChangingCount) {
-    BlockPool pool(4);
-    CacheBlockRef source = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    BlockPool pool(4, {1});
+    CacheBlockRef source = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t block_id = source->Location().lcm_block_id;
 
     CacheBlockRef target = std::move(source);
@@ -107,10 +107,10 @@ TEST(CacheBlockRefTest, MoveTransfersWithoutChangingCount) {
 }
 
 TEST(CacheBlockRefTest, MoveAssignmentReleasesPreviousBlock) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
-    CacheBlockRef holder = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    CacheBlockRef incoming = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef holder = pool.AcquireBlock(/*group_id=*/0);
+    CacheBlockRef incoming = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t incoming_id = incoming->Location().lcm_block_id;
 
     holder = std::move(incoming);
@@ -122,7 +122,7 @@ TEST(CacheBlockRefTest, MoveAssignmentReleasesPreviousBlock) {
 }
 
 TEST(CacheBlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     CacheBlockRef first;
@@ -138,9 +138,9 @@ TEST(CacheBlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
 }
 
 TEST(CacheBlockRefTest, SwapExchangesOwnershipWithoutChangingCounts) {
-    BlockPool pool(4);
-    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    CacheBlockRef second = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    BlockPool pool(4, {1});
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0);
+    CacheBlockRef second = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t first_id = first->Location().lcm_block_id;
     const std::int32_t second_id = second->Location().lcm_block_id;
 
@@ -153,8 +153,8 @@ TEST(CacheBlockRefTest, SwapExchangesOwnershipWithoutChangingCounts) {
 }
 
 TEST(CacheBlockRefTest, SelfAssignmentKeepsOwnership) {
-    BlockPool pool(4);
-    CacheBlockRef ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    BlockPool pool(4, {1});
+    CacheBlockRef ref = pool.AcquireBlock(/*group_id=*/0);
     const std::int32_t block_id = ref->Location().lcm_block_id;
 
     ref = ref;
@@ -165,9 +165,9 @@ TEST(CacheBlockRefTest, SelfAssignmentKeepsOwnership) {
 }
 
 TEST(CacheBlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {
-    BlockPool pool(4);
+    BlockPool pool(4, {1});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
-    CacheBlockRef original = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef original = pool.AcquireBlock(/*group_id=*/0);
     std::vector<CacheBlockRef> refs(8, original);
     EXPECT_EQ(original.use_count(), 9);
 
@@ -180,8 +180,8 @@ TEST(CacheBlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {
 }
 
 TEST(CacheBlockRefTest, LastOwnerDestroysDynamicBlockAndReleasesExactSlot) {
-    BlockPool pool(1);
-    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/4, /*cache_blocks_per_lcm_block=*/2);
+    BlockPool pool(1, {2});
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/0);
     CacheBlockRef last = first;
     const CacheBlockLocation location = first->Location();
 

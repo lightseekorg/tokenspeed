@@ -67,6 +67,8 @@ public:
                   std::int32_t logical_block_index = -1, CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                   std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
+        _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
+                "cache block must belong to the prefix index group");
         validateKey(key);
         CacheEntries& cache_index = cacheEntries(pool);
         CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());
@@ -88,13 +90,7 @@ public:
             return;
         }
 
-        cache_index.entries.push_back(CacheEntry{
-            .key = key,
-            .block_ref = block_ref,
-            .last_access_epoch = access_epoch,
-            .logical_block_index = logical_block_index,
-            .boundary_kind = boundary_kind,
-        });
+        cache_index.entries.emplace_back(key, block_ref, access_epoch, logical_block_index, boundary_kind);
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
@@ -276,6 +272,39 @@ public:
 
 private:
     struct CacheEntry {
+        CacheEntry(const CacheKey& new_key, const CacheBlockRef& new_block_ref, std::uint64_t new_last_access_epoch,
+                   std::int32_t new_logical_block_index, CacheBoundaryKind new_boundary_kind)
+            : key{new_key},
+              block_ref{new_block_ref},
+              last_access_epoch{new_last_access_epoch},
+              logical_block_index{new_logical_block_index},
+              boundary_kind{new_boundary_kind} {
+            PrefixCacheIndex::setCacheOwned(block_ref, true);
+        }
+
+        CacheEntry(const CacheEntry&) = delete;
+        CacheEntry& operator=(const CacheEntry&) = delete;
+        CacheEntry(CacheEntry&& other) noexcept = default;
+        CacheEntry& operator=(CacheEntry&& other) noexcept {
+            if (this != &other) {
+                if (block_ref) {
+                    PrefixCacheIndex::setCacheOwned(block_ref, false);
+                }
+                key = std::move(other.key);
+                block_ref = std::move(other.block_ref);
+                last_access_epoch = other.last_access_epoch;
+                logical_block_index = other.logical_block_index;
+                boundary_kind = other.boundary_kind;
+                was_acquired = other.was_acquired;
+            }
+            return *this;
+        }
+        ~CacheEntry() {
+            if (block_ref) {
+                PrefixCacheIndex::setCacheOwned(block_ref, false);
+            }
+        }
+
         CacheKey key;
         CacheBlockRef block_ref;
         std::uint64_t last_access_epoch{0};
@@ -299,6 +328,10 @@ private:
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
     };
+
+    static void setCacheOwned(CacheBlockRef& block_ref, bool cache_owned) noexcept {
+        block_ref.setCacheOwned(cache_owned);
+    }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
         return cache_entries_by_pool_.try_emplace(&pool).first->second;

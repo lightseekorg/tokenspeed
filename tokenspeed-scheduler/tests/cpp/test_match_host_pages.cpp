@@ -53,7 +53,7 @@ CacheKey Key(std::string content_hash) {
 // allocate -> hash -> free leaves it cached-and-evictable, exactly like a committed store.
 template <typename Manager>
 std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
-    CacheBlockRef block = host_pool.AcquireBlock(manager.Id(), manager.CacheBlocksPerLcmBlock());
+    CacheBlockRef block = host_pool.AcquireBlock(manager.Id());
     const std::int32_t id = block->Location().lcm_block_id;
     manager.RegisterCachedBlock(host_pool, block, key);
     block.reset();
@@ -61,7 +61,7 @@ std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
 }
 
 TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     FullAttnManager mgr(/*block_granularity=*/4);
     EXPECT_TRUE(mgr.MatchIsPrefixClosed());
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};
@@ -76,7 +76,7 @@ TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
 }
 
 TEST(HostTierMatchTest, FullStopsAtFirstMiss) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     FullAttnManager mgr(4);
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3")};
     const std::int32_t p0 = Put(mgr, host_pool, keys[0]);
@@ -86,7 +86,7 @@ TEST(HostTierMatchTest, FullStopsAtFirstMiss) {
 }
 
 TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     FullAttnManager mgr(4);
     std::vector<CacheKey> keys{Key("k0"), Key("k1")};
     (void)Put(mgr, host_pool, keys[1]);
@@ -95,7 +95,7 @@ TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
 }
 
 TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     // block_granularity 4, window 10 -> pages_needed = ceil(9/4) = 3.
     SwaManager mgr(4, /*sliding_window=*/10);
     EXPECT_FALSE(mgr.MatchIsPrefixClosed());
@@ -110,7 +110,7 @@ TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
 }
 
 TEST(HostTierMatchTest, SwaInteriorBoundaryShrink) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     SwaManager mgr(4, 10);  // pages_needed = 3
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};
     const std::int32_t p1 = Put(mgr, host_pool, keys[1]);
@@ -121,7 +121,7 @@ TEST(HostTierMatchTest, SwaInteriorBoundaryShrink) {
 }
 
 TEST(HostTierMatchTest, SwaShortRunAtBottomSuffices) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     SwaManager mgr(4, 10);  // pages_needed = 3, but only 2 extension slots exist
     std::vector<CacheKey> keys{Key("k0"), Key("k1")};
     const std::int32_t p0 = Put(mgr, host_pool, keys[0]);
@@ -131,7 +131,7 @@ TEST(HostTierMatchTest, SwaShortRunAtBottomSuffices) {
 }
 
 TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     SwaManager mgr(4, /*sliding_window=*/9);  // pages_needed = ceil(8/4) = 2
     std::vector<CacheKey> keys{
         Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4"), Key("k5"), Key("k6"),
@@ -148,14 +148,14 @@ TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
 }
 
 TEST(HostTierMatchTest, SwaAllMissReturnsEmpty) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     SwaManager mgr(4, 10);
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};
     EXPECT_TRUE(mgr.Match(host_pool, keys, 1, 5).blocks.empty());
 }
 
 TEST(HostTierMatchTest, SwaZeroNeededWindowAcceptsAllAsHoles) {
-    BlockPool host_pool(9);
+    BlockPool host_pool(9, {1});
     SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2")};
     // Zero needed pages: every boundary is resumable with no host page at all.
