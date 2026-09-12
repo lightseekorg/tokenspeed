@@ -9,6 +9,13 @@ from tokenspeed.runtime.cache.transfer.layout import (
     combine_cache_transfer_layouts,
     select_layer_fields,
 )
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+    Qwen4ExpBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+    Qwen4ExpPLEBackend,
+)
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -36,6 +43,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     CacheGroupSpec,
 )
+from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
 
 
 def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
@@ -373,6 +381,99 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     assert linear_attn.replay_ssm is (replay_enabled and replay_supported)
 
 
+@pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
+@pytest.mark.parametrize("ple_enabled", (False, True))
+def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
+    speculative: bool, width: int, ple_enabled: bool
+) -> None:
+    text_config = SimpleNamespace(
+        ple_layer_ids=(0, 1) if ple_enabled else (),
+        short_conv_layer_ids=(0, 1),
+        ngram_context_len=2,
+        short_conv_state_shape=(4, 3),
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text_config),
+        hf_text_config=text_config,
+        num_attention_layers=2,
+    )
+    target_spec = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        attn_tp_size=1,
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+    )
+    attn_config = AttnConfig(
+        components=(target_spec, _tiny_linear_attn()),
+        speculative_num_draft_tokens=width,
+        **_model_wide_kwargs(),
+    )
+    draft_config = (
+        replace(
+            attn_config,
+            components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
+        )
+        if speculative
+        else None
+    )
+    server_args = SimpleNamespace(
+        block_size=64,
+        max_total_tokens=None,
+        speculative_num_draft_tokens=width,
+        enable_replay_ssm=False,
+    )
+    setup = prepare_cache_setup(
+        family="qwen4_exp",
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=(
+            SimpleNamespace(num_attention_layers=1, hf_text_config=SimpleNamespace())
+            if speculative
+            else None
+        ),
+        draft_attn_config=draft_config,
+        cache_budget_bytes=1 << 20,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    if not speculative:
+        assert setup.fixed_workspace_bytes == 0
+        return
+
+    backend = Qwen4ExpPLEBackend(attn_config, target_spec)
+    backend.set_cache_pool(
+        _pool_over_new_arena(
+            setup.spec, attn_config, num_layers=len(setup.spec.layer_types), rank=0
+        )
+    )
+    ple_bytes = backend.preallocate_verify_workspace(
+        max_bs=attn_config.max_bs, draft_token_num=width
+    )
+    if width == 1:
+        assert ple_bytes == setup.fixed_workspace_bytes == 0
+        # Exercise the startup budget check with the real recipe's result.
+        root = Qwen4ExpBackend(
+            attn_config, AttentionBackend(attn_config, target_spec), backend, None
+        )
+        _prepare_verify_workspace(
+            server_args=server_args,
+            config=attn_config,
+            backend=root,
+            draft_backend=None,
+            uses_paged_state_verify=True,
+            is_inkling=False,
+            expected_bytes=setup.fixed_workspace_bytes,
+        )
+        return
+    # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
+    # conv states; the commit holds two int64 ids per request per layer.
+    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
+    assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
+
+
 def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     model_config = SimpleNamespace(
         num_attention_layers=2,
@@ -549,8 +650,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
-    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc, *, enable_pdl):
-        del enable_pdl
+    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc):
         k_buffer[loc] = cache_k
         v_buffer[loc] = cache_v
 

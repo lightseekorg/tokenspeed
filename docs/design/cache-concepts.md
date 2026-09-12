@@ -277,6 +277,15 @@ already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
 overlap the load.
 
+A batched post-verification commit is the one side-cache writer that issues no
+fence of its own. It moves every bound layer's fields in a single launch, so it
+cannot fence per layer, and it relies on two invariants instead: it runs after
+the whole model forward, by which point every bound layer has already fenced
+this step in its own forward, and under pipeline parallelism only the layers
+this rank forwards are bound to it. Moving such a commit earlier than the end of
+the forward, or binding layers the rank does not forward, breaks the fence
+guarantee without any call site visibly dropping a wait.
+
 The Host-transfer workspace resolves transport capability for its buffer
 binding before publishing consumer waits. NVIDIA mapped-Host transfers can
 use a single full-geometry H2D launch with per-layer ready flags; other paths
@@ -625,6 +634,39 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
+## Sparse indexers: model weights, backend dispatch and verification
+
+* The **model** owns indexer weights and top-k selection, passing
+  `topk_indices` through `PagedAttention.forward` to the backend.
+* The **full-attention backend** owns attention dispatch and full-KV cache
+  addressing. `CacheGroupRouter` expands only the groups served by attention
+  leaves; QSA's compressed/recent history groups are separate consumers.
+* **`QSAIndexerBackend`** owns those two groups' raw block tables, query
+  lengths and transient verification workspace. It uses the shared table
+  fill at expansion ratio one, preserving block ids and clearing padding,
+  and borrows the full-KV address view from the router. Its private
+  `QSAVerifyState` exists only for a speculative target with local QSA fields.
+* **`Qwen4ExpBackend`** composes an attention backend with optional PLE and
+  indexer consumers. Its attention child uses the ordinary hybrid only for
+  views with GDN layers; draft views have neither GDN nor PLE.
+  The runner's existing post-verify calls dispatch once
+  to their respective children; the root neither allocates verify tensors
+  nor registers or looks up QSA state. PLE owns its checkpoint metadata
+  independently of Mamba and shares only the checkpoint arithmetic. See the
+  [execution lifecycle](unified_path.md#backend-package-layout).
+
+LCM owns persistent allocation, prefix matching, transfer and retention,
+including QSA's full-KV, compressed and recent cache groups. Verify-state layer
+ownership and cache addresses come from the bound plan's layer window,
+including under PP and target/draft sharing. Cache recipes reserve verify
+workspace before sizing the arena.
+
+Qwen4-Exp selects its cache recipe by model family, including targets with
+only full-attention layers. PLE and QSA fields and their verify budget do
+not require a GDN component. Recurrent shapes and replay settings are read
+only when that component exists; a recurrent layer label without matching
+linear-attention geometry still fails during recipe construction.
+
 ## Code placement
 
 * Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives
@@ -762,12 +804,15 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   refuses a sliding `State` group at the bridge).
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
-  groups it serves — the router builds one leaf per paged (history-family)
-  group of its bound pool view and fails a live batch missing any of them;
-  state consumers (Mamba/KDA, Inkling conv) index the dict by their own
-  group ids, as does the V4 backend for the several history groups one V4
-  layer reads at once (its pool view reports no `PagedAttention` binding
-  and no router leaf). `cache_consumer_families` remains the boot-time coverage
+  groups it serves. The router builds a leaf for each claimed attention
+  group and fails a live batch missing any of them. QSA's indexer claims
+  its compressed/recent history groups separately; it does not instantiate
+  attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv)
+  index the dict by their own group ids, as does the V4 backend for the
+  several history groups one V4 layer reads at once (its pool view reports
+  no `PagedAttention` binding and no router leaf). Mamba's group set comes from
+  its recurrent fields, so a PLE checkpoint group cannot arm its verify
+  state. `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -783,6 +828,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   kernel pages out, one expand launch per group. Models and the runner never
   compute locations — `write_locations(layer, mode)` is the single accessor
   (`unified_path.md`, "Write locations have one owner").
+  QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
+  each group's `block_granularity`. This ratio-one fill copies stable raw
+  table views and clears holes/padding; it does not add another subdivision
+  convention or derive its addresses through a dummy attention leaf.
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math

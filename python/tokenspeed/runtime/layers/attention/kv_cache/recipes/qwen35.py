@@ -23,6 +23,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    STATE_LAYER_TYPES,
     split_recurrent_state_groups,
 )
 from tokenspeed.runtime.utils.env import envs
@@ -48,7 +49,9 @@ class QwenGDNRecipe(CacheRecipe):
             )
         linear_attn = self.attn_config.component(LinearAttnConfig)
         if linear_attn is None:
-            raise ValueError("Qwen GDN cache requires a linear-attention component")
+            if any(label in STATE_LAYER_TYPES for label in self.target_layer_types):
+                raise ValueError("Qwen GDN cache requires a linear-attention component")
+            return
         # The GDN backend reads the same decision, so publish it once here
         # rather than as a side effect of sizing the workspace.
         linear_attn.replay_ssm = self.replay_ssm
@@ -134,8 +137,8 @@ class QwenGDNRecipe(CacheRecipe):
     ) -> tuple[CacheFieldSpec, ...]:
         if layer_id >= len(self.target_layer_types):
             return self._draft_fields(layer_id, occurrence)
-        conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
         if self.layer_types[layer_id] == LINEAR_ATTENTION:
+            conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.ssm",
@@ -201,7 +204,10 @@ class QwenGDNRecipe(CacheRecipe):
     @cached_property
     def replay_ssm(self) -> bool:
         """Whether the GDN backend replays the SSM state instead of staging it."""
-        if not self.num_draft_layers:
+        if (
+            self.attn_config.component(LinearAttnConfig) is None
+            or not self.num_draft_layers
+        ):
             return False
         if not (
             self.server_args.enable_replay_ssm

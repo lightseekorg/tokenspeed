@@ -141,10 +141,6 @@ class TrimKvToLocsTest(unittest.TestCase):
         self.assertEqual(self.trim(locs, None, None), (None, None))
 
 
-class _StopAfterSpy(Exception):
-    """Raised by the spy to stop make_dummy_batch at the seam under test."""
-
-
 class DummyGroupTablesTest(unittest.TestCase):
     """Capture-time dummy tables: every group gets a real, writable block;
     none get the reserved null block 0."""
@@ -287,7 +283,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         even with the prefill graph disabled."""
         import torch
 
-        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
             compute_state_block_indices,
         )
 
@@ -321,6 +317,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             torch.zeros(3, dtype=torch.int32),
             torch.full((3,), 1024, dtype=torch.int32),
             validate=True,
+            group_id="linear_attention",
         )
 
     def test_expanded_row_reaches_the_kernels_full_width(self):
@@ -467,15 +464,11 @@ class DummyGroupTablesTest(unittest.TestCase):
             # The row-constant table is legal only for a prefix-free extend:
             # with history the state gather resolves in == out and refuses.
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
-            raise _StopAfterSpy
 
         pg.attn_backend.init_forward_metadata = _record
-        with mock.patch(
-            "tokenspeed.runtime.execution.prefill_graph.ForwardContext",
-            lambda **kw: SimpleNamespace(**kw),
-        ):
-            with self.assertRaises(_StopAfterSpy):
-                pg.make_dummy_batch(num_tokens)
+        ctx = pg.make_dummy_batch(num_tokens)
+        self.assertIs(ctx.attn_backend, pg.attn_backend)
+        self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
 
     def test_make_dummy_batch_tables_survive_the_cache_contract(self):

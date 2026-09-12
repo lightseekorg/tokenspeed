@@ -18,24 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Regression test for the MTP draft NaN under CUDA graph (DP + MoE).
+"""Draft collective sizing must agree between capture and replay.
 
-Root cause: the draft first-step MoE all-gather (``draft_first_step_reduce``)
-sizes its TritonRSAG collective from ``ctx.global_bs``. The CUDA-graph capture
-path (``ForwardStepRunner._capture_one``) set ``ctx.global_num_tokens`` to a
-uniform dummy but left ``ctx.global_bs`` as ``None``. With ``global_bs is None``
-the draft MoE scattered-token-count helper falls back to a *single-rank* layout
-(only the local rank has tokens), whereas at replay ``ctx.global_bs`` is the live
-per-rank batch list and yields a *multi-rank* layout. Because the RSAG kernel's
-offsets/launch are frozen at capture, the captured single-rank layout no longer
-matches the replayed multi-rank layout and the gather reads uninitialized
-symmetric memory -> NaN draft logits -> ``accept_rate`` collapses to 0.
+A draft first step narrows the target's verify window to one live row per
+request. Models report that shape through ``report_collective_sizing`` using
+``ctx.bs`` and ``ctx.global_bs``. Without the global batch counts at capture,
+collectives fall back to ``global_num_tokens``, which still describes the
+wider target verify window, and record different sizes from live replay.
 
-The fix sets ``ctx.global_bs`` at capture the same way ``global_num_tokens`` is
-set, so the captured layout matches the replayed layout.
-
-These tests are pure-Python (no GPU / NCCL): they assert the layout invariant
-that the fix restores.
+CPU-only tests exercise this context contract without GPU collectives.
 """
 
 import pytest
@@ -45,7 +36,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext, ForwardMode
 
 
-def _make_mapping(rank: int = 0) -> Mapping:
+def _make_mapping(rank: int) -> Mapping:
     # Mirrors the repro config: DP=4, dense-tp=4, moe-tp=1, ep=4 on a 4-GPU node.
     return Mapping(
         rank=rank,
@@ -58,7 +49,7 @@ def _make_mapping(rank: int = 0) -> Mapping:
 
 
 def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardContext:
-    """A draft first-step decode ctx (draft_first_step_reduce=True)."""
+    """The draft context while report_collective_sizing narrows its rows."""
     return ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -66,73 +57,46 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
         num_extends=0,
         input_num_tokens=bs,
         forward_mode=ForwardMode.DECODE,
-        draft_first_step_reduce=True,
         global_num_tokens=global_num_tokens,
         global_bs=global_bs,
+        collective_num_tokens=bs,
+        collective_global_num_tokens=global_bs,
     )
 
 
 def test_capture_global_bs_none_diverges_from_replay():
-    """Documents the bug: global_bs=None at capture -> single-rank layout that
-    does NOT match the multi-rank layout produced from a live global_bs."""
-    cm = CommManager(mapping=_make_mapping(), layer_id=0, is_moe=True, prev_is_moe=True)
+    """Missing global_bs leaves collectives sized for target verify rows."""
+    cm = CommManager(
+        mapping=_make_mapping(0), layer_id=0, is_moe=True, prev_is_moe=True
+    )
     bs = 1
 
     # Pre-fix capture: global_num_tokens set (uniform dummy), global_bs left None.
     capture_buggy = _draft_first_step_ctx(
-        bs, global_bs=None, global_num_tokens=[bs] * 4
+        bs, global_bs=None, global_num_tokens=[bs * 4] * 4
     )
     # Replay: live per-rank batch sizes (uniform across the padded DP bucket).
-    replay = _draft_first_step_ctx(bs, global_bs=[bs] * 4, global_num_tokens=[bs] * 4)
+    replay = _draft_first_step_ctx(
+        bs, global_bs=[bs] * 4, global_num_tokens=[bs * 4] * 4
+    )
 
     buggy = cm.moe_tp_ep_group_scattered_num_tokens(capture_buggy)
     live = cm.moe_tp_ep_group_scattered_num_tokens(replay)
 
-    # global_bs=None takes the single-rank fallback (only local rank populated)...
-    assert buggy == [1, 0, 0, 0]
-    # ...which differs from the replay multi-rank layout -> the NaN-causing mismatch.
+    # Without the narrowed counts, collectives use the whole verify window.
+    assert buggy == [bs * 4] * 4
+    assert live == [bs] * 4
     assert buggy != live
 
 
-def test_capture_global_bs_set_matches_replay():
-    """The fix: setting global_bs at capture (same as global_num_tokens) makes the
-    captured draft MoE all-gather layout identical to the replayed one."""
-    cm = CommManager(mapping=_make_mapping(), layer_id=0, is_moe=True, prev_is_moe=True)
-    bs = 1
-
-    capture_fixed = _draft_first_step_ctx(
-        bs, global_bs=[bs] * 4, global_num_tokens=[bs] * 4
-    )
-    replay = _draft_first_step_ctx(bs, global_bs=[bs] * 4, global_num_tokens=[bs] * 4)
-
-    assert cm.moe_tp_ep_group_scattered_num_tokens(
-        capture_fixed
-    ) == cm.moe_tp_ep_group_scattered_num_tokens(replay)
-
-
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_capture_matches_replay_all_ranks(rank: int):
-    """For every DP rank, the fixed capture layout matches replay (the scattered
-    counts for the rank's MoE tp_ep group are identical)."""
+def test_draft_collectives_use_narrowed_counts_on_all_ranks(rank: int):
+    """Every DP rank uses the draft's counts instead of the target verify width."""
     cm = CommManager(
         mapping=_make_mapping(rank), layer_id=0, is_moe=True, prev_is_moe=True
     )
     bs = 1
-    ctx = _draft_first_step_ctx(bs, global_bs=[bs] * 4, global_num_tokens=[bs] * 4)
+    ctx = _draft_first_step_ctx(bs, global_bs=[bs] * 4, global_num_tokens=[bs * 4] * 4)
     scattered = cm.moe_tp_ep_group_scattered_num_tokens(ctx)
     # moe tp_ep group spans all 4 ranks (moe_tp=1 * ep=4); each contributes bs.
     assert scattered == [bs] * 4
-
-
-def test_capture_one_sets_global_bs(monkeypatch):
-    """Guards the fix at its source: ForwardStepRunner._capture_one must set
-    ctx.global_bs (not leave it None) for DP, matching how global_num_tokens is
-    set. Verified by inspecting the source so the test needs no GPU/capture."""
-    import inspect
-
-    from tokenspeed.runtime.execution import forward_step
-
-    src = inspect.getsource(forward_step.ForwardStepRunner._capture_one)
-    # Both DP token-metadata fields must be assigned in the capture path.
-    assert "ctx.global_num_tokens" in src
-    assert "ctx.global_bs" in src

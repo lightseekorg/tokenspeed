@@ -23,7 +23,7 @@
 ``CacheGroupRouter`` is the runner-facing attention backend for every model
 whose attention is paged KV. It holds one ``PagedAttentionBackend`` leaf per
 attention (history-family) cache group and is the only object between the
-scheduler bridge and the kernels that knows about groups at all:
+scheduler bridge and the kernels that expands raw group tables:
 
 * it learns each group's block granularity from the pool's published specs
   (``CacheGroupGeometry``) and each leaf's kernel page size, and expands the
@@ -35,9 +35,11 @@ scheduler bridge and the kernels that knows about groups at all:
 * it dispatches a layer's forward to the leaf of ``layer.group_id`` with
   that group's write locations.
 
-Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc`` and nothing
-else. A single-group model is a router with one leaf; there is no
-single-table special case anywhere.
+Leaves see ``page_table`` / ``seq_lens`` / ``out_cache_loc``. Indexers consume
+resolved ``group_view`` results for cross-group indexing. Their verification
+state is registered at startup on the outermost backend and committed through
+its side-state hook, independently of these leaves. A single-group model is a
+router with one leaf; there is no single-table special case.
 """
 
 from __future__ import annotations
@@ -99,6 +101,17 @@ class RouterDecodeWriteLocations:
     by_group: dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class PagedGroupView:
+    """Resolved pages for a backend runtime consuming one cache group.
+
+    The table aliases the router's persistent stack, with its kernel page size.
+    """
+
+    page_table: torch.Tensor
+    kernel_page_size: int
+
+
 class CacheGroupRouter(AttentionBackend):
     """One paged leaf per attention cache group; see the module docstring."""
 
@@ -109,6 +122,7 @@ class CacheGroupRouter(AttentionBackend):
         is_draft: bool,
         spec_num_tokens: int,
         device,
+        consumed_group_ids: tuple[str, ...] | None,
     ) -> None:
         """Args:
         leaf_factory: ``(group_id, block_granularity) -> leaf``; called once
@@ -120,8 +134,11 @@ class CacheGroupRouter(AttentionBackend):
             target's decode write window and the location stack's
             per-request capacity.
         device: Buffer device.
+        consumed_group_ids: Groups served by attention leaves, or None to
+            serve every local paged group. Other groups go to peer consumers.
         """
         self._leaf_factory = leaf_factory
+        self._consumed_group_ids = consumed_group_ids
         self.leaves: dict[str, PagedAttentionBackend] = {}
         self._geometry: CacheGroupGeometry | None = None
         self.is_draft = bool(is_draft)
@@ -181,11 +198,17 @@ class CacheGroupRouter(AttentionBackend):
                     "the router serves paged history groups only"
                 )
 
-    @staticmethod
-    def _derive(cache_pool: CachePool) -> tuple[CacheGroupGeometry, tuple[str, ...]]:
+    def _derive(
+        self, cache_pool: CachePool
+    ) -> tuple[CacheGroupGeometry, tuple[str, ...]]:
         """The geometry and paged group ids ``cache_pool`` publishes."""
         geometry = learn_cache_group_geometry(cache_pool.arena.cache_group_specs)
-        return geometry, tuple(sorted(cache_pool.paged_group_ids))
+        group_ids = cache_pool.paged_group_ids
+        if self._consumed_group_ids is not None:
+            group_ids = tuple(
+                gid for gid in group_ids if gid in self._consumed_group_ids
+            )
+        return geometry, tuple(sorted(group_ids))
 
     def _learn(
         self, cache_pool: CachePool
@@ -304,6 +327,23 @@ class CacheGroupRouter(AttentionBackend):
                 "metadata call"
             )
         return self._stacks
+
+    def group_view(self, group_id: str, bs: int) -> PagedGroupView:
+        """Return a group's resolved kernel pages for the current batch.
+
+        Args:
+            group_id: A paged group published by the bound cache pool.
+            bs: Number of batch rows, including graph padding.
+
+        Returns:
+            A view over the router's table with its kernel page size.
+            The router remains the only geometry owner.
+        """
+        page_size = self.stacks.group_kernel_page_size(group_id)
+        return PagedGroupView(
+            page_table=self.stacks.table(group_id, bs),
+            kernel_page_size=page_size,
+        )
 
     # ------------------------------------------------------------------
     # Write locations
