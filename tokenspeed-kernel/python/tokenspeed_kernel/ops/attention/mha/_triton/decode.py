@@ -838,7 +838,7 @@ def decode_attention_fwd(
 @register_kernel(
     "attention",
     "mha_decode_with_kvcache",
-    name="triton_mha_decode_with_kvcache_cached",
+    name="triton_mha_decode_with_kvcache",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=format_signatures(

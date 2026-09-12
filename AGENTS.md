@@ -96,6 +96,12 @@ Inside the root `tokenspeed-kernel/` directory:
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
+* Register a kernel under the name of the Python function that implements it,
+  prefixed with its solution (`triton_mha_prefill`,
+  `flashinfer_gdn_decode_step`), so `name=` in `register_kernel` and the
+  `def` always agree; `solution="reference"` kernels use the `torch_` prefix.
+  Register a thin wrapper function when one implementation needs a second
+  registration; never register the same function under two names.
 * When defining new public APIs, explain arguments and returns in docstring.
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`

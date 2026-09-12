@@ -128,7 +128,7 @@ if platform.is_nvidia and platform.is_blackwell:
     @register_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        name="fa4_mha_extend_with_kvcache_cached",
+        name="fa4_mha_extend_with_kvcache",
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
@@ -595,7 +595,7 @@ elif platform.is_nvidia and platform.is_hopper:
     @register_kernel(
         "attention",
         "mha_extend_with_kvcache",
-        name="fa3_mha_extend_with_kvcache_cached",
+        name="fa3_mha_extend_with_kvcache",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -658,7 +658,7 @@ elif platform.is_nvidia and platform.is_hopper:
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
-        name="fa3_mha_decode_with_kvcache_cached",
+        name="fa3_mha_decode_with_kvcache",
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),

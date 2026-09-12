@@ -388,6 +388,13 @@ def register_kernel(
 ) -> Callable:
     """Decorator to register a kernel function.
 
+    ``name`` is the registry key that ``override=`` strings, ``describe_kernel``
+    and profiler scopes show. In-tree kernels name the decorated function
+    identically and prefix it with ``solution`` (``triton_mha_prefill``,
+    ``flashinfer_gdn_decode_step``); the PyTorch ground-truth kernels under
+    ``numerics/reference`` register with ``solution="reference"`` and carry the
+    ``torch_`` prefix. ``test/test_kernel_naming.py`` enforces this.
+
     ``priority`` accepts a :class:`Priority` band (recommended) or a raw ``int``
     in ``[0, 20)``. Within a band, add a small offset for relative preference,
     e.g. ``Priority.SPECIALIZED + 2``. See :class:`Priority` for the meaning of
@@ -399,6 +406,7 @@ def register_kernel(
 
         @register_kernel(
             "attention", "decode",
+            name="triton_attention_decode",
             features={"paged"},
             solution="triton",
             capability=CapabilityRequirement(
@@ -412,7 +420,7 @@ def register_kernel(
             priority=Priority.SPECIALIZED + 1,
             tags={"latency", "determinism"},
         )
-        def triton_decode_attention(query, key_cache, value_cache, ...):
+        def triton_attention_decode(query, key_cache, value_cache, ...):
             ...
     """
     priority_int = _validate_priority(priority)

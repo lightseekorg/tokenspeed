@@ -417,8 +417,19 @@ _SIGNATURES = {
 }
 
 
-def _register(format_name: str, min_arch: ArchVersion) -> None:
-    common = dict(
+def _register_topk(
+    mode: str,
+    *,
+    name: str,
+    format_name: str,
+    min_arch: ArchVersion,
+    traits: dict[str, frozenset],
+):
+    """Registration shared by the per-format DeepGEMM indexer top-k kernels."""
+    return register_kernel(
+        "attention",
+        mode,
+        name=name,
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=min_arch,
@@ -430,28 +441,11 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({format_name}),
+            **traits,
         },
         priority=Priority.SPECIALIZED,
         tags={"nvidia", "sparse", "latency"},
     )
-    register_kernel(
-        "attention",
-        "dsv4_prefill_topk",
-        name=f"deep_gemm_dsv4_{format_name}_prefill_topk",
-        **common,
-    )(_dsv4_prefill_topk)
-    register_kernel(
-        "attention",
-        "dsv4_decode_topk",
-        name=f"deep_gemm_dsv4_{format_name}_decode_topk",
-        **{
-            **common,
-            "traits": {
-                **common["traits"],
-                "topk": frozenset({512, 1024, 2048}),
-            },
-        },
-    )(_dsv4_decode_topk)
 
 
 def deep_gemm_dsv4_warmup(**kwargs) -> None:
@@ -512,8 +506,48 @@ if _IS_NVIDIA:
             out.copy_(refreshed)
         return out
 
-    _register("fp8_scaled", ArchVersion(9, 0))
-    _register("mxfp4", ArchVersion(10, 0))
+    _DECODE_TOPK_TRAITS = {"topk": frozenset({512, 1024, 2048})}
+
+    @_register_topk(
+        "dsv4_prefill_topk",
+        name="deep_gemm_dsv4_fp8_scaled_prefill_topk",
+        format_name="fp8_scaled",
+        min_arch=ArchVersion(9, 0),
+        traits={},
+    )
+    def deep_gemm_dsv4_fp8_scaled_prefill_topk(*args, **kwargs):
+        return _dsv4_prefill_topk(*args, **kwargs)
+
+    @_register_topk(
+        "dsv4_decode_topk",
+        name="deep_gemm_dsv4_fp8_scaled_decode_topk",
+        format_name="fp8_scaled",
+        min_arch=ArchVersion(9, 0),
+        traits=_DECODE_TOPK_TRAITS,
+    )
+    def deep_gemm_dsv4_fp8_scaled_decode_topk(*args, **kwargs):
+        return _dsv4_decode_topk(*args, **kwargs)
+
+    @_register_topk(
+        "dsv4_prefill_topk",
+        name="deep_gemm_dsv4_mxfp4_prefill_topk",
+        format_name="mxfp4",
+        min_arch=ArchVersion(10, 0),
+        traits={},
+    )
+    def deep_gemm_dsv4_mxfp4_prefill_topk(*args, **kwargs):
+        return _dsv4_prefill_topk(*args, **kwargs)
+
+    @_register_topk(
+        "dsv4_decode_topk",
+        name="deep_gemm_dsv4_mxfp4_decode_topk",
+        format_name="mxfp4",
+        min_arch=ArchVersion(10, 0),
+        traits=_DECODE_TOPK_TRAITS,
+    )
+    def deep_gemm_dsv4_mxfp4_decode_topk(*args, **kwargs):
+        return _dsv4_decode_topk(*args, **kwargs)
+
     register_kernel(
         "attention",
         "dsv4_warmup",

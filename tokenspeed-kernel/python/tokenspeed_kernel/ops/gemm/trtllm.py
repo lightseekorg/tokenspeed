@@ -79,7 +79,7 @@ def _get_runner(out_dtype: torch.dtype):
     "gemm",
     "mm",
     name="cublaslt_mm_nvfp4",
-    solution="cublas",
+    solution="cublaslt",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
         vendors=frozenset({"nvidia"}),

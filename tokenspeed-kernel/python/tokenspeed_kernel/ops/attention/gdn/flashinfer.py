@@ -135,7 +135,7 @@ def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
 
 CHUNK_SIZE = 64
 
-gdn_chunk_prefill = error_fn
+flashinfer_gdn_chunk_prefill = error_fn
 
 if is_available():
 
@@ -161,7 +161,7 @@ if is_available():
         },
         tags={"hopper", "blackwell", "latency"},
     )
-    def gdn_chunk_prefill(
+    def flashinfer_gdn_chunk_prefill(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -287,8 +287,8 @@ if is_available():
 # GDN decode / MTP (K-last, SM90+)
 # ===-----------------------------------------------------------------------===#
 
-gdn_decode_step = error_fn
-gdn_decode_mtp = error_fn
+flashinfer_gdn_decode_step = error_fn
+flashinfer_gdn_decode_mtp = error_fn
 
 if is_decode_available():
 
@@ -310,7 +310,7 @@ if is_decode_available():
         },
         tags={"hopper", "latency"},
     )
-    def gdn_decode_step(
+    def flashinfer_gdn_decode_step(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -379,7 +379,7 @@ if is_decode_available():
         },
         tags={"hopper", "latency", "speculative-decoding"},
     )
-    def gdn_decode_mtp(
+    def flashinfer_gdn_decode_mtp(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,

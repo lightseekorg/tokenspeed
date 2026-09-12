@@ -58,7 +58,12 @@ choices (still evolving; subject to change):
 
 - **Registration** — backends register with `@register_kernel(family, mode, ...)`,
   declaring supported `format_signatures`, arch capability requirements,
-  non-format traits (head dim, GQA factor, ...), and a priority band.
+  non-format traits (head dim, GQA factor, ...), and a priority band. A kernel
+  is registered under the name of the Python function that implements it,
+  prefixed with its solution (`triton_mha_prefill`, `flashinfer_gdn_decode_step`);
+  the PyTorch ground truth under `numerics/reference/` registers as
+  `solution="reference"` with a `torch_` prefix. `test/test_kernel_naming.py`
+  checks this statically across every vendor's registrations.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
   priority, and returns a callable. Selection accepts an objective (latency,

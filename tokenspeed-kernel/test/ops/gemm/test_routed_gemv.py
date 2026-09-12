@@ -105,24 +105,24 @@ def test_routed_backend_matches_torch(shape, backend):
 )
 def test_non_bf16_inputs_fall_back_to_torch():
     from tokenspeed_kernel.ops.gemm.routed_gemv import (
-        ll_bf16_gemv,
-        skinny_gemv,
-        tgv_gemv,
+        cute_dsl_ll_bf16_gemv,
+        cute_dsl_skinny_gemv,
+        flashinfer_tgv_gemv,
     )
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
     w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
-    got = skinny_gemv(x, w)
+    got = cute_dsl_skinny_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
-    got = tgv_gemv(x, w)
+    got = flashinfer_tgv_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
-    got = ll_bf16_gemv(x, w)
+    got = cute_dsl_ll_bf16_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 
@@ -168,7 +168,7 @@ def test_capture_of_a_warmed_shape_replays_correctly():
     try:
         with torch.cuda.graph(g):
             decode_gemv(x, w, out=out)
-            cold_out = route.skinny_gemv(xc, wc)  # unwarmed: falls back
+            cold_out = route.cute_dsl_skinny_gemv(xc, wc)  # unwarmed: falls back
     finally:
         shape_dynamic_skinny_gemm._compile = real_compile
     assert not compiles  # nothing may JIT inside the capture
@@ -644,7 +644,7 @@ def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset
         "__call__",
         lambda *a, **kw: pytest.fail("under-aligned input must not launch vw-16"),
     )
-    got = routed_gemv.skinny_gemv(x, w)
+    got = routed_gemv.cute_dsl_skinny_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 

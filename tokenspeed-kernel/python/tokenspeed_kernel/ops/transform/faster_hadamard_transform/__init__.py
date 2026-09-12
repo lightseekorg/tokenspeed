@@ -34,13 +34,13 @@ if platform.is_nvidia:
     @register_kernel(
         "transform",
         "hadamard_transform",
-        name="fast_hadamard_transform",
+        name="fast_hadamard_transform_hadamard_transform",
         solution="fast_hadamard_transform",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         priority=Priority.PERFORMANT,
     )
-    def fast_hadamard_transform(
+    def fast_hadamard_transform_hadamard_transform(
         x: torch.Tensor,
         *,
         scale: float = 1.0,
@@ -48,4 +48,4 @@ if platform.is_nvidia:
         return hadamard_transform(x, scale=scale)
 
 
-__all__ = ["fast_hadamard_transform"]
+__all__ = ["fast_hadamard_transform_hadamard_transform"]

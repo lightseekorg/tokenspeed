@@ -120,22 +120,6 @@ def _softmax_topk_kernel(
 @register_kernel(
     "moe",
     "softmax_topk",
-    name="triton_softmax_topk_gfx1250",
-    solution="triton",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(12, 5),
-        max_arch_version=ArchVersion(12, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures(
-        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
-    ),
-    priority=Priority.PERFORMANT,
-    tags={"gfx1250", "routing", "latency"},
-)
-@register_kernel(
-    "moe",
-    "softmax_topk",
     name="triton_softmax_topk",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
@@ -231,4 +215,40 @@ def triton_softmax_topk(
     return weights, ids
 
 
-__all__ = ["triton_softmax_topk"]
+@register_kernel(
+    "moe",
+    "softmax_topk",
+    name="triton_softmax_topk_gfx1250",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    priority=Priority.PERFORMANT,
+    tags={"gfx1250", "routing", "latency"},
+)
+def triton_softmax_topk_gfx1250(
+    *,
+    router_logits: torch.Tensor,
+    topk: int,
+    topk_indices_dtype: torch.dtype,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """gfx1250 registration of :func:`triton_softmax_topk`; see it for arguments."""
+    return triton_softmax_topk(
+        router_logits=router_logits,
+        topk=topk,
+        topk_indices_dtype=topk_indices_dtype,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        enable_pdl=enable_pdl,
+    )
+
+
+__all__ = ["triton_softmax_topk", "triton_softmax_topk_gfx1250"]

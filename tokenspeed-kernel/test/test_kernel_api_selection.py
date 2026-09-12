@@ -3714,7 +3714,7 @@ _CASES = [
         "hopper",
         "attention",
         "mha_extend_with_kvcache",
-        "fa3_mha_extend_with_kvcache_cached",
+        "fa3_mha_extend_with_kvcache",
         _attention_extend,
     ),
     _case(
@@ -3722,7 +3722,7 @@ _CASES = [
         "hopper",
         "attention",
         "mha_decode_with_kvcache",
-        "fa3_mha_decode_with_kvcache_cached",
+        "fa3_mha_decode_with_kvcache",
         _attention_decode,
     ),
     _case(
@@ -3754,7 +3754,7 @@ _CASES = [
         "blackwell-sm100",
         "attention",
         "mha_extend_with_kvcache",
-        "fa4_mha_extend_with_kvcache_cached",
+        "fa4_mha_extend_with_kvcache",
         _attention_extend,
     ),
     _case(

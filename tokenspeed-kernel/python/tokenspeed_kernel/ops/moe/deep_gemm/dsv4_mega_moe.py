@@ -285,7 +285,7 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
         tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
     )
-    def deep_gemm_dsv4_mega_moe(
+    def deep_gemm_dsv4_mega_moe_sm100(
         *,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -337,6 +337,6 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
         )
         return output
 
-    deep_gemm_dsv4_mega_moe._tokenspeed_warmup = (  # type: ignore[attr-defined]
+    deep_gemm_dsv4_mega_moe_sm100._tokenspeed_warmup = (  # type: ignore[attr-defined]
         _warmup_deep_gemm_dsv4_mega_moe
     )

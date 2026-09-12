@@ -182,6 +182,11 @@ def flashinfer_fa2_qsa_sparse_attention(
     )
 
 
+def flashinfer_fa2_fp8_qsa_sparse_attention(*args, **kwargs) -> torch.Tensor:
+    """FP8 KV-cache registration of :func:`flashinfer_fa2_qsa_sparse_attention`."""
+    return flashinfer_fa2_qsa_sparse_attention(*args, **kwargs)
+
+
 if _IS_NVIDIA:
     # Preserve the original stacked-decorator registration order: FP8, then BF16.
     register_kernel(
@@ -200,7 +205,7 @@ if _IS_NVIDIA:
         },
         priority=Priority.PERFORMANT,
         tags={"fallback", "fa2", "fp8", "sparse"},
-    )(flashinfer_fa2_qsa_sparse_attention)
+    )(flashinfer_fa2_fp8_qsa_sparse_attention)
     register_kernel(
         "attention",
         "qsa_sparse_attention",
@@ -218,6 +223,9 @@ if _IS_NVIDIA:
         priority=Priority.PERFORMANT,
         tags={"fallback", "fa2", "sparse"},
     )(flashinfer_fa2_qsa_sparse_attention)
-    __all__ = ["flashinfer_fa2_qsa_sparse_attention"]
+    __all__ = [
+        "flashinfer_fa2_fp8_qsa_sparse_attention",
+        "flashinfer_fa2_qsa_sparse_attention",
+    ]
 else:
     __all__ = []
