@@ -1,4 +1,24 @@
-"""Pre-compile deep_gemm JIT kernels used by DeepSeek V4.
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Pre-compile DeepGEMM JIT kernels used by inference.
 
 deep_gemm compiles CUDA kernels on first invocation for each unique
 (M, N, K, tile) combination. This module provides warmup functions that
@@ -204,6 +224,41 @@ def warmup_prefill_jit(
     if warmup_count > 0:
         logger.info("Warmed up %d deep_gemm prefill kernel families", warmup_count)
         torch.cuda.synchronize()
+
+
+def warmup_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    cache_block_size: int,
+    max_decode_tokens: int,
+    device: torch.device,
+) -> None:
+    """Compile packed MQA scoring and paged metadata kernels before capture.
+
+    Args:
+        num_heads: Per-rank indexer head count.
+        index_head_dim: Unpacked channels per indexer head.
+        cache_block_size: Compressed rows per physical cache page.
+        max_decode_tokens: Largest paged scoring batch to prepare.
+        device: CUDA device on which to compile and warm up.
+
+    Returns:
+        None. Warmup GPU work has completed when the call returns.
+    """
+    _warmup_fp8_fp4_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        device=device,
+        max_kv_len=4096,
+    )
+    _warmup_fp8_fp4_paged_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        cache_block_size=cache_block_size,
+        max_decode_tokens=max_decode_tokens,
+        device=device,
+    )
 
 
 def _compute_num_split(block_k: int, k: int, grid_size: int) -> int:

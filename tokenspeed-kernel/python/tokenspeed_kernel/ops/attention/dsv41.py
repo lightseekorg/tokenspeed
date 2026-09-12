@@ -18,18 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Portable DeepSeek V4.1 cache codecs and bounded selected attention.
+"""DeepSeek V4.1 cache codecs, sparse attention and hierarchical selection.
 
-Rows store value bytes followed by scale bytes (even FP4 element in the low
-nibble). Formats: ``global`` = 512D E2M1/E4M3 groups of 16, 288 bytes;
-``index`` = 128D E2M1/E8M0 groups of 32, 68 bytes; ``swa`` = 512D
-E4M3/E8M0 groups of 32, 528 bytes. The entire post-RoPE vector is quantized.
-These layouts are NOT compatible with dsv4_decode.
+Standalone packed rows place value bytes before scales (even FP4 element in
+low nibble). Formats: global = 512D E2M1/E4M3 groups of16, 288 bytes;
+index = 128D E2M1/E8M0 groups of32, 68 bytes; SWA = 512D E4M3/E8M0
+ groups of32, 528 bytes. The entire post-RoPE vector is quantized.
 
-Paged fields are uint8 [pages, 64, row_bytes] views; their page, row and byte
-strides and storage offsets are honored. Slots address that particular field,
-not a scheduler block or another owner. Invalid slots read zero / skip writes.
-Callers own page mapping, causal lengths, RoPE, normalization and output buffers.
+Paged fields use page-planar storage: all64 value rows, then all64 scale rows.
+Their uint8 [pages,64,row_bytes] shape describes storage, not decoded row axes.
+Portable codecs honor every byte stride; native kernels require contiguous
+page bytes and aligned page strides. Physical slots address a particular field;
+invalid slots read zero or skip writes. Callers own mapping, causal lengths,
+RoPE, normalization, output buffers and cache lifetime.
 """
 
 from __future__ import annotations
@@ -45,9 +46,14 @@ __all__ = [
     "cache_gather",
     "index_q_quantize",
     "selected_attention",
+    "new_attention_schedule",
     "index_score",
     "index_topk",
     "compressor_tail_scatter",
+    "compressor_pool",
+    "swa_rope_scatter",
+    "rope_inplace",
+    "rope_pad_query",
 ]
 
 
@@ -122,6 +128,55 @@ def cache_gather(
     return _kernel("cache_gather", cache)(cache, slots, cache_format, out)
 
 
+def swa_rope_scatter(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Rotate normalized BF16 SWA rows and quantize directly into planar pages.
+
+    values is [T,512], positions and physical slots are integer [T], and the
+    FP32 RoPE table is [max_position,64]. cache is the LCM uint8 [pages,64,528]
+    field with contiguous page bytes. Invalid/null slots skip writes. If out
+    is supplied, write all quantized/dequantized BF16 [T,512] rows there, including
+    rows outside persistent retention. Read old prefixes before this operation.
+    """
+    _kernel("swa_rope_scatter", values)(
+        values, positions, cos_sin_cache, cache, slots, out
+    )
+    return out
+
+
+def compressor_pool(
+    content: torch.Tensor,
+    scores: torch.Tensor,
+    previous: torch.Tensor,
+    tail: torch.Tensor,
+    tail_slots: torch.Tensor,
+    active: torch.Tensor,
+    out: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> torch.Tensor:
+    """Pool completed compressor pairs into FP32 [T,512] without cache writes.
+
+    content/scores are FP32 current projections; previous[T] names each pair's
+    predecessor input row, or -1 to read tail[tail_slots[T]]. tail is the LCM
+    FP32 [pages,2,2,512] field. active[T] masks incomplete/padded pairs to zero.
+    All arguments share a device; out is contiguous FP32 [T,512], or None to
+    allocate. With norm_weight[512], preserve the BF16 pooled boundary and
+    return BF16 RMS-normalized rows using norm_eps; None returns raw FP32.
+    The caller validates dependencies
+    and publishes tail writes only after all pooled reads are enqueued.
+    """
+    return _kernel("compressor_pool", content)(
+        content, scores, previous, tail, tail_slots, active, out, norm_weight, norm_eps
+    )
+
+
 def compressor_tail_scatter(
     content: torch.Tensor,
     scores: torch.Tensor,
@@ -152,11 +207,26 @@ def index_q_quantize(q: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
     return _kernel("index_q_quantize", q)(q, out)
 
 
+def new_attention_schedule() -> object | None:
+    """Create an uninitialized FlashMLA schedule when the optional API is available.
+
+    The caller retains it through capture/replay; no request state or global
+    tensor cache is allocated here. Portable selected attention accepts None.
+    """
+    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+
+    if not is_flash_mla_v41_available():
+        return None
+    from tokenspeed_kernel.ops.attention.flash_mla.dsv41 import new_flashmla_schedule
+
+    return new_flashmla_schedule()
+
+
 def selected_attention(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
-    swa_slots: torch.Tensor,
-    swa_lens: torch.Tensor,
+    swa_slots: torch.Tensor | None,
+    swa_lens: torch.Tensor | None,
     global_cache: torch.Tensor | None,
     global_slots: torch.Tensor | None,
     global_lens: torch.Tensor | None,
@@ -164,6 +234,9 @@ def selected_attention(
     softmax_scale: float,
     out: torch.Tensor | None,
     query_chunk_size: int,
+    schedule: object | None,
+    prefill_kv: torch.Tensor | None,
+    prefill_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Joint SWA/global softmax with one zero-valued sink, returning BF16.
 
@@ -177,20 +250,45 @@ def selected_attention(
         global_slots: Int32/int64 [T, W_global], normally W_global=512; None
             iff global_cache is None. This is a separate physical address domain.
         global_lens: Int32/int64 [T] active prefix lengths, or None with no global.
-        attn_sink: FP32 [H] finite sink logits, included exactly once per head.
+        attn_sink: FP32 [H] sink logits, or a pre-padded 64/128-head vector;
+            each real head includes its sink exactly once.
         softmax_scale: QK multiplier; reference uses 512**-0.5.
         out: Contiguous BF16 destination shaped like q, or None to allocate.
         query_chunk_size: Positive query tile bound for gather/dequant scratch.
+        schedule: Fresh caller-owned native decode schedule, or None for prefill.
+            Eager refresh replaces it; graph capture records its initialization
+            and replay rebuilds metadata from the live lengths.
+        prefill_kv: Optional BF16 [rows,1,512] forward-owned compact workspace.
+        prefill_indices: Optional int32 [T,width] indices into prefill_kv.
+            With a workspace, paged slots/lengths are None. The backend gathers
+            all required old prefix rows before publishing this layer's writes.
 
     Returns:
         Output shaped like q; all-invalid selections return zero. SWA/global
         entries are not deduplicated. Inverse RoPE remains the caller's job.
 
-    Correctness baseline: gathers at most query_chunk_size * (W_swa + W_global)
-    BF16 rows, then reuses dsv4_prefill's FP32 online softmax. No full-history
-    logits or whole-prefill selected workspace. Not a production latency claim.
+    The optional Blackwell implementation reads packed pages directly for
+    decode, and tiles compact BF16 prefill workspaces. The portable implementation
+    uses the same selections and bounded gather with FP32 online softmax.
     """
-    return _kernel("selected_attention", q)(
+    import tokenspeed_kernel.ops.attention.flash_mla.dsv41  # noqa: F401
+    from tokenspeed_kernel.thirdparty.flash_mla import is_flash_mla_v41_available
+
+    native = (
+        schedule is not None or prefill_kv is not None
+    ) and is_flash_mla_v41_available()
+    kernel = select_kernel(
+        "attention",
+        "dsv41_selected_attention",
+        format_signature(x=dense_tensor_format(q.dtype)),
+        features=None,
+        platform=None,
+        objective=SelectionObjective.DEFAULT,
+        traits={"flashmla_eligible": native},
+        solution=None,
+        override=None,
+    )
+    return kernel(
         q,
         swa_cache,
         swa_slots,
@@ -202,6 +300,9 @@ def selected_attention(
         softmax_scale,
         out,
         query_chunk_size,
+        schedule,
+        prefill_kv,
+        prefill_indices,
     )
 
 
@@ -287,16 +388,54 @@ def index_topk(
         Empty history has zero lengths. Equal-score boundary ties may select
         any equivalent subset; no cross-chunk/TP bitwise tie guarantee.
 
-    Full uses 16 fixed partitions whose loops are bounded by device-visible
+    The portable Full implementation uses16 fixed partitions bounded by device-visible
     lengths, not table capacity; Reindex scores at most 2048*8 candidate rows.
     Graph replay recomputes those loop bounds without host synchronization.
     Each partition keeps exact row/block TopK, merged once across partitions.
     Scratch is O(query_chunk_size * 16 * (rounded_topk + rounded_candidate_topk))
     plus gathered Q/weights, independent of configured or visible history.
-    FP32 scores and int64 IDs use 12 bytes per partial entry; capacities round
-    to powers of two and at least the score tile width (at most 256 lanes).
+    FP32 scores and int64 IDs use12 bytes per partial entry; capacities round
+    to powers of two and at least the score tile width (at most256 lanes).
+    With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
+    scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
+    and block maxima. This native accumulation differs from the portable
+    reference's intermediate BF16 rounding. Native query tiles cap logits at
+    32MiB for paged queries and 128MiB for a zero-row-stride request table.
+    That broadcast layout gathers packed history once per call and packs Q
+    once before the score tiles; no payload survives the call.
     """
-    return _kernel("index_topk", index_q)(
+    import tokenspeed_kernel.ops.attention.deep_gemm.dsv41  # noqa: F401
+    from tokenspeed_kernel.ops.attention.deep_gemm.dsv41 import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    native = (
+        index_q.is_cuda
+        and process_group is None
+        and index_q.shape[1] == 32
+        and index_cache.ndim == 3
+        and index_cache.shape[1:] == (64, 68)
+        and index_cache.stride(1) == 68
+        and index_cache.stride(2) == 1
+        and index_cache.stride(0) < 2**31
+        and index_cache.stride(0) % 16 == 0
+        and index_cache.data_ptr() % 16 == 0
+        and is_native_indexer_available()
+        and is_deep_select_available()
+    )
+    kernel = select_kernel(
+        "attention",
+        "dsv41_index_topk",
+        format_signature(x=dense_tensor_format(index_q.dtype)),
+        features=None,
+        platform=None,
+        objective=SelectionObjective.DEFAULT,
+        traits={"native_indexer": native},
+        solution=None,
+        override=None,
+    )
+    return kernel(
         index_q,
         weights,
         index_cache,
@@ -311,3 +450,103 @@ def index_topk(
         process_group,
         out,
     )
+
+
+def _validate_rope(values, positions, cos_sin_cache):
+    if values.ndim not in (2, 3) or values.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "V4.1 RoPE values must be BF16/FP16 [tokens,dim] or [tokens,heads,dim]"
+        )
+    if not values.is_cuda or values.stride(-1) != 1:
+        raise ValueError("V4.1 RoPE requires CUDA values with contiguous head channels")
+    if positions.shape != values.shape[:1] or positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("RoPE positions must be int32/int64 [tokens]")
+    if (
+        cos_sin_cache.ndim != 2
+        or cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.shape[0] <= 0
+        or cos_sin_cache.shape[1] <= 0
+        or cos_sin_cache.shape[1] % 2
+        or cos_sin_cache.shape[1] > values.shape[-1]
+        or cos_sin_cache.stride(-1) != 1
+    ):
+        raise ValueError(
+            "RoPE table must be FP32 [positions,even rotary_dim] within the head width"
+        )
+    if positions.device != values.device or cos_sin_cache.device != values.device:
+        raise ValueError("RoPE tensors must share a device")
+
+
+def rope_inplace(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    solution: str | None,
+) -> torch.Tensor:
+    """Rotate the interleaved tail in-place, preserving non-RoPE channels.
+
+    Args:
+        values: BF16/FP16 [tokens,dim] or [tokens,heads,dim]. Writable views must
+            not overlap; noncontiguous outer strides are supported. Expanded
+            zero-stride rows/heads with more than one element are rejected.
+        positions: Int32/int64 token positions; negative padding positions use row0.
+        cos_sin_cache: FP32 [max_positions,rotary_dim], cosine then sine halves.
+            Caller supplies forward or inverse sine signs. Positive out-of-range
+            positions assert on device before invalid table reads.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        The same values tensor. NoPE channels remain unchanged; FP32 products
+        are separately rounded before the final low-precision store.
+    """
+    _validate_rope(values, positions, cos_sin_cache)
+    if any(
+        size > 1 and stride == 0
+        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
+    ):
+        raise ValueError(
+            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsv41_rope_inplace",
+        format_signature(values=dense_tensor_format(values.dtype)),
+        traits={},
+        solution=solution,
+    )
+    return kernel(values, positions, cos_sin_cache)
+
+
+def rope_pad_query(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    solution: str | None,
+) -> torch.Tensor:
+    """Rotate compact queries while fully writing the FlashMLA 64/128-head input.
+
+    Args:
+        values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
+        positions: Int32/int64 [tokens], with negative padding positions mapped to0.
+        cos_sin_cache: FP32 cosine/sine table for the interleaved head tail.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        input storage is unchanged. This is forward/graph-owned scratch, never
+        persistent KV or a request-indexed state buffer.
+    """
+    _validate_rope(values, positions, cos_sin_cache)
+    if values.ndim != 3 or values.shape[-1] != 512 or not 1 <= values.shape[1] <= 128:
+        raise ValueError("Padded V4.1 queries require [tokens,1..128 heads,512]")
+    kernel = select_kernel(
+        "attention",
+        "dsv41_rope_pad_query",
+        format_signature(values=dense_tensor_format(values.dtype)),
+        traits={},
+        solution=solution,
+    )
+    return kernel(values, positions, cos_sin_cache)

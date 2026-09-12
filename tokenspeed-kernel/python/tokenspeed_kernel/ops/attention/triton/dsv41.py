@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -69,6 +69,15 @@ def _e2m1_decode(code):
 
 
 @triton.jit
+def _planar_offset(byte, CR: tl.constexpr, CB: tl.constexpr, ROW_BYTES: tl.constexpr):
+    # Byte offsets are page-planar, while the external field retains its LCM
+    # [pages, rows, row_bytes] shape. Honor even noncontiguous portable views.
+    if CR == ROW_BYTES * CB:
+        return byte * CB
+    return (byte // ROW_BYTES) * CR + (byte % ROW_BYTES) * CB
+
+
+@triton.jit
 def _pack_kernel(
     X,
     C,
@@ -76,8 +85,8 @@ def _pack_kernel(
     XS0,
     XS1,
     CP,
-    CR,
-    CB,
+    CR: tl.constexpr,
+    CB: tl.constexpr,
     SS,
     PAGE_ROWS: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -113,17 +122,30 @@ def _pack_kernel(
             scale = ((exponent + 127) << 23).to(tl.float32, bitcast=True)
             scale_byte = (exponent + 127).to(tl.uint8)
         y = tl.div_rn(x, scale[:, None]).reshape(D)
-        base = C + (slot // PAGE_ROWS) * CP + (slot % PAGE_ROWS) * CR
+        base = C + (slot // PAGE_ROWS) * CP
+        data_byte = (slot % PAGE_ROWS) * VALUES
+        scale_byte_offset = PAGE_ROWS * VALUES + (slot % PAGE_ROWS) * (D // GROUP)
+        ROW_BYTES: tl.constexpr = VALUES + D // GROUP
         if FORMAT == "swa":
             encoded = (
                 tl.clamp(y, -448.0, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
             )
-            tl.store(base + d * CB, encoded)
+            tl.store(base + _planar_offset(data_byte + d, CR, CB, ROW_BYTES), encoded)
         else:
             codes = _e2m1_encode(y).reshape(D // 2, 2)
             lo, hi = tl.split(codes)
-            tl.store(base + tl.arange(0, D // 2) * CB, lo | (hi << 4))
-        tl.store(base + (VALUES + tl.arange(0, D // GROUP)) * CB, scale_byte)
+            tl.store(
+                base
+                + _planar_offset(data_byte + tl.arange(0, D // 2), CR, CB, ROW_BYTES),
+                lo | (hi << 4),
+            )
+        tl.store(
+            base
+            + _planar_offset(
+                scale_byte_offset + tl.arange(0, D // GROUP), CR, CB, ROW_BYTES
+            ),
+            scale_byte,
+        )
 
 
 @triton.jit
@@ -132,8 +154,8 @@ def _gather_kernel(
     Slots,
     O,
     CP,
-    CR,
-    CB,
+    CR: tl.constexpr,
+    CB: tl.constexpr,
     OS0,
     OS1,
     PAGE_ROWS: tl.constexpr,
@@ -149,13 +171,20 @@ def _gather_kernel(
     valid = (slot >= 0) & (slot < CAPACITY)
     slot = tl.where(valid, slot, 0)
     d = tl.arange(0, D)
-    base = C + (slot // PAGE_ROWS) * CP + (slot % PAGE_ROWS) * CR
-    byte = tl.load(base + tl.where(VALUES == D, d, d // 2) * CB, valid, other=0)
+    base = C + (slot // PAGE_ROWS) * CP
+    data_byte = (slot % PAGE_ROWS) * VALUES + tl.where(VALUES == D, d, d // 2)
+    scale_byte_offset = (
+        PAGE_ROWS * VALUES + (slot % PAGE_ROWS) * (D // GROUP) + d // GROUP
+    )
+    ROW_BYTES: tl.constexpr = VALUES + D // GROUP
+    byte = tl.load(base + _planar_offset(data_byte, CR, CB, ROW_BYTES), valid, other=0)
     if FORMAT == "swa":
         value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     else:
         value = _e2m1_decode((byte >> ((d % 2) * 4)) & 15)
-    scale_byte = tl.load(base + (VALUES + d // GROUP) * CB, valid, other=0)
+    scale_byte = tl.load(
+        base + _planar_offset(scale_byte_offset, CR, CB, ROW_BYTES), valid, other=0
+    )
     if FORMAT == "global":
         scale = scale_byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     else:
@@ -441,9 +470,34 @@ def selected_attention(
     softmax_scale,
     out,
     query_chunk_size,
+    schedule,
+    prefill_kv,
+    prefill_indices,
 ):
+    attn_sink = attn_sink[: q.shape[1]]
     from tokenspeed_kernel.ops.attention import dsv4_prefill
 
+    if prefill_kv is not None:
+        if prefill_indices is None:
+            raise ValueError("prefill_kv requires prefill_indices")
+        out = _output(out, q.shape, q.dtype, q.device)
+        lengths = torch.full(
+            (q.shape[0],), prefill_indices.shape[-1], dtype=torch.int32, device=q.device
+        )
+        dsv4_prefill(
+            q=q.contiguous(),
+            kv=prefill_kv,
+            indices=prefill_indices,
+            lens=lengths,
+            attn_sink=attn_sink.contiguous(),
+            softmax_scale=softmax_scale,
+            out=out,
+            override=None,
+            solution="triton",
+        )
+        return out
+    if prefill_indices is not None:
+        raise ValueError("prefill_indices requires prefill_kv")
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
         raise ValueError("q must be BF16 [tokens, heads, 512]")
     if query_chunk_size < 1:
@@ -621,8 +675,8 @@ def _index_scan_kernel(
     WS0,
     WS1,
     CP,
-    CR,
-    CB,
+    CR: tl.constexpr,
+    CB: tl.constexpr,
     TS0,
     TS1,
     VS,
@@ -682,11 +736,21 @@ def _index_scan_kernel(
             tl.int64
         )
         valid = valid & (page >= 0) & (page < PAGES)
-        base = Cache + page * CP + (logical % 64) * CR
-        byte = tl.load(base[None, :] + (d[:, None] // 2) * CB, valid[None, :], other=0)
+        base = Cache + page * CP
+        data_byte = (logical[None, :] % 64) * 64 + d[:, None] // 2
+        byte = tl.load(
+            base[None, :] + _planar_offset(data_byte, CR, CB, 68),
+            valid[None, :],
+            other=0,
+        )
         value = _e2m1_decode((byte >> ((d[:, None] % 2) * 4)) & 15)
         scale_byte = tl.load(
-            base[None, :] + (64 + d[:, None] // 32) * CB, valid[None, :], other=0
+            base[None, :]
+            + _planar_offset(
+                64 * 64 + (logical[None, :] % 64) * 4 + d[:, None] // 32, CR, CB, 68
+            ),
+            valid[None, :],
+            other=0,
         )
         scale = tl.where(
             scale_byte == 0,
@@ -768,16 +832,7 @@ def _finish_topk(scores, ids, output, lengths):
     lengths.copy_(valid.sum(dim=1))
 
 
-@register_kernel(
-    "attention",
-    "dsv41_index_topk",
-    name="triton_dsv41_index_topk",
-    solution="triton",
-    capability=_CAPABILITY,
-    signatures=_QUERY_SIGNATURES,
-    priority=Priority.PORTABLE,
-)
-def index_topk(
+def _index_topk_outputs(
     index_q,
     weights,
     index_cache,
@@ -792,6 +847,7 @@ def index_topk(
     process_group,
     out,
 ):
+    """Validate the shared selection contract and obtain caller-owned outputs."""
     _index_inputs(index_q, weights, index_cache)
     tokens = index_q.shape[0]
     if page_table.ndim != 2 or page_table.shape[0] != tokens:
@@ -838,6 +894,49 @@ def index_topk(
         )
     for tensor, shape in zip(out, shapes, strict=True):
         _output(tensor, shape, torch.int32, index_q.device)
+    return out
+
+
+@register_kernel(
+    "attention",
+    "dsv41_index_topk",
+    name="triton_dsv41_index_topk",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_QUERY_SIGNATURES,
+    priority=Priority.PORTABLE,
+)
+def index_topk(
+    index_q,
+    weights,
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    candidate_block_size,
+    query_chunk_size,
+    score_chunk_size,
+    process_group,
+    out,
+):
+    out = _index_topk_outputs(
+        index_q,
+        weights,
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        candidate_block_size,
+        query_chunk_size,
+        score_chunk_size,
+        process_group,
+        out,
+    )
+    tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
     row_out.fill_(-1)
     row_lens.zero_()
@@ -851,6 +950,7 @@ def index_topk(
     tile = max(16, min(256, 1 << (score_chunk_size.bit_length() - 1)))
     row_k = max(tile, triton.next_power_of_2(topk))
     block_k = max(tile // 8, triton.next_power_of_2(max(1, candidate_topk)))
+    query_chunk_size = min(query_chunk_size, 256)
     for start in range(0, tokens, query_chunk_size):
         end = min(start + query_chunk_size, tokens)
         q, w, shards = _index_gather_heads(
@@ -909,3 +1009,961 @@ def index_topk(
                 block_lens[start:end],
             )
     return out
+
+
+@triton.jit
+def _compressor_pool(
+    CONTENT,
+    SCORES,
+    PREVIOUS,
+    TAIL,
+    SLOTS,
+    ACTIVE,
+    OUT,
+    NORM,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    N: tl.constexpr,
+    C0: tl.constexpr,
+    C1: tl.constexpr,
+    G0: tl.constexpr,
+    G1: tl.constexpr,
+    P0: tl.constexpr,
+    S0: tl.constexpr,
+    A0: tl.constexpr,
+    T0: tl.constexpr,
+    T1: tl.constexpr,
+    T2: tl.constexpr,
+    T3: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    PAGES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    channels = tl.arange(0, 512)
+    live = tl.load(ACTIVE + row * A0)
+    previous = tl.load(PREVIOUS + row * P0)
+    slot = tl.load(SLOTS + row * S0)
+    in_current = live & (previous >= 0) & (previous < N)
+    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES * 2)
+    old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
+    old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
+    tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
+    tail_content = tl.load(TAIL + tail_offset, in_tail, 0.0)
+    tail_scores = tl.load(TAIL + tail_offset + T2, in_tail, 0.0)
+    old_content = tl.where(in_current, old_content, tail_content)
+    old_scores = tl.where(in_current, old_scores, tail_scores)
+    current = tl.load(CONTENT + row * C0 + channels * C1, live, 0.0)
+    scores = tl.load(SCORES + row * G0 + channels * G1, live, 0.0)
+    maximum = tl.maximum(old_scores, scores)
+    old_exp = libdevice.exp(old_scores - maximum)
+    new_exp = libdevice.exp(scores - maximum)
+    denominator = old_exp + new_exp
+    old_weight = tl.div_rn(old_exp, denominator)
+    new_weight = tl.div_rn(new_exp, denominator)
+    # Preserve separate FP32 products/addition before the caller's BF16 cast.
+    pooled = tl.inline_asm_elementwise(
+        "{ .reg .f32 a, b; mul.rn.f32 a, $1, $2; mul.rn.f32 b, $3, $4; add.rn.f32 $0, a, b; }",
+        constraints="=f,f,f,f,f",
+        args=[old_content, old_weight, current, new_weight],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    pooled = tl.where(live, pooled, 0.0)
+    if HAS_NORM:
+        # The released compressor rounds pooled inputs to BF16 before RMSNorm.
+        pooled = pooled.to(tl.bfloat16).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(pooled * pooled, 0) / 512 + EPS)
+        pooled = pooled * inv_rms
+        pooled = pooled * tl.load(NORM + channels).to(tl.float32)
+    tl.store(OUT + row * O0 + channels * O1, pooled)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_compressor_pool",
+    name="triton_dsv41_compressor_pool",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.float32))}),
+    priority=Priority.PORTABLE,
+)
+def compressor_pool(
+    content, scores, previous, tail, tail_slots, active, out, norm_weight, norm_eps
+):
+    if (
+        content.ndim != 2
+        or content.shape[1] != 512
+        or scores.shape != content.shape
+        or content.dtype != torch.float32
+        or scores.dtype != torch.float32
+        or tail.ndim != 4
+        or tail.shape[1:] != (2, 2, 512)
+        or tail.dtype != torch.float32
+    ):
+        raise ValueError(
+            "Compressor pooling requires FP32 [N,512] and [pages,2,2,512] tail"
+        )
+    count = content.shape[0]
+    for value in (previous, tail_slots):
+        if value.shape != (count,) or value.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Compressor previous rows and slots must be integer [N]")
+    if active.shape != (count,) or active.dtype != torch.bool:
+        raise ValueError("Compressor active mask must be bool [N]")
+    if any(
+        x.device != content.device for x in (scores, previous, tail, tail_slots, active)
+    ):
+        raise ValueError("Compressor operands must share one device")
+    dtype = torch.float32 if norm_weight is None else torch.bfloat16
+    if norm_weight is not None and (
+        norm_weight.shape != (512,)
+        or norm_weight.device != content.device
+        or norm_eps <= 0
+    ):
+        raise ValueError(
+            "Compressor normalization requires a device [512] weight and positive epsilon"
+        )
+    if out is None:
+        out = torch.empty(content.shape, device=content.device, dtype=dtype)
+    elif (
+        out.shape != content.shape or out.dtype != dtype or out.device != content.device
+    ):
+        raise ValueError("Compressor output must be FP32 [N,512] on the input device")
+    if count and any(
+        out.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+        for value in (content, scores, tail)
+    ):
+        raise ValueError("Compressor output must not alias projection or tail storage")
+    if count:
+        _compressor_pool[(count,)](
+            content,
+            scores,
+            previous,
+            tail,
+            tail_slots,
+            active,
+            out,
+            norm_weight,
+            norm_eps,
+            norm_weight is not None,
+            count,
+            *content.stride(),
+            *scores.stride(),
+            previous.stride(0),
+            tail_slots.stride(0),
+            active.stride(0),
+            *tail.stride(),
+            *out.stride(),
+            tail.shape[0],
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+@triton.jit
+def _rotate_interleaved(value, partner, cosine, sine, odd):
+    first = value.to(tl.float32) * cosine
+    second = partner.to(tl.float32) * sine
+    return tl.where(odd, first + second, first - second)
+
+
+@triton.jit
+def _swa_rope_insert(
+    X,
+    POS,
+    CS,
+    CACHE,
+    SLOTS,
+    OUT,
+    X0: tl.constexpr,
+    X1: tl.constexpr,
+    POS0: tl.constexpr,
+    CS0: tl.constexpr,
+    C0: tl.constexpr,
+    S0: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    P: tl.constexpr,
+    NP: tl.constexpr,
+    MAX_POS: tl.constexpr,
+    HAS_OUT: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, 512)
+    position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
+    position_valid = position < MAX_POS
+    tl.device_assert(
+        position_valid, "SWA RoPE position is outside the cosine/sine table"
+    )
+    slot = tl.load(SLOTS + token * S0).to(tl.int64)
+    live = (slot >= P) & (slot < NP * P)
+    x = tl.load(X + token * X0 + d * X1).to(tl.float32)
+    # RMSNorm has already rounded to BF16 in the caller's existing primitive.
+    normalized = x
+    partner = tl.gather(normalized, d ^ 1, axis=0)
+    pair = (d - 448) // 2
+    rope = d >= 448
+    cosine = tl.load(CS + position * CS0 + pair, rope & position_valid, 1.0)
+    sine = tl.load(CS + position * CS0 + 32 + pair, rope & position_valid, 0.0)
+    rotated = tl.where(
+        rope,
+        _rotate_interleaved(normalized, partner, cosine, sine, (d & 1) != 0).to(
+            tl.bfloat16
+        ),
+        normalized.to(tl.bfloat16),
+    )
+    values = tl.reshape(rotated.to(tl.float32), (16, 32))
+    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+    # Use the same group32 IEEE exponent rule as the portable cache codec.
+    raw_scale = amax * (1.0 / 448.0)
+    bits = raw_scale.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.reshape(tl.div_rn(values, scale[:, None]), (512,)).to(tl.float8e4nv)
+    if HAS_OUT:
+        restored = quantized.to(tl.float32) * tl.reshape(
+            tl.broadcast_to(scale[:, None], (16, 32)), (512,)
+        )
+        tl.store(OUT + token * O0 + d * O1, restored.to(tl.bfloat16))
+    page = tl.maximum(slot, 0) // P
+    row = tl.maximum(slot, 0) % P
+    tl.store(
+        CACHE + page * C0 + row * 512 + d, quantized.to(tl.uint8, bitcast=True), live
+    )
+    tl.store(
+        CACHE + page * C0 + P * 512 + row * 16 + tl.arange(0, 16),
+        exponent.to(tl.uint8),
+        live,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv41_swa_rope_scatter",
+    name="triton_dsv41_swa_rope_scatter",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_swa_rope_scatter(values, positions, cos_sin_cache, cache, slots, out):
+    _cache(cache, "swa")
+    _same_device(values, (positions, cos_sin_cache, cache, slots, out))
+    if values.dtype != torch.bfloat16 or values.ndim != 2 or values.shape[1] != 512:
+        raise ValueError("SWA values must be BF16 [tokens,512]")
+    _integers(positions, values.shape[:1], "positions")
+    _integers(slots, values.shape[:1], "slots")
+    if (
+        cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[1] != 64
+        or cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.stride(1) != 1
+    ):
+        raise ValueError("SWA RoPE table must be FP32 [positions,64]")
+    if cache.stride(1) != 528 or cache.stride(2) != 1:
+        raise ValueError("Fused SWA requires contiguous page bytes")
+    if out is not None:
+        _output(out, values.shape, torch.bfloat16, values.device)
+    page_size = 64
+    cache = cache.as_strided((cache.shape[0], page_size * 528), (cache.stride(0), 1))
+    if values.shape[0] == 0:
+        return
+    _swa_rope_insert[(values.shape[0],)](
+        values,
+        positions,
+        cos_sin_cache,
+        cache,
+        slots,
+        out,
+        values.stride(0),
+        values.stride(1),
+        positions.stride(0),
+        cos_sin_cache.stride(0),
+        cache.stride(0),
+        slots.stride(0),
+        0 if out is None else out.stride(0),
+        0 if out is None else out.stride(1),
+        page_size,
+        cache.shape[0],
+        cos_sin_cache.shape[0],
+        out is not None,
+        num_warps=4,
+        enable_fp_fusion=False,
+        debug=True,
+    )
+
+
+def _register_rope(name):
+    return register_kernel(
+        "attention",
+        name,
+        name="triton_" + name,
+        solution="triton",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+        signatures=frozenset(
+            format_signature(values=dense_tensor_format(t))
+            for t in (torch.bfloat16, torch.float16)
+        ),
+        traits={},
+        priority=Priority.PORTABLE,
+    )
+
+
+@triton.jit
+def _rope_inplace_kernel(
+    X,
+    POS,
+    CS,
+    X0,
+    X1,
+    P0,
+    CS0,
+    R: tl.constexpr,
+    MAX_POS: tl.constexpr,
+    B: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    # Keep padding/compressor sentinels in the caller's metadata. Only this
+    # frequency-table lookup maps negative positions to the identity row.
+    position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
+    valid = position < MAX_POS
+    tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
+    pair = tl.arange(0, B)
+    mask = (pair < R // 2) & valid
+    base = X + token * X0 + head * X1
+    even = tl.load(base + 2 * pair, mask, 0.0)
+    odd = tl.load(base + 2 * pair + 1, mask, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, mask, 0.0)
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, mask, 0.0)
+    out_even = _rotate_interleaved(even, odd, cosine, sine, False)
+    out_odd = _rotate_interleaved(odd, even, cosine, sine, True)
+    tl.store(base + 2 * pair, out_even.to(even.dtype), mask)
+    tl.store(base + 2 * pair + 1, out_odd.to(odd.dtype), mask)
+
+
+@_register_rope("dsv41_rope_inplace")
+def rope_inplace(values, positions, cache):
+    if values.numel() == 0:
+        return values
+    rotary_dim = cache.shape[1]
+    heads = 1 if values.ndim == 2 else values.shape[1]
+    _rope_inplace_kernel[(values.shape[0], heads)](
+        values[..., -rotary_dim:],
+        positions,
+        cache,
+        values.stride(0),
+        0 if values.ndim == 2 else values.stride(1),
+        positions.stride(0),
+        cache.stride(0),
+        rotary_dim,
+        cache.shape[0],
+        max(triton.next_power_of_2(rotary_dim // 2), 16),
+        num_warps=4,
+        enable_fp_fusion=False,
+        debug=True,
+    )
+    return values
+
+
+@triton.jit
+def _rope_pad_query(
+    X,
+    POS,
+    CS,
+    OUT,
+    X0: tl.constexpr,
+    X1: tl.constexpr,
+    P0: tl.constexpr,
+    CS0: tl.constexpr,
+    H: tl.constexpr,
+    HP: tl.constexpr,
+    R: tl.constexpr,
+    MAX_POS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, 512)
+    position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
+    valid_position = position < MAX_POS
+    tl.device_assert(valid_position, "RoPE position is outside the cosine/sine table")
+    live = head < H
+    x = tl.load(X + token * X0 + head * X1 + d, live, 0.0)
+    partner = tl.gather(x, d ^ 1, axis=0).to(tl.float32)
+    tail = d >= 512 - R
+    pair = (d - (512 - R)) // 2
+    cosine = tl.load(CS + position * CS0 + pair, tail & live & valid_position, 1.0)
+    sine = tl.load(
+        CS + position * CS0 + R // 2 + pair, tail & live & valid_position, 0.0
+    )
+    rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
+    value = tl.where(tail, rotated.to(x.dtype), x)
+    value = tl.where(live, value, 0.0)
+    tl.store(OUT + (token * HP + head) * 512 + d, value)
+
+
+@_register_rope("dsv41_rope_pad_query")
+def rope_pad_query(values, positions, cache):
+    n, h, _ = values.shape
+    hp = 64 if h <= 64 else 128
+    output = torch.empty((n, hp, 512), dtype=values.dtype, device=values.device)
+    return _launch_query(values, positions, cache, output, hp)
+
+
+def _launch_query(values, positions, cache, output, heads_to_write):
+    n, h, _ = values.shape
+    hp = output.shape[1]
+    if n:
+        _rope_pad_query[(n, heads_to_write)](
+            values,
+            positions,
+            cache,
+            output,
+            values.stride(0),
+            values.stride(1),
+            positions.stride(0),
+            cache.stride(0),
+            h,
+            hp,
+            cache.shape[1],
+            cache.shape[0],
+            num_warps=4,
+            enable_fp_fusion=False,
+            debug=True,
+        )
+    return output
+
+
+@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+def _pack_index_queries(X, V, S, X0, X1):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, 128)
+    x = tl.load(X + row * X0 + d * X1).to(tl.float32)
+    grouped = tl.reshape(x, (4, 32))
+    amax = tl.maximum(tl.max(tl.abs(grouped), 1), 6.0 * 1.1754943508222875e-38)
+    raw = tl.div_rn(amax, 6.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    normalized = tl.reshape(tl.div_rn(grouped, scale[:, None]), (128,))
+    code = _e2m1_encode(normalized).to(tl.int32)
+    pairs = tl.reshape(code, (64, 2))
+    packed = tl.sum(pairs << (tl.arange(0, 2)[None, :] * 4), 1).to(tl.uint8)
+    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
+    tl.store(V + row * 64 + tl.arange(0, 64), packed)
+    tl.store(S + row, word.to(tl.int32))
+
+
+def pack_index_queries(values):
+    flat = values.reshape(-1, 128)
+    data = torch.empty(
+        (*values.shape[:-1], 64), dtype=torch.uint8, device=values.device
+    )
+    scales = torch.empty(values.shape[:-1], dtype=torch.int32, device=values.device)
+    if flat.shape[0]:
+        _pack_index_queries[(flat.shape[0],)](
+            flat,
+            data,
+            scales,
+            flat.stride(0),
+            flat.stride(1),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return data, scales
+
+
+@triton.jit(
+    do_not_specialize=["T0", "T1", "L0", "TC", "NP", "CAP"],
+    do_not_specialize_on_alignment=["T0", "T1", "L0", "TC", "NP", "CAP"],
+)
+def _safe_metadata(
+    T, L, OT, OL, T0, T1, L0, TC, NP, CAP, P: tl.constexpr, B: tl.constexpr
+):
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    column = tile * B + tl.arange(0, B)
+    page = tl.load(T + row * T0 + column * T1, column < TC, other=0).to(tl.int64)
+    valid = (page >= 0) & (page < NP)
+    tl.store(OT + row * TC + column, tl.where(valid, page, 0).to(tl.int32), column < TC)
+    if tile == 0:
+        length = tl.minimum(
+            tl.maximum(tl.load(L + row * L0), 0), tl.minimum(CAP, TC * P)
+        )
+        tl.store(OL + row, length.to(tl.int32))
+
+
+def safe_metadata(table, lengths, pages, capacity, page_size):
+    safe_table = torch.empty(table.shape, dtype=torch.int32, device=table.device)
+    safe_lengths = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
+    if lengths.numel():
+        _safe_metadata[(table.shape[0], triton.cdiv(table.shape[1], 256))](
+            table,
+            lengths,
+            safe_table,
+            safe_lengths,
+            table.stride(0),
+            table.stride(1),
+            lengths.stride(0),
+            table.shape[1],
+            pages,
+            capacity,
+            page_size,
+            256,
+            num_warps=4,
+        )
+    return safe_table, safe_lengths
+
+
+@triton.jit(
+    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
+    do_not_specialize_on_alignment=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
+)
+def _clean_logits(
+    X,
+    L,
+    T,
+    O,
+    X0,
+    L0,
+    T0,
+    T1,
+    TC,
+    NP,
+    CAP,
+    P: tl.constexpr,
+    PAGED: tl.constexpr,
+    B: tl.constexpr,
+):
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    column = tile * B + tl.arange(0, B)
+    valid = (column < CAP) & (column < tl.load(L + row * L0))
+    if PAGED:
+        page = tl.load(
+            T + row * T0 + (column // P) * T1, valid & (column // P < TC), other=0
+        ).to(tl.int64)
+        valid &= (page >= 0) & (page < NP) & (column // P < TC)
+    value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
+    tl.store(O + row * CAP + column, value, column < CAP)
+
+
+def clean_logits(values, lengths, table, pages, capacity, page_size):
+    if (
+        values.ndim != 2
+        or values.shape[0] != lengths.numel()
+        or values.shape[1] < capacity
+        or values.stride(1) != 1
+        or values.dtype != torch.float32
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+    output = torch.empty(
+        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+    )
+    if output.numel():
+        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
+            values,
+            lengths,
+            table if table is not None else lengths,
+            output,
+            values.stride(0),
+            lengths.stride(0),
+            table.stride(0) if table is not None else 0,
+            table.stride(1) if table is not None else 0,
+            table.shape[1] if table is not None else 0,
+            pages,
+            capacity,
+            page_size,
+            table is not None,
+            1024,
+            num_warps=4,
+        )
+    return output
+
+
+@triton.jit(
+    do_not_specialize=["C0", "S0", "N", "NP"],
+    do_not_specialize_on_alignment=["C0", "S0", "N", "NP"],
+)
+def _gather_index_cache(C, S, V, F, C0, S0, N, NP, P: tl.constexpr, B: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    slot = tl.load(S + row * S0, row < N, other=-1).to(tl.int64)
+    valid = (row < N) & (slot >= 0) & (slot < NP * P)
+    page, offset = slot // P, slot % P
+    d = tl.arange(0, 64)
+    data = tl.load(
+        C + page[:, None] * C0 + offset[:, None] * 64 + d[None, :],
+        valid[:, None],
+        other=0,
+    )
+    tl.store(V + row[:, None] * 64 + d[None, :], data, (row < N)[:, None])
+    b = tl.arange(0, 4)
+    sf = tl.load(
+        C + page[:, None] * C0 + P * 64 + offset[:, None] * 4 + b[None, :],
+        valid[:, None],
+        other=127,
+    ).to(tl.uint32)
+    word = tl.sum(sf << (b[None, :] * 8), 1)
+    tl.store(F + row, word.to(tl.int32), row < N)
+
+
+def gather_index_cache(cache, slots, page_size):
+    data = torch.empty((slots.numel(), 64), dtype=torch.uint8, device=cache.device)
+    scales = torch.empty((slots.numel(),), dtype=torch.int32, device=cache.device)
+    if slots.numel():
+        _gather_index_cache[(triton.cdiv(slots.numel(), 32),)](
+            cache,
+            slots,
+            data,
+            scales,
+            cache.stride(0),
+            slots.stride(0),
+            slots.numel(),
+            cache.shape[0],
+            page_size,
+            32,
+            num_warps=4,
+        )
+    return data, scales
+
+
+@triton.jit(
+    do_not_specialize=["L0", "N", "CAP"],
+    do_not_specialize_on_alignment=["L0", "N", "CAP"],
+)
+def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
+    row = tl.program_id(0) * B + tl.arange(0, B)
+    length = tl.load(L + row * L0, row < N, other=0)
+    tl.store(START + row, 0, row < N)
+    tl.store(END + row, tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32), row < N)
+
+
+def dense_ranges(lengths, capacity):
+    starts = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
+    ends = torch.empty_like(starts)
+    if lengths.numel():
+        _dense_ranges[(triton.cdiv(lengths.numel(), 256),)](
+            lengths,
+            starts,
+            ends,
+            lengths.stride(0),
+            lengths.numel(),
+            capacity,
+            256,
+            num_warps=4,
+        )
+    return starts, ends
+
+
+@triton.jit(
+    do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
+    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
+)
+def _prepare_dense(
+    X,
+    L,
+    S,
+    E,
+    X0,
+    X1,
+    L0,
+    S0,
+    W,
+    SW,
+    B: tl.constexpr,
+):
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    p = tile * B + tl.arange(0, B)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
+    value = tl.load(X + row * X0 + p * X1, (p < W) & (p < end), other=-float("inf"))
+    tl.store(S + row * S0 + p, value, p < SW)
+    if tile == 0:
+        tl.store(E + row, end)
+
+
+@triton.jit(
+    do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
+    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
+)
+def _reduce_blocks(
+    X,
+    L,
+    S,
+    E,
+    X0,
+    X1,
+    L0,
+    S0,
+    W,
+    SW,
+    BLOCK_SIZE: tl.constexpr,
+    GROUP: tl.constexpr,
+    PIN_NEWEST: tl.constexpr,
+    B: tl.constexpr,
+):
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    block = tile * B + tl.arange(0, B)
+    lane = tl.arange(0, GROUP)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
+    position = block[:, None] * BLOCK_SIZE + lane[None, :]
+    value = tl.load(
+        X + row * X0 + position * X1,
+        (position < end) & (lane[None, :] < BLOCK_SIZE),
+        other=-float("inf"),
+    )
+    scores = tl.max(value, axis=1)
+    if PIN_NEWEST:
+        scores = tl.where(
+            (end > 0) & (block == (end - 1) // BLOCK_SIZE) & (scores > -float("inf")),
+            float("inf"),
+            scores,
+        )
+    tl.store(S + row * S0 + block, scores, block < SW)
+    if tile == 0:
+        tl.store(E + row, (end + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+
+@triton.jit(
+    do_not_specialize=["C0", "C1", "L0", "N", "W"],
+    do_not_specialize_on_alignment=["C0", "C1", "L0", "N", "W"],
+)
+def _normalize_candidates(
+    C,
+    L,
+    O,
+    E,
+    C0,
+    C1,
+    L0,
+    N,
+    W,
+    BLOCK_SIZE: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.arange(0, B)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
+    candidate = tl.load(C + row * C0 + i * C1, i < N, other=-1)
+    count = (end + BLOCK_SIZE - 1) // BLOCK_SIZE
+    candidate = tl.where(
+        (candidate >= 0) & (candidate < count), candidate, 2147483647
+    ).to(tl.int32)
+    candidate = tl.sort(candidate, descending=False)
+    previous = tl.gather(candidate, tl.maximum(i - 1, 0), axis=0)
+    valid = (candidate != 2147483647) & ((i == 0) | (candidate != previous))
+    tl.store(O + row * N + i, tl.where(valid, candidate, -1), i < N)
+    span = i * BLOCK_SIZE + tl.minimum(BLOCK_SIZE, end - candidate * BLOCK_SIZE)
+    tl.store(E + row, tl.max(tl.where(valid, span, 0), axis=0))
+
+
+@triton.jit(
+    do_not_specialize=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
+    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
+)
+def _gather_candidates(
+    X,
+    L,
+    C,
+    S,
+    X0,
+    X1,
+    L0,
+    S0,
+    W,
+    NC,
+    SW,
+    BLOCK_SIZE: tl.constexpr,
+    B: tl.constexpr,
+):
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    i = tile * B + tl.arange(0, B)
+    candidate = tl.load(C + row * NC + i // BLOCK_SIZE, i < NC * BLOCK_SIZE, other=-1)
+    position = candidate * BLOCK_SIZE + i % BLOCK_SIZE
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
+    valid = (candidate >= 0) & (position < end) & (i < NC * BLOCK_SIZE)
+    value = tl.load(X + row * X0 + position * X1, valid, other=-float("inf"))
+    tl.store(S + row * S0 + i, value, i < SW)
+
+
+@triton.jit(
+    do_not_specialize=["I0", "S0", "NC", "W"],
+    do_not_specialize_on_alignment=["I0", "S0", "NC", "W"],
+)
+def _finish_selection(
+    I,
+    S,
+    E,
+    C,
+    O,
+    I0,
+    S0,
+    NC,
+    K: tl.constexpr,
+    W,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    POSITION_SORT: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    i = tl.arange(0, B)
+    selected = tl.load(I + row * I0 + i, i < K, other=-1)
+    end = tl.load(E + row)
+    valid = (i < K) & (selected >= 0) & (selected < end)
+    score = tl.load(S + row * S0 + selected, valid, other=-float("inf"))
+    valid &= score > -float("inf")
+    position = selected
+    if HAS_CANDIDATES:
+        candidate = tl.load(C + row * NC + selected // BLOCK_SIZE, valid, other=-1)
+        position = candidate * BLOCK_SIZE + selected % BLOCK_SIZE
+        valid &= (candidate >= 0) & (position < W)
+    position = tl.where(valid, position, 2147483647)
+    if POSITION_SORT:
+        position = tl.sort(position, descending=False)
+    tl.store(O + row * K + i, tl.where(position != 2147483647, position, -1), i < K)
+
+
+@triton.jit(
+    do_not_specialize=["COUNT", "WIDTH", "L0"],
+    do_not_specialize_on_alignment=["COUNT", "WIDTH", "L0"],
+)
+def _clamp_selection_ends(L, E, COUNT, WIDTH, L0, TILE: tl.constexpr):
+    row = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    value = tl.load(L + row * L0, row < COUNT, other=0)
+    tl.store(E + row, tl.minimum(tl.maximum(value, 0), WIDTH), row < COUNT)
+
+
+def prepare_native_dense_scores(logits, lengths, alignment):
+    """Borrow aligned read-only logits; native exclusive ends enforce causality.
+
+    Full aligned logical rows avoid vector-load access beyond tensor storage.
+    Unaligned/strided channels keep the masked/aligned copy implementation.
+    Unlike prepare_scores, future score values in a borrowed view are unspecified
+    to the consumer and must never be accessed beyond the clamped ends.
+    """
+    if (
+        logits.shape[1] % alignment == 0
+        and logits.stride(1) == 1
+        and logits.stride(0) >= logits.shape[1]
+        and logits.stride(0) % alignment == 0
+        and logits.data_ptr() % (alignment * logits.element_size()) == 0
+    ):
+        ends = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+        if logits.shape[0]:
+            _clamp_selection_ends[(triton.cdiv(logits.shape[0], 256),)](
+                lengths, ends, logits.shape[0], logits.shape[1], lengths.stride(0), 256
+            )
+        return logits, ends
+    return prepare_scores(logits, lengths, 1, alignment, False)
+
+
+def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
+    """Fuse causal masking/alignment, optionally block maxima and newest pin."""
+    width = logits.shape[1]
+    logical_width = (width + block_size - 1) // block_size
+    stride = (logical_width + alignment - 1) // alignment * alignment
+    scores = torch.empty(
+        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+    )
+    end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    if block_size == 1 and not pin_newest:
+        _prepare_dense[(logits.shape[0], triton.cdiv(stride, 1024))](
+            logits,
+            lengths,
+            scores,
+            end,
+            logits.stride(0),
+            logits.stride(1),
+            lengths.stride(0),
+            stride,
+            width,
+            stride,
+            1024,
+        )
+    else:
+        _reduce_blocks[(logits.shape[0], triton.cdiv(stride, 128))](
+            logits,
+            lengths,
+            scores,
+            end,
+            logits.stride(0),
+            logits.stride(1),
+            lengths.stride(0),
+            stride,
+            width,
+            stride,
+            block_size,
+            triton.next_power_of_2(block_size),
+            pin_newest,
+            128,
+        )
+    return scores, end
+
+
+def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment):
+    """Deduplicate candidate block IDs, then gather a bounded causal score table."""
+    count = candidates.shape[1]
+    normalized = torch.empty(
+        (logits.shape[0], count), dtype=torch.int32, device=logits.device
+    )
+    end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    stride = (count * block_size + alignment - 1) // alignment * alignment
+    scores = torch.empty(
+        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+    )
+    _normalize_candidates[(logits.shape[0],)](
+        candidates,
+        lengths,
+        normalized,
+        end,
+        candidates.stride(0),
+        candidates.stride(1),
+        lengths.stride(0),
+        count,
+        logits.shape[1],
+        block_size,
+        triton.next_power_of_2(count),
+        num_warps=8,
+    )
+    _gather_candidates[(logits.shape[0], triton.cdiv(stride, 1024))](
+        logits,
+        lengths,
+        normalized,
+        scores,
+        logits.stride(0),
+        logits.stride(1),
+        lengths.stride(0),
+        stride,
+        logits.shape[1],
+        count,
+        stride,
+        block_size,
+        1024,
+    )
+    return scores, end, normalized
+
+
+def finish_selection(
+    indices, scores, lengths, candidates, width, block_size, sort_positions
+):
+    """Filter masked native selections and return logical IDs with -1 padding."""
+    output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
+    _finish_selection[(indices.shape[0],)](
+        indices,
+        scores,
+        lengths,
+        candidates if candidates is not None else indices,
+        output,
+        indices.stride(0),
+        scores.stride(0),
+        candidates.shape[1] if candidates is not None else 0,
+        indices.shape[1],
+        width,
+        block_size,
+        candidates is not None,
+        sort_positions,
+        triton.next_power_of_2(indices.shape[1]),
+        num_warps=8,
+    )
+    return output

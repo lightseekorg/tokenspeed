@@ -35,6 +35,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -71,22 +72,45 @@ def _rowcta_gemv_add3_kernel(
 
 
 @triton.jit
-def _rowcta_gemv_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    K: tl.constexpr,
-    BK: tl.constexpr,
-):
-    n = tl.program_id(0)
+def _row_dot(x_ptr, w_ptr, K: tl.constexpr, BK: tl.constexpr):
     acc = tl.zeros([BK], tl.float32)
     for kb in tl.static_range(0, K, BK):
         offs = kb + tl.arange(0, BK)
         mask = offs < K
         xv = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        wv = tl.load(w_ptr + n * K + offs, mask=mask, other=0.0).to(tl.float32)
+        wv = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         acc += wv * xv
-    tl.store(out_ptr + n, tl.sum(acc).to(out_ptr.dtype.element_ty))
+    return tl.sum(acc)
+
+
+@triton.jit
+def _rowcta_gemv_kernel(x_ptr, w_ptr, out_ptr, K: tl.constexpr, BK: tl.constexpr):
+    n = tl.program_id(0)
+    value = _row_dot(x_ptr, w_ptr + n * K, K, BK)
+    tl.store(out_ptr + n, value.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _grouped_rowcta_gemv_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    X_GROUP_STRIDE: tl.constexpr,
+    W_GROUP_STRIDE: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    OUT_GROUP_STRIDE: tl.constexpr,
+):
+    n = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1).to(tl.int64)
+    value = _row_dot(
+        x_ptr + group * X_GROUP_STRIDE,
+        w_ptr + group * W_GROUP_STRIDE + n * W_ROW_STRIDE,
+        K,
+        BK,
+    )
+    tl.store(out_ptr + group * OUT_GROUP_STRIDE + n, value.to(out_ptr.dtype.element_ty))
 
 
 # Registry dispatch: rowcta owns M == 1 while torch handles other shapes.
@@ -243,5 +267,55 @@ def rowcta_gemv_add3(
         K=k,
         BK=512,
         num_warps=4,
+    )
+    return out
+
+
+@register_kernel(
+    "gemm",
+    "grouped_bf16_projection",
+    name="grouped_bf16_projection_rowcta",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
+    ),
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={
+        "batch": frozenset({2}),
+        "m": frozenset({1}),
+        "n": frozenset({1024}),
+        "k": frozenset({4096}),
+        "is_cuda": frozenset({True}),
+        "a_inner_stride_one": frozenset({True}),
+        "b_inner_stride_one": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def grouped_bf16_projection_rowcta(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Single-token grouped projection; the public API validates the layout."""
+    groups, rows, dim = weight.shape
+    if out is None:
+        out = torch.empty((1, groups, rows), dtype=x.dtype, device=x.device)
+    _grouped_rowcta_gemv_kernel[(rows, groups)](
+        x,
+        weight,
+        out,
+        K=dim,
+        BK=4096,
+        X_GROUP_STRIDE=x.stride(1),
+        W_GROUP_STRIDE=weight.stride(0),
+        W_ROW_STRIDE=weight.stride(1),
+        OUT_GROUP_STRIDE=out.stride(1),
+        num_warps=4,
+        enable_fp_fusion=False,
     )
     return out

@@ -90,6 +90,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -247,6 +248,44 @@ def _require_fp8_linear_plan(plan: object) -> _PreparedFp8Linear:
     if not isinstance(plan, _PreparedFp8Linear):
         raise TypeError("plan must be returned by prepare_fp8_linear")
     return plan
+
+
+def quantize_fp8_group32_for_linear(
+    plan: object,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize exact group-32 inputs in the prepared GEMM's scale layout.
+
+    Args:
+        plan: Opaque plan returned by prepare_fp8_linear for [1,32] weights.
+        x: CUDA BF16/FP16 [M,K], K divisible by32. The activation rule preserves
+            the1e-4 amax floor and IEEE upward power-of-two scale rounding.
+
+    Returns:
+        FP8 values and UE8M0 scales ready for fp8_linear(input_scales=...).
+        FlashInfer plans receive fully initialized1D F8_128x4 scales directly;
+        portable/other plans retain the2D row-major scale contract. Outputs
+        belong to this call and are never cached across eager or graph calls.
+    """
+    typed_plan = _require_fp8_linear_plan(plan)
+    if typed_plan.block_size != (1, 32):
+        raise ValueError("Exact group-32 plan quantization requires [1,32] weights")
+    from tokenspeed_kernel.ops.quantization import (
+        quantize_fp8_group32_ue8m0_swizzled,
+        quantize_fp8_with_scale,
+    )
+
+    if typed_plan.override == "flashinfer_mm_mxfp8":
+        return quantize_fp8_group32_ue8m0_swizzled(x, override=None, solution="triton")
+    return quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+        enable_pdl=False,
+        override="triton_quantize_fp8_group32_ue8m0",
+        solution=None,
+    )
 
 
 def fp8_linear(
@@ -675,6 +714,69 @@ def dsv4_grouped_output_projection_warmup_model(
             module.weight_scale_inv,
             max_tokens,
         )
+
+
+def grouped_bf16_projection(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Compute ``einsum('tgd,grd->tgr', x, weight)`` from canonical BF16 weights.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` activations. Strided group and
+            token views, including a slice of padded attention heads, are valid.
+        weight: BF16 ``[groups, output_dim, input_dim]`` live weights. No packing,
+            copying or persistent weight cache is created. Group/row strides are
+            explicit; nonunit inner strides use the original torch fallback.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
+            Must not overlap either input. None allocates a fresh result.
+        solution: Optional registered solution restriction ("triton" or "torch").
+            None selects an implementation from the input geometry.
+
+    Returns:
+        BF16 ``[tokens, groups, output_dim]``; out when provided. Registered
+        implementations declare their supported geometry; unmatched inputs use
+        torch.einsum. Eager and graph execution use the same selection path.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("Grouped projection requires two rank-3 tensors")
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("Grouped projection requires BF16 operands")
+    if x.device != weight.device or x.shape[1:] != (weight.shape[0], weight.shape[2]):
+        raise ValueError(
+            "Grouped projection operands must share device/groups/input_dim"
+        )
+    expected = (x.shape[0], weight.shape[0], weight.shape[1])
+    if out is not None and (
+        tuple(out.shape) != expected
+        or out.dtype != x.dtype
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "Grouped projection out must be contiguous BF16 with matching shape/device"
+        )
+    kernel = select_kernel(
+        "gemm",
+        "grouped_bf16_projection",
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        ),
+        traits={
+            "batch": weight.shape[0],
+            "m": x.shape[0],
+            "n": weight.shape[1],
+            "k": weight.shape[2],
+            "is_cuda": x.is_cuda,
+            "a_inner_stride_one": x.stride(-1) == 1,
+            "b_inner_stride_one": weight.stride(-1) == 1,
+        },
+        solution=solution,
+    )
+    return kernel(x, weight, out)
 
 
 def dsv4_linear_fp32(

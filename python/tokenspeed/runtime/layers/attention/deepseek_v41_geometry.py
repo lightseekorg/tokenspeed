@@ -41,6 +41,8 @@ V41_SWA_ROW_BYTES = 528
 V41_GLOBAL_ROW_BYTES = 288
 V41_INDEX_ROW_BYTES = 68
 V41_WINDOW_SIZE = 128
+# Shared caller/recipe bound for native prefill query and output scratch.
+V41_PREFILL_QUERY_TILE = 2048
 V41_TAIL_ROWS = 2
 
 # (physical rows per page, raw tokens per row). Table columns remain absolute

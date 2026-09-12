@@ -25,7 +25,12 @@ import math
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 fp8_dtype = torch.float8_e4m3fn
 _FP8_BLOCK_SCALE = ScaleFormat(
@@ -523,3 +528,30 @@ def torch_bmm(
         # represented as a reference cast after the native epilogue.
         output = output.to(out_dtype)
     return output
+
+
+@register_kernel(
+    "gemm",
+    "grouped_bf16_projection",
+    name="grouped_bf16_projection_torch",
+    solution="torch",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def grouped_bf16_projection_torch(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Preserve the original batched projection and its BF16 rounding."""
+    result = torch.einsum("tgd,grd->tgr", x, weight)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out

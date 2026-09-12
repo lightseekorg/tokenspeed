@@ -332,3 +332,98 @@ def test_index_scan_graph_oracle(device, shards, dtype, tp_group):
         # NCCL destruction waits for captured graph references to be released.
         if graph is not None:
             graph.reset()
+
+
+def test_native_indexer_page_contract_and_graph_lengths(device):
+    from tokenspeed_kernel.ops.attention.deep_gemm.dsv41 import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    if (
+        torch.cuda.get_device_capability(device)[0] != 10
+        or not is_native_indexer_available()
+        or not is_deep_select_available()
+    ):
+        pytest.skip("requires Blackwell DeepGEMM and DeepSelect")
+    torch.manual_seed(8841)
+    q = torch.randn(1, 32, 128, device=device, dtype=torch.bfloat16)
+    weights = -torch.ones(1, 32, device=device, dtype=torch.bfloat16)
+    cache = torch.zeros((3, 64, 68), device=device, dtype=torch.uint8)
+    keys = torch.randn(192, 128, device=device, dtype=torch.bfloat16)
+    dsv41.cache_scatter(keys, cache, torch.arange(192, device=device), "index")
+    # The public operator permits page zero. The LCM caller alone maps its
+    # reserved null page to -1; absent pages must not outrank negative scores.
+    table = torch.tensor([[0, -1, 2, -1]], device=device, dtype=torch.int32)
+    visible = torch.tensor([256], device=device, dtype=torch.int32)
+
+    def run():
+        return dsv41.index_topk(
+            q, weights, cache, table, visible, None, 16, 32, 8, 1, 64, None, None
+        )
+
+    output = run()
+    assert output[1].item() == 16
+    assert not ((output[0] >= 64) & (output[0] < 128)).any()
+    assert (output[2] // 8 != 3).all()  # no pinned candidate in missing newest page
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    for length in (0, 17, 192, 256):
+        visible.fill_(length)
+        graph.replay()
+        expected = run()
+        for got, want in zip(captured, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # Noncontiguous page bytes use the portable reader with the same byte codec.
+    strided = torch.zeros((3, 64, 136), device=device, dtype=torch.uint8)[..., ::2]
+    dsv41.cache_scatter(keys, strided, torch.arange(192, device=device), "index")
+    result = dsv41.index_topk(
+        q, weights, strided, table, visible, None, 16, 0, 8, 1, 64, None, None
+    )
+    assert result[1].item() == 16
+    assert not ((result[0] >= 64) & (result[0] < 128)).any()
+
+
+def test_native_broadcast_history_matches_paged_and_refreshes_graph(device):
+    from tokenspeed_kernel.ops.attention.deep_gemm.dsv41 import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    if (
+        torch.cuda.get_device_capability(device)[0] != 10
+        or not is_native_indexer_available()
+        or not is_deep_select_available()
+    ):
+        pytest.skip("requires Blackwell packed native indexer")
+    torch.manual_seed(421)
+    q = torch.randn(33, 32, 128, device=device, dtype=torch.bfloat16)
+    weights = -torch.rand(33, 32, device=device, dtype=torch.bfloat16)
+    cache = torch.zeros(6, 64, 68, device=device, dtype=torch.uint8)
+    dsv41.cache_scatter(
+        torch.randn(384, 128, device=device, dtype=torch.bfloat16),
+        cache,
+        torch.arange(384, device=device),
+        "index",
+    )
+    table = torch.tensor([[1, 2, -1, 4]], device=device, dtype=torch.int32).expand(
+        33, -1
+    )
+    lengths = torch.arange(33, device=device, dtype=torch.int32) * 8
+
+    def run(pages):
+        return dsv41.index_topk(
+            q, weights, cache, pages, lengths, None, 512, 64, 8, 1024, 256, None, None
+        )
+
+    dense, paged = run(table), run(table.clone())
+    for actual, expected in zip(dense, paged, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(table)
+    lengths.fill_(193)
+    graph.replay()
+    for actual, expected in zip(captured, run(table), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

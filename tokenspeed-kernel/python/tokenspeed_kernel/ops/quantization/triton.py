@@ -623,3 +623,184 @@ __all__ = [
     "triton_quantize_mxfp4",
     "triton_quantize_fp8_with_scale",
 ]
+
+
+@triton.jit
+def _fp8_group32_ue8m0_quantize(X, Q, S, K: tl.constexpr, X0: tl.constexpr):
+    group = tl.program_id(0).to(tl.int64)
+    row = group // (K // 32)
+    column = (group % (K // 32)) * 32 + tl.arange(0, 32)
+    values = tl.load(X + row * X0 + column).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(values), 0), 1.0e-4)
+    raw = amax * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.div_rn(values, scale).to(tl.float8e4nv)
+    tl.store(Q + row * K + column, quantized)
+    tl.store(S + group, exponent.to(tl.uint8))
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_group32_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_32"}),
+        "scale_encoding": frozenset({"ue8m0"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_group32_ue8m0(
+    x: torch.Tensor,
+    granularity: str,
+    group_size: int,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize group-32 E4M3 data with UE8M0 scales, matching V4.1 act_quant.
+
+    Args:
+        x: [M,K] floating input with contiguous K divisible by 32.
+        granularity: Must be ``token_group``.
+        group_size: Must be 32.
+        scale_encoding: Must be ``ue8m0``.
+        enable_pdl: Accepted for the shared interface; this kernel has no PDL.
+
+    Returns:
+        FP8 [M,K] data and uint8 UE8M0 [M,K/32] scales.
+    """
+    if (
+        x.ndim != 2
+        or x.shape[1] % 32
+        or x.stride(1) != 1
+        or granularity != "token_group"
+        or group_size != 32
+        or scale_encoding != "ue8m0"
+    ):
+        raise ValueError(
+            "FP8 UE8M0 quantization requires [M,K] with contiguous K divisible by 32"
+        )
+    quantized = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty(
+        (x.shape[0], x.shape[1] // 32), dtype=torch.uint8, device=x.device
+    )
+    if x.numel():
+        _fp8_group32_ue8m0_quantize[(x.numel() // 32,)](
+            x,
+            quantized,
+            scales,
+            K=x.shape[1],
+            X0=x.stride(0),
+            num_warps=1,
+            num_stages=1,
+        )
+    return quantized, scales
+
+
+@triton.jit
+def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
+    # Equivalent to [Mtiles,4,32,Ktiles,4].transpose(1,3).contiguous().
+    return (
+        (row // 128 * K_TILES + column // 4) * 512
+        + row % 32 * 16
+        + row // 32 % 4 * 4
+        + column % 4
+    )
+
+
+@triton.jit(
+    do_not_specialize=["M", "X0"],
+    do_not_specialize_on_alignment=["M", "X0"],
+)
+def _fp8_group32_ue8m0_quantize_swizzled(
+    X,
+    Q,
+    S,
+    M,
+    X0,
+    K: tl.constexpr,
+    GROUPS: tl.constexpr,
+    ZERO_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    k_tiles = tl.cdiv(K, 128)
+    if pid * GROUPS < M * (K // 32):
+        group = pid * GROUPS + tl.arange(0, GROUPS)
+        row = group // (K // 32)
+        scale_column = group % (K // 32)
+        column = scale_column[:, None] * 32 + tl.arange(0, 32)[None, :]
+        values = tl.load(X + row[:, None] * X0 + column, row[:, None] < M, 0.0).to(
+            tl.float32
+        )
+        # Preserve the original quantizer's exact arithmetic and rounding boundary.
+        amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+        raw = amax * (1.0 / 448.0)
+        bits = raw.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+        tl.store(Q + row[:, None] * K + column, quantized, row[:, None] < M)
+        scale_offset = _fp8_swizzled_scale_offset(row, scale_column, k_tiles)
+        tl.store(S + scale_offset, exponent.to(tl.uint8), row < M)
+
+    # Padding writes have disjoint addresses from all live scale stores. Each
+    # program owns a fixed slice, so no memset/copy or cross-CTA barrier is needed.
+    if M % 128 != 0 or K % 128 != 0:
+        padded_columns = k_tiles * 4
+        index = pid * ZERO_BLOCK + tl.arange(0, ZERO_BLOCK)
+        pad_row, pad_column = index // padded_columns, index % padded_columns
+        padding = (index < tl.cdiv(M, 128) * 128 * padded_columns) & (
+            (pad_row >= M) | (pad_column >= K // 32)
+        )
+        offset = _fp8_swizzled_scale_offset(pad_row, pad_column, k_tiles)
+        tl.store(S + offset, 0, padding)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_group32_ue8m0_swizzled",
+    name="triton_quantize_fp8_group32_ue8m0_swizzled",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_group32_ue8m0_swizzled(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = x.shape
+    quantized = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale_count = triton.cdiv(m, 128) * 128 * triton.cdiv(k, 128) * 4
+    scales = torch.empty((scale_count,), dtype=torch.uint8, device=x.device)
+    if m:
+        # Small inputs need enough independent CTAs; large inputs amortize
+        # address/reduction overhead across more groups per CTA. These static
+        # work sizes never depend on input values or request history.
+        total_groups = m * (k // 32)
+        groups = (
+            4
+            if total_groups <= 1024
+            else 16 if total_groups <= 8192 else 32 if total_groups <= 131072 else 64
+        )
+        zero_block = 256
+        programs = max(
+            triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
+        )
+        _fp8_group32_ue8m0_quantize_swizzled[(programs,)](
+            x,
+            quantized,
+            scales,
+            m,
+            x.stride(0),
+            k,
+            groups,
+            zero_block,
+            num_warps=4,
+            num_stages=1,
+        )
+    return quantized, scales
