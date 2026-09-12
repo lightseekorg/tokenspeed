@@ -445,8 +445,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 local_packed,
                 volatile=False,
             )
-            if token == token_cta:
-                cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.residual_from_shared):
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
 
             cute.arch.cluster_arrive()
             # All CTAs must complete this handshake before the st.shared::cluster exchange: a partial wait skews barrier phases and the pre-DSM wait can match a stale phase, losing the peer-entered guarantee.
@@ -527,6 +528,11 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                     bf16x8_to_packed_u32x4(prefix),
                     volatile=False,
                 )
+                # gdc_wait only waits for the trigger, and the successor reads
+                # this buffer right after it: release the store before signalling.
+                cute.arch.fence_acq_rel_gpu()
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
             else:
                 if cutlass.const_expr(self.fp32_internal):
                     norm_square = norm_input * norm_input

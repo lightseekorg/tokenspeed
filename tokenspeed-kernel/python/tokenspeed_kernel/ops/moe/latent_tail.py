@@ -663,17 +663,19 @@ def attn_reduce_shape_supported(*, tp_size: int, hidden_size: int) -> bool:
 
     Returns:
         ``True`` when :func:`build_attn_reduce_collective` can be built for
-        this pair, ``False`` when the cluster geometry rules it out. The
-        constructor raises rather than declining, so a caller that wants a
-        capability answer has to ask here first.
+        this pair; ``False`` when the cluster geometry rules it out or the
+        platform cannot import the collective at all. The constructor raises
+        rather than declining, so a caller wanting a capability answer asks
+        here first.
     """
-    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
-        validate_shape,
-    )
-
     try:
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
+            validate_shape,
+        )
+
         validate_shape(tp_size=tp_size, latent_dim=hidden_size, hidden_dim=hidden_size)
-    except ValueError:
+    except (ImportError, ValueError):
+        # The collective needs cuda bindings; a platform without them declines.
         return False
     return True
 
