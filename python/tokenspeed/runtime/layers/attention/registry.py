@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.factory import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
+    cache_recipe,
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -777,8 +778,13 @@ def _create_target_components(
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
+    backend: AttentionBackend | None,
 ):
-    """The target's compute view onto the shared arena + target backend."""
+    """The target's compute view onto the shared arena + target backend.
+
+    ``backend`` reuses an existing one, for a caller that is building a
+    replacement arena for backends it already owns.
+    """
     # The arena owns every planned field; this view binds only the target
     # model's layer window.
     pool = create_cache_pool(
@@ -788,6 +794,8 @@ def _create_target_components(
         num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
+    if backend is not None:
+        return backend, pool
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
             server_args,
@@ -830,6 +838,7 @@ def _create_draft_components(
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
+    backend: AttentionBackend | None,
 ):
     """Draft backend + the ONE arena viewed through the draft's layer window.
 
@@ -857,6 +866,8 @@ def _create_draft_components(
         rank=pool.rank,
         field_layer_offset=num_target_layers,
     )
+    if backend is not None:
+        return backend, draft_pool
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
             server_args,
@@ -932,6 +943,33 @@ def _narrow_spec_for_pp(spec: CachePoolSpec, mapping) -> tuple[CachePoolSpec, ob
     return spec, pp_logical_plan
 
 
+def cudagraph_probe_supported(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> bool:
+    """Whether a probe-sized arena can stand in for this family's real one.
+
+    Resolved the way ``create_attn_components`` resolves it, without building
+    a pool: the family that stages speculative verify scratch in the bound
+    pool needs a row per request at the serving concurrency, which no
+    probe-sized arena has.
+    """
+    target = _resolve_attn_side(model_config, server_args.attention_backend)
+    config = _create_attn_config(server_args, model_config)
+    recipe = cache_recipe(
+        _resolve_cache_family(target, model_config, config),
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=0,
+        num_lcm_blocks_override=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    return not recipe.verify_scratch_in_pool()
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -942,6 +980,10 @@ def create_attn_components(
     draft_model_config: ModelConfig | None = None,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    *,
+    graph_reserve_bytes: int,
+    num_lcm_blocks_override: int | None,
+    reuse_backends: tuple[AttentionBackend, AttentionBackend | None] | None,
 ) -> tuple[
     AttentionBackend,
     CachePool,
@@ -996,13 +1038,19 @@ def create_attn_components(
         cache_family,
         draft_cache_family,
     )
-    cache_memory = profile_available_cache_memory_bytes(
-        attn_config=config,
-        gpu_id=gpu_id,
-        tp_size=server_args.mapping.world_size,
-        gpu_memory_utilization=server_args.gpu_memory_utilization,
-        total_gpu_memory=gpu_memory,
-        world_group=server_args.mapping.world_group,
+    # A probe arena is sized by block count, so it needs no memory profile.
+    cache_memory = (
+        0
+        if num_lcm_blocks_override is not None
+        else profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            graph_reserve_bytes=graph_reserve_bytes,
+            world_group=server_args.mapping.world_group,
+        )
     )
     cache_setup = prepare_cache_setup(
         family=cache_family,
@@ -1014,6 +1062,7 @@ def create_attn_components(
         cache_budget_bytes=cache_memory,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        num_lcm_blocks_override=num_lcm_blocks_override,
     )
     spec = cache_setup.spec
     target_spec = spec
@@ -1042,7 +1091,9 @@ def create_attn_components(
         )
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
-    logger.info(
+    # A probe arena is not the served geometry; it must not read as one.
+    logger.log(
+        logging.DEBUG if num_lcm_blocks_override is not None else logging.INFO,
         "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
         "layers=%d (draft %d), groups=%s",
         spec.memory_plan.lcm_block_bytes,
@@ -1070,7 +1121,9 @@ def create_attn_components(
     )
     if pp_logical_plan is not None:
         arena.pp_logical_plan = pp_logical_plan
+    reuse_target, reuse_draft = reuse_backends if reuse_backends else (None, None)
     backend, pool = _create_target_components(
+        backend=reuse_target,
         server_args=server_args,
         model_config=model_config,
         config=config,
@@ -1083,6 +1136,7 @@ def create_attn_components(
         is_inkling=target.is_inkling,
     )
     draft_attn_backend, draft_pool = _create_draft_components(
+        backend=reuse_draft,
         server_args=server_args,
         model_config=draft_model_config,
         config=draft_attn_config,

@@ -739,12 +739,13 @@ def test_communication_buffers_precede_cache_capacity_planning():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "prepare_communication_runtime"
     ]
+    # The call, not the closure that wraps it: the boot builds components twice.
     cache_lines = [
         node.lineno
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "create_attn_components"
+        and node.func.id in ("create_attn_components", "build_components")
     ]
 
     assert prepare_lines and cache_lines

@@ -182,18 +182,26 @@ def prepare_cache_setup(
     cache_budget_bytes: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
+    num_lcm_blocks_override: int | None = None,
 ) -> CacheSetup:
     """Apply one model recipe and size target/draft arenas from one budget."""
-    recipe = _RECIPES.get(family)
-    if recipe is None:
-        raise ValueError(f"unsupported cache model family: {family}")
-    return recipe(
+    return cache_recipe(
+        family,
         server_args=server_args,
         model_config=model_config,
         attn_config=attn_config,
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=cache_budget_bytes,
+        num_lcm_blocks_override=num_lcm_blocks_override,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     ).setup()
+
+
+def cache_recipe(family: CacheModelFamily, **kwargs) -> CacheRecipe:
+    """The family's recipe, built but not yet set up."""
+    recipe = _RECIPES.get(family)
+    if recipe is None:
+        raise ValueError(f"unsupported cache model family: {family}")
+    return recipe(**kwargs)

@@ -24,7 +24,7 @@ import bisect
 import gc
 import queue
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -40,6 +40,9 @@ from tokenspeed.runtime.execution.graph_ptr_guard import (
     graph_debug_enabled,
     snapshot_graph_metadata,
     verify_graph_metadata,
+)
+from tokenspeed.runtime.execution.memory_delta import (
+    MemoryDeltaObserver,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
@@ -305,24 +308,33 @@ class ForwardStepRunner:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self):
+    def capture(
+        self,
+        *,
+        entries: int | None,
+        observer: MemoryDeltaObserver,
+    ):
         """
         Capture CUDA graphs for all configured batch sizes.
 
         Args:
-            forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
+            entries: Capture only the largest ``entries`` batch sizes of the
+                ladder, for a caller that measures a sample rather than
+                serving from it. None captures the whole ladder.
+            observer: Measured around each capture, for the same caller.
         """
         rank = self.global_rank
+        batch_sizes = sorted(self.capture_bs, reverse=True)[:entries]
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)
                 for variant in self._cuda_graph_capture_variants()
-                for bs in sorted(self.capture_bs, reverse=True)
+                for bs in batch_sizes
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
+                logger.info("Capturing batches: %s", batch_sizes)
             for variant, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
@@ -336,9 +348,43 @@ class ForwardStepRunner:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
+                graph, output_buffers = self._capture_one(
+                    bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+                )
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
+
+    @property
+    def capture_entries(self) -> dict[str, int]:
+        """Graphs a full capture records, per sampler variant.
+
+        One series each: a variant opens its own captured buffers, so its
+        first capture is a one-off that must not be extrapolated across the
+        ladder entries the probe did not sample.
+        """
+        if self.disable:
+            return {}
+        return {
+            f"decode:{variant}": len(self.capture_bs)
+            for variant in self._cuda_graph_capture_variants()
+        }
+
+    def release_graphs(self) -> None:
+        """Drop the captured graphs and the pool they share.
+
+        The buffers the graphs recorded belong to the bound cache pool, so a
+        caller that rebinds releases here first. The module-level mempool
+        handle goes with them: the next capture starts a fresh one rather
+        than reusing blocks these graphs still name.
+        """
+        global global_graph_memory_pool
+
+        self.graphs.clear()
+        self.output_buffers.clear()
+        self._metadata_snapshots.clear()
+        # Held here, they are charged to the profile that sizes the next arena.
+        self._placeholder_tables.clear()
+        global_graph_memory_pool = None
 
     def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
         if self.sampling_backend is None:
@@ -400,7 +446,12 @@ class ForwardStepRunner:
                 self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
             )
 
-    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
+    def _capture_one(
+        self,
+        bs: int,
+        variant: str = CUDA_GRAPH_VARIANT_DEFAULT,
+        observer: AbstractContextManager[None] = nullcontext(),
+    ):
         graph_cls = (
             self.device_module.NPUGraph
             if self.device == "npu"
@@ -530,7 +581,7 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
-        with self.device_module.graph(
+        with observer, self.device_module.graph(
             graph,
             pool=global_graph_memory_pool,
             stream=self.stream,

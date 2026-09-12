@@ -62,6 +62,8 @@ def profile_available_cache_memory_bytes(
     tp_size: int,
     gpu_memory_utilization: float,
     total_gpu_memory: int,
+    *,
+    graph_reserve_bytes: int,
     world_group=None,
 ) -> int:
     cpu_group = (
@@ -75,7 +77,15 @@ def profile_available_cache_memory_bytes(
         distributed=tp_size > 1,
         cpu_group=cpu_group,
     )
-    cache_memory = available_gpu_memory - total_gpu_memory * (
-        1 - gpu_memory_utilization
-    )
+    headroom = total_gpu_memory * (1 - gpu_memory_utilization)
+    # The headroom funds activations and fragmentation, not the graph pools.
+    unallocated = headroom + graph_reserve_bytes / (1 << 30)
+    cache_memory = available_gpu_memory - unallocated
+    if graph_reserve_bytes and cache_memory <= 0:
+        raise ValueError(
+            f"no cache budget left after reserving {unallocated:.2f} GiB "
+            f"for the CUDA graphs out of {available_gpu_memory:.2f} GiB free; "
+            "re-run with --disable-cudagraph-memory-reserve to size the cache "
+            "from free memory instead"
+        )
     return int(cache_memory * (1 << 30))

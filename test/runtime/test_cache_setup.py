@@ -586,6 +586,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family("mha", "mla")
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
+            backend=None,
             server_args=None,
             model_config=SimpleNamespace(num_attention_layers=1),
             config=object(),
@@ -636,6 +637,9 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             rank=0,
             gpu_memory=0,
             draft_model_config=draft,
+            graph_reserve_bytes=0,
+            num_lcm_blocks_override=None,
+            reuse_backends=None,
         )
 
 

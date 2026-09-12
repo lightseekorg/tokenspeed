@@ -33,6 +33,7 @@ import sys
 
 # Executed as a script by run_ci_suite: the test dir must be importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest  # noqa: E402
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
@@ -44,7 +45,7 @@ _RUNTIME = (
     / "runtime"
     / "execution"
 )
-_STEP_OPERATIONS = frozenset({"_autotune", "freeze", "capture", "capture_graphs"})
+_STEP_OPERATIONS = frozenset({"autotune", "freeze", "capture", "capture_graphs"})
 
 
 def _tree(name: str) -> ast.Module:
@@ -154,10 +155,22 @@ def test_nothing_the_constructor_reaches_tunes_freezes_or_captures():
 
 
 def test_the_step_names_every_operation_the_constructor_gave_up():
-    """The move must be complete, not partial: all four land in the step."""
+    """The move must be complete, not partial: the boot path owns all four.
+
+    Tuning left ``capture_graphs`` when the probe made it run twice -- a
+    captured graph keeps the tactic it was captured with, and the tuner's
+    token bound is a once-per-process call -- so the boot path now names it
+    directly, alongside the step that freezes and captures.
+    """
     step = _function(_tree("model_executor.py"), "capture_graphs")
     names = {call.func.attr for call in _attribute_calls(step)}
-    assert _STEP_OPERATIONS - {"capture_graphs"} <= names, names
+    builder = _function(_tree("device.py"), "build_device_side")
+    boot_names = {call.func.attr for call in _attribute_calls(builder)}
+
+    # Only tuning moved; freeze and capture stay where the constructor left them.
+    assert {"freeze", "capture"} <= names, names
+    assert "autotune" in boot_names, boot_names
+    assert "autotune" not in names, names
 
 
 def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
@@ -172,9 +185,22 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
         for call in _attribute_calls(step)
         if call.func.attr in _STEP_OPERATIONS
     ]
-    assert sequence == ["_autotune", "freeze", "capture", "capture"]
+    assert sequence == ["freeze", "capture", "capture"]
 
     builder = _function(_tree("device.py"), "build_device_side")
+    tune = [
+        call.lineno
+        for call in _attribute_calls(builder)
+        if call.func.attr == "autotune"
+    ]
+    capture = [
+        call.lineno
+        for call in _attribute_calls(builder)
+        if call.func.attr == "capture_graphs"
+    ]
+    assert len(tune) == 1, tune
+    assert max(tune) < min(capture), (tune, capture)
+
     seed = [
         call.lineno
         for call in ast.walk(builder)
@@ -182,9 +208,8 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
         and isinstance(call.func, ast.Name)
         and call.func.id == "set_random_seed"
     ]
-    capture = [
-        call.lineno
-        for call in _attribute_calls(builder)
-        if call.func.attr == "capture_graphs"
-    ]
-    assert seed and capture and max(capture) < min(seed), (capture, seed)
+    assert seed and max(capture) < min(seed), (capture, seed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
