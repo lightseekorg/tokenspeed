@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -111,3 +112,7 @@ def test_draft_refresh_keeps_short_rows_unclamped() -> None:
         torch.zeros((2, 8), dtype=torch.int32),
     )
     assert backend.forward_decode_metadata.seq_lens.tolist() == [1, 200]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

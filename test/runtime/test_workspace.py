@@ -137,3 +137,7 @@ def test_initial_size_comes_from_env():
         pool = WorkspacePool("cpu")
     (view,) = pool.allocate(((1 << 20,), torch.uint8))  # fits, no growth
     assert view.numel() == 1 << 20
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

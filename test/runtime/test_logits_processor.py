@@ -518,3 +518,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
     out = proc._get_logits(hidden, lm_head, md)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

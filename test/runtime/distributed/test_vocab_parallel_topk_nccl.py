@@ -227,3 +227,7 @@ def test_a_quantized_head_survives_the_real_collective():
 
 def test_two_ranks_keep_their_candidates_through_a_cuda_graph():
     _run(2, _check_capture_and_replay)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

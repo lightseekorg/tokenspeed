@@ -857,3 +857,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
         torch.testing.assert_close(
             buffers[layer].float(), expected, atol=tolerance, rtol=tolerance
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

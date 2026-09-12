@@ -394,3 +394,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 
     torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
     torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens_k[0::spec])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
