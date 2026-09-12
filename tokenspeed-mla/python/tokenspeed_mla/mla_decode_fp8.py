@@ -3132,19 +3132,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         softmax_params: SimpleNamespace,
         correction_factor: cutlass.Float32,
         row_sum: cutlass.Float32,
-        row_max: cutlass.Float32,
         row_max_new: cutlass.Float32,
+        no_correction: cutlass.Int32,
         tAcc: cute.Tensor,
         tidx: cutlass.Int32,
         p_cor_producer_state: pipeline.PipelineState,
-    ) -> tuple[pipeline.PipelineState, cutlass.Float32]:
-        """Compute the correction factor for the last k tile."""
-        no_correction = 0
-        if (
-            row_max_new - row_max
-        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
-            no_correction = 1
-            row_max_new = row_max
+    ) -> pipeline.PipelineState:
+        """Hand this tile's (row_sum, reference max, correction factor,
+        skip flag) to the correction warp through TMEM (see softmax for the
+        skip decision)."""
 
         # pad for 4x32b
         if cutlass.const_expr(self.use_2cta_instrs):
@@ -3215,7 +3211,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cute.arch.fence_view_async_tmem_store()
         common_params.p_cor_pipeline.producer_commit(p_cor_producer_state)
         p_cor_producer_state.advance()
-        return p_cor_producer_state, row_max_new
+        return p_cor_producer_state
 
     @cute.jit
     def softmax(
@@ -3562,15 +3558,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
         )
+        # Skip the accumulator rescale when the row max grew by at most
+        # skip_correction_threshold (log2 units): keep the previous reference
+        # max, so this tile's P values are at most 2**threshold (e4m3 holds
+        # 448) and neither the running sum nor the accumulator needs a
+        # correction. The math is exact either way; the first tile
+        # (row_max = -inf) never skips.
+        skip = (
+            row_max_new - row_max
+        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold
+        no_correction = cutlass.Int32(1) if skip else cutlass.Int32(0)
+        row_max_new = row_max if skip else row_max_new
+        correction_factor = cutlass.Float32(1.0) if skip else correction_factor
         # split kv case
         if cutlass.const_expr(not is_local_last_tile):
-            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+            p_cor_producer_state = self.exchange_p_cor_metadata(
                 common_params,
                 softmax_params,
                 correction_factor,
                 row_sum,
-                row_max,
                 row_max_new,
+                no_correction,
                 tAcc,
                 tidx,
                 p_cor_producer_state,
@@ -3652,13 +3660,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # split kv case
         if cutlass.const_expr(is_local_last_tile):
-            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+            p_cor_producer_state = self.exchange_p_cor_metadata(
                 common_params,
                 softmax_params,
                 correction_factor,
                 row_sum,
-                row_max,
                 row_max_new,
+                no_correction,
                 tAcc,
                 tidx,
                 p_cor_producer_state,
