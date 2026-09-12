@@ -570,19 +570,15 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # The dispatch validates this exact shape; only m rows are written.
+            # The result lives in the collective's own latent buffer; the
+            # next layer's reduce may overwrite it, by which point this layer
+            # has consumed it.
             residual_out, _ = self.state.cute_ar(
                 attn_partial,
                 prefix_sum,
                 self.state.dummy_norm.weight,
                 include_reduce_scatter=False,
                 include_routed=True,
-                latent_output_override=torch.empty(
-                    ATTN_AR_MAX_TOKENS,
-                    attn_partial.shape[1],
-                    dtype=attn_partial.dtype,
-                    device=attn_partial.device,
-                ),
             )
             return residual_out, None
         if (

@@ -1213,7 +1213,6 @@ class CollectiveKernel:
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         shared_output_override: torch.Tensor | None = None,
-        latent_output_override: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not include_reduce_scatter and not include_routed:
             raise ValueError("at least one collective role must be enabled")
@@ -1255,7 +1254,6 @@ class CollectiveKernel:
             include_reduce_scatter=include_reduce_scatter,
             include_routed=include_routed,
             shared_output_override=shared_output_override,
-            latent_output_override=latent_output_override,
         )
 
     def call_deferred(
@@ -1360,7 +1358,6 @@ class CollectiveKernel:
             include_reduce_scatter=include_reduce_scatter,
             include_routed=True,
             shared_output_override=None,
-            latent_output_override=None,
         )
 
     def _dispatch(
@@ -1376,7 +1373,6 @@ class CollectiveKernel:
         include_reduce_scatter: bool,
         include_routed: bool,
         shared_output_override: torch.Tensor | None,
-        latent_output_override: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self._routed_workspace.device
         if self._scratch_allocator is not None:
@@ -1400,21 +1396,6 @@ class CollectiveKernel:
                 "shared_output_override must be contiguous CUDA BF16 "
                 f"[{self.max_m}, {self.hidden_dim}]"
             )
-        latent_output = (
-            self._latent_output
-            if latent_output_override is None
-            else latent_output_override
-        )
-        if (
-            latent_output.shape != (self.max_m, self.latent_dim)
-            or latent_output.dtype != torch.bfloat16
-            or latent_output.device != device
-            or not latent_output.is_contiguous()
-        ):
-            raise ValueError(
-                "the latent output buffer must be contiguous CUDA BF16 "
-                f"[{self.max_m}, {self.latent_dim}]"
-            )
         shard_start = self.rank * self.shard_dim
         shared_shard = shared_output[:, shard_start : shard_start + self.shard_dim]
 
@@ -1422,7 +1403,7 @@ class CollectiveKernel:
             launch(
                 latent_source,
                 gamma,
-                latent_output,
+                self._latent_output,
                 self._routed_workspace,
                 self._routed_flags,
                 self._routed_multicast_ptr,
@@ -1448,7 +1429,7 @@ class CollectiveKernel:
                 finalize_top_k=finalize_top_k,
             )
         return (
-            latent_output[:m],
+            self._latent_output[:m],
             shared_shard,
         )
 

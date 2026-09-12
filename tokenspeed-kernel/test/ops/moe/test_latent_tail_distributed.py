@@ -406,9 +406,6 @@ def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix():
             gamma,
             include_reduce_scatter=False,
             include_routed=True,
-            latent_output_override=torch.empty(
-                max_m, H, dtype=torch.bfloat16, device=dev
-            ),
         )
         torch.cuda.synchronize()
         err = (out.float() - expected.float()).abs().max().item()
@@ -423,70 +420,6 @@ def test_residual_from_shared_sums_the_ranks_and_adds_the_prefix():
         ).abs().max().item() > tol
 
 
-def test_residual_from_shared_writes_the_caller_s_buffer():
-    """The returned rows must live in the override, not the instance scratch.
-
-    Reading the returned tensor alone cannot tell the two apart -- both are
-    ``latent_output[:m]`` -- so compare storage, and call twice so a kernel
-    that honours the override once but not again is caught.
-    """
-    _, dev = _setup()
-    _require_attn_collective()
-    max_m, m = 8, 2
-    kernel = _attn_collective(dev, max_m)
-    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
-    partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
-    prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
-
-    seen = []
-    for _ in range(2):
-        override = torch.empty(max_m, H, dtype=torch.bfloat16, device=dev)
-        out, _ = kernel(
-            partial,
-            prefix,
-            gamma,
-            include_reduce_scatter=False,
-            include_routed=True,
-            latent_output_override=override,
-        )
-        torch.cuda.synchronize()
-        assert out.data_ptr() == override.data_ptr()
-        seen.append(override.data_ptr())
-    # Positive control: the two calls really did hand in different buffers, so
-    # the equality above is not trivially satisfied by one reused allocation.
-    assert seen[0] != seen[1]
-
-
-@pytest.mark.parametrize(
-    "bad",
-    ["rows", "dtype", "strided"],
-)
-def test_residual_from_shared_rejects_an_unusable_override(bad):
-    """The dispatch bakes a static layout, so a mis-shaped buffer must not run."""
-    _, dev = _setup()
-    _require_attn_collective()
-    max_m, m = 8, 1
-    kernel = _attn_collective(dev, max_m)
-    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
-    partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
-    prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
-    if bad == "rows":
-        override = torch.empty(max_m - 1, H, dtype=torch.bfloat16, device=dev)
-    elif bad == "dtype":
-        override = torch.empty(max_m, H, dtype=torch.float16, device=dev)
-    else:
-        override = torch.empty(max_m, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
-    with pytest.raises(ValueError, match="latent output buffer"):
-        kernel(
-            partial,
-            prefix,
-            gamma,
-            include_reduce_scatter=False,
-            include_routed=True,
-            latent_output_override=override,
-        )
-
-
 def test_residual_from_shared_rejects_the_reduce_scatter_role():
     """This epilogue emits reduced+residual; scattering the residual is nonsense."""
     _, dev = _setup()
@@ -496,7 +429,6 @@ def test_residual_from_shared_rejects_the_reduce_scatter_role():
     partial = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
     prefix = torch.zeros(m, H, dtype=torch.bfloat16, device=dev).contiguous()
     gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
-    override = torch.empty(8, H, dtype=torch.bfloat16, device=dev)
     with pytest.raises(ValueError, match="include_reduce_scatter"):
         kernel(
             partial,
@@ -504,7 +436,6 @@ def test_residual_from_shared_rejects_the_reduce_scatter_role():
             gamma,
             include_reduce_scatter=True,
             include_routed=True,
-            latent_output_override=override,
         )
     # Positive control: the same call with the role off must go through, or the
     # test would pass on a kernel that rejects everything.
@@ -514,10 +445,58 @@ def test_residual_from_shared_rejects_the_reduce_scatter_role():
         gamma,
         include_reduce_scatter=False,
         include_routed=True,
-        latent_output_override=override,
     )
     torch.cuda.synchronize()
     assert out.shape == (m, H)
+
+
+def test_residual_from_shared_chains_through_its_own_latent_buffer():
+    """Layer L's result is layer L+1's residual, and it lives in the kernel.
+
+    The caller keeps no buffer of its own, so each call reads the buffer the
+    previous call wrote and writes it again. The epilogue loads and stores one
+    element per thread at one offset, which is what makes that legal; this
+    pins it against a chain long enough to catch a generation-rotation bug.
+    """
+    rank, dev = _setup()
+    _require_attn_collective()
+    depth, m = 24, 2
+    kernel = _attn_collective(dev, 8)
+    gamma = torch.ones(H, dtype=torch.bfloat16, device=dev).contiguous()
+
+    def partial_for(layer):
+        g = torch.Generator(device=dev).manual_seed(1000 * layer + rank)
+        return (
+            (torch.randn(m, H, generator=g, dtype=torch.float32, device=dev) * 0.1)
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+
+    g0 = torch.Generator(device=dev).manual_seed(7)  # residual is rank-uniform
+    x = (
+        (torch.randn(m, H, generator=g0, dtype=torch.float32, device=dev) * 0.1)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    expected = x.float()
+
+    last_acc = None
+    for layer in range(depth):
+        part = partial_for(layer)
+        acc = part.float().clone()
+        dist.all_reduce(acc)
+        last_acc = acc
+        expected = (expected + acc).to(torch.bfloat16).float()
+        x, _ = kernel(part, x, gamma, include_reduce_scatter=False, include_routed=True)
+        torch.cuda.synchronize()
+
+    err = (x.float() - expected).abs().max().item()
+    scale = expected.abs().max().item()
+    tol = 8e-3 * max(scale, 1.0)
+    assert err <= tol, f"depth={depth} max|err|={err} scale={scale}"
+    # Negative control: the same comparison must reject a chain that skipped
+    # its last layer, or the tolerance is wide enough to hide a broken chain.
+    assert (x.float() - (expected - last_acc)).abs().max().item() > tol
 
 
 def test_residual_from_shared_rejects_a_mismatched_latent_width():

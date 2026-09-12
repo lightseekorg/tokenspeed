@@ -448,7 +448,6 @@ class KimiK3LatentTailOp:
                 routed_partial,
                 shared_partial,
                 rms_weight,
-                latent_output_override=None,
             )
         else:
             self._validate_prepared_shared_shard(prepared_shared_shard)
@@ -458,7 +457,6 @@ class KimiK3LatentTailOp:
                 rms_weight,
                 include_reduce_scatter=False,
                 include_routed=True,
-                latent_output_override=None,
             )
             shared_shard = prepared_shared_shard
         return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
@@ -602,7 +600,6 @@ class KimiK3LatentTailOp:
             include_reduce_scatter=True,
             include_routed=False,
             shared_output_override=self._split_shared_output,
-            latent_output_override=None,
         )
         return shared_shard
 

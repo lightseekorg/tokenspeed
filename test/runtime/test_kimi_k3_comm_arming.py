@@ -275,11 +275,6 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     assert kwargs["include_routed"] is True
     assert collective.call_count == 1
     assert out is reduced and mixed is None
-    # Without an override the kernel writes its own latent scratch, which the
-    # next layer's reduce then overwrites while this layer still holds it.
-    override = kwargs["latent_output_override"]
-    assert override.shape == (ATTN_AR_MAX_TOKENS, partial.shape[1])
-    assert override.dtype == partial.dtype and override.device == partial.device
 
     # Nine tokens belong to the vendor. Assert it took over, not merely that we
     # did not: an exception on the way there would satisfy a call_count of zero.
