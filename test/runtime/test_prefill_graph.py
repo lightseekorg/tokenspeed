@@ -691,6 +691,60 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
             pg.capture(None)
 
 
+class PrefillGraphOutputStorageTest(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution.prefill_graph import (
+                CapturedForward,
+                PrefillGraph,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.torch = torch
+        self.CapturedForward = CapturedForward
+        self.graph = PrefillGraph.__new__(PrefillGraph)
+        self.graph.capture_buckets = [2, 4]
+        self.graph._hidden_output_buf = None
+        self.graph._aux_output_bufs = None
+        self.graph._outputs = {}
+
+    def _store(self, bucket, value):
+        hidden = self.torch.full((bucket, 3), value)
+        aux = [self.torch.full((bucket, 3), value + 10)]
+        outputs = self.CapturedForward(hidden, aux)
+        if self.graph._hidden_output_buf is None:
+            self.graph._allocate_output_buffers(outputs)
+        self.graph._outputs[bucket] = self.graph._store_outputs(bucket, outputs)
+        return self.graph._outputs[bucket]
+
+    def test_buckets_retain_views_of_the_same_max_bucket_storage(self):
+        largest = self._store(4, 1)
+        smaller = self._store(2, 2)
+
+        self.assertEqual(
+            largest.hidden_states.untyped_storage().data_ptr(),
+            smaller.hidden_states.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            largest.aux_hidden_states[0].untyped_storage().data_ptr(),
+            smaller.aux_hidden_states[0].untyped_storage().data_ptr(),
+        )
+
+    def test_null_capture_mode_keeps_padding_out_of_the_slice(self):
+        """No aux taps: hidden still lands in the shared buffer and slices."""
+        hidden = self.torch.tensor([[3, 3, 3], [3, 3, 3], [99, 99, 99], [99, 99, 99]])
+        outputs = self.CapturedForward(hidden, None)
+        self.graph._allocate_output_buffers(outputs)
+        captured = self.graph._store_outputs(4, outputs)
+        rows, aux = captured.sliced(2)
+
+        self.assertIsNone(aux)
+        self.assertEqual(rows.shape, (2, 3))
+        self.assertTrue(self.torch.equal(rows, self.torch.full((2, 3), 3)))
+
+
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
     """trtllm under the prefill graph: the extend prewrite must not bake
     capture-time write locs into the graph, and the break's KV write must
