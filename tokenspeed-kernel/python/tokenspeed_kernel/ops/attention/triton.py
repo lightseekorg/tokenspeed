@@ -106,3 +106,55 @@ def triton_attn_merge_state(
         BLOCK_D=block_d,
     )
     return out, lse
+
+
+@register_kernel(
+    "attention",
+    "attn_merge_state",
+    name="npu_attn_merge_state",
+    solution="torch_npu",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=format_signatures(
+        ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PERFORMANT,
+    traits={},
+    tags={"portability"},
+)
+def npu_attn_merge_state(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    lse_scale_log2: float,
+    inplace: bool = False,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch-composition attention state merge for Ascend NPU.
+
+    Matches the Triton kernel's log2-domain merge arithmetic exactly:
+    ``lse_a_log2 = lse_a * lse_scale_log2``, exponential weights via
+    ``exp2``, and the merged LSE ``(lse_max_log2 + log2(denom)) /
+    lse_scale_log2``.
+    """
+    del enable_pdl
+    out = out_a if inplace else torch.empty_like(out_a)
+    lse = lse_a if inplace else torch.empty_like(lse_a)
+
+    lse_a_log2 = lse_a.float() * lse_scale_log2
+    lse_b_log2 = lse_b.float() * lse_scale_log2
+    lse_max_log2 = torch.maximum(lse_a_log2, lse_b_log2)
+    weight_a = torch.exp2(lse_a_log2 - lse_max_log2)
+    weight_b = torch.exp2(lse_b_log2 - lse_max_log2)
+    denom = weight_a + weight_b
+
+    out_a_f = out_a.float()
+    out_b_f = out_b.float()
+    merged = (
+        (out_a_f * weight_a[..., None] + out_b_f * weight_b[..., None])
+        / denom[..., None]
+    ).to(out_a.dtype)
+    merged_lse = ((lse_max_log2 + torch.log2(denom)) / lse_scale_log2).to(lse_a.dtype)
+    out.copy_(merged)
+    lse.copy_(merged_lse)
+    return out, lse

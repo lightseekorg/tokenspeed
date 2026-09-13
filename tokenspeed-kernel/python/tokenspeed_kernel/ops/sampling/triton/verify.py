@@ -70,6 +70,51 @@ def _verify_chain_target_sampled_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _verify_chain_target_sampled_npu(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    target_sampled: torch.Tensor,
+    bs: int,
+    num_draft_tokens: int,
+) -> None:
+    """Torch equivalent of the Triton verify kernel for Ascend NPU.
+
+    Mirrors ``_verify_chain_target_sampled_kernel``: a draft token at
+    position ``i`` is accepted when it equals the target sample at ``i - 1``
+    and every earlier draft token was accepted; the accepted prefix is copied
+    into ``predicts``, the accepted indices into ``accept_index``, and the
+    bonus token (``target_sampled[num_accepted]``) into
+    ``predicts[num_accepted]``.
+    """
+    device = candidates.device
+    n = num_draft_tokens
+    total = bs * n
+    target_flat = target_sampled.reshape(-1)[:total]
+    target_rows = target_flat.view(bs, n)
+    cand_rows = candidates.view(bs, n)
+
+    match = cand_rows[:, 1:] == target_rows[:, :-1]  # [bs, n-1]
+    leading = torch.cumprod(match.to(torch.int32), dim=1)  # [bs, n-1]
+    num_accepted = leading.sum(dim=1).to(torch.int32)  # [bs]
+
+    col = torch.arange(n, device=device).unsqueeze(0)  # [1, n]
+    fill_mask = (col < num_accepted.unsqueeze(1)) | (
+        col == num_accepted.unsqueeze(1)
+    )
+    preds2d = predicts[:total].view(bs, n)
+    preds2d.copy_(torch.where(fill_mask, target_rows, preds2d))
+
+    row_off = (torch.arange(bs, device=device) * n).unsqueeze(1)  # [bs, 1]
+    flat_idx = (row_off + col).to(torch.int32)  # [bs, n]
+    acc2d = accept_index.view(bs, n)
+    acc2d[:, 0] = row_off[:, 0].to(torch.int32)
+    accepted_mask = (col >= 1) & (col <= num_accepted.unsqueeze(1))
+    acc2d.copy_(torch.where(accepted_mask, flat_idx, acc2d))
+    accept_token_num.copy_(num_accepted)
+
+
 def verify_chain_target_sampled(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -113,6 +158,17 @@ def verify_chain_target_sampled(
         raise ValueError(
             f"target_sampled must be int32 or int64, got {target_sampled.dtype}"
         )
+    if candidates.device.type == "npu":
+        _verify_chain_target_sampled_npu(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            target_sampled,
+            bs,
+            num_draft_tokens,
+        )
+        return
     if candidates.device.type != "cuda":
         raise ValueError("verify_chain_target_sampled requires CUDA tensors")
     if bs == 0:

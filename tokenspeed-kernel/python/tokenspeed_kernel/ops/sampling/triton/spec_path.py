@@ -64,6 +64,33 @@ def _greedy_path_kernel(
         tl.store(out_ptr + out_base + step + 1, token)
 
 
+def _greedy_path_npu(
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    out: torch.Tensor,
+    batch_size: int,
+    num_steps: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Torch walk of the candidate lattice for Ascend NPU.
+
+    Mirrors ``_greedy_path_kernel``: each step picks the locally best edge
+    from the predecessor row, breaking ties toward the lowest index
+    (``torch.argmax`` returns the first maximum).
+    """
+    device = candidate_ids.device
+    rows = torch.arange(batch_size, device=device)
+    out[:, 0] = anchor_token_ids.to(torch.int32)
+    prev = torch.zeros(batch_size, dtype=torch.long, device=device)
+    for step in range(num_steps):
+        row_scores = scores[rows, step, prev, :]  # [batch, top_k]
+        best = torch.argmax(row_scores, dim=-1)  # first max on ties
+        out[:, step + 1] = candidate_ids[rows, step, best]
+        prev = best
+    return out
+
+
 def dflash2_greedy_path(
     candidate_ids: torch.Tensor,
     scores: torch.Tensor,
@@ -110,6 +137,16 @@ def dflash2_greedy_path(
         raise ValueError("candidate_ids and scores must be contiguous")
     if out.stride(1) != 1:
         raise ValueError("out rows must be contiguous")
+    if candidate_ids.device.type == "npu":
+        return _greedy_path_npu(
+            candidate_ids,
+            scores,
+            anchor_token_ids,
+            out,
+            batch_size,
+            num_steps,
+            top_k,
+        )
     if not all(
         tensor.device.type == "cuda"
         for tensor in (candidate_ids, scores, anchor_token_ids, out)

@@ -501,6 +501,105 @@ def _check_top_k_top_p_gumbel_inputs(
     return rows, vocab_size, num_blocks
 
 
+def _sample_top_k_top_p_npu(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    min_p_pool: torch.Tensor | None = None,
+    num_tokens_per_req: int = 1,
+) -> torch.Tensor:
+    """Torch-composition top-k/top-p Gumbel sampling for Ascend NPU.
+
+    The Triton Gumbel kernels are CUDA-only (``tl.topk`` / ``tl.rand``),
+    so on NPU we reproduce the same candidate semantics with torch ops:
+    temperature scaling -> top-k candidates (``torch.topk``) -> top-p
+    cumulative filter over the descending candidates -> deterministic
+    Gumbel-max over the kept set (SplitMix64-seeded per request row).
+
+    Returns:
+        ``out[:rows]`` filled with sampled token ids in ``[0, vocab)``; the
+        ids always lie inside the per-row ``torch.topk`` candidate set.
+    """
+    rows, vocab_size = logits.shape
+    if rows == 0:
+        return out[:0]
+    device = logits.device
+    req_rows = rows // num_tokens_per_req
+    pool_idx = req_pool_indices[:req_rows].to(torch.long)
+
+    temperature = torch.clamp(temperature_pool[pool_idx], min=1.0e-20)
+    top_k = torch.clamp(top_k_pool[pool_idx].to(torch.long), min=1, max=vocab_size)
+    top_p = top_p_pool[pool_idx]
+    seed = seed_pool[pool_idx]
+    offset = offsets_pool[pool_idx]
+    if num_tokens_per_req > 1:
+        temperature = temperature.repeat_interleave(num_tokens_per_req)
+        top_k = top_k.repeat_interleave(num_tokens_per_req)
+        top_p = top_p.repeat_interleave(num_tokens_per_req)
+        seed = seed.repeat_interleave(num_tokens_per_req)
+        offset = offset.repeat_interleave(num_tokens_per_req)
+    if min_p_pool is not None:
+        min_p_log_threshold = torch.log(
+            torch.clamp(min_p_pool[pool_idx], min=1.0e-20)
+        )
+        if num_tokens_per_req > 1:
+            min_p_log_threshold = min_p_log_threshold.repeat_interleave(
+                num_tokens_per_req
+            )
+    else:
+        min_p_log_threshold = torch.full((rows,), float("-inf"), device=device)
+
+    scaled = logits.float() / temperature[:, None]  # [rows, vocab]
+    max_k = int(top_k.max().clamp(max=vocab_size).item())
+    if max_k <= 0:
+        max_k = 1
+    topk_vals, topk_idx = torch.topk(scaled, k=max_k, dim=-1)  # descending
+    max_logit = topk_vals[:, :1]
+    weights = torch.exp(topk_vals - max_logit)
+    probs = weights / torch.clamp(weights.sum(dim=-1, keepdim=True), min=1.0e-20)
+    rank = torch.arange(max_k, device=device).unsqueeze(0).expand(rows, max_k)
+    k_actual = top_k.clamp(max=max_k).unsqueeze(1)
+    cum_before = torch.cumsum(probs, dim=-1) - probs
+    keep = (
+        (rank < k_actual)
+        & (cum_before < top_p.unsqueeze(1))
+        & (topk_vals >= max_logit + min_p_log_threshold.unsqueeze(1))
+    )
+
+    # Deterministic uniform noise per (seed, offset, row): one CPU Generator
+    # per request row seeded from the pool values, so repeated calls with the
+    # same pools reproduce the same sample (mirrors the Triton kernels' use of
+    # ``tl.randint(seed, offset)``).
+    uniform = torch.empty(rows, max_k, dtype=torch.float64)
+    for r in range(rows):
+        g = torch.Generator()
+        g.manual_seed(
+            (int(seed[r].item()) * 1000003 + int(offset[r].item())) & ((1 << 63) - 1)
+        )
+        uniform[r] = torch.rand(max_k, generator=g, dtype=torch.float64)
+    uniform = torch.clamp(
+        uniform.to(dtype=scaled.dtype, device=device), min=1.0e-7
+    )
+    gumbel = -torch.log(-torch.log(uniform))
+
+    scores = torch.where(
+        keep,
+        topk_vals + gumbel,
+        torch.full_like(topk_vals, float("-inf")),
+    )
+    # Ties break toward the lowest index (torch.argmax returns the first max).
+    best = scores.argmax(dim=-1)
+    token_ids = topk_idx.gather(-1, best.unsqueeze(-1)).squeeze(-1)
+    out[:rows].copy_(token_ids.to(out.dtype))
+    return out[:rows]
+
+
 def gumbel_sample_top_k_top_p_from_pools(
     logits: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -519,6 +618,19 @@ def gumbel_sample_top_k_top_p_from_pools(
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
     """Sample finite top-k/top-p candidates with Gumbel-Max."""
+    if logits.device.type == "npu":
+        return _sample_top_k_top_p_npu(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            top_k_pool,
+            top_p_pool,
+            seed_pool,
+            offsets_pool,
+            out,
+            min_p_pool=min_p_pool,
+            num_tokens_per_req=num_tokens_per_req,
+        )
     if top_k_pad & (top_k_pad - 1):
         raise ValueError("top_k_pad must be a power of two for tl.topk")
     rows, vocab_size, num_blocks = _check_top_k_top_p_gumbel_inputs(
@@ -1176,6 +1288,18 @@ def gumbel_sample_top_k_top_p_qrita_from_pools(
 ) -> torch.Tensor:
     """Sample finite top-k/top-p rows using Qrita-style pivots."""
     rows = logits.shape[0]
+    if logits.device.type == "npu":
+        return _sample_top_k_top_p_npu(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            top_k_pool,
+            top_p_pool,
+            seed_pool,
+            offsets_pool,
+            out,
+            num_tokens_per_req=num_tokens_per_req,
+        )
     if num_programs is None:
         num_sms = torch.cuda.get_device_properties(logits.device).multi_processor_count
         num_programs = min(num_sms, max(int(rows), 1))

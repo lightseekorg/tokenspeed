@@ -965,6 +965,45 @@ def _set_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _set_mla_kv_buffer_npu(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    sanitize: bool,
+) -> None:
+    """Torch scatter equivalent of :func:`set_mla_kv_buffer_triton` on NPU.
+
+    The Triton kernels use CUDA-only constructs (``tl.extra.cuda.gdc_*``), so
+    the Ascend NPU path writes the combined latent+RoPE row with a plain
+    indexed scatter, which is bit-equivalent for the supported row layout.
+    """
+    n_loc = loc.numel()
+    if n_loc == 0:
+        return
+    nope_dim = cache_k_nope.size(-1)
+    rope_dim = cache_k_rope.size(-1)
+    loc_l = loc.reshape(-1).to(torch.long)
+    row = torch.cat(
+        [cache_k_nope.reshape(n_loc, -1), cache_k_rope.reshape(n_loc, -1)],
+        dim=-1,
+    )
+    if sanitize and row.dtype.is_floating_point:
+        float_maxes = [
+            torch.finfo(t.dtype).max
+            for t in (cache_k_nope, cache_k_rope, kv_buffer)
+            if t.dtype.is_floating_point
+        ]
+        max_finite = min(float_maxes) if float_maxes else 3.4e38
+        row = torch.nan_to_num(
+            row,
+            nan=0.0,
+            posinf=max_finite,
+            neginf=-max_finite,
+        )
+    kv_buffer[loc_l] = row.to(kv_buffer.dtype)
+
+
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
@@ -988,6 +1027,11 @@ def set_mla_kv_buffer_triton(
     Returns:
         None. The cache writes are enqueued on the current device stream.
     """
+    if kv_buffer.device.type == "npu":
+        _set_mla_kv_buffer_npu(
+            kv_buffer, loc, cache_k_nope, cache_k_rope, sanitize=sanitize
+        )
+        return
     # Dispatch buckets from experiments on B200 GPUs.
     # Small batches use more CTAs per location; large batches use wider tiles.
     n_loc = loc.numel()
@@ -1323,6 +1367,28 @@ def _get_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _get_mla_kv_buffer_npu(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+) -> None:
+    """Torch gather equivalent of :func:`get_mla_kv_buffer_triton` on NPU."""
+    n_loc = loc.numel()
+    if n_loc == 0:
+        return
+    nope_dim = cache_k_nope.size(-1)
+    rope_dim = cache_k_rope.size(-1)
+    loc_l = loc.reshape(-1).to(torch.long)
+    row = kv_buffer[loc_l]  # [n_loc, nope_dim + rope_dim]
+    cache_k_nope.copy_(
+        row[..., :nope_dim].reshape(cache_k_nope.shape).to(cache_k_nope.dtype)
+    )
+    cache_k_rope.copy_(
+        row[..., nope_dim:].reshape(cache_k_rope.shape).to(cache_k_rope.dtype)
+    )
+
+
 def get_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
@@ -1343,6 +1409,9 @@ def get_mla_kv_buffer_triton(
     Returns:
         None. The cache reads are enqueued on the current device stream.
     """
+    if kv_buffer.device.type == "npu":
+        _get_mla_kv_buffer_npu(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        return
     # Dispatch buckets from experiments on B200 GPUs.
     n_loc = loc.numel()
     nope_dim = cache_k_nope.size(-1)
@@ -1449,6 +1518,27 @@ def _store_kv_cache_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _store_kv_cache_npu(
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_dst: torch.Tensor,
+    v_dst: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """Torch indexed-scatter equivalent of :func:`store_kv_cache` on NPU.
+
+    The Triton scatter kernel is CUDA-only (PDL via ``tl.extra.cuda``), so the
+    Ascend NPU path uses plain indexed assignment, which is semantically
+    equivalent for the supported row layouts.
+    """
+    n_tokens = k_src.shape[0]
+    if n_tokens == 0:
+        return
+    loc_l = loc.to(torch.long)
+    k_dst[loc_l] = k_src
+    v_dst[loc_l] = v_src
+
+
 def store_kv_cache(
     k_src: torch.Tensor,
     v_src: torch.Tensor,
@@ -1472,6 +1562,9 @@ def store_kv_cache(
     """
     n_tokens = k_src.shape[0]
     if n_tokens == 0:
+        return
+    if k_src.device.type == "npu":
+        _store_kv_cache_npu(k_src, v_src, k_dst, v_dst, loc)
         return
     n_kv_k = k_src.numel() // n_tokens
     n_kv_v = v_src.numel() // n_tokens

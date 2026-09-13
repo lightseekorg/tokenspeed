@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -202,7 +203,16 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
         max_verify_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
-        num_sms = torch.cuda.get_device_properties(config.device).multi_processor_count
+        if config.device.type == "npu":
+            try:
+                npu_props = torch.npu.get_device_properties(config.device)
+                num_sms = getattr(npu_props, "cube_core_num", 0) or 1
+            except Exception:
+                num_sms = 1
+        else:
+            num_sms = torch.cuda.get_device_properties(
+                config.device
+            ).multi_processor_count
         self._qrita_verify_num_programs = min(num_sms, max_verify_rows)
         self._qrita_verify_buffer = torch.empty(
             (self._qrita_verify_num_programs, vocab_size),
@@ -298,6 +308,113 @@ class TritonSamplingBackend(SamplingBackend):
         logits_output.next_token_logprobs = selected_token_logprobs(
             logits, sampled, selected_out
         )
+
+    def _npu_sample(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch-composition sampling for the Ascend NPU path.
+
+        Routes every pool route through ``gumbel_sample_top_k_top_p_from_pools``,
+        whose NPU branch reproduces the top-k/top-p Gumbel semantics with torch
+        ops. Greedy requests carry ``top_k=1`` in the pool, so they collapse to
+        argmax; unfiltered requests clamp ``top_k`` to the vocab size and sample
+        over the full distribution.
+        """
+        bs = logits.shape[0]
+        req_pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
+        )
+        offsets_pool = (
+            sampling_info.valid_cache_lengths
+            if sampling_info.valid_cache_lengths is not None
+            else self._zero_offsets_pool
+        )
+        batch_next_token_ids = gumbel_sample_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            self._topk_candidate_ids[:bs],
+            self._topk_candidate_logits[:bs],
+            self._gumbel_out[:bs],
+            block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
+            top_k_pad=self._top_k_top_p_pad,
+        )
+        sampled = batch_next_token_ids.to(torch.int32)
+        self.maybe_broadcast(sampled)
+        self._write_logprob_outputs(logits_output, logits, sampled)
+        return sampled, self._ones_buf[:bs]
+
+    def _npu_verify(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch-composition speculative verification for the Ascend NPU path.
+
+        Samples one target token per draft position with the same NPU top-k/top-p
+        torch sampler, then verifies the draft chain with the torch equivalent of
+        ``verify_chain_target_sampled``.
+        """
+        bs = candidates.shape[0]
+        num_tokens_per_req = candidates.shape[1]
+        rows = bs * num_tokens_per_req
+
+        predict = self._predict_buf[:rows]
+        accept_index = (
+            self._accept_index_buf[:rows].view(bs, num_tokens_per_req).fill_(-1)
+        )
+        accept_length = self._accept_length_buf[:bs]
+
+        req_pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
+        )
+        offsets_pool = (
+            sampling_info.valid_cache_lengths
+            if sampling_info.valid_cache_lengths is not None
+            else self._zero_offsets_pool
+        )
+        target_sampled = gumbel_sample_top_k_top_p_from_pools(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            self._topk_verify_candidate_ids[:rows],
+            self._topk_verify_candidate_logits[:rows],
+            self._gumbel_verify_out[:rows],
+            block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
+            top_k_pad=self._top_k_top_p_pad,
+            num_tokens_per_req=num_tokens_per_req,
+        )
+        verify_chain_target_sampled(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            target_sampled=target_sampled,
+        )
+
+        accept_length += 1
+        self.maybe_broadcast(predict, accept_index, accept_length)
+
+        if self.config.enable_output_logprobs:
+            self._write_logprob_outputs(
+                logits_output,
+                logits,
+                predict,
+            )
+        return predict, accept_length
 
     @staticmethod
     def _select_sample_route(
@@ -438,6 +555,9 @@ class TritonSamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
 
+        if current_platform().is_npu:
+            return self._npu_sample(logits_output, logits, sampling_info)
+
         # Greedy requests normalize to top_k=1 (SamplingParams.__post_init__),
         # so the pool route below serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
@@ -561,6 +681,9 @@ class TritonSamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
+
+        if current_platform().is_npu:
+            return self._npu_verify(logits_output, logits, sampling_info, candidates)
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
         offsets_pool = (

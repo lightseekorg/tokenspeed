@@ -88,7 +88,7 @@ def argmax(
     if (
         logits.dim() != 2
         or logits.shape[0] == 0
-        or not logits.is_cuda
+        or not (logits.is_cuda or logits.device.type == "npu")
         or logits.dtype not in _SUPPORTED_DTYPES
     ):
         return _argmax_torch_fallback(logits, out=out)
@@ -120,5 +120,6 @@ def argmax(
 
 
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.sampling.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
