@@ -523,8 +523,10 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         }
         return nullptr;
     }();
-    groups_[group_index].Index().RegisterFullBlocks(tierPool<Tier>(), table, keys, access_epoch, first_cache_block,
-                                                    boundary_kind, inserted);
+    CacheGroup& group = groups_[group_index];
+    group.Index().RegisterFullBlocks(tierPool<Tier>(),
+                                     group.Allocator().BlocksToPublish(table, first_cache_block, keys.size()), keys,
+                                     access_epoch, first_cache_block, boundary_kind, inserted);
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }

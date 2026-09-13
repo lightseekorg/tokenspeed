@@ -75,6 +75,18 @@ public:
         return ids;
     }
 
+    // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The
+    // index owns no table: publishing a completed block may dedupe it against
+    // the key's existing canonical block, and the table must then hold that
+    // canonical reference, so the mutable window is issued here, by the one
+    // component allowed to change a table.
+    std::span<CacheBlockRef> BlocksToPublish(BlockTable& table, std::int32_t first_slot, std::size_t count) const {
+        _assert(first_slot >= 0, "first_slot must be >= 0");
+        _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(count) <= table.NumBlocks(),
+                "publish window exceeds table size");
+        return std::span<CacheBlockRef>{table.blocks_}.subspan(static_cast<std::size_t>(first_slot), count);
+    }
+
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         table.blocks_ = std::move(hit.blocks);

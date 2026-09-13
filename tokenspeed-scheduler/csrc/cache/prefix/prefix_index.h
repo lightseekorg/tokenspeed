@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "cache/core/block_pool.h"
-#include "cache/core/block_table.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "utils.h"
@@ -105,20 +104,23 @@ public:
         }
     }
 
-    void RegisterFullBlocks(const BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
-                            std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                            CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
-                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
-        _assert(first_slot >= 0, "first_slot must be >= 0");
-        _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(keys.size()) <= table.NumBlocks(),
-                "key range exceeds table size");
+    // Registers blocks[j] under keys[j]. blocks is the caller's own storage
+    // (GroupAllocator::BlocksToPublish for a request table): a block that
+    // dedupes against an existing canonical entry is replaced in place.
+    // first_logical_block is the logical prefix position of blocks[0].
+    void RegisterFullBlocks(const BlockPool& pool, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                            std::uint64_t access_epoch, std::int32_t first_logical_block,
+                            CacheBoundaryKind boundary_kind,
+                            std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
+        _assert(first_logical_block >= 0, "first_logical_block must be >= 0");
+        _assert(blocks.size() == keys.size(), "one key per published block");
         for (std::size_t j = 0; j < keys.size(); ++j) {
-            CacheBlockRef& block_ref = table.blocks_[static_cast<std::size_t>(first_slot) + j];
+            CacheBlockRef& block_ref = blocks[j];
             if (!block_ref) {
                 continue;
             }
-            Register(pool, block_ref, keys[j], access_epoch, first_slot + static_cast<std::int32_t>(j), boundary_kind,
-                     newly_cached);
+            Register(pool, block_ref, keys[j], access_epoch, first_logical_block + static_cast<std::int32_t>(j),
+                     boundary_kind, newly_cached);
         }
     }
 

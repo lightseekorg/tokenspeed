@@ -452,7 +452,7 @@ TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
     const CacheBlockLocation location = table.Blocks().front()->Location();
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
 
     mgr.Free(table);
 
@@ -480,7 +480,7 @@ TEST(FullAttnManagerLcmTest, ChildEvictionLeavesSiblingLocationValid) {
     const CacheKey second_key = RealKey({5, 6, 7, 8}, 0);
     const CacheBlockLocation sibling = table.Blocks()[1]->Location();
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
     mgr.Free(table);
 
     EXPECT_TRUE(mgr.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
@@ -496,8 +496,8 @@ TEST(FullAttnManagerLcmTest, PinnedChildBlocksWholeParentEviction) {
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(
-        pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
+                           access_epoch);
 
     EXPECT_FALSE(mgr.ParentIsFullyEvictable(pool, 1));
     mgr.Free(table);
@@ -510,7 +510,7 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     BlockTable table;
     ASSERT_TRUE(first_group.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    first_group.Index().RegisterFullBlocks(
+    first_group.RegisterFullBlocks(
         pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
     first_group.Free(table);
 
@@ -536,12 +536,12 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const CacheKey other_key = RealKey({5, 6, 7, 8}, 0);
     std::uint64_t next_access_epoch = 0;
-    mgr.Index().RegisterFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
-    mgr.Index().RegisterFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
     const CacheBlockLocation first_location = first.Blocks()[0]->Location();
     const CacheBlockLocation other_location = other.Blocks()[0]->Location();
 
-    mgr.Index().RegisterFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.RegisterFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
     mgr.Free(first);
     mgr.Free(other);
     mgr.Free(duplicate);
@@ -564,7 +564,7 @@ TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     const CacheKey second{.namespace_id = 2, .group_id = 0, .content_hash = "shared-content"};
     const std::uint64_t access_epoch = 1;
 
-    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
+    mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
 
     EXPECT_EQ(mgr.NumCachedBlocks(pool), 2);
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, first));

@@ -469,7 +469,12 @@ The conversion is `GroupGeometry` in the coordinator layer:
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
-dependency is visible in the signature, not hidden in shared state.
+dependency is visible in the signature, not hidden in shared state. The
+reverse direction is symmetric: publishing a table's completed blocks may
+replace one with the key's existing canonical block, and that write goes
+through a mutable window the allocator hands out
+(`GroupAllocator::BlocksToPublish`) to `PrefixCacheIndex::RegisterFullBlocks`.
+The index never sees a `BlockTable`; the allocator remains its only mutator.
 
 ## The coordinator layer (`csrc/cache/coordinator/`)
 
