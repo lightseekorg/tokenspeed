@@ -50,10 +50,10 @@ import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
 import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
+import tokenspeed_kernel.ops.attention.dsv4._triton.indexer as _attention_triton_dsv4_indexer
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
-import tokenspeed_kernel.ops.attention.dsv4.triton.indexer as _attention_triton_dsv4_indexer
 import tokenspeed_kernel.ops.attention.gdn as _attention_gdn_pkg
 import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.kda as _attention_kda_pkg

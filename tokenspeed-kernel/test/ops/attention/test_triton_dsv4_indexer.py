@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_plan,
     dsv4_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.dsv4.triton.indexer import _indexer_logits
+from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import _indexer_logits
 
 
 def _inputs(tokens: int, heads: int, pages: int):

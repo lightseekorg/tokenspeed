@@ -94,8 +94,8 @@ Inside the root `tokenspeed-kernel/` directory:
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
-  `attention/mha/triton.py`. Multi-file implementations may use a solution
-  package such as `moe/triton/`.
+  `attention/mha/triton.py`; multi-file implementations keep helpers under a
+  private directory such as `attention/mha/_triton/`.
 * Prefer to `@register_kernel` with the name as the Python `def` function
   attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.

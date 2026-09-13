@@ -34,7 +34,7 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsv4.triton.indexer import (  # noqa: F401
+from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import (  # noqa: F401
     triton_dsv4_decode_topk_mxfp4,
     triton_dsv4_plan,
     triton_dsv4_prefill_topk_mxfp4,
