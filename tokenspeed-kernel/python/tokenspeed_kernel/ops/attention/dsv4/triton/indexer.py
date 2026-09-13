@@ -119,7 +119,7 @@ def _mxfp4_logits_kernel(
     weights = tl.load(weights_ptr + token * HEADS + heads)
     scores = tl.sum(tl.maximum(products, 0.0) * weights[:, None], axis=0)
     tl.store(
-        logits_ptr + token * max_candidates + offsets,
+        logits_ptr + token.to(tl.int64) * max_candidates + offsets,
         tl.where(valid, scores, -float("inf")),
         mask=offsets < max_candidates,
     )

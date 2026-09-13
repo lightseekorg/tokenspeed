@@ -36,13 +36,10 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_decode_cuda_graph_replays_changed_inputs[1]
     tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
-    # DeepSeek V4 portable Triton path on gfx1250: one case per code path
-    # (decode radix top-k, ragged prefill with a compact table, graph refresh,
-    # selected attention with the extra segment, each routing kind, router
-    # into the MXFP4 experts, and the gfx1250 kernel selection). The
-    # need_scores=True router cases stay out: the pinned rocJITsu mis-scales
+    # DeepSeek V4 portable Triton path on gfx1250: one case per code path.
+    # TODO: need_scores=True router cases stay out: the pinned rocJITsu mis-scales
     # float division for subnormal quotients, which corrupts their F.softplus
-    # reference on the simulator; re-add them when the simulator is fixed.
+    # reference on the simulator.
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_logits_and_topk[64-2048]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_prefill_ragged_candidates[True]
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_indexer.py::test_decode_graph_refresh_and_padding
