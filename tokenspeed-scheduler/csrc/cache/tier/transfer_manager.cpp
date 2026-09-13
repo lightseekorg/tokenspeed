@@ -21,6 +21,7 @@
 #include "cache/tier/transfer_manager.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 #include "utils.h"
@@ -31,10 +32,18 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
-    std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
+    // Keys already travelling: every ticket of every in-flight write-back.
+    // Derived from write_backs_ on demand rather than mirrored in a second
+    // container that would have to be kept in step with it. Candidates join
+    // the same set so a key queued twice in one round is stored once.
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
+    for (const auto& [op_id, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.tickets) {
+            storing_keys.insert(ticket.key);
+        }
+    }
     for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key) || store_keys_.contains(candidate.key) ||
-            !batch_keys.insert(candidate.key).second) {
+        if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
             continue;
         }
 
@@ -85,9 +94,6 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         return std::nullopt;
     }
     const std::uint32_t op_id = nextOpId();
-    for (const StoreTicket& ticket : tickets) {
-        store_keys_.insert(ticket.key);
-    }
     const bool inserted = write_backs_.emplace(op_id, InFlightWriteBack{guard, std::move(tickets)}).second;
     _assert(inserted, "duplicate store op id");
     return WriteBackOperation{
@@ -128,9 +134,6 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     }
     std::vector<StoreTicket> stores = std::move(it->second.tickets);
     write_backs_.erase(it);
-    for (const StoreTicket& ticket : stores) {
-        store_keys_.erase(ticket.key);
-    }
     // Publishing the Host entry also drops the tickets' Device pins (if any)
     // when `stores` goes out of scope: the source is evictable again.
     for (StoreTicket& ticket : stores) {
