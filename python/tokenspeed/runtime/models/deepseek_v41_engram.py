@@ -694,21 +694,32 @@ class RowShardedEngramEmbedding(nn.Module):
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
-        local = (indices >= self.row_start) & (indices < self.row_end)
-        local_ids = (indices - self.row_start).masked_fill(~local, 0)
-        if self.host_table:
-            codes = host_gather.uint8_row_gather(
-                self.weight.view(torch.uint8), local_ids, None
+        if indices.is_cuda and not self.host_table:
+            from tokenspeed_kernel.ops.embedding import mxfp8_embedding
+
+            values = mxfp8_embedding(
+                self.weight,
+                self.scale,
+                indices.contiguous(),
+                self.row_start,
+                self.row_end,
             )
-            scales = host_gather.uint8_row_gather(self.scale, local_ids, None)
-            values = _dequant_fp8_e8m0(codes, scales)
         else:
-            local_ids = local_ids.long()
-            # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
-            values = _dequant_fp8_e8m0(
-                self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
-            )
-        values = values.masked_fill(~local.unsqueeze(-1), 0)
+            local = (indices >= self.row_start) & (indices < self.row_end)
+            local_ids = (indices - self.row_start).masked_fill(~local, 0)
+            if self.host_table:
+                codes = host_gather.uint8_row_gather(
+                    self.weight.view(torch.uint8), local_ids, None
+                )
+                scales = host_gather.uint8_row_gather(self.scale, local_ids, None)
+                values = _dequant_fp8_e8m0(codes, scales)
+            else:
+                local_ids = local_ids.long()
+                # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
+                values = _dequant_fp8_e8m0(
+                    self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
+                )
+            values = values.masked_fill(~local.unsqueeze(-1), 0)
         if len(self.tp_group) > 1 and self.host_layout != "shared":
             values = all_reduce(
                 values,
@@ -860,6 +871,12 @@ class DeepseekV41Engram(nn.Module):
             return hidden_states
         embeddings = self.embed(hash_ids).flatten(-2)
         kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
+        if hidden_states.is_cuda:
+            from tokenspeed_kernel.ops.residual import normalized_dot_gate
+
+            return normalized_dot_gate(
+                hidden_states, kv, self.q_weight, self.k_weight, token_mask, self.eps
+            )
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         h = hidden_states.float()
