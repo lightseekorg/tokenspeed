@@ -78,10 +78,6 @@ class DeepseekV41Config(PretrainedConfig):
         for name in ("dtype", "bos_token_id", "eos_token_id", "pad_token_id"):
             if name in kwargs:
                 setattr(self.text_config, name, getattr(self, name))
-        quantization_config = kwargs.get("quantization_config")
-        if quantization_config is not None and "expert_dtype" in quantization_config:
-            self.text_config.expert_dtype = quantization_config["expert_dtype"]
-
     def __setattr__(self, name, value):
         if name == "text_config" and isinstance(value, dict):
             value = DeepseekV41TextConfig(**value)
