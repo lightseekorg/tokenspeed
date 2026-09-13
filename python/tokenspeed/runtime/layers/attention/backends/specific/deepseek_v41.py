@@ -53,7 +53,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
-from tokenspeed.runtime.layers.attention.page_table import group_slot_mapping_from_raw
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
@@ -170,6 +169,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 )
             return
         self._max_decode_bs = max_bs
+        self._decode_history_status = torch.empty(
+            max_bs, dtype=torch.int32, device=self.device
+        )
         horizon = (1 + int(kwargs.get("overlap_schedule_depth", 0))) * int(
             kwargs.get("max_tokens_per_req", 1)
         )
@@ -245,32 +247,29 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         else:
             self._swa_plans.clear()
         meta = self._decode_view(bs)
+        from tokenspeed_kernel.ops.attention.triton.page_table import copy_page_table
+
         for gid, dest in meta.block_tables.items():
             src = block_tables[gid]
             if src.shape[1] > dest.shape[1]:
                 raise ValueError(
                     f"V4.1 {gid} table exceeds initialized context capacity"
                 )
-            dest.zero_()
-            dest[:actual_bs, : src.shape[1]].copy_(src[:actual_bs])
-        meta.seq_lens.zero_()
-        meta.seq_lens[:actual_bs].copy_(seq_lens[:actual_bs])
-        meta.positions.copy_(meta.seq_lens.to(torch.int64) - 1)
-        meta.positions[:num_extends].fill_(-1)
-        meta.request_pool_indices.fill_(-1)
-        meta.request_pool_indices[:actual_bs].copy_(req_pool_indices[:actual_bs])
+            copy_page_table(src, dest, actual_bs)
         meta.num_extends = num_extends
         self.forward_metadata = self.forward_decode_metadata = meta
-        meta.swa_write_slots.copy_(
-            self.cache_slots(
-                V41_SWA_GROUP_ID,
-                meta.positions,
-                meta.request_indices,
-                ForwardMode.DECODE,
-            )
+        from tokenspeed_kernel.ops.attention.dsv41 import decode_rows
+
+        decode_rows(
+            seq_lens,
+            req_pool_indices,
+            meta.positions,
+            meta.seq_lens,
+            meta.request_pool_indices,
+            actual_bs,
+            num_extends,
         )
-        self._refresh_decode_window(meta)
-        self._validate_decode_history(meta, actual_bs)
+        self._refresh_decode_window(meta, actual_bs)
         if num_extends:
             self.sparse_topk.decode = None
         else:
@@ -290,47 +289,42 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         ).to(torch.int32)
         return slots, (positions + 1).clamp(0, 128).to(torch.int32)
 
-    def _refresh_decode_window(self, metadata):
-        """Refresh pointer-stable derived addresses once, before any layer reads.
+    def _refresh_decode_window(self, metadata, actual_bs):
+        """Build query addresses and check dependencies before any layer runs.
 
-        These are batch metadata, not retained KV. The same producer runs for
-        eager, idle capture setup, and each live replay; no graph-pool allocation
-        is retained as an eager request cache.
+        Eager, mixed, capture setup and live graph replay use the same producer.
+        All persistent outputs are refreshed in place; history remains LCM-owned.
         """
-        slots, lengths = self._decode_window(
-            metadata.positions, metadata.request_indices
-        )
-        metadata.swa_read_slots.copy_(slots)
-        metadata.swa_read_lens.copy_(lengths)
+        from tokenspeed_kernel.ops.attention.dsv41 import decode_window
 
-    def _validate_decode_history(self, meta: V41Metadata, actual_bs: int) -> None:
-        # Refresh is outside capture/replay on BOTH paths. Fail before launching
-        # the model, not with an asynchronous device assert or a dropped prefix.
-        for start in range(0, actual_bs, 8):
-            stop = min(start + 8, actual_bs)
-            positions = meta.positions[start:stop]
-            requests = meta.request_indices[start:stop]
-            prefix = positions[:, None] - torch.arange(127, 0, -1, device=self.device)
-            slots = self.cache_slots(
-                V41_SWA_GROUP_ID,
-                prefix,
-                requests[:, None].expand_as(prefix),
-                ForwardMode.DECODE,
+        n = metadata.positions.numel()
+        if not n:
+            return
+        status = self._decode_history_status[:n]
+        counts = self.cache_pool.arena.cache_group_page_counts
+        decode_window(
+            metadata.positions,
+            metadata.request_indices,
+            metadata.swa_write_slots,
+            metadata.swa_read_slots,
+            metadata.swa_read_lens,
+            status,
+            metadata.block_tables[V41_SWA_GROUP_ID],
+            metadata.block_tables[V41_COMPRESSOR_TAIL_GROUP_ID],
+            counts[V41_SWA_GROUP_ID],
+            counts[V41_COMPRESSOR_TAIL_GROUP_ID],
+        )
+        # One host observation preserves the fail-before-forward recovery
+        # contract. Padding and leading extends contribute no history errors.
+        errors = status[:actual_bs].cpu().tolist() if actual_bs else []
+        if any(error & 1 for error in errors):
+            raise RuntimeError(
+                "V4.1 SWA prefix is missing; supply the dependency tail or recover the request"
             )
-            if bool(((prefix >= 0) & (slots < 0)).any()):
-                raise RuntimeError(
-                    "V4.1 SWA prefix is missing; supply the dependency tail or recover the request"
-                )
-            previous = (positions - 1).masked_fill(
-                (positions < 0) | (positions % 2 != 1), -1
+        if any(error & 2 for error in errors):
+            raise RuntimeError(
+                "V4.1 required compressor tail is absent; request needs recovery"
             )
-            slots = self.cache_slots(
-                V41_COMPRESSOR_TAIL_GROUP_ID, previous, requests, ForwardMode.DECODE
-            )
-            if bool(((previous >= 0) & (slots < 0)).any()):
-                raise RuntimeError(
-                    "V4.1 required compressor tail is absent; request needs recovery"
-                )
 
     def init_forward_metadata(
         self,
@@ -423,8 +417,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             torch.empty((total - n, 128), dtype=torch.int32, device=self.device),
             torch.empty(total - n, dtype=torch.int32, device=self.device),
         )
-        self._refresh_decode_window(self.forward_decode_metadata)
-        self._validate_decode_history(self.forward_decode_metadata, bs - num_extends)
+        self._refresh_decode_window(self.forward_decode_metadata, bs - num_extends)
         self.sparse_topk.clear()
 
     def query_metadata(self, forward_mode: ForwardMode) -> V41Metadata:
@@ -474,19 +467,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("positions and request_indices must have equal shape")
         rows, stride = V41_GROUP_GEOMETRY[group_id]
         meta = self.query_metadata(forward_mode)
-        slots = group_slot_mapping_from_raw(
-            positions.reshape(-1),
-            request_indices.reshape(-1),
+        from tokenspeed_kernel.ops.attention.triton.page_table import (
+            bounded_group_slots,
+        )
+
+        return bounded_group_slots(
+            positions,
+            request_indices,
             meta.block_tables[group_id],
             rows,
             stride,
-        ).reshape(positions.shape)
-        valid = (positions >= 0) & (slots >= rows)
-        if self.cache_pool is not None:
-            valid &= (
-                slots < self.cache_pool.arena.cache_group_page_counts[group_id] * rows
-            )
-        return slots.masked_fill(~valid, -1)
+            1,
+            self.cache_pool.arena.cache_group_page_counts[group_id],
+        )
 
     def write_locations(self, layer, forward_mode: ForwardMode) -> torch.Tensor:
         return self.query_metadata(forward_mode).swa_write_slots
@@ -502,12 +495,16 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         """Map request-local global row IDs to owner's slots with per-query causality."""
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
-        visible = (positions + 1) // ratio
-        valid = (logical_rows >= 0) & (logical_rows < visible[:, None])
-        raw = (logical_rows * ratio).masked_fill(~valid, -1)
-        return self.cache_slots(
-            gid, raw, request_indices[:, None].expand_as(raw), forward_mode
-        ).to(torch.int32)
+        from tokenspeed_kernel.ops.attention.dsv41 import global_slots
+
+        return global_slots(
+            logical_rows,
+            positions,
+            request_indices,
+            self.query_metadata(forward_mode).block_tables[gid],
+            ratio,
+            self.cache_pool.arena.cache_group_page_counts[gid],
+        )
 
     def _lookup_rows(
         self, source_positions, source_requests, positions, requests
@@ -594,23 +591,40 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._owner_group(owner)
         if content.shape != (positions.numel(), 512) or scores.shape != content.shape:
             raise ValueError("compressor content/scores must be [tokens, 512]")
-        active = (positions >= 0) & (positions % 2 == 1)
-        pair_positions = (positions - 1).masked_fill(~active, -1)
-        pair_requests = request_indices.masked_fill(~active, -1)
-        if not positions.numel():
-            return (
-                content.to(
-                    torch.bfloat16 if norm_weight is not None else content.dtype
-                ).clone(),
+        if content.is_cuda:
+            from tokenspeed_kernel.ops.attention import dsv41
+
+            gid = V41_COMPRESSOR_TAIL_GROUP_ID
+            active, pair_positions, pair_requests, previous, slots, write_slots = (
+                dsv41.compressor_metadata(
+                    positions,
+                    request_indices,
+                    self.query_metadata(forward_mode).block_tables[gid],
+                    self.context_len,
+                    self.cache_pool.arena.cache_group_page_counts[gid],
+                )
+            )
+        else:
+            active = (positions >= 0) & (positions % 2 == 1)
+            pair_positions = (positions - 1).masked_fill(~active, -1)
+            pair_requests = request_indices.masked_fill(~active, -1)
+            if not positions.numel():
+                return (
+                    content.to(
+                        torch.bfloat16 if norm_weight is not None else content.dtype
+                    ).clone(),
+                    pair_positions,
+                    pair_requests,
+                )
+            previous = self._lookup_rows(
+                positions, request_indices, pair_positions, pair_requests
+            )
+            slots = self.cache_slots(
+                V41_COMPRESSOR_TAIL_GROUP_ID,
                 pair_positions,
                 pair_requests,
+                forward_mode,
             )
-        previous = self._lookup_rows(
-            positions, request_indices, pair_positions, pair_requests
-        )
-        slots = self.cache_slots(
-            V41_COMPRESSOR_TAIL_GROUP_ID, pair_positions, pair_requests, forward_mode
-        )
         missing = active & (previous < 0)
         if not forward_mode.is_decode() and bool((missing & (slots < 0)).any()):
             raise RuntimeError(
@@ -658,9 +672,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        self.write_compressor_tail(
-            owner, content, scores, positions, request_indices, forward_mode
-        )
+        if content.is_cuda:
+            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
+        else:
+            self.write_compressor_tail(
+                owner, content, scores, positions, request_indices, forward_mode
+            )
         return pooled, pair_positions, pair_requests
 
     def write_global(
@@ -793,9 +810,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         reindex = source != owner
         if reindex and candidates is None:
             raise RuntimeError("V4.1 Reindex is missing candidate-source selections")
+        same_candidate_rows = reindex and (
+            positions is candidates.positions
+            and request_indices is candidates.request_indices
+        )
         candidate_index = (
             self._selection_rows(candidates, positions, request_indices, forward_mode)
-            if reindex
+            if reindex and not same_candidate_rows
             else None
         )
         produce_candidates = layer_id == self.spec.candidate_source
@@ -853,10 +874,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ]
         )
         for start, stop, request in windows:
-            visible = (
-                ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
-            )
             if request is not None:
+                visible = (
+                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                )
                 _, _, prefix, count = next(
                     span for span in self._prefill_spans if span[0] == request
                 )
@@ -865,16 +886,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 row = row.masked_fill(row <= 0, -1)
                 tile_table = row.expand(stop - start, -1)
             else:
-                req = request_indices[start:stop]
-                live_req = (req >= 0) & (req < table.shape[0])
-                tile_table = table[req.clamp(0, table.shape[0] - 1)].clone()
-                tile_table.masked_fill_((tile_table <= 0) | ~live_req[:, None], -1)
+                from tokenspeed_kernel.ops.attention.dsv41 import selection_table
+
+                tile_table, visible = selection_table(
+                    positions[start:stop], request_indices[start:stop], table, ratio
+                )
             cb = None
             if reindex:
-                ci = candidate_index[start:stop]
-                cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
-                    ci[:, None] < 0, -1
-                )
+                if same_candidate_rows:
+                    cb = candidates.block_ids[start:stop]
+                else:
+                    ci = candidate_index[start:stop]
+                    cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
+                        ci[:, None] < 0, -1
+                    )
             dsv41.index_topk(
                 index_q[start:stop],
                 index_weights[start:stop],

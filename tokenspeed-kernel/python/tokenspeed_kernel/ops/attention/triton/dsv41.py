@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.attention.triton.page_table import resolve_group_slot
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -38,6 +39,10 @@ _FLOAT_SIGNATURES = frozenset(
     for dtype in (torch.bfloat16, torch.float32)
 )
 _BYTE_SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
+_INTEGER_SIGNATURES = frozenset(
+    format_signature(x=dense_tensor_format(dtype))
+    for dtype in (torch.int32, torch.int64)
+)
 _QUERY_SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
 
 
@@ -1967,3 +1972,461 @@ def finish_selection(
         num_warps=8,
     )
     return output
+
+
+@triton.jit
+def _write_selection(
+    Selected,
+    Candidates,
+    Rows,
+    Lengths,
+    Blocks,
+    BlockLengths,
+    selected_stride: tl.constexpr,
+    candidate_stride: tl.constexpr,
+    K: tl.constexpr,
+    C: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    k = tl.arange(0, ROW_BLOCK)
+    ids = tl.load(Selected + row * selected_stride + k, k < K, other=-1)
+    tl.store(Rows + row * K + k, ids, k < K)
+    tl.store(Lengths + row, tl.sum((ids >= 0).to(tl.int32)))
+    count = tl.full((), 0, tl.int32)
+    if C:
+        c = tl.arange(0, CANDIDATE_BLOCK)
+        candidates = tl.load(Candidates + row * candidate_stride + c, c < C, other=-1)
+        count = tl.sum((candidates >= 0).to(tl.int32))
+        # Candidate IDs have no score ordering contract. Publish ascending
+        # positions, with invalid IDs in the trailing suffix.
+        candidates = tl.sort(tl.where(candidates >= 0, candidates, 2147483647))
+        candidates = tl.where(candidates == 2147483647, -1, candidates)
+        tl.store(Blocks + row * C + c, candidates, c < C)
+    tl.store(BlockLengths + row, count)
+
+
+def write_selection(selected, candidates, out):
+    """Copy logical selections and count valid IDs in caller-owned output tiles."""
+    rows, lengths, blocks, block_lengths = out
+    if selected.shape[0] == 0:
+        return
+    _write_selection[(selected.shape[0],)](
+        selected,
+        candidates if candidates is not None else selected,
+        rows,
+        lengths,
+        blocks,
+        block_lengths,
+        selected.stride(0),
+        candidates.stride(0) if candidates is not None else 0,
+        rows.shape[1],
+        blocks.shape[1],
+        triton.next_power_of_2(rows.shape[1]),
+        triton.next_power_of_2(max(1, blocks.shape[1])),
+        num_warps=8,
+    )
+
+
+@triton.jit(do_not_specialize=["BS", "ACTUAL", "EXTENDS"])
+def _decode_rows_kernel(
+    Seq,
+    Req,
+    Positions,
+    Lengths,
+    PoolRows,
+    BS,
+    ACTUAL,
+    EXTENDS,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    length = tl.load(Seq + row, row < ACTUAL, other=0)
+    pool = tl.load(Req + row, row < ACTUAL, other=-1)
+    tl.store(Positions + row, tl.where(row >= EXTENDS, length - 1, -1), row < BS)
+    tl.store(Lengths + row, length, row < BS)
+    tl.store(PoolRows + row, pool, row < BS)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_decode_rows",
+    name="triton_dsv41_decode_rows",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def decode_rows(
+    seq_lens,
+    request_pool_indices,
+    positions,
+    lengths,
+    pool_rows,
+    actual_bs,
+    num_extends,
+):
+    """Refresh persistent decode row metadata, including inactive rows, in place."""
+    if positions.numel():
+        _decode_rows_kernel[(triton.cdiv(positions.numel(), 256),)](
+            seq_lens,
+            request_pool_indices,
+            positions,
+            lengths,
+            pool_rows,
+            positions.numel(),
+            actual_bs,
+            num_extends,
+            BLOCK=256,
+        )
+
+
+@triton.jit
+def _decode_window_kernel(
+    Positions,
+    Requests,
+    Write,
+    Read,
+    ReadLen,
+    Status,
+    Swa,
+    Tail,
+    SW,
+    TW,
+    SS,
+    TS,
+    SC,
+    TC,
+    TABLE_ROWS,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+    SWA_PAGES: tl.constexpr,
+    TAIL_PAGES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pos = tl.load(Positions + row * PS).to(tl.int64)
+    req = tl.load(Requests + row * RS)
+    offsets = tl.arange(0, 128)
+    wanted = tl.maximum(pos - 127, 0) + offsets
+    wanted = tl.where(wanted <= pos, wanted, -1)
+    slots = resolve_group_slot(
+        Swa, wanted, req, TABLE_ROWS, SW, SS, SC, 64, 1, 1, SWA_PAGES
+    )
+    write = resolve_group_slot(
+        Swa, pos, req, TABLE_ROWS, SW, SS, SC, 64, 1, 1, SWA_PAGES
+    )
+    tl.store(Write + row, write)
+    tl.store(Read + row * 128 + offsets, slots)
+    tl.store(ReadLen + row, tl.minimum(tl.maximum(pos + 1, 0), 128))
+    # The current token is written later; only preceding tokens are dependencies.
+    missing_swa = tl.max(((wanted >= 0) & (wanted < pos) & (slots < 0)).to(tl.int32), 0)
+    previous = tl.where((pos >= 0) & (pos % 2 == 1), pos - 1, -1)
+    tail = resolve_group_slot(
+        Tail, previous, req, TABLE_ROWS, TW, TS, TC, 2, 1, 1, TAIL_PAGES
+    )
+    missing_tail = (previous >= 0) & (tail < 0)
+    tl.store(Status + row, missing_swa | (missing_tail.to(tl.int32) * 2))
+
+
+@register_kernel(
+    "attention",
+    "dsv41_decode_window",
+    name="triton_dsv41_decode_window",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def decode_window(
+    positions,
+    requests,
+    write_slots,
+    read_slots,
+    read_lens,
+    status,
+    swa_table,
+    tail_table,
+    swa_pages,
+    tail_pages,
+):
+    """Write SWA addresses and history error bits for an arbitrary decode window.
+
+    positions/requests are logical query coordinates, including negative padding.
+    Tables contain LCM group pages. Output buffers have N rows (read_slots [N,128]);
+    status bit 0 denotes missing SWA history, bit 1 a missing compressor tail.
+    Every output row is overwritten, so the buffers are reusable under graphs.
+    """
+    if positions.numel():
+        _decode_window_kernel[(positions.numel(),)](
+            positions,
+            requests,
+            write_slots,
+            read_slots,
+            read_lens,
+            status,
+            swa_table,
+            tail_table,
+            swa_table.shape[1],
+            tail_table.shape[1],
+            swa_table.stride(0),
+            tail_table.stride(0),
+            swa_table.stride(1),
+            tail_table.stride(1),
+            swa_table.shape[0],
+            positions.stride(0),
+            requests.stride(0),
+            swa_pages,
+            tail_pages,
+            num_warps=4,
+        )
+
+
+@triton.jit(do_not_specialize=["N"])
+def _global_slots_kernel(
+    Rows,
+    P,
+    Req,
+    Table,
+    Out,
+    N,
+    K: tl.constexpr,
+    LS0: tl.constexpr,
+    LS1: tl.constexpr,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+    TR,
+    TC,
+    TS0,
+    TS1,
+    RATIO: tl.constexpr,
+    PAGES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = i // K
+    logical = tl.load(Rows + row * LS0 + i % K * LS1, i < N, other=-1)
+    pos = tl.load(P + row * PS, i < N, other=-1)
+    req = tl.load(Req + row * RS, i < N, other=-1)
+    raw = tl.where(
+        (logical >= 0) & (logical < (pos + 1) // RATIO),
+        logical.to(tl.int64) * RATIO,
+        -1,
+    )
+    slots = resolve_group_slot(Table, raw, req, TR, TC, TS0, TS1, 64, RATIO, 1, PAGES)
+    tl.store(Out + i, slots, i < N)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_global_slots",
+    name="triton_dsv41_global_slots",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def global_slots(rows, positions, requests, table, ratio, pages):
+    """Map selected logical rows, applying per-query causality and page bounds."""
+    out = torch.empty(rows.shape, device=rows.device, dtype=torch.int32)
+    if rows.numel():
+        _global_slots_kernel[(triton.cdiv(rows.numel(), 256),)](
+            rows,
+            positions,
+            requests,
+            table,
+            out,
+            rows.numel(),
+            rows.shape[1],
+            *rows.stride(),
+            positions.stride(0),
+            requests.stride(0),
+            *table.shape,
+            *table.stride(),
+            ratio,
+            pages,
+            BLOCK=256,
+        )
+    return out
+
+
+@triton.jit(do_not_specialize=["N", "TC"])
+def _selection_table_kernel(
+    P,
+    Req,
+    Table,
+    Out,
+    Lens,
+    N,
+    TC,
+    TR,
+    TS0,
+    TS1,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+    RATIO: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.load(Req + row * RS)
+    pos = tl.load(P + row * PS)
+    live = (req >= 0) & (req < TR)
+    page = tl.load(Table + req * TS0 + col * TS1, live & (col < TC), other=-1)
+    tl.store(Out + row * TC + col, tl.where(page > 0, page, -1), col < TC)
+    if tl.program_id(1) == 0:
+        tl.store(Lens + row, tl.maximum((pos + 1) // RATIO, 0))
+
+
+@register_kernel(
+    "attention",
+    "dsv41_selection_table",
+    name="triton_dsv41_selection_table",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def selection_table(positions, requests, table, ratio):
+    """Gather indexer rows and visible lengths, converting null page zero to -1."""
+    n = positions.numel()
+    out = torch.empty((n, table.shape[1]), dtype=torch.int32, device=table.device)
+    lengths = torch.empty(n, dtype=torch.int32, device=table.device)
+    if n:
+        _selection_table_kernel[(n, max(1, triton.cdiv(table.shape[1], 256)))](
+            positions,
+            requests,
+            table,
+            out,
+            lengths,
+            n,
+            table.shape[1],
+            table.shape[0],
+            *table.stride(),
+            positions.stride(0),
+            requests.stride(0),
+            ratio,
+            BLOCK=256,
+        )
+    return out, lengths
+
+
+@triton.jit
+def _compressor_metadata(
+    Positions,
+    Requests,
+    Table,
+    Keys,
+    Order,
+    Active,
+    PairPositions,
+    PairRequests,
+    Previous,
+    ReadSlots,
+    WriteSlots,
+    N: tl.constexpr,
+    P0: tl.constexpr,
+    R0: tl.constexpr,
+    TR: tl.constexpr,
+    TC: tl.constexpr,
+    TS0: tl.constexpr,
+    TS1: tl.constexpr,
+    PAGES: tl.constexpr,
+    GRAIN: tl.constexpr,
+    SCAN: tl.constexpr,
+):
+    row = tl.program_id(0)
+    position = tl.load(Positions + row * P0).to(tl.int64)
+    request = tl.load(Requests + row * R0).to(tl.int64)
+    active = (position >= 0) & (position % 2 == 1)
+    pair = tl.where(active, position - 1, -1)
+    pair_request = tl.where(active, request, -1)
+    previous = tl.full((), -1, tl.int64)
+    if SCAN:
+        indices = tl.arange(0, SCAN)
+        source_position = tl.load(Positions + indices * P0, indices < N, -1)
+        source_request = tl.load(Requests + indices * R0, indices < N, -1)
+        match = (
+            (indices < N) & (source_position == pair) & (source_request == pair_request)
+        )
+        previous = tl.min(tl.where(match, indices, N), 0).to(tl.int64)
+        previous = tl.where(previous < N, previous, -1)
+    else:
+        wanted = pair_request * GRAIN + pair
+        left = tl.full((), 0, tl.int32)
+        right = tl.full((), N, tl.int32)
+        while left < right:
+            mid = (left + right) // 2
+            value = tl.load(Keys + mid)
+            lower = value < wanted
+            left = tl.where(lower, mid + 1, left)
+            right = tl.where(lower, right, mid)
+        key = tl.load(Keys + left, left < N, -1)
+        previous = tl.load(Order + left, (left < N) & (key == wanted), -1)
+    previous = tl.where(active & (request >= 0), previous, -1)
+    read_slot = resolve_group_slot(
+        Table, pair, pair_request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+    )
+    write_slot = resolve_group_slot(
+        Table, position, request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+    )
+    tl.store(Active + row, active)
+    tl.store(PairPositions + row, pair)
+    tl.store(PairRequests + row, pair_request)
+    tl.store(Previous + row, previous)
+    tl.store(ReadSlots + row, read_slot)
+    tl.store(WriteSlots + row, write_slot)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_compressor_metadata",
+    name="triton_dsv41_compressor_metadata",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def compressor_metadata(positions, requests, table, context_len, pages):
+    """Find each completed pair's predecessor and LCM tail addresses."""
+    n = positions.numel()
+    _integers(positions, (n,), "positions")
+    _integers(requests, (n,), "requests")
+    if table.ndim != 2:
+        raise ValueError("Compressor tail page table must be two-dimensional")
+    _integers(table, table.shape, "table")
+    _same_device(positions, (requests, table))
+    active = torch.empty(n, dtype=torch.bool, device=positions.device)
+    pair_positions = torch.empty_like(positions)
+    pair_requests = torch.empty_like(requests)
+    previous, read_slots, write_slots = (
+        torch.empty(n, dtype=torch.int64, device=positions.device) for _ in range(3)
+    )
+    out = active, pair_positions, pair_requests, previous, read_slots, write_slots
+    if n:
+        # Scan small query tiles directly; sorting bounds the larger prefill
+        # lookup to O(N log N). Neither algorithm assumes query ordering.
+        scan = triton.next_power_of_2(n) if n <= 128 else 0
+        keys, order = (
+            (None, None)
+            if scan
+            else (requests.to(torch.int64) * (context_len + 1) + positions).sort()
+        )
+        _compressor_metadata[(n,)](
+            positions,
+            requests,
+            table,
+            keys,
+            order,
+            *out,
+            n,
+            positions.stride(0),
+            requests.stride(0),
+            *table.shape,
+            *table.stride(),
+            pages,
+            context_len + 1,
+            scan,
+            num_warps=4,
+        )
+    return out

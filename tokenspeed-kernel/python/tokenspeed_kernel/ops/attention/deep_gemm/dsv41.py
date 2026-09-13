@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.triton.dsv41 import (
     gather_index_cache,
     pack_index_queries,
     safe_metadata,
+    write_selection,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -236,17 +237,14 @@ def index_topk(
             )
         candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
         selected = select_topk(logits, visible, candidates, topk, 8)
-        rows[begin:end].copy_(selected)
-        lengths[begin:end].copy_((selected >= 0).sum(-1, dtype=torch.int32))
-        if candidate_topk:
-            chosen = select_candidates(logits, visible, candidate_topk, 8)
-            # Candidate IDs have no score ordering contract. Publish positions
-            # sorted with invalid IDs in the trailing suffix, as the public API.
-            chosen = chosen.masked_fill(chosen < 0, torch.iinfo(torch.int32).max)
-            chosen = chosen.sort(dim=-1).values
-            chosen.masked_fill_(chosen == torch.iinfo(torch.int32).max, -1)
-            blocks[begin:end].copy_(chosen)
-            block_lengths[begin:end].copy_((chosen >= 0).sum(-1, dtype=torch.int32))
-        else:
-            block_lengths[begin:end].zero_()
+        chosen = (
+            select_candidates(logits, visible, candidate_topk, 8)
+            if candidate_topk
+            else None
+        )
+        write_selection(
+            selected,
+            chosen,
+            tuple(tensor[begin:end] for tensor in out),
+        )
     return out
