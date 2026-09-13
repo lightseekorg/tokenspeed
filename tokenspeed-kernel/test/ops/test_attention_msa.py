@@ -672,7 +672,7 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         kwargs = _two_request_extend_case(kv_cache_dtype)
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
-        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        out_cute = msa_extend_with_kvcache(solution="cute_dsl", **kwargs)
         import cutlass.cute as cute
 
         # Importing MSA must preserve option-bound compilation for other users.
