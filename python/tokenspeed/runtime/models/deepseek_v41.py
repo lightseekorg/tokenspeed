@@ -865,6 +865,8 @@ class DeepseekV41MoE(DeepseekV4MoE):
                 )
 
     def _select_experts(self, hidden_states, input_ids):
+        if hidden_states.is_cuda:
+            return super()._select_experts(hidden_states, input_ids)
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         scores = F.softplus(logits).sqrt()
         ids = (
