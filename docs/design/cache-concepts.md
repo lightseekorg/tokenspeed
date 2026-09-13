@@ -587,7 +587,10 @@ Its responsibilities:
   draft checkpoint when a separate draft pool is present,
   `--skip-softmax-threshold` (a nonzero gfx950 MHA prefill skip changes
   attention output and therefore downstream cached K/V; 0.0 is exact
-  dense attention), and
+  dense attention), the resolved EAGLE3 capture-layer list
+  (`--eagle3-layers-to-capture`, or the draft config's
+  `eagle_aux_hidden_state_layer_ids` when that flag is unset; empty when
+  EAGLE3 is off), and
   `L3_RUNTIME_COMPAT` (a required namespace epoch bumped when built-in
   model code, positional encoding, or a cache-producing kernel changes
   KV without touching checkpoint, layout, or listed options). A git SHA
@@ -620,7 +623,12 @@ Its responsibilities:
   fingerprints the files it can read and the replica all-gathers those
   digests so a rank-local shard change still rotates the namespace;
   `npcache` hashes `np/weight_names.json` and the listed NumPy files
-  when that cache exists, because the loader then skips `*.bin`). Mistral
+  when that cache exists, because the loader then skips `*.bin`).
+  `extensible` hashes `--ext-yaml` and the `ext_def_file` that
+  `ExtensibleModelLoader` imports — including on a Hugging Face hub
+  snapshot, whose commit does not cover those files — so a custom input
+  processor cannot share a namespace with the same checkpoint bytes.
+  Mistral
   fingerprints include `consolidated.safetensors.index.json` so two dumps
   with the same `consolidated*.safetensors` candidates but different shard
   maps cannot share a namespace. The
@@ -690,11 +698,12 @@ Its responsibilities:
   prefill, exhausted Device pages) is not rehashed or remotely probed. The
   scheduler's L3 key shadow is bounded to Host page capacity. A single
   registration keeps the earliest contiguous prefix keys so prefix-closed
-  matchers still hit; later unrelated keys LRU-evict older prompts.
-  Unregister removes keys from both the live set and the LRU order deque
-  so vanished-object recovery cannot accumulate tombstones while the live
-  set stays below capacity. Admit-time registration restores keys that
-  were dropped from the shadow.
+  matchers still hit, even when sequential write-backs already filled the
+  shadow with this prompt's suffix; later unrelated keys LRU-evict older
+  prompts. Unregister removes keys from both the live set and the LRU
+  order deque so vanished-object recovery cannot accumulate tombstones
+  while the live set stays below capacity. Admit-time registration
+  restores keys that were dropped from the shadow.
   That probe is not a lease: after Admit
   allocates Host pages, `batch_get_into` can still miss. Prefetch runs
   on the control plane (CPU, same as `batch_exists`), is MIN-reduced

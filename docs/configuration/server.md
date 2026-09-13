@@ -345,7 +345,9 @@ config `_commit_hash` or a 40-hex folder name outside a Hugging Face hub
 more than one weight encoding cannot share objects across loaders
 (`sharded_state` combines every rank's local files matching the
 configured shard pattern, default `model-rank-*-part-*`, not only rank
-0's; `npcache` fingerprints the NumPy cache when present), and
+0's; `npcache` fingerprints the NumPy cache when present; `extensible`
+also hashes `--ext-yaml` and the imported `ext_def_file`, including on a
+Hugging Face hub snapshot whose commit does not cover those files), and
 `--weight-version`), `--hf-overrides` (the effective
 HF text-config delta: `rope_theta`, `rope_scaling`, and other architecture
 fields), the packed Host layout (field payloads, not GPU-capacity
@@ -355,7 +357,10 @@ bytes and `--speculative-draft-model-quantization` when a draft pool is
 present), the pipeline stage, the context-parallel
 width (`cp_size`), any
 speculative draft checkpoint, `--skip-softmax-threshold` (nonzero
-changes attention output and therefore downstream cached K/V), and
+changes attention output and therefore downstream cached K/V), the
+resolved EAGLE3 capture-layer list (`--eagle3-layers-to-capture` or the
+draft config's `eagle_aux_hidden_state_layer_ids`; empty when EAGLE3 is
+off), and
 `L3_RUNTIME_COMPAT` (bumped when
 built-in model code, RoPE, or a cache-producing kernel changes KV for
 the same checkpoint and layout). Live weight updates flush Device/Host

@@ -103,6 +103,7 @@ class StorageKeyTest(unittest.TestCase):
                 "cache_quantization": "",
                 "runtime_compat": L3_RUNTIME_COMPAT,
                 "skip_softmax_threshold": 0.0,
+                "eagle3_layers_to_capture": [],
             }
             values.update(overrides)
             return storage_key_prefix(**values)
@@ -136,6 +137,17 @@ class StorageKeyTest(unittest.TestCase):
         self.assertEqual(
             prefix(skip_softmax_threshold=0.0), prefix(skip_softmax_threshold=0.0)
         )
+        self.assertNotEqual(base, prefix(eagle3_layers_to_capture=[2, 16, 29]))
+        self.assertNotEqual(
+            prefix(eagle3_layers_to_capture=[2, 16, 29]),
+            prefix(eagle3_layers_to_capture=[1, 16, 29]),
+        )
+        self.assertEqual(
+            prefix(eagle3_layers_to_capture=[2, 16, 29]),
+            prefix(eagle3_layers_to_capture=[2, 16, 29]),
+        )
+        with self.assertRaises(TypeError):
+            prefix(eagle3_layers_to_capture="2,16,29")
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
         with self.assertRaises(TypeError):
@@ -158,6 +170,10 @@ class StorageKeyTest(unittest.TestCase):
             signature.parameters["skip_softmax_threshold"].default,
             inspect.Parameter.empty,
         )
+        self.assertIs(
+            signature.parameters["eagle3_layers_to_capture"].default,
+            inspect.Parameter.empty,
+        )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -166,6 +182,7 @@ class StorageKeyTest(unittest.TestCase):
             revision=revision,
             load_format=load_format,
             model_loader_extra_config={},
+            ext_yaml="",
         )
 
     def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
@@ -643,6 +660,7 @@ class StorageKeyTest(unittest.TestCase):
                 revision="",
                 load_format="sharded_state",
                 model_loader_extra_config={},
+                ext_yaml="",
             )
             extra = {"pattern": "alt-rank-{rank}-part-{part}.bin"}
             alt_id = l3_checkpoint_id(
@@ -651,6 +669,7 @@ class StorageKeyTest(unittest.TestCase):
                 revision="",
                 load_format="sharded_state",
                 model_loader_extra_config=extra,
+                ext_yaml="",
             )
             self.assertNotEqual(default_id, alt_id)
             with open(default_shard, "wb") as handle:
@@ -664,6 +683,7 @@ class StorageKeyTest(unittest.TestCase):
                     revision="",
                     load_format="sharded_state",
                     model_loader_extra_config=extra,
+                    ext_yaml="",
                 ),
             )
             with open(alt_shard, "wb") as handle:
@@ -677,6 +697,7 @@ class StorageKeyTest(unittest.TestCase):
                     revision="",
                     load_format="sharded_state",
                     model_loader_extra_config=extra,
+                    ext_yaml="",
                 ),
             )
 
@@ -757,10 +778,130 @@ class StorageKeyTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self._checkpoint_id(
                     directory,
-                    load_format="extensible",
+                    load_format="unknown-loader",
                     hf_config=SimpleNamespace(),
                     revision="",
                 )
+
+    def test_checkpoint_id_hashes_extensible_yaml_and_extension_code(self):
+        commit = "d" * 40
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "hub", "models--org--model")
+            snapshot = os.path.join(repo, "snapshots", commit)
+            os.makedirs(os.path.join(repo, "refs"))
+            os.makedirs(snapshot)
+            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+                handle.write("{}")
+            with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
+                handle.write(b"same-weights")
+
+            def write_yaml(name: str, ext_def_name: str) -> str:
+                yaml_path = os.path.join(root, name)
+                with open(yaml_path, "w", encoding="utf-8") as handle:
+                    handle.write(f"ext_def_file: {ext_def_name}\n")
+                return yaml_path
+
+            def write_ext_def(name: str, body: str) -> None:
+                with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                    handle.write(body)
+
+            write_ext_def("a.py", "PROCESSOR = 'a'\n")
+            write_ext_def("b.py", "PROCESSOR = 'b'\n")
+            yaml_a = write_yaml("a.yaml", "a.py")
+            yaml_b = write_yaml("b.yaml", "b.py")
+            yaml_a_copy = write_yaml("a-copy.yaml", "a.py")
+
+            def extensible_id(ext_yaml: str) -> str:
+                return l3_checkpoint_id(
+                    snapshot,
+                    hf_config=SimpleNamespace(),
+                    revision="main",
+                    load_format="extensible",
+                    model_loader_extra_config={},
+                    ext_yaml=ext_yaml,
+                )
+
+            id_a = extensible_id(yaml_a)
+            id_b = extensible_id(yaml_b)
+            self.assertTrue(id_a.startswith(f"{commit}:extensible:ext-"))
+            self.assertNotEqual(id_a, f"{commit}:extensible")
+            self.assertNotEqual(id_a, id_b)
+            self.assertEqual(id_a, extensible_id(yaml_a_copy))
+            write_ext_def("a.py", "PROCESSOR = 'a-changed'\n")
+            self.assertNotEqual(id_a, extensible_id(yaml_a))
+            with self.assertRaises(ValueError):
+                extensible_id("")
+
+    def test_checkpoint_id_fingerprints_extensible_local_weights_and_yaml(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            yaml_path = os.path.join(first, "ext.yaml")
+            ext_def = os.path.join(first, "ext.py")
+            with open(ext_def, "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'shared'\n")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: ext.py\n")
+            for directory, payload in ((first, b"weights-a"), (second, b"weights-b")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write("{}")
+                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
+                    handle.write(payload)
+            first_id = l3_checkpoint_id(
+                first,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="extensible",
+                model_loader_extra_config={},
+                ext_yaml=yaml_path,
+            )
+            second_id = l3_checkpoint_id(
+                second,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="extensible",
+                model_loader_extra_config={},
+                ext_yaml=yaml_path,
+            )
+            self.assertTrue(first_id.startswith("local-"))
+            self.assertNotEqual(first_id, second_id)
+            other_yaml = os.path.join(second, "other.yaml")
+            with open(other_yaml, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: ext.py\ncontext: {}\n")
+            with open(os.path.join(second, "ext.py"), "w", encoding="utf-8") as handle:
+                handle.write("PROCESSOR = 'shared'\n")
+            other_id = l3_checkpoint_id(
+                first,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="extensible",
+                model_loader_extra_config={},
+                ext_yaml=other_yaml,
+            )
+            self.assertNotEqual(first_id, other_id)
+
+    def test_checkpoint_id_ignores_ext_yaml_unless_extensible(self):
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            yaml_path = os.path.join(directory, "ext.yaml")
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                handle.write("ext_def_file: missing.py\n")
+            without_yaml = l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+                load_format="auto",
+                model_loader_extra_config={},
+                ext_yaml="",
+            )
+            with_yaml = l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash=commit),
+                revision="main",
+                load_format="auto",
+                model_loader_extra_config={},
+                ext_yaml=yaml_path,
+            )
+            self.assertEqual(without_yaml, with_yaml)
+            self.assertEqual(without_yaml, f"{commit}:auto")
 
     def test_checkpoint_id_requires_load_format(self):
         signature = inspect.signature(l3_checkpoint_id)
@@ -771,11 +912,20 @@ class StorageKeyTest(unittest.TestCase):
             signature.parameters["model_loader_extra_config"].default,
             inspect.Parameter.empty,
         )
+        self.assertIs(signature.parameters["ext_yaml"].default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
             l3_checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash="a" * 40),
                 revision="main",
+            )
+        with self.assertRaises(TypeError):
+            l3_checkpoint_id(
+                "org/model",
+                hf_config=SimpleNamespace(_commit_hash="a" * 40),
+                revision="main",
+                load_format="auto",
+                model_loader_extra_config={},
             )
         with self.assertRaises(ValueError):
             self._checkpoint_id(
@@ -888,6 +1038,7 @@ class StorageKeyTest(unittest.TestCase):
                 revision="main",
                 load_format="auto",
                 model_loader_extra_config={},
+                ext_yaml="",
             )
 
     def test_cache_quantization_id_hashes_scale_file_contents(self):

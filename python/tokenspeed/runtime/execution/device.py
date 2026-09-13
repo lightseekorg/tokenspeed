@@ -833,6 +833,7 @@ def build_device_side(
     )
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
+        _eagle_aux_layer_ids,
         create_model_executor,
         create_model_runner,
     )
@@ -988,6 +989,7 @@ def build_device_side(
                 # LoadConfig currently gets the same empty extra-config;
                 # both must stay aligned if a shard pattern is wired through.
                 model_loader_extra_config={},
+                ext_yaml=str(server_args.ext_yaml or ""),
             )
             if draft_model_config is not None:
                 draft_revision = l3_checkpoint_id(
@@ -996,6 +998,7 @@ def build_device_side(
                     revision=str(draft_model_config.revision or ""),
                     load_format=str(server_args.load_format),
                     model_loader_extra_config={},
+                    ext_yaml=str(server_args.ext_yaml or ""),
                 )
             else:
                 draft_revision = ""
@@ -1027,6 +1030,19 @@ def build_device_side(
             )
             attn_tp_size = int(server_args.mapping.attn.tp_size)
             cp_size = int(server_args.mapping.attn.cp_size)
+            eagle3_layers_to_capture: list[int] = []
+            if server_args.speculative_algorithm == "EAGLE3":
+                configured_layers = server_args.eagle3_layers_to_capture
+                if configured_layers:
+                    eagle3_layers_to_capture = [
+                        int(layer) for layer in configured_layers
+                    ]
+                elif draft_model_config is not None:
+                    draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
+                    if draft_layers:
+                        eagle3_layers_to_capture = [
+                            int(layer) for layer in draft_layers
+                        ]
 
             def prefix_for_weight_version(weight_version: str) -> str:
                 return storage_key_prefix(
@@ -1044,6 +1060,7 @@ def build_device_side(
                     cache_quantization=cache_quantization,
                     runtime_compat=L3_RUNTIME_COMPAT,
                     skip_softmax_threshold=float(server_args.skip_softmax_threshold),
+                    eagle3_layers_to_capture=eagle3_layers_to_capture,
                 )
 
             l2_cache_executor.attach_l3_storage(

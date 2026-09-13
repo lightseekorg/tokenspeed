@@ -53,6 +53,7 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "npcache": (("*.bin",),),
     "sharded_state": (("model-rank-*-part-*.safetensors",),),
     "dummy": (),
+    "extensible": (("*.safetensors",), ("*.bin",), ("*.pt",)),
 }
 # Keep in lockstep with ShardedStateLoader.DEFAULT_PATTERN.
 _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
@@ -190,6 +191,7 @@ def l3_checkpoint_id(
     revision: str,
     load_format: str,
     model_loader_extra_config: dict,
+    ext_yaml: str,
 ) -> str:
     """Return an immutable identity for the loaded checkpoint bytes.
 
@@ -207,7 +209,10 @@ def l3_checkpoint_id(
     ``*.py`` (top-level modules and imported package subdirectories) so
     ``--trust-remote-code`` configuration/modeling helpers that derive
     architecture fields cannot share a namespace with identical
-    JSON/weights. ``sharded_state`` fingerprints the files
+    JSON/weights. ``extensible`` also hashes ``--ext-yaml`` and the
+    ``ext_def_file`` that ``ExtensibleModelLoader`` imports, so a custom
+    input processor cannot share a namespace with the same checkpoint.
+    ``sharded_state`` fingerprints the files
     ``model_loader_extra_config["pattern"]`` selects
     (``ShardedStateLoader.DEFAULT_PATTERN`` when unset), not leftover
     default-named shards. ``npcache`` fingerprints ``np/weight_names.json``
@@ -226,37 +231,52 @@ def l3_checkpoint_id(
         model_loader_extra_config, sort_keys=True, separators=(",", ":")
     )
     fmt = _normalize_load_format(load_format)
+    ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:
             return _checkpoint_id_with_load_format(
-                snapshot, load_format=fmt, extra_config=model_loader_extra_config
+                snapshot,
+                load_format=fmt,
+                extra_config=model_loader_extra_config,
+                ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_path, fmt, extra_json),
             load_format=fmt,
             extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
         )
     commit = getattr(hf_config, "_commit_hash", None)
     if isinstance(commit, str) and _HF_COMMIT_HASH_RE.fullmatch(commit):
         return _checkpoint_id_with_load_format(
-            commit, load_format=fmt, extra_config=model_loader_extra_config
+            commit,
+            load_format=fmt,
+            extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
         )
     model_dir = _resolved_model_dir(model_path, revision=revision)
     if model_dir is not None:
         snapshot = _snapshot_commit_hash(model_dir)
         if snapshot is not None:
             return _checkpoint_id_with_load_format(
-                snapshot, load_format=fmt, extra_config=model_loader_extra_config
+                snapshot,
+                load_format=fmt,
+                extra_config=model_loader_extra_config,
+                ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_dir, fmt, extra_json),
             load_format=fmt,
             extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
         )
     if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
         return _checkpoint_id_with_load_format(
-            revision, load_format=fmt, extra_config=model_loader_extra_config
+            revision,
+            load_format=fmt,
+            extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
         )
     raise ValueError(
         "L3 namespace needs an immutable checkpoint id; pin --revision to a "
@@ -363,13 +383,49 @@ def _normalize_load_format(load_format: str) -> str:
     return normalized
 
 
+def _extensible_fingerprint(ext_yaml: str, *, load_format: str) -> str:
+    """Hash ``--ext-yaml`` and the extension module it loads, if any.
+
+    ``ExtensibleModelLoader`` reads both. A Hugging Face snapshot commit
+    does not cover those files, so they must enter the checkpoint id
+    before the snapshot shortcut returns. Non-extensible loaders must
+    pass an empty path.
+    """
+
+    if load_format != "extensible":
+        return ""
+    if not isinstance(ext_yaml, str) or not ext_yaml.strip():
+        raise ValueError("extensible L3 ids require --ext-yaml")
+    yaml_path = os.path.abspath(ext_yaml)
+    hasher = hashlib.sha256()
+    hasher.update(b"ext_yaml")
+    _update_file_digest(hasher, yaml_path)
+    import yaml
+
+    with open(yaml_path, encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        return hasher.hexdigest()
+    ext_def = config.get("ext_def_file")
+    if not isinstance(ext_def, str) or not ext_def.strip():
+        return hasher.hexdigest()
+    def_path = ext_def
+    if not os.path.isabs(def_path):
+        def_path = os.path.join(os.path.dirname(yaml_path), def_path)
+    hasher.update(b"ext_def_file")
+    _update_file_digest(hasher, os.path.abspath(def_path))
+    return hasher.hexdigest()
+
+
 def _checkpoint_id_with_load_format(
-    identity: str, *, load_format: str, extra_config: dict
+    identity: str, *, load_format: str, extra_config: dict, ext_digest: str
 ) -> str:
     base = f"{identity}:{load_format}"
     if extra_config:
         payload = json.dumps(extra_config, sort_keys=True, separators=(",", ":"))
-        return f"{base}:{hashlib.sha256(payload.encode()).hexdigest()}"
+        base = f"{base}:{hashlib.sha256(payload.encode()).hexdigest()}"
+    if ext_digest:
+        return f"{base}:ext-{ext_digest}"
     return base
 
 
@@ -640,15 +696,16 @@ def storage_key_prefix(
     cache_quantization: str,
     runtime_compat: str,
     skip_softmax_threshold: float,
+    eagle3_layers_to_capture: Sequence[int],
 ) -> str:
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, attention-TP width,
     context-parallel width, draft pool, cache-quantization config (target
-    and draft), runtime HF overrides, the KV-producer compat epoch, or
-    ``--skip-softmax-threshold`` and silently collide with an incompatible
-    deployment.
+    and draft), runtime HF overrides, the KV-producer compat epoch,
+    ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
+    and silently collide with an incompatible deployment.
     ``revision`` is the resolved immutable checkpoint (Hugging Face commit
     or local fingerprint), not a moving branch name. ``model_overrides``
     is the ``--hf-overrides`` dict applied to the HF text config
@@ -657,10 +714,15 @@ def storage_key_prefix(
     that produced the KV, not a build SHA. ``skip_softmax_threshold`` is
     the resolved gfx950 MHA prefill skip-softmax threshold (0.0 is exact
     dense attention). A nonzero value changes attention output and
-    therefore downstream cached K/V. Empty strings and an empty override
-    dict are valid and mean "unset" (no draft pool, no extra cache scales,
-    no HF overrides). ``cp_size`` belongs here rather than only in the
-    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
+    therefore downstream cached K/V. ``eagle3_layers_to_capture`` is the
+    resolved EAGLE3 hidden-state capture list (``--eagle3-layers-to-capture``
+    or the draft config's ``eagle_aux_hidden_state_layer_ids``); an empty
+    list means EAGLE3 is off or no capture ids were configured. Different
+    capture layers change which target hidden states the draft consumes
+    and therefore the KV those layers produce. Empty strings and an empty
+    override dict are valid and mean "unset" (no draft pool, no extra cache
+    scales, no HF overrides). ``cp_size`` belongs here rather than only in
+    the per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
     blocks to the same rank under different widths. ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
@@ -671,6 +733,8 @@ def storage_key_prefix(
 
     if not isinstance(model_overrides, dict):
         raise TypeError("model_overrides must be a dict")
+    if isinstance(eagle3_layers_to_capture, (str, bytes)):
+        raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
     payload = json.dumps(
         {
             "model": str(model_name),
@@ -687,6 +751,9 @@ def storage_key_prefix(
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
             "skip_softmax_threshold": float(skip_softmax_threshold),
+            "eagle3_layers_to_capture": [
+                int(layer) for layer in eagle3_layers_to_capture
+            ],
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -873,6 +873,36 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2));
 }
 
+TEST(CacheOperationTest, L3StorageKeyShadowEvictsProtectedSuffixToKeepPrefix) {
+    BlockPool device_pool{8, {1}};
+    BlockPool host_pool{2, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey key_h2{.group_id = 0, .content_hash = "h2"};
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1});
+    coordinator.RegisterStorageKeys(std::array{key_h2});
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h0));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h2))
+        << "sequential write-backs leave only the newest suffix in the Host-capacity shadow";
+
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1, key_h2});
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0))
+        << "re-registering the prompt must evict protected suffix keys to keep the earliest prefix";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key_h2));
+    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).host.num_common_tokens, 4)
+        << "prefix-closed matching must see the restored leading keys, not a suffix-only hole";
+}
+
 TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
     BlockPool device_pool{8, {1, 1}};
     BlockPool host_pool{2, {1, 1}};

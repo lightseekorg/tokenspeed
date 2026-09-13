@@ -4654,9 +4654,11 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
 // Mooncake L3 under flat KV: Host writeback inserts storage_keys_; Host
 // eviction must not drop Mooncake objects. The scheduler shadow is bounded
 // to Host page capacity. A registration longer than that bound keeps the
-// prefix-start keys so prefix-closed matching still hits; later unrelated
-// keys LRU-evict older prompts. Admit-time RegisterStorageKeys restores
-// keys the shadow dropped. A later Device+Host miss that is still in L3
+// prefix-start keys so prefix-closed matching still hits, even when
+// sequential write-backs left only this prompt's suffix in the shadow;
+// later unrelated keys LRU-evict older prompts. Admit-time
+// RegisterStorageKeys restores keys the shadow dropped. A later
+// Device+Host miss that is still in L3
 // allocates a Host page and emits LoadBack with prefetch_from_storage.
 // ---------------------------------------------------------------------------
 class L3StorageHitSuite : public HostHitSuite {

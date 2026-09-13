@@ -995,6 +995,7 @@ void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
     std::unordered_map<ContentHash, std::size_t> hash_index;
     for (const CacheKey& key : ordered) {
         hash_index.emplace(key.content_hash, hash_index.size());
+        _assert(key.group_id < groups_.size(), "storage key group id out of range");
     }
     std::stable_sort(ordered.begin(), ordered.end(), [&hash_index](const CacheKey& left, const CacheKey& right) {
         const std::size_t left_hash = hash_index.at(left.content_hash);
@@ -1007,14 +1008,28 @@ void CacheCoordinator::RegisterStorageKeys(std::span<const CacheKey> keys) {
         }
         return left.group_id < right.group_id;
     });
-    std::unordered_set<CacheKey, CacheKeyHash> batch(ordered.begin(), ordered.end());
+    std::unordered_set<CacheKey, CacheKeyHash> keep;
     for (const CacheKey& key : ordered) {
-        _assert(key.group_id < groups_.size(), "storage key group id out of range");
+        if (keep.size() >= storage_key_limit_) {
+            break;
+        }
+        keep.insert(key);
+    }
+    for (const CacheKey& key : ordered) {
+        if (!keep.contains(key)) {
+            storage_keys_.erase(key);
+        }
+    }
+    compactStorageKeyOrder();
+    for (const CacheKey& key : ordered) {
+        if (!keep.contains(key)) {
+            break;
+        }
         if (storage_keys_.contains(key)) {
             continue;
         }
         while (storage_keys_.size() >= storage_key_limit_) {
-            if (!evictOldestUnprotectedKey(batch)) {
+            if (!evictOldestUnprotectedKey(keep)) {
                 break;
             }
         }
