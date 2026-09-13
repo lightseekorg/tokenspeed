@@ -584,7 +584,10 @@ Its responsibilities:
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), the resolved attention-TP width
   (`attn.tp_size`), the speculative
-  draft checkpoint when a separate draft pool is present, and
+  draft checkpoint when a separate draft pool is present,
+  `--skip-softmax-threshold` (a nonzero gfx950 MHA prefill skip changes
+  attention output and therefore downstream cached K/V; 0.0 is exact
+  dense attention), and
   `L3_RUNTIME_COMPAT` (a required namespace epoch bumped when built-in
   model code, positional encoding, or a cache-producing kernel changes
   KV without touching checkpoint, layout, or listed options). A git SHA

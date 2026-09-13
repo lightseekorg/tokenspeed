@@ -621,27 +621,32 @@ def storage_key_prefix(
     draft_weight_version: str,
     cache_quantization: str,
     runtime_compat: str,
+    skip_softmax_threshold: float,
 ) -> str:
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
     identity, cache layout, pipeline stage, attention-TP width,
     context-parallel width, draft pool, cache-quantization config (target
-    and draft), runtime HF overrides, or the KV-producer compat epoch and
-    silently collide with an incompatible deployment.
+    and draft), runtime HF overrides, the KV-producer compat epoch, or
+    ``--skip-softmax-threshold`` and silently collide with an incompatible
+    deployment.
     ``revision`` is the resolved immutable checkpoint (Hugging Face commit
     or local fingerprint), not a moving branch name. ``model_overrides``
     is the ``--hf-overrides`` dict applied to the HF text config
     (rope_theta, rope_scaling, and the rest of the effective architecture).
     ``runtime_compat`` is ``L3_RUNTIME_COMPAT``: the epoch of the runtime
-    that produced the KV, not a build SHA. Empty strings and an empty
-    override dict are valid and mean "unset" (no draft pool, no extra
-    cache scales, no HF overrides). ``cp_size`` belongs here rather than
-    only in the per-object ``c{cp_rank}`` shard id: zigzag CP assigns
-    different token blocks to the same rank under different widths.
-    ``attn_tp_size`` belongs here rather than only in the per-object
-    ``r{tp_rank}`` shard id: GQA with TP above the KV-head count keeps one
-    local KV head per rank, so packed Host geometry is unchanged, while
+    that produced the KV, not a build SHA. ``skip_softmax_threshold`` is
+    the resolved gfx950 MHA prefill skip-softmax threshold (0.0 is exact
+    dense attention). A nonzero value changes attention output and
+    therefore downstream cached K/V. Empty strings and an empty override
+    dict are valid and mean "unset" (no draft pool, no extra cache scales,
+    no HF overrides). ``cp_size`` belongs here rather than only in the
+    per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
+    blocks to the same rank under different widths. ``attn_tp_size``
+    belongs here rather than only in the per-object ``r{tp_rank}`` shard
+    id: GQA with TP above the KV-head count keeps one local KV head per
+    rank, so packed Host geometry is unchanged, while
     ``tp_rank // num_kv_head_replicas`` assigns different heads to the
     same rank.
     """
@@ -663,6 +668,7 @@ def storage_key_prefix(
             "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
+            "skip_softmax_threshold": float(skip_softmax_threshold),
         },
         sort_keys=True,
         separators=(",", ":"),

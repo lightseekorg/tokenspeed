@@ -102,6 +102,7 @@ class StorageKeyTest(unittest.TestCase):
                 "draft_weight_version": "",
                 "cache_quantization": "",
                 "runtime_compat": L3_RUNTIME_COMPAT,
+                "skip_softmax_threshold": 0.0,
             }
             values.update(overrides)
             return storage_key_prefix(**values)
@@ -131,6 +132,10 @@ class StorageKeyTest(unittest.TestCase):
         )
         self.assertNotEqual(base, prefix(runtime_compat="2"))
         self.assertEqual(prefix(runtime_compat="1"), prefix(runtime_compat="1"))
+        self.assertNotEqual(base, prefix(skip_softmax_threshold=1e-2))
+        self.assertEqual(
+            prefix(skip_softmax_threshold=0.0), prefix(skip_softmax_threshold=0.0)
+        )
         with self.assertRaises(TypeError):
             storage_key_prefix("org/model")
         with self.assertRaises(TypeError):
@@ -148,6 +153,10 @@ class StorageKeyTest(unittest.TestCase):
         )
         self.assertIs(
             signature.parameters["runtime_compat"].default, inspect.Parameter.empty
+        )
+        self.assertIs(
+            signature.parameters["skip_softmax_threshold"].default,
+            inspect.Parameter.empty,
         )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):

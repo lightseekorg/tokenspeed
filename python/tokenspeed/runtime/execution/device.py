@@ -1043,6 +1043,7 @@ def build_device_side(
                     draft_weight_version=weight_version if draft_model else "",
                     cache_quantization=cache_quantization,
                     runtime_compat=L3_RUNTIME_COMPAT,
+                    skip_softmax_threshold=float(server_args.skip_softmax_threshold),
                 )
 
             l2_cache_executor.attach_l3_storage(
