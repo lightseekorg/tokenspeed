@@ -280,18 +280,8 @@ def test_compressor_prefill_rejects_missing_history():
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
     tables[TAIL].zero_()
-    meta = _extend(backend, tables, [1], [3])
     with pytest.raises(RuntimeError, match="compressor tail"):
-        backend.compress(
-            2,
-            torch.zeros(1, 512),
-            torch.zeros(1, 512),
-            meta.positions,
-            meta.request_indices,
-            ForwardMode.EXTEND,
-            norm_weight=None,
-            norm_eps=0.0,
-        )
+        _extend(backend, tables, [1], [3])
 
 
 def _decode_compute(backend, inputs, bs):
@@ -300,7 +290,7 @@ def _decode_compute(backend, inputs, bs):
     meta = backend.query_metadata(mode)
     pos, req = meta.positions, meta.request_indices
     pooled, pair_pos, pair_req = backend.compress(
-        2, content[:bs], scores[:bs], pos, req, mode, norm_weight=None, norm_eps=0.0
+        2, content[:bs], scores[:bs], mode, norm_weight=None, norm_eps=0.0
     )
     latent = torch.nn.functional.rms_norm(
         pooled.to(torch.bfloat16), (512,), weight=None, eps=1e-6
@@ -384,8 +374,6 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
         2,
         history.float(),
         torch.randn(24, 512, device="cuda"),
-        meta.positions,
-        meta.request_indices,
         ForwardMode.EXTEND,
         norm_weight=None,
         norm_eps=0.0,
@@ -416,7 +404,16 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             captures[bs] = graph, output
     torch.cuda.current_stream().wait_stream(stream)
     arena = backend.cache_pool.arena.buffer
-    pointers = {bs: backend._decode_view(bs).positions.data_ptr() for bs in (1, 2)}
+    pointers = {
+        bs: tuple(
+            t.data_ptr()
+            for t in (
+                backend._decode_view(bs).positions,
+                *backend._decode_view(bs).compressor,
+            )
+        )
+        for bs in (1, 2)
+    }
     # Alternate captures with shared or private pools and intervening eager work.
     for step, (bs, actual, lengths) in enumerate(
         (
@@ -465,7 +462,13 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
         assert torch.equal(arena, expected_cache)
         assert (
-            backend.query_metadata(ForwardMode.DECODE).positions.data_ptr()
+            tuple(
+                t.data_ptr()
+                for t in (
+                    backend.query_metadata(ForwardMode.DECODE).positions,
+                    *backend.query_metadata(ForwardMode.DECODE).compressor,
+                )
+            )
             == pointers[bs]
         )
         if actual == 0:
@@ -722,8 +725,6 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
             2,
             content[prefix : prefix + count],
             scores[prefix : prefix + count],
-            meta.positions,
-            meta.request_indices,
             ForwardMode.EXTEND,
             norm_weight=None,
             norm_eps=0.0,
@@ -742,8 +743,6 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
         2,
         torch.randn(2, 512),
         torch.randn(2, 512),
-        meta.positions,
-        meta.request_indices,
         ForwardMode.EXTEND,
         norm_weight=None,
         norm_eps=0.0,
@@ -755,8 +754,6 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
         2,
         new_content,
         new_scores,
-        meta.positions,
-        meta.request_indices,
         ForwardMode.EXTEND,
         norm_weight=None,
         norm_eps=0.0,
@@ -929,8 +926,6 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
             2,
             content[prefix:stop],
             scores[prefix:stop],
-            meta.positions,
-            meta.request_indices,
             mode,
             norm_weight=None,
             norm_eps=0.0,
@@ -1191,3 +1186,108 @@ def test_gpu_compressor_pool_preserves_fp32_math_and_dynamic_graph_inputs(count)
             slots.fill_(3)
             graph.replay()
             torch.testing.assert_close(out, reference(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    backend = _backend(device, 2)
+    tables = _tables(device)
+    # The first completed pair needs token2 before token4 reuses its tail slot.
+    tables[TAIL][0, 2] = tables[TAIL][0, 1]
+    calls = []
+    prepare = dsv41.compressor_metadata
+
+    def counted(*args):
+        calls.append(args)
+        return prepare(*args)
+
+    monkeypatch.setattr(dsv41, "compressor_metadata", counted)
+    meta = _extend(backend, tables, [4, 3], [3, 0])
+    assert len(calls) == 1
+    assert meta.compressor.previous.tolist() == [-1, -1, 1, -1, -1, 4, -1]
+    before = tuple(t.clone() for t in meta.compressor)
+    torch.manual_seed(61)
+    for owner in (2, 8, 14):
+        content = torch.randn(7, 512, device=device)
+        scores = torch.randn_like(content)
+        tail = backend.cache_pool.compressor_tail(owner)
+        tail.normal_()
+        old_tail = tail.clone()
+        expected = torch.zeros_like(content)
+        # Independent pair lookup, including the cross-chunk tail read.
+        coords = list(
+            zip(meta.positions.tolist(), meta.request_indices.tolist(), strict=True)
+        )
+        for i, (position, request) in enumerate(coords):
+            if position % 2 != 1:
+                continue
+            if (position - 1, request) in coords:
+                prior = coords.index((position - 1, request))
+                c, s = content[prior], scores[prior]
+            else:
+                page = tables[TAIL][request, (position - 1) // 2]
+                c, s = old_tail[page, (position - 1) % 2]
+            weights = torch.stack((s, scores[i])).softmax(0)
+            expected[i] = weights[0] * c + weights[1] * content[i]
+        got, positions, requests = backend.compress(
+            owner, content, scores, ForwardMode.EXTEND, None, 0.0
+        )
+        torch.testing.assert_close(got, expected)
+        assert positions is meta.compressor.pair_positions
+        assert requests is meta.compressor.pair_requests
+        for original, value in zip(before, meta.compressor, strict=True):
+            torch.testing.assert_close(original, value, rtol=0, atol=0)
+    assert len(calls) == 1
+    # The canonical compressor entry point rejects a partial projection window.
+    with pytest.raises(ValueError, match="content/scores"):
+        backend.compress(2, content[:2], scores[:2], ForwardMode.EXTEND, None, 0.0)
+    # Preparing a new forward must resolve the changed LCM assignment again.
+    tables[TAIL][0, 1] = 0
+    with pytest.raises(RuntimeError, match="compressor tail"):
+        _extend(backend, tables, [4, 3], [3, 0])
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mixed_compressor_plan_windows_match_combined_pooling(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    backend = _backend(device, 2)
+    backend.init_forward_metadata(
+        2,
+        1,
+        torch.tensor([23, 17], device=device),
+        torch.tensor([5, 10], device=device),
+        ForwardMode.MIXED,
+        block_tables=_tables(device),
+        extend_seq_lens=torch.tensor([3], device=device),
+        extend_seq_lens_cpu=torch.tensor([3]),
+        extend_prefix_lens=torch.tensor([2], device=device),
+        extend_prefix_lens_cpu=torch.tensor([2]),
+        extend_with_prefix=True,
+    )
+    full = backend.query_metadata(ForwardMode.MIXED).compressor
+    extend = backend.query_metadata(ForwardMode.EXTEND).compressor
+    decode = backend.query_metadata(ForwardMode.DECODE).compressor
+    assert full.previous.tolist() == [-1, 0, -1, -1]
+    assert decode.previous.tolist() == [-1]
+    for all_rows, leading, trailing in zip(full, extend, decode, strict=True):
+        assert leading.data_ptr() == all_rows.data_ptr()
+        assert trailing.data_ptr() == all_rows[3:].data_ptr()
+    torch.manual_seed(62)
+    content, scores = (torch.randn(4, 512, device=device) for _ in range(2))
+    backend.cache_pool.arena.buffer.zero_()
+    expected = backend.compress(2, content, scores, ForwardMode.MIXED, None, 0.0)
+    backend.cache_pool.arena.buffer.zero_()
+    leading = backend.compress(
+        2, content[:3], scores[:3], ForwardMode.EXTEND, None, 0.0
+    )
+    trailing = backend.compress(
+        2, content[3:], scores[3:], ForwardMode.DECODE, None, 0.0
+    )
+    for got, left, right in zip(expected, leading, trailing, strict=True):
+        torch.testing.assert_close(got, torch.cat((left, right)), rtol=0, atol=0)
