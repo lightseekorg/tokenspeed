@@ -449,15 +449,16 @@ if platform.is_nvidia:
             enable_pdl=enable_pdl,
         )[0]
 
-    def _call_mxfp4_situ_routed_moe(
+    def _call_mxfp4_routed_moe(
         w: torch.nn.Module,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         x: torch.Tensor,
         output: torch.Tensor | None,
         enable_pdl: bool,
-        hidden_states_scale: torch.Tensor | None = None,
-        do_finalize: bool = True,
+        hidden_states_scale: torch.Tensor | None,
+        do_finalize: bool,
+        activation_type: int,
     ):
         num_experts, local_experts, local_expert_offset = _local_expert_range(w)
         # FlashInfer's precomputed route is an unpacked (ids, weights) tuple.
@@ -473,13 +474,13 @@ if platform.is_nvidia:
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w.w13_weight,
             gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=w.gemm1_alpha,
-            gemm1_beta=w.gemm1_beta,
+            gemm1_bias=getattr(w, "w13_weight_bias", None),
+            gemm1_alpha=getattr(w, "gemm1_alpha", None),
+            gemm1_beta=getattr(w, "gemm1_beta", None),
             gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
             gemm2_weights=w.w2_weight,
             gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=getattr(w, "w2_weight_bias", None),
             output1_scale_scalar=None,
             output1_scale_gate_scalar=None,
             output2_scale_scalar=None,
@@ -494,7 +495,7 @@ if platform.is_nvidia:
             routing_method_type=1,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
-            activation_type=_SITU_ACTIVATION_TYPE,
+            activation_type=activation_type,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output if do_finalize else None,
         )
@@ -519,7 +520,11 @@ if platform.is_nvidia:
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing"}),
+            "routing_mode": frozenset(
+                {"kernel_routing", "precomputed_topk"}
+                if _fi_fp4_routed_moe is not None
+                else {"kernel_routing"}
+            ),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
@@ -587,7 +592,24 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output, enable_pdl)
+        if (topk_weights is None) != (topk_ids is None):
+            raise ValueError("topk_weights and topk_ids must be supplied together")
+        if topk_ids is not None:
+            result = _call_mxfp4_routed_moe(
+                w,
+                topk_weights,
+                topk_ids,
+                x_quant,
+                output,
+                enable_pdl,
+                x_scale,
+                True,
+                _FiActivationType.Swiglu,
+            )
+        else:
+            result = _call_mxfp4_moe(
+                w, router_logits, x_quant, x_scale, output, enable_pdl
+            )
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result
@@ -711,7 +733,7 @@ if platform.is_nvidia:
                 )
 
         if use_precomputed_topk:
-            result = _call_mxfp4_situ_routed_moe(
+            result = _call_mxfp4_routed_moe(
                 w,
                 topk_weights,
                 topk_ids,
@@ -720,6 +742,7 @@ if platform.is_nvidia:
                 enable_pdl,
                 hidden_states_scale=hidden_states_scale,
                 do_finalize=do_finalize,
+                activation_type=_SITU_ACTIVATION_TYPE,
             )
             if not do_finalize:
                 return result

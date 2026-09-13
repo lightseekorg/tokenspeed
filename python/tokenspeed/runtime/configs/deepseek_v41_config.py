@@ -72,6 +72,9 @@ class DeepseekV41Config(PretrainedConfig):
         text = kwargs.pop("text_config", {})
         self.text_config = text
         super().__init__(**kwargs)
+        expert_dtype = kwargs.get("quantization_config", {}).get("expert_dtype")
+        if expert_dtype is not None:
+            self.text_config.expert_dtype = expert_dtype
         for name in ("dtype", "bos_token_id", "eos_token_id", "pad_token_id"):
             if name in kwargs:
                 setattr(self.text_config, name, getattr(self, name))
