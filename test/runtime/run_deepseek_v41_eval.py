@@ -25,7 +25,8 @@ All paths/ports/time limits, --execution-mode eager|graph, --batch-size,
 --max-total-tokens, --max-model-len and --chunked-prefill-size are explicit;
 the supplied snapshot is never modified.
 Batch size controls server admission, decode capture and EvalScope concurrency.
-Graph mode enables decode capture only.
+Graph mode enables decode capture only. --dspark enables the checkpoint-local
+five-proposal draft and six-token target verify through the same harness.
 The output directory must exist and be empty. With --run-eval, EvalScope must
 finish successfully and report all 1,319 GSM8K test samples without errors.
 A complete run writes public result.json and fails unless accuracy > 0.90;
@@ -138,6 +139,7 @@ def main():
     ):
         parser.add_argument("--" + name, type=int, required=True)
     parser.add_argument("--run-eval", action="store_true")
+    parser.add_argument("--dspark", action="store_true")
     args = parser.parse_args()
     if not 0 < args.batch_size <= args.max_total_tokens:
         parser.error("Require 0 < batch-size <= max-total-tokens")
@@ -188,6 +190,8 @@ def main():
         "--port",
         str(port),
     ]
+    if args.dspark:
+        command.extend(("--speculative-algorithm", "DSPARK"))
     if args.execution_mode == "eager":
         command.append("--enforce-eager")
     else:
@@ -287,6 +291,7 @@ def main():
                     )
                 result = read_gsm8k_result(output / "evalscope", version("evalscope"))
                 result["execution_mode"] = args.execution_mode
+                result["speculative_algorithm"] = "DSPARK" if args.dspark else None
                 result["batch_size"] = args.batch_size
                 result["max_total_tokens"] = args.max_total_tokens
                 result["max_model_len"] = args.max_model_len

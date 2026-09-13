@@ -30,6 +30,7 @@ from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     DeepseekV41AttentionBackend,
+    V41CompressorPlan,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -146,7 +147,25 @@ def _layout(recipe):
 
 
 def _backend(device, max_bs):
+    return _verify_backend(device, max_bs, 1)
+
+
+def _verify_backend(device, max_bs, verify_width):
     recipe = _recipe(device)
+    recipe.decode_input_tokens = verify_width
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        max_bs=max_bs,
+        speculative_num_draft_tokens=verify_width,
+        components=(
+            replace(
+                recipe.attn_config.component(DeepseekV41Config),
+                max_query_tokens=max(
+                    recipe.server_args.chunked_prefill_size, max_bs * verify_width
+                ),
+            ),
+        ),
+    )
     arena = CacheArena(
         _layout(recipe).bind(16),
         device,
@@ -159,7 +178,7 @@ def _backend(device, max_bs):
     backend = DeepseekV41AttentionBackend(config, config.component(DeepseekV41Config))
     backend.set_cache_pool(pool)
     backend.init_cuda_graph_state(
-        max_bs, max_tokens_per_req=1, overlap_schedule_depth=1
+        max_bs, max_tokens_per_req=verify_width, overlap_schedule_depth=1
     )
     return backend
 
@@ -223,6 +242,208 @@ def test_refresh_rejects_missing_history_before_execution(
             num_extends=0,
             for_graph_replay=for_graph_replay,
         )
+
+
+@pytest.mark.parametrize("verify_width", [1, 3, 5, 6])
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+def test_packed_refresh_positions_padding_and_token_count(
+    verify_width, for_graph_replay
+):
+    backend = _verify_backend("cpu", 3, verify_width)
+    tables = _tables("cpu")
+    backend.init_forward_metadata_capture_cuda_graph(
+        3,
+        torch.zeros(3, dtype=torch.int64),
+        torch.ones(3, dtype=torch.int32),
+        ForwardMode.DECODE,
+        block_tables=tables,
+        num_tokens=3 * verify_width,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    tensors = list(meta.block_tables.values()) + [
+        meta.positions,
+        meta.request_indices,
+        meta.request_pool_indices,
+        meta.seq_lens,
+        meta.swa_write_slots,
+        meta.swa_read_slots,
+        meta.swa_read_lens,
+        *meta.compressor,
+    ]
+    assert backend._decode_history_status.numel() == 3 * verify_width
+    assert all(tensor.shape == (3 * verify_width,) for tensor in meta.compressor)
+    pointers = [tensor.data_ptr() for tensor in tensors]
+    runner = SimpleNamespace(
+        attn_backend=backend, draft_attn_backend=None, max_tokens_per_req=verify_width
+    )
+    for actual in (2, 1, 0, 2):
+        ForwardStepRunner._prepare_decode_metadata(
+            runner,
+            3,
+            actual,
+            torch.tensor([19, 7]),
+            torch.tensor([129 + verify_width, 3 + verify_width]),
+            ForwardMode.DECODE,
+            use_graph=for_graph_replay,
+            block_tables=tables,
+        )
+        assert backend.query_metadata(ForwardMode.DECODE) is meta
+        assert [tensor.data_ptr() for tensor in tensors] == pointers
+        expected = list(range(129, 129 + verify_width)) + list(
+            range(3, 3 + verify_width)
+        )
+        assert meta.positions.tolist() == expected[: actual * verify_width] + [-1] * (
+            (3 - actual) * verify_width
+        )
+        assert meta.request_indices.tolist() == [
+            r for r in range(actual) for _ in range(verify_width)
+        ] + [-1] * ((3 - actual) * verify_width)
+        assert meta.seq_lens.shape == meta.request_pool_indices.shape == (3,)
+        assert all(
+            table.shape[0] == 3 and not table[actual:].any()
+            for table in meta.block_tables.values()
+        )
+        assert (meta.swa_write_slots[actual * verify_width :] == -1).all()
+        assert not meta.compressor.active[actual * verify_width :].any()
+        for tensor in meta.compressor[1:]:
+            assert (tensor[actual * verify_width :] == -1).all()
+        assert meta.swa_read_slots.shape == (3 * verify_width, 128)
+        assert meta.swa_read_lens.shape == (3 * verify_width,)
+        assert meta.swa_read_slots.dtype == meta.swa_read_lens.dtype == torch.int32
+        assert (meta.swa_read_slots[actual * verify_width :] == -1).all()
+        torch.testing.assert_close(
+            meta.swa_read_lens, (meta.positions + 1).clamp(0, 128).int()
+        )
+        torch.testing.assert_close(
+            meta.swa_write_slots,
+            backend.cache_slots(
+                SWA, meta.positions, meta.request_indices, ForwardMode.DECODE
+            ),
+        )
+    with pytest.raises(ValueError, match="num_tokens"):
+        backend.refresh_decode_metadata(
+            3,
+            0,
+            torch.empty(0),
+            torch.empty(0),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            num_extends=0,
+            num_tokens=3 * verify_width - 1,
+            for_graph_replay=for_graph_replay,
+        )
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([7]),
+        torch.tensor([0]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        num_tokens=verify_width,
+        for_graph_replay=for_graph_replay,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    assert meta.positions.tolist() == list(range(verify_width))
+    assert meta.seq_lens.tolist() == [verify_width]
+
+
+@pytest.mark.parametrize("verify_width", [1, 3, 5])
+def test_packed_mixed_metadata_and_count_validation(verify_width):
+    backend = _verify_backend("cpu", 2, verify_width)
+    tables = _tables("cpu")
+    kwargs = dict(
+        block_tables=tables,
+        extend_seq_lens=torch.tensor([3]),
+        extend_seq_lens_cpu=torch.tensor([3]),
+        extend_prefix_lens=torch.tensor([2]),
+        extend_prefix_lens_cpu=torch.tensor([2]),
+        extend_with_prefix=True,
+        num_tokens=3 + verify_width,
+    )
+    backend.init_forward_metadata(
+        2,
+        1,
+        torch.tensor([23, 17]),
+        torch.tensor([5, 129 + verify_width]),
+        ForwardMode.MIXED,
+        **kwargs,
+    )
+    prefill = backend.query_metadata(ForwardMode.EXTEND)
+    decode = backend.query_metadata(ForwardMode.DECODE)
+    assert prefill.positions.tolist() == [2, 3, 4]
+    assert decode.positions.tolist() == list(range(129, 129 + verify_width))
+    assert decode.request_indices.tolist() == [1] * verify_width
+    assert (
+        backend.query_metadata(ForwardMode.MIXED).positions.numel() == 3 + verify_width
+    )
+    assert backend.write_locations(None, ForwardMode.DECODE).shape == (verify_width,)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([23, 17]),
+        torch.tensor([5, 129 + verify_width]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=1,
+        num_tokens=2 * verify_width,
+        for_graph_replay=False,
+    )
+    assert backend.query_metadata(ForwardMode.EXTEND) is prefill
+    assert backend.query_metadata(ForwardMode.DECODE).positions.tolist() == [
+        -1
+    ] * verify_width + list(range(129, 129 + verify_width))
+    kwargs["num_tokens"] += 1
+    with pytest.raises(ValueError, match="num_tokens"):
+        backend.init_forward_metadata(
+            2,
+            1,
+            torch.tensor([23, 17]),
+            torch.tensor([5, 129 + verify_width]),
+            ForwardMode.MIXED,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+@pytest.mark.parametrize(
+    "group,start,column,message",
+    [(SWA, 190, 0, "SWA prefix"), (TAIL, 3, 1, "compressor tail")],
+)
+def test_packed_history_checks_each_window_start(
+    for_graph_replay, group, start, column, message
+):
+    width = 5
+    backend = _verify_backend("cpu", 2, width)
+    tables = _tables("cpu")
+    # Request 0 has no external tail; missing internal pair rows must not be
+    # treated as old history. Request 1 exercises the first query, not its last.
+    tables[TAIL][0].zero_()
+    tables[group][1, column] = 0
+    with pytest.raises(RuntimeError, match=message):
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([19, 7]),
+            torch.tensor([width, start + width]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            num_extends=0,
+            num_tokens=2 * width,
+            for_graph_replay=for_graph_replay,
+        )
+    tables[group][1, column] = _tables("cpu")[group][1, column]
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([19, 7]),
+        torch.tensor([width, start + width]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        num_tokens=2 * width,
+        for_graph_replay=for_graph_replay,
+    )
 
 
 def test_full_scan_is_bounded_by_table_and_physical_capacity():
@@ -338,22 +559,24 @@ def _decode_compute(backend, inputs, bs):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shared_pool", [False, True])
-def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
+@pytest.mark.parametrize("verify_width", [1, 3, 5])
+def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_width):
     from tokenspeed_kernel.ops.attention import dsv41
 
     assert DeepseekV41AttentionBackend.cuda_graph_support.decode_graph
     assert not DeepseekV41AttentionBackend.cuda_graph_support.prefill_graph
     torch.manual_seed(42)
-    backend = _backend("cuda", 5)
+    backend = _verify_backend("cuda", 5, verify_width)
     backend.cache_pool.arena.buffer.zero_()
     tables = _tables("cuda")
+    capacity = 5 * verify_width
     inputs = (
-        torch.randn(5, 512, device="cuda"),
-        torch.randn(5, 512, device="cuda"),
-        torch.randn(5, 2, 512, device="cuda", dtype=torch.bfloat16),
-        torch.randn(5, 512, device="cuda", dtype=torch.bfloat16),
-        torch.randn(5, 2, 128, device="cuda", dtype=torch.bfloat16),
-        torch.rand(5, 2, device="cuda", dtype=torch.bfloat16),
+        torch.randn(capacity, 512, device="cuda"),
+        torch.randn(capacity, 512, device="cuda"),
+        torch.randn(capacity, 2, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(capacity, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(capacity, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.rand(capacity, 2, device="cuda", dtype=torch.bfloat16),
         torch.zeros(2, device="cuda"),
     )
     meta = _extend(backend, tables, [12, 12], [0, 0])
@@ -393,14 +616,15 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
                     torch.ones(bs, device="cuda", dtype=torch.int32),
                     ForwardMode.DECODE,
                     block_tables=tables,
+                    num_tokens=bs * verify_width,
                 )
-                _decode_compute(backend, inputs, bs)
+                _decode_compute(backend, inputs, bs * verify_width)
             # Warmup has already prepared native scheduler metadata. Actual
             # capture must obtain fresh producer state even without another
             # refresh of these identical input buffers.
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool, stream=stream):
-                output = _decode_compute(backend, inputs, bs)
+                output = _decode_compute(backend, inputs, bs * verify_width)
             captures[bs] = graph, output
     torch.cuda.current_stream().wait_stream(stream)
     arena = backend.cache_pool.arena.buffer
@@ -441,9 +665,13 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             forward_mode=ForwardMode.DECODE,
             block_tables=live_tables,
             num_extends=0,
+            num_tokens=bs * verify_width,
             for_graph_replay=False,
         )
-        expected = [tensor.clone() for tensor in _decode_compute(backend, inputs, bs)]
+        expected = [
+            tensor.clone()
+            for tensor in _decode_compute(backend, inputs, bs * verify_width)
+        ]
         expected_cache = arena.clone()
         arena.copy_(before)
         backend.refresh_decode_metadata(
@@ -454,6 +682,7 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             forward_mode=ForwardMode.DECODE,
             block_tables=live_tables,
             num_extends=0,
+            num_tokens=bs * verify_width,
             for_graph_replay=True,
         )
         graph, output = captures[bs]
@@ -471,6 +700,9 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             )
             == pointers[bs]
         )
+        meta = backend.query_metadata(ForwardMode.DECODE)
+        for tensor in (meta.positions, meta.request_indices, meta.swa_write_slots):
+            assert (tensor[actual * verify_width :] == -1).all()
         if actual == 0:
             assert torch.equal(arena, before)
         assert not bool(backend.cache_pool.swa(2)[0].any())
@@ -486,7 +718,10 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
         wide_tables[SWA][r, 0] = r + 1
         wide_tables[R1][r, 0] = 541 + r
         wide_tables[R2][r, 0] = 161 + r
-        wide_tables[TAIL][r, 0] = 541 + r
+        tail_pages = (verify_width + 1) // 2
+        wide_tables[TAIL][r, :tail_pages] = torch.arange(
+            541 + r * tail_pages, 541 + (r + 1) * tail_pages, device="cuda"
+        )
     for bs in (5, 0):
         backend.refresh_decode_metadata(
             bs,
@@ -496,11 +731,12 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
             forward_mode=ForwardMode.DECODE,
             block_tables=wide_tables,
             num_extends=0,
+            num_tokens=bs * verify_width,
             for_graph_replay=False,
         )
-        output = _decode_compute(backend, inputs, bs)
-        assert output[0].shape == (bs, 512)
-        assert output[3].shape == (bs, 2, 512)
+        output = _decode_compute(backend, inputs, bs * verify_width)
+        assert output[0].shape == (bs * verify_width, 512)
+        assert output[3].shape == (bs * verify_width, 2, 512)
     meta = backend.query_metadata(ForwardMode.DECODE)
     for layer in (20, 24, 25):
         source = layer != 25
@@ -515,6 +751,81 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool):
         )
         assert slots.shape == (0, backend.spec.index_topk) and lens.shape == (0,)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("verify_width", [1, 3, 6, 8])
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
+    recipe = _recipe("cpu")
+    hf = recipe.model_config.hf_config
+    hf.candidate_topk_blocks, hf.candidate_block_size, hf.index_topk = 2, 8, 4
+    args = SimpleNamespace(
+        device="cpu",
+        attn_tp_size=1,
+        data_parallel_size=2,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, dp_size=2)),
+        prefix_granularity=128,
+        spec_context_pad=2 * verify_width,
+        max_num_seqs=4,
+        chunked_prefill_size=3,
+        max_total_tokens=1024,
+        kv_cache_quant_method="none",
+        disaggregation_mode="null",
+        pipeline_parallel_size=1,
+        speculative_algorithm="DSPARK" if verify_width > 1 else None,
+        speculative_num_draft_tokens=verify_width,
+        speculative_num_steps=verify_width - 1,
+    )
+    model = SimpleNamespace(
+        hf_config=hf,
+        num_attention_layers=40,
+        num_attention_heads=2,
+        dtype=torch.bfloat16,
+        context_len=512,
+    )
+    config = DeepseekV41Config.generate(args, model, False)
+    assert config.speculative_num_draft_tokens == verify_width
+    assert config.max_bs == 2
+    assert config.context_len == 512 + args.spec_context_pad
+    queries = max(3, 2 * verify_width)
+    assert config.component(DeepseekV41Config).max_query_tokens == queries
+    recipe.server_args, recipe.attn_config = args, config
+    recipe.decode_input_tokens, recipe.overlap_schedule_depth = (
+        verify_width,
+        overlap_depth,
+    )
+    layout = _layout(recipe)
+    assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
+    specs = {spec.group_id: spec for spec, _ in recipe.groups()}
+    horizon = (1 + overlap_depth) * verify_width
+    assert specs[SWA].sliding_window_tokens == 128 + horizon
+    assert specs[TAIL].sliding_window_tokens == 2 + horizon
+    tables = (
+        4 * config.max_bs * sum(v41_table_widths(config.context_len, horizon).values())
+    )
+    # These small shapes fit one query tile. Portable TopK scratch dominates
+    # with 576 score columns and block_k=128; no fixed 64-MiB fallback remains.
+    assert recipe.workspace_bytes() == (
+        2 * (tables + config.max_bs * 32 + queries * (64 + 128 * 4 + 4) + 4)
+        + queries * ((2048 + 2 * 512 + 128) * 8 + 528)
+        + queries * 512 * 4
+        + 2 * queries * 64 * 512 * 2
+        + queries * 2 * 512 * 2
+        + (config.context_len + queries + config.max_bs * 128) * 512 * 2
+        + queries * (512 * 2 + (128 + 512) * 4)
+        + queries * 32 * (128 * 2 + 68)
+        + queries * 24 * (512 + 128) * 12
+        + 576 * 68
+    )
+    with pytest.raises(NotImplementedError, match="target attention"):
+        DeepseekV41Config.generate(args, model, True)
+    args.pipeline_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="PP=1"):
+        recipe.groups()
+    args.pipeline_parallel_size = 1
+    recipe.attn_config = replace(config, pd_disaggregation_enabled=True)
+    with pytest.raises(NotImplementedError, match="PD"):
+        recipe.groups()
 
 
 def test_recipe_exact_geometry_capacity_and_dispatch():
@@ -573,8 +884,9 @@ def test_owner_topology_and_reject_invalid_recipes():
             config, replace(config.component(DeepseekV41Config), index_topk=513)
         )
     recipe = _recipe("cpu")
-    recipe.decode_input_tokens = 5
-    with pytest.raises(NotImplementedError, match="speculation"):
+    recipe.draft_attn_config = recipe.attn_config
+    recipe.draft_model_config = SimpleNamespace(num_attention_layers=3)
+    with pytest.raises(NotImplementedError, match="target layers only"):
         recipe.groups()
     recipe = _recipe("cpu")
     recipe.attn_config = replace(recipe.attn_config, prefix_granularity=64)
@@ -708,6 +1020,60 @@ def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
         assert backend.write_locations(None, ForwardMode.DECODE).tolist() == (
             [192, 323][:actual_bs] + [-1] * (2 - actual_bs)
         )
+
+
+@pytest.mark.parametrize("prefix", [127, 128])
+@pytest.mark.parametrize("accepted", [1, 2, 3, 4, 5])
+def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
+    width = 5
+    backend = _verify_backend("cpu", 1, width)
+    tables = _tables("cpu")
+    torch.manual_seed(41)
+    content, scores = torch.randn(2, prefix + width, 512)
+    new_content, new_scores = torch.randn(2, width, 512)
+    meta = _extend(backend, tables, [prefix], [0])
+    backend.compress(
+        2,
+        content[:prefix],
+        scores[:prefix],
+        ForwardMode.EXTEND,
+        norm_weight=None,
+        norm_eps=0.0,
+    )
+    for start, values, gates in (
+        (prefix, content[prefix:], scores[prefix:]),
+        (prefix + accepted, new_content, new_scores),
+    ):
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([19]),
+            torch.tensor([start + width]),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            num_extends=0,
+            num_tokens=width,
+            for_graph_replay=False,
+        )
+        meta = backend.query_metadata(ForwardMode.DECODE)
+        pooled, positions, _ = backend.compress(
+            2,
+            values,
+            gates,
+            ForwardMode.DECODE,
+            norm_weight=None,
+            norm_eps=0.0,
+        )
+    # The rejected branch is never restored or zeroed. New odd positions pair
+    # with either retained accepted inputs or an input in the replacement window.
+    full_content = torch.cat((content[: prefix + accepted], new_content))
+    full_scores = torch.cat((scores[: prefix + accepted], new_scores))
+    live = positions >= 0
+    pair = positions[live, None] + torch.arange(2)
+    expected = (full_content[pair] * full_scores[pair].softmax(1)).sum(1)
+    torch.testing.assert_close(pooled[live], expected, rtol=0, atol=0)
+    assert not pooled[~live].any()
+    assert not backend.cache_pool.compressor_tail(2)[0].any()
 
 
 def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
@@ -1253,15 +1619,19 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_mixed_compressor_plan_windows_match_combined_pooling(device):
+@pytest.mark.parametrize("verify_width", [1, 3, 5, 6])
+@pytest.mark.parametrize("decode_prefix", [8, 9])
+def test_mixed_compressor_plan_windows_match_combined_pooling(
+    device, verify_width, decode_prefix
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    backend = _backend(device, 2)
+    backend = _verify_backend(device, 2, verify_width)
     backend.init_forward_metadata(
         2,
         1,
         torch.tensor([23, 17], device=device),
-        torch.tensor([5, 10], device=device),
+        torch.tensor([5, decode_prefix + verify_width], device=device),
         ForwardMode.MIXED,
         block_tables=_tables(device),
         extend_seq_lens=torch.tensor([3], device=device),
@@ -1273,13 +1643,25 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(device):
     full = backend.query_metadata(ForwardMode.MIXED).compressor
     extend = backend.query_metadata(ForwardMode.EXTEND).compressor
     decode = backend.query_metadata(ForwardMode.DECODE).compressor
-    assert full.previous.tolist() == [-1, 0, -1, -1]
-    assert decode.previous.tolist() == [-1]
-    for all_rows, leading, trailing in zip(full, extend, decode, strict=True):
+    expected_previous = [
+        i - 1 if i > 0 and (decode_prefix + i) % 2 else -1 for i in range(verify_width)
+    ]
+    assert decode.previous.tolist() == expected_previous
+    assert full.previous.tolist() == [-1, 0, -1] + [
+        previous + 3 if previous >= 0 else -1 for previous in expected_previous
+    ]
+    for name, all_rows, leading, trailing in zip(
+        full._fields, full, extend, decode, strict=True
+    ):
         assert leading.data_ptr() == all_rows.data_ptr()
-        assert trailing.data_ptr() == all_rows[3:].data_ptr()
+        if name != "previous":
+            assert trailing.data_ptr() == all_rows[3:].data_ptr()
+    before = tuple(tensor.clone() for tensor in full)
     torch.manual_seed(62)
-    content, scores = (torch.randn(4, 512, device=device) for _ in range(2))
+    content = torch.randn(3 + verify_width, 512, device=device)
+    # Isolate address rebasing from CPU softmax's batch-size-dependent rounding.
+    # Equal scores give exact 0.5 weights while random content exposes wrong rows.
+    scores = torch.zeros_like(content)
     backend.cache_pool.arena.buffer.zero_()
     expected = backend.compress(2, content, scores, ForwardMode.MIXED, None, 0.0)
     backend.cache_pool.arena.buffer.zero_()
@@ -1291,3 +1673,33 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(device):
     )
     for got, left, right in zip(expected, leading, trailing, strict=True):
         torch.testing.assert_close(got, torch.cat((left, right)), rtol=0, atol=0)
+    for original, value in zip(before, full, strict=True):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    positions = torch.tensor([2, 3, 4, 10, 11, 12, 7, 8, 9, 10], device=device)
+    requests = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 2], device=device)
+    table = torch.ones((3, 8), dtype=torch.int32, device=device)
+    full = V41CompressorPlan.allocate(positions.numel(), torch.device(device))
+    dsv41.compressor_metadata(positions, requests, table, 2, *full)
+    before = tuple(tensor.clone() for tensor in full)
+    for start, stop in ((0, 3), (3, 10), (6, 10), (4, 8), (6, 6), (0, 0)):
+        window = full.window(start, stop)
+        expected = V41CompressorPlan.allocate(stop - start, torch.device(device))
+        dsv41.compressor_metadata(
+            positions[start:stop], requests[start:stop], table, 2, *expected
+        )
+        for name, parent, got, want in zip(
+            full._fields, full, window, expected, strict=True
+        ):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+            if start == 0 or name != "previous":
+                assert got.data_ptr() == parent[start:stop].data_ptr()
+    for original, value in zip(before, full, strict=True):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)

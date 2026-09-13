@@ -269,7 +269,9 @@ def configure_minimax_m3_attention(model_config) -> None:
 _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
-        architectures=frozenset({"DeepseekV41ForCausalLM"}),
+        architectures=frozenset(
+            {"DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark"}
+        ),
         configure=configure_deepseek_v41_attention,
         default_backend="deepseek_v41",
         default_prefix_granularity=256,
@@ -463,7 +465,8 @@ class ModelConfig:
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
-            and resolve_architecture(self.hf_config) == "DeepseekV4ForCausalLMDSpark"
+            and resolve_architecture(self.hf_config)
+            in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
         ):
             from tokenspeed.runtime.models.deepseek_v4_dspark import (
                 DEFAULT_DSPARK_WINDOW_SIZE,

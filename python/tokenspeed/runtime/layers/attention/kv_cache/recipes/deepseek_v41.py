@@ -60,7 +60,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 class DeepseekV41Recipe(CacheRecipe):
-    """Target-only Flash FlatKV; packing is independent of prefix granularity."""
+    """Target Flash FlatKV for decode/verify, without LCM-backed draft fields.
+
+    Verify width changes retention and workspace, never the target field layout.
+    Checkpoint-local DSpark windows remain owned by the drafter.
+    """
 
     family = "deepseek_v41"
 
@@ -76,10 +80,12 @@ class DeepseekV41Recipe(CacheRecipe):
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        if self.num_draft_layers or self.decode_input_tokens != 1:
+        if self.num_draft_layers:
             raise NotImplementedError(
-                "DeepSeek V4.1 FlatKV does not support speculation yet"
+                "DeepSeek V4.1 FlatKV stores target layers only; draft windows are external"
             )
+        if self.decode_input_tokens < 1:
+            raise ValueError("DeepSeek V4.1 verify width must be positive")
         if self.pd_disaggregation_enabled:
             raise NotImplementedError(
                 "DeepSeek V4.1 PD cache transfer is not validated"
@@ -224,12 +230,11 @@ class DeepseekV41Recipe(CacheRecipe):
             * max_bs
             * sum(v41_table_widths(self.attn_config.context_len, horizon).values())
         )
-        queries = max(0, int(self.server_args.chunked_prefill_size)) + int(
-            self.server_args.max_num_seqs
-        )
-        # Request ids, positions, starts, lengths, four write-location vectors;
-        # two generations allow an extend followed by a decode metadata view.
-        metadata = 2 * (tables + max_bs * (96 + 128 * 4 + 4) + 4)
+        queries = self.attn_config.component(DeepseekV41Config).max_query_tokens
+        # Tables/lengths stay request-shaped; positions, request maps, write
+        # locations and compact SWA slots/lengths cover every verify query.
+        # Budget extend plus persistent decode views.
+        metadata = 2 * (tables + max_bs * 32 + queries * (64 + 128 * 4 + 4) + 4)
         # Both MIXED windows together are bounded by queries. Include the
         # packed current SWA rows and two generations of selection records.
         selections = queries * ((2048 + 2 * 512 + 128) * 8 + 528)

@@ -81,13 +81,13 @@ def engram_context_len(text_config) -> int:
 def ngram_inputs_for_forward(
     forward_op, rid_to_state: Mapping, context_len: int
 ) -> NGramInputs | None:
-    """Snapshot only this forward's raw physical-token windows, never long history.
+    """Snapshot one bounded seed window per request, including empty prefills.
 
-    Prefix hits, chunking, retraction and PD all read the same prompt/output
-    lists; detokenizer's unpadded prompt is not physical model input. At PP=1,
-    overlap leaves at most the *current* decode token uncommitted. Its three
-    predecessors are already on the host. The device position selects whether
-    the snapshot's newest token is current (committed) or previous (pending).
+    Each row is [current, prev1..3] at the extend prefix or the newest committed
+    decode token. Prompt/output lists contain physical IDs, unlike the unpadded
+    detokenizer prompt. The executor uses these immutable windows to seed/reset
+    its accepted input tail; ongoing decode and proposed predecessors stay on
+    the device, even when an entire verify result awaits its host commit.
     """
     if context_len == 0:
         return None
@@ -104,25 +104,20 @@ def ngram_inputs_for_forward(
             if start < 0 or start + length > total:
                 raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
         else:
-            if length != 1:
-                raise NotImplementedError(
-                    "Engram input history does not support speculation"
-                )
             start = total - 1
             if start < 0:
                 raise ValueError(f"N-gram decode requires physical tokens for {rid}")
-        for position in range(start, start + length):
-            tokens.append(
-                tuple(
-                    (
-                        -1
-                        if p < 0
-                        else prompt[p] if p < prompt_len else output[p - prompt_len]
-                    )
-                    for p in range(position, position - context_len - 1, -1)
+        tokens.append(
+            tuple(
+                (
+                    -1
+                    if p < 0 or p >= total
+                    else prompt[p] if p < prompt_len else output[p - prompt_len]
                 )
+                for p in range(start, start - context_len - 1, -1)
             )
-            positions.append(position)
+        )
+        positions.append(start)
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
 
 

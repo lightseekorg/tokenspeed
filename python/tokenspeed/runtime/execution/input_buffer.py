@@ -124,49 +124,98 @@ class InputBuffers:
         }
 
     def fill_ngram_inputs(
-        self, snapshot: NGramInputs | None, total_tokens: int, vocab_size: int
+        self,
+        snapshot: NGramInputs | None,
+        total_tokens: int,
+        runtime_states: RuntimeStates,
+        forward_op,
     ) -> None:
-        """Resolve host history against physical device positions before ID clamping.
+        """Assemble branch-local raw history before embedding-ID clamping.
 
-        Only the current decode ID may be pending at the supported overlap depth;
-        input_ids_buf already resolves it from future_input_map. A position delta
-        of zero selects columns 1..3 (committed current), one selects 0..2
-        (pending current). Gather deliberately rejects any uncovered history.
+        ``snapshot`` holds one immutable host seed per request in ``forward_op``;
+        ``total_tokens`` is its packed input size. ``runtime_states`` owns the
+        accepted prefix, advanced with valid_cache_lengths. For token j and
+        distance d, use input[j-d] if j >= d, else accepted_prefix[d-j-1]. The
+        same rule covers prefill, N=1 decode and speculative verify. Returns None.
         """
         if self.ngram_previous_tokens_buf is None:
             if snapshot is not None:
                 raise ValueError("N-gram snapshot supplied without input buffers")
             return
         assert self.ngram_token_mask_buf is not None
+        tail = runtime_states.ngram_accepted_tokens
+        needs_seed = runtime_states.ngram_needs_seed
+        assert tail is not None and needs_seed is not None
+        bs = len(forward_op.request_ids)
         if (
             snapshot is None
-            or len(snapshot.tokens) != total_tokens
-            or len(snapshot.positions) != total_tokens
+            or len(snapshot.tokens) != bs
+            or len(snapshot.positions) != bs
         ):
-            raise ValueError("Engram requires one history snapshot per input token")
-        self.ngram_previous_tokens_buf[total_tokens:].fill_(-1)
-        self.ngram_token_mask_buf[total_tokens:].zero_()
-        if total_tokens == 0:
-            return
+            raise ValueError("Engram requires one history snapshot per request")
         context_len = self.ngram_previous_tokens_buf.shape[1]
         if any(len(row) != context_len + 1 for row in snapshot.tokens):
             raise ValueError("Engram snapshot has the wrong history width")
-        tokens_cpu, positions_cpu = self._bulk_pinned(
-            (total_tokens * (context_len + 1), torch.int64),
-            (total_tokens, torch.int64),
+        self.ngram_previous_tokens_buf[total_tokens:].fill_(-1)
+        self.ngram_token_mask_buf[total_tokens:].zero_()
+        if bs == 0:
+            return
+
+        num_extends = forward_op.num_extends()
+        overrides = forward_op.decode_input_ids
+        reset = [
+            i < num_extends
+            or runtime_states.ngram_request_ids[slot] != rid
+            or (overrides is not None and overrides[i - num_extends] != -1)
+            for i, (rid, slot) in enumerate(
+                zip(forward_op.request_ids, forward_op.request_pool_indices)
+            )
+        ]
+        tokens_cpu, positions_cpu, reset_cpu = self._bulk_pinned(
+            (bs * (context_len + 1), torch.int64),
+            (bs, torch.int64),
+            (bs, torch.bool),
         )
-        tokens_cpu.view(total_tokens, -1).copy_(
-            torch.tensor(snapshot.tokens, dtype=torch.int64)
-        )
+        tokens_cpu.view(bs, -1).copy_(torch.tensor(snapshot.tokens, dtype=torch.int64))
         positions_cpu.copy_(torch.tensor(snapshot.positions, dtype=torch.int64))
-        tokens = tokens_cpu.view(total_tokens, -1).to(self.device, non_blocking=True)
+        reset_cpu.copy_(torch.tensor(reset, dtype=torch.bool))
+        tokens = tokens_cpu.view(bs, -1).to(self.device, non_blocking=True)
         positions = positions_cpu.to(self.device, non_blocking=True)
-        delta = self.positions_buf[:total_tokens] - positions
-        columns = torch.arange(1, context_len + 1, device=self.device) - delta[:, None]
-        previous = tokens.gather(1, columns)
+        slots = self.req_pool_indices_buf[:bs]
+        seed = reset_cpu.to(self.device, non_blocking=True) | needs_seed[slots]
+        delta = runtime_states.valid_cache_lengths[slots] - positions
+        # Only lifecycle seeds need host coverage. In steady-state decode a
+        # delayed commit can leave delta much larger than the entire window.
+        torch._assert_async(
+            (~seed | ((delta >= 0) & (delta <= 1))).all(),
+            "Engram seed snapshot does not cover the accepted input frontier",
+        )
+        distances = torch.arange(1, context_len + 1, device=self.device)
+        columns = (distances - delta[:, None]).clamp(0, context_len)
+        prefix = torch.where(seed[:, None], tokens.gather(1, columns), tail[slots])
+        vocab_size = runtime_states.vocab_size
+        prefix.masked_fill_((prefix < 0) | (prefix >= vocab_size), -1)
+        tail[slots] = prefix
+        needs_seed[slots] = False
+        for rid, slot in zip(forward_op.request_ids, forward_op.request_pool_indices):
+            runtime_states.ngram_request_ids[slot] = rid
+        if total_tokens == 0:
+            return
+
+        lengths = self.input_lengths_buf[:bs]
+        ends = lengths.cumsum(0)
+        rows = torch.arange(total_tokens, device=self.device)
+        requests = torch.searchsorted(ends, rows, right=True)
+        local_rows = rows - (ends - lengths)[requests]
+        columns = (distances - local_rows[:, None] - 1).clamp(0, context_len - 1)
+        ids = self.input_ids_buf[:total_tokens]
+        previous = torch.where(
+            local_rows[:, None] >= distances,
+            ids[(rows[:, None] - distances).clamp_min(0)],
+            prefix[requests].gather(1, columns),
+        )
         previous.masked_fill_((previous < 0) | (previous >= vocab_size), -1)
         self.ngram_previous_tokens_buf[:total_tokens].copy_(previous)
-        ids = self.input_ids_buf[:total_tokens]
         self.ngram_token_mask_buf[:total_tokens].copy_((ids >= 0) & (ids < vocab_size))
 
     def _record_pad_tape(self) -> "PrepTape | None":
@@ -469,7 +518,7 @@ class InputBuffers:
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
         vocab_size = runtime_states.vocab_size
-        self.fill_ngram_inputs(ngram_inputs, total_tokens, vocab_size)
+        self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
         if valid_cache_lengths is not None:
@@ -506,6 +555,7 @@ class InputBuffers:
                 )
                 self.seq_lens_buf[batch_size:].fill_(1)
 
+        self.input_lengths_buf[batch_size:].zero_()
         return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
@@ -519,6 +569,7 @@ class InputBuffers:
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
+            self.input_lengths_buf[:batch_size].zero_()
             self.req_pool_indices_buf[:batch_size].fill_(0)
             self.state_write_req_pool_indices_buf[:batch_size].fill_(
                 self.state_write_padding_pool_index

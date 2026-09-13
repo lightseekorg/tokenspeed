@@ -220,7 +220,9 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
-_DSPARK_DRAFT_ARCHITECTURE = "DeepseekV4ForCausalLMDSpark"
+_DSPARK_DRAFT_ARCHITECTURES = frozenset(
+    {"DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,7 +263,7 @@ def _resolve_attn_side(
     architectures = getattr(hf_config, "architectures", None) or []
     text_config = getattr(hf_config, "text_config", hf_config)
     qwen4_exp = is_qwen4_exp(hf_config)
-    is_dspark = _DSPARK_DRAFT_ARCHITECTURE in architectures
+    is_dspark = any(a in _DSPARK_DRAFT_ARCHITECTURES for a in architectures)
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     return _AttnSideProfile(
         architectures=tuple(architectures),
@@ -375,7 +377,7 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
-    if is_deepseek_v41_config(model_config.hf_config):
+    if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     if profile.is_deepseek_v4:
         return "deepseek_v4"

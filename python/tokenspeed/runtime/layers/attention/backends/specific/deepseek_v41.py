@@ -23,7 +23,10 @@
 The model owns projection, RMSNorm, RoPE and inverse output RoPE. This backend
 owns logical-position resolution, all cache writes, and sparse selection. All
 request history is in the four LCM groups; cross-layer scratch contains only
-the current forward's selection and immutable query-address plans. Memory-only writes need not have query rows.
+the current forward's selection and immutable query-address plans. Memory-only
+writes need not have query rows. Decode/verify uses a fixed request-major token
+window, including graph padding. Rejected suffix bytes stay invisible until
+overwritten at their absolute positions; no backend-private rollback is needed.
 
 Request indices below are BATCH TABLE ROWS, not request-pool slots. Obtain the
 ordinary full-query inputs from query_metadata(mode); CED may explicitly subset
@@ -63,7 +66,7 @@ class V41CompressorPlan(NamedTuple):
     """Current-forward pair indices and addresses shared by all ratio-2 owners.
 
     Contains no projected inputs or request history. Decode storage is allocated
-    at max_decode_bs and refreshed in place before eager or graph execution.
+    at max_decode_bs * verify_width and refreshed in place before execution.
     """
 
     active: torch.Tensor
@@ -81,9 +84,15 @@ class V41CompressorPlan(NamedTuple):
         )
 
     def window(self, start: int, stop: int):
-        # Only prefix views or the one-row-per-request mixed decode suffix are
-        # used: predecessor indices remain local without an offset adjustment.
-        return V41CompressorPlan(*(value[start:stop] for value in self))
+        """Slice canonical rows, rebasing predecessors without changing the parent.
+
+        Prefix views retain every pointer for decode capture/replay. A mixed
+        suffix owns only its rebased predecessor indices; addresses remain views.
+        """
+        plan = V41CompressorPlan(*(value[start:stop] for value in self))
+        if start:
+            plan = plan._replace(previous=(plan.previous - start).clamp_min(-1))
+        return plan
 
 
 @dataclass
@@ -145,10 +154,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
-        if config.is_draft or self.spec_num_tokens != 1:
-            raise NotImplementedError(
-                "V4.1 FlatKV baseline supports target-only decoding"
-            )
+        if config.is_draft:
+            raise NotImplementedError("V4.1 FlatKV implements target attention only")
         if config.kernel_page_size not in (None, 64):
             raise ValueError("V4.1 SWA/global readers require 64-row pages")
         if config.prefix_granularity <= 0 or config.prefix_granularity % 128:
@@ -192,7 +199,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError(f"V4.1 pool is missing the {gid} row geometry")
         super().set_cache_pool(cache_pool)
 
-    def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        *,
+        max_tokens_per_req: int,
+        overlap_schedule_depth: int,
+        **kwargs,
+    ) -> None:
+        """Allocate request tables and packed token views for eager and graph verify."""
+        del kwargs
+        if max_tokens_per_req != self.spec_num_tokens:
+            raise ValueError(
+                "V4.1 decode capacity must use the configured verify width"
+            )
+        max_tokens = max_bs * self.spec_num_tokens
+        if max_tokens > self.spec.max_query_tokens:
+            raise ValueError("V4.1 decode capacity exceeds budgeted query workspace")
         if self._decode_buffers is not None:
             if max_bs != self._max_decode_bs:
                 raise RuntimeError(
@@ -201,31 +224,35 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             return
         self._max_decode_bs = max_bs
         self._decode_history_status = torch.empty(
-            max_bs, dtype=torch.int32, device=self.device
+            max_tokens, dtype=torch.int32, device=self.device
         )
-        horizon = (1 + int(kwargs.get("overlap_schedule_depth", 0))) * int(
-            kwargs.get("max_tokens_per_req", 1)
-        )
+        horizon = (1 + overlap_schedule_depth) * max_tokens_per_req
         self._decode_buffers = V41Metadata(
             block_tables={
                 gid: torch.zeros((max_bs, width), dtype=torch.int32, device=self.device)
                 for gid, width in v41_table_widths(self.context_len, horizon).items()
             },
-            positions=torch.full((max_bs,), -1, dtype=torch.int64, device=self.device),
-            request_indices=torch.arange(max_bs, dtype=torch.int64, device=self.device),
+            positions=torch.full(
+                (max_tokens,), -1, dtype=torch.int64, device=self.device
+            ),
+            request_indices=torch.full(
+                (max_tokens,), -1, dtype=torch.int64, device=self.device
+            ),
             request_pool_indices=torch.full(
                 (max_bs,), -1, dtype=torch.int64, device=self.device
             ),
             seq_lens=torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             num_extends=0,
             swa_write_slots=torch.full(
-                (max_bs,), -1, dtype=torch.int64, device=self.device
+                (max_tokens,), -1, dtype=torch.int64, device=self.device
             ),
             swa_read_slots=torch.full(
-                (max_bs, 128), -1, dtype=torch.int32, device=self.device
+                (max_tokens, 128), -1, dtype=torch.int32, device=self.device
             ),
-            swa_read_lens=torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            compressor=V41CompressorPlan.allocate(max_bs, self.device),
+            swa_read_lens=torch.zeros(
+                max_tokens, dtype=torch.int32, device=self.device
+            ),
+            compressor=V41CompressorPlan.allocate(max_tokens, self.device),
         )
 
     def _decode_view(self, bs: int) -> V41Metadata:
@@ -233,17 +260,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 decode batch exceeds initialized capacity")
         if bs not in self._decode_views_by_bs:
             b = self._decode_buffers
+            num_tokens = bs * self.spec_num_tokens
             self._decode_views_by_bs[bs] = V41Metadata(
                 {gid: t[:bs] for gid, t in b.block_tables.items()},
-                b.positions[:bs],
-                b.request_indices[:bs],
+                b.positions[:num_tokens],
+                b.request_indices[:num_tokens],
                 b.request_pool_indices[:bs],
                 b.seq_lens[:bs],
                 0,
-                b.swa_write_slots[:bs],
-                b.swa_read_slots[:bs],
-                b.swa_read_lens[:bs],
-                b.compressor.window(0, bs),
+                b.swa_write_slots[:num_tokens],
+                b.swa_read_slots[:num_tokens],
+                b.swa_read_lens[:num_tokens],
+                b.compressor.window(0, num_tokens),
             )
         return self._decode_views_by_bs[bs]
 
@@ -270,8 +298,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # The target runner omits num_extends on pure decode; mixed/draft
         # refresh callers can name the leading extend window explicitly.
         num_extends = kwargs.pop("num_extends", 0)
+        # The configured width owns the shape even for callers that supply only
+        # request metadata. The runner's explicit packed count must agree.
+        if "num_tokens" in kwargs and kwargs["num_tokens"] != bs * self.spec_num_tokens:
+            raise ValueError("V4.1 num_tokens must equal batch size times verify width")
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        if not forward_mode.is_decode_or_idle():
+            raise ValueError("V4.1 refresh requires decode or idle mode")
         if not 0 <= num_extends <= actual_bs <= bs:
             raise ValueError("V4.1 invalid live/decode batch sizes")
         self._check_tables(block_tables, actual_bs)
@@ -299,10 +333,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             seq_lens,
             req_pool_indices,
             meta.positions,
+            meta.request_indices,
             meta.seq_lens,
             meta.request_pool_indices,
             actual_bs,
             num_extends,
+            self.spec_num_tokens,
         )
         self._prepare_compressor(meta)
         self._refresh_decode_window(meta, actual_bs)
@@ -362,9 +398,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             counts[V41_SWA_GROUP_ID],
             counts[V41_COMPRESSOR_TAIL_GROUP_ID],
         )
-        # One host observation preserves the fail-before-forward recovery
-        # contract. Padding and leading extends contribute no history errors.
-        errors = status[:actual_bs].cpu().tolist() if actual_bs else []
+        # The fused producer reports only span-start errors. Observe all token
+        # rows: request starts need not have a uniform stride in mixed batches.
+        # Padding, leading extends and internal pairs contribute no errors.
+        errors = status.cpu().tolist() if actual_bs else []
         if any(error & 1 for error in errors):
             raise RuntimeError(
                 "V4.1 SWA prefix is missing; supply the dependency tail or recover the request"
@@ -390,16 +427,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         extend_with_prefix: bool,
         **kwargs,
     ) -> None:
-        del extend_with_prefix, kwargs
+        del extend_with_prefix
         if forward_mode.is_decode():
             raise ValueError("V4.1 decode metadata must use refresh_decode_metadata")
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
         self._prepared_selections.clear()
-        counts = [int(n) for n in extend_seq_lens_cpu[:num_extends].tolist()] + [1] * (
-            bs - num_extends
-        )
+        if not 0 <= num_extends <= bs:
+            raise ValueError("V4.1 invalid extend/decode batch sizes")
+        width = self.spec_num_tokens
+        counts = [int(n) for n in extend_seq_lens_cpu[:num_extends].tolist()] + [
+            width
+        ] * (bs - num_extends)
         total = sum(counts)
+        if "num_tokens" in kwargs and kwargs["num_tokens"] != total:
+            raise ValueError("V4.1 num_tokens disagrees with extend/verify lengths")
         prefixes = [int(n) for n in extend_prefix_lens_cpu[:num_extends].tolist()]
         offset = 0
         spans = []
@@ -417,12 +459,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         starts = lengths.cumsum(0) - lengths
         prefix = torch.cat(
-            (extend_prefix_lens[:num_extends], seq_lens[num_extends:bs] - 1)
+            (
+                extend_prefix_lens[:num_extends],
+                seq_lens[num_extends:bs].clamp_min(width) - width,
+            )
         ).to(torch.int64)
         positions = (
             torch.arange(total, device=self.device)
             - starts[requests]
             + prefix[requests]
+        )
+        seq_lens = torch.cat(
+            (seq_lens[:num_extends], seq_lens[num_extends:bs].clamp_min(width))
         )
         tables = {
             gid: t[:bs] for gid, t in block_tables.items() if gid in V41_GROUP_GEOMETRY

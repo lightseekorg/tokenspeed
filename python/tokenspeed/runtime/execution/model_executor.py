@@ -352,13 +352,9 @@ class ModelExecutor:
             device=self.device,
         )
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
-        if ngram_context and (
-            config.spec_algo is not None
-            or config.pp_size != 1
-            or config.overlap_schedule_depth > 1
-        ):
+        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
-                "Engram input history requires PP=1 and non-speculative decoding"
+                "Engram input history requires PP=1 and in-flight depth <= 1"
             )
         self.input_buffers.init_ngram_buffers(ngram_context)
         self.runtime_states = RuntimeStates(
@@ -367,6 +363,7 @@ class ModelExecutor:
             device=self.device,
             output_length=config.output_length,
         )
+        self.runtime_states.init_ngram_state(ngram_context)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -978,11 +975,11 @@ class ModelExecutor:
         input_lengths: torch.Tensor,
         num_extends: int,
     ):
-        """Write output tokens to future_input_map and update cache lengths.
+        """Advance accepted inputs and cache lengths together on execution_stream.
 
-        Must NOT be captured in CUDA graph — these writes are read by the
-        next iteration's batch prep on the default stream, so they need
-        explicit stream synchronization (see execute_forward_op).
+        Serving calls this after eager execution or graph replay. All writes
+        are tensor-only, including padding masks, so recording this update has
+        the same semantics. Callers must pass the state-write pool indices.
         """
         if self.drafter is None:
             # Without drafter, store output tokens for next round.
@@ -1004,6 +1001,29 @@ class ModelExecutor:
         else:
             deltas = torch.cat(
                 [input_lengths[:num_extends], accept_lengths[num_extends:]]
+            )
+        ib = self.input_buffers
+        live = req_pool_indices != ib.state_write_padding_pool_index
+        deltas = torch.where(live, deltas, 0)
+        tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            assert ib.ngram_previous_tokens_buf is not None
+            assert ib.ngram_token_mask_buf is not None
+            # A accepted inputs end at row A-1, NOT at the sampled bonus or
+            # the end of the proposed window. Masks retain raw OOV barriers
+            # after input_ids_buf has been clamped for the embedding lookup.
+            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
+                0, ib.max_num_tokens - 1
+            )
+            current = torch.where(
+                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
+            )
+            accepted_tail = torch.cat(
+                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
+                dim=1,
+            )
+            tail[req_pool_indices] = torch.where(
+                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
@@ -1462,7 +1482,9 @@ class ModelExecutor:
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
-                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                    req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
+                        :bs
+                    ],
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],

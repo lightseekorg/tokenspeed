@@ -190,10 +190,10 @@ class EventLoop:
 
         self._ngram_context_len = engram_context_len(self.model_config.hf_text_config)
         if self._ngram_context_len and (
-            self.in_flight_depth > 1 or server_args.speculative_algorithm is not None
+            server_args.mapping.has_pp or self.in_flight_depth > 1
         ):
             raise NotImplementedError(
-                "Engram input history requires PP=1 and non-speculative decoding"
+                "Engram input history requires PP=1 and in-flight depth <= 1"
             )
 
         decode_input_tokens = (

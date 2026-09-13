@@ -26,6 +26,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
     model_wide_kwargs,
+    resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import v41_layer_mapping
 
@@ -52,10 +53,26 @@ class DeepseekV41Config(SoftmaxAttnConfig):
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
-        if is_draft or server_args.speculative_algorithm is not None:
+        if is_draft:
             raise NotImplementedError(
-                "V4.1 FlatKV target-only baseline does not support speculation"
+                "V4.1 FlatKV config describes target attention only"
             )
+        verify_width = (
+            resolve_speculative_num_tokens(server_args, is_draft)
+            if server_args.speculative_algorithm is not None
+            else 1
+        )
+        if verify_width < 1:
+            raise ValueError("V4.1 verify width must be positive")
+        kwargs = model_wide_kwargs(
+            server_args,
+            model_config,
+            is_draft,
+            kv_cache_dtype=torch.uint8,
+            kv_cache_mxfp8=False,
+            draft_block_decode=False,
+            speculative_num_draft_tokens=verify_width,
+        )
         hf = getattr(model_config.hf_config, "text_config", model_config.hf_config)
         ratios = tuple(
             int(r) for r in hf.compress_ratios[: model_config.num_attention_layers]
@@ -81,21 +98,16 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             index_topk=int(hf.index_topk),
             candidate_topk=int(hf.candidate_topk_blocks),
             candidate_block_size=int(hf.candidate_block_size),
-            max_query_tokens=max(0, int(server_args.chunked_prefill_size))
-            + int(server_args.max_num_seqs),
+            # Mixed batches share the scheduler's total token budget; decode
+            # capture must also fit the full padded request batch at verify width.
+            max_query_tokens=max(
+                int(server_args.chunked_prefill_size), kwargs["max_bs"] * verify_width
+            ),
         )
         return AttnConfig(
             components=(spec,),
             kernel_page_size=64,
-            **model_wide_kwargs(
-                server_args,
-                model_config,
-                is_draft,
-                kv_cache_dtype=torch.uint8,
-                kv_cache_mxfp8=False,
-                draft_block_decode=False,
-                speculative_num_draft_tokens=1,
-            ),
+            **kwargs,
         )
 
     def cache_cell_size(self, config: AttnConfig) -> int:

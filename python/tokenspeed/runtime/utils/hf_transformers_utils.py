@@ -435,11 +435,11 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if (
-            speculative_algorithm == "DSPARK"
-            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
+            "DeepseekV4ForCausalLM",
+            "DeepseekV41ForCausalLM",
         ):
-            config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+            config.architectures[0] += "DSpark"
         else:
             config.architectures[0] += "NextN"
 
@@ -451,6 +451,7 @@ def get_config(
 
     if resolve_architecture(config) in [
         "DeepseekV41ForCausalLM",
+        "DeepseekV41ForCausalLMDSpark",
         "KimiK25ForConditionalGeneration",
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
@@ -780,8 +781,9 @@ def get_tokenizer(
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
-    use_v41_encoder = tokenizer_mode == "auto" and (
-        "DeepseekV41ForCausalLM" in (architectures or [])
+    use_v41_encoder = tokenizer_mode == "auto" and any(
+        arch in ("DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark")
+        for arch in (architectures or [])
     )
     if use_v41_encoder and not trust_remote_code:
         raise ValueError(

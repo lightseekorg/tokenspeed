@@ -300,6 +300,7 @@ def main_env(tmp_path, report, monkeypatch):
 
 
 @pytest.mark.parametrize("execution_mode", ["eager", "graph"])
+@pytest.mark.parametrize("dspark", [False, True])
 @pytest.mark.parametrize(
     "batch_size,max_total_tokens,max_model_len,chunked_prefill_size",
     [(16, 16384, 4096, 1024), (32, 32768, 4096, 1024), (32, 1048576, 1048576, 8192)],
@@ -308,6 +309,7 @@ def test_full_eval_writes_result_only_after_completion(
     tmp_path,
     main_env,
     execution_mode,
+    dspark,
     batch_size,
     max_total_tokens,
     max_model_len,
@@ -316,6 +318,8 @@ def test_full_eval_writes_result_only_after_completion(
 ):
     evaluate, launch = main_env
     argv = list(sys.argv)
+    if dspark:
+        argv.append("--dspark")
     argv[argv.index("--execution-mode") + 1] = execution_mode
     argv[argv.index("--batch-size") + 1] = str(batch_size)
     argv[argv.index("--max-total-tokens") + 1] = str(max_total_tokens)
@@ -327,6 +331,7 @@ def test_full_eval_writes_result_only_after_completion(
     assert result["passed"] is True
     assert result["samples"] == 1319
     assert result["execution_mode"] == execution_mode
+    assert result["speculative_algorithm"] == ("DSPARK" if dspark else None)
     assert result["batch_size"] == batch_size
     assert result["max_total_tokens"] == max_total_tokens
     assert result["max_model_len"] == max_model_len
@@ -346,6 +351,12 @@ def test_full_eval_writes_result_only_after_completion(
         assert server_command[
             server_command.index("--max-cudagraph-capture-size") + 1
         ] == str(batch_size)
+    assert ("--speculative-algorithm" in server_command) == dspark
+    if dspark:
+        assert (
+            server_command[server_command.index("--speculative-algorithm") + 1]
+            == "DSPARK"
+        )
     assert ("--enforce-eager" in server_command) == (execution_mode == "eager")
     assert ("--max-cudagraph-capture-size" in server_command) == (
         execution_mode == "graph"

@@ -38,7 +38,7 @@ fields. The runner owns refresh/overlap/rollback and can use stable input views.
 No setter retains a mutable per-forward tensor; no hashes survive a forward.
 
 This baseline executes every scheduled token through every backbone layer. CED
-shortening, PP, CP and speculative/draft execution are not implemented. Attention
+shortening, PP and CP are not implemented. DSpark captures layer inputs. Attention
 and MoE TPxEP widths must match to keep the HC stream replicated on attention TP.
 """
 
@@ -1078,6 +1078,7 @@ class DeepseekV41Model(nn.Module):
         self.config, self.mapping = config, mapping
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
+        self.dspark_capture_layers = ()
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1173,18 +1174,22 @@ class DeepseekV41Model(nn.Module):
         h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
         pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
         pre_mix[:, 0] = 1
+        captured = []
         for layer in self.layers:
             if layer.engram is not None:
                 h = layer.engram(
                     h, hashes[:, layer.engram.layer_hash_index], engram_token_mask
                 )
+            if layer.layer_id in self.dspark_capture_layers:
+                # The draft was trained on unweighted HC means at layer inputs.
+                captured.append(h.mean(dim=1))
             h, pre_mix = layer(h, pre_mix, positions, input_ids, ctx)
         h = v41_hc_pre(h, pre_mix)
         capture = (
             ctx.capture_hidden_mode is not None
             and ctx.capture_hidden_mode.need_capture()
         )
-        return _norm(h, self.norm), [h] if capture else None
+        return _norm(h, self.norm), (captured or [h]) if capture else None
 
 
 class DeepseekV41ForCausalLM(BaseCausalLM):
@@ -1194,6 +1199,19 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def initialize_engram(self, tokenizer) -> None:
         self.model.initialize_engram(tokenizer)
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Capture ordered, unique target layer inputs for the checkpoint draft."""
+        layers = tuple(layer_ids)
+        if (
+            not layers
+            or tuple(sorted(set(layers))) != layers
+            or layers[0] < 0
+            or layers[-1] >= self.model.config.num_hidden_layers
+        ):
+            raise ValueError("DSpark capture layers must be ordered target layer IDs")
+        self.model.dspark_capture_layers = layers
+        self.capture_aux_hidden_states = True
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

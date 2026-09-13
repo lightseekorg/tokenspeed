@@ -2034,19 +2034,27 @@ def _decode_rows_kernel(
     Seq,
     Req,
     Positions,
+    Requests,
     Lengths,
     PoolRows,
     BS,
     ACTUAL,
     EXTENDS,
+    WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    length = tl.load(Seq + row, row < ACTUAL, other=0)
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = token // WIDTH
+    length = tl.load(Seq + row, row < ACTUAL, other=0).to(tl.int64)
+    length = tl.where(row < ACTUAL, tl.maximum(length, WIDTH), 0)
     pool = tl.load(Req + row, row < ACTUAL, other=-1)
-    tl.store(Positions + row, tl.where(row >= EXTENDS, length - 1, -1), row < BS)
-    tl.store(Lengths + row, length, row < BS)
-    tl.store(PoolRows + row, pool, row < BS)
+    live = (row >= EXTENDS) & (row < ACTUAL)
+    position = length - WIDTH + token % WIDTH
+    tl.store(Positions + token, tl.where(live, position, -1), token < BS * WIDTH)
+    tl.store(Requests + token, tl.where(live, row, -1), token < BS * WIDTH)
+    request_row = (row < BS) & (token % WIDTH == 0)
+    tl.store(Lengths + row, length, request_row)
+    tl.store(PoolRows + row, pool, request_row)
 
 
 @register_kernel(
@@ -2062,22 +2070,26 @@ def decode_rows(
     seq_lens,
     request_pool_indices,
     positions,
+    requests,
     lengths,
     pool_rows,
     actual_bs,
     num_extends,
+    width,
 ):
-    """Refresh persistent decode row metadata, including inactive rows, in place."""
+    """Refresh request vectors and packed token coordinates, including padding."""
     if positions.numel():
         _decode_rows_kernel[(triton.cdiv(positions.numel(), 256),)](
             seq_lens,
             request_pool_indices,
             positions,
+            requests,
             lengths,
             pool_rows,
-            positions.numel(),
+            lengths.numel(),
             actual_bs,
             num_extends,
+            WIDTH=width,
             BLOCK=256,
         )
 
@@ -2119,14 +2131,22 @@ def _decode_window_kernel(
     tl.store(Write + row, write)
     tl.store(Read + row * 128 + offsets, slots)
     tl.store(ReadLen + row, tl.minimum(tl.maximum(pos + 1, 0), 128))
-    # The current token is written later; only preceding tokens are dependencies.
+    # Only span starts need external history; later rows use current projections.
+    prior_pos = tl.load(Positions + (row - 1) * PS, row > 0, other=-2).to(tl.int64)
+    prior_req = tl.load(Requests + (row - 1) * RS, row > 0, other=-1)
+    window_start = (
+        (pos >= 0)
+        & (req >= 0)
+        & ((row == 0) | (req != prior_req) | (pos != prior_pos + 1))
+    )
     missing_swa = tl.max(((wanted >= 0) & (wanted < pos) & (slots < 0)).to(tl.int32), 0)
     previous = tl.where((pos >= 0) & (pos % 2 == 1), pos - 1, -1)
     tail = resolve_group_slot(
         Tail, previous, req, TABLE_ROWS, TW, TS, TC, 2, 1, 1, TAIL_PAGES
     )
     missing_tail = (previous >= 0) & (tail < 0)
-    tl.store(Status + row, missing_swa | (missing_tail.to(tl.int32) * 2))
+    error = missing_swa | (missing_tail.to(tl.int32) * 2)
+    tl.store(Status + row, tl.where(window_start, error, 0))
 
 
 @register_kernel(
@@ -2150,11 +2170,11 @@ def decode_window(
     swa_pages,
     tail_pages,
 ):
-    """Write SWA addresses and history error bits for an arbitrary decode window.
+    """Write SWA addresses for consecutive, possibly ragged request spans.
 
-    positions/requests are logical query coordinates, including negative padding.
-    Tables contain LCM group pages. Output buffers have N rows (read_slots [N,128]);
-    status bit 0 denotes missing SWA history, bit 1 a missing compressor tail.
+    positions/requests include negative padding. Tables contain LCM group pages.
+    Output buffers have N rows (read_slots [N,128]); status bits 0/1 denote
+    missing external SWA/tail history at span starts, and are zero elsewhere.
     Every output row is overwritten, so the buffers are reusable under graphs.
     """
     if positions.numel():

@@ -561,21 +561,54 @@ def decode_rows(
     seq_lens,
     request_pool_indices,
     positions,
+    requests,
     lengths,
     pool_rows,
     actual_bs,
     num_extends,
+    width,
 ):
-    """Refresh persistent [bs] position/length/pool rows from live request inputs.
+    """Refresh request-major decode/verify metadata in place; return None.
 
-    All outputs are overwritten; rows past actual_bs are padding, and leading
-    num_extends rows have no decode position. Input vectors are contiguous.
+    Contiguous integer inputs seq_lens/request_pool_indices have >= actual_bs
+    entries. Outputs positions/requests are [bs * width], lengths/pool_rows
+    are [bs]. Requests are batch-table rows, never request-pool indices.
+    width is a positive token count; live lengths clamp to at least width.
+    All outputs are overwritten. Padding and leading num_extends requests
+    have token coordinates -1; padding also has length 0 and pool row -1.
     """
+    bs = lengths.numel()
+    if not isinstance(width, int) or isinstance(width, bool) or width < 1:
+        raise ValueError("decode width must be a positive integer")
+    if not 0 <= num_extends <= actual_bs <= bs:
+        raise ValueError("invalid live/decode batch sizes")
+    if (
+        positions.shape != (bs * width,)
+        or requests.shape != positions.shape
+        or lengths.shape != (bs,)
+        or pool_rows.shape != (bs,)
+        or seq_lens.ndim != 1
+        or request_pool_indices.ndim != 1
+        or min(seq_lens.numel(), request_pool_indices.numel()) < actual_bs
+    ):
+        raise ValueError(
+            "decode metadata requires request-sized and packed token vectors"
+        )
+    tensors = (seq_lens, request_pool_indices, positions, requests, lengths, pool_rows)
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("decode row vectors must be contiguous")
+    if any(tensor.device != positions.device for tensor in tensors):
+        raise ValueError("decode row vectors must share a device")
     if not positions.is_cuda:
         lengths.zero_()
-        lengths[:actual_bs].copy_(seq_lens[:actual_bs])
-        positions.copy_(lengths.to(torch.int64) - 1)
-        positions[:num_extends].fill_(-1)
+        lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
+        positions.view(bs, width).copy_(
+            lengths.to(torch.int64)[:, None] - width + torch.arange(width)
+        )
+        requests.view(bs, width).copy_(torch.arange(bs)[:, None])
+        for tensor in (positions, requests):
+            tensor[: num_extends * width].fill_(-1)
+            tensor[actual_bs * width :].fill_(-1)
         pool_rows.fill_(-1)
         pool_rows[:actual_bs].copy_(request_pool_indices[:actual_bs])
         return
@@ -583,10 +616,12 @@ def decode_rows(
         seq_lens,
         request_pool_indices,
         positions,
+        requests,
         lengths,
         pool_rows,
         actual_bs,
         num_extends,
+        width,
     )
 
 
@@ -604,10 +639,13 @@ def decode_window(
 ):
     """Fill SWA addresses and history errors for N logical query coordinates.
 
-    positions/requests are integer [N], tables are LCM group pages. Destinations
-    are write_slots[N], read_slots[N,128], read_lens[N], status[N]. Status bit 0
-    reports missing SWA history; bit 1 reports a required compressor tail. Page
-    zero and pages beyond the supplied capacities never address live cache.
+    positions/requests are integer [N] in consecutive request-major spans;
+    spans may have different lengths. Tables are LCM group pages. Destinations
+    are write_slots[N], read_slots[N,128], read_lens[N], status[N]. Only the
+    first live row of each span reports history errors: bit 0 for missing SWA
+    history, bit 1 for a required compressor tail. Internal pairs use current
+    projections, not retained tails. Padding status is zero. Page zero and
+    pages beyond the supplied capacities never address live cache. Returns None.
     """
     if not positions.is_cuda:
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
@@ -631,9 +669,15 @@ def decode_window(
             (positions < 0) | (positions % 2 != 1), -1
         )
         tail = bounded_group_slots(previous, requests, tail_table, 2, 1, 1, tail_pages)
+        window_start = (positions >= 0) & (requests >= 0)
+        window_start[1:] &= (requests[1:] != requests[:-1]) | (
+            positions[1:] != positions[:-1] + 1
+        )
         status.copy_(
-            missing_swa.to(torch.int32)
-            | (((previous >= 0) & (tail < 0)).to(torch.int32) * 2)
+            (
+                missing_swa.to(torch.int32)
+                | (((previous >= 0) & (tail < 0)).to(torch.int32) * 2)
+            ).masked_fill(~window_start, 0)
         )
         return
     _kernel("decode_window", positions)(

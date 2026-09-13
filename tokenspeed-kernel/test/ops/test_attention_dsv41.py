@@ -1016,3 +1016,155 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
             out, _compressor_metadata_reference(p, r, table, 4), strict=True
         ):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("target", ["cpu", "cuda"])
+@pytest.mark.parametrize("width", [1, 3, 5, 6, 129])
+@pytest.mark.parametrize("bs", [0, 3])
+def test_decode_rows_packed_request_bounds_padding_and_replay(target, width, bs):
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+    seq = torch.tensor([0, 133], dtype=torch.int32, device=target)
+    pools = torch.tensor([19, 7], dtype=torch.int64, device=target)
+    storage = [
+        torch.full((n + 4,), 777, dtype=dtype, device=target)
+        for n, dtype in (
+            (bs * width, torch.int64),
+            (bs * width, torch.int64),
+            (bs, torch.int32),
+            (bs, torch.int64),
+        )
+    ]
+    out = tuple(tensor[2:-2] for tensor in storage)
+
+    def prepare(actual, extends):
+        dsv41.decode_rows(seq, pools, *out, actual, extends, width)
+
+    def check(actual, extends):
+        lengths = [max(int(seq[i]), width) if i < actual else 0 for i in range(bs)]
+        positions, requests = [], []
+        for i in range(bs):
+            live = extends <= i < actual
+            positions.extend(
+                range(lengths[i] - width, lengths[i]) if live else [-1] * width
+            )
+            requests.extend([i if live else -1] * width)
+        expected = (
+            positions,
+            requests,
+            lengths,
+            [int(pools[i]) if i < actual else -1 for i in range(bs)],
+        )
+        for got, want, guarded in zip(out, expected, storage, strict=True):
+            torch.testing.assert_close(
+                got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
+            )
+            assert (guarded[:2] == 777).all() and (guarded[-2:] == 777).all()
+
+    for actual, extends in ((2, 0), (1, 0), (0, 0), (2, 1), (2, 2)):
+        actual, extends = min(actual, bs), min(extends, bs)
+        for tensor in storage:
+            tensor.fill_(777)
+        prepare(actual, extends)
+        check(actual, extends)
+    if target == "cuda" and bs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare(2, 0)
+        for step in range(3):
+            seq.add_(1)
+            pools.add_(3)
+            for tensor in storage:
+                tensor.fill_(777)
+            graph.replay()
+            check(2, 0)
+
+
+def test_decode_rows_rejects_request_token_shape_confusion():
+    with pytest.raises(ValueError, match="request-sized and packed token"):
+        dsv41.decode_rows(
+            torch.tensor([5, 10]),
+            torch.tensor([19, 7]),
+            torch.empty(6, dtype=torch.int64),
+            torch.empty(6, dtype=torch.int64),
+            torch.empty(6, dtype=torch.int32),
+            torch.empty(6, dtype=torch.int64),
+            2,
+            0,
+            3,
+        )
+
+
+@pytest.mark.parametrize("target", ["cpu", "cuda"])
+def test_decode_window_ragged_external_history_only_and_replay(target):
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+    p = torch.tensor([-1, 0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 190, 191, -1], device=target)
+    r = torch.tensor([-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, -1], device=target)
+    swa = torch.ones((3, 4), dtype=torch.int32, device=target)
+    tail = torch.ones((3, 100), dtype=torch.int32, device=target)
+    tail[0].zero_()  # All pairs are internal to the first request's window.
+    tail[1, 1] = 0  # Request 1 really needs token 2 from its external tail.
+    tail[2].zero_()  # Token 190 is supplied by this forward, not its tail page.
+    swa[2, 0] = 0  # Token 63 belongs to request 2's external SWA history.
+    n = p.numel()
+    out = (
+        torch.empty(n, dtype=torch.int64, device=target),
+        torch.empty((n, 128), dtype=torch.int32, device=target),
+        torch.empty(n, dtype=torch.int32, device=target),
+        torch.empty(n, dtype=torch.int32, device=target),
+    )
+
+    def prepare():
+        dsv41.decode_window(p, r, *out, swa, tail, 2, 2)
+
+    prepare()
+    if target == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare()
+    for step in range(3):
+        if step == 1:
+            tail[1, 1] = 1
+            swa[2, 0] = 1
+        if step == 2:
+            p.fill_(-1)
+        for tensor in out:
+            tensor.fill_(777)
+        if target == "cuda":
+            graph.replay()
+        else:
+            prepare()
+        errors = [0] * n
+        if step == 0:
+            errors[6], errors[11] = 2, 1
+        assert out[3].cpu().tolist() == errors
+        table = swa.cpu().tolist()
+
+        def slot(position, request):
+            if position < 0 or not 0 <= request < len(table):
+                return -1
+            column, offset = divmod(position, 64)
+            if column >= len(table[request]):
+                return -1
+            page = table[request][column]
+            return page * 64 + offset if 0 < page < 2 else -1
+
+        coordinates = list(zip(p.cpu().tolist(), r.cpu().tolist(), strict=True))
+        expected = (
+            [slot(position, request) for position, request in coordinates],
+            [
+                [
+                    slot(wanted, request) if wanted <= position else -1
+                    for wanted in range(
+                        max(0, position - 127), max(0, position - 127) + 128
+                    )
+                ]
+                for position, request in coordinates
+            ],
+            [min(max(position + 1, 0), 128) for position, _ in coordinates],
+        )
+        for got, want in zip(out[:3], expected, strict=True):
+            torch.testing.assert_close(
+                got.cpu(), torch.tensor(want, dtype=got.dtype), rtol=0, atol=0
+            )
